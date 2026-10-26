@@ -1159,6 +1159,10 @@ impl NativeServiceCapacityFixture {
                 NonZeroU64::MIN,
             )),
         );
+        Self::from_fixture(fixture, children)
+    }
+
+    fn from_fixture(fixture: NativeSignalFixture, children: usize) -> Self {
         let source = BornInZoneSource {
             zone: fixture.zone,
             slot: fixture.slot,
@@ -1214,6 +1218,84 @@ impl NativeServiceCapacityFixture {
             pending: Vec::new(),
             children,
         }
+    }
+
+    fn after_root_exec(children: usize) -> Self {
+        let mut fixture = NativeSignalFixture::new(
+            ExecutionBinding {
+                task: carrick_core_abi::EntryTaskKey::from_raw(7001),
+                generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+                mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+            },
+            carrick_core_abi::EntryTaskKey::from_raw(7001),
+            carrick_core_abi::BirthSerial::of_task(TaskSerial::from_registry_allocation(
+                NonZeroU64::MIN,
+            )),
+        );
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        let mut service = fixture.service();
+        {
+            let mut root = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    source,
+                    fixture.task,
+                    fixture.address,
+                    &words(fixture.address),
+                    &mut service,
+                )
+                .unwrap();
+            assert!(matches!(
+                root.begin_exec_service(test_exec_payload(b"/bin/static")),
+                Ok(NativeResume::Left(None))
+            ));
+            assert!(root.take_handoff_receipt().is_some());
+        }
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 211, 0x120_0000);
+        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        assert_eq!(selected.record, fixture.record.id);
+        let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+            .unwrap()
+            .words;
+        let root_key = fixture.runtime.graph.lock().root_key;
+        let predecessor = fixture.runtime.task_binding(root_key).unwrap().address;
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                predecessor,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.resume_checkpoint(),
+            Ok(NativeResume::NoPending)
+        ));
+        drop(root);
+        fixture.address = fixture.runtime.task_binding(root_key).unwrap().address;
+        assert!(
+            fixture
+                .registry
+                .for_entry(source, fixture.task, fixture.address)
+                .is_ok(),
+            "successor registry lookup"
+        );
+        assert!(
+            fixture
+                .registry
+                .for_record(fixture.zone, fixture.record)
+                .is_some(),
+            "successor record lookup"
+        );
+        Self::from_fixture(fixture, children)
     }
 
     fn select(&self) -> Option<(RecordRef, AddressContext<RootGpa>, ParkedContextWords)> {
@@ -2752,4 +2834,63 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
         Ok(NativeResume::Left(None))
     ));
     assert!(reused.take_handoff_receipt().is_some());
+}
+
+#[cfg(test)]
+#[test]
+fn native_exec_successor_reaps_its_fork_child() {
+    let capacity = NativeServiceCapacityFixture::after_root_exec(1);
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+
+    let (child_record, child_address, child_words) = capacity.select().unwrap();
+    let child_pid = fixture.task.visible_pid().unwrap();
+    assert_ne!(child_pid, 7001);
+    let mut child_service = fixture.service();
+    let mut child = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            child_address,
+            &child_words,
+            &mut child_service,
+        )
+        .unwrap();
+    assert!(matches!(
+        child.resume_checkpoint(),
+        Ok(NativeResume::NoPending)
+    ));
+    assert_eq!(child.calling_tid(), child_pid);
+    assert!(matches!(
+        child.exit_group(0),
+        LifecycleOutcome::Transferred { .. }
+    ));
+    assert!(child.take_run_failure().is_none());
+    drop(child);
+
+    let (parent_record, parent_address, parent_words) = capacity.select().unwrap();
+    assert_ne!(parent_record, child_record);
+    assert_eq!(fixture.task.visible_pid(), Some(7001));
+    let mut parent_service = fixture.service();
+    let mut parent = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            parent_address,
+            &parent_words,
+            &mut parent_service,
+        )
+        .unwrap();
+    assert!(matches!(
+        parent.resume_checkpoint(),
+        Ok(NativeResume::Returned(result)) if result.raw() == i64::from(child_pid)
+    ));
+    assert_eq!(parent_service.copies, vec![LinuxWaitStatus::exited(0)]);
 }
