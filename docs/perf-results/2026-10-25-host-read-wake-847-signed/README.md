@@ -1,5 +1,71 @@
 # Issue #847 signed hardware evidence
 
+## Exact `3e3e702d9` bootstrap regression and portable correction (2026-10-25)
+
+The exact bundle for `3e3e702d9b7ccfb981527d4af36eab2d67a9f15e`
+verified and restored 1,195 executables before the requested serial proof:
+
+```text
+/Volumes/carrick-build/fixtures/published/3e3e702d9b7ccfb981527d4af36eab2d67a9f15e/18f2a1a0d3ae419df8300441a1de62edee71fde625a6b750e00b1e1e5467e2f3.tar.gz
+bundle identity: 18f2a1a0d3ae419df8300441a1de62edee71fde625a6b750e00b1e1e5467e2f3
+archive SHA-256: c0363cd8fa14897a785b6854a1bab77706058e7a74b61cfdfb3db460744e6ff3
+input identity: 293074b237d1d1b0a2ec3ba5560927dc50a6b24526c35117811014c7003a78b2
+```
+
+The first requested host-read repetition, `847-3e3-hostread-01`, failed in
+0.11 seconds before the workload entered its loop:
+
+```text
+reserve sparse HVPatch root mmap arena: host mapping operation failed: stage-1 edit lacks its Editor exclusion
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.11s
+remaining carrick procs (run-id 847-3e3-hostread-01) = 0
+remaining carrick procs (run-id 847-3e3-hostread-01-cli) = 0
+```
+
+Classification: source regression, not the #847 hang. There was no guest
+EFAULT, watchdog, carrier fatal, or watchdog census. The matrix stopped on
+that regression, so the remaining 19 host-read repetitions and all companion
+populations were not run on this artifact. The complete log is retained at
+`/tmp/847-3e3-hostread-01.log`.
+
+The signed executable was
+`target/release/deps/el1_sched-a135647895e386e6`:
+
+```text
+SHA-256: f4967796b6e3ff63aac1cf7c282060691ede501bf860fca7cdf37e4055888ff0
+CDHash: 9d63aff64e2e94175228d8562f1c443b70cec94f
+LC_UUID: 8B4F803F-A61E-3ABF-A853-61A888372A8C
+identifier: el1_sched-a135647895e386e6.tmp.66718
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+The portable correction is split into three reviewable commits. `2b58752be`
+acquires the root MM's Editor exclusion across bootstrap ASID setup.
+`a81a89199` accepts an authenticated EL1 COW settlement after a later admitted
+owner has retired or re-armed the replacement, while still rejecting the old
+output's reappearance. `62d74d6b8` gives relocated bootstrap primaries their
+missing retirement owner: whole-MM, rootless-shared, and exec-predecessor
+retirement consume the exact MM receipt, retain proof custody across pins, and
+complete at the carrier safe point. The same change preserves declined and
+republished inventory proofs instead of dropping or demanding them early.
+
+Portable verification on `62d74d6b8`:
+
+- `carrick-vmm-hvf --lib`, serial: 800 passed, 3 ignored;
+- `carrick-vmm-hvf --lib`, default parallel: 800 passed, 3 ignored;
+- focused later-owner settlement, parked-pin, rootless-shared,
+  exec-successor, declined-retirement, and exact-root witnesses: passed;
+- `just fmt-check`, `just clippy`, `just clippy-linux`,
+  `just lint-domains`, and `just test-kernel`: passed;
+- normal EL1 image: 1,053,104 / 1,572,864 bytes, maximum checked stack
+  11,503 / 12,288 (`native wait copy`);
+- all-target/Linux clippy EL1 image: 1,081,920 / 1,572,864 bytes, maximum
+  checked stack 12,015 / 12,288 (`signal terminal exit`).
+
+The source changed after the failed signed artifact. An exact bundle for the
+new evidence head is required before the 20/20 host-read proof and companions.
+
 ## Exact `98e177408` bootstrap regression (2026-10-25)
 
 The exact bundle for `98e177408103bc79ef5a79306b921a2c31dc2b94`
