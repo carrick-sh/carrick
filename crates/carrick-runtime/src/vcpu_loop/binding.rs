@@ -6688,6 +6688,19 @@ pub(crate) enum VcpuLoopLaunch {
 }
 
 impl VcpuLoopLaunch {
+    fn record_editor_license_refusal(outcome: &Result<VcpuLoopOutcome, RuntimeError>) {
+        if let Err(RuntimeError::Trap(TrapError::Stage1EditorLicenseRefused {
+            authority_mm,
+            license_mm,
+        })) = outcome
+        {
+            carrick_kernel::event_ring::rec_stage1_editor_license_refusal(
+                *authority_mm,
+                *license_mm,
+            );
+        }
+    }
+
     pub(crate) fn is_persistent(&self) -> bool {
         matches!(self, Self::Persistent { .. })
     }
@@ -6696,7 +6709,10 @@ impl VcpuLoopLaunch {
     /// shutdown belongs exclusively to the carrier terminal finalizer.
     pub(crate) fn wait(self) -> Result<VcpuLoopOutcome, RuntimeError> {
         match self {
-            Self::Direct(result) => result,
+            Self::Direct(result) => {
+                Self::record_editor_license_refusal(&result);
+                result
+            }
             Self::Persistent {
                 result,
                 completion,
@@ -6704,6 +6720,7 @@ impl VcpuLoopLaunch {
                 liveness,
             } => {
                 let outcome = result.wait_supervised(&liveness);
+                Self::record_editor_license_refusal(&outcome);
                 // An aborted kernel's executor bindings are not going to
                 // retire: the abort exists precisely because the graph will
                 // not progress, and its guest threads are still loaded. Waiting
@@ -7424,6 +7441,34 @@ mod tests {
     use carrick_guest_mem::GuestMemory;
     use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn editor_license_refusal_reaches_terminal_event_ring() {
+        let outcome = VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(
+            TrapError::Stage1EditorLicenseRefused {
+                authority_mm: Some(0x7134),
+                license_mm: 0x7956,
+            },
+        )))
+        .wait();
+        assert!(matches!(
+            outcome,
+            Err(RuntimeError::Trap(
+                TrapError::Stage1EditorLicenseRefused { .. }
+            ))
+        ));
+        assert!(
+            carrick_kernel::event_ring::drain_recent(64)
+                .into_iter()
+                .filter_map(Result::ok)
+                .any(|event| {
+                    event.kind == carrick_kernel::event_ring::STAGE1_EDITOR_LICENSE_REFUSAL
+                        && event.a == 0x7134
+                        && event.b == 0x7956
+                }),
+            "typed refusal must leave a terminal event-ring receipt"
+        );
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]

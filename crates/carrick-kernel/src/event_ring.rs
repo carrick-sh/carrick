@@ -365,6 +365,22 @@ pub fn rec_stage2_rollback_invariant(record: u64, vm_generation: u64, logical_ow
     );
 }
 
+/// A stage-1 mutation presented an Editor exclusion for a different MM.
+/// `a` is the authority MM (`0` while an authority is still unbound), `b` is
+/// the MM named by the exclusion, and `c` is reserved. The operation returns a
+/// typed refusal; this terminal-event record preserves the mismatch without a
+/// carrier panic.
+pub const STAGE1_EDITOR_LICENSE_REFUSAL: u8 = 87;
+
+pub fn rec_stage1_editor_license_refusal(authority_mm: Option<u64>, license_mm: u64) {
+    rec(
+        STAGE1_EDITOR_LICENSE_REFUSAL,
+        low32(authority_mm.unwrap_or(0)),
+        low32(license_mm),
+        0,
+    );
+}
+
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloneRefusalProducer {
@@ -398,7 +414,7 @@ fn clone_refusal_label(producer: i32) -> &'static str {
 }
 
 /// Highest event kind a reader accepts.
-const LAST_KIND: u8 = STAGE2_ROLLBACK_INVARIANT;
+const LAST_KIND: u8 = STAGE1_EDITOR_LICENSE_REFUSAL;
 
 /// At most this many [`FAULTSIG_MBOX`] records follow one fault signal, so a
 /// census of all mailboxes never floods the ring.
@@ -1887,6 +1903,20 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
             "MMOCC_REFUSE slot={a} running_mm={} requested_mm={}",
             b as u32, c as u32
         ),
+        STAGE2_AUTHORITY_INVARIANT => {
+            format!(
+                "STAGE2_AUTHORITY_INVARIANT mm={} tid={b} revision={}",
+                a as u32, c as u32
+            )
+        }
+        STAGE2_ROLLBACK_INVARIANT => format!(
+            "STAGE2_ROLLBACK_INVARIANT record={} vm_generation={} logical_owner={}",
+            a as u32, b as u32, c as u32
+        ),
+        STAGE1_EDITOR_LICENSE_REFUSAL => format!(
+            "STAGE1_EDITOR_LICENSE_REFUSAL authority_mm={} license_mm={}",
+            a as u32, b as u32
+        ),
         ALIAS_MUTATION => format!(
             "ALIAS    coordinator={:#x} tid={c} begin=mutation",
             ((a as u32 as u64) << 32) | (b as u32 as u64)
@@ -3016,6 +3046,24 @@ mod tests {
                 .into_iter()
                 .filter_map(Result::ok)
                 .all(|event| is_high_rate(event.kind))
+        );
+    }
+
+    #[test]
+    fn editor_license_refusal_is_a_decoded_lifecycle_event() {
+        rec_stage1_editor_license_refusal(Some(0x1234), 0x5678);
+        let event = drain_recent(N)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|event| {
+                event.kind == STAGE1_EDITOR_LICENSE_REFUSAL
+                    && event.a == 0x1234
+                    && event.b == 0x5678
+            })
+            .expect("typed Editor-license refusal reaches the terminal event ring");
+        assert_eq!(
+            decode(event.kind, event.a, event.b, event.c),
+            "STAGE1_EDITOR_LICENSE_REFUSAL authority_mm=4660 license_mm=22136"
         );
     }
 }

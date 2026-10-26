@@ -303,7 +303,14 @@ impl CloneTidOutputTransaction {
             Err(carrick_guest_mem::MemoryError::HostMap(_)) => {
                 carrick_observability::probes::HvpatchCloneTidWriteResult::HostMap
             }
-            Err(carrick_guest_mem::MemoryError::EditorLicenseRefused { .. }) => {
+            Err(carrick_guest_mem::MemoryError::EditorLicenseRefused {
+                authority_mm,
+                license_mm,
+            }) => {
+                carrick_kernel::event_ring::rec_stage1_editor_license_refusal(
+                    *authority_mm,
+                    *license_mm,
+                );
                 carrick_observability::probes::HvpatchCloneTidWriteResult::HostMap
             }
             Err(
