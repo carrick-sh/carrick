@@ -49,6 +49,13 @@ impl PendingServiceReply {
     }
 }
 
+/// Carrier readiness never completes a parked syscall. Its continuation stays
+/// owned by the process table until service settlement re-drives it.
+enum CarrierContinuation {
+    Completed(SyscallResult),
+    Parked(TaskKey),
+}
+
 pub(super) struct PendingService<'a> {
     reply: Option<PendingServiceReply>,
     /// Exec input is ring-owned guest memory. Its virtual address is published
@@ -56,9 +63,7 @@ pub(super) struct PendingService<'a> {
     _exec_payload: Option<Box<[u8]>>,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     retry_syscall_after_supply: bool,
-    /// A completed in-ring syscall result survives the carrier's readiness
-    /// wake, whose scheduler result is not a guest return value.
-    completed_carrier_result: Option<SyscallResult>,
+    carrier_continuation: Option<CarrierContinuation>,
     request: ServiceRequest,
     pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
     pub(super) claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
@@ -354,8 +359,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .and_then(|mm| self.service.prepare_exec_successor_slot(mm))
             })
             .transpose()?;
-        let completed_carrier_result = matches!(operation, ServiceOperation::CarrierWork { .. })
-            .then(|| SyscallResult::new(self.words.syscall_return() as i64));
+        let carrier_continuation =
+            matches!(operation, ServiceOperation::CarrierWork { .. }).then(|| {
+                if self.runtime.graph.lock().pending.contains_key(&self.key) {
+                    CarrierContinuation::Parked(self.key)
+                } else {
+                    CarrierContinuation::Completed(SyscallResult::new(
+                        self.words.syscall_return() as i64
+                    ))
+                }
+            });
         let mut reply = match operation {
             ServiceOperation::Fault(fault) if !fault.present && fault_sequence.is_some() => {
                 Some(PendingServiceReply::Fault(
@@ -429,7 +442,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 _exec_payload: exec_payload,
                 exec_successor,
                 retry_syscall_after_supply,
-                completed_carrier_result,
+                carrier_continuation,
                 request,
                 wait: owner_wait,
                 claim,
@@ -1405,15 +1418,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     ServiceOperation::CarrierWork { .. },
                     ServiceResult::Supplied | ServiceResult::Cancelled,
                 ) => {
-                    // Bytes/results already committed before suspension. Cancellation
-                    // cannot turn that completion into a short transfer or EINTR.
-                    // Return the retained result explicitly: the service wake's
-                    // scheduling result is only readiness and must not overwrite
-                    // the completed syscall value saved in this continuation.
-                    pending
-                        .completed_carrier_result
-                        .map(NativeResume::Returned)
-                        .ok_or(NativeProcessError::Quarantined)
+                    match pending.carrier_continuation {
+                        // Committed bytes/results survive readiness and cancellation.
+                        Some(CarrierContinuation::Completed(result)) => {
+                            Ok(NativeResume::Returned(result))
+                        }
+                        Some(CarrierContinuation::Parked(caller))
+                            if caller == self.key
+                                && self.runtime.graph.lock().pending.contains_key(&caller) =>
+                        {
+                            // Re-drive after releasing the service claim below.
+                            // No scheduling scalar can complete this operation.
+                            Ok(NativeResume::NoPending)
+                        }
+                        _ => Err(NativeProcessError::Quarantined),
+                    }
                 }
                 (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
                     Err(NativeProcessError::Quarantined)
@@ -1522,7 +1541,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         })();
         // Mapping/signal completion still needs the exact member/MM. Release
         // terminal custody only after the ring has made that decision.
+        let redrive = matches!(
+            pending.carrier_continuation,
+            Some(CarrierContinuation::Parked(_))
+        ) && matches!(completed, Ok(NativeResume::NoPending));
         self.release_service_claim(pending.claim)?;
+        if redrive {
+            // Also covers an ACK already ready at enrollment: that caller does
+            // not pass through resume_checkpoint before returning to EL0.
+            // The retained wait/IPC owner alone commits effects and its result.
+            return match self.resume_pending_wait() {
+                Some(LifecycleOutcome::Returned { result, .. }) => {
+                    Ok(NativeResume::Returned(result))
+                }
+                Some(LifecycleOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    ..
+                }) => Ok(NativeResume::Left(None)),
+                _ => Err(NativeProcessError::Quarantined),
+            };
+        }
         completed
     }
 }
