@@ -427,41 +427,37 @@ impl UserTransferCustody {
         publication_authority: bool,
     ) {
         carrick_observability::probes::hvpatch_el1_host_read_retention(ipa, reason);
-        carrick_observability::probes::hvpatch_el1_host_read_retention_detail_with(
-            ipa,
-            reason,
-            || {
-                let snapshot = identity
-                    .and_then(|identity| self.custody.stage2_record_snapshot(identity.record_id))
-                    .or_else(|| self.custody.stage2_record_covering_any(ipa));
-                if let Some(snapshot) = snapshot {
-                    let mut state = u64::from(snapshot.mapped)
-                        | (u64::from(snapshot.backend_map_installed) << 1)
-                        | (u64::from(snapshot.retirement_requested) << 2)
-                        | (u64::from(snapshot.terminalized_by_vm_destroy) << 3)
-                        | (u64::from(snapshot.superseded_by_rebind) << 4)
-                        | (u64::from(snapshot.release_in_flight) << 5)
-                        | (u64::from(snapshot.release_retry_pending) << 6)
-                        | (u64::from(publication_authority) << 7);
-                    state |= snapshot.pin_count.min(u64::MAX >> 16) << 16;
-                    (
-                        snapshot.record_id.0,
-                        snapshot.vm_generation.0,
-                        snapshot.logical_owner.map_or(0, |owner| owner.generation),
-                        state,
-                    )
-                } else if let Some(identity) = identity {
-                    (
-                        identity.record_id.0,
-                        identity.vm_generation.0,
-                        identity.logical_owner.map_or(0, |owner| owner.generation),
-                        u64::from(publication_authority) << 7,
-                    )
-                } else {
-                    (0, 0, 0, u64::from(publication_authority) << 7)
-                }
-            },
-        );
+        carrick_observability::probes::hvpatch_el1_host_read_retention_detail(ipa, reason, || {
+            let snapshot = identity
+                .and_then(|identity| self.custody.stage2_record_snapshot(identity.record_id))
+                .or_else(|| self.custody.stage2_record_covering_any(ipa));
+            if let Some(snapshot) = snapshot {
+                let mut state = u64::from(snapshot.mapped)
+                    | (u64::from(snapshot.backend_map_installed) << 1)
+                    | (u64::from(snapshot.retirement_requested) << 2)
+                    | (u64::from(snapshot.terminalized_by_vm_destroy) << 3)
+                    | (u64::from(snapshot.superseded_by_rebind) << 4)
+                    | (u64::from(snapshot.release_in_flight) << 5)
+                    | (u64::from(snapshot.release_retry_pending) << 6)
+                    | (u64::from(publication_authority) << 7);
+                state |= snapshot.pin_count.min(u64::MAX >> 16) << 16;
+                (
+                    snapshot.record_id.0,
+                    snapshot.vm_generation.0,
+                    snapshot.logical_owner.map_or(0, |owner| owner.generation),
+                    state,
+                )
+            } else if let Some(identity) = identity {
+                (
+                    identity.record_id.0,
+                    identity.vm_generation.0,
+                    identity.logical_owner.map_or(0, |owner| owner.generation),
+                    u64::from(publication_authority) << 7,
+                )
+            } else {
+                (0, 0, 0, u64::from(publication_authority) << 7)
+            }
+        });
     }
 
     fn retain_exact_for(

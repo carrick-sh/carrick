@@ -3016,7 +3016,7 @@ mod hvpatch_guest_probe_abi {
         let source = include_str!("probes.rs");
         for declaration in [
             "fn hvpatch__el1__host__read__retention__detail(",
-            "pub fn hvpatch_el1_host_read_retention_detail_with(",
+            "pub fn hvpatch_el1_host_read_retention_detail(",
         ] {
             assert!(
                 source.matches(declaration).count() >= 2,
@@ -7367,7 +7367,7 @@ mod real {
     /// release retry bit 6, sampled publication authority bit 7, and pin count
     /// in bits 63:16.
     #[inline(never)]
-    pub fn hvpatch_el1_host_read_retention_detail_with(
+    pub fn hvpatch_el1_host_read_retention_detail(
         ipa: u64,
         reason: u32,
         diagnostic: impl FnOnce() -> (u64, u64, u64, u64),
@@ -9903,7 +9903,7 @@ mod stub {
     stub!(el1_native_fork_stock_refusal(reason: &str, requested: &str, cached: &str, requested_context: &str, cached_context: &str));
     stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
 
-    pub fn hvpatch_el1_host_read_retention_detail_with(
+    pub fn hvpatch_el1_host_read_retention_detail(
         _ipa: u64,
         _reason: u32,
         _diagnostic: impl FnOnce() -> (u64, u64, u64, u64),
