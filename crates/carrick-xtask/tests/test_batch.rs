@@ -88,8 +88,28 @@ fn batch_builds_once_and_preserves_filters_serial_environment_and_failures() {
 
 #[test]
 fn exported_batch_runs_without_compiling_and_rejects_missing_or_changed_inputs() {
+    exported_batch_fixture(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn exported_batch_accepts_symlinked_checkout_without_allowing_relocation() {
+    exported_batch_fixture(true);
+}
+
+fn exported_batch_fixture(symlinked: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
+    let alias = tempfile::tempdir().unwrap();
+    let linked = alias.path().join("checkout");
+    #[cfg(unix)]
+    if symlinked {
+        std::os::unix::fs::symlink(dir.path(), &linked).unwrap();
+    }
+    let root = if symlinked {
+        linked.as_path()
+    } else {
+        dir.path()
+    };
     std::fs::create_dir(root.join("src")).unwrap();
     std::fs::write(root.join("Cargo.toml"), "[package]\nname='archived-batch'\nversion='0.1.0'\nedition='2021'\n[features]\nwitness=[]\n").unwrap();
     std::fs::write(root.join("src/lib.rs"), "#[test] fn green() { assert!(cfg!(feature=\"witness\")); }\n#[test] fn red() { panic!(\"filter lost\"); }\n").unwrap();
@@ -149,8 +169,22 @@ fn exported_batch_runs_without_compiling_and_rejects_missing_or_changed_inputs()
         "feature drift must fail closed"
     );
     let saved_manifest = std::fs::read(root.join("target/test-batch.json")).unwrap();
+    if symlinked {
+        let mut aliased_root: serde_json::Value = serde_json::from_slice(&saved_manifest).unwrap();
+        aliased_root["root"] = root.to_str().unwrap().into();
+        std::fs::write(
+            root.join("target/test-batch.json"),
+            serde_json::to_vec(&aliased_root).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            import("lanes").status.success(),
+            "equivalent checkout aliases must import"
+        );
+    }
+
     let mut wrong_root: serde_json::Value = serde_json::from_slice(&saved_manifest).unwrap();
-    wrong_root["root"] = "/another/checkout".into();
+    wrong_root["root"] = alias.path().to_str().unwrap().into();
     std::fs::write(
         root.join("target/test-batch.json"),
         serde_json::to_vec(&wrong_root).unwrap(),
