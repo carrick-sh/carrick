@@ -1,5 +1,81 @@
 # Issue #847 signed hardware evidence
 
+## Exact `3e5abed72` bootstrap regression and review closure (2026-10-26)
+
+The exact bundle for `3e5abed72a8e9e3c2cc0abf8af68f7fbd0b88b4c`
+verified and restored 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/3e5abed72a8e9e3c2cc0abf8af68f7fbd0b88b4c/3ef30cb7418785d6e2396fe5d4bdc31a9e76fcda886ef3582e10b41fb3bf2d7a.tar.gz
+bundle identity: 3ef30cb7418785d6e2396fe5d4bdc31a9e76fcda886ef3582e10b41fb3bf2d7a
+archive SHA-256: d88dc8782a3d78767a14279fc5d2cfca0427673b8db2faabe3ea1eff669f9d75
+input identity: 293074b237d1d1b0a2ec3ba5560927dc50a6b24526c35117811014c7003a78b2
+```
+
+The prerequisite-bearing smoke attempt `847-3e5-smoke-01` was rejected by
+the disk guard at 13 GiB free and never executed a guest. The approved
+no-prerequisite signed harness run `847-3e5-smoke-02` (backend run
+`847-3e5-smoke-02-b1`) reached HVF and failed in 0.11 seconds before the
+workload loop:
+
+```text
+configuration refused: exclude root EL1 Editor before HVPatch ASID setup
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.11s
+remaining carrick procs (run-id 847-3e5-smoke-02-b1) = 0
+remaining carrick procs (run-id 847-3e5-smoke-02-b1-cli) = 0
+remaining carrick procs (run-id 847-3e5-smoke-02) = 0
+remaining carrick procs (run-id 847-3e5-smoke-02-cli) = 0
+```
+
+Classification: source bootstrap regression, not the #847 hang. There was no
+guest EFAULT, watchdog, carrier fatal, or watchdog census. The negative
+entitlement control passed and its scoped cleanup was zero. The full 20-run
+population and companions stopped at the required smoke gate. The complete
+run is retained at `/tmp/847-3e5-smoke-02.log`.
+
+The signed executable was
+`target/release/deps/el1_sched-a135647895e386e6`:
+
+```text
+SHA-256: 0cc68839acbdc5f5cf67395ce70c06640f82d270acd8da12fbd2ea31881e0ca3
+CDHash: 5a35286ac32c664962fbfe8e22a967c0547ab94d
+LC_UUID: DCA660B5-A90F-39C7-BE76-27E7AFE51047
+identifier: el1_sched-a135647895e386e6.tmp.13414
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+`a7e833024` fixes the bootstrap path by taking the already-installed raw zone
+table rather than the policy-gated live scheduler view. The accompanying
+audit enumerated every production `Stage1Authority::edit*` caller, including
+boot, arena setup, AArch64 live edits, local COW, foreign COW, and sparse
+materialization/import; each now takes the exact-MM owned edit license.
+
+The three design-review P1s remain closed on this head: replacement
+unpublication comes only from verified descriptor receipts after invalidation;
+whole-MM proof is bound to the exact MM; and the edit license is an owned,
+process-visible exact-MM capability rather than thread-local state. The final
+review closure makes host `Stage1LeafRetired` unavailable until its TLBI
+callback succeeds. Losing the consume-once rollback receipt leaves the extent
+quarantined and emits `STAGE2_ROLLBACK_INVARIANT` through the terminal event
+ring instead of silently leaking diagnostic evidence.
+
+Portable verification on the post-review source:
+
+- serialized `carrick-vmm-hvf --lib`: 801 passed, 0 failed, 3 ignored;
+- focused TLBI-order, foreign-COW, host-repoint and terminal-invariant
+  witnesses: passed;
+- `just fmt-check`, `just clippy`, `just clippy-linux`,
+  `just lint-domains`, `just test-kernel`, and the contract-change gate:
+  passed;
+- normal EL1 image: 1,053,104 / 1,572,864 bytes, maximum checked stack
+  11,503 / 12,288 (`native wait copy`);
+- all-target EL1 image: 1,081,920 / 1,572,864 bytes, maximum checked stack
+  12,015 / 12,288 (`signal terminal exit`).
+
+The source changed after the failed signed artifact. An exact bundle for the
+new evidence head is required before the 20/20 host-read proof and companions.
+
 ## Exact `3e3e702d9` bootstrap regression and portable correction (2026-10-25)
 
 The exact bundle for `3e3e702d9b7ccfb981527d4af36eab2d67a9f15e`
