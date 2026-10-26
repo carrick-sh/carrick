@@ -957,7 +957,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if self.handoff.is_some() {
             NativeResume::Left(None)
         } else {
-            NativeResume::NoPending
+            let _ = self.run_failed(NativeProcessError::Quarantined.run_failure_reason());
+            NativeResume::Left(None)
         }
     }
 
@@ -967,11 +968,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
     ) -> NativeResume {
-        // Cancellation and claim acknowledgement are best-effort cleanup on
-        // an irrevocable per-process kill path. Neither may turn the carrier
-        // into the victim of one malformed or stale exec completion.
-        let _ = self.service.cancel_exec_successor(receipt);
-        let _ = self.release_service_claim(claim);
+        let cancelled = self.service.cancel_exec_successor(receipt);
+        let released = self.release_service_claim(claim);
+        if let Err(error) = cancelled.and(released) {
+            let _ = self.run_failed(error.run_failure_reason());
+            return NativeResume::Left(None);
+        }
         self.kill_refused_exec()
     }
 
@@ -1176,12 +1178,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         page: &ThreadLifecyclePage,
     ) -> Result<NativeResume, NativeProcessError> {
-        let pending = self
+        let (pending, settled) = self
             .runtime
             .graph
             .lock()
             .pending
-            .remove_exec(&self.key)
+            .remove_settled_exec(&self.key, page)
             .ok_or(NativeProcessError::Stale)?;
         page.clear_exit_wait();
         page.await_exec_binding_after_close()
@@ -1191,6 +1193,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // Only a committed successor reopens admission. A refused exec is
             // converted into process closing and must never resurrect the
             // predecessor gate.
+            if settled.retract_exec_cancellation(page).is_err() {
+                return Ok(self.kill_refused_exec());
+            }
             page.reopen_after_exec_binding()
                 .map_err(|_| NativeProcessError::Stale)?;
         }

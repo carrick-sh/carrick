@@ -2475,6 +2475,9 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn exec_cancel_crossing_restores_all_preparation_baselines() {
+        // This binds the real cancellation crossing and aggregate Drop
+        // accounting. #875 tracks replacing the synthetic physical fields
+        // with a tiny `prepare_native_exec_successor` mapping plan.
         use carrick_core_abi::service::{ServiceBirth, ServiceIdentity};
         use carrick_sched_core::{
             RecordId, RecordRef,

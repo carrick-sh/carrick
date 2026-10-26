@@ -4,7 +4,7 @@
 //   pipe_c2p (child writes via stdout, parent reads "got:U")
 //   clone(SIGCHLD)
 //   child: dup3(c2p_write, 1); dup3(p2c_read, 0); execve(reader_writer)
-//   parent: write "U" to pipe_p2c_write; ppoll pipe_c2p_read; read; print
+//   parent: delay; write "U" to pipe_p2c_write; ppoll pipe_c2p_read; read; print
 //
 // If this hangs, we have the EXACT apt deadlock in a 200-line repro
 // with NO glibc, NO buffering complexity, just the syscalls.
@@ -60,6 +60,17 @@ parent:
     svc #0
     mov w0, w23
     mov x8, #57
+    svc #0
+
+    // Keep the exec'd child blocked in read(0, ...) long enough for the host
+    // owner-wait path to enroll. nanosleep((0, 200ms), NULL).
+    str xzr, [sp, #64]
+    movz x0, #0xc200
+    movk x0, #0x0beb, lsl #16
+    str x0, [sp, #72]
+    add x0, sp, #64
+    mov x1, #0
+    mov x8, #101
     svc #0
 
     // write(p2c_write, "URI-REQUEST", 11)
