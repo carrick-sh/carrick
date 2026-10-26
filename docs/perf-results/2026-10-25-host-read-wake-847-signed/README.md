@@ -428,6 +428,106 @@ Fresh portable verification:
 No signed test was run because this correction changes source and therefore
 requires an exact-candidate fixture bundle.
 
+## Total Editor order and consume-once retirement ownership
+
+The implementation now follows `/tmp/847-DESIGN.md` rather than deriving
+stage-2 retirement authority from a cached absence observation. Host stage-1
+edits require an exact edit license, mint `Stage1LeafRetired` only inside
+`edit_unpublishing`, and publish the Editor revision before lowering host
+exclusion. `InventoryFrameRegistry` alone converts a receipt naming the lease
+into the non-cloneable `Stage1Unpublished` proof at the zero-reference
+crossing. Pending retirement owns that proof until one exact claimant consumes
+it or returns it unfinished.
+
+Publication and rollback are one RAII transaction.
+`Stage2PublicationAuthority::rollback` consumes the guard and yields the exact
+`NeverPublishedRecord`; commit, rollback, record removal, and rebind publish
+after their directory locks drop. Terminal refused retirements remain indexed
+as quarantine and their IPA cannot be issued again. A malformed exclusive
+retirement claim is handled as a typed local error rather than introducing a
+new carrier-fatal authority cohort.
+
+The thirteen design acceptance items are covered as follows:
+
+1. `edit_unpublishing_binds_retired_leaf_to_old_ipa_and_image` checks the
+   exact old `(VA, IPA)` receipt, including repointing.
+2. `reference_ledger_mints_only_at_zero_for_a_receipt_naming_the_lease` and
+   `two_mms_by_n_real_retirements_leave_no_custody_growth` exercise the real
+   zero crossing and multi-MM cleanup.
+3. `.semgrep/typed-domains.yml` permanently rejects every deleted derived
+   proof/reselect spelling from DESIGN section 7.
+4. `host_edit_release_advances_editor_before_lowering_gate` and
+   `serial_host_editor_release_after_select_reselects_without_stranding`
+   cover the total Editor order and production owner park.
+5. The `carrick-aarch64` compile-fail doctest rejects an edit without a
+   `Stage1EditLicense`.
+6. `every_cause_refuses_release_before_enrollment_and_ignores_other_causes`
+   and `release_after_enrollment_reprobes_before_park_for_every_cause` cover
+   release-before-enrolment and release-after-enrolment.
+7. `stage2_publication_commit_guard_wakes_valid_leaf_and_rebinds_successor`
+   and `stage2_publication_rollback_guard_wakes_enrolled_copy` cover both RAII
+   exits and rollback proof consumption.
+8. The commit-guard successor test plus
+   `replacement_completion_and_rollback_touch_the_right_owner` require rebind
+   to consume the predecessor proof before the successor is retained.
+9. `serial_host_mm_exit_close_races_a_parked_sibling_copy_without_invariant_kill`
+   drives the common exit/exec terminal-close publication path with two live
+   threads.
+10. `serial_host_unchanged_selection_without_stage2_authority_kills_only_its_mm`
+    checks the event-ring invariant record, exact-MM SIGKILL, and surviving
+    carrier/sibling MM.
+11. `serial_host_munmap_retirement_races_blocking_read_with_one_executor`
+    drives the production blocking-read park through a real host munmap with
+    executor capacity exhausted.
+12. `terminal_stage2_retirement_is_invisible_and_quarantines_ipa` checks
+    terminal invisibility and `ExtentCollision` on reuse.
+13. `carrier_lease_batch_collision_publishes_nothing_and_retains_every_candidate`,
+    `directory_failpoint_rolls_back_inventory_before_final_carrier_drop`, and
+    the two replacement tests cover typed rollback failures without a silent
+    proof-less skip.
+
+Five test functions are entirely new relative to `a932c5ddc`:
+
+- `edit_unpublishing_binds_retired_leaf_to_old_ipa_and_image`;
+- `a_revision_change_buys_exactly_one_reselect`;
+- `host_edit_release_advances_editor_before_lowering_gate`;
+- `reference_ledger_mints_only_at_zero_for_a_receipt_naming_the_lease`;
+- `pending_retirement_owns_one_proof_and_returns_an_unfinished_claim`.
+
+The other acceptance witnesses above are strengthened pre-existing tests and
+are not counted as new. In particular,
+`bounded_idle_retry_rotates_past_persistent_prefix_and_services_detached_work`
+now proves that the generic carrier sweep cannot steal an exact directory
+claim after a backend refusal.
+
+Portable verification:
+
+- all thirteen focused design filters passed on `af62078db`; after the final
+  fallible-claim change,
+  `pending_retirement_owns_one_proof_and_returns_an_unfinished_claim` and
+  `bounded_idle_retry_rotates_past_persistent_prefix_and_services_detached_work`
+  passed again on `8aab9a297`;
+- on `8aab9a297`, `just fmt-check`, `just clippy`, `just clippy-linux`,
+  `just lint-domains`, and `just test-kernel` passed;
+- default EL1 image: 1,053,104 / 1,572,864 bytes; maximum checked stack
+  11,503 / 12,288 bytes (`native wait copy`);
+- allocator-test-control EL1 image: 1,057,296 / 1,572,864 bytes; maximum
+  checked stack 11,503 / 12,288 bytes (`native wait copy`);
+- all-target clippy EL1 image: 1,081,920 / 1,572,864 bytes; maximum checked
+  stack 12,015 / 12,288 bytes (`signal terminal exit`).
+
+A diagnostic full `carrick-vmm-hvf --lib` run is not green: older foreign-COW
+fixtures such as
+`concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit` and
+`host_retained_reuse_repoints_through_the_host_editor` call host edits from
+spawned threads without the now-required thread-bound Editor exclusion. The
+design acceptance filters and requested portable gates are green, but this
+broad-suite fixture migration remains explicit rather than being reported as
+a pass.
+
+No signed test was run on this source. Its exact fixture bundle is required
+before the signed 20/20 proof and companion matrix.
+
 ## Exact stage-1 and rollback proofs after review of `055bf2354`
 
 Editor retirement receipts now carry the exact VA-to-IPA translations removed
