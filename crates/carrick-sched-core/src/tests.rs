@@ -1824,6 +1824,32 @@ fn a_host_load_starts_a_fresh_slice() {
     assert_eq!(zone.slot(SLOT).queued_since(), 0);
 }
 
+/// Contract kernel.el1.slot-liveness: a stopped slot with a switched record
+/// still needs its driver. Abandonment must fail until the record is handed
+/// back or parked; otherwise rebinding can erase the slot side of `OnCpu`.
+#[test]
+fn a_driver_cannot_leave_while_a_switched_record_is_current() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    zone.drive(SLOT, 7);
+    let record = park(&zone, 1, 0x1000);
+    wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT }).unwrap();
+    assert_eq!(zone.switch_in(SLOT), Some(record));
+    zone.leave_guest(SLOT, &HostWait);
+    let mut taken = Vec::new();
+    let mut placed = Vec::new();
+
+    assert!(!zone.leave_slot(SLOT, 7, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
+    assert_eq!(zone.slot(SLOT).driver(), Some(7));
+    assert_eq!(zone.slot(SLOT).current(), Some(record));
+    assert!(matches!(
+        zone.record(record).claim(),
+        Claim::OnCpu { slot: SLOT, .. }
+    ));
+    assert!(taken.is_empty());
+    assert!(placed.is_empty());
+}
+
 /// A slot follows its mailbox lease, which a task carries between executors:
 /// the executor that stopped driving a slot vacates it (its queue leaves,
 /// no placement chooses it), unless another executor drives it now.
