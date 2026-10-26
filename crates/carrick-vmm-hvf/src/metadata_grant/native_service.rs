@@ -264,7 +264,7 @@ impl NativeService {
             carrick_core_abi::service::ServiceOperation::Exec {
                 capability,
                 payload: _,
-            } => (capability, self.exec_payload().ok_or_else(stale)?),
+            } => (capability, self.exec_payload().ok_or_else(|| stale())?),
             _ => return self.refuse(),
         };
         let (successor_mm, root_generation, manifest) = match self.reply.as_ref() {
@@ -273,7 +273,7 @@ impl NativeService {
                 // request completion has not yet released that allocation.
                 let (successor_mm, root_generation) = unsafe { manifest.as_ref() }
                     .proposal(request.identity)
-                    .ok_or_else(stale)?;
+                    .ok_or_else(|| stale())?;
                 (successor_mm, root_generation, *manifest)
             }
             _ => return Err(stale()),
@@ -281,7 +281,7 @@ impl NativeService {
         let service = self
             .custody
             .native_exec_service(capability)
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         match service.prepare(request, payload) {
             Ok(prepared) => {
                 let prepared = match crate::trap::prepare_native_exec_successor(
@@ -328,14 +328,14 @@ impl NativeService {
                     root: prepared.root(),
                     asid: asid.asid(),
                     asid_generation: core::num::NonZeroU64::new(asid.generation())
-                        .ok_or_else(stale)?,
+                        .ok_or_else(|| stale())?,
                 },
                 carrick_core_abi::service::ExecSuccessorEntry {
                     entry: carrick_guest_arch::UserVa::new(prepared.entry()),
                     stack_pointer: carrick_guest_arch::UserVa::new(prepared.stack_pointer()),
                 },
             )
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         if sealed.open(identity, receipt).is_none_or(|view| {
             view.successor_mm != successor_mm || view.root_generation != root_generation
         }) {
@@ -368,14 +368,14 @@ impl NativeService {
         self,
         complete: impl FnOnce(ServiceTicket<ServicePin>) -> Result<(), TrapError>,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
-        let region = retained_abi_region(&self.custody).ok_or_else(stale)?;
+        let region = retained_abi_region(&self.custody).ok_or_else(|| stale())?;
         let (_, zone) = stopped_records(
             region,
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
         )
-        .ok_or_else(stale)?;
+        .ok_or_else(|| stale())?;
         let key = ObjectWaitKey::native_service(self.request().identity.birth.record)
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin)
             .map_err(|_| stale())?;
@@ -435,16 +435,16 @@ impl NativeService {
             None => return self.refuse(),
         };
         let custody = Arc::clone(&self.custody);
-        let region = retained_abi_region(&custody).ok_or_else(stale)?;
+        let region = retained_abi_region(&custody).ok_or_else(|| stale())?;
         let (_, zone) = stopped_records(
             region,
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
         )
-        .ok_or_else(stale)?;
+        .ok_or_else(|| stale())?;
         let handle = self.request().identity.birth.mm;
         let entry = zone
-            .space_entry(core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?)
-            .ok_or_else(stale)?;
+            .space_entry(core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(|| stale())?)
+            .ok_or_else(|| stale())?;
         let source = entry
             .notifications(handle.incarnation())
             .map_err(|_| stale())?;
@@ -455,7 +455,7 @@ impl NativeService {
             waker: carrick_sched_core::Waker::Host,
             deliver: SpaceWakeDelivery::Function(deliver),
         });
-        let index = zone.spaces.find(handle.mm().raw()).ok_or_else(stale)?;
+        let index = zone.spaces.find(handle.mm().raw()).ok_or_else(|| stale())?;
         let exclusion = match access.try_exclude_editor(index, handle.mm().raw()) {
             Ok(exclusion) => exclusion,
             Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
@@ -471,22 +471,22 @@ impl NativeService {
             }
             Err(_) => return self.refuse(),
         };
-        let pool = carrick_el1_abi::cow_grant_pool_host().ok_or_else(stale)?;
+        let pool = carrick_el1_abi::cow_grant_pool_host().ok_or_else(|| stale())?;
         let mut stock = custody.fork_stock.lock();
         if stock.owner.child_owner(handle.mm()) != Some(handle)
             || stock.owner.is_quarantined(handle.mm())
         {
             return self.refuse();
         }
-        let root = stock.owner.child_root(handle.mm()).ok_or_else(stale)?;
-        let inventory = stock.inventory().ok_or_else(stale)?;
+        let root = stock.owner.child_root(handle.mm()).ok_or_else(|| stale())?;
+        let inventory = stock.inventory().ok_or_else(|| stale())?;
         let physical = stock
             .owner
             .child_physical_mut(handle.mm(), root)
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         let owner = carrick_hal::GuestFrameOwner {
             native_mm: carrick_guest_arch::MmGeneration::new(
-                core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?,
+                core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(|| stale())?,
             ),
             root_generation: carrick_guest_arch::ContextGeneration::new(handle.incarnation()),
         };
@@ -555,26 +555,31 @@ impl NativeService {
         {
             return self.refuse();
         }
-        let root = stock.owner.child_root(handle.mm()).ok_or_else(stale)?;
-        let inventory = stock.inventory().ok_or_else(stale)?;
+        let root = stock.owner.child_root(handle.mm()).ok_or_else(|| stale())?;
+        let inventory = stock.inventory().ok_or_else(|| stale())?;
         let physical = stock
             .owner
             .child_physical_mut(handle.mm(), root)
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         let source = window
             .host_backing
-            .map(|identity| physical.sources.retain(identity, || None).ok_or_else(stale))
+            .map(|identity| {
+                physical
+                    .sources
+                    .retain(identity, || None)
+                    .ok_or_else(|| stale())
+            })
             .transpose()?;
         // File I/O retains only its bounded source capability. It must not
         // hold carrier-wide stock custody while another native child exits.
         drop(stock);
         let bytes = if let Some(source) = source {
-            let identity = window.host_backing.ok_or_else(stale)?;
+            let identity = window.host_backing.ok_or_else(|| stale())?;
             let read = carrick_hal::fork_stock::HostBackingRead::new(
                 identity,
                 window.range.len() as usize,
             )
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
             match source.read(read) {
                 Ok(bytes) => Some(bytes),
                 Err(
@@ -598,7 +603,7 @@ impl NativeService {
         let physical = stock
             .owner
             .child_physical_mut(handle.mm(), root)
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         let publication_len = bytes
             .as_ref()
             .map_or(window.range.len(), |bytes| bytes.len() as u64);
@@ -607,7 +612,7 @@ impl NativeService {
         }
         let owner = carrick_hal::GuestFrameOwner {
             native_mm: carrick_guest_arch::MmGeneration::new(
-                core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?,
+                core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(|| stale())?,
             ),
             root_generation: carrick_guest_arch::ContextGeneration::new(handle.incarnation()),
         };
@@ -662,7 +667,7 @@ impl NativeService {
             },
         )?;
         let rows = grants.retain_backing(staged, retained)?;
-        let data = rows.first().ok_or_else(stale)?;
+        let data = rows.first().ok_or_else(|| stale())?;
         let table_reservation = match stock.owner.reserve_native_descriptor_tables(
             &mut crate::fork_stock::fork_table_accounting(&custody),
             handle,
@@ -677,7 +682,7 @@ impl NativeService {
         };
         let txn = DescriptorTxn {
             id: DescriptorTxnId {
-                mm_key: core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?,
+                mm_key: core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(|| stale())?,
                 generation: window.operation.sequence,
             },
             root: SubstrateGpa(root.address().raw()),
@@ -741,14 +746,14 @@ impl NativeService {
         backing_fault: bool,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let request = self.request();
-        let region = retained_abi_region(&self.custody).ok_or_else(stale)?;
+        let region = retained_abi_region(&self.custody).ok_or_else(|| stale())?;
         let (_, zone) = stopped_records(
             region,
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
         )
-        .ok_or_else(stale)?;
+        .ok_or_else(|| stale())?;
         let key = ObjectWaitKey::native_service(self.request().identity.birth.record)
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         let queue = zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin)
             .map_err(|_| stale())?;
@@ -790,8 +795,12 @@ impl NativeService {
         Ok(effects)
     }
 }
+#[track_caller]
 fn stale() -> TrapError {
-    TrapError::Hypervisor("native service custody mismatch".into())
+    TrapError::Hypervisor(format!(
+        "native service custody mismatch at {}",
+        core::panic::Location::caller(),
+    ))
 }
 
 /// Once the lane notice is consumed, absence is no longer a valid intake
@@ -816,8 +825,8 @@ pub(super) fn take(
     custody: &Arc<crate::trap::CarrierVmCustody>,
     cpu: carrick_guest_arch::CpuId,
 ) -> Result<Option<NativeService>, TrapError> {
-    let region = retained_abi_region(custody).ok_or_else(stale)?;
-    let (task, zone) = stopped_records(region, cpu).ok_or_else(stale)?;
+    let region = retained_abi_region(custody).ok_or_else(|| stale())?;
+    let (task, zone) = stopped_records(region, cpu).ok_or_else(|| stale())?;
     let Some(selector) = task.service_notice.take().map_err(|_| stale())? else {
         return Ok(None);
     };
@@ -847,7 +856,10 @@ pub(super) fn take(
         ) else {
             return consumed.miss("native-service control metadata absent");
         };
-        let offset = identity.control_slot.checked_sub(base).ok_or_else(stale)? as usize;
+        let offset = identity
+            .control_slot
+            .checked_sub(base)
+            .ok_or_else(|| stale())? as usize;
         if offset
             .checked_add(core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>())
             .is_none_or(|end| end > len)
@@ -861,7 +873,8 @@ pub(super) fn take(
             let Some(mapping) = aperture.slots.get(index).and_then(Option::as_ref) else {
                 return consumed.miss("native-service metadata aperture absent");
             };
-            let extent = MetadataExtent::new(base, len as u64, mapping.token).ok_or_else(stale)?;
+            let extent =
+                MetadataExtent::new(base, len as u64, mapping.token).ok_or_else(|| stale())?;
             aperture
                 .pin_extent(extent, generation.0)
                 .map_err(|_| stale())?
@@ -900,11 +913,11 @@ pub(super) fn take(
                     .record_ptr::<carrick_el1_abi::MmPortalSlots>(
                         carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize,
                     )
-                    .ok_or_else(stale)?;
+                    .ok_or_else(|| stale())?;
                 // SAFETY: initialized portal in the retained carrier ABI region.
                 let portal = unsafe { &*portal };
                 let cow = ticket
-                    .take_fault_selection(portal.grant(cpu.raw() as usize).ok_or_else(stale)?)
+                    .take_fault_selection(portal.grant(cpu.raw() as usize).ok_or_else(|| stale())?)
                     .map_err(|_| stale())?;
                 let (reply, reply_pin) = if let Some(address) = ticket.reply_address() {
                     match ticket.request().operation {
@@ -947,7 +960,7 @@ pub(super) fn take(
                     cow,
                     custody: Arc::clone(custody),
                     slot: carrick_sched_core::SlotId::from_index(cpu.raw() as usize)
-                        .ok_or_else(stale)?,
+                        .ok_or_else(|| stale())?,
                 })
             }
             // A stale selector cannot acknowledge or complete a successor.
@@ -966,7 +979,7 @@ fn retain_exec_payload(
 ) -> Result<RetainedExecPayload, TrapError> {
     let address = payload.address().raw();
     let len = usize::try_from(payload.length().raw()).map_err(|_| stale())?;
-    let end = address.checked_add(len as u64).ok_or_else(stale)?;
+    let end = address.checked_add(len as u64).ok_or_else(|| stale())?;
 
     // Authentication is against the request's retained MM incarnation, not
     // whichever task a host process lookup happens to find.
@@ -975,13 +988,13 @@ fn retain_exec_payload(
         if stock.owner.child_owner(handle.mm()) != Some(handle) {
             return Err(stale());
         }
-        let root = stock.owner.child_root(handle.mm()).ok_or_else(stale)?;
+        let root = stock.owner.child_root(handle.mm()).ok_or_else(|| stale())?;
         let mut cursor = address;
         while cursor < end {
             if native_output(custody, root, cursor) != Some(cursor & !4095) {
                 return Err(stale());
             }
-            cursor = end.min((cursor | 4095).checked_add(1).ok_or_else(stale)?);
+            cursor = end.min((cursor | 4095).checked_add(1).ok_or_else(|| stale())?);
         }
     }
 
@@ -990,8 +1003,9 @@ fn retain_exec_payload(
     if address >= bootstrap_start && end <= bootstrap_end {
         let offset =
             usize::try_from(address - carrick_el1_abi::EL1_REGION_BASE).map_err(|_| stale())?;
-        let pointer = core::ptr::NonNull::new(region.record_ptr::<u8>(offset).ok_or_else(stale)?)
-            .ok_or_else(stale)?;
+        let pointer =
+            core::ptr::NonNull::new(region.record_ptr::<u8>(offset).ok_or_else(|| stale())?)
+                .ok_or_else(|| stale())?;
         return Ok(RetainedExecPayload {
             pointer,
             len,
@@ -1001,8 +1015,8 @@ fn retain_exec_payload(
 
     let address = carrick_guest_arch::KernelVa::new(address);
     let (_, base, extent_len) =
-        retained_dynamic_metadata(custody, address, len).ok_or_else(stale)?;
-    let generation = custody.live_generation().ok_or_else(stale)?;
+        retained_dynamic_metadata(custody, address, len).ok_or_else(|| stale())?;
+    let generation = custody.live_generation().ok_or_else(|| stale())?;
     let pin = {
         let aperture = metadata_aperture(custody).lock();
         let index =
@@ -1011,10 +1025,11 @@ fn retain_exec_payload(
             .slots
             .get(index)
             .and_then(Option::as_ref)
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         aperture
             .pin_extent(
-                MetadataExtent::new(base, extent_len as u64, mapping.token).ok_or_else(stale)?,
+                MetadataExtent::new(base, extent_len as u64, mapping.token)
+                    .ok_or_else(|| stale())?,
                 generation.0,
             )
             .map_err(|_| stale())?
@@ -1026,7 +1041,7 @@ fn retain_exec_payload(
             .add((address.raw() - base) as usize)
     };
     Ok(RetainedExecPayload {
-        pointer: core::ptr::NonNull::new(pointer).ok_or_else(stale)?,
+        pointer: core::ptr::NonNull::new(pointer).ok_or_else(|| stale())?,
         len,
         _mapping: Some(pin),
     })
@@ -1066,12 +1081,15 @@ pub(crate) fn settle_native_cow(
     pool: &carrick_el1_abi::CowGrantPool,
     excluded: &carrick_sched_core::ExcludedEditor<'_>,
 ) -> Result<Option<usize>, TrapError> {
-    let mm = carrick_el1_abi::ReservationMm::new(excluded.key()).ok_or_else(stale)?;
+    let mm = carrick_el1_abi::ReservationMm::new(excluded.key()).ok_or_else(|| stale())?;
     let mut stock = custody.fork_stock.lock();
     let Some(root) = stock.owner.child_root(mm) else {
         return Ok(None);
     };
-    let physical = stock.owner.child_physical_mut(mm, root).ok_or_else(stale)?;
+    let physical = stock
+        .owner
+        .child_physical_mut(mm, root)
+        .ok_or_else(|| stale())?;
     let Some(grants) = &mut physical.supplied else {
         return if pool.has_completions_for(mm.raw()) {
             Err(stale())
@@ -1165,15 +1183,16 @@ pub(super) fn retain_reply<T>(
             .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
             .and_then(|offset| usize::try_from(offset).ok())
             .filter(|offset| fork_custody_in_retained_region(*offset, size))
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         return Ok((
-            core::ptr::NonNull::new(region.record_ptr(offset).ok_or_else(stale)?)
-                .ok_or_else(stale)?,
+            core::ptr::NonNull::new(region.record_ptr(offset).ok_or_else(|| stale())?)
+                .ok_or_else(|| stale())?,
             None,
         ));
     }
-    let (_, base, len) = retained_dynamic_metadata(custody, address, size).ok_or_else(stale)?;
-    let generation = custody.live_generation().ok_or_else(stale)?;
+    let (_, base, len) =
+        retained_dynamic_metadata(custody, address, size).ok_or_else(|| stale())?;
+    let generation = custody.live_generation().ok_or_else(|| stale())?;
     let pin = {
         let aperture = metadata_aperture(custody).lock();
         let index =
@@ -1182,10 +1201,10 @@ pub(super) fn retain_reply<T>(
             .slots
             .get(index)
             .and_then(Option::as_ref)
-            .ok_or_else(stale)?;
+            .ok_or_else(|| stale())?;
         aperture
             .pin_extent(
-                MetadataExtent::new(base, len as u64, mapping.token).ok_or_else(stale)?,
+                MetadataExtent::new(base, len as u64, mapping.token).ok_or_else(|| stale())?,
                 generation.0,
             )
             .map_err(|_| stale())?
@@ -1200,7 +1219,7 @@ pub(super) fn retain_reply<T>(
         return Err(stale());
     }
     Ok((
-        core::ptr::NonNull::new(pointer.cast()).ok_or_else(stale)?,
+        core::ptr::NonNull::new(pointer.cast()).ok_or_else(|| stale())?,
         Some(pin),
     ))
 }
