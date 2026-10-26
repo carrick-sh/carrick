@@ -284,6 +284,111 @@ fn arm_native_fork_timer_delivers_child_without_parent_wait() {
 }
 
 #[test]
+fn arm_native_preemption_service_exit_reinstalls_child_root() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+        ]),
+    )
+    .with_words(words);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mut cpu = crate::sched::FakeCpu::default();
+    frame.x[8] = 220;
+    frame.x[0] = 17;
+    arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+    let child = fixture.zone.runnable_head(fixture.slot).unwrap();
+    let counters = carrick_el1_abi::Counters::new();
+    let mut handoff = None;
+    cpu.now = cpu.timer.unwrap();
+    assert_eq!(
+        super::super::dispatch::native_scheduler(
+            &mut crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff,
+        )
+        .interrupt(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+    let child_roots = cpu.ttbr;
+    let child_mm = fixture.zone.record(child).identity().mm;
+    assert_eq!(fixture.zone.installed_space(fixture.slot), child_mm);
+
+    // An idle executor has no host task to load the queued host-owned
+    // parent. The next timer must yield its service head with both records
+    // queued, before the host resets this vCPU to the maintenance roots.
+    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    cpu.now = cpu.timer.unwrap();
+    assert_eq!(
+        super::super::dispatch::native_scheduler(
+            &mut crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff,
+        )
+        .interrupt(&mut frame, 0),
+        carrick_el1_abi::Action::Idle
+    );
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert_eq!(
+        fixture.zone.installed_space(fixture.slot),
+        0,
+        "service exit retained the native child's installed MM"
+    );
+    assert_eq!(cpu.ttbr, (0x30000, 0x30000));
+    assert!(
+        fixture
+            .zone
+            .take_service_head_for_executor(fixture.slot)
+            .is_some()
+    );
+    // Model run_idle_entry_on_vcpu's unconditional hardware-root reset.
+    cpu.ttbr = (0x30000, 0x30000);
+    let installs = cpu.translations.len();
+    assert_eq!(
+        super::super::dispatch::native_scheduler(
+            &mut crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff,
+        )
+        .idle_entry(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+    assert_eq!(
+        cpu.ttbr, child_roots,
+        "native child ran on the carrier root"
+    );
+    assert_eq!(fixture.zone.installed_space(fixture.slot), child_mm);
+    assert_eq!(cpu.translations.len() - installs, 1);
+}
+
+#[test]
 fn arm_native_wait_runs_ready_child_before_host_handoff() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);

@@ -437,6 +437,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// The next thread on this vCPU needs its executor: leave for the host
     /// with no thread on the vCPU; the executor takes it from the run queue.
     fn service_exit(&mut self) -> Served {
+        // The host idle entry resets the hardware roots. Release the same
+        // occupancy now so a queued native successor must install its MM.
+        self.leave_space();
         self.counters.exit_reasons[El1ExitReason::Service as usize].fetch_add(1, Ordering::Relaxed);
         self.zone
             .counters
@@ -577,6 +580,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                     .fetch_add(1, Ordering::Relaxed);
                 zone.leave_idle(slot);
                 zone.counters.el1_idle_exits.fetch_add(1, Ordering::Relaxed);
+                self.leave_space();
                 return Served::Idle;
             }
             let now = self.cpu.now();
@@ -811,6 +815,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         {
             self.counters.exit_reasons[El1ExitReason::IdleEntryHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
+            self.leave_space();
             return carrick_el1_abi::Action::Idle;
         }
         match self.idle(frame, timeout_result) {
