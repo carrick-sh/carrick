@@ -840,10 +840,12 @@ mod tests {
 
         assert_eq!(
             retirement.prepare(),
-            Err(carrick_kernel::dispatch::MountRetirementError::LiveOwners {
-                container,
-                owners: 2,
-            })
+            Err(
+                carrick_kernel::dispatch::fs::state::MountRetirementError::LiveOwners {
+                    container,
+                    owners: 2,
+                },
+            )
         );
         drop(capability);
         retirement.prepare().unwrap();
