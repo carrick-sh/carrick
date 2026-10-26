@@ -477,7 +477,8 @@ fn reused_slot_exec(argv0: &str) -> i32 {
     if first == 0 {
         unsafe { libc::_exit(0) };
     }
-    let mut status = 0;
+    // A zero initializer cannot distinguish missing copyout from _exit(0).
+    let mut status = 0x5a5a;
     let waited = unsafe { libc::waitpid(first, &mut status, 0) };
     if waited != first || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -502,7 +503,7 @@ fn reused_slot_exec(argv0: &str) -> i32 {
             libc::_exit(5);
         }
     }
-    status = 0;
+    status = 0x5a5a;
     if unsafe { libc::waitpid(second, &mut status, 0) } != second
         || !libc::WIFEXITED(status)
         || libc::WEXITSTATUS(status) != 0
