@@ -274,6 +274,7 @@ _lint-domains-source:
     # went vacuous under a green `just ci`).
     python3 scripts/migrate/check-task-participant-witnesses.py --self-test
     python3 scripts/migrate/check-mm-authority.py --self-test
+    python3 scripts/migrate/test-rust-lexer.py
     python3 scripts/migrate/check-dispatch-lock-authority.py --self-test
     python3 scripts/migrate/check-serial-host-tests.py --self-test
     python3 scripts/migrate/check-pipe-core-boundary.py --self-test
