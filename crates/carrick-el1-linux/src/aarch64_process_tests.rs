@@ -452,7 +452,7 @@ impl ForkStockCrossing for TestStockCrossing {
                                 };
                                 (status == libc::KERN_SUCCESS).then_some(at as *mut libc::c_void)
                             }
-                            #[cfg(not(target_os = "macos"))]
+                            #[cfg(any(target_os = "linux", target_os = "android"))]
                             {
                                 // SAFETY: MAP_FIXED_NOREPLACE fails rather than replacing a mapping.
                                 let mapped = unsafe {
@@ -469,6 +469,36 @@ impl ForkStockCrossing for TestStockCrossing {
                                 };
                                 (mapped != libc::MAP_FAILED && mapped as u64 == addr)
                                     .then_some(mapped)
+                            }
+                            #[cfg(not(any(
+                                target_os = "macos",
+                                target_os = "linux",
+                                target_os = "android"
+                            )))]
+                            {
+                                // A plain hint never replaces a mapping; keep it
+                                // only where the kernel placed it exactly.
+                                // SAFETY: a fresh anonymous mapping, unmapped
+                                // again when it landed elsewhere.
+                                let mapped = unsafe {
+                                    libc::mmap(
+                                        addr as *mut libc::c_void,
+                                        len,
+                                        libc::PROT_READ | libc::PROT_WRITE,
+                                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                                        -1,
+                                        0,
+                                    )
+                                };
+                                if mapped == libc::MAP_FAILED {
+                                    return None;
+                                }
+                                if mapped as u64 != addr {
+                                    // SAFETY: unmaps only the mapping made above.
+                                    unsafe { libc::munmap(mapped, len) };
+                                    return None;
+                                }
+                                Some(mapped)
                             }
                         }
                         let mapped = loop {

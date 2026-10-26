@@ -1206,12 +1206,14 @@ impl<'a> FsView<'a> {
         let Some(description) = self.open_file(fd).map(|open_file| open_file.description) else {
             return;
         };
-        let path = self
-            .lookup_recorded_fd_open_path(fd)
-            .or_else(|| description.open_path_snapshot());
-        if path
-            .as_deref()
-            .is_some_and(|path| self.fs.inotify_registry.has_watches_covering(path))
+        // Only a live watch can need the close effect: skip the per-open
+        // path copy (and its allocations) when no watch exists.
+        if !self.fs.inotify_registry.is_empty()
+            && self
+                .lookup_recorded_fd_open_path(fd)
+                .or_else(|| description.open_path_snapshot())
+                .as_deref()
+                .is_some_and(|path| self.fs.inotify_registry.has_watches_covering(path))
         {
             description
                 .require_close_effects(carrick_el1_abi::ipc::fd::CloseEffects::INOTIFY_CLOSE);
