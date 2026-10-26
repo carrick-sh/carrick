@@ -88,6 +88,36 @@ fn test_whole_mm_stage1_proof_for(mm: u64) -> carrick_core::mm::retirement::Stag
     prepare_test_whole_mm_retirement(&mut task)
 }
 
+fn bind_test_mm_for_host_edits(
+    access: &MmAccessState,
+    mm: u64,
+    asid: u16,
+    stage1_root: u64,
+) -> (
+    Box<carrick_sched_core::AddressSpaces>,
+    carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion,
+) {
+    access
+        .install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(
+                std::num::NonZeroU64::new(mm).unwrap(),
+            ),
+            CarrierForeignMmBinding {
+                asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                    std::num::NonZeroU16::new(asid).unwrap(),
+                ),
+                stage1_root: carrick_guest_mem::Gpa::new(stage1_root),
+            },
+        )
+        .expect("publish test MM identity");
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let excluded = spaces
+        .unpublished(mm)
+        .expect("test MM starts Editor-excluded");
+    let held = carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
+    (spaces, held)
+}
+
 #[test]
 fn whole_mm_receipt_cannot_release_another_mms_structural_reference() {
     let lease = (0xa300_0000_0000, 0x20_0000);
@@ -644,6 +674,19 @@ fn retired_carrier_mm_authority(
         stage1_lifecycle: parking_lot::Mutex::new(CarrierMmStage1Lifecycle::Retired(
             std::sync::Arc::new(test_whole_mm_stage1_proof()),
         )),
+    }
+}
+
+fn published_carrier_mm_authority(
+    identity: CarrierStage2RecordIdentity,
+    frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+) -> HvpatchCarrierMmAuthority {
+    let custody = legacy_test_carrier_vm_custody_arc();
+    HvpatchCarrierMmAuthority::PublicationTest {
+        stage2_logical_leases: carrier_stage2_logical_leases(custody, &[identity]),
+        custody: std::sync::Arc::downgrade(custody),
+        frames,
+        stage1_lifecycle: parking_lot::Mutex::new(CarrierMmStage1Lifecycle::Published),
     }
 }
 
@@ -1451,8 +1494,9 @@ fn exec_successor_root_publication_installs_exact_structural_authority() {
     access
         .install_structural_mapping_authority(Some(root_slot), owner)
         .expect("install exec successor's exact root authority");
+    let _editor_exclusion = bind_test_mm_for_host_edits(&access, 12, 1, root_slot.0);
     let proof = access
-        .retire_mm_root_stage2_in(&custody, root_slot, &test_whole_mm_stage1_proof())
+        .retire_mm_root_stage2_in(&custody, root_slot, &test_whole_mm_stage1_proof_for(12))
         .expect("retire exec successor root by exact authority")
         .proof;
     assert_eq!((proof.root_slot_base(), proof.root_slot_size()), root_slot);
@@ -1663,6 +1707,11 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
     mapping.stage2_lease = Some(lease);
     let mut task = hvpatch_task_state_test_fixture(7, 0x4000, 7);
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    frames
+        .lock()
+        .stage2_references
+        .insert((0x1234_0000, 0x4000), 1);
     task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
         mappings: TaskMappingIndex::from_region(mapping),
         extents: [(
@@ -1675,8 +1724,8 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
         .into_iter()
         .collect(),
         predecessor_aliases: Vec::new(),
-        frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
-        stage2_reference_releases: std::collections::BTreeMap::new(),
+        frames,
+        stage2_reference_releases: [((0x1234_0000, 0x4000), 1)].into_iter().collect(),
         mm_root_slot: task.mm_root_slot,
         mm_access: None,
         predecessor_identity,
@@ -2015,6 +2064,11 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
     old_mapping.size = old_alias.size;
     old_mapping.is_dynamic_alias = true;
     old_mapping.owner_generation = old_generation;
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    frames
+        .lock()
+        .stage2_references
+        .insert((lease_key.0, lease_key.1 as u64), 1);
     let mut cleanup = PendingExecStage2Cleanup {
         mappings: TaskMappingIndex::from_region(old_mapping),
         extents: [(
@@ -2027,8 +2081,10 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
         .into_iter()
         .collect(),
         predecessor_aliases: vec![old_alias],
-        frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
-        stage2_reference_releases: std::collections::BTreeMap::new(),
+        frames,
+        stage2_reference_releases: [((lease_key.0, lease_key.1 as u64), 1)]
+            .into_iter()
+            .collect(),
         mm_root_slot: task.mm_root_slot,
         mm_access: None,
         predecessor_identity,
@@ -3129,6 +3185,7 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
     task.mm_access
         .install_structural_mapping_authority(Some(root_slot), std::sync::Arc::clone(&root_owner))
         .expect("install exact root authority");
+    let _editor_exclusion = bind_test_mm_for_host_edits(&task.mm_access, 12, 1, root_slot.0);
     {
         let mut inventory = task.frame_inventory.lock();
         inventory.initialized = true;
@@ -3149,7 +3206,10 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
             frames
                 .extent_references
                 .insert((frame, root_slot.0, root_len), 1);
-            frames.stage2_references.insert((root_slot.0, root_len), 1);
+            *frames
+                .stage2_references
+                .entry((root_slot.0, root_len))
+                .or_default() += 1;
         }
         let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
         inventory.retirement_reservation = Some(
@@ -3270,6 +3330,7 @@ fn shared_inventory_final_owner_retires_only_its_exact_structural_root() {
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let root_slot = (0x7d40_0000_0000_u64, 0x20_0000_u64);
     let (custody, mut task, owner, identity) = shared_inventory_root_fixture(root_slot);
+    let _editor_exclusion = bind_test_mm_for_host_edits(&task.mm_access, 12, 1, root_slot.0);
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(461));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(462));
     let shared_key = (0x5500_0000_u64, 0x4000_u64);
@@ -3292,7 +3353,7 @@ fn shared_inventory_final_owner_retires_only_its_exact_structural_root() {
         );
     }
 
-    let stage1_unpublished = test_whole_mm_stage1_proof();
+    let stage1_unpublished = prepare_test_whole_mm_retirement(&mut task);
     let proof =
         HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot, &stage1_unpublished)
             .expect("retire only final shared-inventory root");
@@ -3315,8 +3376,28 @@ fn root_retirement_refuses_mismatched_coordinates_and_active_pins() {
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let root_slot = (0x7d60_0000_0000_u64, 0x20_0000_u64);
     let (custody, mut task, owner, identity) = shared_inventory_root_fixture(root_slot);
+    let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
+    task.mm_access
+        .install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(
+                std::num::NonZeroU64::new(predecessor_mm).unwrap(),
+            ),
+            CarrierForeignMmBinding {
+                asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                    std::num::NonZeroU16::new(predecessor_identity.asid).unwrap(),
+                ),
+                stage1_root: carrick_guest_mem::Gpa::new(root_slot.0),
+            },
+        )
+        .expect("publish root-retirement MM identity");
+    let editor_spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let editor_excluded = editor_spaces
+        .unpublished(predecessor_mm)
+        .expect("root retirement starts Editor-excluded");
+    let _editor_exclusion =
+        carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&editor_excluded);
 
-    let stage1_unpublished = test_whole_mm_stage1_proof();
+    let stage1_unpublished = prepare_test_whole_mm_retirement(&mut task);
     let mismatch = HvfVmState::retire_task_state_mm_root_only(
         &mut task,
         (root_slot.0 + root_slot.1, root_slot.1),
@@ -3336,7 +3417,10 @@ fn root_retirement_refuses_mismatched_coordinates_and_active_pins() {
     let pinned =
         HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot, &stage1_unpublished)
             .expect_err("an active record pin must prevent a root proof");
-    assert!(pinned.to_string().contains("remained nonterminal"));
+    assert!(
+        pinned.to_string().contains("remained nonterminal"),
+        "unexpected pinned-root refusal: {pinned}"
+    );
     assert!(custody.stage2_record_snapshot(identity.record_id).is_some());
 
     drop(pin);
@@ -3356,24 +3440,50 @@ fn exec_predecessor_returns_proof_for_a_root_omitted_from_retirement_candidates(
     let (custody, mut task, owner, identity) = shared_inventory_root_fixture(root_slot);
     task.shared_process_mm = false;
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
+    task.mm_access
+        .install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(
+                std::num::NonZeroU64::new(predecessor_mm).unwrap(),
+            ),
+            CarrierForeignMmBinding {
+                asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                    std::num::NonZeroU16::new(predecessor_identity.asid).unwrap(),
+                ),
+                stage1_root: carrick_guest_mem::Gpa::new(root_slot.0),
+            },
+        )
+        .expect("publish predecessor MM identity");
+    let editor_spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let editor_excluded = editor_spaces
+        .unpublished(predecessor_mm)
+        .expect("predecessor starts Editor-excluded");
+    let _editor_exclusion =
+        carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&editor_excluded);
+    let frames = std::sync::Arc::clone(&task.frame_inventory.lock().frames);
     task.pending_exec_stage2_cleanup = Some(PendingExecStage2Cleanup {
         mappings: std::mem::take(&mut task.mappings),
         extents: std::collections::BTreeMap::new(),
         predecessor_aliases: Vec::new(),
-        frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+        frames: std::sync::Arc::clone(&frames),
         stage2_reference_releases: std::collections::BTreeMap::new(),
         mm_root_slot: Some(root_slot),
         mm_access: Some(std::sync::Arc::clone(&task.mm_access)),
         predecessor_identity,
         predecessor_mm,
         shared_projection: false,
-        carrier_mm: None,
+        carrier_mm: Some(std::sync::Arc::new(published_carrier_mm_authority(
+            identity, frames,
+        ))),
         armed: true,
     });
 
-    let proof =
-        HvfVmState::retire_task_state_exec_predecessor_with_root_proof(&mut task, root_slot, None)
-            .expect("exec predecessor exact root proof");
+    let stage1_unpublished = prepare_test_whole_mm_retirement(&mut task);
+    let proof = HvfVmState::retire_task_state_exec_predecessor_with_root_proof(
+        &mut task,
+        root_slot,
+        Some(stage1_unpublished),
+    )
+    .expect("exec predecessor exact root proof");
 
     assert_eq!((proof.root_slot_base(), proof.root_slot_size()), root_slot);
     assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
@@ -3381,7 +3491,7 @@ fn exec_predecessor_returns_proof_for_a_root_omitted_from_retirement_candidates(
 }
 
 #[test]
-fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority() {
+fn carrier_drop_preserves_lease_until_last_exact_stage1_reference() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let frame = carrick_hal::FrameId::from_kernel_allocation(id(41));
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(42));
@@ -3418,7 +3528,7 @@ fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority(
             let mut frames = inventory.frames.lock();
             frames.references.insert(frame, 1);
             frames.extent_references.insert((frame, key.0, key.1), 1);
-            frames.stage2_references.insert(key, 1);
+            frames.stage2_references.insert(key, 2);
         }
         let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
         inventory.retirement_reservation = Some(
@@ -3438,28 +3548,37 @@ fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority(
         register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1), 0x1000);
     let frames = std::sync::Arc::clone(&task.frame_inventory.lock().frames);
 
-    retire_test_process_mappings(&mut task).expect("retire the backend's final known row");
+    retire_test_process_mappings(&mut task).expect("retire one of two exact stage-1 references");
 
     {
         let frames = frames.lock();
-        assert!(!frames.stage2_references.contains_key(&key));
-        assert!(
-            frames.authority_retained_stage2.contains(&key),
-            "kernel/backend disagreement must survive a zero backend count",
-        );
+        assert_eq!(frames.stage2_references.get(&key), Some(&1));
+        assert!(!frames.authority_retained_stage2.contains(&key));
     }
-    drop(unpublished_carrier_mm_authority(
+    drop(retired_carrier_mm_authority(
         key,
         std::sync::Arc::clone(&frames),
         unpublished,
     ));
     assert!(
         carrier_stage2_leases().lock().contains_key(&key),
-        "carrier teardown must not override authority-retained physical ownership",
+        "carrier teardown must not override another MM's exact reference",
     );
-    assert!(
-        !frames.lock().authority_retained_stage2.contains(&key),
-        "carrier teardown consumes the one-shot authority-retained handoff",
+    let custody = legacy_test_carrier_vm_custody();
+    let identity = custody.carrier_stage2_records.lock()[&key];
+    let last_mm = test_whole_mm_stage1_proof_for(13);
+    let stage1 = frames
+        .lock()
+        .release_stage2_reference(
+            key,
+            Some(identity),
+            Stage1UnpublicationReceipt::Inventory(&last_mm),
+        )
+        .unwrap()
+        .expect("the second MM's exact unpublication crosses the reference ledger");
+    assert_eq!(
+        custody.request_released_stage2_record_retirement(identity, stage1),
+        CarrierStage2RetireOutcome::DeferredActivePins,
     );
     assert!(
         HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
@@ -5186,7 +5305,22 @@ fn final_carrier_mm_drop_keeps_a_backend_referenced_stage2_lease_live() {
         "the retained lease must stay discoverable for later exact retirement",
     );
 
-    frames.lock().stage2_references.remove(&key);
+    let custody = legacy_test_carrier_vm_custody();
+    let identity = custody.carrier_stage2_records.lock()[&key];
+    let last_mm = test_whole_mm_stage1_proof_for(13);
+    let stage1 = frames
+        .lock()
+        .release_stage2_reference(
+            key,
+            Some(identity),
+            Stage1UnpublicationReceipt::Inventory(&last_mm),
+        )
+        .unwrap()
+        .expect("the last exact stage-1 reference authorizes retirement");
+    assert_eq!(
+        custody.request_released_stage2_record_retirement(identity, stage1),
+        CarrierStage2RetireOutcome::DeferredActivePins,
+    );
     assert!(
         HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
             retire_pending_carrier_lease(key)
@@ -5609,7 +5743,7 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
             mapping: carrick_hal::MappingId::from_kernel_allocation(id(92)),
         },
     ];
-    let stage1 = test_leaf_retirement_receipt(old_key.0);
+    let stage1 = test_leaf_retirement_receipt(old_stage2.0);
     let split = CowInventorySplit {
         stage1_authority: stage1.authority(),
         replacement_is_existing: false,
@@ -7994,6 +8128,7 @@ impl carrick_mmu_core::aarch64::TableArenaSource for BootstrapRetirementArenaSou
 fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStage2RecordIdentity {
     task.mm_root_slot = None; // Bootstrap roots use their source's table capacity.
     let custody = legacy_test_carrier_vm_custody_arc();
+    let (process_identity, mm) = predecessor_test_identity(task);
     let manager = carrick_mmu_core::aarch64::PageTableManager::new(
         carrick_mem::memory::stage1_hvpatch_page_tables(),
         carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
@@ -8009,6 +8144,19 @@ fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStag
         crate::hvf_aarch64_engine::HostCowStats::default(),
         crate::trap::foreign_mm::LiveBacking::deferred(custody.clone()),
     );
+    task.mm_access
+        .install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(
+                std::num::NonZeroU64::new(mm).unwrap(),
+            ),
+            CarrierForeignMmBinding {
+                asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                    std::num::NonZeroU16::new(process_identity.asid).unwrap(),
+                ),
+                stage1_root: carrick_guest_mem::Gpa::new(base),
+            },
+        )
+        .expect("publish relocated bootstrap MM identity");
     tables
         .install_source(Box::new(BootstrapRetirementArenaSource(Some(
             carrick_mmu_core::aarch64::SubstrateGpa(base),
@@ -8082,6 +8230,7 @@ fn final_parked_pin_returns_pooled_arena_after_owner_retirement() {
     let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let pending_before = custody.pending_carrier_stage2_retirement_count();
     let (mut task, _, _, _) =
         exit_task_holding_owned_lease(820, 0x4000, 820, 821, &kernel, &frames);
     let base = pool.base_ipa();
@@ -8090,6 +8239,11 @@ fn final_parked_pin_returns_pooled_arena_after_owner_retirement() {
     retire_test_process_mappings(&mut task)
         .expect("whole-MM unpublication requests pinned root retirement");
     drop(task);
+    assert_eq!(
+        custody.pending_carrier_stage2_retirement_count(),
+        pending_before + 1,
+        "pinned root owner drop must retain its exact proof"
+    );
     assert!(
         pool.allocate_slot_at(base).is_none(),
         "parked pin owns the slot"
@@ -8101,7 +8255,10 @@ fn final_parked_pin_returns_pooled_arena_after_owner_retirement() {
     );
     let report =
         retry_pending_global_frame_retirements_at_idle_in_using(custody, &mut |_, _| Ok(()));
-    assert_eq!(report.inspected_carrier, 1);
+    assert!(
+        report.inspected_carrier >= 1,
+        "parked-pin retirement turn: {report:?}"
+    );
     let terminal = custody.stage2_record_snapshot(record.record_id).is_none();
     let reused = pool
         .allocate_slot_at(base)
@@ -8129,7 +8286,7 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
     let mut engine = old.page_tables_authority();
     engine
         .install_exec_successor(
-            crate::trap::test_stage1_edit_license(),
+            crate::trap::test_stage1_edit_license_for(&engine),
             new.page_tables_authority(),
         )
         .unwrap();
@@ -8152,7 +8309,10 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
         carrier_mm: None,
         armed: true,
     };
-    let result = cleanup.retire();
+    let predecessor_stage1 = prepare_test_whole_mm_retirement(&mut old);
+    let result = cleanup
+        .retire_with_cleanup_boundary(&mut |_| {}, &mut |_| {}, Some(&predecessor_stage1))
+        .map(|_| ());
     cleanup.armed = false; // A failed witness must report rather than abort in Drop.
     result.expect("detached predecessor cleanup keeps its own physical publisher");
     assert!(
@@ -8252,7 +8412,9 @@ fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
     let parked = std::sync::Arc::clone(&first.mm_access);
     assert!(pool.allocate_slot_at(base).is_none());
     drop(parked); // The final parked holder has retired.
-    HvfVmState::retire_task_state_shared_inventory_table_capacity(&mut first).unwrap();
+    let first_stage1 = prepare_test_whole_mm_retirement(&mut first);
+    HvfVmState::retire_task_state_shared_inventory_table_capacity(&mut first, &first_stage1)
+        .unwrap();
     assert!(
         custody
             .stage2_record_snapshot(first_record.record_id)
@@ -8261,7 +8423,8 @@ fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
     let (mut successor, _, _, _) =
         exit_task_holding_owned_lease(725, 0xc000, 725, 726, &kernel, &frames);
     let successor_record = relocate_exit_fixture_root(&mut successor, base);
-    HvfVmState::retire_task_state_shared_inventory_table_capacity(&mut first).unwrap();
+    HvfVmState::retire_task_state_shared_inventory_table_capacity(&mut first, &first_stage1)
+        .unwrap();
     assert!(
         pool.allocate_slot_at(base).is_none(),
         "late prior retirement must not release successor"
@@ -8301,10 +8464,10 @@ fn two_live_mm_pinned_table_retirement_detaches_without_returning_physical_capac
     let record = relocate_exit_fixture_root(&mut first, base);
     let other = relocate_exit_fixture_root(&mut second, base + 0x20_0000);
     let pin = custody.pin_stage2_record(record).unwrap();
-    let result = first.page_tables_authority().retire_table_capacity(
-        None,
-        carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-        |_| Ok(()),
+    let stage1_unpublished = prepare_test_whole_mm_retirement(&mut first);
+    let result = HvfVmState::retire_task_state_shared_inventory_table_capacity(
+        &mut first,
+        &stage1_unpublished,
     );
     let kept_owner = first
         .mm_access
@@ -8374,24 +8537,16 @@ fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
     let record_snapshot = custody
         .stage2_record_snapshot(record.record_id)
         .expect("whole-MM table record exists before retirement");
-    let stage1 = {
-        let mut frames = frames.lock();
-        frames
-            .register_structural_stage2_reference(
-                (record_snapshot.ipa, record_snapshot.len as u64),
-                stage1_unpublished.mm(),
-            )
-            .and_then(|()| {
-                frames.release_structural_stage2_reference(
-                    (record_snapshot.ipa, record_snapshot.len as u64),
-                    record,
-                    stage1_unpublished.mm(),
-                    Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
-                )
-            })
-    }
-    .expect("whole-MM inventory proof covers its exact table record")
-    .expect("whole-MM inventory proof releases the last table reference");
+    let stage1 = frames
+        .lock()
+        .release_structural_stage2_reference(
+            (record_snapshot.ipa, record_snapshot.len as u64),
+            record,
+            stage1_unpublished.mm(),
+            Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
+        )
+        .expect("whole-MM inventory proof covers its exact table record")
+        .expect("whole-MM inventory proof releases the last table reference");
     assert_eq!(
         custody.request_released_stage2_record_retirement(record, stage1),
         CarrierStage2RetireOutcome::DeferredActivePins

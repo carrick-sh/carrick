@@ -1522,6 +1522,72 @@ impl MmAccessState {
         )
     }
 
+    /// Retire the physically published primary owned by a bootstrap table
+    /// source. Unlike fork/exec roots, that primary has no prepared
+    /// `mm_root_stage2` slot: it was published before the task-only process
+    /// plan existed. The whole-MM receipt is therefore the exact stage-1
+    /// unpublication proof for its structural reference.
+    pub(crate) fn retire_bootstrap_table_root_stage2_in(
+        &self,
+        custody: &CarrierVmCustody,
+        base: u64,
+        stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
+    ) -> Result<(), TrapError> {
+        const TABLE_ARENA_SIZE: usize = 2 * 1024 * 1024;
+        let owner = self
+            .structural_owners
+            .read()
+            .get(&(base, TABLE_ARENA_SIZE))
+            .cloned();
+        let Some(owner) = owner else {
+            if custody
+                .stage2_record_covering(base, TABLE_ARENA_SIZE)
+                .is_none()
+            {
+                return Ok(());
+            }
+            return Err(TrapError::Hypervisor(
+                "bootstrap table primary lost exact structural owner".to_owned(),
+            ));
+        };
+        let identity = owner.record_identity();
+        if custody.stage2_record_snapshot(identity.record_id).is_none() {
+            owner.commit_stage1_publication();
+            owner.release_pooled_root_slot();
+            self.remove_structural_owner_if(custody, (base, TABLE_ARENA_SIZE), |candidate| {
+                std::sync::Arc::ptr_eq(candidate, &owner)
+            });
+            return Ok(());
+        }
+        let stage1 = self.release_structural_stage2_reference(
+            custody,
+            identity,
+            Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
+        )?;
+        custody.enqueue_carrier_stage2_retirement(identity);
+        if custody.request_released_stage2_record_retirement(identity, stage1)
+            != CarrierStage2RetireOutcome::DeferredActivePins
+        {
+            custody.cancel_carrier_stage2_retirement(identity);
+            return Err(TrapError::Hypervisor(
+                "bootstrap table primary could not authorize retirement".to_owned(),
+            ));
+        }
+        owner.commit_stage1_publication();
+        owner
+            .retained
+            .owner_retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        retire_carrier_stage2_record_at_safe_point(custody, identity)?;
+        if custody.stage2_record_snapshot(identity.record_id).is_none() {
+            owner.release_pooled_root_slot();
+        }
+        self.remove_structural_owner_if(custody, (base, TABLE_ARENA_SIZE), |candidate| {
+            std::sync::Arc::ptr_eq(candidate, &owner)
+        });
+        Ok(())
+    }
+
     /// Retire an exec predecessor's physical root while preserving its
     /// software image/source for the successor authority handoff.
     pub(crate) fn retire_exec_mm_root_stage2_in(
@@ -1586,18 +1652,26 @@ impl MmAccessState {
                 .owner
                 .record_populated_prefix(copied_bytes as usize);
 
-            let stage1 = self.release_structural_stage2_reference(
-                custody,
-                authority.record_identity,
-                Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
-            )?;
-            if custody.request_released_stage2_record_retirement(authority.record_identity, stage1)
-                != CarrierStage2RetireOutcome::DeferredActivePins
-            {
-                return Err(TrapError::Hypervisor(
-                    "stage-1 root retirement could not authorize its exact stage-2 record"
-                        .to_owned(),
-                ));
+            let retirement_requested = custody
+                .stage2_record_snapshot(authority.record_identity.record_id)
+                .is_some_and(|snapshot| snapshot.retirement_requested);
+            if !retirement_requested {
+                let stage1 = self.release_structural_stage2_reference(
+                    custody,
+                    authority.record_identity,
+                    Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
+                )?;
+                custody.enqueue_carrier_stage2_retirement(authority.record_identity);
+                if custody
+                    .request_released_stage2_record_retirement(authority.record_identity, stage1)
+                    != CarrierStage2RetireOutcome::DeferredActivePins
+                {
+                    custody.cancel_carrier_stage2_retirement(authority.record_identity);
+                    return Err(TrapError::Hypervisor(
+                        "stage-1 root retirement could not authorize its exact stage-2 record"
+                            .to_owned(),
+                    ));
+                }
             }
 
             authority
@@ -1618,6 +1692,7 @@ impl MmAccessState {
                     "stage-1 root structural record remained nonterminal: {snapshot:?}"
                 )));
             }
+            custody.cancel_carrier_stage2_retirement(authority.record_identity);
             // The record is terminal: the runtime may reissue this root slot the
             // moment it holds the proof below, so a pooled slot goes back to the
             // pool here rather than at the last `Arc` drop of the retained mapping.

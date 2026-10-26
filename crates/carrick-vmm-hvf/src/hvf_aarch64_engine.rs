@@ -1976,12 +1976,13 @@ pub fn retire_detached_task_only_shared_root_with_proof(
 /// touching the frame ledger shared with its predecessor.
 pub fn retire_detached_task_only_shared_rootless_capacity(
     state: &HvpatchTaskOnlyEngineState,
+    stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
 ) -> Result<(), TrapError> {
     let mut parked = state.parked_task.lock();
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
     })?;
-    HvfVmState::retire_task_state_shared_inventory_table_capacity(task)
+    HvfVmState::retire_task_state_shared_inventory_table_capacity(task, stage1_unpublished)
 }
 
 pub fn retire_detached_exec_predecessor(

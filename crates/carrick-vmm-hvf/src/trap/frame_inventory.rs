@@ -382,6 +382,11 @@ impl StagedProcessStage2Retirement {
                     proofs.insert(lease, proof);
                 }
             }
+            reconcile_carrier_stage2_authority_retention(
+                registry,
+                lease,
+                self.candidates.contains(&lease),
+            );
         }
         Ok((self.candidates, proofs))
     }
@@ -3082,9 +3087,6 @@ impl HvfVmState {
                 frames.shared.remove(&extent.backing);
             }
         }
-        for (&lease, &population_complete) in &stage2_population_complete {
-            reconcile_carrier_stage2_authority_retention(&mut frames, lease, population_complete);
-        }
         drop(frames);
         inventory.declined_leases =
             declined_lease_remainders(inventory.extents.values(), &retired_stage2, &retired);
@@ -3910,6 +3912,17 @@ impl HvfVmState {
                 }
             }
         }
+        for (lease, stage1) in stage1_reference_proofs {
+            let identity = stage1.identity();
+            if stage1.lease() != lease
+                || custody.request_released_stage2_record_retirement(identity, stage1)
+                    != CarrierStage2RetireOutcome::DeferredActivePins
+            {
+                return Err(TrapError::Hypervisor(format!(
+                    "declined process retirement could not retain its exact stage-1 proof for {lease:?}"
+                )));
+            }
+        }
         let retired_root = Self::retire_task_table_capacity(
             task,
             custody,
@@ -4007,7 +4020,18 @@ impl HvfVmState {
             .retire_table_capacity(
                 None,
                 carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-                |_| Ok(()),
+                |manager| {
+                    if let Some(manager) = manager {
+                        task.mm_access
+                            .retire_bootstrap_table_root_stage2_in(
+                                custody,
+                                manager.base(),
+                                stage1_unpublished,
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(())
+                },
             )
             .map_err(TrapError::Hypervisor)?;
         Ok(None)
@@ -4017,6 +4041,7 @@ impl HvfVmState {
     /// MM. Its frame ledger belongs to another task and is left untouched.
     pub(crate) fn retire_task_state_shared_inventory_table_capacity(
         task: &mut HvfTaskState,
+        stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
     ) -> Result<(), TrapError> {
         if task.mm_root_slot.is_some() {
             return Err(TrapError::Hypervisor(
@@ -4027,7 +4052,22 @@ impl HvfVmState {
             .retire_table_capacity(
                 None,
                 carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-                |_| Ok(()),
+                |manager| {
+                    if let Some(manager) = manager {
+                        #[cfg(not(test))]
+                        let custody = task.custody.as_ref();
+                        #[cfg(test)]
+                        let custody = legacy_test_carrier_vm_custody();
+                        task.mm_access
+                            .retire_bootstrap_table_root_stage2_in(
+                                custody,
+                                manager.base(),
+                                stage1_unpublished,
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(())
+                },
             )
             .map_err(TrapError::Hypervisor)
     }

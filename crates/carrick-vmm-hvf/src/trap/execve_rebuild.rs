@@ -237,17 +237,6 @@ impl PendingExecStage2Cleanup {
             {
                 continue;
             }
-            let stage1_reference = stage1_reference_proofs.remove(&lease).ok_or_else(|| {
-                TrapError::Hypervisor(format!(
-                    "exec predecessor extent {lease:?} did not cross the stage-1 reference ledger"
-                ))
-            })?;
-            if stage1_reference.lease() != lease {
-                return Err(TrapError::Hypervisor(format!(
-                    "exec predecessor receipt names {:?}, expected {lease:?}",
-                    stage1_reference.lease()
-                )));
-            }
             let mut exact_owner_retired = false;
             if HvfVmState::retire_stage2_candidate_if_unreferenced(&self.frames, lease, || {
                 let stage1_unpublished = stage1_unpublished.ok_or_else(|| {
@@ -266,6 +255,18 @@ impl PendingExecStage2Cleanup {
                         size as u64,
                     )
                 } else {
+                    let stage1_reference =
+                        stage1_reference_proofs.remove(&lease).ok_or_else(|| {
+                            TrapError::Hypervisor(format!(
+                                "exec predecessor extent {lease:?} did not cross the stage-1 reference ledger"
+                            ))
+                        })?;
+                    if stage1_reference.lease() != lease {
+                        return Err(TrapError::Hypervisor(format!(
+                            "exec predecessor receipt names {:?}, expected {lease:?}",
+                            stage1_reference.lease()
+                        )));
+                    }
                     let outcome = retire_global_frame_host_owner_if_generation_in(
                         custody,
                         stage1_reference,
@@ -304,12 +305,29 @@ impl PendingExecStage2Cleanup {
             .as_ref()
             .filter(|_| self.mm_root_slot.is_none())
         {
+            let stage1_unpublished = stage1_unpublished.ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "exec predecessor bootstrap-root retirement lacks whole-MM unpublication proof"
+                        .to_owned(),
+                )
+            })?;
             mm_access
                 .page_tables_authority()
                 .retire_table_capacity(
                     None,
                     carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff,
-                    |_| Ok(()),
+                    |manager| {
+                        if let Some(manager) = manager {
+                            mm_access
+                                .retire_bootstrap_table_root_stage2_in(
+                                    custody,
+                                    manager.base(),
+                                    stage1_unpublished,
+                                )
+                                .map_err(|error| error.to_string())?;
+                        }
+                        Ok(())
+                    },
                 )
                 .map_err(TrapError::Hypervisor)?;
         }

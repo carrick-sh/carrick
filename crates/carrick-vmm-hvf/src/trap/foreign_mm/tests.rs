@@ -15,12 +15,12 @@ const TEST_VA: u64 = 0x6000_2000_0000;
 const OWNER_LEN: usize = 0x4000;
 use crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK;
 
-fn test_whole_mm_stage1_proof() -> carrick_core::mm::retirement::Stage1UnpublishedMm {
+fn test_whole_mm_stage1_proof_for(mm: u64) -> carrick_core::mm::retirement::Stage1UnpublishedMm {
     let mut task = hvpatch_neutral_task_state_for_test();
     task.cow_identity = Some(carrick_hal::FrameCowIdentity {
         linux_pid: 1,
         linux_tid: 1,
-        mm: 1,
+        mm,
         asid: 1,
     });
     prepare_test_whole_mm_retirement(&mut task)
@@ -379,9 +379,15 @@ impl Drop for OwnerCleanup {
             let Some(identity) = global_frame_stage2_identity_in(custody, key.0, key.1) else {
                 continue;
             };
-            let proof = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
-                custody, identity,
-            );
+            let proof = custody
+                .claim_stage2_retirement(identity)
+                .and_then(|claim| claim.into_proof())
+                .unwrap_or_else(|| {
+                    crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
+                        custody, identity,
+                    )
+                    .into()
+                });
             let outcome = retire_global_frame_host_owner_in(custody, proof, key.0, key.1);
             assert!(
                 outcome.is_retired(),
@@ -2345,6 +2351,8 @@ fn rx_ptrace_text_cow_case(guest: bool) {
         0x9b00_2300_0000 + lane * 0x0100_0000_0000,
         *b"old!",
     );
+    *child.editor_exclusion.lock() =
+        Some(TestEditorExclusion::unpublished(child.snapshot.mm.get()));
     child.snapshot.executable_ranges = vec![
         carrick_hal::ForeignExecutableRange::from_kernel_projection(
             GuestVa::new(TEST_VA),
@@ -2700,6 +2708,8 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
         0x9b00_2500_0000,
         *b"old!",
     );
+    *child.editor_exclusion.lock() =
+        Some(TestEditorExclusion::unpublished(child.snapshot.mm.get()));
     child.snapshot.executable_ranges = vec![
         carrick_hal::ForeignExecutableRange::from_kernel_projection(
             GuestVa::new(TEST_VA),
@@ -3882,12 +3892,18 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
             )
         })
         .collect();
+    let frames = Arc::clone(&state.frame_inventory.ledger.lock().frames);
+    let stage2_reference_releases = owners
+        .0
+        .iter()
+        .map(|&(ipa, length)| ((ipa, length), 1_usize))
+        .collect();
     let mut cleanup = PendingExecStage2Cleanup {
         mappings: TaskMappingIndex::new(),
         extents,
         predecessor_aliases: Vec::new(),
-        frames: Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
-        stage2_reference_releases: std::collections::BTreeMap::new(),
+        frames,
+        stage2_reference_releases,
         mm_root_slot: None,
         mm_access: None,
         predecessor_identity: carrick_hal::ExecPredecessorIdentity {
@@ -6156,6 +6172,16 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         executable_ranges: Vec::new(),
         readable_ranges: Vec::new(),
     };
+    child_state
+        .install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(child_snapshot.mm),
+            CarrierForeignMmBinding {
+                asid: carrick_hal::ForeignAsid::from_kernel_allocation(child_snapshot.asid),
+                stage1_root: child_snapshot.stage1_root,
+            },
+        )
+        .expect("publish child MM identity before host stage-1 edits");
+    let _child_editor_exclusion = TestEditorExclusion::unpublished(child_snapshot.mm.get());
     let child_live = TestLiveAuthority(Arc::new(parking_lot::RwLock::new(child_snapshot.clone())));
     let cow_authority = Arc::new(TestForeignCowAuthority {
         live: Arc::clone(&child_live.0),
@@ -12016,7 +12042,7 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
 
     // 3. Exercise real pooled-root retirement path: retire_mm_root_stage2_in -> release_pooled_root_slot
     let table_authority = installed.state.page_tables_authority();
-    let stage1_unpublished = test_whole_mm_stage1_proof();
+    let stage1_unpublished = test_whole_mm_stage1_proof_for(installed.snapshot.mm.get());
     let mut saw_unmap = false;
     let mut retirement_excluded_access = false;
     let retired_root = installed
@@ -12182,7 +12208,11 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
 
     installed
         .state
-        .retire_mm_root_stage2_in(&transport.custody, root_slot, &test_whole_mm_stage1_proof())
+        .retire_mm_root_stage2_in(
+            &transport.custody,
+            root_slot,
+            &test_whole_mm_stage1_proof_for(installed.snapshot.mm.get()),
+        )
         .expect("retire the reissued pooled root through its exact arena receipt");
 
     // 8. Dropping state invalidates cached root lookup on old resolver
@@ -12336,7 +12366,9 @@ fn retained_reuse_fixture(
     // munmap: retire the leaves through the host editor while the host
     // still owns descriptors (output retained, VALID clear), then hand the
     // live descriptors to the requested lane.
-    let _editor = TestEditorExclusion::unpublished(installed.snapshot.mm.get());
+    *installed.editor_exclusion.lock() = Some(TestEditorExclusion::unpublished(
+        installed.snapshot.mm.get(),
+    ));
     installed
         .state
         .with_stage1_edit_license(|license| {

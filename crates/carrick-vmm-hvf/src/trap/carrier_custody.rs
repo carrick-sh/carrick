@@ -3544,7 +3544,7 @@ mod carrier_vm_custody_tests {
                     Err(injected)
                 },
             ),
-            1,
+            2,
             "the first idle-turn failure must remain queued",
         );
         assert_eq!(retry_calls, 1);
@@ -3689,7 +3689,7 @@ mod carrier_vm_custody_tests {
                     Ok(())
                 },
             ),
-            1,
+            2,
         );
         assert_eq!(
             calls, 0,
@@ -4668,6 +4668,10 @@ mod carrier_vm_custody_tests {
         .expect("register G1 carrier-MM record")[0];
         unpublished.commit_publication();
         assert_eq!(old_identity.vm_generation, g1);
+        let old_stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
+            &custody,
+            old_identity,
+        );
         destroy_vm_with_custody_using(&custody, "carrier G1 destroy", || 0, || {})
             .expect("destroy G1");
         let g2 = custody.begin_create().expect("begin G2");
@@ -4688,14 +4692,8 @@ mod carrier_vm_custody_tests {
         custody.commit_create(g2).expect("publish G2");
 
         assert_eq!(
-            custody.request_released_stage2_record_retirement(
-                old_identity,
-                crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
-                    &custody,
-                    old_identity
-                ),
-            ),
-            super::CarrierStage2RetireOutcome::TerminalizedByVmDestroy
+            custody.request_released_stage2_record_retirement(old_identity, old_stage1,),
+            super::CarrierStage2RetireOutcome::NotFound
         );
         assert!(
             custody

@@ -336,7 +336,10 @@ impl HvpatchTaskEngineBindingState {
                             })
                         }
                         None => {
-                            carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_shared_rootless_capacity(state)?;
+                            carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_shared_rootless_capacity(
+                                state,
+                                &stage1_unpublished,
+                            )?;
                             Ok(None)
                         }
                     };
