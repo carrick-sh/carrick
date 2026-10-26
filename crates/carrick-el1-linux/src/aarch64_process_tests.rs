@@ -6551,13 +6551,26 @@ fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
         NativeThreadGroupOwner::Root
     );
     assert!(
-        !arm_owner_must_serve(
+        arm_owner_must_serve(
             221,
             0,
             || arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
             1,
         ),
-        "the admitted root still forwards its own exec after its first fork"
+        "the admitted root owns execve after its first fork"
+    );
+    assert!(
+        arm_owner_must_serve(
+            281,
+            0,
+            || arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
+            1,
+        ),
+        "the admitted root owns execveat after its first fork"
+    );
+    assert!(
+        !arm_owner_must_serve(221, 0, || NativeThreadGroupOwner::Unowned, 1),
+        "a host-loaded task has no native exec owner"
     );
     assert_eq!(
         arm_thread_group_owner(fixture.zone, &fixture.task, foreign_page),
