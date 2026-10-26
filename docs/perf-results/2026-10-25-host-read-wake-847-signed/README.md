@@ -1,5 +1,76 @@
 # Issue #847 signed hardware evidence
 
+## Exact `e6cfbc5ac` clean-exit arena smoke failure (2026-10-26)
+
+The exact bundle for evidence head
+`e6cfbc5ac3c04b8f3038ae576dca9caf27628bdc` verified, restored, and
+verified again with 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/e6cfbc5ac3c04b8f3038ae576dca9caf27628bdc/3703bc004fb220b008d77ed6fe26bf1048a865105dd67b5474593ecc8969a2b5.tar.gz
+bundle identity: 3703bc004fb220b008d77ed6fe26bf1048a865105dd67b5474593ecc8969a2b5
+archive SHA-256: d0d94108140fe0a88c47af853e74ad41290fd71982a91195a64032430bc3a1bc
+input identity: 1b0c6348ad4325add0c8937509ef4ee9965ed1d096c797116ef83f8990be63fb
+```
+
+Mandatory bootstrap smoke `847-e6-smoke-01` reached HVF and failed 0/1 in
+0.33 seconds with the same root-slot refusal. This was a typed hypervisor
+error, not a `carrick: FATAL` carrier abort:
+
+```text
+stage-1 extension arena IPA 0x9a00000000 is still held by the root-slot pool;
+stage2=Some(CarrierStage2RecordSnapshot { record_id:
+CarrierStage2RecordId(14), vm_generation: CarrierVmGeneration(1),
+ipa: 661424963584, len: 2097152, host_addr: 4388225024, mapped: true,
+backend_map_installed: false, release_ipa: false, perms: 3, logical_owner:
+Some(CarrierLogicalOwner { id: 14, generation: 14 }), pin_count: 0,
+retirement_requested: false, retry_eligible: false, retry_pending: None,
+terminalized_by_vm_destroy: false, superseded_by_rebind: false,
+release_in_flight: false, release_retry_pending: false })
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured;
+90 filtered out; finished in 0.33s
+```
+
+The negative entitlement control passed. All scoped cleanup counts for
+`847-e6-smoke-01`, `-b1`, `-neg`, and `-cli` were zero. There was no watchdog
+census. Per the mandatory stop condition, the remaining population did not
+start:
+
+- bootstrap smoke: 0/1 (`847-e6-smoke-01`);
+- host-blocked-read acceptance: 0/0 of 20;
+- `native_root_exec_replaces_pid1_shell`: 0/0;
+- `el1_ipc_pipe_blocking_roundtrips`: 0/0 of 3;
+- `el1_fork_cow_resolves_in_guest`: 0/0 of 3.
+
+The exact smoke executable was
+`target/release/deps/el1_sched-d8a5a9a0d2511a83`:
+
+```text
+SHA-256: 8959879ebc5a9a60cb2b130e9e79e3e3bc7f0bb2b09b02ad95d4409c427477cc
+CDHash: abe6729a7979e0e61e9327f3858ec4066ceeb731
+LC_UUID: 490805C1-2069-3B9C-915E-254FC8E4F258
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+Diagnostic run `847-e6-postmortem-06` stopped the same signed executable at
+`sparse_materialization.rs:860` while the successor root was in
+`publish_raw_stage1_arenas_into -> reserve_table_arena ->
+publish_initial_table_root -> initialize_root_process`. Its complete
+lifecycle ring (`errors=0`) proves the predecessor completed clean exit first:
+
+```text
+8375 HVPPEXIT pid=1 tid=1 exit=0 publication=begin
+8377 HVPPEXIT pid=1 tid=1 exit=0 publication=complete
+```
+
+The 40 MiB modified-memory core is
+`/tmp/847-e6-postmortem-06/carrier.core`; the all-thread backtrace and both
+ring populations are in `/tmp/847-e6-postmortem-06/test.log`. Diagnostic
+setup runs `-02` through `-05` either did not launch a guest or stopped at the
+same site without saving a core; every one cleaned to zero and none is a
+functional verdict.
+
 ## Clean-exit extension-arena retirement repair (2026-10-26)
 
 Commit `58df7db5af223fa6993fcd1d1994e93a2a09a45e` closes the root-slot
