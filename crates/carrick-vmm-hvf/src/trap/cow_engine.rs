@@ -4179,7 +4179,8 @@ impl HvfTaskState {
             const NON_GLOBAL: u64 = 1 << 11;
             let page_tables_authority = self.page_tables_authority();
             let edit_access = std::sync::Arc::clone(&self.mm_access);
-            edit_access.with_stage1_edit_license(|license| {
+            edit_access
+                .with_stage1_edit_license(|license| {
                 page_tables_authority.edit_unpublishing(
                     license,
                     || {
@@ -4332,6 +4333,16 @@ impl HvfTaskState {
                     },
                 )
             })
+                .and_then(|((), pending)| {
+                    let pending = pending.ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "HVPatch COW edit did not retire its old stage-1 leaf".to_owned(),
+                        )
+                    })?;
+                    pending
+                        .complete_after(|| flush_stage1.flush())
+                        .map(|receipt| ((), Some(receipt)))
+                })
         };
         let stage1_leaf = match page_table_result {
             Ok(((), receipt)) => receipt,
@@ -4393,12 +4404,6 @@ impl HvfTaskState {
                     },
                 )
             });
-            if let Err(error) = flush_stage1.flush() {
-                carrick_fatal!(
-                    "hvpatch::mm_authority",
-                    "HVPatch COW stage-1 TLBI failed: {error}"
-                );
-            }
         }
         drop(old_source.take());
         if let Some(grant) = guest_backing.as_mut() {

@@ -350,6 +350,21 @@ pub fn rec_stage2_authority_invariant(mm: u64, tid: i32, revision: u64) {
     rec(STAGE2_AUTHORITY_INVARIANT, low32(mm), tid, low32(revision));
 }
 
+/// A never-published stage-2 record lost its consume-once rollback authority.
+/// `a` is the record id, `b` the VM generation and `c` the logical-owner id
+/// (all low 32 bits). The backend quarantines the record instead of reissuing
+/// its IPA; this event makes that terminal leak visible in watchdog history.
+pub const STAGE2_ROLLBACK_INVARIANT: u8 = 86;
+
+pub fn rec_stage2_rollback_invariant(record: u64, vm_generation: u64, logical_owner: u64) {
+    rec(
+        STAGE2_ROLLBACK_INVARIANT,
+        low32(record),
+        low32(vm_generation),
+        low32(logical_owner),
+    );
+}
+
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloneRefusalProducer {
@@ -383,7 +398,7 @@ fn clone_refusal_label(producer: i32) -> &'static str {
 }
 
 /// Highest event kind a reader accepts.
-const LAST_KIND: u8 = STAGE2_AUTHORITY_INVARIANT;
+const LAST_KIND: u8 = STAGE2_ROLLBACK_INVARIANT;
 
 /// At most this many [`FAULTSIG_MBOX`] records follow one fault signal, so a
 /// census of all mailboxes never floods the ring.

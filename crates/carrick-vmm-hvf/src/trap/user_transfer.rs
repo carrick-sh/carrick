@@ -1075,7 +1075,10 @@ pub(super) mod tests {
                         |editor| editor.invalidate(va, 4096).map(|_| ()),
                     )
                     .unwrap();
-                let receipt = receipt.expect("retirement edit removed the exact leaf");
+                let receipt = receipt
+                    .expect("retirement edit removed the exact leaf")
+                    .complete_after(|| Ok::<(), ()>(()))
+                    .unwrap();
                 let mut frames = crate::trap::frame_inventory::InventoryFrameRegistry::default();
                 frames.stage2_references.insert((ipa, 16384), 1);
                 let stage1 = frames

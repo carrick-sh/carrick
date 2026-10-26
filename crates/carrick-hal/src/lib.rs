@@ -38,6 +38,7 @@ pub mod fork_stock;
 pub mod physical_grants;
 pub mod stage1_exclusive;
 pub mod stage1_mm;
+pub mod stage2_invariant;
 
 pub mod trap;
 pub use trap::{

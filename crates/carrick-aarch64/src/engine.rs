@@ -1670,7 +1670,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     ) -> Result<
         (
             PageTableApplyOutcome,
-            Option<crate::stage1_authority::Stage1LeafRetired>,
+            Option<crate::stage1_authority::PendingStage1LeafRetired>,
         ),
         MemoryError,
     > {
@@ -1901,14 +1901,18 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             Some((address, len)),
             edit,
         )?;
-        if outcome.flush_required {
-            self.invalidate_after_edit()
-                .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))?;
-        }
-        receipt.ok_or_else(|| {
+        let receipt = receipt.ok_or_else(|| {
             MemoryError::HostMap(
                 "stage-1 edit did not retire any translation in its declared range".to_owned(),
             )
+        })?;
+        receipt.complete_after(|| {
+            if outcome.flush_required {
+                self.invalidate_after_edit()
+                    .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
+            } else {
+                Ok(())
+            }
         })
     }
 

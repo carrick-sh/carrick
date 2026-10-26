@@ -2766,6 +2766,8 @@ mod carrier_vm_custody_tests {
             .expect("test stage-1 leaf unpublication")
             .1
             .expect("editor removed the exact test stage-1 leaf")
+            .complete_after(|| Ok::<(), ()>(()))
+            .unwrap()
     }
 
     #[test]
@@ -5030,6 +5032,10 @@ mod carrier_vm_custody_tests {
                 |editor| editor.invalidate(va, 4096).map(|_| ()),
             )
             .unwrap();
+        let receipt = receipt
+            .unwrap()
+            .complete_after(|| Ok::<(), ()>(()))
+            .unwrap();
         let lease = (0xa081_b000_0000, 0x4000);
         let mut frames = InventoryFrameRegistry::default();
         frames.stage2_references.insert(lease, 1);
@@ -5037,7 +5043,7 @@ mod carrier_vm_custody_tests {
             frames.release_stage2_reference(
                 lease,
                 Some(identity),
-                Stage1UnpublicationReceipt::EditorRange(&receipt.unwrap()),
+                Stage1UnpublicationReceipt::EditorRange(&receipt),
             ),
             Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease)),
             "an editor receipt may authorize only the physical range it actually removed"

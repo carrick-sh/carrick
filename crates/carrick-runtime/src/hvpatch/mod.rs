@@ -1063,6 +1063,13 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     dispatcher: &mut SyscallDispatcher,
     carrier: &crate::carrier::CarrierRuntime,
 ) -> Result<Option<RootProcessInitialization>, RuntimeError> {
+    let _ = carrick_hal::stage2_invariant::install_stage2_rollback_invariant_reporter(|event| {
+        carrick_kernel::event_ring::rec_stage2_rollback_invariant(
+            event.record_id,
+            event.vm_generation,
+            event.logical_owner,
+        );
+    });
     const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
     let stage1_root = engine.get_sys_reg(SysReg::Ttbr0).map_err(|error| {
         RuntimeError::Trap(crate::trap::TrapError::Hypervisor(error.to_string()))

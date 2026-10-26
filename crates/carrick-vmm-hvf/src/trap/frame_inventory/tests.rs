@@ -40,6 +40,8 @@ fn test_leaf_retirement_receipt(ipa: u64) -> carrick_aarch64::stage1_authority::
         .unwrap()
         .1
         .unwrap()
+        .complete_after(|| Ok::<(), ()>(()))
+        .unwrap()
 }
 
 #[test]
@@ -5348,6 +5350,41 @@ fn final_carrier_mm_drop_schedules_unpinned_stage2_retirement_at_safe_point() {
     assert_eq!(report.inspected_carrier, 1);
     assert!(!global_frame_ipa_allocator().lock().is_live(key.0, key.1));
     assert!(!carrier_stage2_leases().lock().contains_key(&key));
+}
+
+#[test]
+fn missing_unpublished_stage2_receipt_reports_terminal_invariant() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static REPORTED_RECORD: AtomicU64 = AtomicU64::new(0);
+    fn record(event: carrick_hal::stage2_invariant::Stage2RollbackInvariant) {
+        REPORTED_RECORD.store(event.record_id, Ordering::SeqCst);
+    }
+
+    let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+    assert!(
+        carrick_hal::stage2_invariant::install_stage2_rollback_invariant_reporter(record),
+        "the unit-test process installs the terminal reporter once"
+    );
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
+    let key = lease.key();
+    let (_, unpublished) = register_carrier_lease(lease, 0x1000);
+    let identity = custody.carrier_stage2_records.lock()[&key];
+    let proof = unpublished
+        .consume(identity)
+        .expect("fixture removes the exact rollback receipt before owner drop");
+
+    drop(unpublished_carrier_mm_authority(key, frames, unpublished));
+
+    assert_eq!(REPORTED_RECORD.load(Ordering::SeqCst), identity.record_id.0);
+    assert_eq!(
+        custody.request_never_published_stage2_record_retirement(identity, proof),
+        CarrierStage2RetireOutcome::DeferredActivePins
+    );
+    custody.request_global_frame_retirement_retry();
+    let _ = retry_pending_global_frame_retirements_at_idle_in_using(custody, &mut |_, _| Ok(()));
 }
 
 #[test]

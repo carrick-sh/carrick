@@ -3228,7 +3228,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         requested.binding.asid,
         requested.binding.stage1_root,
     );
-    let stage1 = match page_table_result {
+    let pending_stage1 = match page_table_result {
         Ok(((), Some(stage1))) => stage1,
         Ok(((), None)) => {
             return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
@@ -3261,23 +3261,29 @@ pub(crate) fn perform_foreign_cow_transaction(
             "missing page-table rollback pre-image after successful page-table modification",
         );
     }
-    if let Err(error) = invalidator.invalidate_exact_asid(binding, deadline) {
-        let restored = restore_stage1(&mut rollback, 9);
-        let recycled_manager = lease
-            .state
-            .finish_foreign_cow_restore(restored, &mut rollback, 9);
-        *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
-        if invalidator
-            .invalidate_exact_asid(binding, deadline)
-            .is_err()
-        {
-            carrick_fatal!(
-                "hvpatch::mm_authority",
-                "stage-1 TLB invalidation failed during foreign COW invalidation-error rollback"
-            );
+    let stage1 = match pending_stage1
+        .complete_after(|| invalidator.invalidate_exact_asid(binding, deadline))
+    {
+        Ok(stage1) => stage1,
+        Err(error) => {
+            let restored = restore_stage1(&mut rollback, 9);
+            let recycled_manager =
+                lease
+                    .state
+                    .finish_foreign_cow_restore(restored, &mut rollback, 9);
+            *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
+            if invalidator
+                .invalidate_exact_asid(binding, deadline)
+                .is_err()
+            {
+                carrick_fatal!(
+                    "hvpatch::mm_authority",
+                    "stage-1 TLB invalidation failed during foreign COW invalidation-error rollback"
+                );
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     if let Err(error) = foreign_cow_failpoint(&lease.state, 4) {
         let restored = restore_stage1(&mut rollback, 10);
         let recycled_manager = lease

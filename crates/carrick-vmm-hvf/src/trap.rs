@@ -3928,9 +3928,12 @@ fn request_never_published_carrier_stage2_record_retirements(
     };
     for identity in retirements {
         let Some(never_published) = unpublished.consume(identity) else {
-            debug_assert!(
-                false,
-                "unpublished carrier MM lost stage-2 publication authority: {identity:?}"
+            carrick_hal::stage2_invariant::report_stage2_rollback_invariant(
+                carrick_hal::stage2_invariant::Stage2RollbackInvariant {
+                    record_id: identity.record_id.0,
+                    vm_generation: identity.vm_generation.0,
+                    logical_owner: identity.logical_owner.map_or(0, |owner| owner.id),
+                },
             );
             continue;
         };

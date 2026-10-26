@@ -140,6 +140,37 @@ pub struct Stage1LeafRetired {
 #[derive(Debug)]
 struct TlbiComplete;
 
+/// An Editor-licensed unpublication whose required stage-1 invalidation has
+/// not yet completed. It cannot authorize stage-2 retirement until
+/// [`Self::complete_after`] runs the caller's maintenance operation.
+#[derive(Debug)]
+pub struct PendingStage1LeafRetired {
+    authority: u64,
+    image_generation: std::num::NonZeroU64,
+    va: u64,
+    len: usize,
+    retired: Vec<(u64, u64)>,
+}
+
+impl PendingStage1LeafRetired {
+    /// Complete the architectural invalidation before exposing retirement
+    /// authority. A failed invalidation retains no usable proof.
+    pub fn complete_after<E>(
+        self,
+        invalidate: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Stage1LeafRetired, E> {
+        invalidate()?;
+        Ok(Stage1LeafRetired {
+            authority: self.authority,
+            image_generation: self.image_generation,
+            va: self.va,
+            len: self.len,
+            retired: self.retired,
+            _tlbi: TlbiComplete,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct Stage1LeafRetirementPlan {
     authority: u64,
@@ -190,17 +221,19 @@ impl Stage1LeafRetirementPlan {
         })
     }
 
-    fn finish(self, mut translate: impl FnMut(u64) -> Option<u64>) -> Option<Stage1LeafRetired> {
+    fn finish(
+        self,
+        mut translate: impl FnMut(u64) -> Option<u64>,
+    ) -> Option<PendingStage1LeafRetired> {
         self.retired
             .iter()
             .all(|&(va, ipa)| translate(va) != Some(ipa))
-            .then_some(Stage1LeafRetired {
+            .then_some(PendingStage1LeafRetired {
                 authority: self.authority,
                 image_generation: self.image_generation,
                 va: self.va,
                 len: self.len,
                 retired: self.retired,
-                _tlbi: TlbiComplete,
             })
     }
 }
@@ -1351,7 +1384,7 @@ impl Stage1Authority {
         va: u64,
         len: usize,
         f: F,
-    ) -> Result<(R, Option<Stage1LeafRetired>), E>
+    ) -> Result<(R, Option<PendingStage1LeafRetired>), E>
     where
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
@@ -1691,7 +1724,7 @@ impl Stage1Authority {
         va: u64,
         len: usize,
         f: F,
-    ) -> Result<(R, Option<Stage1LeafRetired>), E>
+    ) -> Result<(R, Option<PendingStage1LeafRetired>), E>
     where
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
@@ -2820,7 +2853,15 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-        let receipt = receipt.expect("repoint retires the old translation");
+        let invalidated = std::cell::Cell::new(false);
+        let receipt = receipt
+            .expect("repoint retires the old translation")
+            .complete_after(|| {
+                invalidated.set(true);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert!(invalidated.get(), "retirement proof follows its TLBI");
         assert_eq!(receipt.authority(), authority.authority_id());
         assert_ne!(receipt.image_generation(), before);
         assert_eq!(receipt.range(), (va, 4096));
