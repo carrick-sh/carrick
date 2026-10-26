@@ -684,9 +684,10 @@ pub fn capture_native_service_exit(
     frame: &mut TrapFrame,
     action: Action,
     wait: Option<carrick_core_abi::PortalOwnerWait>,
+    counters: &Counters,
 ) -> Action {
     if matches!(action, Action::Forward | Action::ServedWithWork)
-        && let Some(owned) = arm_native_service_exit(frame, action, wait)
+        && let Some(owned) = arm_native_service_exit(frame, action, wait, counters)
     {
         return owned;
     }
@@ -809,6 +810,22 @@ fn native_exec_stage(
     Some(crate::exec_stage::stage_exec_payload(&mut user, request))
 }
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn refuse_traced_native_exec(
+    frame: &mut TrapFrame,
+    task: &CurrentTask,
+    counters: &Counters,
+) -> bool {
+    if !matches!(frame.x[8], 221 | 281) || !task.ptrace_traced() {
+        return false;
+    }
+    let nr = frame.x[8] as usize;
+    counters.refused[nr].fetch_add(1, Ordering::Relaxed);
+    counters.served[nr].fetch_add(1, Ordering::Relaxed);
+    frame.x[0] = carrick_syscall_abi::LINUX_EPERM.guest_retval() as u64;
+    true
+}
+
 /// Capture the exception while its native owner still owns the trap words.
 /// The host receives a selector only after this continuation has parked.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -817,6 +834,7 @@ fn arm_native_service_exit(
     frame: &mut TrapFrame,
     action: Action,
     wait: Option<carrick_core_abi::PortalOwnerWait>,
+    counters: &Counters,
 ) -> Option<Action> {
     use super::native_process_runtime::NativeResume;
     use carrick_personality_linux::lifecycle::ProcessNative;
@@ -826,6 +844,9 @@ fn arm_native_service_exit(
     let record = zone.slot(slot).current()?;
     if !zone.record(record).is_native_owned() {
         return None;
+    }
+    if refuse_traced_native_exec(frame, task, counters) {
+        return Some(arm_signal_user_return(frame));
     }
     let (page, control) = task.lifecycle_refs()?;
     let (operation, exec_payload) = match native_exec_stage(frame, task) {
@@ -3629,5 +3650,30 @@ mod tests {
         }
         pending.frame.x[8] = 124;
         assert!(PendingFamilies::sched_venue(&mut pending).is_some());
+    }
+
+    #[test]
+    fn traced_native_exec_is_refused_with_counted_eperm() {
+        let task = CurrentTask::new();
+        task.publish_ptrace_traced(true);
+        let counters = Counters::default();
+        for ordinal in [221, 281] {
+            let mut frame = TrapFrame::default();
+            frame.x[8] = ordinal;
+            assert!(refuse_traced_native_exec(&mut frame, &task, &counters));
+            assert_eq!(
+                frame.x[0] as i64,
+                carrick_syscall_abi::LINUX_EPERM.guest_retval()
+            );
+            assert_eq!(
+                counters.refused[ordinal as usize].load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(counters.served[ordinal as usize].load(Ordering::Relaxed), 1);
+        }
+        task.publish_ptrace_traced(false);
+        let mut frame = TrapFrame::default();
+        frame.x[8] = 221;
+        assert!(!refuse_traced_native_exec(&mut frame, &task, &counters));
     }
 }

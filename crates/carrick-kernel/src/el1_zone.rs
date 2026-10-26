@@ -1914,6 +1914,7 @@ mod tests {
                 carrick_el1_abi::SnapshotGeneration::from_raw(2_658),
                 1,
                 2,
+                false,
                 carrick_el1_abi::ContextGeneration::new(std::num::NonZeroU64::MIN),
             );
         }

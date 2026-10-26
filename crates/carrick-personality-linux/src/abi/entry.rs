@@ -139,6 +139,8 @@ pub struct LinuxTaskMetadata {
     pub control_slot: AtomicU64,
     /// Namespace-visible process leader, published by the task owner.
     pub visible_pid: AtomicU32,
+    /// Nonzero while the exact loaded task is owned by a ptrace tracer.
+    pub ptrace_traced: AtomicU32,
 }
 impl LinuxTaskMetadata {
     pub const fn new() -> Self {
@@ -146,6 +148,7 @@ impl LinuxTaskMetadata {
             lifecycle_page: AtomicU64::new(0),
             control_slot: AtomicU64::new(0),
             visible_pid: AtomicU32::new(0),
+            ptrace_traced: AtomicU32::new(0),
         }
     }
 }
@@ -162,6 +165,7 @@ const _: () = {
     assert!(core::mem::offset_of!(LinuxTaskState, pending_host_work) == 24);
     assert!(core::mem::offset_of!(LinuxTaskState, served_with_work) == 28);
     assert!(core::mem::size_of::<LinuxTaskMetadata>() == 24);
+    assert!(core::mem::offset_of!(LinuxTaskMetadata, ptrace_traced) == 20);
 };
 
 /// What a thread owes the host after EL1 served its syscall with work.

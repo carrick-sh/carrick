@@ -943,9 +943,36 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// an authentication/adoption race retires it through the same SIGKILL
     /// close transaction used for a losing sibling.
     #[inline(never)]
-    fn kill_refused_exec(&mut self) -> Result<NativeResume, NativeProcessError> {
-        let _ = self.exit_with_signal(carrick_signal_core::policy::Signal::KILL.number() as u8)?;
-        Ok(NativeResume::Left(None))
+    fn kill_refused_exec(&mut self) -> NativeResume {
+        if self
+            .exit_with_signal(carrick_signal_core::policy::Signal::KILL.number() as u8)
+            .is_ok()
+        {
+            return NativeResume::Left(None);
+        }
+        // A concurrent terminal transition can consume the direct exit
+        // admission.  Drive its already-owned lifecycle continuation instead
+        // of escalating one process's failed exec into a carrier failure.
+        let _ = self.resume_pending_lifecycle();
+        if self.handoff.is_some() {
+            NativeResume::Left(None)
+        } else {
+            NativeResume::NoPending
+        }
+    }
+
+    #[inline(never)]
+    fn cancel_refused_exec(
+        &mut self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
+    ) -> NativeResume {
+        // Cancellation and claim acknowledgement are best-effort cleanup on
+        // an irrevocable per-process kill path. Neither may turn the carrier
+        // into the victim of one malformed or stale exec completion.
+        let _ = self.service.cancel_exec_successor(receipt);
+        let _ = self.release_service_claim(claim);
+        self.kill_refused_exec()
     }
 
     #[inline(never)]
@@ -958,35 +985,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let manifest = match pending.reply.as_ref() {
             Some(PendingServiceReply::Exec(manifest)) => &**manifest,
             _ => {
-                let cancelled = self.service.cancel_exec_successor(receipt);
-                let released = self.release_service_claim(pending.claim);
-                cancelled?;
-                released?;
-                return self.kill_refused_exec();
+                return Ok(self.cancel_refused_exec(receipt, pending.claim));
             }
         };
         let Some(sealed) = manifest.open(request.identity, receipt) else {
-            let cancelled = self.service.cancel_exec_successor(receipt);
-            let released = self.release_service_claim(pending.claim);
-            cancelled?;
-            released?;
-            return self.kill_refused_exec();
+            return Ok(self.cancel_refused_exec(receipt, pending.claim));
         };
         let Some(mm) = NonZeroU64::new(sealed.successor_mm.raw()) else {
-            let cancelled = self.service.cancel_exec_successor(receipt);
-            let released = self.release_service_claim(pending.claim);
-            cancelled?;
-            released?;
-            return self.kill_refused_exec();
+            return Ok(self.cancel_refused_exec(receipt, pending.claim));
         };
         if pending.exec_successor.as_ref().is_none_or(|slot| {
             slot.mm() != sealed.successor_mm || slot.root_generation() != sealed.root_generation
         }) {
-            let cancelled = self.service.cancel_exec_successor(receipt);
-            let released = self.release_service_claim(pending.claim);
-            cancelled?;
-            released?;
-            return self.kill_refused_exec();
+            return Ok(self.cancel_refused_exec(receipt, pending.claim));
         }
         let expected_address = AddressContext {
             root: sealed.root,
@@ -996,23 +1007,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let comm = match pending.exec_comm() {
             Ok(comm) => comm,
             Err(error) => {
-                let cancelled = self.service.cancel_exec_successor(receipt);
-                let released = self.release_service_claim(pending.claim);
-                cancelled?;
-                released?;
                 let _ = error;
-                return self.kill_refused_exec();
+                return Ok(self.cancel_refused_exec(receipt, pending.claim));
             }
         };
         let validated = match self.validate_exec_successor(expected_address) {
             Ok(validated) => validated,
             Err(error) => {
-                let cancelled = self.service.cancel_exec_successor(receipt);
-                let released = self.release_service_claim(pending.claim);
-                cancelled?;
-                released?;
                 let _ = error;
-                return self.kill_refused_exec();
+                return Ok(self.cancel_refused_exec(receipt, pending.claim));
             }
         };
         let prepared_fds = {
@@ -1021,20 +1024,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(row) => row.native().resources(),
                 Err(_) => {
                     drop(graph);
-                    let cancelled = self.service.cancel_exec_successor(receipt);
-                    let released = self.release_service_claim(pending.claim);
-                    cancelled?;
-                    released?;
-                    return self.kill_refused_exec();
+                    return Ok(self.cancel_refused_exec(receipt, pending.claim));
                 }
             };
             if resources.members.len() != 1 {
                 drop(graph);
-                let cancelled = self.service.cancel_exec_successor(receipt);
-                let released = self.release_service_claim(pending.claim);
-                cancelled?;
-                released?;
-                return self.kill_refused_exec();
+                return Ok(self.cancel_refused_exec(receipt, pending.claim));
             }
             let result = resources.prepare_close_on_exec(
                 self.key,
@@ -1043,32 +1038,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             );
             if result.is_err() {
                 drop(result);
-                let cancelled = self.service.cancel_exec_successor(receipt);
-                let released = self.release_service_claim(pending.claim);
-                cancelled?;
-                released?;
-                return self.kill_refused_exec();
+                return Ok(self.cancel_refused_exec(receipt, pending.claim));
             }
             match result {
                 Ok(prepared) => prepared,
                 Err(_) => return Err(NativeProcessError::Quarantined),
             }
         };
-        let successor_service = match pending
-            .exec_successor
-            .as_ref()
-            .ok_or(NativeProcessError::Quarantined)?
-            .prepare_adoption()
-        {
+        let Some(successor_slot) = pending.exec_successor.as_ref() else {
+            drop(prepared_fds);
+            return Ok(self.cancel_refused_exec(receipt, pending.claim));
+        };
+        let successor_service = match successor_slot.prepare_adoption() {
             Ok(handle) => handle,
             Err(error) => {
                 drop(prepared_fds);
-                let cancelled = self.service.cancel_exec_successor(receipt);
-                let released = self.release_service_claim(pending.claim);
-                cancelled?;
-                released?;
                 let _ = error;
-                return self.kill_refused_exec();
+                return Ok(self.cancel_refused_exec(receipt, pending.claim));
             }
         };
         let rebind_control = pending.control.clone();
@@ -1079,12 +1065,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Ok(prepared) => prepared,
             Err(error) => {
                 drop(prepared_fds);
-                let cancelled = self.service.cancel_exec_successor(receipt);
-                let released = self.release_service_claim(pending.claim);
-                cancelled?;
-                released?;
                 let _ = error;
-                return self.kill_refused_exec();
+                return Ok(self.cancel_refused_exec(receipt, pending.claim));
             }
         };
         let successor = match self
@@ -1094,23 +1076,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Ok(successor) => successor,
             Err(error) => {
                 drop(prepared_fds);
-                let cancelled = self.service.cancel_exec_successor(receipt);
-                let released = self.release_service_claim(pending.claim);
-                cancelled?;
-                released?;
                 let _ = error;
-                return self.kill_refused_exec();
+                return Ok(self.cancel_refused_exec(receipt, pending.claim));
             }
         };
-        let successor_slot = pending
-            .exec_successor
-            .take()
-            .ok_or(NativeProcessError::Quarantined)?;
+        let Some(successor_slot) = pending.exec_successor.take() else {
+            drop(prepared_fds);
+            let _ = self.release_service_claim(pending.claim);
+            return Ok(self.kill_refused_exec());
+        };
         successor_slot.commit();
         if successor.address != expected_address {
             drop(prepared_fds);
-            self.release_service_claim(pending.claim)?;
-            return self.kill_refused_exec();
+            let _ = self.release_service_claim(pending.claim);
+            return Ok(self.kill_refused_exec());
         }
         let predecessor = self.caller_address;
         let successor_address = successor.address;
@@ -1124,8 +1103,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .finish_exec_successor(predecessor, successor_address)
                 .is_err()
         {
-            self.release_service_claim(pending.claim)?;
-            return self.kill_refused_exec();
+            let _ = self.release_service_claim(pending.claim);
+            return Ok(self.kill_refused_exec());
         }
         self.release_service_claim(pending.claim)?;
         Ok(NativeResume::NoPending)

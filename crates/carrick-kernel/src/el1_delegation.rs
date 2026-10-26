@@ -137,6 +137,7 @@ pub fn publish_current_task(
     generation: carrick_el1_abi::SnapshotGeneration,
     file_table: u64,
     visible_pid: u32,
+    ptrace_traced: bool,
     root_generation: carrick_el1_abi::ContextGeneration,
 ) {
     if file_table == 0 {
@@ -161,6 +162,7 @@ pub fn publish_current_task(
         .file_table
         .store(file_table, Ordering::Relaxed);
     current_task.publish_visible_pid(visible_pid);
+    current_task.publish_ptrace_traced(ptrace_traced);
     current_task.publish_root_generation(root_generation);
     current_task
         .execution
