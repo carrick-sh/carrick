@@ -578,8 +578,11 @@ impl Stage1Authority {
         while cursor < end {
             let offset = cursor.checked_sub(completion.span_va)?;
             let old = completion.old_ipa.checked_add(offset)?;
-            let new = completion.new_ipa.checked_add(offset)?;
-            if manager.translate(cursor) != Some(new) {
+            // EL1's completion authenticates the old-to-new publication and
+            // its TLBI. A later admitted owner edit may already have retired
+            // or re-armed the replacement before host settlement; only a
+            // reappearance of the old output invalidates this receipt.
+            if manager.translate_retained_output(cursor) == Some(old) {
                 return None;
             }
             retired.push((cursor, old));
