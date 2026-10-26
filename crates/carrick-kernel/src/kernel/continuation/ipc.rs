@@ -360,7 +360,7 @@ fn epoll_rerun(op: &IpcOperation, clock: CounterClock) -> IpcHostOutcome {
 /// The outcome of stopping `op` for `cause` at counter reading `clock`
 /// (pure policy).
 pub fn interrupted(op: &IpcOperation, cause: IpcCause, clock: CounterClock) -> IpcHostOutcome {
-    if op.kind == IpcOpKind::EpollWait {
+    if matches!(op.kind, IpcOpKind::EpollWait | IpcOpKind::PollWait) {
         // epoll_wait(2) is never restarted after a handler, SA_RESTART or
         // not, and a stop followed by SIGCONT interrupts it too, with no
         // handler (man 7 signal, the Linux-specific list). Other control
@@ -590,7 +590,7 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
     if let Some(cause) = signal {
         return interrupt(region, token, cause, wake);
     }
-    if op.kind == IpcOpKind::EpollWait {
+    if matches!(op.kind, IpcOpKind::EpollWait | IpcOpKind::PollWait) {
         // A parked zone epoll wait owns no progress: the host runs the
         // original call (its harvest covers both halves) with what is left
         // of its deadline, so a wake that found nothing never extends it.

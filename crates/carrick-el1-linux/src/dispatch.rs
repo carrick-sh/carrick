@@ -1830,7 +1830,8 @@ impl<
         self.ipc_transfer()
     }
     fn poll(&mut self) -> FamilyCompletion {
-        let Some(task) = self.task() else {
+        let task_index = self.frame.task_index();
+        let Some(task) = self.current_tasks.get(task_index) else {
             return FamilyCompletion::Forward;
         };
         let fds_ptr = self.frame.argument(0).unwrap_or(0);
@@ -1920,6 +1921,47 @@ impl<
         };
         if !copied {
             return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
+        }
+        if nfds == 1
+            && matches!(sig_mask, PollSignalMask::Inherit)
+            && self
+                .ipc
+                .is_some_and(|venue| venue.tables.is_owned_table(task))
+        {
+            let Some(frame) = self.frame.arm_frame() else {
+                self.frame.record_isa_unsupported_forward();
+                return FamilyCompletion::Forward;
+            };
+            let Some(slot) = SlotId::from_index(frame.slot as usize) else {
+                return FamilyCompletion::Forward;
+            };
+            let Some(zone) = self.zone.as_mut() else {
+                return FamilyCompletion::Forward;
+            };
+            let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
+            let mut user = file::ValidatedCopy {
+                task,
+                validator: &file::HardwareValidator,
+            };
+            let Some(venue) = self.ipc else {
+                return FamilyCompletion::Forward;
+            };
+            if let Some(disposition) = ipc::serve_poll_one(
+                &mut sched,
+                frame,
+                venue,
+                &mut user,
+                &mut pollfds[0],
+                fds_ptr,
+                timeout_ms,
+            ) {
+                return carrick_personality_linux::dispatch::transfer_effect(
+                    &task.linux,
+                    fds_ptr,
+                    frame.x[0] as i64,
+                    disposition,
+                );
+            }
         }
         let file_table = task
             .linux

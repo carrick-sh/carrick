@@ -74,6 +74,8 @@ pub use linux::{SYS_READ, SYS_WRITE};
 
 mod epoll;
 pub use epoll::SYS_EPOLL_PWAIT;
+mod poll;
+pub use poll::serve_one as serve_poll_one;
 
 /// Where the venue finds a task's descriptor table in the shared authority.
 /// Returns a table only when it is the task's complete descriptor namespace
@@ -1281,7 +1283,7 @@ mod tests {
             let mut extent = self.descriptor_extent(64);
             let t = self.host().fork(parent, &mut extent).unwrap();
             self.map
-                .publish(file_table_of(tid, self.a_tid), t.to_raw())
+                .publish_owned(file_table_of(tid, self.a_tid), t.to_raw())
                 .unwrap();
             t
         }
@@ -1397,6 +1399,36 @@ mod tests {
             };
             serve_ipc(&mut sched, frame, &venue, &mut user)
         }
+        fn call_poll(
+            &mut self,
+            frame: &mut TrapFrame,
+            pollfd: &mut crate::file_table::PollFd,
+            user_va: u64,
+            timeout_ms: i32,
+        ) -> IpcServed {
+            let zone: &ZoneTables = &self.zone;
+            let mut sched = Sched {
+                handoff: None,
+                zone,
+                slot: SLOT,
+                task: &self.task,
+                cpu: &mut self.cpu,
+                user: &HardwareUserWord,
+                counters: self.counters,
+            };
+            let venue = IpcVenue {
+                region: *self.region,
+                tables: &self.tables,
+            };
+            let mut user = User {
+                task: &self.task,
+                mem: &self.mem,
+            };
+            serve_poll_one(
+                &mut sched, frame, &venue, &mut user, pollfd, user_va, timeout_ms,
+            )
+            .expect("native one-fd poll")
+        }
         /// Queue thread `tid` of `mm`, runnable on the slot, about to issue
         /// the syscall in `frame` (its SVC at `svc`).
         fn queue(&self, tid: u64, mm: u64, frame: &TrapFrame, svc: u64) {
@@ -1434,6 +1466,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_child_poll_on_inherited_pipe_parks_and_wakes_in_guest() {
+        let mut w = world();
+        let parent = w.table(w.a_tid);
+        let (reader, writer, _) = w.pipe(parent, BLOCK);
+        let (empty_reader, _, _) = w.pipe(parent, BLOCK);
+        w.fork_table(parent, 202);
+        w.fork_table(parent, 303);
+        w.task.linux.file_table.store(202, Ordering::Release);
+
+        let va = 0x2_0000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.write(OTHER_MM, va, &0xfeed_u64.to_ne_bytes());
+        let b_write = syscall(SYS_WRITE, writer, va, 8, B_SVC);
+        w.queue(303, OTHER_MM, &b_write, B_SVC);
+
+        let mut pollfd = crate::file_table::PollFd {
+            fd: reader,
+            events: 0x0001 | 0x0008 | 0x0010,
+            revents: 0,
+        };
+        let mut frame = syscall(7, 0, 0, 0, A_SVC);
+        frame.x[0] = va;
+        frame.x[1] = 1;
+        frame.x[2] = 5_000;
+        let a_regs = frame.x;
+        assert_eq!(w.call_poll(&mut frame, &mut pollfd, va, 5_000), SWITCHED);
+        assert_eq!(frame.elr, B_SVC);
+
+        frame = b_write;
+        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, 8));
+        let mut block_b = syscall(SYS_READ, empty_reader, va, 8, B_SVC);
+        assert_eq!(w.call(&mut block_b), SWITCHED);
+        assert_eq!(block_b.x, a_regs);
+        reenter(&mut block_b, A_SVC);
+
+        pollfd.revents = 0;
+        assert_eq!(w.call_poll(&mut block_b, &mut pollfd, va, 5_000), RETURNED);
+        assert_eq!(block_b.x[0], 1);
+        assert_eq!(pollfd.revents, 0x0001);
+        assert_eq!(host_calls(&w), 0, "native wait never crossed to host");
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(!w.zone.record(current).has_object_operation());
+    }
     /// The operation a handback frame names (its token is in `x0`).
     fn handed_back(w: &World, frame: &TrapFrame) -> IpcOperation {
         let raw = carrick_el1_abi::ipc::RawIpcOpToken::unpack(frame.x[0]);
