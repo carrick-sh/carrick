@@ -46,3 +46,35 @@ fn el1_transparent_fork_exec_shared_backing() {
         "expected at least 6 write syscalls across fork and exec in shared EL1 counters, got {forwarded_writes}"
     );
 }
+
+#[test]
+fn native_root_exec_replaces_pid1_shell() {
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(90));
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command(["/bin/sh", "-c", "exec /bin/echo pid1_exec_ok"])
+            .run_blocking(),
+    );
+    assert!(result.success(), "stderr={}", result.stderr_utf8());
+    assert_eq!(result.stdout_utf8(), "pid1_exec_ok\n");
+}
+
+#[test]
+fn native_child_exec_after_reusing_a_retired_slot() {
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(90));
+    let result = common::run_or_fail(
+        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([
+                "/bin/sh",
+                "-c",
+                "(exit 0) & first=$!; wait $first; (exec /bin/echo reused_slot_exec_ok) & second=$!; wait $second",
+            ])
+            .run_blocking(),
+    );
+    assert!(result.success(), "stderr={}", result.stderr_utf8());
+    assert_eq!(result.stdout_utf8(), "reused_slot_exec_ok\n");
+}
