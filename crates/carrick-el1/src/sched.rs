@@ -95,6 +95,7 @@ pub trait ThreadCpu {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeAction {
     NoPending,
+    RetrySyscall,
     Returned(carrick_guest_arch::NativeReturnWord),
     Left,
 }
@@ -473,15 +474,25 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let resumed = self
             .cpu
             .resume_lifecycle(zone, self.task, slot, switched.record);
+        let retry_syscall = resumed == ResumeAction::RetrySyscall;
         let result = match resumed {
             ResumeAction::Returned(result) => Some(result.0),
             ResumeAction::NoPending => switched.result,
+            // The wake only says that physical supply completed. Replaying
+            // the SVC must preserve all original syscall arguments, including
+            // x0, rather than installing the scheduler's wake result.
+            ResumeAction::RetrySyscall => None,
             ResumeAction::Left => {
                 self.leave_space();
                 return LoadResult::Left;
             }
         };
         self.cpu.load(frame, ctx);
+        if retry_syscall {
+            // The typed continuation is created only while handling an AArch64
+            // SVC, whose saved ELR names the following aligned instruction.
+            frame.elr = frame.elr.wrapping_sub(4);
+        }
         self.task
             .linux
             .orig_arg0

@@ -2224,6 +2224,7 @@ fn exec_after_sibling_drain(parked_read: bool) {
     let resumed = entry.resume_checkpoint();
     let resumed_kind = match &resumed {
         Ok(NativeResume::NoPending) => "no-pending",
+        Ok(NativeResume::RetrySyscall) => "retry-syscall",
         Ok(NativeResume::Left(_)) => "left",
         Ok(NativeResume::Returned(_)) => "returned",
         Ok(NativeResume::Invalid) => "invalid",

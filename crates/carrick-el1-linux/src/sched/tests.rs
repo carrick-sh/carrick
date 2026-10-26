@@ -1562,6 +1562,38 @@ fn left_checkpoint_skips_selected_frame_and_runs_next_record() {
 }
 
 #[test]
+fn syscall_retry_preserves_arguments_and_reenters_the_svc() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let word = AtomicU32::new(0);
+    let address = word.as_ptr() as u64;
+    let context = thread_ctx(0xB, address);
+    let record = queue_foreign(&zone, 202, MM, address, context);
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, address, FUTEX_WAIT_PRIVATE, 0);
+    cpu.resume_once = Some(ResumeAction::RetrySyscall);
+
+    assert_eq!(
+        (Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: counters(),
+        })
+        .run_next(&mut frame, 0),
+        Served::Returned { switched: true }
+    );
+    assert_eq!(zone.slot(SLOT).current(), Some(record));
+    assert_eq!(frame.x, context.x, "wake result must not replace x0");
+    assert_eq!(frame.elr, context.pc - 4);
+}
+
+#[test]
 fn left_checkpoint_host_exit_keeps_the_prior_frame() {
     let zone = zone();
     publish_space(&zone, MM, TTBR_MM);

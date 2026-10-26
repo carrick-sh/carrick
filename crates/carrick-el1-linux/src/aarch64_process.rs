@@ -210,6 +210,7 @@ pub(super) fn map_resume<X: ForkStockCrossing>(
 ) -> crate::sched::ResumeAction {
     match outcome {
         NativeResume::NoPending => crate::sched::ResumeAction::NoPending,
+        NativeResume::RetrySyscall => crate::sched::ResumeAction::RetrySyscall,
         NativeResume::Returned(result) => crate::sched::ResumeAction::Returned(
             carrick_guest_arch::NativeReturnWord(result.raw() as u64),
         ),

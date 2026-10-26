@@ -60,6 +60,10 @@ use core::{
 /// a record with retained lifecycle work.
 pub enum NativeResume {
     NoPending,
+    /// Physical supply completed for user memory needed to stage the current
+    /// syscall. Re-enter the exact SVC instruction instead of returning to
+    /// EL0 after it.
+    RetrySyscall,
     Returned(SyscallResult),
     Left(Option<LinuxWaitStatus>),
     Invalid,
@@ -4810,6 +4814,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some(result) = self.resume_service() {
             match result.map_err(NativeProcessError::run_failure_reason)? {
                 NativeResume::NoPending => {}
+                NativeResume::RetrySyscall => return Ok(NativeResume::RetrySyscall),
                 NativeResume::Left(status) => {
                     if self.take_handoff_receipt().is_none() {
                         return Ok(NativeResume::Invalid);
