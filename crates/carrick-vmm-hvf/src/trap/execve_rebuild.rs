@@ -207,6 +207,7 @@ impl PendingExecStage2Cleanup {
                 )
             })?;
             let staged = StagedProcessStage2Retirement {
+                owner_mm: self.predecessor_mm,
                 candidates: self
                     .extents
                     .keys()
@@ -2138,13 +2139,24 @@ impl HvfVmState {
                 } else {
                     Vec::new()
                 };
-                let staged = Self::stage_retirement(&mut inventory, retired, authority.as_ref())
-                    .unwrap_or_else(|error| {
-                        carrick_fatal!(
-                            "hvpatch::frame_inventory",
-                            "stage inventory after HVPatch exec unmap: {error}"
-                        );
-                    });
+                let staged = Self::stage_retirement(
+                    &mut inventory,
+                    retired,
+                    authority.as_ref(),
+                    self.cow_identity
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "HVPatch exec retirement has no predecessor MM identity".to_owned(),
+                            )
+                        })?
+                        .mm,
+                )
+                .unwrap_or_else(|error| {
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "stage inventory after HVPatch exec unmap: {error}"
+                    );
+                });
                 predecessor_stage2_reference_releases = staged.reference_releases;
                 let scope = CowInventoryLifecycleScope {
                     custody: &self.carrier_foreign_mm_transport.custody,

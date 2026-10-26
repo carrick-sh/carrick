@@ -2807,6 +2807,7 @@ mod carrier_vm_custody_tests {
             frames.release_stage2_reference(
                 lease,
                 Some(identity),
+                crate::trap::Stage1ReferenceOwner::EditorAuthority(wrong.authority()),
                 Stage1UnpublicationReceipt::EditorRange(&wrong),
             ),
             Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease))
@@ -2814,11 +2815,25 @@ mod carrier_vm_custody_tests {
         assert_eq!(frames.stage2_references.get(&lease), Some(&2));
 
         let exact = leaf_retirement_receipt(lease.0);
+        assert_eq!(
+            frames.release_stage2_reference(
+                lease,
+                Some(identity),
+                crate::trap::Stage1ReferenceOwner::EditorAuthority(
+                    exact.authority().wrapping_add(1),
+                ),
+                Stage1UnpublicationReceipt::EditorRange(&exact),
+            ),
+            Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease)),
+            "an exact-range receipt from a different Editor authority cannot release the extent",
+        );
+        assert_eq!(frames.stage2_references.get(&lease), Some(&2));
         assert!(
             frames
                 .release_stage2_reference(
                     lease,
                     Some(identity),
+                    crate::trap::Stage1ReferenceOwner::EditorAuthority(exact.authority()),
                     Stage1UnpublicationReceipt::EditorRange(&exact),
                 )
                 .unwrap()
@@ -2828,6 +2843,7 @@ mod carrier_vm_custody_tests {
             .release_stage2_reference(
                 lease,
                 Some(identity),
+                crate::trap::Stage1ReferenceOwner::EditorAuthority(exact.authority()),
                 Stage1UnpublicationReceipt::EditorRange(&exact),
             )
             .unwrap()
@@ -5045,6 +5061,7 @@ mod carrier_vm_custody_tests {
             frames.release_stage2_reference(
                 lease,
                 Some(identity),
+                crate::trap::Stage1ReferenceOwner::EditorAuthority(receipt.authority()),
                 Stage1UnpublicationReceipt::EditorRange(&receipt),
             ),
             Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease)),

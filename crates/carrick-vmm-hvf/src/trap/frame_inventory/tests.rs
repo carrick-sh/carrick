@@ -157,6 +157,36 @@ fn whole_mm_receipt_cannot_release_another_mms_structural_reference() {
     assert_eq!(frames.stage2_references.get(&lease), Some(&1));
 }
 
+#[test]
+fn whole_mm_receipt_cannot_release_another_mms_data_extent() {
+    let lease = (0xa300_0020_0000, 0x4000);
+    let mut frames = InventoryFrameRegistry::default();
+    frames.stage2_references.insert(lease, 1);
+    let receipt = test_whole_mm_stage1_proof_for(42);
+
+    assert_eq!(
+        frames.release_stage2_reference(
+            lease,
+            None,
+            Stage1ReferenceOwner::Mm(41),
+            Stage1UnpublicationReceipt::Inventory(&receipt),
+        ),
+        Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease))
+    );
+    assert_eq!(frames.stage2_references.get(&lease), Some(&1));
+
+    assert_eq!(
+        frames.release_stage2_reference(
+            lease,
+            None,
+            Stage1ReferenceOwner::Mm(42),
+            Stage1UnpublicationReceipt::Inventory(&receipt),
+        ),
+        Ok(None)
+    );
+    assert!(!frames.stage2_references.contains_key(&lease));
+}
+
 /// Model the inventory after one 4 KiB semantic discard in each 16 KiB
 /// compound, with a fork peer still retaining the complete compound. This
 /// exercises inventory/physical retirement, not the guest DONTNEED adapter.
@@ -228,13 +258,14 @@ fn el1_partial_discard_peer_retention_three_scales() {
                 Vec::new(),
             )
         };
+        let parent_proof = test_whole_mm_stage1_proof_for(12);
         let parent_staged = HvfVmState::stage_retirement(
             &mut parent,
             &mut reservation(1),
             &TestFrameMappingCount::Exact(2),
+            parent_proof.mm(),
         )
         .unwrap();
-        let parent_proof = test_whole_mm_stage1_proof();
         let parent_candidates = parent_staged
             .release_with(
                 &mut parent.frames.lock(),
@@ -260,13 +291,14 @@ fn el1_partial_discard_peer_retention_three_scales() {
                     .all(|byte| *byte == 0x7c)
             );
         }
+        let child_proof = test_whole_mm_stage1_proof_for(13);
         let child_staged = HvfVmState::stage_retirement(
             &mut child,
             &mut reservation(2),
             &TestFrameMappingCount::Exact(1),
+            child_proof.mm(),
         )
         .unwrap();
-        let child_proof = test_whole_mm_stage1_proof();
         let child_candidates = child_staged
             .release_with(
                 &mut child.frames.lock(),
@@ -3586,6 +3618,7 @@ fn carrier_drop_preserves_lease_until_last_exact_stage1_reference() {
         .release_stage2_reference(
             key,
             Some(identity),
+            Stage1ReferenceOwner::Mm(last_mm.mm()),
             Stage1UnpublicationReceipt::Inventory(&last_mm),
         )
         .unwrap()
@@ -3775,7 +3808,7 @@ fn process_retirement_does_not_combine_counts_from_different_populations() {
     let authority = task.cow_authority.as_ref().unwrap();
     let mut inventory = task.frame_inventory.lock();
     let mut reservation = inventory.retirement_reservation.take().unwrap();
-    HvfVmState::stage_retirement(&mut inventory, &mut reservation, authority.as_ref())
+    HvfVmState::stage_retirement(&mut inventory, &mut reservation, authority.as_ref(), 1)
         .expect("stage retirement with one sibling publication attempt");
     let commit = reservation.commit(());
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -5226,6 +5259,7 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
         custody,
         &inventory,
         &retirement,
+        receipt.authority(),
         Stage1UnpublicationReceipt::EditorRange(&receipt),
         reservation,
         |_| Ok(()),
@@ -5327,6 +5361,7 @@ fn final_carrier_mm_drop_keeps_a_backend_referenced_stage2_lease_live() {
         .release_stage2_reference(
             key,
             Some(identity),
+            Stage1ReferenceOwner::Mm(last_mm.mm()),
             Stage1UnpublicationReceipt::Inventory(&last_mm),
         )
         .unwrap()
@@ -8771,6 +8806,7 @@ fn an_unmap_retirement_racing_a_sibling_unmap_carries_the_conditional_retire() {
         custody,
         &unmapping.frame_inventory.ledger,
         &retirement,
+        receipt.authority(),
         Stage1UnpublicationReceipt::EditorRange(&receipt),
         reservation,
         |commit| {
@@ -8983,9 +9019,9 @@ pub(crate) fn assert_fork_child_exec_retirement(
         );
     }
     let mut reservation = kernel.reserve(0, 0, child.extents.len() * 2).unwrap();
-    let staged = HvfVmState::stage_retirement(child, &mut reservation, &kernel)
+    let stage1 = test_whole_mm_stage1_proof_for(13);
+    let staged = HvfVmState::stage_retirement(child, &mut reservation, &kernel, stage1.mm())
         .expect("stage the fork child's old-mm exec retirement");
-    let stage1 = test_whole_mm_stage1_proof();
     let retired = staged
         .release_with(
             &mut child.frames.lock(),
@@ -9068,6 +9104,7 @@ fn a_sibling_exit_cannot_decide_between_an_unmap_apply_and_its_backend_decrement
         custody,
         &unmapping.frame_inventory.ledger,
         &retirement,
+        receipt.authority(),
         Stage1UnpublicationReceipt::EditorRange(&receipt),
         reservation,
         |commit| {

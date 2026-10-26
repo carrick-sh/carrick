@@ -6520,6 +6520,7 @@ impl HvfVmState {
             &custody,
             &self.frame_inventory.ledger,
             &retirement,
+            self.page_tables_authority().authority_id(),
             stage1,
             reservation,
             |commit| {
