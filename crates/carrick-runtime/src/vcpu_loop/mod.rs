@@ -5226,9 +5226,7 @@ pub(crate) mod tests {
                             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
                             "the production service must park on the sibling's editor, never return EFAULT",
                         );
-                    } else if stale_selection_without_editor {
-                        assert!(matches!(first, DispatchOutcome::OwnerMemoryWait { .. }));
-                    } else if released_editor_admission {
+                    } else if stale_selection_without_editor || released_editor_admission {
                         assert!(matches!(first, DispatchOutcome::OwnerMemoryWait { .. }));
                     }
                     assert_eq!(engine.prepared_commits, 0);
