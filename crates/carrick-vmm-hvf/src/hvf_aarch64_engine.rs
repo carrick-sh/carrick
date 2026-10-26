@@ -2776,8 +2776,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &mut self,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         identity: carrick_hal::FrameCowIdentity,
-    ) {
-        self.state.bind_frame_cow(authority, identity);
+    ) -> Result<(), TrapError> {
+        self.state.bind_frame_cow(authority, identity)
     }
 
     fn prepare_el1_frame_grant(

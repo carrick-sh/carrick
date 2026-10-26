@@ -3422,7 +3422,8 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         &mut self,
         _authority: std::sync::Arc<dyn FrameCowAuthority>,
         _identity: FrameCowIdentity,
-    ) {
+    ) -> Result<(), TrapError> {
+        Ok(())
     }
 
     /// Service an exact file fault selected by the admitted owner. `None`

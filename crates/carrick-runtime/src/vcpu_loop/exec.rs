@@ -2244,7 +2244,7 @@ where
                     mm: committed_mm.raw(),
                     asid: binding.asid.raw(),
                 },
-            );
+            )?;
             if !kernel
                 .dispatcher
                 .bind_deferred_anonymous_state(engine, committed_mm)

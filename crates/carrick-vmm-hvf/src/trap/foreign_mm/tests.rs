@@ -940,7 +940,7 @@ fn install_mm_sparse(
             deferred,
         ));
     }
-    transport.register(&snapshot, &state);
+    transport.register(&snapshot, &state).unwrap();
     InstalledMm {
         live: TestLiveAuthority(Arc::new(parking_lot::RwLock::new(snapshot.clone()))),
         snapshot,
@@ -3937,7 +3937,9 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         Arc::new(parking_lot::Mutex::new(Vec::new())),
         crate::hvf_aarch64_engine::HostCowStats::default(),
     );
-    transport.register(&replacement_snapshot, &replacement_state);
+    transport
+        .register(&replacement_snapshot, &replacement_state)
+        .unwrap();
 
     let mut bytes = [0_u8; 4];
     let receipt = lease
@@ -7559,7 +7561,7 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
         asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
         stage1_root: Gpa::new(physical_ipa),
     };
-    transport.register_identity(mm, binding, &state);
+    transport.register_identity(mm, binding, &state).unwrap();
     let snapshot = CarrierForeignMmSnapshot {
         mm,
         binding,
@@ -7645,8 +7647,12 @@ fn owned_foreign_mm_registration_teardown_is_exact_and_stale_safe() {
     let new_state = make_state();
     let old_mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
     let new_mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(32).unwrap());
-    let old = transport.register_owned_identity(old_mm, binding, &old_state);
-    let current = transport.register_owned_identity(new_mm, binding, &new_state);
+    let old = transport
+        .register_owned_identity(old_mm, binding, &old_state)
+        .unwrap();
+    let current = transport
+        .register_owned_identity(new_mm, binding, &new_state)
+        .unwrap();
 
     drop(old);
     let current_snapshot = CarrierForeignMmSnapshot {
@@ -8548,11 +8554,13 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let child_captured = CarrierForeignMmSnapshot::capture(&child_snapshot);
 
     // Register child identity in carrier foreign MM transport
-    carrier_foreign_mm_transport.register_identity(
-        child_captured.mm,
-        child_captured.binding,
-        &child_task_state.mm_access,
-    );
+    carrier_foreign_mm_transport
+        .register_identity(
+            child_captured.mm,
+            child_captured.binding,
+            &child_task_state.mm_access,
+        )
+        .unwrap();
 
     let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::clone(
         &carrier_foreign_mm_transport,
@@ -8672,7 +8680,9 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         }
     }
     let stale_transport = Arc::new(CarrierForeignMmTransport::new());
-    stale_transport.register_identity(child_captured.mm, child_captured.binding, &stale_mm_access);
+    stale_transport
+        .register_identity(child_captured.mm, child_captured.binding, &stale_mm_access)
+        .unwrap();
     let stale_endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(
         stale_transport as Arc<dyn carrick_hal::ForeignMmTransport>,
     );
@@ -13054,7 +13064,7 @@ mod guest_cow {
         // settles nothing.
         let spaces = AddressSpaces::new();
         let transport = Arc::new(CarrierForeignMmTransport::new());
-        transport.register(&child.snapshot, &child.state);
+        transport.register(&child.snapshot, &child.state).unwrap();
         // As every COW runtime binding does, the carrier records the MM's state.
         custody.register_guest_cow_state(mm, &child.state);
         let settlement = CarrierGuestCowSettlement::for_test(&custody, pool);
@@ -13321,13 +13331,17 @@ mod guest_cow {
             LiveDescriptorOwner::Host
         );
         assert_eq!(state.protections.pending_owner(), Some(handle));
-        state.install_identity(
-            carrick_hal::ForeignMmId::from_kernel_allocation(mm),
-            CarrierForeignMmBinding {
-                asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
-                stage1_root: Gpa::new(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
-            },
-        );
+        state
+            .install_identity(
+                carrick_hal::ForeignMmId::from_kernel_allocation(mm),
+                CarrierForeignMmBinding {
+                    asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                        NonZeroU16::new(7).unwrap(),
+                    ),
+                    stage1_root: Gpa::new(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
+                },
+            )
+            .unwrap();
         assert_eq!(
             engine_authority.live_descriptor_owner(),
             LiveDescriptorOwner::Guest,
@@ -13391,15 +13405,23 @@ mod guest_cow {
             asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
             stage1_root: Gpa::new(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
         };
-        first.install_identity(
-            carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(807).unwrap()),
-            binding,
-        );
+        first
+            .install_identity(
+                carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(807).unwrap()),
+                binding,
+            )
+            .unwrap();
         // A state presented with the first MM's identity cannot consume the
         // second MM's pending guard, despite the equal root virtual address.
-        second.install_identity(
-            carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(807).unwrap()),
-            binding,
+        assert!(
+            second
+                .install_identity(
+                    carrick_hal::ForeignMmId::from_kernel_allocation(
+                        NonZeroU64::new(807).unwrap(),
+                    ),
+                    binding,
+                )
+                .is_err()
         );
         assert_eq!(first.protections.owner(), Some(first_handle));
         assert_eq!(
@@ -13412,10 +13434,12 @@ mod guest_cow {
             second_tables.live_descriptor_owner(),
             LiveDescriptorOwner::Host
         );
-        second.install_identity(
-            carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(808).unwrap()),
-            binding,
-        );
+        second
+            .install_identity(
+                carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(808).unwrap()),
+                binding,
+            )
+            .unwrap();
         assert_eq!(second.protections.owner(), Some(second_handle));
         assert_eq!(
             second_tables.live_descriptor_owner(),
@@ -13747,13 +13771,17 @@ mod guest_cow {
         let pending_state = state_with(LiveBackingBinding::Deferred, protections);
         pending_state.bind_page_tables_authority(pending.clone());
         assert_eq!(pending.live_descriptor_owner(), LiveDescriptorOwner::Host);
-        pending_state.install_identity(
-            carrick_hal::ForeignMmId::from_kernel_allocation(mm),
-            CarrierForeignMmBinding {
-                asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
-                stage1_root: Gpa::new(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
-            },
-        );
+        pending_state
+            .install_identity(
+                carrick_hal::ForeignMmId::from_kernel_allocation(mm),
+                CarrierForeignMmBinding {
+                    asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                        NonZeroU16::new(7).unwrap(),
+                    ),
+                    stage1_root: Gpa::new(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
+                },
+            )
+            .unwrap();
         assert_eq!(pending.live_descriptor_owner(), LiveDescriptorOwner::Guest);
         assert_eq!(pending_state.protections.owner(), Some(handle));
     }

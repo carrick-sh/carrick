@@ -5598,7 +5598,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         &mut self,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         identity: carrick_hal::FrameCowIdentity,
-    ) {
+    ) -> Result<(), TrapError> {
         if self.mm_generation != identity.mm {
             carrick_fatal!(
                 "aarch64::cow_identity",
@@ -5610,7 +5610,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // FrameCowIdentity carries the numeric hardware ASID, not the strong
         // allocation generation. `bind_task_snapshot_identity` installed that
         // generation immediately before this call; preserve it verbatim.
-        self.vm.bind_frame_cow(authority, identity);
+        self.vm.bind_frame_cow(authority, identity)
     }
 
     fn service_owner_file_fault(

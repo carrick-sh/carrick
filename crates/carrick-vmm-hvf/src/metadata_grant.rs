@@ -429,10 +429,34 @@ struct GrantedSlotRecord {
 /// Validated EL1 metadata-aperture retirement operation. The aperture has a
 /// permanent carrier-control stage-1 leaf, so it is outside user-MM SELECT;
 /// only the exact validated return transaction may retire its stage-2 record.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct El1MetadataRetirement {
     identity: crate::trap::CarrierStage2RecordIdentity,
 }
+
+impl Clone for El1MetadataRetirement {
+    fn clone(&self) -> Self {
+        Self {
+            identity: self.identity,
+        }
+    }
+}
+
+impl std::fmt::Debug for El1MetadataRetirement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("El1MetadataRetirement")
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
+impl PartialEq for El1MetadataRetirement {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for El1MetadataRetirement {}
 
 impl El1MetadataRetirement {
     pub(crate) fn matches(&self, identity: crate::trap::CarrierStage2RecordIdentity) -> bool {

@@ -7304,7 +7304,7 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
                 mm: mm.raw(),
                 asid: binding.asid.raw(),
             },
-        );
+        )?;
     }
     if !kernel.dispatcher.bind_deferred_anonymous_state(engine, mm) {
         return Err(RuntimeError::Configuration(

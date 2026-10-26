@@ -2541,7 +2541,7 @@ impl HvfVmState {
         &mut self,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         identity: carrick_hal::FrameCowIdentity,
-    ) {
+    ) -> Result<(), TrapError> {
         self.task.bind_frame_cow(authority, identity);
         if let (Some(mm), Some(asid), Some((stage1_root, _))) = (
             std::num::NonZeroU64::new(identity.mm),
@@ -2555,8 +2555,9 @@ impl HvfVmState {
                     stage1_root: carrick_guest_mem::Gpa::new(stage1_root),
                 },
                 &self.task.mm_access,
-            );
+            )?;
         }
+        Ok(())
     }
 
     pub(crate) fn prepare_exec_address_space(
@@ -6292,7 +6293,7 @@ impl HvpatchTaskRegistration {
                 stage1_root: carrick_guest_mem::Gpa::new(stage1_root),
             },
             &task.mm_access,
-        ));
+        )?);
         Ok(())
     }
 

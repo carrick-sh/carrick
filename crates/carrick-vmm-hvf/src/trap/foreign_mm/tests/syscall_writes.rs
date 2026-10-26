@@ -256,7 +256,9 @@ fn native_code_content_syscall_alias_fallback_revokes_original_instruction_read(
     let mut fixture = WriteFixture::new();
     let owner = fixture.owner();
     let transport = CarrierForeignMmTransport::new();
-    transport.register(&fixture.installed.snapshot, &fixture.installed.state);
+    transport
+        .register(&fixture.installed.snapshot, &fixture.installed.state)
+        .unwrap();
     let mut bytes = [0; 4];
     let receipt = read_instructions_installed(&transport, &fixture.installed, &mut bytes).unwrap();
     assert_eq!(

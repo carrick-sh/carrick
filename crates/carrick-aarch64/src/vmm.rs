@@ -1050,7 +1050,8 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         &mut self,
         _authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
         _identity: carrick_hal::FrameCowIdentity,
-    ) {
+    ) -> Result<(), TrapError> {
+        Ok(())
     }
 
     fn prepare_el1_frame_grant(

@@ -156,12 +156,13 @@ impl CarrierForeignMmTransport {
         &self,
         snapshot: &dyn carrick_hal::ForeignMmSnapshot,
         state: &std::sync::Arc<MmAccessState>,
-    ) {
+    ) -> Result<(), TrapError> {
         let snapshot = CarrierForeignMmSnapshot::capture(snapshot);
-        state.install_identity(snapshot.mm, snapshot.binding);
+        state.install_identity(snapshot.mm, snapshot.binding)?;
         self.states
             .write()
             .insert(snapshot.binding, std::sync::Arc::downgrade(state));
+        Ok(())
     }
 
     pub(crate) fn register_identity(
@@ -169,11 +170,12 @@ impl CarrierForeignMmTransport {
         mm: carrick_hal::ForeignMmId,
         binding: CarrierForeignMmBinding,
         state: &std::sync::Arc<MmAccessState>,
-    ) {
-        state.install_identity(mm, binding);
+    ) -> Result<(), TrapError> {
+        state.install_identity(mm, binding)?;
         self.states
             .write()
             .insert(binding, std::sync::Arc::downgrade(state));
+        Ok(())
     }
 
     /// The closed first-load publication supplies its exact root while the
@@ -213,14 +215,14 @@ impl CarrierForeignMmTransport {
         mm: carrick_hal::ForeignMmId,
         binding: CarrierForeignMmBinding,
         state: &std::sync::Arc<MmAccessState>,
-    ) -> CarrierForeignMmRegistration {
-        self.register_identity(mm, binding, state);
-        CarrierForeignMmRegistration {
+    ) -> Result<CarrierForeignMmRegistration, TrapError> {
+        self.register_identity(mm, binding, state)?;
+        Ok(CarrierForeignMmRegistration {
             transport: std::sync::Arc::clone(self),
             mm,
             binding,
             state: std::sync::Arc::downgrade(state),
-        }
+        })
     }
 
     pub(crate) fn unregister_exact(&self, registration: &CarrierForeignMmRegistration) {
@@ -1021,7 +1023,9 @@ impl MmAccessState {
             crate::hvf_aarch64_engine::HostCowStats::default(),
         );
         let snapshot = CarrierForeignMmSnapshot::capture(snapshot);
-        state.install_identity(snapshot.mm, snapshot.binding);
+        state
+            .install_identity(snapshot.mm, snapshot.binding)
+            .expect("foreign-read fixture binds its exact MM identity");
         let resolver =
             MmAccessLiveResolver::new(&state, legacy_test_carrier_vm_custody_arc().clone());
         state.set_live_resolver(resolver);
@@ -1038,23 +1042,25 @@ impl MmAccessState {
         &self,
         mm: carrick_hal::ForeignMmId,
         binding: CarrierForeignMmBinding,
-    ) {
+    ) -> Result<(), TrapError> {
+        if self
+            .protections
+            .pending_owner()
+            .is_some_and(|owner| owner.mm().raw() != mm.raw_for_probe())
+        {
+            return Err(TrapError::Hypervisor(format!(
+                "stage-1 authority offered another MM's pending identity {}",
+                mm.raw_for_probe()
+            )));
+        }
         if !self.page_tables.read().bind_mm(mm.raw_for_probe()) {
-            carrick_fatal::carrick_fatal!(
-                "hvpatch::stage1_authority",
+            return Err(TrapError::Hypervisor(format!(
                 "stage-1 authority rebound to MM {}",
                 mm.raw_for_probe()
-            );
+            )));
         }
         *self.identity.write() = Some((mm, binding));
-        self.register_structural_stage2_references()
-            .unwrap_or_else(|error| {
-                carrick_fatal::carrick_fatal!(
-                    "hvpatch::stage2_reference",
-                    "failed to bind structural stage-2 references to MM {}: {error}",
-                    mm.raw_for_probe()
-                )
-            });
+        self.register_structural_stage2_references()?;
         // The initial runner may have recorded backing before the kernel
         // publishes its exact MM identity. Revisit only the same pending
         // admission once both are present.
@@ -1064,6 +1070,7 @@ impl MmAccessState {
             let promoted = unsafe { self.bind_backing(&authority, resolver) };
             self.record_guest_lane_promotion(promoted);
         }
+        Ok(())
     }
 
     pub(crate) fn page_tables_authority(&self) -> carrick_aarch64::Stage1Authority {
