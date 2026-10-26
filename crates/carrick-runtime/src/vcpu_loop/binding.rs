@@ -6645,8 +6645,8 @@ where
             }
         };
 
-        let native_exec_capability = match kernel.native_exec_capability() {
-            Ok(capability) => capability,
+        let native_exec_admission = match kernel.begin_native_exec_service_admission() {
+            Ok(admission) => admission,
             Err(error) => {
                 prepared.fail_exact();
                 return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
@@ -6654,20 +6654,24 @@ where
                 ))));
             }
         };
-        let native_exec_registration = match authority.install_native_exec_service(
-            native_exec_capability.id(),
-            native_exec_capability
-                as Arc<dyn carrick_vmm_hvf::metadata_grant::NativeExecHostService>,
-        ) {
-            Ok(registration) => registration,
-            Err(error) => {
+        if let super::NativeExecServiceAdmission::Install(native_exec_capability) =
+            native_exec_admission
+        {
+            let native_exec_registration = match authority.install_native_exec_service(
+                native_exec_capability.id(),
+                native_exec_capability
+                    as Arc<dyn carrick_vmm_hvf::metadata_grant::NativeExecHostService>,
+            ) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    prepared.fail_exact();
+                    return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
+                }
+            };
+            if let Err(error) = kernel.install_native_exec_registration(native_exec_registration) {
                 prepared.fail_exact();
-                return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
+                return VcpuLoopLaunch::Direct(Err(error));
             }
-        };
-        if let Err(error) = kernel.install_native_exec_registration(native_exec_registration) {
-            prepared.fail_exact();
-            return VcpuLoopLaunch::Direct(Err(error));
         }
 
         // No guest has entered: its start gate remains held. The extracted
