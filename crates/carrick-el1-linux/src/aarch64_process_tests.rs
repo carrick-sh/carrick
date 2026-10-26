@@ -6572,6 +6572,18 @@ fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
         arm_owner_must_serve(221, 0, || NativeThreadGroupOwner::Unowned, 1),
         "the first native root exec establishes its process owner"
     );
+    let mut exec_frame = carrick_el1_abi::TrapFrame::default();
+    exec_frame.x[0] = 0x1234;
+    exec_frame.x[8] = 221;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut exec_frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "the production ARM adapter must hand execve to native service capture"
+    );
+    assert_eq!(
+        exec_frame.x[0], 0x1234,
+        "ring-first dispatch must not install ENOSYS before native exec capture"
+    );
     assert_eq!(
         arm_thread_group_owner(fixture.zone, &fixture.task, foreign_page),
         NativeThreadGroupOwner::Unowned
