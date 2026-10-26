@@ -562,6 +562,46 @@ Fresh portable verification:
 No signed test was run because this correction changes source and therefore
 requires an exact-candidate fixture bundle.
 
+## Exact `3e5abed72` bootstrap smoke and stage-1 edit audit
+
+The exact `3e5abed72a8e9e3c2cc0abf8af68f7fbd0b88b4c` fixture bundle verified
+and restored 1,195 executables. Signed run `847-3e5-smoke-02` reached HVF but
+failed before the workload in 0.11 seconds:
+
+```text
+configuration refused: exclude root EL1 Editor before HVPatch ASID setup
+```
+
+There was no watchdog census, EFAULT, or carrier fatal. The signed harness's
+negative entitlement control passed and run-scoped cleanup reported zero
+remaining Carrick processes. (`847-3e5-smoke-01` never ran a guest: the 20 GiB
+disk guard rejected its prerequisite build while 13 GiB was free.)
+
+The root cause was policy/authority confusion in
+`mm_occupancy::exclude_el1_editor`: it consulted `el1_zone::zone()`, which is
+deliberately unavailable until guest scheduling is enabled, even though the
+raw EL1 address-space table and its unpublished Editor proof already exist.
+Editor exclusion and revision publication now use the raw installed zone
+table, so bootstrap edits are licensed and their guard remains live until that
+exact table is removed.
+
+The same change audited every production `Stage1Authority::edit*` caller:
+
+- the shared AArch64 live-edit funnel (`engine.rs`) receives the exact-MM
+  `Stage1EditLicense` and passes it to both `edit` and `edit_unpublishing`;
+- retained COW and COW replacement (`cow_engine.rs`) obtain the exact MM's
+  exclusion before every edit, rollback, commit, and unpublishing edit;
+- sparse materialisation/import (`sparse_materialization.rs`) does the same
+  for publication, rollback, commit, journal begin, and final mapping;
+- carrier bootstrap and arena setup reach those funnels only after acquiring
+  the root MM exclusion; and
+- the remaining direct calls are VM-free/test-support witnesses, each with an
+  explicit ring `SpaceEditor` or exact-MM host license.
+
+The focused `carrick-kernel` MM-occupancy population passed (21/21). A new
+signed bundle is required before retrying the smoke or the requested 20-run
+population.
+
 ## Total Editor order and consume-once retirement ownership
 
 The implementation now follows the stage-1-first design recorded on issue

@@ -750,7 +750,8 @@ impl SpaceTables {
                 .is_some_and(|region| std::ptr::eq(&region.zone.spaces, self.spaces));
         }
         self.zone.is_none()
-            || crate::el1_zone::zone().is_some_and(|zone| std::ptr::eq(&zone.spaces, self.spaces))
+            || carrick_el1_abi::zone_tables()
+                .is_some_and(|zone| std::ptr::eq(&zone.spaces, self.spaces))
     }
 }
 
@@ -840,7 +841,11 @@ impl std::fmt::Debug for El1EditorExclusion {
 /// guard. An unpublished MM still returns a guard: the address-space table's
 /// unpublished proof licenses bootstrap edits before its first publication.
 pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
-    let zone = crate::el1_zone::zone()?;
+    // Editor exclusion is an address-space publication contract, not a
+    // scheduler-hatch policy.  Bootstrap edits happen after the EL1 region is
+    // installed but before guest scheduling is enabled; using `el1_zone::zone`
+    // here made those real edits unable to acquire their unpublished proof.
+    let zone = carrick_el1_abi::zone_tables()?;
     exclude_el1_editor_in(
         SpaceTables {
             spaces: &zone.spaces,
