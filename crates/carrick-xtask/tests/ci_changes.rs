@@ -490,6 +490,7 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
       "commit-trailers": { "result": "success" },
       "lint-clippy": { "result": "success" },
       "lint-gates": { "result": "success" },
+      "xtask-tests-build": { "result": "success" },
       "lint-domains": { "result": "success" },
       "portable": { "result": "skipped" },
       "loom": { "result": "skipped" },
@@ -725,6 +726,7 @@ fn stack_layer_detection_and_ci_results_gating() {
       "commit-trailers": { "result": "success" },
       "lint-clippy": { "result": "success" },
       "lint-gates": { "result": "success" },
+      "xtask-tests-build": { "result": "success" },
       "lint-domains": { "result": "success" },
       "portable": { "result": "skipped" },
       "loom": { "result": "skipped" },
@@ -796,6 +798,7 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
       "commit-trailers": { "result": "success" },
       "lint-clippy": { "result": "success" },
       "lint-gates": { "result": "success" },
+      "xtask-tests-build": { "result": "success" },
       "lint-domains": { "result": "success" },
       "portable": { "result": "success" },
       "loom": { "result": "success" },
@@ -850,7 +853,13 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
         run_ci_results("merge_group", None, &mg_needs),
         "merge_group with only the macOS skew check must pass ci-results"
     );
-    for job in ["lint-clippy", "lint-gates", "loom", "macos-authority"] {
+    for job in [
+        "lint-clippy",
+        "lint-gates",
+        "xtask-tests-build",
+        "loom",
+        "macos-authority",
+    ] {
         let mut missing: serde_json::Value = serde_json::from_str(&mg_needs).unwrap();
         missing.as_object_mut().unwrap().remove(job);
         assert!(
@@ -937,6 +946,7 @@ fn heavy_same_repo_pr_requires_the_full_macos_suite() {
       "commit-trailers": { "result": "success" },
       "lint-clippy": { "result": "success" },
       "lint-gates": { "result": "success" },
+      "xtask-tests-build": { "result": "success" },
       "lint-domains": { "result": "success" },
       "portable": { "result": "success" },
       "loom": { "result": "success" },
@@ -1040,6 +1050,7 @@ fn every_heavy_pr_job_skips_on_lower_stack_layers() {
         if name == "lint-clippy"
             || name == "lint-gates"
             || name == "lint-domains"
+            || name == "xtask-tests-build"
             || name.starts_with("macos-")
         {
             continue;

@@ -573,3 +573,81 @@ artifact-package-env-witness:
     );
     passed(run(false));
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn clippy_recipes_keep_production_features_and_fail_closed_on_discovery() {
+    let build = Build::new();
+    for name in ["bash", "just", "grep", "sort", "tr"] {
+        symlink(find(name), build.root.path().join("bin").join(name)).unwrap();
+    }
+    let cargo = build.root.path().join("bin/cargo");
+    fs::remove_file(&cargo).unwrap();
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+if [ "$1" = --config ]; then shift 2; fi
+case "$1" in
+ tree)
+    case "$TREE_MODE" in
+      empty) exit 0 ;;
+      missing) printf 'carrick-runtime v0.1.0\n'; exit 0 ;;
+    esac
+    printf 'carrick-cli v0.1.0\ncarrick-runtime v0.1.0\ncarrick-embed v0.1.0\n'
+    if [ "$TREE_MODE" = failed ]; then exit 23; fi
+    ;;
+ clippy) printf '%s\n' "$*" >> "$CLIPPY_LOG" ;;
+ *) echo "unexpected cargo invocation: $*" >&2; exit 97 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let artifact = build.root.path().join("xtask artifact");
+    fs::write(
+        &artifact,
+        "#!/bin/sh\nif [ \"$1\" = worktree-run ]; then shift 2; exec \"$@\"; fi\nexit 98\n",
+    )
+    .unwrap();
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
+    let log = build.root.path().join("clippy.log");
+    let run = |mode| {
+        build
+            .command("clippy")
+            .env("CARRICK_XTASK_BIN", &artifact)
+            .env("TREE_MODE", mode)
+            .env("CLIPPY_LOG", &log)
+            .output()
+            .unwrap()
+    };
+    passed(run("good"));
+    let calls = fs::read_to_string(&log).unwrap();
+    let lines: Vec<_> = calls.lines().collect();
+    assert_eq!(lines.len(), 4, "{calls}");
+    assert_eq!(
+        lines[0],
+        "clippy -p carrick-cli --no-default-features --features syscall-shim,platform-linux --all-targets --keep-going -- -D warnings"
+    );
+    assert_eq!(
+        lines[1],
+        "clippy -p carrick-xtask --lib --bins --keep-going -- -D warnings"
+    );
+    assert!(lines[2].contains("-p carrick-cli -p carrick-runtime"));
+    assert!(lines[2].contains("-p carrick-xtask"));
+    assert!(lines[2].contains("--features carrick-xtask/impact --all-targets"));
+    assert!(!lines[2].contains("-p carrick-embed"));
+    assert_eq!(
+        lines[3],
+        "clippy -p carrick-embed --no-default-features --features syscall-shim,platform-linux --lib --bins --examples --keep-going -- -D warnings"
+    );
+    for mode in ["failed", "empty", "missing"] {
+        fs::write(&log, "").unwrap();
+        let out = run(mode);
+        assert!(!out.status.success(), "{mode}: discovery must fail closed");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap().lines().count(),
+            2,
+            "{mode}: no partial union may run"
+        );
+    }
+}

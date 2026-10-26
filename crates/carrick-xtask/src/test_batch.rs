@@ -16,6 +16,12 @@ pub struct TestBatchArgs {
     /// Compile the unified selection without executing binaries or rustdoc.
     #[arg(long)]
     pub no_run: bool,
+    /// Export the compiled union (including CLI fixtures) as a portable CI tarball.
+    #[arg(long, conflicts_with = "artifacts")]
+    pub export: Option<PathBuf>,
+    /// Run a selection from an extracted batch, failing on feature or target drift.
+    #[arg(long)]
+    pub artifacts: Option<PathBuf>,
     /// Extra arguments passed to the source recipe (for example --no-run).
     #[arg(last = true)]
     pub args: Vec<String>,
@@ -31,6 +37,7 @@ struct Lane {
     implicit_doc: bool,
     no_run: bool,
     no_default: bool,
+    all_features: bool,
     target_dir: Option<String>,
 }
 
@@ -62,6 +69,7 @@ fn parse(record: Vec<String>, meta: &Value) -> Result<Lane> {
         implicit_doc: false,
         no_run: false,
         no_default: false,
+        all_features: false,
         target_dir: None,
     };
     let mut excludes = BTreeSet::new();
@@ -116,6 +124,7 @@ fn parse(record: Vec<String>, meta: &Value) -> Result<Lane> {
             }
             "--doc" => lane.doc = true,
             "--no-default-features" => lane.no_default = true,
+            "--all-features" => lane.all_features = true,
             "--no-run" => lane.no_run = true,
             "--locked" | "--no-fail-fast" => {}
             s if !s.starts_with('-') => lane.harness.push(arg.clone()),
@@ -195,7 +204,23 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
             Err("source recipe failed".into())
         };
     }
-    let meta = metadata(&root)?;
+    let imported = args
+        .artifacts
+        .as_ref()
+        .map(|path| -> Result<BatchArtifact> {
+            let manifest: BatchArtifact = serde_json::from_slice(&std::fs::read(root.join(path))?)?;
+            // env!(CARGO_MANIFEST_DIR) and CARGO_BIN_EXE in fixture binaries refer
+            // to this path. Never silently run an artifact from another checkout.
+            if manifest.root != root {
+                return Err("batch artifact checkout path differs".into());
+            }
+            Ok(manifest)
+        })
+        .transpose()?;
+    let meta = match &imported {
+        Some(m) => m.metadata.clone(),
+        None => metadata(&root)?,
+    };
     let lanes = crate::test_shards::records(&root, &args.recipe, &args.args)?
         .into_iter()
         .map(|record| parse(record, &meta))
@@ -217,6 +242,20 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
                 }
             }
         }
+        if lane.all_features {
+            for pkg in meta["packages"].as_array().ok_or("missing packages")? {
+                let name = pkg["name"].as_str().ok_or("missing name")?;
+                if lane.packages.contains(name) {
+                    for feature in pkg["features"]
+                        .as_object()
+                        .ok_or("missing features")?
+                        .keys()
+                    {
+                        features.insert(format!("{name}/{feature}"));
+                    }
+                }
+            }
+        }
         // Bare features are package scoped before unifying the package set.
         for feature in &lane.features {
             if feature.contains('/') {
@@ -231,113 +270,78 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
             }
         }
     }
-    let mut cmd = Command::new("cargo");
-    let first = lanes.first().ok_or("missing lanes")?;
-    let test_index = first
-        .record
-        .iter()
-        .skip(3)
-        .position(|s| s == "test")
-        .ok_or("missing cargo test")?
-        + 3;
-    cmd.args(&first.record[3..test_index]);
-    for lane in &lanes {
-        let index = lane
-            .record
-            .iter()
-            .skip(3)
-            .position(|s| s == "test")
-            .ok_or("missing cargo test")?
-            + 3;
-        if lane.record[3..index] != first.record[3..test_index] {
-            return Err("batch lanes must share their Cargo configuration".into());
+    let no_default = lanes.iter().any(|l| l.no_default);
+    let binaries = if let Some(manifest) = imported {
+        if lanes.iter().any(|l| l.doc || l.implicit_doc) {
+            return Err("cannot import rustdoc lanes".into());
         }
-        if lane.target_dir != first.target_dir {
-            return Err("batch lanes must share their target directory".into());
+        if manifest.features != features || manifest.no_default != no_default {
+            return Err("batch artifact feature selection differs".into());
         }
-    }
-    cmd.current_dir(&root).args([
-        "test",
-        "--locked",
-        "--no-run",
-        "--message-format=json-render-diagnostics",
-    ]);
-    if lanes.iter().any(|l| l.no_default) {
-        cmd.arg("--no-default-features");
-    }
-    if let Some(dir) = &first.target_dir {
-        cmd.args(["--target-dir", dir]);
-    }
-    for package in packages {
-        cmd.args(["-p", &package]);
-    }
-    if !features.is_empty() {
-        cmd.args([
-            "--features",
-            &features.into_iter().collect::<Vec<_>>().join(","),
-        ]);
-    }
-    // Select only the union of requested target names, never signed/KVM extras.
-    let mut selectors = BTreeSet::new();
-    for pkg in meta["packages"].as_array().ok_or("missing packages")? {
-        for target in pkg["targets"].as_array().ok_or("missing targets")? {
-            let name = target["name"].as_str().ok_or("missing name")?;
-            let id = pkg["id"].as_str().ok_or("missing id")?;
-            if targets.contains(&(id.to_owned(), name.to_owned())) {
-                let kind = target["kind"][0].as_str().ok_or("missing kind")?;
-                match kind {
-                    "lib" => {
-                        selectors.insert(("--lib", String::new()));
-                    }
-                    "bin" => {
-                        selectors.insert(("--bin", name.to_owned()));
-                    }
-                    "test" => {
-                        selectors.insert(("--test", name.to_owned()));
-                    }
-                    _ => return Err(format!("unsupported target kind {kind}").into()),
-                }
+        let mut binaries = BTreeMap::new();
+        for binary in manifest.binaries {
+            let path = root.join(&binary.path);
+            if binary.path.is_absolute()
+                || !path.starts_with(&root)
+                || binary
+                    .path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                || !path.is_file()
+            {
+                return Err(
+                    format!("missing or invalid batch artifact: {}", path.display()).into(),
+                );
             }
+            binaries.insert((binary.package, binary.target), path);
         }
-    }
-    for (flag, name) in selectors {
-        cmd.arg(flag);
-        if !name.is_empty() {
-            cmd.arg(name);
+        binaries
+    } else {
+        let (binaries, files) = compile(&root, &lanes, &meta, &packages, &features, &targets)?;
+        if let Some(path) = &args.export {
+            if lanes.iter().any(|l| l.doc || l.implicit_doc) {
+                return Err("cannot export rustdoc lanes".into());
+            }
+            let manifest = BatchArtifact {
+                root: root.clone(),
+                metadata: meta.clone(),
+                features,
+                no_default,
+                binaries: binaries
+                    .iter()
+                    .map(|((package, target), path)| {
+                        Ok(ArtifactBinary {
+                            package: package.clone(),
+                            target: target.clone(),
+                            path: path.strip_prefix(&root)?.to_path_buf(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            let file = std::fs::File::create(root.join(path))?;
+            let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+                file,
+                flate2::Compression::fast(),
+            ));
+            let json = serde_json::to_vec(&manifest)?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(json.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, "target/test-batch.json", json.as_slice())?;
+            for file in files {
+                archive.append_path_with_name(&file, file.strip_prefix(&root)?)?;
+            }
+            archive.into_inner()?.finish()?;
+            return Ok(());
         }
-    }
-    eprintln!("test-batch: one compile for {} lanes: {cmd:?}", lanes.len());
-    let mut child = cmd.stdout(Stdio::piped()).spawn()?;
-    let stdout = child.stdout.take().ok_or("missing Cargo stdout")?;
-    let mut binaries = BTreeMap::<(String, String), PathBuf>::new();
-    for line in BufReader::new(stdout).lines() {
-        let msg: Value = serde_json::from_str(&line?)?;
-        if msg["reason"] == "compiler-message"
-            && let Some(rendered) = msg["message"]["rendered"].as_str()
-        {
-            eprint!("{rendered}");
+        binaries
+    };
+    // Validate every requested executable even for --no-run consumers.
+    for target in &targets {
+        if !binaries.contains_key(target) {
+            return Err(format!("missing test executable: {target:?}").into());
         }
-        if msg["reason"] == "compiler-artifact"
-            && msg["profile"]["test"] == true
-            && let Some(exe) = msg["executable"].as_str()
-        {
-            binaries.insert(
-                (
-                    msg["package_id"]
-                        .as_str()
-                        .ok_or("missing artifact package")?
-                        .to_owned(),
-                    msg["target"]["name"]
-                        .as_str()
-                        .ok_or("missing artifact name")?
-                        .to_owned(),
-                ),
-                PathBuf::from(exe),
-            );
-        }
-    }
-    if !child.wait()?.success() {
-        return Err("batch compilation failed".into());
     }
     if args.no_run {
         return Ok(());
@@ -405,4 +409,145 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
         return Err(format!("red batch lanes: {}", red.join(", ")).into());
     }
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BatchArtifact {
+    root: PathBuf,
+    metadata: Value,
+    features: BTreeSet<String>,
+    no_default: bool,
+    binaries: Vec<ArtifactBinary>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArtifactBinary {
+    package: String,
+    target: String,
+    path: PathBuf,
+}
+
+type Binaries = BTreeMap<(String, String), PathBuf>;
+fn compile(
+    root: &Path,
+    lanes: &[Lane],
+    meta: &Value,
+    packages: &BTreeSet<String>,
+    features: &BTreeSet<String>,
+    targets: &BTreeSet<(String, String)>,
+) -> Result<(Binaries, BTreeSet<PathBuf>)> {
+    let mut cmd = Command::new("cargo");
+    let first = lanes.first().ok_or("missing lanes")?;
+    let test_index = first
+        .record
+        .iter()
+        .skip(3)
+        .position(|s| s == "test")
+        .ok_or("missing cargo test")?
+        + 3;
+    cmd.args(&first.record[3..test_index]);
+    for lane in lanes {
+        let index = lane
+            .record
+            .iter()
+            .skip(3)
+            .position(|s| s == "test")
+            .ok_or("missing cargo test")?
+            + 3;
+        if lane.record[3..index] != first.record[3..test_index] {
+            return Err("batch lanes must share their Cargo configuration".into());
+        }
+        if lane.target_dir != first.target_dir {
+            return Err("batch lanes must share their target directory".into());
+        }
+    }
+    cmd.current_dir(root).args([
+        "test",
+        "--locked",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
+    ]);
+    if lanes.iter().any(|l| l.no_default) {
+        cmd.arg("--no-default-features");
+    }
+    if let Some(dir) = &first.target_dir {
+        cmd.args(["--target-dir", dir]);
+    }
+    for package in packages {
+        cmd.args(["-p", package]);
+    }
+    if !features.is_empty() {
+        cmd.args([
+            "--features",
+            &features.iter().cloned().collect::<Vec<_>>().join(","),
+        ]);
+    }
+    // Select only the union of requested target names, never signed/KVM extras.
+    let mut selectors = BTreeSet::new();
+    for pkg in meta["packages"].as_array().ok_or("missing packages")? {
+        for target in pkg["targets"].as_array().ok_or("missing targets")? {
+            let name = target["name"].as_str().ok_or("missing name")?;
+            let id = pkg["id"].as_str().ok_or("missing id")?;
+            if targets.contains(&(id.to_owned(), name.to_owned())) {
+                let kind = target["kind"][0].as_str().ok_or("missing kind")?;
+                match kind {
+                    "lib" => {
+                        selectors.insert(("--lib", String::new()));
+                    }
+                    "bin" => {
+                        selectors.insert(("--bin", name.to_owned()));
+                    }
+                    "test" => {
+                        selectors.insert(("--test", name.to_owned()));
+                    }
+                    _ => return Err(format!("unsupported target kind {kind}").into()),
+                }
+            }
+        }
+    }
+    for (flag, name) in selectors {
+        cmd.arg(flag);
+        if !name.is_empty() {
+            cmd.arg(name);
+        }
+    }
+    eprintln!("test-batch: one compile for {} lanes: {cmd:?}", lanes.len());
+    let mut child = cmd.stdout(Stdio::piped()).spawn()?;
+    let stdout = child.stdout.take().ok_or("missing Cargo stdout")?;
+    let mut files = BTreeSet::new();
+    let mut binaries = BTreeMap::<(String, String), PathBuf>::new();
+    for line in BufReader::new(stdout).lines() {
+        let msg: Value = serde_json::from_str(&line?)?;
+        if msg["reason"] == "compiler-message"
+            && let Some(rendered) = msg["message"]["rendered"].as_str()
+        {
+            eprint!("{rendered}");
+        }
+        if msg["reason"] == "compiler-artifact"
+            && let Some(exe) = msg["executable"].as_str()
+        {
+            files.insert(PathBuf::from(exe));
+        }
+        if msg["reason"] == "compiler-artifact"
+            && msg["profile"]["test"] == true
+            && let Some(exe) = msg["executable"].as_str()
+        {
+            binaries.insert(
+                (
+                    msg["package_id"]
+                        .as_str()
+                        .ok_or("missing artifact package")?
+                        .to_owned(),
+                    msg["target"]["name"]
+                        .as_str()
+                        .ok_or("missing artifact name")?
+                        .to_owned(),
+                ),
+                PathBuf::from(exe),
+            );
+        }
+    }
+    if !child.wait()?.success() {
+        return Err("batch compilation failed".into());
+    }
+    Ok((binaries, files))
 }

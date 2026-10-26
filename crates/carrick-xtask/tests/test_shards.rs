@@ -138,7 +138,12 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
         needs.iter().any(|v| v.as_str() == Some("lint-domains")),
         "ci-ok must require lint-domains"
     );
-    for job in ["lint-clippy", "macos-authority", "loom"] {
+    for job in [
+        "lint-clippy",
+        "macos-authority",
+        "loom",
+        "xtask-tests-build",
+    ] {
         assert!(
             needs.iter().any(|v| v.as_str() == Some(job)),
             "ci-ok must require {job}"
