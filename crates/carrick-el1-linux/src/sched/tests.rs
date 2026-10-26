@@ -780,6 +780,74 @@ fn late_host_work_on_a_switched_native_record_enters_its_owner_boundary() {
     assert_eq!(cpu.host_work_boundaries, [record]);
 }
 
+/// A host-loaded task can narrow its affinity after this slot switched to a
+/// native-owned record. That host placement change must not bypass the late
+/// host-work boundary and strand the native record as current.
+#[test]
+fn late_host_work_settles_native_owner_before_host_affinity_exit() {
+    use carrick_sched_core::affinity::AffinityAuthority;
+
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    host_publish(&zone, SLOT, 0, None, 0);
+    zone.enter_guest(SLOT);
+    let record = zone.alloc_record(identity(101)).unwrap();
+    assert!(zone.mark_native_owned(record));
+    // SAFETY: the fresh unpublished record is exclusively owned here.
+    unsafe {
+        *zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_register(thread_ctx(0xA, 0x1000), TTBR_MM, MM, 1);
+    }
+    zone.requeue_preempted(SLOT, record);
+    let task = CurrentTask::new();
+    let counters = counters();
+    let mut frame = TrapFrame {
+        slot: u64::from(SLOT.raw()),
+        ..TrapFrame::default()
+    };
+    let mut cpu = FakeCpu::default();
+    assert_eq!(
+        Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters,
+        }
+        .serve_idle_entry(&mut frame),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(zone.slot(SLOT).current(), Some(record));
+
+    let affinity = AffinityAuthority::new();
+    affinity.initialize(1 << 1);
+    // SAFETY: this fixture retains `affinity` through the scheduler call.
+    let source = unsafe { carrick_sched_core::AffinitySource::from_authority(&affinity) };
+    zone.publish_slot_with_affinity(SLOT, 0, Some(0), source);
+    assert!(zone.slot(SLOT).affinity_excludes_cpu());
+    task.linux.mark_pending_host_work();
+    task.linux.record_completed_with_work();
+    cpu.host_work_once = Some(carrick_el1_abi::Action::Idle);
+
+    assert_eq!(
+        Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters,
+        }
+        .serve_irq(&mut frame),
+        carrick_el1_abi::Action::Idle,
+        "host affinity bypassed the native owner boundary"
+    );
+    assert_eq!(cpu.host_work_boundaries, [record]);
+}
+
 #[test]
 fn a_wait_on_a_changed_word_returns_eagain_without_parking() {
     let zone = zone();
