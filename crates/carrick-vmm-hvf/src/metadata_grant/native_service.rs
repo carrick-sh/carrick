@@ -1,7 +1,8 @@
 //! Backing custody for a ring-owned request; no host task or process adoption.
 use super::*;
 use carrick_core_abi::service::{
-    ServiceCell, ServiceError, ServiceFailureCode, ServiceRequest, ServiceSelector, ServiceTicket,
+    ExecCapabilityId, ServiceCell, ServiceError, ServiceFailureCode, ServiceRequest,
+    ServiceSelector, ServiceTicket,
 };
 use carrick_sched_core::object_wait::ObjectWaitKey;
 use core::ops::Deref;
@@ -20,6 +21,132 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
 /// until the ring consumes successor adoption or terminal cleanup drops it.
 pub trait NativeExecPreparation: core::fmt::Debug + Send + 'static {
     fn into_mapping_plan(self: Box<Self>) -> crate::trap::GuestMappingPlan;
+}
+
+/// Exact carrier registration for a retained exec service.
+///
+/// The directory, rather than the run that installed it, owns the service
+/// while guest work can name its capability.  The returned registration is
+/// the run's unique removal authority and must settle after its process tree
+/// has joined but before container resources are retired.
+#[derive(Debug, Default)]
+pub(crate) struct NativeExecServiceDirectory {
+    services: parking_lot::Mutex<Vec<(ExecCapabilityId, Arc<dyn NativeExecHostService>)>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeExecRegistrationError {
+    Duplicate,
+    Absent,
+}
+
+impl NativeExecServiceDirectory {
+    pub(crate) fn install(
+        self: &Arc<Self>,
+        capability: ExecCapabilityId,
+        service: Arc<dyn NativeExecHostService>,
+    ) -> Result<NativeExecServiceRegistration, NativeExecRegistrationError> {
+        let mut services = self.services.lock();
+        if services.iter().any(|(id, _)| *id == capability) {
+            return Err(NativeExecRegistrationError::Duplicate);
+        }
+        services.push((capability, service));
+        Ok(NativeExecServiceRegistration {
+            directory: Arc::clone(self),
+            capability,
+            armed: true,
+        })
+    }
+
+    pub(crate) fn service(
+        &self,
+        capability: ExecCapabilityId,
+    ) -> Option<Arc<dyn NativeExecHostService>> {
+        self.services
+            .lock()
+            .iter()
+            .find(|(id, _)| *id == capability)
+            .map(|(_, service)| Arc::clone(service))
+    }
+
+    fn remove(&self, capability: ExecCapabilityId) -> Result<(), NativeExecRegistrationError> {
+        let mut services = self.services.lock();
+        let index = services
+            .iter()
+            .position(|(id, _)| *id == capability)
+            .ok_or(NativeExecRegistrationError::Absent)?;
+        services.swap_remove(index);
+        Ok(())
+    }
+}
+
+/// Consuming authority to release one carrier-retained exec service.
+#[must_use]
+pub struct NativeExecServiceRegistration {
+    directory: Arc<NativeExecServiceDirectory>,
+    capability: ExecCapabilityId,
+    armed: bool,
+}
+
+impl NativeExecServiceRegistration {
+    pub fn retire(mut self) -> Result<(), NativeExecRegistrationError> {
+        self.directory.remove(self.capability)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for NativeExecServiceRegistration {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.directory.remove(self.capability);
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_exec_service_registration_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct RetainedService {
+        _retained: Arc<()>,
+    }
+
+    impl NativeExecHostService for RetainedService {
+        fn prepare(
+            &self,
+            _request: ServiceRequest,
+            _payload: &[u8],
+        ) -> Result<Box<dyn NativeExecPreparation>, ServiceFailureCode> {
+            Err(ServiceFailureCode::MINIMUM)
+        }
+    }
+
+    #[test]
+    fn native_exec_registration_retirement_releases_installed_service() {
+        let directory = Arc::new(NativeExecServiceDirectory::default());
+        let retained = Arc::new(());
+        let witness = Arc::downgrade(&retained);
+        let capability = carrick_core_abi::service::ExecCapabilityId::new(
+            core::num::NonZeroU64::new(1).unwrap(),
+        );
+        let service: Arc<dyn NativeExecHostService> = Arc::new(RetainedService {
+            _retained: Arc::clone(&retained),
+        });
+        drop(retained);
+
+        let registration = directory.install(capability, service).unwrap();
+        assert!(
+            witness.upgrade().is_some(),
+            "installed service was not retained"
+        );
+        registration.retire().unwrap();
+        assert!(
+            witness.upgrade().is_none(),
+            "settled registration retained the service owner"
+        );
+    }
 }
 
 struct ServicePin {

@@ -2089,10 +2089,14 @@ impl HvpatchPersistentExecutorFactoryAuthority {
         &self,
         capability: carrick_core_abi::service::ExecCapabilityId,
         service: Arc<dyn crate::metadata_grant::NativeExecHostService>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<crate::metadata_grant::NativeExecServiceRegistration, TrapError> {
         self.spec
             .install_native_exec_service(capability, service)
-            .map_err(|()| TrapError::Hypervisor("duplicate native exec capability".into()))
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "native exec service registration failed: {error:?}"
+                ))
+            })
     }
 
     /// The settlement of guest EL1 COW completions for every MM of this

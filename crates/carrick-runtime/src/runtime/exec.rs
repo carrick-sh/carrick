@@ -829,4 +829,23 @@ mod tests {
             carrick_kernel::dispatch::exec_files::ExecCaller::Host { .. }
         ));
     }
+
+    #[test]
+    fn native_exec_capability_is_the_exact_extra_mount_owner() {
+        let dispatcher = SyscallDispatcher::new();
+        let container = dispatcher.container().id();
+        let mut retirement = dispatcher.prepare_mount_retirement();
+        let capability = capture_native_exec_capability(&dispatcher).unwrap();
+        drop(dispatcher);
+
+        assert_eq!(
+            retirement.prepare(),
+            Err(carrick_kernel::dispatch::MountRetirementError::LiveOwners {
+                container,
+                owners: 2,
+            })
+        );
+        drop(capability);
+        retirement.prepare().unwrap();
+    }
 }
