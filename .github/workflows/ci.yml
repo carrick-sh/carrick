@@ -75,10 +75,10 @@ jobs:
         include:
           - family: linux-x64
             runner: ubuntu-latest
-            cache-size: 1G
+            cache-size: 3G
           - family: darwin-hosted
             runner: macos-15
-            cache-size: 1G
+            cache-size: 2G
           - family: linux-arm64
             runner: ubuntu-24.04-arm
             cache-size: 512M
@@ -141,16 +141,20 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: |
-          just ci-prebuild-xtask
           case "$FAMILY" in
             darwin-hosted)
               just build
               just doc
               # Debug PR checks/tests run last to survive bounded-cache eviction.
               just check
-              just clippy
               just xtask test-batch --no-run test
               just xtask test-batch --no-run test-integration
+              # Fresh Cargo outputs skip sccache entirely. Replay the critical
+              # graph after clearing only this ephemeral hosted target directory.
+              cargo clean
+              just ci-prebuild-xtask
+              export CARRICK_XTASK_BIN="$PWD/target/debug/carrick-xtask"
+              just clippy
               just test-xtask --no-run
               ;;
             linux-x64)
@@ -165,14 +169,20 @@ jobs:
               just doc
               # Cross/release/doc entries yield to the debug PR-critical set.
               just check
-              just clippy
               just xtask test-batch --no-run test
               just xtask test-batch --no-run test-integration
-              just test-xtask --no-run
               just test-loom --no-run
               just test-kernel-semantics --no-run
               cargo test --locked --no-run -p carrick-host-linux
               cargo test --locked --no-run -p carrick-softcpu-x86 --lib --tests
+              just clippy
+              # Refresh compiler-cache LRU even when earlier Cargo outputs are
+              # fresh. Keep the default admission build and the exact all-feature
+              # test artifact consumed by lint-gates/lint-domains last.
+              cargo clean
+              just ci-prebuild-xtask
+              export CARRICK_XTASK_BIN="$PWD/target/debug/carrick-xtask"
+              just ci-build-xtask-tests
               ;;
             linux-arm64)
               cargo check --locked -p carrick-kernel-example --tests
@@ -180,6 +190,8 @@ jobs:
               cargo test --locked --no-run -p carrick-kernel-example --tests
               ;;
           esac
+      - name: Compiler cache statistics after critical replay
+        run: just build-cache
       - name: Save shared compiler cache
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
