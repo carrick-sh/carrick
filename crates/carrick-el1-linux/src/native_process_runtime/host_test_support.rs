@@ -1220,6 +1220,7 @@ impl NativeServiceCapacityFixture {
         }
     }
 
+    #[cfg(test)]
     fn after_root_exec(children: usize) -> Self {
         let mut fixture = NativeSignalFixture::new(
             ExecutionBinding {
