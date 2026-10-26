@@ -2926,6 +2926,63 @@ fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
 
 #[cfg(test)]
 #[test]
+fn blocking_wait4_reenters_its_owner_after_host_materialization() {
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    assert_eq!(
+        fixture.zone.record(fixture.record.id).resume_disposition(),
+        carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(OwnerEntry::Syscall),
+        "the host materializer must not install a readiness scalar and return to EL0"
+    );
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let (_, address, saved) = capacity.select().unwrap();
+    let child_pid = fixture.task.visible_pid().unwrap();
+    let mut service = fixture.service();
+    {
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.exit_group(0),
+            LifecycleOutcome::Transferred { .. }
+        ));
+    }
+    let (_, address, saved) = capacity.select().unwrap();
+    let mut parent = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    // The real host materializer re-enters the original syscall instruction.
+    // Fresh dispatch must offer its retained owner before invoking wait4 anew.
+    assert!(matches!(
+        parent.resume_owned_continuation(),
+        Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == i64::from(child_pid)
+    ));
+    assert!(parent.resume_owned_continuation().is_none());
+    drop(parent);
+    assert_eq!(service.copies, vec![LinuxWaitStatus::exited(0)]);
+}
+
+#[cfg(test)]
+#[test]
 fn carrier_work_wake_redrives_parked_wait4_before_returning_to_user() {
     carrier_work_redrives_parked_wait4(false);
 }

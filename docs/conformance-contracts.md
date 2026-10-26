@@ -1506,6 +1506,13 @@ ACKs must re-drive the retained wait owner, copy status once, return the child
 PID and refuse a second reap with ECHILD (10). Readiness alone is never a
 completed wait result. Completed syscall results remain retained separately.
 
+Plain process wait/IPC parks also publish `OwnerContinuation(Syscall)` on the
+scheduler record. Host materialization preserves arguments and re-enters the
+saved instruction; fresh dispatch consumes the retained operation before
+invoking a new syscall. `blocking_wait4_reenters_its_owner_after_host_materialization`
+binds the parked disposition to that fresh-entry owner and exact status copy.
+A closing participant still follows its terminal owner rather than wait/IPC.
+
 Linux authority is exit(2)/wait(2): release the child's resources before
 notification, retain the parent's wait, and consume its terminal status once.
 The VM-free ARM production service witness
