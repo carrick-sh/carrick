@@ -152,6 +152,13 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
         let observed = unsafe {
             carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
         };
+        let observed = if cause == carrick_el1_abi::PortalWaitCause::Editor {
+            // SAFETY: this is the direct SELECT admission-refusal arm, before
+            // any physical retention attempt.
+            unsafe { observed.into_editor_admission() }
+        } else {
+            observed
+        };
         if cause == carrick_el1_abi::PortalWaitCause::Editor {
             carrick_observability::probes::hvpatch_el1_host_read_editor_wait(
                 va,
@@ -373,6 +380,8 @@ mod tests {
                 if found.handle() == retry.handle()
                     && found.revision() == retry.revision()
                     && found.cause() == carrick_el1_abi::PortalWaitCause::Editor
+                    && found.origin()
+                        == carrick_el1_abi::PortalOwnerWaitOrigin::Stage2Authority
         ));
     }
 }

@@ -90,10 +90,21 @@ impl PortalWaitCause {
 /// Exact admitted owner and producer revision sampled before a failed probe.
 /// Contains no resource guard or prepared semantic permit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortalOwnerWaitOrigin {
+    /// A current stage-1 selection lost the physical authority that must
+    /// cover it. An unchanged Editor observation is an MM-local invariant.
+    Stage2Authority,
+    /// SELECT or PREPARE lost the Editor word after sampling its release
+    /// revision. The exact Editor release is the refusal's producer.
+    EditorAdmission,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortalOwnerWait {
     handle: El1MmHandle,
     cause: PortalWaitCause,
     revision: u64,
+    origin: PortalOwnerWaitOrigin,
 }
 impl PortalOwnerWait {
     /// # Safety
@@ -109,6 +120,20 @@ impl PortalOwnerWait {
             handle,
             cause,
             revision,
+            origin: PortalOwnerWaitOrigin::Stage2Authority,
+        }
+    }
+    /// Mark an exact Editor-admission refusal decoded from SELECT or PREPARE.
+    ///
+    /// # Safety
+    /// The caller must have consumed a refusal emitted directly by the
+    /// admitted owner's Editor-word acquisition. A physical retention
+    /// refusal must retain [`PortalOwnerWaitOrigin::Stage2Authority`].
+    pub const unsafe fn into_editor_admission(self) -> Self {
+        debug_assert!(matches!(self.cause, PortalWaitCause::Editor));
+        Self {
+            origin: PortalOwnerWaitOrigin::EditorAdmission,
+            ..self
         }
     }
     pub const fn handle(self) -> El1MmHandle {
@@ -119,6 +144,9 @@ impl PortalOwnerWait {
     }
     pub const fn revision(self) -> u64 {
         self.revision
+    }
+    pub const fn origin(self) -> PortalOwnerWaitOrigin {
+        self.origin
     }
 }
 

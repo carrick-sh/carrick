@@ -122,6 +122,13 @@ fn finish_supply(
             let wait = unsafe {
                 carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
             };
+            let wait = if cause == carrick_el1_abi::PortalWaitCause::Editor {
+                // SAFETY: the withdrawn GRANT carries the service's direct
+                // Editor admission refusal, not a physical-retention retry.
+                unsafe { wait.into_editor_admission() }
+            } else {
+                wait
+            };
             Ok(SupplyProgress::OwnerWait(wait))
         } else {
             Ok(SupplyProgress::Declined)
@@ -558,6 +565,13 @@ impl OwnedUserTransfer {
         if let Some(suspension) = ticket.take_prepare_suspension() {
             return Ok(match suspension {
                 carrick_el1_abi::PortalPrepareSuspension::Owner(wait) => {
+                    let wait = if wait.cause() == carrick_el1_abi::PortalWaitCause::Editor {
+                        // SAFETY: this is the direct service PREPARE
+                        // admission-refusal arm.
+                        unsafe { wait.into_editor_admission() }
+                    } else {
+                        wait
+                    };
                     TransferProgress::OwnerWait(wait)
                 }
                 carrick_el1_abi::PortalPrepareSuspension::SelectionChanged

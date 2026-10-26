@@ -4580,6 +4580,20 @@ pub(crate) mod tests {
         exercise_owner_wait_schedule(carrick_abi::syscall::nr::FSTAT, None, false, true);
     }
 
+    #[test]
+    fn serial_host_select_refusal_at_editor_release_rechecks_without_killing_mm() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::FSTAT,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            OwnerWaitSelection::ReleasedEditorAdmission,
+        );
+    }
+
     fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>, native: bool) {
         exercise_owner_wait_schedule(nr, signum, native, false);
     }
@@ -4606,6 +4620,7 @@ pub(crate) mod tests {
     enum OwnerWaitSelection {
         Normal,
         Stale,
+        ReleasedEditorAdmission,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4620,6 +4635,7 @@ pub(crate) mod tests {
         selection: OwnerWaitSelection,
     ) {
         let stale_selection_without_editor = selection == OwnerWaitSelection::Stale;
+        let released_editor_admission = selection == OwnerWaitSelection::ReleasedEditorAdmission;
         #[derive(Debug)]
         struct RetirementRequestedBacking {
             ready: std::sync::atomic::AtomicBool,
@@ -5102,18 +5118,76 @@ pub(crate) mod tests {
                         engine.prepare_dependency =
                             Some(carrick_guest_mem::OwnedMemoryWait::new(retirement.clone()));
                     }
-                    if stale_selection_without_editor {
+                    if stale_selection_without_editor || released_editor_admission {
+                        if released_editor_admission {
+                            carrick_sched_core::spaces::editor_release_test_hook::arm();
+                        }
                         release_tx.send(()).unwrap();
+                        let mut admission_observation = None;
+                        let mut admission_wait = None;
+                        if released_editor_admission {
+                            carrick_sched_core::spaces::editor_release_test_hook::wait_until_revision_advanced();
+                            struct ContinueEditorRelease;
+                            impl Drop for ContinueEditorRelease {
+                                fn drop(&mut self) {
+                                    carrick_sched_core::spaces::editor_release_test_hook::continue_release();
+                                }
+                            }
+                            let release_guard = ContinueEditorRelease;
+                            let editor_still_held = zone
+                                .spaces
+                                .active_editor(zone.spaces.find(mm.raw()).unwrap())
+                                .is_some();
+                            let access = carrick_el1_linux::sched::object_wait::space_access(
+                                zone,
+                                carrick_sched_core::SlotId::new(1),
+                            );
+                            let admission_refused = access
+                                .try_begin_edit(
+                                    zone.spaces.find(mm.raw()).unwrap(),
+                                    mm.raw(),
+                                    NonZeroU64::new(4).unwrap(),
+                                )
+                                .is_none();
+                            admission_observation = Some((editor_still_held, admission_refused));
+                            admission_wait = portal
+                                .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
+                                .unwrap();
+                            drop(release_guard);
+                        }
+                        wait = if released_editor_admission {
+                            admission_wait.expect(
+                                "the refused admission must retain its advanced Editor receipt",
+                            )
+                        } else {
+                            portal
+                                .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
+                                .unwrap()
+                                .unwrap()
+                        };
+                        if released_editor_admission {
+                            assert!(
+                                admission_observation == Some((true, true)),
+                                "the production Editor admission must refuse after sampling the advanced revision"
+                            );
+                            // SAFETY: this witness models a SELECT admission
+                            // that sampled the already-advanced release
+                            // revision before losing the still-held word.
+                            wait = unsafe { wait.into_editor_admission() };
+                        }
                         peer.take().unwrap().join().unwrap();
                         carrick_kernel::el1_zone::hand_back_completions();
-                        wait = portal
-                            .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
-                            .unwrap()
-                            .unwrap();
-                        engine.copyout_owner_probe = Some(CopyoutOwnerProbe {
-                            wait,
-                            zone: zone as *const _ as usize,
-                        });
+                        engine.copyout_owner_probe = if released_editor_admission {
+                            // The sampled refusal is the first SELECT. Once
+                            // its editor releases, the production retry can
+                            // acquire the word and complete.
+                            None
+                        } else {
+                            Some(CopyoutOwnerProbe {
+                                wait,
+                                zone: zone as *const _ as usize,
+                            })
+                        };
                         if stale_selection_without_editor {
                             engine.prepare_dependency =
                                 Some(carrick_guest_mem::OwnedMemoryWait::new(retirement.clone()));
@@ -5121,13 +5195,18 @@ pub(crate) mod tests {
                     }
                     if physical {
                         assert!(matches!(first, DispatchOutcome::OwnerPhysicalWait { .. }));
-                    } else if !free_reservation_redrive && !stale_selection_without_editor {
+                    } else if !free_reservation_redrive
+                        && !stale_selection_without_editor
+                        && !released_editor_admission
+                    {
                         assert_eq!(
                             first,
                             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
                             "the production service must park on the sibling's editor, never return EFAULT",
                         );
                     } else if stale_selection_without_editor {
+                        assert!(matches!(first, DispatchOutcome::OwnerMemoryWait { .. }));
+                    } else if released_editor_admission {
                         assert!(matches!(first, DispatchOutcome::OwnerMemoryWait { .. }));
                     }
                     assert_eq!(engine.prepared_commits, 0);
@@ -5281,6 +5360,29 @@ pub(crate) mod tests {
                         assert!(
                             peer.as_ref().is_none_or(|peer| peer.is_finished()),
                             "invariant containment must not strand the carrier peer"
+                        );
+                        scheduler.close();
+                        return;
+                    } else if released_editor_admission {
+                        let completed = job
+                            .drive_service_outcome(
+                                &mut engine,
+                                &mut control,
+                                frame,
+                                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                                Some(resume),
+                            )
+                            .unwrap();
+                        assert!(
+                            !matches!(completed, executor::ExecutorExit::Blocked(_)),
+                            "a completed Editor admission release must recheck, not park"
+                        );
+                        assert!(
+                            kernel
+                                .fatal_signal
+                                .recorded_for(job.state.fatal_image_generation)
+                                .is_none(),
+                            "a genuine Editor admission refusal must never become STAGE2INV"
                         );
                         scheduler.close();
                         return;

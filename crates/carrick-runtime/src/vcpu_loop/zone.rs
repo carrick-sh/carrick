@@ -964,7 +964,9 @@ where
             zone.free_record(record);
             return Ok(OwnerMemoryPark::Recheck(action));
         }
-        if cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor {
+        if cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
+            && wait.origin() == carrick_el1_abi::PortalOwnerWaitOrigin::Stage2Authority
+        {
             let current_revision = enrollment.current_revision();
             let editor_held = editor_is_held(zone, wait_mm);
             match editor_refusal_disposition(enrollment.revision(), current_revision, editor_held) {

@@ -179,6 +179,60 @@ pub(super) mod editor_test_hook {
     }
 }
 
+/// Deterministic host-test control for the release edge between advancing the
+/// Editor revision and clearing its exclusion word. Product graphs do not
+/// enable `host-test`.
+#[cfg(any(test, feature = "host-test"))]
+pub mod editor_release_test_hook {
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    const IDLE: u8 = 0;
+    const ARMED: u8 = 1;
+    const REVISION_ADVANCED: u8 = 2;
+    const CONTINUE: u8 = 3;
+    static PHASE: AtomicU8 = AtomicU8::new(IDLE);
+
+    pub fn arm() {
+        assert_eq!(
+            PHASE.compare_exchange(IDLE, ARMED, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(IDLE),
+            "Editor release test hook already armed"
+        );
+    }
+
+    pub fn wait_until_revision_advanced() {
+        while PHASE.load(Ordering::SeqCst) != REVISION_ADVANCED {
+            core::hint::spin_loop();
+        }
+    }
+
+    pub fn continue_release() {
+        assert_eq!(
+            PHASE.compare_exchange(
+                REVISION_ADVANCED,
+                CONTINUE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ),
+            Ok(REVISION_ADVANCED),
+            "Editor release test hook did not reach the revision edge"
+        );
+    }
+
+    pub(super) fn after_revision_advance() {
+        if PHASE
+            .compare_exchange(ARMED, REVISION_ADVANCED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        while PHASE.load(Ordering::SeqCst) != CONTINUE {
+            core::hint::spin_loop();
+        }
+        PHASE.store(IDLE, Ordering::SeqCst);
+    }
+}
+
 /// Exclusive guest EL1 mutation ownership for one published address space.
 /// Dropping the guard acknowledges a host pause or retirement waiting after
 /// it closed the entry's gate.
@@ -331,6 +385,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'_, C> {
                 .reserve(SpaceWaitCause::Editor)
                 .advance_revision(venue.waker, &completion);
             let revision = lease.observe(SpaceWaitCause::Editor).revision();
+            #[cfg(any(test, feature = "host-test"))]
+            editor_release_test_hook::after_revision_advance();
             self.release_editor();
             self.released = true;
             receipt.publish();

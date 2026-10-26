@@ -112,6 +112,14 @@ impl<'a, S: PreparedService, P: TransferPin> PreparedWrite<'a, S, P> {
             if let Some(suspension) = ticket.take_prepare_suspension() {
                 return Err(match suspension {
                     carrick_el1_abi::PortalPrepareSuspension::Owner(observed) => {
+                        let observed =
+                            if observed.cause() == carrick_el1_abi::PortalWaitCause::Editor {
+                                // SAFETY: this suspension was decoded directly
+                                // from PREPARE's Editor admission refusal.
+                                unsafe { observed.into_editor_admission() }
+                            } else {
+                                observed
+                            };
                         if observed.cause() == carrick_el1_abi::PortalWaitCause::Editor {
                             carrick_observability::probes::hvpatch_el1_host_read_editor_wait(
                                 request.range.address(),
@@ -455,7 +463,12 @@ mod tests {
             vec![GuestWriteRange::new(carrick_guest_mem::GuestVa::new(0x40000), 12288).unwrap()],
             pages(&state),
         );
-        assert!(matches!(result, Err(MemoryPrepareError::OwnerWait(_))));
+        assert!(matches!(
+            result,
+            Err(MemoryPrepareError::OwnerWait(wait))
+                if wait.origin()
+                    == carrick_el1_abi::PortalOwnerWaitOrigin::EditorAdmission
+        ));
         assert!(state.copied.borrow().is_empty());
         assert_eq!(
             *state.events.borrow(),
