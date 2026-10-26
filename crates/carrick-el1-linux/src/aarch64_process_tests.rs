@@ -6575,10 +6575,21 @@ fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
     let mut exec_frame = carrick_el1_abi::TrapFrame::default();
     exec_frame.x[0] = 0x1234;
     exec_frame.x[8] = 221;
+    let exec_route = arm_call(fixture, fixture.control, &mut service, &mut exec_frame).unwrap();
     assert_eq!(
-        arm_call(fixture, fixture.control, &mut service, &mut exec_frame).unwrap(),
-        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        exec_route,
+        carrick_personality_linux::dispatch::CompletionRoute::NativeService,
         "the production ARM adapter must hand execve to native service capture"
+    );
+    assert_eq!(
+        super::dispatch::resolve_arm_process_route(
+            exec_route,
+            &mut exec_frame,
+            &carrick_el1_abi::Counters::new(),
+            core::slice::from_ref(&fixture.task),
+            || panic!("a native-service handoff is not an owner refusal"),
+        ),
+        carrick_el1_abi::Action::Forward,
     );
     assert_eq!(
         exec_frame.x[0], 0x1234,

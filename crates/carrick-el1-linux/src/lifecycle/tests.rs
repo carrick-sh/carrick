@@ -253,6 +253,7 @@ impl World {
             CompletionRoute::WithWork => Action::ServedWithWork,
             CompletionRoute::Suspended => Action::Idle,
             CompletionRoute::Forward => Action::Forward,
+            CompletionRoute::NativeService => Action::Forward,
             CompletionRoute::InvalidCompletion => panic!("stale native completion"),
             CompletionRoute::HostCustody => Action::HostCustody,
         }
@@ -401,6 +402,7 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
             CompletionRoute::WithWork => Action::ServedWithWork,
             CompletionRoute::Suspended => Action::Idle,
             CompletionRoute::Forward => Action::Forward,
+            CompletionRoute::NativeService => Action::Forward,
             CompletionRoute::InvalidCompletion => panic!("stale entry completion"),
         }
     })
