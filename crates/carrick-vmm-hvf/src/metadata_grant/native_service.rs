@@ -147,6 +147,10 @@ mod native_exec_service_registration_tests {
             witness.upgrade().is_some(),
             "installed service was not retained"
         );
+        assert!(
+            directory.service(capability).is_some(),
+            "plain root exec capability must resolve before retirement"
+        );
         registration.retire().unwrap();
         assert!(
             witness.upgrade().is_none(),
