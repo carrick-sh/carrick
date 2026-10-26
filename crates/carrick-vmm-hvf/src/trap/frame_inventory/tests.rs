@@ -8174,7 +8174,7 @@ fn carries_conditional_retire_of(task: &mut HvfTaskState, frame: carrick_hal::Fr
 }
 
 #[derive(Debug)]
-struct BootstrapRetirementArenaSource(Option<carrick_mmu_core::aarch64::SubstrateGpa>);
+struct BootstrapRetirementArenaSource(Vec<carrick_mmu_core::aarch64::SubstrateGpa>);
 
 struct BootstrapRetirementPoolFixture {
     custody: std::sync::Arc<CarrierVmCustody>,
@@ -8207,14 +8207,22 @@ impl carrick_mmu_core::aarch64::TableArenaSource for BootstrapRetirementArenaSou
         ))
     }
     fn take_arena(&mut self) -> Option<carrick_mmu_core::aarch64::SubstrateGpa> {
-        self.0.take()
+        self.0.pop()
     }
     fn return_arena(&mut self, base: carrick_mmu_core::aarch64::SubstrateGpa) {
-        self.0 = Some(base);
+        self.0.push(base);
     }
 }
 
 fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStage2RecordIdentity {
+    relocate_exit_fixture_root_with_extensions(task, base, &[])
+}
+
+fn relocate_exit_fixture_root_with_extensions(
+    task: &mut HvfTaskState,
+    base: u64,
+    extensions: &[u64],
+) -> CarrierStage2RecordIdentity {
     task.mm_root_slot = None; // Bootstrap roots use their source's table capacity.
     let custody = legacy_test_carrier_vm_custody_arc();
     let (process_identity, mm) = predecessor_test_identity(task);
@@ -8246,13 +8254,80 @@ fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStag
             },
         )
         .expect("publish relocated bootstrap MM identity");
+    let mut arenas = extensions
+        .iter()
+        .rev()
+        .copied()
+        .map(carrick_mmu_core::aarch64::SubstrateGpa)
+        .collect::<Vec<_>>();
+    arenas.push(carrick_mmu_core::aarch64::SubstrateGpa(base));
     tables
-        .install_source(Box::new(BootstrapRetirementArenaSource(Some(
-            carrick_mmu_core::aarch64::SubstrateGpa(base),
-        ))))
+        .install_source(Box::new(BootstrapRetirementArenaSource(arenas)))
         .unwrap();
     assert_eq!(tables.publish_initial_table_root(|_| Ok(())).unwrap(), base);
     custody.stage2_record_covering(base, 1).unwrap()
+}
+
+#[test]
+fn bootstrap_clean_exit_returns_extension_arena_for_next_bootstrap() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        2,
+    ));
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let base = pool.base_ipa();
+    let extension = base + 0x20_0000;
+    let (mut predecessor, _, _, _) =
+        exit_task_holding_owned_lease(791, 0x4000, 791, 792, &kernel, &frames);
+    relocate_exit_fixture_root_with_extensions(&mut predecessor, base, &[extension]);
+
+    let tables = predecessor.page_tables_authority();
+    let mut block = crate::memory::LINUX_MMAP_BASE + 64 * 0x20_0000;
+    tables
+        .edit(
+            crate::trap::test_stage1_edit_license_for(&tables),
+            || Err(TrapError::Hypervisor("manager must be present".to_owned())),
+            |editor| {
+                while editor.pool_stats().3 < 2 {
+                    editor
+                        .set_rw(block + 0x1000, 0x1000, false)
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "grow predecessor table arena: {error:?}"
+                            ))
+                        })?;
+                    block += 0x20_0000;
+                }
+                editor.publish_extension_arenas(|manager| {
+                    predecessor.publish_stage1_extension_arenas(manager)
+                })
+            },
+        )
+        .expect("bootstrap publishes its extension through the production owner");
+    let extension_record = custody
+        .stage2_record_covering(extension, 1)
+        .expect("extension arena has exact stage-2 authority");
+    assert_eq!(pool.allocated_count(), 2);
+
+    retire_test_process_mappings(&mut predecessor)
+        .expect("clean exit owns stage-1 and physical arena retirement");
+    assert!(
+        custody
+            .stage2_record_snapshot(extension_record.record_id)
+            .is_none(),
+        "clean exit must retire extension backing before its slot is reusable"
+    );
+
+    let (mut successor, _, _, _) =
+        exit_task_holding_owned_lease(793, 0x8000, 793, 794, &kernel, &frames);
+    relocate_exit_fixture_root(&mut successor, extension);
+    retire_test_process_mappings(&mut successor)
+        .expect("next bootstrap retires the reused extension slot");
+    assert_eq!(pool.allocated_count(), 0);
 }
 
 #[test]

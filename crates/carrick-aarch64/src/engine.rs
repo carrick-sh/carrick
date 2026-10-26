@@ -1736,8 +1736,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     Ok(res) => {
                         outcome = res;
                         if outcome.changed {
-                            self.vm
-                                .publish_stage1_extension_arenas(editor.manager)
+                            editor
+                                .publish_extension_arenas(|manager| {
+                                    self.vm.publish_stage1_extension_arenas(manager)
+                                })
                                 .map_err(|error| {
                                     MemoryError::HostMap(format!(
                                         "publish stage-1 extension arenas failed: {error:?}"
@@ -4949,9 +4951,11 @@ fn apply_stage1_protection_edit(
     armed_cow: &[crate::vmm::ForkCowRange],
 ) -> Result<PageTableApplyOutcome, PageTableError> {
     let mut source: Option<Box<dyn carrick_mmu_core::aarch64::TableArenaSource>> = None;
+    let mut published_arenas = Vec::new();
     let mut editor = crate::stage1_authority::Stage1Editor {
         manager: mgr,
         arena_source: &mut source,
+        published_arenas: &mut published_arenas,
         image_generation: None,
     };
     editor.apply_protection_edit(address, len, prot, armed_cow)

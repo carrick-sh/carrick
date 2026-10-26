@@ -5009,6 +5009,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
                         block += TWO_MIB;
                     }
                     assert_eq!(editor.pool_stats().3, 2, "manager grew to 2 arenas");
+                    editor.publish_extension_arenas(|_| Ok::<(), TrapError>(()))?;
 
                     let page_table_resolver =
                         runtime.page_table_resolver(editor.base(), Some(primary_host_ptr));

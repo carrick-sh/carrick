@@ -3375,7 +3375,13 @@ impl PageTableManager {
 
     /// Guest-physical base addresses of all extension arenas attached to this manager.
     pub fn extension_arena_bases(&self) -> Vec<u64> {
-        self.arenas[1..].iter().map(|a| a.base).collect()
+        self.extension_arena_bases_iter().collect()
+    }
+
+    /// Iterate extension arena bases without allocating. Publication checks
+    /// use this while metadata allocation can itself be under refusal.
+    pub fn extension_arena_bases_iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.arenas[1..].iter().map(|arena| arena.base)
     }
 
     /// Sum of the populated table bytes (`next_free`) across all arenas.

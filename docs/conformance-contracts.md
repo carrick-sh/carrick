@@ -476,6 +476,11 @@ The two-live-MM VM-free bindings are
 `two_live_mm_pinned_table_retirement_cannot_return_physical_capacity`: retirement
 releases one slot, retains the other MM's bytes and identity, and a pin allows
 zero capacity returns. These do not qualify full-crate parallel host fixtures.
+`bootstrap_clean_exit_returns_extension_arena_for_next_bootstrap` grows a
+host-edited bootstrap image into a second pooled arena, drives its production
+clean-exit retirement, and requires the next bootstrap to reuse that exact
+physical slot. Stage-1 publication cannot precede the extension's committed
+backing, and the same authority records it for terminal retirement.
 `two_live_mm_empty_inventory_releases_already_terminal_table_capacity` covers
 an earlier exact physical retirement followed by MM teardown without data rows:
 the old record permits release of only its still-retained capacity.

@@ -375,6 +375,26 @@ struct Stage1AuthorityInner {
     guest_lane_pending: bool,
 }
 
+fn publish_missing_extension_arenas<E>(
+    manager: &PageTableManager,
+    published_arenas: &mut Vec<u64>,
+    publish: impl FnOnce(&PageTableManager) -> Result<(), E>,
+) -> Result<(), E> {
+    if manager
+        .extension_arena_bases_iter()
+        .all(|base| published_arenas.contains(&base))
+    {
+        return Ok(());
+    }
+    publish(manager)?;
+    for base in manager.extension_arena_bases_iter() {
+        if !published_arenas.contains(&base) {
+            published_arenas.push(base);
+        }
+    }
+    Ok(())
+}
+
 impl Drop for Stage1AuthorityInner {
     fn drop(&mut self) {
         if let Some(image) = self.manager.take() {
@@ -823,8 +843,25 @@ impl Stage1Authority {
         // to the backing that becomes authoritative; a manager that cannot
         // publish them keeps them and the selection stays pending.
         let host_owned = inner.live_owner == LiveDescriptorOwner::Host;
-        let synced = match inner.manager.as_mut() {
+        let publisher = inner.arena_publisher.clone();
+        let Stage1AuthorityInner {
+            ref mut manager,
+            ref mut published_arenas,
+            ..
+        } = *inner;
+        let synced = match manager.as_mut() {
             Some(manager) if host_owned && manager.has_unsynced_edits() => {
+                if publish_missing_extension_arenas(manager, published_arenas, |manager| {
+                    publisher
+                        .as_ref()
+                        .ok_or(())?
+                        .publish_extension_arenas(manager)
+                        .map_err(|_| ())
+                })
+                .is_err()
+                {
+                    return false;
+                }
                 // SAFETY: the caller authenticated `resolver` for this
                 // authority's arenas (this function's contract).
                 unsafe { manager.sync_to_host(&resolver) }.is_ok()
@@ -1048,20 +1085,23 @@ impl Stage1Authority {
             .iter()
             .find(|base| !inner_ref.published_arenas.contains(base))
         {
-            let published = inner_ref
-                .arena_publisher
-                .as_ref()
-                .is_some_and(|publisher| publisher.publish_extension_arenas(manager).is_ok());
-            if !published {
+            let Some(publisher) = inner_ref.arena_publisher.as_ref() else {
                 let _ = manager.abandon_guest_descriptor_txn(&txn);
                 return Err(GuestTxnPrepareError::Manager(
                     PageTableError::UnresolvedArena(unpublished),
                 ));
-            }
-            for base in arenas {
-                if !inner_ref.published_arenas.contains(&base) {
-                    inner_ref.published_arenas.push(base);
-                }
+            };
+            if publish_missing_extension_arenas(
+                manager,
+                &mut inner_ref.published_arenas,
+                |manager| publisher.publish_extension_arenas(manager),
+            )
+            .is_err()
+            {
+                let _ = manager.abandon_guest_descriptor_txn(&txn);
+                return Err(GuestTxnPrepareError::Manager(
+                    PageTableError::UnresolvedArena(unpublished),
+                ));
             }
         }
         inner.txn_generation = generation.get();
@@ -1454,6 +1494,7 @@ impl Stage1Authority {
         let Stage1AuthorityInner {
             ref mut manager,
             ref mut arena_source,
+            ref mut published_arenas,
             live_owner,
             ..
         } = *inner;
@@ -1467,6 +1508,7 @@ impl Stage1Authority {
         let mut editor = Stage1Editor {
             manager,
             arena_source,
+            published_arenas,
             image_generation,
         };
         f(&mut editor)
@@ -1796,6 +1838,7 @@ impl Stage1Authority {
                 let Stage1AuthorityInner {
                     ref mut manager,
                     ref mut arena_source,
+                    ref mut published_arenas,
                     live_owner,
                     ..
                 } = *inner;
@@ -1811,6 +1854,7 @@ impl Stage1Authority {
                 let mut editor = Stage1Editor {
                     manager,
                     arena_source,
+                    published_arenas,
                     image_generation,
                 };
                 f(&mut editor)?
@@ -2288,6 +2332,7 @@ impl Drop for ReservedTableArena {
 pub struct Stage1Editor<'a> {
     pub manager: &'a mut PageTableManager,
     pub arena_source: &'a mut Option<Box<dyn TableArenaSource>>,
+    pub(crate) published_arenas: &'a mut Vec<u64>,
     pub(crate) image_generation: Option<std::num::NonZeroU64>,
 }
 
@@ -2320,6 +2365,15 @@ impl<'a> Stage1Editor<'a> {
         self.manager.undo_is_open()
     }
 
+    /// Publish every extension arena grown by this edit and make that
+    /// physical ownership part of this authority's terminal retirement.
+    pub fn publish_extension_arenas<E>(
+        &mut self,
+        publish: impl FnOnce(&PageTableManager) -> Result<(), E>,
+    ) -> Result<(), E> {
+        publish_missing_extension_arenas(self.manager, self.published_arenas, publish)
+    }
+
     /// Synchronize dirty page table descriptors to the live host backing.
     ///
     /// # Safety
@@ -2329,6 +2383,13 @@ impl<'a> Stage1Editor<'a> {
         &mut self,
         resolver: impl HostArenaResolver,
     ) -> Result<(), PageTableError> {
+        if let Some(unpublished) = self
+            .manager
+            .extension_arena_bases_iter()
+            .find(|base| !self.published_arenas.contains(base))
+        {
+            return Err(PageTableError::UnresolvedArena(unpublished));
+        }
         unsafe { self.manager.sync_to_host(resolver) }
     }
 
@@ -2890,9 +2951,11 @@ pub(crate) mod tests {
 
             let mut planned = image.snapshot_image().unwrap();
             let mut source = None;
+            let mut published_arenas = Vec::new();
             let mut editor = Stage1Editor {
                 manager: &mut planned,
                 arena_source: &mut source,
+                published_arenas: &mut published_arenas,
                 image_generation: None,
             };
             let plan = protection_terminal_rules(address, len, prot, armed_cow, *new_mapping);
@@ -3032,9 +3095,11 @@ pub(crate) mod tests {
             )
             .unwrap();
         let mut source = None;
+        let mut published_arenas = Vec::new();
         let mut editor = Stage1Editor {
             manager: &mut manager,
             arena_source: &mut source,
+            published_arenas: &mut published_arenas,
             image_generation: None,
         };
         let cow = [crate::vmm::ForkCowRange {
@@ -4556,6 +4621,7 @@ pub(crate) mod tests {
                         editor.map_aliased(va, ipa, 0x1000, RWX).unwrap();
                     }
                     assert!(editor.manager.arenas.len() > 8);
+                    editor.publish_extension_arenas(|_| Ok::<(), PageTableError>(()))?;
 
                     // Inject refusal during sync_to_host (>8-arena overflow hosts vector reservation)
                     test_allocator::FAIL_AFTER.with(|c| c.set(Some(0)));

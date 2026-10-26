@@ -2569,7 +2569,9 @@ impl HvfTaskState {
                                         "restrict HVPatch retained reuse leaves: {error:?}"
                                     ))
                                 })?;
-                            self.publish_stage1_extension_arenas(editor.manager)?;
+                            editor.publish_extension_arenas(|manager| {
+                                self.publish_stage1_extension_arenas(manager)
+                            })?;
                             let page_table_resolver =
                                 self.page_table_resolver(editor.base(), Some(page_table_host));
                             unsafe { editor.sync_to_host(page_table_resolver) }.map_err(|e| {
@@ -3245,7 +3247,9 @@ impl HvfTaskState {
                         }
                         page_va = page_va.saturating_add(PAGE_SIZE);
                     }
-                    self.publish_stage1_extension_arenas(manager.manager)?;
+                    manager.publish_extension_arenas(|tables| {
+                        self.publish_stage1_extension_arenas(tables)
+                    })?;
                     let page_table_resolver =
                         self.page_table_resolver(manager.base(), Some(page_table_host));
                     unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|error| {
@@ -4268,7 +4272,9 @@ impl HvfTaskState {
                                 page_va = page_va.saturating_add(PAGE_SIZE);
                             }
                         }
-                        self.publish_stage1_extension_arenas(manager.manager)?;
+                        manager.publish_extension_arenas(|tables| {
+                            self.publish_stage1_extension_arenas(tables)
+                        })?;
                         let page_table_resolver =
                             self.page_table_resolver(manager.base(), Some(page_table_host));
                         unsafe { manager.sync_to_host(page_table_resolver) }.map_err(|e| {

@@ -1505,16 +1505,18 @@ pub(super) fn publish_replacing(
                             "publish sparse HVPatch mmap stage-1 permissions: {other:?}"
                         )),
                     })?;
-                    context.state.publish_stage1_extension_arenas_into(
-                        // The root region's guest-visible mapping is read-only,
-                        // but structural table backing must remain writable for
-                        // hardware table-walk updates. Fork construction uses
-                        // the same explicit permission for extension arenas.
-                        &context.custody,
-                        editor.manager,
-                        applevisor::memory::MemPerms::ReadWrite,
-                        &mut extension_regions,
-                    )?;
+                    editor.publish_extension_arenas(|manager| {
+                        context.state.publish_stage1_extension_arenas_into(
+                            // The root region's guest-visible mapping is read-only,
+                            // but structural table backing must remain writable for
+                            // hardware table-walk updates. Fork construction uses
+                            // the same explicit permission for extension arenas.
+                            &context.custody,
+                            manager,
+                            applevisor::memory::MemPerms::ReadWrite,
+                            &mut extension_regions,
+                        )
+                    })?;
                     let page_table_resolver = context
                         .state
                         .pinned_stage1_arenas(&context.custody, editor.base())?;
