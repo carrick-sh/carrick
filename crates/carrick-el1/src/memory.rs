@@ -1868,6 +1868,39 @@ mod tests {
         }
 
         #[test]
+        fn delegated_map_stack_uses_private_anonymous_owner_and_guard() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            // Rust's Linux stack-overflow handler: alternate stack plus guard.
+            let (route, address) = syscall(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [0, 0x4000, RW, ANON | MAP_STACK, u64::MAX, 0],
+            );
+            assert_eq!(
+                route,
+                DelegatedAnonymous::Served,
+                "MAP_STACK must use the Linux private-anonymous owner"
+            );
+            assert!(address > 0);
+            let (route, result) = syscall(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MPROTECT,
+                [address as u64, 0x1000, 0, 0, 0, 0],
+            );
+            assert_eq!((route, result), (DelegatedAnonymous::Served, 0));
+        }
+
+        #[test]
         fn mmap_unrepresented_protection_preserves_host_linux_decoder() {
             assert_eq!(
                 MmapProtectionRoute::decode(1 << 28),
