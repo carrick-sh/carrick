@@ -4220,11 +4220,8 @@ mod carrier_vm_custody_tests {
         assert!(
             custody
                 .stage2_record_snapshot(fixed_old_identity.record_id)
-                .is_some_and(|record| {
-                    record.terminalized_by_vm_destroy
-                        && record.superseded_by_rebind
-                        && !record.mapped
-                })
+                .is_none(),
+            "rebind must consume the predecessor proof and remove the old record"
         );
         let current_record_id = current.record_identity.record_id;
         let second = super::reconcile_global_frame_owners_after_replay_in_using(
