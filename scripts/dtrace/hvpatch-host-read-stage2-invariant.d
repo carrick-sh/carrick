@@ -43,30 +43,54 @@ carrick*:::hvpatch-el1-host-read-retention
 /pid == $target || progenyof($target)/
 {
     printf("RETENTION ts=%lld pid=%d tid=%d ipa=0x%llx reason=%u\n",
-        walltimestamp, pid, tid, arg0, arg1);
+        walltimestamp, pid, tid, (uint64_t)arg0, arg1);
 }
 
 carrick*:::hvpatch-el1-host-read-retention-detail
 /pid == $target || progenyof($target)/
 {
     printf("RETENTION-DETAIL ts=%lld pid=%d tid=%d ipa=0x%llx reason=%u record=%llu vm_generation=%llu owner_generation=%llu state=0x%llx mapped=%u backend=%u retirement_requested=%u terminal=%u superseded=%u release_in_flight=%u release_retry=%u publication_authority=%u pins=%llu\n",
-        walltimestamp, pid, tid, arg0, arg1, arg2, arg3, arg4, arg5,
+        walltimestamp, pid, tid, (uint64_t)arg0, arg1,
+        (uint64_t)arg2, (uint64_t)arg3, (uint64_t)arg4, (uint64_t)arg5,
         arg5 & 1, (arg5 >> 1) & 1, (arg5 >> 2) & 1,
         (arg5 >> 3) & 1, (arg5 >> 4) & 1, (arg5 >> 5) & 1,
-        (arg5 >> 6) & 1, (arg5 >> 7) & 1, arg5 >> 16);
+        (arg5 >> 6) & 1, (arg5 >> 7) & 1, (uint64_t)arg5 >> 16);
+    ustack(8);
+}
+
+carrick*:::hvpatch-el1-host-read-editor-wait
+/pid == $target || progenyof($target)/
+{
+    printf("EDITOR-WAIT ts=%lld pid=%d tid=%d address=0x%llx source=%u revision=%llu\n",
+        walltimestamp, pid, tid, (uint64_t)arg0, arg1, (uint64_t)arg2);
+    ustack(8);
+}
+
+pid$target::*rec_stage2_authority_invariant*:entry
+{
+    printf("INVARIANT ts=%lld pid=%d tid=%d mm=%llu guest_tid=%d selected_revision=%llu current_revision=%llu editor_held=%u\n",
+        walltimestamp, pid, tid, (uint64_t)arg0, arg1,
+        (uint64_t)arg2, (uint64_t)arg3, arg4);
     ustack(8);
 }
 
 pid$target::*register_stage2_record_locked*:entry,
 pid$target::*rebind_stage2_record*:entry,
-pid$target::*request_record_retirement*:entry,
-pid$target::*prepare_record_retirement*:entry,
-pid$target::*terminalize_record*:entry,
 pid$target::*remove_record*:entry,
 pid$target::*remove_terminal_stage2_record*:entry
 {
     printf("STAGE2-LIFECYCLE ts=%lld pid=%d tid=%d fn=%s a0=%p a1=%p a2=%p a3=%p a4=%p a5=%p\n",
         walltimestamp, pid, tid, probefunc, arg0, arg1, arg2, arg3, arg4, arg5);
+    ustack(8);
+}
+
+pid$target::*request_record_retirement*:entry,
+pid$target::*prepare_record_retirement*:entry,
+pid$target::*terminalize_record*:entry
+{
+    this->record = (uint64_t *)copyin(arg0, 8);
+    printf("STAGE2-RETIRE ts=%lld pid=%d tid=%d fn=%s record=%llu a0=%p a1=%p a2=%p a3=%p\n",
+        walltimestamp, pid, tid, probefunc, this->record[0], arg0, arg1, arg2, arg3);
     ustack(8);
 }
 
@@ -79,8 +103,7 @@ pid$target::*close_and_wait_for_editor*:entry
     ustack(8);
 }
 
-pid$target::*run_fixture_in_image*:entry,
-pid$target::*poll_with_engine*:entry
+pid$target::*run_fixture_in_image*:entry
 {
     printf("PREFLIGHT ts=%lld pid=%d tid=%d fn=%s\n",
         walltimestamp, pid, tid, probefunc);

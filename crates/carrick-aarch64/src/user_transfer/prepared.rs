@@ -112,6 +112,13 @@ impl<'a, S: PreparedService, P: TransferPin> PreparedWrite<'a, S, P> {
             if let Some(suspension) = ticket.take_prepare_suspension() {
                 return Err(match suspension {
                     carrick_el1_abi::PortalPrepareSuspension::Owner(observed) => {
+                        if observed.cause() == carrick_el1_abi::PortalWaitCause::Editor {
+                            carrick_observability::probes::hvpatch_el1_host_read_editor_wait(
+                                request.range.address(),
+                                2,
+                                observed.revision(),
+                            );
+                        }
                         if observed.cause() == carrick_el1_abi::PortalWaitCause::Metadata {
                             MemoryPrepareError::Supply(MemorySupplyRequest::Metadata {
                                 operation: request.operation,

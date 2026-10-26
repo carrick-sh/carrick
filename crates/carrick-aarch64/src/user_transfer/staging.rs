@@ -152,6 +152,13 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
         let observed = unsafe {
             carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
         };
+        if cause == carrick_el1_abi::PortalWaitCause::Editor {
+            carrick_observability::probes::hvpatch_el1_host_read_editor_wait(
+                va,
+                1,
+                observed.revision(),
+            );
+        }
         return Err(if cause == carrick_el1_abi::PortalWaitCause::Metadata {
             MemoryPrepareError::Supply(MemorySupplyRequest::Metadata {
                 operation: PortalOperation {

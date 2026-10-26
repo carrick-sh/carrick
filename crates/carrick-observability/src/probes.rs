@@ -3015,12 +3015,26 @@ mod hvpatch_guest_probe_abi {
     fn host_read_retention_detail_keeps_six_scalar_shape() {
         let source = include_str!("probes.rs");
         for declaration in [
-            "fn hvpatch__el1__host__read__retention__detail(_: u64, _: u32, _: u64, _: u64, _: u64, _: u64) {}",
+            "fn hvpatch__el1__host__read__retention__detail(",
             "pub fn hvpatch_el1_host_read_retention_detail_with(",
         ] {
             assert!(
                 source.matches(declaration).count() >= 2,
                 "missing host-read retention detail ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_read_editor_wait_names_the_typed_source() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__el1__host__read__editor__wait(",
+            "stub!(hvpatch_el1_host_read_editor_wait(address: u64, source: u32, revision: u64));",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing host-read Editor-wait source ABI declaration {declaration}"
             );
         }
     }
@@ -5788,6 +5802,9 @@ mod real {
             _: u64,
         ) {
         }
+        /// An Editor wait returned before physical retention. Args: guest
+        /// address, typed source (1 SELECT admission, 2 PREPARE), revision.
+        fn hvpatch__el1__host__read__editor__wait(_: u64, _: u32, _: u64) {}
 
         /// phase, mailbox host address, generation, request sequence, state.
         fn syscall__mailbox__lifecycle(_: u32, _: u64, _: u64, _: u64, _: u32) {}
@@ -7359,6 +7376,11 @@ mod real {
             let (record, vm_generation, owner_generation, state) = diagnostic();
             (ipa, reason, record, vm_generation, owner_generation, state)
         });
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_el1_host_read_editor_wait(address: u64, source: u32, revision: u64) {
+        carrick_usdt::hvpatch__el1__host__read__editor__wait!(|| (address, source, revision));
     }
 
     /// Read diagnostic payload only when the lifecycle probe is enabled.
@@ -9887,6 +9909,7 @@ mod stub {
         _diagnostic: impl FnOnce() -> (u64, u64, u64, u64),
     ) {
     }
+    stub!(hvpatch_el1_host_read_editor_wait(address: u64, source: u32, revision: u64));
 
     pub fn syscall_mailbox_lifecycle_with(
         _phase: super::SyscallMailboxPhase,
