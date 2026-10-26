@@ -1137,14 +1137,17 @@ pub fn come_back_to_slot(slot: SlotId, driver: u64) {
 /// with no guest CPU and drives nothing. If nobody took `slot` over, what is
 /// queued there leaves; a first-entry thread no live slot will take waits on
 /// `now`, while a service thread goes back to its host run queue.
-pub fn leave_slot(slot: SlotId, driver: u64, now: Option<SlotId>) {
-    if let Some(zone) = zone() {
-        leave_slot_in(zone, slot, driver, now);
-    }
+#[must_use]
+pub fn leave_slot(slot: SlotId, driver: u64, now: Option<SlotId>) -> bool {
+    let Some(zone) = zone() else {
+        return true;
+    };
+    leave_slot_in(zone, slot, driver, now)
 }
 
 /// [`leave_slot`] on the tables `zone`.
-pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<SlotId>) {
+#[must_use]
+pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<SlotId>) -> bool {
     let mut records = Vec::new();
     let mut placements = Vec::new();
     if zone.leave_slot(
@@ -1161,6 +1164,9 @@ pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<S
             &mut publish_handback,
             &mut capture_handbacks,
         );
+        true
+    } else {
+        false
     }
 }
 
