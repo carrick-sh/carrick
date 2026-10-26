@@ -827,6 +827,16 @@ pub struct El1EditorExclusion {
     held: Option<carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion>,
 }
 
+impl El1EditorExclusion {
+    /// Borrow the edit proof owned by this exact exclusion guard.
+    pub fn license(&self) -> &carrick_hal::el1_editor_exclusion::El1EditorExcluded {
+        self.held
+            .as_ref()
+            .expect("EL1 editor exclusion guard always owns its proof")
+            .license()
+    }
+}
+
 impl std::fmt::Debug for El1EditorExclusion {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1159,6 +1169,7 @@ pub struct ReservationRootPublication {
 pub struct PreAdmissionGuard {
     tables: SpaceTables,
     mm: MmId,
+    editor: El1EditorExclusion,
     _serial: parking_lot::MutexGuard<'static, ()>,
 }
 // SAFETY: every publication of these tables takes SPACES_LOCK. This guard
@@ -1174,6 +1185,9 @@ unsafe impl carrick_hal::PreAdmissionOwner for PreAdmissionGuard {
     }
     fn unpublished(&self) -> bool {
         self.tables.spaces.find(self.mm.raw()).is_none()
+    }
+    fn editor_excluded(&self) -> &carrick_guest_mem::El1EditorExcluded {
+        self.editor.license()
     }
 }
 impl PreAdmissionGuard {
@@ -1212,9 +1226,11 @@ impl PreAdmissionGuard {
         if mm.raw() == 0 || tables.spaces.find(mm.raw()).is_some() {
             return None;
         }
+        let editor = exclude_el1_editor_in(tables, mm)?;
         Some(Self {
             tables,
             mm,
+            editor,
             _serial: serial,
         })
     }

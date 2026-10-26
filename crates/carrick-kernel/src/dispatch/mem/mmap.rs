@@ -2526,7 +2526,7 @@ impl<'a> MemView<'a> {
                 let Ok(len_usize) = usize::try_from(aligned_len) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                if cx.memory.unmap_range(address.0, len_usize).is_err() {
+                if cx.memory.unmap_range(cx.mm_mutation.el1_editor_license(), address.0, len_usize).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
@@ -2563,7 +2563,7 @@ impl<'a> MemView<'a> {
                     .iter()
                     .map(|alloc| this.snapshot_shared_writeback(&mut *cx.memory, alloc))
                     .collect::<Vec<_>>();
-                if cx.memory.unmap_range(address.0, len_usize).is_err() {
+                if cx.memory.unmap_range(cx.mm_mutation.el1_editor_license(), address.0, len_usize).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
                 mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
@@ -2647,7 +2647,7 @@ impl<'a> MemView<'a> {
             };
             // Invalidate the freed range before removing any dispatcher VMA
             // metadata or returning it to the allocator.
-            if cx.memory.unmap_range(address.0, len_usize).is_err() {
+            if cx.memory.unmap_range(cx.mm_mutation.el1_editor_license(), address.0, len_usize).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             }
             mark_range_unmapped(&mut *cx.memory, address.0, len_usize);
@@ -4143,9 +4143,9 @@ impl<'a> MemView<'a> {
             if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
                 let owner_proposal = this.mem().lock().has_owner_proposal();
                 let publication = if owner_proposal {
-                    cx.memory.protect_owner_reserved_range(address.0, len, prot)
+                    cx.memory.protect_owner_reserved_range(cx.mm_mutation.el1_editor_license(), address.0, len, prot)
                 } else {
-                    cx.memory.protect_range(address.0, len, prot)
+                    cx.memory.protect_range(cx.mm_mutation.el1_editor_license(), address.0, len, prot)
                 };
                 if let Err(error) = publication {
                     tracing::error!(
@@ -4190,7 +4190,7 @@ impl<'a> MemView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 }
             } else if mprotect_range_in_identity_image(address.0, length, layout) {
-                if cx.memory.protect_range(address.0, len, prot).is_err()
+                if cx.memory.protect_range(cx.mm_mutation.el1_editor_license(), address.0, len, prot).is_err()
                     && this.page_geometry.native_profile
                         == Some(carrick_spec::NativePageProfile::Native16k)
                 {
@@ -4205,7 +4205,7 @@ impl<'a> MemView<'a> {
                 }
             } else if (this.range_has_host_alias_backing(address.0, length)
                 || cx.memory.supports_concurrent_exec_protection())
-                && let Err(error) = cx.memory.protect_range(address.0, len, prot)
+                && let Err(error) = cx.memory.protect_range(cx.mm_mutation.el1_editor_license(), address.0, len, prot)
             {
                 crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::AliasBackingProtectRange, || {
                     Some(error.to_string())
@@ -4225,7 +4225,7 @@ impl<'a> MemView<'a> {
                     crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::BusFaultReapply, || None);
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
-                if let Err(error) = cx.memory.protect_range(bus_start, bus_len, 0) {
+                if let Err(error) = cx.memory.protect_range(cx.mm_mutation.el1_editor_license(), bus_start, bus_len, 0) {
                     crate::mprotect_diag::record(crate::mprotect_diag::MprotectEnomemSite::BusFaultReapply, || {
                         Some(error.to_string())
                     });

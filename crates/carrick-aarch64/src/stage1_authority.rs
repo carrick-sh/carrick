@@ -99,7 +99,6 @@ mod edit_license_sealed {
 /// mutation lane.
 pub trait Stage1EditLicense: edit_license_sealed::Sealed {
     fn mm(&self) -> u64;
-    fn is_active(&self) -> bool;
 }
 
 impl Stage1EditLicense for carrick_hal::el1_editor_exclusion::El1EditorExcluded {
@@ -107,9 +106,6 @@ impl Stage1EditLicense for carrick_hal::el1_editor_exclusion::El1EditorExcluded 
         self.mm()
     }
 
-    fn is_active(&self) -> bool {
-        self.is_active()
-    }
 }
 
 impl<C> Stage1EditLicense for carrick_sched_core::SpaceEditor<'_, C>
@@ -120,9 +116,6 @@ where
         self.key()
     }
 
-    fn is_active(&self) -> bool {
-        true
-    }
 }
 
 /// Non-cloneable proof that one exact authority image stopped translating
@@ -448,14 +441,11 @@ impl Stage1Authority {
     }
 
     fn assert_license(&self, license: &impl Stage1EditLicense) {
-        assert!(license.is_active(), "stage-1 Editor license expired");
-        if let Some(mm) = self.inner.lock().mm {
-            assert_eq!(
-                license.mm(),
-                mm,
-                "stage-1 Editor license belongs to another MM"
-            );
-        }
+        assert_eq!(
+            Some(license.mm()),
+            self.inner.lock().mm,
+            "stage-1 Editor license must name the authority's bound MM"
+        );
     }
 
     /// Capture the exact live leaves a prepared guest retirement transaction

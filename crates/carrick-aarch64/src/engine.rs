@@ -559,6 +559,9 @@ struct EngineStage1Services<'a, V: Aarch64Vmm> {
     /// break-before-make) invalidation, which the caller then runs once for
     /// its whole edit; `None` runs every invalidation at once.
     required_invalidation: Option<&'a std::cell::Cell<bool>>,
+    /// Present only when the caller handed this service the exact guard's
+    /// host-editor proof. Guest-owned publication needs no host edit proof.
+    editor_excluded: Option<&'a carrick_guest_mem::El1EditorExcluded>,
 }
 impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Services<'_, V> {
     fn slot(&self) -> Option<usize> {
@@ -600,6 +603,7 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
         slots: &carrick_el1_abi::DescriptorTxnSlots,
     ) -> Option<Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt, TrapError>>
     {
+        let excluded = self.editor_excluded?;
         let (process_asid, carrier_root) = (self.process_asid, self.carrier_root);
         let required_invalidation = self.required_invalidation;
         let maintenance = VcpuBbmMaintenance::<V> {
@@ -610,6 +614,7 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
         };
         crate::descriptor_drain::apply_as_host_if_excluded(
             &self.tables,
+            excluded,
             slots,
             txn,
             &maintenance,
@@ -1476,23 +1481,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// shared (and therefore preserved for other siblings/parent).
     fn replace_page_tables(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         replacement: ExecStage1Replacement,
     ) -> Result<bool, TrapError> {
-        let was_shared = carrick_hal::el1_editor_exclusion::with_held_exclusion(
-            self.mm_generation,
-            |license| {
-                let license = license.ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "exec stage-1 replacement lacks its Editor exclusion".to_owned(),
-                    )
-                })?;
-                replace_page_tables_authority(
-                    &mut self.page_tables,
-                    license,
-                    replacement,
-                    |detached| self.vm.retire_stage1_extension_arenas(detached),
-                )
-            },
+        let was_shared = replace_page_tables_authority(
+            &mut self.page_tables,
+            license,
+            replacement,
+            |detached| self.vm.retire_stage1_extension_arenas(detached),
         )?;
         self.vm.bind_stage1_page_tables(self.page_tables.clone());
         Ok(was_shared)
@@ -1648,22 +1644,25 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     fn pt_edit_locked(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<PageTableApplyOutcome, MemoryError> {
-        self.pt_edit_locked_after_adopting(None, edit)
+        self.pt_edit_locked_after_adopting(license, None, edit)
     }
 
     fn pt_edit_locked_after_adopting(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         live_range: Option<(u64, usize)>,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<PageTableApplyOutcome, MemoryError> {
-        self.pt_edit_locked_after_adopting_inner(live_range, None, edit)
+        self.pt_edit_locked_after_adopting_inner(license, live_range, None, edit)
             .map(|(outcome, _)| outcome)
     }
 
     fn pt_edit_locked_after_adopting_inner(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         live_range: Option<(u64, usize)>,
         unpublish_range: Option<(u64, usize)>,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
@@ -1704,11 +1703,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         };
         let mut outcome = PageTableApplyOutcome::default();
         let mut unpublished = None;
-        let edit_res: Result<(), MemoryError> =
-            carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm_generation, |license| {
-                let license = license.ok_or_else(|| {
-                    MemoryError::HostMap("stage-1 edit lacks its Editor exclusion".to_owned())
-                })?;
+        let edit_res: Result<(), MemoryError> = (|| {
                 let mut edit = Some(edit);
                 let mut apply = |editor: &mut Stage1Editor<'_>| {
                     if editor.base() != pt_base {
@@ -1831,7 +1826,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         &mut apply,
                     )
                 }
-            });
+        })();
         edit_res?;
         Ok((outcome, unpublished))
     }
@@ -1840,9 +1835,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// not publish a new guest-visible translation.
     fn pt_edit(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<(), MemoryError> {
-        self.pt_edit_locked(edit).map(|_outcome| ())
+        self.pt_edit_locked(license, edit).map(|_outcome| ())
     }
 
     /// Edit the stage-1 tables AND, if any descriptor changed in a way that
@@ -1863,9 +1859,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// re-invented.
     fn pt_edit_and_flush(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<(), MemoryError> {
-        let outcome = self.pt_edit_locked(edit)?;
+        let outcome = self.pt_edit_locked(license, edit)?;
         if !outcome.flush_required {
             // Nothing changed that requires a TLB flush: no previously-valid leaf
             // was modified, split, or coalesced, so there is no stale TLB entry
@@ -1878,11 +1875,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     fn pt_edit_and_flush_after_adopting(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         len: usize,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<(), MemoryError> {
-        let outcome = self.pt_edit_locked_after_adopting(Some((address, len)), edit)?;
+        let outcome = self.pt_edit_locked_after_adopting(license, Some((address, len)), edit)?;
         if !outcome.flush_required {
             return Ok(());
         }
@@ -1892,11 +1890,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     fn pt_edit_unpublishing_and_flush_after_adopting(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         len: usize,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<crate::stage1_authority::Stage1LeafRetired, MemoryError> {
         let (outcome, receipt) = self.pt_edit_locked_after_adopting_inner(
+            license,
             Some((address, len)),
             Some((address, len)),
             edit,
@@ -1926,11 +1926,15 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// either its old or its final state.
     fn apply_stage1_rules(
         &mut self,
+        license: Option<&carrick_guest_mem::El1EditorExcluded>,
         adopt: (u64, usize),
         rules: &[(u64, usize, TerminalRule)],
     ) -> Result<(), MemoryError> {
         if self.page_tables.live_descriptor_owner() != LiveDescriptorOwner::Guest {
-            return self.pt_edit_and_flush_after_adopting(adopt.0, adopt.1, |editor| {
+            let license = license.ok_or_else(|| {
+                MemoryError::HostMap("host stage-1 rules lack their Editor exclusion".to_owned())
+            })?;
+            return self.pt_edit_and_flush_after_adopting(license, adopt.0, adopt.1, |editor| {
                 editor.apply_terminal_rules(rules)
             });
         }
@@ -1987,13 +1991,19 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// their final state.
     fn retire_stage1_range(
         &mut self,
+        license: Option<&carrick_guest_mem::El1EditorExcluded>,
         va: u64,
         len: usize,
         reclaim: bool,
     ) -> Result<Option<crate::stage1_authority::Stage1LeafRetired>, MappingRetirementError> {
         if self.page_tables.live_descriptor_owner() != LiveDescriptorOwner::Guest {
+            let license = license.ok_or_else(|| {
+                MappingRetirementError::Indeterminate(MemoryError::HostMap(
+                    "host stage-1 retirement lacks its Editor exclusion".to_owned(),
+                ))
+            })?;
             return self
-                .pt_edit_unpublishing_and_flush_after_adopting(va, len, |editor| {
+                .pt_edit_unpublishing_and_flush_after_adopting(license, va, len, |editor| {
                     if reclaim {
                         editor.unmap_aliased(va, len)
                     } else {
@@ -2155,7 +2165,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     /// Revert uncommitted page table edits from the undo journal to shadow and host memory,
     /// and flush stale translations from the stage-1 TLB.
-    fn pt_rollback_undo_and_flush(&mut self) -> Result<(), MemoryError> {
+    fn pt_rollback_undo_and_flush(
+        &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
+    ) -> Result<(), MemoryError> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
@@ -2174,16 +2187,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             host,
             size,
         };
-        carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm_generation, |license| {
-            let license = license.ok_or_else(|| {
-                MemoryError::HostMap("stage-1 rollback lacks its Editor exclusion".to_owned())
-            })?;
-            unsafe {
-                self.page_tables
-                    .rollback_undo(license, resolver)
-                    .map_err(page_table_rollback_error_to_memory_error)
-            }
-        })?;
+        unsafe {
+            self.page_tables
+                .rollback_undo(license, resolver)
+                .map_err(page_table_rollback_error_to_memory_error)
+        }?;
         self.run_stage1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
     }
@@ -2553,6 +2561,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
+            editor_excluded: None,
         }
     }
 
@@ -2871,6 +2880,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     fn repoint_guest_alias(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         va: u64,
         target_ipa: u64,
         len: usize,
@@ -2887,6 +2897,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
+            editor_excluded: Some(license),
         };
         self.vm
             .repoint_guest_alias(va, target_ipa, len, content, access, &mut services)
@@ -2895,11 +2906,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     fn ensure_frame_cow_write(
         &mut self,
+        license: Option<&carrick_guest_mem::El1EditorExcluded>,
         va: u64,
         len: usize,
         intent: FrameCowWriteIntent,
     ) -> Result<(), MemoryError> {
-        self.ensure_sparse_mmap_backing(va, len)?;
+        self.ensure_sparse_mmap_backing(license, va, len)?;
         let slot = self.mailbox_slot();
         let tables = self.page_tables.clone();
         let vm = &mut self.vm;
@@ -2914,6 +2926,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
+            editor_excluded: license,
         };
         vm.ensure_frame_cow_write(va, len, intent, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
@@ -2921,6 +2934,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     fn publish_protection(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         len: usize,
         prot: u64,
@@ -2930,7 +2944,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // An admitted anonymous root keeps untouched pages hidden. Publishing
         // sparse host backing here would create a second owner for them.
         if !owner_reserved && prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
-            self.ensure_sparse_mmap_backing(address, len)?;
+            self.ensure_sparse_mmap_backing(Some(license), address, len)?;
         }
         let armed_cow = if prot & LINUX_PROT_WRITE != 0 {
             self.vm.armed_frame_cow_ranges(address, len)
@@ -2987,7 +3001,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         } else {
             plan
         };
-        if let Err(error) = self.apply_stage1_rules((address, len), &plan) {
+        if let Err(error) = self.apply_stage1_rules(Some(license), (address, len), &plan) {
             self.trace_read_fault(address, len, 3);
             return Err(error);
         }
@@ -3000,7 +3014,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             })
     }
 
-    fn ensure_sparse_mmap_backing(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
+    fn ensure_sparse_mmap_backing(
+        &mut self,
+        license: Option<&carrick_guest_mem::El1EditorExcluded>,
+        va: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         let in_sparse_arena = self.process_asid.is_some()
             && self.vm.sparse_mmap_arena_enabled()
             && ((va >= carrick_mem::memory::LINUX_MMAP_BASE
@@ -3015,6 +3034,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         if !in_sparse_arena || len == 0 {
             return Ok(());
         }
+        let license = license.ok_or_else(|| {
+            MemoryError::HostMap(
+                "sparse materialization requires its MM Editor exclusion".to_owned(),
+            )
+        })?;
         // Persistent exec intentionally drops its software editor. A NEW sparse
         // materialization needs that editor, so instantiate it before the
         // backend transaction only when absent. When the editor already exists,
@@ -3040,6 +3064,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
+            editor_excluded: Some(license),
         };
         vm.ensure_sparse_mmap_backing(va, len, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch sparse mmap backing: {error}")))
@@ -3149,6 +3174,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// the exact-MM resident-fault authority before resolving its backing.
     fn commit_prepared_host_write(
         &mut self,
+        editor: Option<&carrick_guest_mem::El1EditorExcluded>,
         address: u64,
         length: usize,
         checked: bool,
@@ -3241,8 +3267,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         .map_err(|error| error.to_string())
                     })
                 } else {
+                    let editor = editor.ok_or_else(|| {
+                        MemoryError::HostMap(
+                            "prepared host write requires its MM Editor exclusion".to_owned(),
+                        )
+                    })?;
                     authority.commit_host_first_touch(page, &mut |page, prot| {
-                        <Self as GuestMemory>::protect_range(self, page, 4096, prot)
+                        <Self as GuestMemory>::protect_range(self, editor, page, 4096, prot)
                             .map_err(|error| error.to_string())
                     })
                 }
@@ -4119,7 +4150,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             );
             error
         };
-        self.commit_prepared_host_write(address, bytes.len(), true)
+        self.commit_prepared_host_write(None, address, bytes.len(), true)
             .map_err(|error| report_fault(9, error))?;
         let length = bytes.len();
         let mut copied = 0usize;
@@ -4127,7 +4158,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             let (va, ipa, chunk_len) = self
                 .syscall_buffer_chunk(address, copied, length)
                 .map_err(|error| report_fault(10, error))?;
-            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::GuestVisible)
+            self.ensure_frame_cow_write(
+                None,
+                va,
+                chunk_len,
+                FrameCowWriteIntent::GuestVisible,
+            )
                 .map_err(|error| report_fault(11, error))?;
             self.vm
                 .translated_write(va, ipa.raw(), &bytes[copied..copied + chunk_len])
@@ -4146,7 +4182,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // permission (the host page is writable). PROT_NONE is NOT re-gated (the
         // default `write_bytes_unchecked` doesn't gate either). The translated IPA
         // resolves a `repoint_private` overlay to the private backing.
-        self.commit_prepared_host_write(address, bytes.len(), false)?;
+        self.commit_prepared_host_write(None, address, bytes.len(), false)?;
         let length = bytes.len();
         let mut copied = 0usize;
         while copied < length {
@@ -4162,7 +4198,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             let (va, ipa, chunk_len) = self
                 .syscall_buffer_chunk(address, copied, length)
                 .map_err(|error| report_fault(0, error))?;
-            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::PrivilegedInternal)
+            self.ensure_frame_cow_write(
+                None,
+                va,
+                chunk_len,
+                FrameCowWriteIntent::PrivilegedInternal,
+            )
                 .map_err(|error| report_fault(1, error))?;
             self.vm
                 .translated_write_unchecked(va, ipa.raw(), &bytes[copied..copied + chunk_len])
@@ -4216,7 +4257,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn prepare_host_write(&mut self, address: u64, length: usize) -> Result<(), MemoryError> {
-        self.commit_prepared_host_write(address, length, false)
+        self.commit_prepared_host_write(None, address, length, false)
     }
 
     fn host_read(&self, address: u64, len: usize) -> Option<carrick_guest_mem::HostRead> {
@@ -4233,8 +4274,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
-        self.commit_prepared_host_write(address, len, true).ok()?;
-        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible)
+        self.commit_prepared_host_write(None, address, len, true)
+            .ok()?;
+        self.ensure_frame_cow_write(None, address, len, FrameCowWriteIntent::GuestVisible)
             .ok()?;
         self.vm.host_ptr_for_write(address, len)
     }
@@ -4258,7 +4300,12 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         self.vm.set_no_access(address, len, no_access);
     }
 
-    fn mark_bus_fault(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn mark_bus_fault(
+        &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         if len == 0
             || !address.is_multiple_of(4096)
             || !len.is_multiple_of(4096)
@@ -4269,7 +4316,11 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 length: len,
             });
         }
-        self.apply_stage1_rules((address, len), &[(address, len, TerminalRule::BusFault)])
+        self.apply_stage1_rules(
+            Some(license),
+            (address, len),
+            &[(address, len, TerminalRule::BusFault)],
+        )
     }
 
     fn set_no_write(&mut self, address: u64, len: usize, no_write: bool) {
@@ -4342,12 +4393,18 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             // ordinary user-copy authority cannot replace it.
             return Err(MemoryError::Unsupported);
         }
-        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::BackingMaintenance)?;
+        self.ensure_frame_cow_write(
+            None,
+            address,
+            len,
+            FrameCowWriteIntent::BackingMaintenance,
+        )?;
         self.vm.zero_backing(address, len)
     }
 
     fn discard_private_anonymous(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         len: usize,
     ) -> Result<bool, carrick_guest_mem::RepointPrivateError> {
@@ -4385,10 +4442,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // Keep semantic mapping/protection metadata intact. After editing starts,
         // uncertain publication must fail stopped with old owners still retained.
         let stage1 = if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
-            self.retire_stage1_range(address, len, true)
+            self.retire_stage1_range(Some(license), address, len, true)
                 .map_err(MappingRetirementError::into_memory_error)
         } else {
-            self.pt_edit_unpublishing_and_flush_after_adopting(address, len, |mgr| {
+            self.pt_edit_unpublishing_and_flush_after_adopting(license, address, len, |mgr| {
                 mgr.unmap_aliased(address, len)
             })
             .map(Some)
@@ -4534,6 +4591,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
+            editor_excluded: None,
         };
         vm.materialize_private_file_backing(va, len, host_fd, offset, source, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
@@ -4577,23 +4635,35 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// text (PROT_READ|PROT_EXEC) actually executes instead of permission-faulting
     /// on the NX-by-default arena. (Boot regions — image text, trampolines, vDSO —
     /// are mapped executable at boot and never edited here.)
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        self.publish_protection(address, len, prot, false)
-    }
-
-    fn protect_owner_reserved_range(
+    fn protect_range(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         len: usize,
         prot: u64,
     ) -> Result<(), MemoryError> {
-        self.publish_protection(address, len, prot, true)
+        self.publish_protection(license, address, len, prot, false)
+    }
+
+    fn protect_owner_reserved_range(
+        &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
+        self.publish_protection(license, address, len, prot, true)
     }
 
     /// `munmap`: invalidate the stage-1 descriptors for `[address, address+len)` so
     /// the guest's own access faults (vs the host-side `no_access` check). The
     /// unmapped range is typically ALREADY-TOUCHED, so flush the stale TLB entry.
-    fn restore_shared_identity(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
+    fn restore_shared_identity(
+        &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
+        va: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         let len_u64 = u64::try_from(len).map_err(|_| MemoryError::OutOfBounds {
             address: va,
             length: len,
@@ -4612,6 +4682,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 carrier_root,
                 suspended_el1_sp: self.suspended_el1_sp,
                 required_invalidation: None,
+                editor_excluded: Some(license),
             };
             return self
                 .vm
@@ -4622,19 +4693,25 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }
         // The aperture leaf goes back to its own frame read/write and
         // non-executable; the caller publishes the mapping's protection next.
-        self.pt_edit_and_flush_after_adopting(va, len, |mgr| {
+        self.pt_edit_and_flush_after_adopting(license, va, len, |mgr| {
             mgr.map_aliased(va, va, len_u64, UserLeafAccess::READ_WRITE)
                 .map(|changed| PageTableApplyOutcome::new(changed, changed))
         })
     }
 
-    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.retire_mapping(GuestVa::new(address), len)
+    fn unmap_range(
+        &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        self.retire_mapping(license, GuestVa::new(address), len)
             .map_err(MappingRetirementError::into_memory_error)
     }
 
     fn retire_mapping(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         address: GuestVa,
         len: usize,
     ) -> Result<(), MappingRetirementError> {
@@ -4659,9 +4736,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 }))
                 || carrick_mem::memory::is_high_va(address))
         {
-            self.retire_stage1_range(address, len, true)?
+            self.retire_stage1_range(Some(license), address, len, true)?
         } else {
-            self.retire_stage1_range(address, len, false)?
+            self.retire_stage1_range(Some(license), address, len, false)?
         };
         self.vm
             .on_unmap(stage1.as_ref(), address, len)
@@ -4684,13 +4761,18 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// `munmap` of a high-VA alias: invalidate AND reclaim the now-empty alias
     /// sub-table(s) (vs `unmap_range`, which keeps the table for the low-VA arena's
     /// in-place reuse). Flush the stale TLB entry. Mirrors HVF.
-    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn unmap_alias_range(
+        &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         // Reclaim the alias leaves/table and complete TLBI before unregistering
         // backend lookup metadata. This legacy API erases the classification;
         // replacement uses retire_mapping so partial publication cannot be
         // mistaken for an intact predecessor.
         let stage1 = self
-            .retire_stage1_range(address, len, true)
+            .retire_stage1_range(Some(license), address, len, true)
             .map_err(MappingRetirementError::into_memory_error)?;
         self.vm
             .on_unmap(stage1.as_ref(), address, len)
@@ -4717,6 +4799,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// TLBI so any stale stage-1 entry is invalidated.
     fn repoint_private(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         va: u64,
         overlay_slot_va: u64,
         len: usize,
@@ -4757,6 +4840,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
             return self
                 .repoint_guest_alias(
+                    license,
                     va,
                     overlay_ipa,
                     len,
@@ -4791,7 +4875,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // scratch image; fail stopped so a later successful edit cannot publish
         // partial leaves after this candidate was recycled.
         let outcome = self
-            .pt_edit_locked(|mgr| {
+            .pt_edit_locked(license, |mgr| {
                 // Read/write and non-executable until the caller publishes
                 // the new mapping's protection (`protect_range`).
                 mgr.map_aliased(va, overlay_ipa, len as u64, UserLeafAccess::READ_WRITE)
@@ -4813,6 +4897,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
 
     fn repoint_shared_leaf(
         &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         va: u64,
         target_ipa: u64,
         len: usize,
@@ -4822,22 +4907,22 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let access = UserLeafAccess::from_linux_prot(prot);
         let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
         if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
-            self.repoint_guest_alias(va, target_ipa, len, None, access)?;
+            self.repoint_guest_alias(license, va, target_ipa, len, None, access)?;
             return if prot_none {
-                self.protect_range(va, len, 0)
+                self.protect_range(license, va, len, 0)
             } else {
                 Ok(())
             };
         }
         let outcome = self
-            .pt_edit_locked(|mgr| {
+            .pt_edit_locked(license, |mgr| {
                 mgr.map_aliased(va, target_ipa, len as u64, access)
                     .map(|changed| PageTableApplyOutcome::new(changed, changed))
             })
             .map_err(|e| MemoryError::HostMap(format!("repoint shared leaf pt edit: {e}")))?;
         if !outcome.changed {
             return if prot_none {
-                self.protect_range(va, len, 0)
+                self.protect_range(license, va, len, 0)
             } else {
                 Ok(())
             };
@@ -4850,7 +4935,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // A PROT_NONE move keeps its output and loses its access only after
         // the ownership edge is published against the live leaf.
         if prot_none {
-            self.protect_range(va, len, 0)?;
+            self.protect_range(license, va, len, 0)?;
         }
         Ok(())
     }
@@ -5018,7 +5103,11 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.is_forked_child
     }
 
-    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+    fn execve_into(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        new_image: &AddressSpace,
+    ) -> Result<(), TrapError> {
         self.settle_owed_resume_invalidation()?;
         let expected_shared = self.exec_predecessor_shared.take();
         let authority_id = self.page_tables.authority_id();
@@ -5031,7 +5120,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // Adopt the replacement's MM authority before reserving its aperture.
         // A backend retaining detached predecessor cleanup keeps the old
         // tables and publisher until that exact MM's retirement proof.
-        let was_shared = self.replace_page_tables(self.vm.exec_stage1_replacement())?;
+        let was_shared = self.replace_page_tables(editor, self.vm.exec_stage1_replacement())?;
         if let Some(expected) = expected_shared
             && expected != was_shared
         {
@@ -5049,7 +5138,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             seed_heap_unmapped(&legacy);
         }
         if let Some(asid) = self.process_asid {
-            <Self as ThreadedEngine>::configure_process_asid(self, asid)?;
+            <Self as ThreadedEngine>::configure_process_asid(self, editor, asid)?;
         }
         // A fresh image has no in-flight syscall or fault.
         self.pending_resume_pc = None;
@@ -5061,6 +5150,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
 
     fn map_host_alias(
         &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
         va: GuestVa,
         ipa: Gpa,
         len: u64,
@@ -5085,7 +5175,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
             return self.map_host_alias_on_guest_lane(va, gpa, len, writable);
         }
         let mut descriptors = [0_u64; 4];
-        let page_table_result = self.pt_edit_and_flush(|mgr| {
+        let page_table_result = self.pt_edit_and_flush(editor, |mgr| {
             // Never executable here: a PROT_EXEC alias is published by the
             // caller's `protect_range` with the mapping's own protection.
             let changed = mgr.map_aliased(
@@ -5140,7 +5230,7 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
                     "host alias mapping length {len:#x} exceeded host pointer width during failure cleanup unwinding"
                 );
             });
-            if let Err(unmap_error) = self.unmap_alias_range(va.raw(), cleanup_len) {
+            if let Err(unmap_error) = self.unmap_alias_range(editor, va.raw(), cleanup_len) {
                 carrick_fatal!(
                     "aarch64::alias_cleanup",
                     "failed to unmap staged alias range at {:#x} (len {:#x}) after hypervisor alias mapping failure: {unmap_error}",
@@ -5272,6 +5362,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
+            editor_excluded: None,
         };
         let refusal =
             match self
@@ -5307,6 +5398,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 // span held, as the host lane's `unmap_aliased` does.
                 self.vm.abandon_alias_inventory();
                 if let Err(retire) = self.apply_stage1_rules(
+                    None,
                     (va.raw(), cleanup_len),
                     &[(va.raw(), cleanup_len, TerminalRule::pt(PtOp::Retire))],
                 ) {
@@ -5776,6 +5868,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn publish_el1_frame_grant(
         &mut self,
+        editor: Option<&carrick_guest_mem::El1EditorExcluded>,
         grant: carrick_hal::threaded::El1FrameGrantPublication,
     ) -> Result<carrick_hal::threaded::El1FrameGrantPublished, TrapError> {
         use carrick_hal::threaded::El1FrameGrantPublished;
@@ -5811,7 +5904,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             return result;
         }
         let size = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
-        self.pt_edit_and_flush_after_adopting(grant.semantic_base, size, |editor| {
+        let editor = editor.ok_or_else(|| {
+            TrapError::Hypervisor("frame grant host edit lacks its Editor exclusion".to_owned())
+        })?;
+        self.pt_edit_and_flush_after_adopting(editor, grant.semantic_base, size, |editor| {
             // TLB maintenance only if the publication overwrote a descriptor
             // the walker could have cached: a VALID leaf, a valid block it
             // split, or a valid table pointer a reclaim sweep cleared. A first
@@ -6115,6 +6211,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
+            editor_excluded: None,
         };
         vm.refresh_fork_process_state(&mut flush)?;
         drop(flush);
@@ -6220,6 +6317,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             carrier_root,
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
+            editor_excluded: None,
         };
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
         let resolution = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
@@ -6411,7 +6509,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.set_persistent_vm_lifecycle(enabled);
     }
 
-    fn configure_process_asid(&mut self, asid: u16) -> Result<(), TrapError> {
+    fn configure_process_asid(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        asid: u16,
+    ) -> Result<(), TrapError> {
         if asid == 0 {
             return Err(TrapError::Hypervisor(
                 "hvpatch process ASID zero is reserved".to_owned(),
@@ -6431,7 +6533,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // software manager solely to rediscover two no-ops.
         if self.process_asid.is_none() {
             if self.vm.sparse_mmap_arena_enabled() {
-                self.pt_edit_and_flush(|manager| {
+                self.pt_edit_and_flush(editor, |manager| {
                     manager.set_prot_none(
                         carrick_mem::memory::LINUX_MMAP_BASE,
                         carrick_mem::memory::mmap_arena_size() as usize,
@@ -6442,7 +6544,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 })?;
                 self.vm.retire_initial_mmap_arena()?;
             }
-            self.pt_edit_and_flush(|editor| editor.reserve_hvpatch_process_apertures())
+            self.pt_edit_and_flush(editor, |editor| editor.reserve_hvpatch_process_apertures())
                 .map_err(|error| {
                     memory_error_to_trap_error(
                         error,
@@ -6514,6 +6616,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn build_process_spec(
         &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
         mut request: ProcessForkRequest,
     ) -> Result<Self::ProcessSpec, TrapError> {
         use carrick_observability::probes::{
@@ -6563,7 +6666,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
         let page_tables_absent = self.page_tables.is_none();
         if page_tables_absent {
-            self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
+            self.pt_edit(editor, |_| Ok(PageTableApplyOutcome::default()))
                 .map_err(|error| {
                     TrapError::Hypervisor(format!(
                         "load hvpatch parent page tables for process fork: {error}"
@@ -6599,7 +6702,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // directly (a live image has nothing to adopt), and the live edit
         // funnel refuses there.
         const USER_ADDRESS_SPACE: usize = 1 << 48;
-        self.pt_edit_locked_after_adopting(Some((0, USER_ADDRESS_SPACE)), |_| {
+        self.pt_edit_locked_after_adopting(editor, Some((0, USER_ADDRESS_SPACE)), |_| {
             Ok(PageTableApplyOutcome::default())
         })
         .map_err(|error| {
@@ -6780,7 +6883,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                         TrapError::Hypervisor("page-table region not mapped".to_owned())
                     })?;
 
-                    self.pt_edit_and_flush(|manager| {
+                    self.pt_edit_and_flush(editor, |manager| {
                         manager.begin_undo()?;
                         let mut outcome = PageTableApplyOutcome::default();
                         for range in &unarmed_ranges {
@@ -6865,7 +6968,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })();
 
             if let Err(error) = publish_parent {
-                if let Err(rollback_error) = self.pt_rollback_undo_and_flush() {
+                if let Err(rollback_error) = self.pt_rollback_undo_and_flush(editor) {
                     carrick_fatal!(
                         "aarch64::fork_cow",
                         "failed page table rollback and TLBI invalidation during parent fork COW setup after error {error}: {rollback_error}"
@@ -6959,7 +7062,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         })
     }
 
-    fn commit_process_fork(&mut self) -> Result<(), TrapError> {
+    fn commit_process_fork(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+    ) -> Result<(), TrapError> {
         if let Some(owner) = self.pending_owner_fork.take() {
             let used = owner.pending.completion().parent_tables_used;
             let receipt = owner.pending.finish(true, |frame, effect| {
@@ -6974,16 +7080,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             return Ok(());
         }
         let _ = self.pending_process_fork.take();
-        carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm_generation, |license| {
-            let license = license.ok_or_else(|| {
-                TrapError::Hypervisor("descriptor commit lost its Editor exclusion".to_owned())
-            })?;
-            self.page_tables.commit_undo(license);
-            Ok(())
-        })
+        self.page_tables.commit_undo(editor);
+        Ok(())
     }
 
-    fn rollback_process_fork(&mut self) -> Result<(), TrapError> {
+    fn rollback_process_fork(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+    ) -> Result<(), TrapError> {
         if let Some(owner) = self.pending_owner_fork.take() {
             let receipt = owner.pending.finish(false, |frame, effect| {
                 self.run_owner_fork_service(frame, effect)
@@ -7000,7 +7104,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let Some(rollback) = self.pending_process_fork.take() else {
             return Ok(());
         };
-        self.pt_rollback_undo_and_flush().map_err(|error| {
+        self.pt_rollback_undo_and_flush(editor).map_err(|error| {
             TrapError::Hypervisor(format!(
                 "restore parent after failed in-process fork: {error}"
             ))

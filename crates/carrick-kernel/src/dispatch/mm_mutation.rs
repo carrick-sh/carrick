@@ -221,6 +221,22 @@ impl<'authority> MmMutationGuard<'authority> {
         self.mm
     }
 
+    /// Borrow the edit proof owned by this exact MM mutation guard.
+    pub fn el1_editor_license(
+        &self,
+    ) -> &carrick_hal::el1_editor_exclusion::El1EditorExcluded {
+        self._el1_editor
+            .as_ref()
+            .expect("MM mutation guard always owns an EL1 editor exclusion")
+            .license()
+    }
+
+    pub fn try_el1_editor_license(
+        &self,
+    ) -> Option<&carrick_hal::el1_editor_exclusion::El1EditorExcluded> {
+        self._el1_editor.as_ref().map(|guard| guard.license())
+    }
+
     pub fn with_operation(
         mut self,
         operation: carrick_observability::probes::HvpatchTopologyOperation,
@@ -293,6 +309,10 @@ impl<'authority> MmMutationGuard<'authority> {
 }
 
 impl carrick_hal::ForeignMmInvalidator for MmMutationGuard<'_> {
+    fn editor_excluded(&self) -> Option<&carrick_guest_mem::El1EditorExcluded> {
+        self.try_el1_editor_license()
+    }
+
     /// Publication is immediate: the guard holds the target MM's fence, and
     /// each vCPU services the invalidation before it runs the MM again, so
     /// nothing is waited for and the deadline is not consulted.

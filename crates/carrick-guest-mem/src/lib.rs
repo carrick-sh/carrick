@@ -64,6 +64,46 @@
 //! `serde::Serialize`, and `thiserror::Error` — precisely so it sits at the
 //! bottom of the build graph and almost never has to be rebuilt.
 
+/// One held exclusion of an MM's EL1 editor. The proof is owned by the guard
+/// which raised the gate and can only be lent to the edit it protects.
+#[derive(Debug)]
+pub struct HeldEl1EditorExclusion {
+    license: El1EditorExcluded,
+}
+
+impl HeldEl1EditorExclusion {
+    #[must_use]
+    pub fn register(excluded: &carrick_sched_core::ExcludedEditor<'_>) -> Self {
+        Self {
+            license: El1EditorExcluded { mm: excluded.key() },
+        }
+    }
+
+    #[must_use]
+    pub fn mm(&self) -> u64 {
+        self.license.mm
+    }
+
+    #[must_use]
+    pub fn license(&self) -> &El1EditorExcluded {
+        &self.license
+    }
+}
+
+/// Borrow-only proof that the exact MM's host editor exclusion is held.
+/// Construction is bound to sched-core's unforgeable [`ExcludedEditor`].
+#[derive(Debug)]
+pub struct El1EditorExcluded {
+    mm: u64,
+}
+
+impl El1EditorExcluded {
+    #[must_use]
+    pub fn mm(&self) -> u64 {
+        self.mm
+    }
+}
+
 /// Policy written into the ARM EL1 aperture before guest execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ArmRingFirst {
@@ -759,6 +799,7 @@ pub trait GuestMemory {
     /// must fail stopped, never fall through to a scrub of uncertain ownership.
     fn discard_private_anonymous(
         &mut self,
+        _license: &El1EditorExcluded,
         _address: u64,
         _len: usize,
     ) -> Result<bool, RepointPrivateError> {
@@ -816,7 +857,12 @@ pub trait GuestMemory {
     /// A private-file page wholly beyond EOF must not retain EL1-private
     /// authority from prepared backing. Called after its guest protection is
     /// invalidated and before the BUS fault range becomes visible.
-    fn mark_bus_fault(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+    fn mark_bus_fault(
+        &mut self,
+        _license: &El1EditorExcluded,
+        _address: u64,
+        _len: usize,
+    ) -> Result<(), MemoryError> {
         Ok(())
     }
 
@@ -911,7 +957,13 @@ pub trait GuestMemory {
     /// (delivered as SIGSEGV) — not only on host-side `read_bytes` checks.
     /// `prot` is the Linux PROT mask (0 = PROT_NONE). Default: no-op (the
     /// in-memory backend has no stage-1 tables; it relies on `set_no_access`).
-    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _license: &El1EditorExcluded,
+        _address: u64,
+        _len: usize,
+        _prot: u64,
+    ) -> Result<(), MemoryError> {
         Ok(())
     }
 
@@ -920,11 +972,12 @@ pub trait GuestMemory {
     /// them on first touch. Other backends use their ordinary protection path.
     fn protect_owner_reserved_range(
         &mut self,
+        license: &El1EditorExcluded,
         address: u64,
         len: usize,
         prot: u64,
     ) -> Result<(), MemoryError> {
-        self.protect_range(address, len, prot)
+        self.protect_range(license, address, len, prot)
     }
 
     /// Bind the pristine backing authority of this exact MM. Copied MMs must
@@ -962,7 +1015,12 @@ pub trait GuestMemory {
 
     /// Make `[address, address+len)` unmapped in stage-1 (faults until reused),
     /// for guest `munmap`. Default: no-op.
-    fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+    fn unmap_range(
+        &mut self,
+        _license: &El1EditorExcluded,
+        _address: u64,
+        _len: usize,
+    ) -> Result<(), MemoryError> {
         Ok(())
     }
 
@@ -971,10 +1029,11 @@ pub trait GuestMemory {
     /// backing remains intact. Untyped unmap errors prove no such guarantee.
     fn retire_mapping(
         &mut self,
+        license: &El1EditorExcluded,
         address: GuestVa,
         len: usize,
     ) -> Result<(), MappingRetirementError> {
-        self.unmap_range(address.raw(), len)
+        self.unmap_range(license, address.raw(), len)
             .map_err(MappingRetirementError::Indeterminate)
     }
 
@@ -983,8 +1042,13 @@ pub trait GuestMemory {
     /// the spare pool (a high-VA alias is torn down completely, vs the low-VA
     /// arena whose pages are reused in place). Default: same as `unmap_range`
     /// (the in-memory backend has no sub-table pool to leak).
-    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.unmap_range(address, len)
+    fn unmap_alias_range(
+        &mut self,
+        license: &El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        self.unmap_range(license, address, len)
     }
 
     /// Repoint guest VA `[va, va+len)` to a slot in the boot-mapped PRIVATE
@@ -1005,6 +1069,7 @@ pub trait GuestMemory {
     /// tables and don't model the overlay).
     fn repoint_private(
         &mut self,
+        _license: &El1EditorExcluded,
         _va: u64,
         _overlay_ipa: u64,
         _len: usize,
@@ -1020,6 +1085,7 @@ pub trait GuestMemory {
     /// destination leaves carry exactly the moved mapping's Linux `prot`.
     fn repoint_shared_leaf(
         &mut self,
+        _license: &El1EditorExcluded,
         _va: u64,
         _target_ipa: u64,
         _len: usize,
@@ -1040,7 +1106,12 @@ pub trait GuestMemory {
     /// output address, so making an invalid stale overlay leaf valid would
     /// otherwise resurrect private storage as a shared mapping. Backends without
     /// stage-1 translation keep the default no-op.
-    fn restore_shared_identity(&mut self, _va: u64, _len: usize) -> Result<(), MemoryError> {
+    fn restore_shared_identity(
+        &mut self,
+        _license: &El1EditorExcluded,
+        _va: u64,
+        _len: usize,
+    ) -> Result<(), MemoryError> {
         Ok(())
     }
 

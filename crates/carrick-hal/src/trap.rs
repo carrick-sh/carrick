@@ -196,7 +196,11 @@ pub trait SyscallTrap {
     /// re-initialise this engine with `new_image`. Does NOT advance past a
     /// syscall (execve has no successful return); the next `next_syscall`
     /// resumes at the new image's entry point.
-    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError>;
+    fn execve_into(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        new_image: &AddressSpace,
+    ) -> Result<(), TrapError>;
     fn is_forked_child(&self) -> bool {
         false
     }
@@ -259,6 +263,7 @@ pub trait SyscallTrap {
     /// the hook (HVF and KVM do).
     fn map_host_alias(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         va: GuestVa,
         ipa: Gpa,
         len: u64,

@@ -2096,9 +2096,10 @@ impl HvfVmState {
 impl HvfTaskState {
     fn with_stage1_edit_license<R>(
         &self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         edit: impl FnOnce(&carrick_hal::el1_editor_exclusion::El1EditorExcluded) -> Result<R, TrapError>,
     ) -> Result<R, TrapError> {
-        self.mm_access.with_stage1_edit_license(edit)
+        self.mm_access.with_stage1_edit_license(license, edit)
     }
 
     /// Whether the frame backing `ipa` is referenced by MORE than one extent in
@@ -2306,6 +2307,9 @@ impl HvfTaskState {
         })?;
         let _quiesce = authority.quiesce().map_err(|error| {
             TrapError::Hypervisor(format!("quiesce HVPatch retained reuse: {error}"))
+        })?;
+        let editor_excluded = _quiesce.editor_excluded().ok_or_else(|| {
+            TrapError::Hypervisor("retained reuse has no exact-MM EL1 Editor exclusion".into())
         })?;
 
         // Another sibling may have repaired the leaf while this thread waited.
@@ -2528,7 +2532,7 @@ impl HvfTaskState {
             let publication = {
                 let page_tables_authority = self.page_tables_authority();
                 let edit_access = std::sync::Arc::clone(&self.mm_access);
-                edit_access.with_stage1_edit_license(|license| {
+                edit_access.with_stage1_edit_license(editor_excluded, |license| {
                     page_tables_authority.edit(
                         license,
                         || {
@@ -2606,7 +2610,7 @@ impl HvfTaskState {
                 })
             };
             if let Err(error) = publication {
-                let _ = self.with_stage1_edit_license(|license| {
+                let _ = self.with_stage1_edit_license(editor_excluded, |license| {
                     self.page_tables_authority().edit(
                         license,
                         || Err(TrapError::Hypervisor("page tables disappeared".into())),
@@ -2633,7 +2637,7 @@ impl HvfTaskState {
                 return Err(error);
             }
             // Publication succeeded: the journalled pre-images are no longer needed.
-            let _ = self.with_stage1_edit_license(|license| {
+            let _ = self.with_stage1_edit_license(editor_excluded, |license| {
                 self.page_tables_authority().edit(
                     license,
                     || Err(TrapError::Hypervisor("page tables disappeared".into())),
@@ -3174,6 +3178,7 @@ impl HvfTaskState {
     /// keeps naming `old_ipa`.
     pub(super) fn reuse_sole_owner_cow_in_place(
         &mut self,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         span: CowArmedSpan,
         old_ipa: u64,
         page_table_host: *mut u8,
@@ -3192,7 +3197,7 @@ impl HvfTaskState {
         let page_table_result = {
             let page_tables_authority = self.page_tables_authority();
             let edit_access = std::sync::Arc::clone(&self.mm_access);
-            edit_access.with_stage1_edit_license(|license| page_tables_authority.edit(
+            edit_access.with_stage1_edit_license(editor_excluded, |license| page_tables_authority.edit(
                 license,
                 || {
                     page_tables_authority.emit_absent_probe(2);
@@ -3313,7 +3318,7 @@ impl HvfTaskState {
             ))
         };
         if let Err(error) = page_table_result {
-            let _ = self.with_stage1_edit_license(|license| {
+            let _ = self.with_stage1_edit_license(editor_excluded, |license| {
                 self.page_tables_authority().edit(
                     license,
                     || Err(TrapError::Hypervisor("page tables disappeared".into())),
@@ -3336,7 +3341,7 @@ impl HvfTaskState {
             }
             return Err(error);
         }
-        let _ = self.with_stage1_edit_license(|license| {
+        let _ = self.with_stage1_edit_license(editor_excluded, |license| {
             self.page_tables_authority().edit(
                 license,
                 || Err(TrapError::Hypervisor("page tables disappeared".into())),
@@ -3380,6 +3385,9 @@ impl HvfTaskState {
         // Pause sibling walkers first before inspecting or mutating MM COW state.
         let _quiesce = authority.quiesce().map_err(|error| {
             TrapError::Hypervisor(format!("quiesce HVPatch frame COW: {error}"))
+        })?;
+        let editor_excluded = _quiesce.editor_excluded().ok_or_else(|| {
+            TrapError::Hypervisor("frame COW has no exact-MM EL1 Editor exclusion".into())
         })?;
         super::guest_cow::require_guest_cow_settled(identity.mm, "host frame COW");
 
@@ -3685,6 +3693,7 @@ impl HvfTaskState {
             // inventory or alias change; its leaves become writable in place.
             drop(old_source.take());
             self.reuse_sole_owner_cow_in_place(
+                editor_excluded,
                 span,
                 old_ipa,
                 page_table_host,
@@ -4180,7 +4189,7 @@ impl HvfTaskState {
             let page_tables_authority = self.page_tables_authority();
             let edit_access = std::sync::Arc::clone(&self.mm_access);
             edit_access
-                .with_stage1_edit_license(|license| {
+                .with_stage1_edit_license(editor_excluded, |license| {
                 page_tables_authority.edit_unpublishing(
                     license,
                     || {
@@ -4348,7 +4357,7 @@ impl HvfTaskState {
             Ok(((), receipt)) => receipt,
             Err(error) => {
                 if !guest_lane {
-                    let _ = self.with_stage1_edit_license(|license| {
+                    let _ = self.with_stage1_edit_license(editor_excluded, |license| {
                         self.page_tables_authority().edit(
                             license,
                             || Err(TrapError::Hypervisor("page tables disappeared".into())),
@@ -4394,7 +4403,7 @@ impl HvfTaskState {
         };
         // Publication succeeded: the journalled pre-images are no longer needed.
         if !guest_lane {
-            let _ = self.with_stage1_edit_license(|license| {
+            let _ = self.with_stage1_edit_license(editor_excluded, |license| {
                 self.page_tables_authority().edit(
                     license,
                     || Err(TrapError::Hypervisor("page tables disappeared".into())),

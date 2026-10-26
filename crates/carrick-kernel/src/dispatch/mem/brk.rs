@@ -79,7 +79,7 @@ impl<'a> MemView<'a> {
                     return this.refuse_brk(&mem, pending);
                 };
                 let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
-                if let Err(error) = cx.memory.protect_range(grow_start, grow_len, rw) {
+                if let Err(error) = cx.memory.protect_range(cx.mm_mutation.el1_editor_license(), grow_start, grow_len, rw) {
                     carrick_fatal!(
                         "dispatch::brk",
                         "protect_range failed during brk heap expansion 0x{grow_start:x}+0x{grow_len:x}: {error}"
@@ -96,7 +96,7 @@ impl<'a> MemView<'a> {
                 else {
                     return this.refuse_brk(&mem, pending);
                 };
-                if cx.memory.protect_range(shrink_start, shrink_len, 0).is_err() {
+                if cx.memory.protect_range(cx.mm_mutation.el1_editor_license(), shrink_start, shrink_len, 0).is_err() {
                     carrick_fatal!(
                         "dispatch::brk",
                         "protect_range failed during brk heap contraction"

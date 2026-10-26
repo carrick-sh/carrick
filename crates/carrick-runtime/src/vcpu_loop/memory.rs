@@ -378,18 +378,37 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         &self,
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
     {
-        carrick_kernel::dispatch::mm_quiesce::acquire_frame_cow_quiesce(
+        struct LicensedQuiesce {
+            _stage1: carrick_kernel::dispatch::mm_quiesce::FrameCowExactMmGuard,
+            editor: carrick_kernel::kernel::mm_occupancy::El1EditorExclusion,
+        }
+        impl carrick_hal::FrameCowQuiesce for LicensedQuiesce {
+            fn editor_excluded(&self) -> Option<&carrick_guest_mem::El1EditorExcluded> {
+                Some(self.editor.license())
+            }
+        }
+
+        let stage1 = carrick_kernel::dispatch::mm_quiesce::acquire_frame_cow_quiesce(
             &self.pt_quiesce,
             self.mm,
             self.tid,
             carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
         )
-        .map(|guard| Box::new(guard) as Box<dyn carrick_hal::FrameCowQuiesce>)
         .map_err(|error| {
             Box::new(std::io::Error::other(format!(
                 "HVPatch frame-COW vCPU quiesce failed: {error:?}"
             ))) as Box<dyn std::error::Error + Send + Sync>
-        })
+        })?;
+        let editor = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(self.mm)
+            .ok_or_else(|| {
+                Box::new(std::io::Error::other(
+                    "HVPatch frame-COW quiesce could not exclude the EL1 Editor",
+                )) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+        Ok(Box::new(LicensedQuiesce {
+            _stage1: stage1,
+            editor,
+        }))
     }
 
     fn reserve(

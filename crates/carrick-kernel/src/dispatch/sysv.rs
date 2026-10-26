@@ -2502,7 +2502,7 @@ impl<'a> IpcView<'a> {
             };
             let permit = mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
-            if cx.memory.unmap_alias_range(addr, len).is_err() {
+            if cx.memory.unmap_alias_range(cx.mm_mutation.el1_editor_license(), addr, len).is_err() {
                 // A backend error may follow a partial page-table/stage-2
                 // mutation. Returning ENOMEM would let the guest continue with
                 // attachment and backend ownership in an unknowable split state.

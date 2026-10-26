@@ -2556,9 +2556,14 @@ pub struct FrameBackingAuthentication {
 /// a kernel copy-to-user into the same page) must publish one new physical
 /// frame. The backend owns physical allocation/mapping; the runtime owns the
 /// authenticated kernel frame inventory transaction.
-pub trait FrameCowQuiesce {}
+pub trait FrameCowQuiesce {
+    /// Borrow the exact-MM EL1 Editor exclusion held for this quiesce.
+    fn editor_excluded(&self) -> Option<&carrick_guest_mem::El1EditorExcluded> {
+        None
+    }
+}
 
-impl<T> FrameCowQuiesce for T {}
+impl FrameCowQuiesce for () {}
 
 /// The pending production Fork result and its physical byte-source leases.
 pub type PendingOwnerForkReceipt = (
@@ -3454,6 +3459,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// descriptor transaction EL1 must execute.
     fn publish_el1_frame_grant(
         &mut self,
+        _editor: Option<&carrick_guest_mem::El1EditorExcluded>,
         _grant: El1FrameGrantPublication,
     ) -> Result<El1FrameGrantPublished, TrapError> {
         Ok(El1FrameGrantPublished::Unsupported)
@@ -3772,7 +3778,11 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// Bind this engine to one in-process guest's AArch64 ASID. The default is
     /// a no-op for backends that retain the one-host-process-per-guest-process
     /// model. Hvpatch overrides this and keeps the ASID across exec replacement.
-    fn configure_process_asid(&mut self, _asid: u16) -> Result<(), TrapError> {
+    fn configure_process_asid(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        _asid: u16,
+    ) -> Result<(), TrapError> {
         Ok(())
     }
 
@@ -3825,6 +3835,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
 
     fn build_process_spec(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         _request: ProcessForkRequest,
     ) -> Result<Self::ProcessSpec, TrapError> {
         Err(TrapError::Hypervisor(
@@ -3867,7 +3878,10 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
         None
     }
 
-    fn commit_process_fork(&mut self) -> Result<(), TrapError> {
+    fn commit_process_fork(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+    ) -> Result<(), TrapError> {
         Ok(())
     }
 
@@ -3882,7 +3896,10 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
 
     /// Restore parent stage-1 and COW-arm metadata after a recoverable child
     /// spawn/materialization failure.
-    fn rollback_process_fork(&mut self) -> Result<(), TrapError> {
+    fn rollback_process_fork(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+    ) -> Result<(), TrapError> {
         Ok(())
     }
 

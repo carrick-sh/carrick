@@ -1079,14 +1079,16 @@ impl MmAccessState {
 
     pub(crate) fn with_stage1_edit_license<R>(
         &self,
+        license: &carrick_guest_mem::El1EditorExcluded,
         edit: impl FnOnce(&carrick_hal::el1_editor_exclusion::El1EditorExcluded) -> Result<R, TrapError>,
     ) -> Result<R, TrapError> {
         let mm = self.stage1_edit_mm()?;
-        carrick_hal::el1_editor_exclusion::with_held_exclusion(mm, |license| {
-            edit(license.ok_or_else(|| {
-                TrapError::Hypervisor("stage-1 edit lacks its exact MM Editor exclusion".to_owned())
-            })?)
-        })
+        if license.mm() != mm {
+            return Err(TrapError::Hypervisor(
+                "stage-1 edit license belongs to another MM".to_owned(),
+            ));
+        }
+        edit(license)
     }
 
     pub(crate) fn stage1_edit_mm(&self) -> Result<u64, TrapError> {
@@ -3110,31 +3112,29 @@ pub(crate) fn perform_foreign_cow_transaction(
             "foreign COW stage-1 authority invariant: {reason}"
         )
     };
-    let restore_stage1 = |rollback: &mut Option<carrick_mmu_core::aarch64::PageTableManager>,
+    let restore_stage1 = |invalidator: &dyn carrick_hal::ForeignMmInvalidator,
+                          rollback: &mut Option<carrick_mmu_core::aarch64::PageTableManager>,
                           site| {
-        carrick_hal::el1_editor_exclusion::with_held_exclusion(
-            requested.mm.raw_for_probe(),
-            |license| {
-                let license = license
-                    .unwrap_or_else(|| authority_invariant("restore lost its Editor exclusion"));
-                unsafe {
-                    page_tables_authority.restore_image_and_host(
-                        license,
-                        rollback,
-                        site,
-                        resolve_page_table_host,
-                    )
-                }
-            },
-        )
+        let license = invalidator
+            .editor_excluded()
+            .unwrap_or_else(|| authority_invariant("restore lost its Editor exclusion"));
+        unsafe {
+            page_tables_authority.restore_image_and_host(
+                license,
+                rollback,
+                site,
+                resolve_page_table_host,
+            )
+        }
     };
     let mut recycled = lease.state.cow_rollback_scratch.lock().take();
     let mut rollback = None;
-    let page_table_result = carrick_hal::el1_editor_exclusion::with_held_exclusion(
-        requested.mm.raw_for_probe(),
-        |license| {
-            page_tables_authority.try_edit_unpublishing_until(
-                license.ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?,
+    let page_table_result = {
+        let license = invalidator
+            .editor_excluded()
+            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
+        page_tables_authority.try_edit_unpublishing_until(
+                license,
                 deadline,
                 carrick_hal::ForeignMmTransportError::TimedOut,
                 carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
@@ -3222,8 +3222,7 @@ pub(crate) fn perform_foreign_cow_transaction(
                     Ok::<(), carrick_hal::ForeignMmTransportError>(())
                 },
             )
-        },
-    );
+    };
     let binding = carrick_hal::ForeignMmBinding::for_aarch64(
         requested.binding.asid,
         requested.binding.stage1_root,
@@ -3235,7 +3234,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         }
         Err(error) => {
             if rollback.is_some() {
-                let restored = restore_stage1(&mut rollback, 8);
+                let restored = restore_stage1(invalidator, &mut rollback, 8);
                 let recycled_manager =
                     lease
                         .state
@@ -3266,7 +3265,7 @@ pub(crate) fn perform_foreign_cow_transaction(
     {
         Ok(stage1) => stage1,
         Err(error) => {
-            let restored = restore_stage1(&mut rollback, 9);
+            let restored = restore_stage1(invalidator, &mut rollback, 9);
             let recycled_manager =
                 lease
                     .state
@@ -3285,7 +3284,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         }
     };
     if let Err(error) = foreign_cow_failpoint(&lease.state, 4) {
-        let restored = restore_stage1(&mut rollback, 10);
+        let restored = restore_stage1(invalidator, &mut rollback, 10);
         let recycled_manager = lease
             .state
             .finish_foreign_cow_restore(restored, &mut rollback, 10);
@@ -3384,7 +3383,7 @@ pub(crate) fn perform_foreign_cow_transaction(
                     )
                 });
             let mut rollback = Some(rollback);
-            let restored = restore_stage1(&mut rollback, 11);
+            let restored = restore_stage1(invalidator, &mut rollback, 11);
             let recycled_manager =
                 lease
                     .state

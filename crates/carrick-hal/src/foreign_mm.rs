@@ -391,6 +391,12 @@ pub trait ForeignMmLiveAuthority: Send + Sync {
 /// request publication at the transaction boundary but cannot retain or mint
 /// the page-table authority behind it.
 pub trait ForeignMmInvalidator {
+    /// Borrow the exact target MM's host-editor proof from the guard which
+    /// owns this invalidation scope. There is no process-global lookup.
+    fn editor_excluded(&self) -> Option<&carrick_guest_mem::El1EditorExcluded> {
+        None
+    }
+
     fn invalidate_exact_asid(
         &mut self,
         binding: ForeignMmBinding,

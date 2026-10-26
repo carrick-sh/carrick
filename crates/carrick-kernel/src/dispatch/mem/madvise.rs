@@ -751,7 +751,7 @@ impl<'a> MemView<'a> {
                             continue;
                         }
                         if segment.provenance.is_private_anonymous() {
-                            let discarded = match cx.memory.discard_private_anonymous(segment.start, segment_len) {
+                            let discarded = match cx.memory.discard_private_anonymous(cx.mm_mutation.el1_editor_license(), segment.start, segment_len) {
                                 Ok(discarded) => discarded,
                                 Err(carrick_guest_mem::RepointPrivateError::Clean(_)) => {
                                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -780,7 +780,7 @@ impl<'a> MemView<'a> {
                                     .memory
                                     .resident_pages(GuestVa::new(segment.start), 1, this.linux_page_size())
                                     .is_none()
-                                && cx.memory.protect_range(segment.start, segment_len, 0).is_ok()
+                                && cx.memory.protect_range(cx.mm_mutation.el1_editor_license(), segment.start, segment_len, 0).is_ok()
                             {
                                 // This mapping stays readable; its next
                                 // first-touch publication must restore the

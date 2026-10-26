@@ -9,6 +9,7 @@ use core::num::NonZeroU64;
 pub unsafe trait PreAdmissionOwner {
     fn mm(&self) -> NonZeroU64;
     fn unpublished(&self) -> bool;
+    fn editor_excluded(&self) -> &carrick_guest_mem::El1EditorExcluded;
 }
 
 /// A borrowed, exact-MM pre-admission physical preparation capability.
@@ -24,6 +25,9 @@ impl<'a> PreAdmissionPermit<'a> {
     }
     pub fn unpublished(&self) -> bool {
         self.owner.unpublished()
+    }
+    pub fn editor_excluded(&self) -> &'a carrick_guest_mem::El1EditorExcluded {
+        self.owner.editor_excluded()
     }
     pub fn authenticates(&self, receipt: &PreAdmissionReceipt<'_>) -> bool {
         core::ptr::addr_eq(self.owner, receipt.owner) && self.mm() == receipt.owner.mm()

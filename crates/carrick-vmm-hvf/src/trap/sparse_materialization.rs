@@ -949,6 +949,18 @@ pub(super) struct PublicationContext<'a> {
 }
 
 impl<'a> PublicationContext<'a> {
+    fn editor_excluded(
+        &self,
+    ) -> Result<&carrick_guest_mem::El1EditorExcluded, TrapError> {
+        self._exclusion
+            .as_deref()
+            .and_then(carrick_hal::FrameCowQuiesce::editor_excluded)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "sparse publication has no exact-MM EL1 Editor exclusion".to_owned(),
+                )
+            })
+    }
     /// A physical grant selected by the target EL1 owner. No host policy
     /// snapshot or caller-vCPU identity can authorize this constructor. The
     /// guest revalidates the generation and window before exposing leaves.
@@ -1426,7 +1438,7 @@ pub(super) fn publish_replacing(
         let publication = {
             let page_tables_authority = context.state.page_tables_authority();
             let has_source = page_tables_authority.has_source();
-            context.state.with_stage1_edit_license(|license| {
+            context.state.with_stage1_edit_license(context.editor_excluded()?, |license| {
                 page_tables_authority.edit(
                 license,
                 || {
@@ -1561,7 +1573,7 @@ pub(super) fn publish_replacing(
             })
         };
         if let Err(error) = publication {
-            let rollback = context.state.with_stage1_edit_license(|license| {
+            let rollback = context.state.with_stage1_edit_license(context.editor_excluded()?, |license| {
                 context.state.page_tables_authority().edit(
                     license,
                     || {
@@ -1626,7 +1638,7 @@ pub(super) fn publish_replacing(
             return Err(error);
         }
         // Publication succeeded: the journalled pre-images are no longer needed.
-        let _ = context.state.with_stage1_edit_license(|license| {
+        let _ = context.state.with_stage1_edit_license(context.editor_excluded()?, |license| {
             context.state.page_tables_authority().edit(
                 license,
                 || Err(TrapError::Hypervisor("page tables disappeared".into())),
@@ -3016,20 +3028,22 @@ impl RetainedImportSource {
 /// Owns only a freshly acquired loader journal on the retained stage-1
 /// authority. All import acquisition uses the same atomic fresh claim; this
 /// non-clone owner is installed before source copying or physical publication.
-struct ImportDescriptorUndo {
+struct ImportDescriptorUndo<'a> {
     tables: carrick_aarch64::Stage1Authority,
     resolver: std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>,
-    mm: u64,
+    editor_excluded: &'a carrick_guest_mem::El1EditorExcluded,
     active: bool,
 }
-impl ImportDescriptorUndo {
-    fn begin(state: &MmAccessState) -> Result<Self, TrapError> {
+impl<'a> ImportDescriptorUndo<'a> {
+    fn begin(
+        state: &MmAccessState,
+        editor_excluded: &'a carrick_guest_mem::El1EditorExcluded,
+    ) -> Result<Self, TrapError> {
         let failure =
             || TrapError::Hypervisor("import requires an unclaimed loader journal".into());
         let tables = state.page_tables_authority();
         let resolver = state.live_resolver.read().clone().ok_or_else(failure)?;
-        let mm = state.stage1_edit_mm()?;
-        state.with_stage1_edit_license(|license| {
+        state.with_stage1_edit_license(editor_excluded, |license| {
             tables.edit(
                 license,
                 || Err(failure()),
@@ -3046,20 +3060,12 @@ impl ImportDescriptorUndo {
         Ok(Self {
             tables,
             resolver,
-            mm,
+            editor_excluded,
             active: true,
         })
     }
     fn commit(&mut self) -> Result<(), TrapError> {
-        carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm, |license| {
-            let license = license.ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "import descriptor commit lost its Editor exclusion".to_owned(),
-                )
-            })?;
-            self.tables.commit_undo(license);
-            Ok::<(), TrapError>(())
-        })?;
+        self.tables.commit_undo(self.editor_excluded);
         self.active = false;
         Ok(())
     }
@@ -3069,28 +3075,20 @@ impl ImportDescriptorUndo {
         }
         // SAFETY: this owner retains the exact resolver and fresh journal;
         // its caller still holds pre-admission mutation/publication authority.
-        let rollback = carrick_hal::el1_editor_exclusion::with_held_exclusion(
-            self.mm,
-            |license| -> Result<(), TrapError> {
-                let license = license.ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "import descriptor rollback lost its Editor exclusion".to_owned(),
-                    )
-                })?;
-                unsafe { self.tables.rollback_undo(license, &self.resolver) }
+        let rollback = (|| -> Result<(), TrapError> {
+                unsafe { self.tables.rollback_undo(self.editor_excluded, &self.resolver) }
                     .map(|_| ())
                     .map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "import descriptor rollback failed before physical release: {error:?}"
                         ))
                     })
-            },
-        );
+            })();
         rollback.unwrap_or_else(|error| carrick_fatal!("hvpatch::user_transfer", "{error:?}"));
         self.active = false;
     }
 }
-impl Drop for ImportDescriptorUndo {
+impl Drop for ImportDescriptorUndo<'_> {
     fn drop(&mut self) {
         self.rollback();
     }
@@ -3099,7 +3097,7 @@ impl Drop for ImportDescriptorUndo {
 /// Physical publication remains rollback-owned until the same kernel owner
 /// confirms normal root admission. The permit keeps publication exclusion alive.
 pub struct PendingImport<'a> {
-    descriptor_undo: ImportDescriptorUndo,
+    descriptor_undo: ImportDescriptorUndo<'a>,
     permit: carrick_hal::PreAdmissionPermit<'a>,
     pending: PendingTransferGrant,
 }
@@ -3198,7 +3196,7 @@ impl PublicationContext<'static> {
         {
             return Err(invalid());
         }
-        let descriptor_undo = ImportDescriptorUndo::begin(&self.state)?;
+        let descriptor_undo = ImportDescriptorUndo::begin(&self.state, permit.editor_excluded())?;
         let bytes = source.snapshot();
         let binding = self.state.cow_runtime.read().clone().ok_or_else(invalid)?;
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
@@ -3294,10 +3292,8 @@ impl PublicationContext<'static> {
         };
         let resolver = &import.descriptor_undo.resolver;
         let ready = import.ready();
-        carrick_hal::el1_editor_exclusion::with_held_exclusion(
-            import.descriptor_undo.mm,
-            |license| {
-                let license = license.ok_or_else(invalid)?;
+        {
+                let license = import.descriptor_undo.editor_excluded;
                 import.descriptor_undo.tables.edit(
                     license,
                     || Err(invalid()),
@@ -3323,8 +3319,7 @@ impl PublicationContext<'static> {
                         })
                     },
                 )
-            },
-        )?;
+            }?;
         Ok(import)
     }
 }

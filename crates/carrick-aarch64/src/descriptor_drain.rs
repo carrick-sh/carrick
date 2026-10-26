@@ -198,6 +198,7 @@ pub trait GuestDrainVenue {
 /// the transaction and everything ahead of it.
 pub fn apply_as_host_if_excluded<M>(
     tables: &crate::stage1_authority::Stage1Authority,
+    excluded: &carrick_guest_mem::El1EditorExcluded,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
     maintenance: &M,
@@ -222,8 +223,9 @@ where
             txn.id
         ))
     };
-    carrick_hal::el1_editor_exclusion::with_held_exclusion(txn.id.mm_key.get(), |excluded| {
-        let excluded = excluded?;
+    if excluded.mm() != txn.id.mm_key.get() {
+        return None;
+    }
         // Submissions already waiting for the MM (a frame grant EL1 has yet
         // to apply) land first, in submission order: applied after them, a
         // retirement could be overtaken by a grant's prepare onto the freed
@@ -246,7 +248,6 @@ where
                     check().map(|()| receipt)
                 }),
         )
-    })
 }
 
 /// The production venue: the engine's own vCPU and the shared EL1 region.
@@ -552,7 +553,7 @@ impl<E: ThreadedEngine> carrick_hal::threaded::El1FrameGrantVenue for EngineGran
         &mut self,
         grant: carrick_hal::threaded::El1FrameGrantPublication,
     ) -> Result<carrick_hal::threaded::El1FrameGrantPublished, TrapError> {
-        self.0.publish_el1_frame_grant(grant)
+        self.0.publish_el1_frame_grant(None, grant)
     }
 
     fn apply_guest_publication(
