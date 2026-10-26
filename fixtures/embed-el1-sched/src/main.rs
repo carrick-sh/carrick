@@ -16,6 +16,8 @@
 //!   and a pair is handing off.
 //! - `exec`: `execve` from a non-leader thread while siblings are parked.
 //! - `exec-child`: the image `exec` runs.
+//! - `exec-successor-memory`: execs this static image, then the successor
+//!   faults the far end of a sparse anonymous mapping and resolves fork COW.
 //! - `epoll-pingpong <iters>`: two threads hand a turn back and forth through
 //!   eventfds, each blocking in `epoll_wait` on its own epoll (libuv's
 //!   MessagePort shape); prints the round-trip latency.
@@ -453,6 +455,91 @@ fn exec_mode(argv0: &str) -> i32 {
     loop {
         let _ = futex_wait(&FOREVER[0], 0);
     }
+}
+
+fn exec_successor_memory(argv0: &str) -> i32 {
+    let path = std::ffi::CString::new(argv0).expect("argv0");
+    let arg0 = std::ffi::CString::new("el1-sched").expect("arg0");
+    let arg1 = std::ffi::CString::new("exec-successor-memory-child").expect("arg1");
+    let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
+    let envp = [std::ptr::null::<libc::c_char>()];
+    let rc = unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+    println!("exec-successor-memory failed rc={rc}");
+    3
+}
+
+fn exec_successor_memory_child() -> i32 {
+    const PAGE: usize = 4096;
+    const SPARSE_LEN: usize = 128 * 1024 * 1024;
+    let sparse = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            SPARSE_LEN,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if sparse == libc::MAP_FAILED {
+        println!("exec-successor-memory sparse mmap failed");
+        return 4;
+    }
+    let sparse = sparse.cast::<u8>();
+    let far = unsafe { sparse.add(SPARSE_LEN - PAGE) };
+    if unsafe { sparse.read_volatile() } != 0 || unsafe { far.read_volatile() } != 0 {
+        println!("exec-successor-memory sparse mapping was not zero-filled");
+        return 5;
+    }
+    unsafe {
+        sparse.write_volatile(0x31);
+        far.write_volatile(0x79);
+    }
+    if unsafe { sparse.read_volatile() } != 0x31 || unsafe { far.read_volatile() } != 0x79 {
+        println!("exec-successor-memory sparse writes were not retained");
+        return 6;
+    }
+
+    let cow = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if cow == libc::MAP_FAILED {
+        println!("exec-successor-memory cow mmap failed");
+        return 7;
+    }
+    let cow = cow.cast::<u8>();
+    unsafe { cow.write_volatile(0x11) };
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("exec-successor-memory fork failed");
+        return 8;
+    }
+    if pid == 0 {
+        unsafe { cow.write_volatile(0x22) };
+        unsafe { libc::_exit(i32::from(cow.read_volatile() != 0x22)) };
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(pid, &mut status, 0) } != pid
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+        || unsafe { cow.read_volatile() } != 0x11
+    {
+        println!("exec-successor-memory cow isolation failed status={status}");
+        return 9;
+    }
+    unsafe {
+        libc::munmap(sparse.cast(), SPARSE_LEN);
+        libc::munmap(cow.cast(), PAGE);
+    }
+    println!("exec-successor-memory ok");
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -3515,6 +3602,8 @@ fn main() {
         "delayed-parent-notification" => delayed_parent_notification(),
         "exit-group" => exit_group_mode(),
         "exec" => exec_mode(&args[0]),
+        "exec-successor-memory" => exec_successor_memory(&args[0]),
+        "exec-successor-memory-child" => exec_successor_memory_child(),
         "pinned-pingpong" => pinned_pingpong(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(5),

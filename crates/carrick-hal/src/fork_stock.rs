@@ -650,8 +650,14 @@ struct ExecPredecessor<T, C> {
     successor: ReservationMm,
     tag: Option<ChildTag<T>>,
     tables: Vec<RootGpa>,
-    physical: C,
+    physical: ExecPredecessorPhysical<C>,
     released: bool,
+}
+
+#[derive(Debug)]
+enum ExecPredecessorPhysical<C> {
+    Root,
+    Child(C),
 }
 
 /// One-shot identity for settling an exec predecessor after the ring has
@@ -1276,7 +1282,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             successor_root,
             successor_tag,
             successor_physical,
-            None,
+            false,
         )
     }
 
@@ -1290,17 +1296,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         successor_root: RootGpa,
         successor_tag: T::Tag,
         successor_physical: C,
-    ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)>
-    where
-        C: Default,
-    {
+    ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
         self.replace_for_exec_with_tag(
             execution,
             successor,
             successor_root,
             successor_tag,
             successor_physical,
-            Some(C::default()),
+            true,
         )
     }
 
@@ -1311,7 +1314,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         successor_root: RootGpa,
         successor_tag: T::Tag,
         successor_physical: C,
-        root_predecessor: Option<C>,
+        root_predecessor: bool,
     ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
         let refuse = |tags: &mut T, error, physical| {
             let released = tags.release_unpublished(successor_tag);
@@ -1340,16 +1343,14 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             );
         };
         let exact_predecessor = match self.children.get(&predecessor_key) {
-            Some(child) if root_predecessor.is_none() => {
+            Some(child) if !root_predecessor => {
                 child.owner.carrier() == self.carrier
                     && child.owner.mm() == predecessor_mm
                     && child.root == execution.context.root
                     && child.owner.incarnation() == execution.context.generation.raw()
                     && execution.context.mm.raw().get() == predecessor_mm.raw()
             }
-            None if root_predecessor.is_some() => {
-                execution.context.mm.raw().get() == predecessor_mm.raw()
-            }
+            None if root_predecessor => execution.context.mm.raw().get() == predecessor_mm.raw(),
             _ => false,
         };
         if !exact_predecessor
@@ -1386,17 +1387,17 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                     predecessor.lifecycle,
                     predecessor.control,
                     Some(predecessor.tag),
-                    predecessor.physical,
+                    ExecPredecessorPhysical::Child(predecessor.physical),
                 )
             } else {
-                let Some(predecessor_physical) = root_predecessor else {
+                if !root_predecessor {
                     return refuse(
                         &mut self.tags,
                         ForkStockServiceError::StaleExecution,
                         successor_physical,
                     );
-                };
-                (None, None, None, predecessor_physical)
+                }
+                (None, None, None, ExecPredecessorPhysical::Root)
             };
         let mut tables = self
             .committed_tables
@@ -1459,7 +1460,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return Err(ForkStockServiceError::StaleExecution);
         }
         if !pending.released {
-            if !release(&pending.physical, &absence) {
+            if let ExecPredecessorPhysical::Child(physical) = &pending.physical
+                && !release(physical, &absence)
+            {
                 self.exec_predecessors.insert(receipt.sequence, pending);
                 return Err(ForkStockServiceError::MemoryAccessFailed);
             }

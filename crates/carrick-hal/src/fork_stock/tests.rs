@@ -243,15 +243,20 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
     assert_eq!(stock.child_root(successor_mm), Some(page(0x90_0000)));
     assert_eq!(stock.child_lifecycle(successor_mm), None);
 
+    let mut child_releases = 0;
     stock
         .settle_exec_predecessor(
             &mut NoTableLedger,
             receipt,
             absent(predecessor_mm).unwrap(),
             |_| true,
-            |_, absence| absence.mm() == predecessor_mm,
+            |_, _| {
+                child_releases += 1;
+                false
+            },
         )
         .unwrap();
+    assert_eq!(child_releases, 0, "root frames are not fork-stock custody");
     stock.retire_exited_root(successor_mm);
     assert_eq!(
         stock
