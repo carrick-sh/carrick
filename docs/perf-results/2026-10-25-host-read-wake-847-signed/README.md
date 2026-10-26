@@ -1,5 +1,104 @@
 # Issue #847 signed hardware evidence
 
+## `2e26b934d` bootstrap root cause and source correction (2026-10-26)
+
+The guest fault recorded below was not caused by a stage-1 leaf exposing zero
+or misaligned content.  Live register and syscall captures on the exact signed
+artifact identified an earlier anonymous-`mmap` refusal:
+
+```text
+847-2e26-fault-live9:
+  PC=0x29e564 (__copy_tls: str x1, [x20], #8)
+  x20=0x144 x23=0xfffffffffffffff4 (-ENOMEM)
+
+847-2e26-mmap-refusal:
+  mmap(addr=0, length=344, prot=3, flags=34, fd=-1, offset=0) = -1 errno 12
+  reason: anonymous predecessor retirement failed
+
+847-2e26-mmap-error3:
+  guest stage-1 unmap: verified retirement did not bind its old leaves
+```
+
+Musl used the failed TLS allocation result in its pointer arithmetic and then
+wrote through `0x144`.  The faulting instruction and bad pointer therefore
+followed the `ENOMEM`; the page containing `__copy_tls` was intact.  The saved
+core and rings remain at:
+
+```text
+/tmp/847-2e26-fatalring-14/carrier.core
+/tmp/847-2e26-fatalring-14/carrier.lldb.txt
+```
+
+The rejected retirement was the inaccessible neighbour in a freshly prepared
+sparse arena.  Its authenticated descriptor transaction correctly retired no
+live stage-1 leaf.  `complete_guest_retirement_proof` nevertheless represented
+both “verified and empty” and “verification failed” as `None`, so the engine
+converted the former into `ENOMEM`.
+
+Commit `d1a72f4d7` makes that state structural: proof validation is a typed
+`Result`, while a successful retirement carries `Option<Stage1LeafRetired>`.
+A live pre-image produces a proof; an invalid retained output produces
+`Ok(None)` and cannot authorize stage-2 retirement.  The strengthened
+`guest_owned_authority_refuses_host_live_stores_and_builds_guest_transactions`
+witness runs the real prepare/apply/verify transaction over both a live leaf
+and its prepared inaccessible neighbour.  This preserves the publication
+invariant: no stage-1 leaf is exposed without committed backing, and an invalid
+retained output cannot manufacture retirement authority.
+
+The carrier fatal was a second defect.  The task died before carrier
+registration, but still owned the Kernel's inventory reservation.  Commit
+`4a8872256` makes detached retirement consume an already-staged commit when
+present or commit that reservation with an empty event batch when the task
+never registered.  Missing both is a typed `RetirementRefused`, not a generic
+hypervisor failure.  The strengthened
+`whole_mm_retirement_of_never_registered_detached_space_is_empty` production
+witness retires a never-registered MM, consumes the returned commit, and
+checks that its event batch is empty.
+
+The same pass audited static missing-result failures at the fallible carrier
+retirement/publication crossings.  The following are now typed
+`RetirementRefused` or `PublicationRefused` results:
+
+- carrier-exit custody and carrier-MM unpublished inventory;
+- exec-predecessor carrier MM, root proof, inventory authority, and MM
+  identity;
+- task stage-1 unpublication and prepared-task rollback/custody/frame registry;
+- task-only root owner and inventory reservation;
+- process root proof, inventory authority/reservation/identity, and detached
+  inventory completion;
+- declined-remainder settlement and process-materialization inventory;
+- every default AArch64 inventory publication/retirement method which has no
+  backend implementation.
+
+Direct `carrick_fatal!` checks left in constructors and infallible typed
+accessors (for example, a published `PendingTransferGrant` without its owned
+descriptor transaction) are not absence crossings: those values cannot be
+returned as refusals without weakening the type's construction invariant.
+They were enumerated separately during the audit and were not relabelled as
+ordinary lifecycle refusals.
+
+Fresh portable verification at `4a8872256`:
+
+- `guest_owned_authority_refuses_host_live_stores_and_builds_guest_transactions`:
+  1 passed;
+- `whole_mm_retirement_of_never_registered_detached_space_is_empty`: 1 passed;
+- serialized `carrick-vmm-hvf --lib`: 803 passed, 0 failed, 3 ignored;
+- `just fmt-check`, `just clippy`, `just clippy-linux`, and
+  `just lint-domains`: passed;
+- `just test-kernel`: passed (kernel library 2,639 passed, 1 ignored, and all
+  kernel-semantics targets completed without failure);
+- `just check-contract-change 2da501dcf0cc81aae517e038bb72dbfee1e1a716 HEAD`:
+  passed;
+- default EL1 image: 1,053,200 / 1,572,864 bytes; maximum checked stack
+  11,503 / 12,288 bytes (`native wait copy`);
+- allocator-test-control EL1 image: 1,057,376 / 1,572,864 bytes; maximum
+  checked stack 11,503 / 12,288 bytes (`native wait copy`);
+- all-target clippy EL1 image: 1,082,032 / 1,572,864 bytes; maximum checked
+  stack 12,015 / 12,288 bytes (`signal terminal exit`).
+
+No signed post-fix run was attempted because these commits change source and
+need an exact-candidate fixture bundle.
+
 ## Exact `2e26b934d` inventory-commit fatal (2026-10-26)
 
 The exact bundle for `2e26b934d032924e61cf03e1546b054dedef6780`
