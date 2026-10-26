@@ -55,6 +55,7 @@ pub(super) struct PendingService<'a> {
     /// in the request and cannot be recycled until completion/cancellation ACK.
     _exec_payload: Option<Box<[u8]>>,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
+    retry_syscall_after_supply: bool,
     request: ServiceRequest,
     pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
     pub(super) claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
@@ -221,7 +222,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, fault_sequence, None, None)
+        self.begin_service_inner(operation, fault_sequence, None, None, false)
+    }
+    /// Supply one nonresident user page needed to stage an exec request, then
+    /// retry the exact SVC. A refused supply remains an ordinary `EFAULT` from
+    /// exec rather than becoming a user data-abort signal.
+    pub fn begin_exec_stage_fault_service(
+        &mut self,
+        fault: carrick_guest_arch::FaultInfo,
+        fault_sequence: Option<core::num::NonZeroU64>,
+        owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        self.begin_service_inner(
+            ServiceOperation::Fault(fault),
+            fault_sequence,
+            owner_wait,
+            None,
+            true,
+        )
     }
     pub fn begin_exec_service(
         &mut self,
@@ -244,6 +262,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None,
             None,
             Some(payload),
+            false,
         )
     }
     /// Park the exact ring operation on the producer observed before its
@@ -253,7 +272,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         wait: carrick_core_abi::PortalOwnerWait,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, None, Some(wait), None)
+        self.begin_service_inner(operation, None, Some(wait), None, false)
     }
     #[inline(never)]
     fn begin_service_inner(
@@ -262,6 +281,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         fault_sequence: Option<core::num::NonZeroU64>,
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
         exec_payload: Option<Box<[u8]>>,
+        retry_syscall_after_supply: bool,
     ) -> Result<NativeResume, NativeProcessError> {
         if matches!(operation, ServiceOperation::Exec { .. }) != exec_payload.is_some() {
             return Err(NativeProcessError::Stale);
@@ -403,6 +423,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 reply,
                 _exec_payload: exec_payload,
                 exec_successor,
+                retry_syscall_after_supply,
                 request,
                 wait: owner_wait,
                 claim,
@@ -470,6 +491,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         )
         .ok_or(NativeProcessError::Stale)?;
         let entry = match request.operation {
+            _ if self
+                .runtime
+                .graph
+                .lock()
+                .service_wait(&self.record)
+                .is_some_and(|pending| pending.retry_syscall_after_supply) =>
+            {
+                OwnerEntry::Syscall
+            }
             ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => OwnerEntry::Exception,
             ServiceOperation::Crossing { .. } | ServiceOperation::Exec { .. } => {
                 OwnerEntry::Syscall
@@ -1239,6 +1269,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if pending.request != *request {
             return Err(NativeProcessError::Quarantined);
         }
+        let retry_syscall_after_supply = pending.retry_syscall_after_supply;
         if self.runtime.graph.lock().pending.has_exit(&self.key) {
             if let (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(receipt)) =
                 (request.operation, result)
@@ -1251,14 +1282,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source
                     .zone
                     .record(self.record.id)
-                    .publish_owner_continuation(match request.operation {
-                        ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => {
-                            OwnerEntry::Exception
+                    .publish_owner_continuation(if retry_syscall_after_supply {
+                        OwnerEntry::Syscall
+                    } else {
+                        match request.operation {
+                            ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => {
+                                OwnerEntry::Exception
+                            }
+                            ServiceOperation::Crossing { .. } | ServiceOperation::Exec { .. } => {
+                                OwnerEntry::Syscall
+                            }
+                            ServiceOperation::CarrierWork { entry } => entry,
                         }
-                        ServiceOperation::Crossing { .. } | ServiceOperation::Exec { .. } => {
-                            OwnerEntry::Syscall
-                        }
-                        ServiceOperation::CarrierWork { entry } => entry,
                     });
             }
             self.release_service_claim(pending.claim)?;
@@ -1343,116 +1378,134 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .record(self.record.id)
                 .consume_owner_continuation();
         }
-        let completed = (|| match (request.operation, result) {
-            (_, ServiceResult::Wait(_)) => Err(NativeProcessError::Quarantined),
-            (
-                ServiceOperation::CarrierWork { .. },
-                ServiceResult::Supplied | ServiceResult::Cancelled,
-            ) => {
-                // Bytes/results already committed before suspension. Cancellation
-                // cannot turn that completion into a short transfer or EINTR.
-                Ok(NativeResume::NoPending)
+        let completed = (|| {
+            if retry_syscall_after_supply {
+                return match result {
+                    ServiceResult::Supplied => Ok(NativeResume::RetrySyscall),
+                    ServiceResult::Refused
+                    | ServiceResult::BackingFault
+                    | ServiceResult::Cancelled
+                    | ServiceResult::Failed(_) => Ok(NativeResume::Returned(SyscallResult::new(
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                    ))),
+                    ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_) => {
+                        Err(NativeProcessError::Quarantined)
+                    }
+                };
             }
-            (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
-                Err(NativeProcessError::Quarantined)
-            }
-            (ServiceOperation::Crossing { .. }, ServiceResult::Refused) => {
-                Ok(NativeResume::Returned(SyscallResult::new(
-                    carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
-                )))
-            }
-            (ServiceOperation::Crossing { .. }, ServiceResult::Cancelled) => {
-                Ok(NativeResume::Returned(SyscallResult::new(
-                    carrick_syscall_abi::LINUX_EINTR.guest_retval(),
-                )))
-            }
-            (
-                ServiceOperation::Fault(_) | ServiceOperation::Exception(_),
-                ServiceResult::Cancelled,
-            ) => Ok(NativeResume::NoPending),
-            (ServiceOperation::Fault(fault), ServiceResult::BackingFault) => {
-                self.force_fault_info(
-                    carrick_signal_core::policy::Signal::BUS,
-                    carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                        carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
-                    ),
-                    carrick_syscall_abi::LinuxSiginfo {
-                        si_code: carrick_syscall_abi::LINUX_BUS_ADRERR,
-                        si_addr: fault.address.raw(),
-                        ..carrick_syscall_abi::LinuxSiginfo::empty()
-                    },
-                )
-                .map_err(|_| NativeProcessError::Fault)?;
-                Ok(NativeResume::NoPending)
-            }
-            (_, ServiceResult::BackingFault) => Err(NativeProcessError::Quarantined),
-            (ServiceOperation::Exec { .. }, ServiceResult::Failed(failure)) => Ok(
-                NativeResume::Returned(SyscallResult::new(-i64::from(failure.raw()))),
-            ),
-            (_, ServiceResult::Failed(_)) => Err(NativeProcessError::Quarantined),
-            (ServiceOperation::Fault(fault), ServiceResult::Refused) => {
-                self.force_sigsegv_info(
-                    carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                        carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
-                    ),
-                    carrick_syscall_abi::LinuxSiginfo {
-                        si_code: if fault.present {
-                            carrick_syscall_abi::LINUX_SEGV_ACCERR
-                        } else {
-                            carrick_syscall_abi::LINUX_SEGV_MAPERR
+            match (request.operation, result) {
+                (_, ServiceResult::Wait(_)) => Err(NativeProcessError::Quarantined),
+                (
+                    ServiceOperation::CarrierWork { .. },
+                    ServiceResult::Supplied | ServiceResult::Cancelled,
+                ) => {
+                    // Bytes/results already committed before suspension. Cancellation
+                    // cannot turn that completion into a short transfer or EINTR.
+                    Ok(NativeResume::NoPending)
+                }
+                (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
+                    Err(NativeProcessError::Quarantined)
+                }
+                (ServiceOperation::Crossing { .. }, ServiceResult::Refused) => {
+                    Ok(NativeResume::Returned(SyscallResult::new(
+                        carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+                    )))
+                }
+                (ServiceOperation::Crossing { .. }, ServiceResult::Cancelled) => {
+                    Ok(NativeResume::Returned(SyscallResult::new(
+                        carrick_syscall_abi::LINUX_EINTR.guest_retval(),
+                    )))
+                }
+                (
+                    ServiceOperation::Fault(_) | ServiceOperation::Exception(_),
+                    ServiceResult::Cancelled,
+                ) => Ok(NativeResume::NoPending),
+                (ServiceOperation::Fault(fault), ServiceResult::BackingFault) => {
+                    self.force_fault_info(
+                        carrick_signal_core::policy::Signal::BUS,
+                        carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+                        ),
+                        carrick_syscall_abi::LinuxSiginfo {
+                            si_code: carrick_syscall_abi::LINUX_BUS_ADRERR,
+                            si_addr: fault.address.raw(),
+                            ..carrick_syscall_abi::LinuxSiginfo::empty()
                         },
-                        si_addr: fault.address.raw(),
-                        ..carrick_syscall_abi::LinuxSiginfo::empty()
-                    },
-                )
-                .map_err(|_| NativeProcessError::Fault)?;
-                Ok(NativeResume::NoPending)
-            }
-            (ServiceOperation::Exception(exception), ServiceResult::Refused) => {
-                let (signal, si_code) = native_exception_signal(exception.kind);
-                self.force_fault_info(
-                    signal,
-                    carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                        carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
-                    ),
-                    carrick_syscall_abi::LinuxSiginfo {
-                        si_code,
-                        si_addr: exception.address.raw(),
-                        ..carrick_syscall_abi::LinuxSiginfo::empty()
-                    },
-                )
-                .map_err(|_| NativeProcessError::Fault)?;
-                Ok(NativeResume::NoPending)
-            }
-            (ServiceOperation::Fault(_), ServiceResult::Supplied) => {
-                // Supply changes physical availability only. Retry the exact
-                // faulting instruction; the ring fault resolver still decides
-                // the descriptor transaction or signal.
-                Ok(NativeResume::NoPending)
-            }
-            (ServiceOperation::Crossing { .. }, ServiceResult::Supplied) => {
-                // No generic host syscall dispatcher owns native semantics.
-                Err(NativeProcessError::Quarantined)
-            }
-            (ServiceOperation::Exception(_), ServiceResult::Supplied) => {
-                Err(NativeProcessError::Quarantined)
-            }
-            (ServiceOperation::Exec { .. }, ServiceResult::Supplied) => {
-                // The successor adoption route consumes successful preparation
-                // before this ordinary syscall-return mapping is reachable.
-                Err(NativeProcessError::Quarantined)
-            }
-            (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(_)) => {
-                Err(NativeProcessError::Quarantined)
-            }
-            (_, ServiceResult::ExecPrepared(_)) => Err(NativeProcessError::Quarantined),
-            (ServiceOperation::Exec { .. }, ServiceResult::Refused) => Ok(NativeResume::Returned(
-                SyscallResult::new(carrick_syscall_abi::LINUX_ENOSYS.guest_retval()),
-            )),
-            (ServiceOperation::Exec { .. }, ServiceResult::Cancelled) => {
-                // An exec cancellation is published only by process closing.
-                // The caller is being retired and must never observe EINTR.
-                Ok(NativeResume::NoPending)
+                    )
+                    .map_err(|_| NativeProcessError::Fault)?;
+                    Ok(NativeResume::NoPending)
+                }
+                (_, ServiceResult::BackingFault) => Err(NativeProcessError::Quarantined),
+                (ServiceOperation::Exec { .. }, ServiceResult::Failed(failure)) => Ok(
+                    NativeResume::Returned(SyscallResult::new(-i64::from(failure.raw()))),
+                ),
+                (_, ServiceResult::Failed(_)) => Err(NativeProcessError::Quarantined),
+                (ServiceOperation::Fault(fault), ServiceResult::Refused) => {
+                    self.force_sigsegv_info(
+                        carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+                        ),
+                        carrick_syscall_abi::LinuxSiginfo {
+                            si_code: if fault.present {
+                                carrick_syscall_abi::LINUX_SEGV_ACCERR
+                            } else {
+                                carrick_syscall_abi::LINUX_SEGV_MAPERR
+                            },
+                            si_addr: fault.address.raw(),
+                            ..carrick_syscall_abi::LinuxSiginfo::empty()
+                        },
+                    )
+                    .map_err(|_| NativeProcessError::Fault)?;
+                    Ok(NativeResume::NoPending)
+                }
+                (ServiceOperation::Exception(exception), ServiceResult::Refused) => {
+                    let (signal, si_code) = native_exception_signal(exception.kind);
+                    self.force_fault_info(
+                        signal,
+                        carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+                        ),
+                        carrick_syscall_abi::LinuxSiginfo {
+                            si_code,
+                            si_addr: exception.address.raw(),
+                            ..carrick_syscall_abi::LinuxSiginfo::empty()
+                        },
+                    )
+                    .map_err(|_| NativeProcessError::Fault)?;
+                    Ok(NativeResume::NoPending)
+                }
+                (ServiceOperation::Fault(_), ServiceResult::Supplied) => {
+                    // Supply changes physical availability only. Retry the exact
+                    // faulting instruction; the ring fault resolver still decides
+                    // the descriptor transaction or signal.
+                    Ok(NativeResume::NoPending)
+                }
+                (ServiceOperation::Crossing { .. }, ServiceResult::Supplied) => {
+                    // No generic host syscall dispatcher owns native semantics.
+                    Err(NativeProcessError::Quarantined)
+                }
+                (ServiceOperation::Exception(_), ServiceResult::Supplied) => {
+                    Err(NativeProcessError::Quarantined)
+                }
+                (ServiceOperation::Exec { .. }, ServiceResult::Supplied) => {
+                    // The successor adoption route consumes successful preparation
+                    // before this ordinary syscall-return mapping is reachable.
+                    Err(NativeProcessError::Quarantined)
+                }
+                (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(_)) => {
+                    Err(NativeProcessError::Quarantined)
+                }
+                (_, ServiceResult::ExecPrepared(_)) => Err(NativeProcessError::Quarantined),
+                (ServiceOperation::Exec { .. }, ServiceResult::Refused) => {
+                    Ok(NativeResume::Returned(SyscallResult::new(
+                        carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+                    )))
+                }
+                (ServiceOperation::Exec { .. }, ServiceResult::Cancelled) => {
+                    // An exec cancellation is published only by process closing.
+                    // The caller is being retired and must never observe EINTR.
+                    Ok(NativeResume::NoPending)
+                }
             }
         })();
         // Mapping/signal completion still needs the exact member/MM. Release
