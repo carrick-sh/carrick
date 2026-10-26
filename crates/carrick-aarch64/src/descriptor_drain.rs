@@ -226,28 +226,28 @@ where
     if excluded.mm() != txn.id.mm_key.get() {
         return None;
     }
-        // Submissions already waiting for the MM (a frame grant EL1 has yet
-        // to apply) land first, in submission order: applied after them, a
-        // retirement could be overtaken by a grant's prepare onto the freed
-        // range (windowcoherence lane on: "prepare ... Refused(Occupied)").
-        match tables.apply_submitted_as_host(slots, excluded, maintenance, invalidate_asid) {
-            Ok(true) => {}
-            Ok(false) => return None,
-            Err(error) => return Some(Err(failed(error))),
-        }
-        Some(
-            tables
-                .execute_guest_descriptor_txn_as_host(txn, excluded, maintenance)
-                .map_err(failed)
-                .and_then(|receipt| {
-                    if carrick_mmu_core::aarch64::descriptor_txn::outcome_requires_invalidation(
-                        &receipt.outcome,
-                    ) {
-                        invalidate_asid();
-                    }
-                    check().map(|()| receipt)
-                }),
-        )
+    // Submissions already waiting for the MM (a frame grant EL1 has yet
+    // to apply) land first, in submission order: applied after them, a
+    // retirement could be overtaken by a grant's prepare onto the freed
+    // range (windowcoherence lane on: "prepare ... Refused(Occupied)").
+    match tables.apply_submitted_as_host(slots, excluded, maintenance, invalidate_asid) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => return Some(Err(failed(error))),
+    }
+    Some(
+        tables
+            .execute_guest_descriptor_txn_as_host(txn, excluded, maintenance)
+            .map_err(failed)
+            .and_then(|receipt| {
+                if carrick_mmu_core::aarch64::descriptor_txn::outcome_requires_invalidation(
+                    &receipt.outcome,
+                ) {
+                    invalidate_asid();
+                }
+                check().map(|()| receipt)
+            }),
+    )
 }
 
 /// The production venue: the engine's own vCPU and the shared EL1 region.

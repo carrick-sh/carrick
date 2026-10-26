@@ -303,6 +303,9 @@ impl CloneTidOutputTransaction {
             Err(carrick_guest_mem::MemoryError::HostMap(_)) => {
                 carrick_observability::probes::HvpatchCloneTidWriteResult::HostMap
             }
+            Err(carrick_guest_mem::MemoryError::EditorLicenseRefused { .. }) => {
+                carrick_observability::probes::HvpatchCloneTidWriteResult::HostMap
+            }
             Err(
                 carrick_guest_mem::MemoryError::ReadSuspended(_)
                 | carrick_guest_mem::MemoryError::Physical(_)

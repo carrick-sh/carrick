@@ -288,8 +288,16 @@ pub(crate) trait HvpatchProcessBackendOps<E: ThreadedEngine, M: CurrentMmMemory>
     /// take a host COW on an armed span: a later arm would re-arm a span the
     /// host already made private and disarmed.
     fn arm_parent(&mut self, _memory: &mut M) {}
-    fn commit_parent(&mut self, memory: &mut M, editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>) -> Result<(), RuntimeError>;
-    fn rollback_parent(&mut self, memory: &mut M, editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>) -> Result<(), RuntimeError>;
+    fn commit_parent(
+        &mut self,
+        memory: &mut M,
+        editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
+    ) -> Result<(), RuntimeError>;
+    fn rollback_parent(
+        &mut self,
+        memory: &mut M,
+        editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
+    ) -> Result<(), RuntimeError>;
     fn abort_and_rollback_prepared(
         &mut self,
         prepared: Self::Prepared,
@@ -373,7 +381,9 @@ where
                     Ok(spec) => spec,
                     Err(error) => {
                         let _ = memory.cancel_process_inventory();
-                        memory.rollback_process_fork(editor_excluded).map_err(RuntimeError::Trap)?;
+                        memory
+                            .rollback_process_fork(editor_excluded)
+                            .map_err(RuntimeError::Trap)?;
                         return Err(RuntimeError::Trap(error));
                     }
                 };
@@ -383,7 +393,9 @@ where
                     Ok(spec) => spec,
                     Err(_) => {
                         let _ = memory.cancel_process_inventory();
-                        memory.rollback_process_fork(editor_excluded).map_err(RuntimeError::Trap)?;
+                        memory
+                            .rollback_process_fork(editor_excluded)
+                            .map_err(RuntimeError::Trap)?;
                         return Err(RuntimeError::Configuration(
                             "persistent HVPatch fork rejected non-HVF process spec".to_owned(),
                         ));
@@ -438,7 +450,11 @@ where
                         let _cancelled = memory.cancel_process_inventory();
                         Ok(())
                     },
-                    |memory| memory.rollback_process_fork(editor_excluded).map_err(RuntimeError::Trap),
+                    |memory| {
+                        memory
+                            .rollback_process_fork(editor_excluded)
+                            .map_err(RuntimeError::Trap)
+                    },
                 ) {
                     return Err(<Self as HvpatchProcessBackendOps<E, E>>::fail_stop(
                         self,
@@ -524,13 +540,25 @@ where
         }
     }
 
-    fn commit_parent(&mut self, memory: &mut E, editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>) -> Result<(), RuntimeError> {
-        memory.commit_process_fork(editor_excluded).map_err(RuntimeError::Trap)
+    fn commit_parent(
+        &mut self,
+        memory: &mut E,
+        editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
+    ) -> Result<(), RuntimeError> {
+        memory
+            .commit_process_fork(editor_excluded)
+            .map_err(RuntimeError::Trap)
     }
 
-    fn rollback_parent(&mut self, memory: &mut E, editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>) -> Result<(), RuntimeError> {
+    fn rollback_parent(
+        &mut self,
+        memory: &mut E,
+        editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
+    ) -> Result<(), RuntimeError> {
         let _ = memory.cancel_process_inventory();
-        memory.rollback_process_fork(editor_excluded).map_err(RuntimeError::Trap)
+        memory
+            .rollback_process_fork(editor_excluded)
+            .map_err(RuntimeError::Trap)
     }
 
     fn commit(
@@ -1047,7 +1075,7 @@ pub(crate) mod tests {
         let result = <FakeBackendOps as HvpatchProcessBackendOps<
             carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine,
             Memory,
-        >>::abort_and_rollback_prepared(&mut ops, (), &mut memory, true);
+        >>::abort_and_rollback_prepared(&mut ops, (), &mut memory, None, true);
         assert!(result.is_err());
         assert_eq!(ops.aborts, 1);
         assert_eq!(ops.parent_rollbacks, 1);
@@ -1709,6 +1737,7 @@ pub(crate) mod tests {
         fn prepare(
             &mut self,
             _memory: &mut Memory,
+            _editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
             inventory: HvpatchProcessInventoryPreparation<'_>,
             request: carrick_hal::ProcessForkRequest,
             _identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
@@ -1796,12 +1825,20 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn commit_parent(&mut self, _memory: &mut Memory) -> Result<(), RuntimeError> {
+        fn commit_parent(
+            &mut self,
+            _memory: &mut Memory,
+            _editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
+        ) -> Result<(), RuntimeError> {
             self.parent_commits += 1;
             Ok(())
         }
 
-        fn rollback_parent(&mut self, _memory: &mut Memory) -> Result<(), RuntimeError> {
+        fn rollback_parent(
+            &mut self,
+            _memory: &mut Memory,
+            _editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
+        ) -> Result<(), RuntimeError> {
             self.parent_rollbacks += 1;
             Ok(())
         }

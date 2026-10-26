@@ -399,8 +399,8 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
                 "HVPatch frame-COW vCPU quiesce failed: {error:?}"
             ))) as Box<dyn std::error::Error + Send + Sync>
         })?;
-        let editor = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(self.mm)
-            .ok_or_else(|| {
+        let editor =
+            carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(self.mm).ok_or_else(|| {
                 Box::new(std::io::Error::other(
                     "HVPatch frame-COW quiesce could not exclude the EL1 Editor",
                 )) as Box<dyn std::error::Error + Send + Sync>

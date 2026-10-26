@@ -64,10 +64,21 @@ impl GuestMemory for BudgetMemory {
         }
         self.0.zero_backing(address, len)
     }
-    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.0.unmap_range(address, len)
+    fn unmap_range(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        self.0.unmap_range(editor, address, len)
     }
-    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        _address: u64,
+        _len: usize,
+        _prot: u64,
+    ) -> Result<(), MemoryError> {
         Ok(())
     }
 }

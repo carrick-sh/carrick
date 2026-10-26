@@ -93,8 +93,14 @@ fn serial_host_el1_descriptor_service_executes_and_settles() {
         carrick_vmm_hvf::hvf_aarch64_engine::attach_task_engine(task, &mut lifecycle, vcpu);
     engine.overlay_task_state_on_live_executor(&cpu).unwrap();
     assert_eq!(engine.next_syscall().unwrap().unwrap().number.raw(), 93);
+    let mm = NonZeroU64::new(77).unwrap();
+    let spaces = carrick_sched_core::AddressSpaces::new();
+    let space = spaces.publish_closed(mm.get(), 0x1000, 0).unwrap();
+    let excluded = spaces.raise_and_wait_for_editor(space, || {});
+    let held = carrick_guest_mem::HeldEl1EditorExclusion::register(&excluded);
+    engine.configure_process_asid(held.license(), 1).unwrap();
     // Adopt the actual boot tables before transferring this isolated root.
-    engine.protect_range(DATA, 4096, 3).unwrap();
+    engine.protect_range(held.license(), DATA, 4096, 3).unwrap();
     let ttbr0 = engine.live_ttbr0().unwrap();
     let root = ttbr0 & 0x0000_ffff_ffff_f000;
     let root_len = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
@@ -131,7 +137,6 @@ fn serial_host_el1_descriptor_service_executes_and_settles() {
         &*((region + carrick_el1_abi::EL1_ZONE_OFFSET as usize)
             as *const carrick_el1_abi::ZoneTables)
     };
-    let mm = NonZeroU64::new(77).unwrap();
     assert_eq!(
         engine.page_tables().select_guest_descriptor_owner(),
         Ok(carrick_aarch64::stage1_authority::GuestLaneSelection::Selected)
@@ -180,5 +185,5 @@ fn serial_host_el1_descriptor_service_executes_and_settles() {
         "EL1 published user RO"
     );
     // Host mutation remains fenced after successful hardware settlement.
-    assert!(engine.protect_range(DATA, 4096, 3).is_err());
+    assert!(engine.protect_range(held.license(), DATA, 4096, 3).is_err());
 }

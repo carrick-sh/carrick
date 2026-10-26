@@ -4639,7 +4639,12 @@ mod ipc_set_tests {
             self.inner.write_bytes_raw(address, bytes)
         }
 
-        fn unmap_alias_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+        fn unmap_alias_range(
+            &mut self,
+            _editor: &carrick_guest_mem::El1EditorExcluded,
+            _address: u64,
+            _len: usize,
+        ) -> Result<(), MemoryError> {
             Err(MemoryError::HostMap(
                 "injected alias unmap failure".to_string(),
             ))

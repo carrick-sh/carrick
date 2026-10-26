@@ -3304,6 +3304,7 @@ pub(crate) mod tests {
         fn prepare(
             &mut self,
             _memory: &mut Memory,
+            _editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
             inventory: HvpatchProcessInventoryPreparation<'_>,
             request: carrick_hal::ProcessForkRequest,
             _identity: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity,
@@ -3391,12 +3392,20 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn commit_parent(&mut self, _memory: &mut Memory) -> Result<(), RuntimeError> {
+        fn commit_parent(
+            &mut self,
+            _memory: &mut Memory,
+            _editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
+        ) -> Result<(), RuntimeError> {
             self.parent_commits += 1;
             Ok(())
         }
 
-        fn rollback_parent(&mut self, _memory: &mut Memory) -> Result<(), RuntimeError> {
+        fn rollback_parent(
+            &mut self,
+            _memory: &mut Memory,
+            _editor_excluded: Option<&carrick_guest_mem::El1EditorExcluded>,
+        ) -> Result<(), RuntimeError> {
             self.parent_rollbacks += 1;
             Ok(())
         }
@@ -3872,7 +3881,11 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
+        fn execve_into(
+            &mut self,
+            _editor: &carrick_guest_mem::El1EditorExcluded,
+            _new_image: &AddressSpace,
+        ) -> Result<(), TrapError> {
             self.execve_installs += 1;
             if let Some(reason) = &self.fail_execve_into {
                 return Err(TrapError::Hypervisor(reason.clone()));

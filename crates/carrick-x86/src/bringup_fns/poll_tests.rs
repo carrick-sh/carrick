@@ -80,7 +80,11 @@ impl SyscallTrap for PollGuest {
         self.results.push(result);
         Ok(())
     }
-    fn execve_into(&mut self, _: &AddressSpace) -> Result<(), TrapError> {
+    fn execve_into(
+        &mut self,
+        _: &carrick_guest_mem::El1EditorExcluded,
+        _: &AddressSpace,
+    ) -> Result<(), TrapError> {
         panic!("unexpected exec")
     }
     fn inject_signal(&mut self, _: SignalInjection) -> Result<(), TrapError> {

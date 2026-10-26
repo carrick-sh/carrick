@@ -554,7 +554,11 @@ mod tests {
             self.completed.push(value);
             Ok(())
         }
-        fn execve_into(&mut self, _: &crate::memory::AddressSpace) -> Result<(), TrapError> {
+        fn execve_into(
+            &mut self,
+            _: &carrick_guest_mem::El1EditorExcluded,
+            _: &crate::memory::AddressSpace,
+        ) -> Result<(), TrapError> {
             Err(TrapError::UnsupportedPlatform)
         }
         fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {

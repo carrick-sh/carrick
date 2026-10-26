@@ -410,6 +410,13 @@ impl HostAliasBacking {
 
 #[derive(Debug, ::thiserror::Error)]
 pub enum TrapError {
+    #[error(
+        "stage-1 Editor license refused: authority_mm={authority_mm:?} license_mm={license_mm}"
+    )]
+    Stage1EditorLicenseRefused {
+        authority_mm: Option<u64>,
+        license_mm: u64,
+    },
     /// An authenticated native owner retired its root; never resume the guest.
     #[error("native root exited: {status:?}")]
     NativeRootExit {

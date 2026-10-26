@@ -2194,7 +2194,12 @@ impl<'a> MemView<'a> {
             source_after,
         } = relocation;
         let rollback = |this: &Self, memory: &mut M, errno: LinuxErrno| -> LinuxErrno {
-            match this.rollback_fresh_arena_mapping(memory, editor_excluded, destination, destination_len) {
+            match this.rollback_fresh_arena_mapping(
+                memory,
+                editor_excluded,
+                destination,
+                destination_len,
+            ) {
                 Ok(()) => errno,
                 // The destination could not be unpublished either: report
                 // the syscall failure; the rollback itself fail-stops under
@@ -2225,7 +2230,12 @@ impl<'a> MemView<'a> {
         // private/cacheable mid-move.
         memory.set_mapping_protection_and_sharing(destination, dest_len, false, false, sharing);
         if memory
-            .protect_range(editor_excluded, destination, dest_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
+            .protect_range(
+                editor_excluded,
+                destination,
+                dest_len,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+            )
             .is_err()
         {
             return Err(rollback(self, memory, LINUX_ENOMEM));
@@ -2259,7 +2269,10 @@ impl<'a> MemView<'a> {
                 let overlaps = destination < source.saturating_add(source_len)
                     && source < destination.saturating_add(destination_len);
                 if !overlaps {
-                    if memory.unmap_range(editor_excluded, source, src_len).is_err() {
+                    if memory
+                        .unmap_range(editor_excluded, source, src_len)
+                        .is_err()
+                    {
                         return Err(rollback(self, memory, LINUX_ENOMEM));
                     }
                     mark_range_unmapped(memory, source, src_len);
@@ -2782,9 +2795,11 @@ impl SyscallDispatcher {
     pub(in crate::dispatch::mem) fn commit_mmap_locked_range(
         &self,
         memory: &mut impl CurrentMmMemory,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         range: Option<carrick_vfs::GuestMemoryRange>,
     ) -> Result<(), LinuxErrno> {
-        self.mem_view().commit_mmap_locked_range(memory, range)
+        self.mem_view()
+            .commit_mmap_locked_range(memory, editor_excluded, range)
     }
 
     #[cfg(test)]
@@ -2801,9 +2816,11 @@ impl SyscallDispatcher {
     pub(in crate::dispatch::mem) fn lock_current_mappings(
         &self,
         memory: &mut impl CurrentMmMemory,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         onfault: bool,
     ) -> Result<(), LinuxErrno> {
-        self.mem_view().lock_current_mappings(memory, onfault)
+        self.mem_view()
+            .lock_current_mappings(memory, editor_excluded, onfault)
     }
 }
 
@@ -2884,6 +2901,21 @@ pub(super) fn mmap_request_uses_alias(
     semantic_identity_range: bool,
 ) -> bool {
     address_uses_alias || (fixed && !has_identity_backing && !semantic_identity_range)
+}
+
+#[cfg(test)]
+pub(crate) fn test_editor_excluded() -> &'static carrick_guest_mem::El1EditorExcluded {
+    static LICENSE: std::sync::OnceLock<&'static carrick_guest_mem::El1EditorExcluded> =
+        std::sync::OnceLock::new();
+    LICENSE.get_or_init(|| {
+        let spaces = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
+        let index = spaces.publish_closed(1, 0x1000, 0).expect("test MM");
+        let excluded = Box::leak(Box::new(spaces.raise_and_wait_for_editor(index, || {})));
+        let held = Box::leak(Box::new(
+            carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(excluded),
+        ));
+        held.license()
+    })
 }
 
 #[cfg(test)]

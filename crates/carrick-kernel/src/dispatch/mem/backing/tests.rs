@@ -204,11 +204,22 @@ impl GuestMemory for FileBackedLoweringMemory {
         self.inner.write_bytes_raw(address, bytes)
     }
 
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        self.inner.protect_range(address, len, prot)
+    fn protect_range(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
+        self.inner.protect_range(editor, address, len, prot)
     }
 
-    fn mark_bus_fault(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn mark_bus_fault(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         self.bus_marks.borrow_mut().push((address, len));
         Ok(())
     }

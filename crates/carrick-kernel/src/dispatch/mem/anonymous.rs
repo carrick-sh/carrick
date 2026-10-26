@@ -2336,7 +2336,10 @@ impl MemView<'_> {
             !prot_none && !prot.contains(LinuxProtFlags::WRITE),
             carrick_guest_mem::MappingSharing::Private,
         );
-        if memory.protect_range(editor_excluded, start, length, prot.bits()).is_err() {
+        if memory
+            .protect_range(editor_excluded, start, length, prot.bits())
+            .is_err()
+        {
             mark_range_unmapped(memory, start, length);
             return Err(LINUX_ENOMEM);
         }
@@ -2379,13 +2382,19 @@ impl MemView<'_> {
         let extension = proposed.range;
         let prot = LinuxProtFlags::from_bits_retain(proposed.protection.bits());
         let stale = extension.start() < self.writable_high();
-        if let Err(errno) =
-            self.publish_fresh_anonymous(memory, editor_excluded, extension.start(), extension.len(), prot, stale)
-        {
+        if let Err(errno) = self.publish_fresh_anonymous(
+            memory,
+            editor_excluded,
+            extension.start(),
+            extension.len(),
+            prot,
+            stale,
+        ) {
             return Ok(DispatchOutcome::errno(errno));
         }
         if locked
-            && let Err(errno) = self.populate_locked(memory, editor_excluded, extension.start(), extension.len())
+            && let Err(errno) =
+                self.populate_locked(memory, editor_excluded, extension.start(), extension.len())
         {
             return Ok(DispatchOutcome::errno(errno));
         }
@@ -2439,7 +2448,12 @@ impl MemView<'_> {
             self.remove_mapping_metadata(source.start(), source.len());
         }
         if locked
-            && let Err(errno) = self.populate_locked(memory, editor_excluded, destination.start(), destination.len())
+            && let Err(errno) = self.populate_locked(
+                memory,
+                editor_excluded,
+                destination.start(),
+                destination.len(),
+            )
         {
             return Ok(DispatchOutcome::errno(errno));
         }

@@ -883,7 +883,11 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         }
         dispatcher
             .with_kernel_resources(&context, || {
-                dispatcher.reconcile_el1_deferred_returns(&permit, engine, mutation.el1_editor_license())
+                dispatcher.reconcile_el1_deferred_returns(
+                    &permit,
+                    engine,
+                    mutation.el1_editor_license(),
+                )
             })
             .map_err(|error| {
                 TrapError::Hypervisor(format!(
@@ -1790,6 +1794,7 @@ mod tests {
 
         fn execve_into(
             &mut self,
+            _editor: &carrick_guest_mem::El1EditorExcluded,
             _new_image: &crate::memory::AddressSpace,
         ) -> Result<(), TrapError> {
             Err(TrapError::UnsupportedPlatform)
@@ -2817,6 +2822,7 @@ mod guest_descriptor_lane_tests {
         /// Break-before-make and ASID invalidations a host-applied
         /// transaction ran (each a maintenance exit in production).
         invalidations: std::cell::Cell<usize>,
+        host_excluded: bool,
     }
 
     impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for FakeVenue<'_> {
@@ -2900,9 +2906,13 @@ mod guest_descriptor_lane_tests {
             txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
             slots: &DescriptorTxnSlots,
         ) -> Option<Result<DescriptorReceipt, TrapError>> {
+            if !self.host_excluded {
+                return None;
+            }
             let venue: &FakeVenue<'_> = self;
             carrick_aarch64::descriptor_drain::apply_as_host_if_excluded(
                 venue.authority,
+                test_editor_excluded(),
                 slots,
                 txn,
                 venue,
@@ -2979,19 +2989,21 @@ mod guest_descriptor_lane_tests {
 
     /// Hold `MM`'s EL1 editor exclusion on this thread, as the syscall and
     /// first-touch mutation guards do.
-    fn excluded<R>(f: impl FnOnce() -> R) -> R {
-        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
-        let index = spaces
-            .publish_closed(MM, LINUX_PAGE_TABLES_BASE, 0)
-            .unwrap();
-        let result = {
-            let excluded = spaces.raise_and_wait_for_editor(index, || {});
-            let _held =
-                carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
-            f()
-        };
-        spaces.lower(index);
-        result
+    fn test_editor_excluded() -> &'static carrick_guest_mem::El1EditorExcluded {
+        static LICENSE: std::sync::OnceLock<&'static carrick_guest_mem::El1EditorExcluded> =
+            std::sync::OnceLock::new();
+        LICENSE.get_or_init(|| {
+            let spaces = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
+            let excluded = Box::leak(Box::new(spaces.unpublished(MM).unwrap()));
+            let held = Box::leak(Box::new(
+                carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(excluded),
+            ));
+            held.license()
+        })
+    }
+
+    fn excluded<R>(f: impl FnOnce(&carrick_guest_mem::El1EditorExcluded) -> R) -> R {
+        f(test_editor_excluded())
     }
 
     fn venue<'a>(
@@ -3010,6 +3022,7 @@ mod guest_descriptor_lane_tests {
             answered: 0,
             calls: 0,
             invalidations: std::cell::Cell::new(0),
+            host_excluded: false,
         }
     }
 
@@ -3031,7 +3044,12 @@ mod guest_descriptor_lane_tests {
                 apply_guest_descriptor_txns_now(fake, &slots, &[txn]).unwrap()
             };
             let receipts = if exclusion {
-                excluded(|| publish(&mut fake))
+                excluded(|_| {
+                    fake.host_excluded = true;
+                    let receipts = publish(&mut fake);
+                    fake.host_excluded = false;
+                    receipts
+                })
             } else {
                 publish(&mut fake)
             };
@@ -3080,10 +3098,11 @@ mod guest_descriptor_lane_tests {
             tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants::NONE,
         };
         let fake = venue(&resolver, &slots, &authority);
-        excluded(|| {
+        excluded(|editor| {
             assert!(
                 carrick_aarch64::descriptor_drain::apply_as_host_if_excluded(
                     &authority,
+                    editor,
                     &slots,
                     &txn,
                     &fake,
@@ -3114,8 +3133,10 @@ mod guest_descriptor_lane_tests {
             .unwrap();
         let arm = authority.prepare_guest_descriptor_txn(nz(MM), op).unwrap();
         let mut fake = venue(&resolver, &slots, &authority);
-        excluded(|| {
+        excluded(|_| {
+            fake.host_excluded = true;
             apply_guest_descriptor_txns_now(&mut fake, &slots, &[arm]).unwrap();
+            fake.host_excluded = false;
         });
         assert_eq!(fake.calls, 0, "the host applied both, no drain call");
         let receipt = slots
@@ -3137,7 +3158,8 @@ mod guest_descriptor_lane_tests {
         let (authority, resolver) = guest_lane();
         let slots = Box::new(DescriptorTxnSlots::new());
         let mut fake = venue(&resolver, &slots, &authority);
-        excluded(|| {
+        excluded(|_| {
+            fake.host_excluded = true;
             let first_touch = authority
                 .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
                 .unwrap();
@@ -3151,6 +3173,7 @@ mod guest_descriptor_lane_tests {
             apply_guest_descriptor_txns_now(&mut fake, &slots, &[arm]).unwrap();
             assert!(!writable(&authority, VA));
             assert_eq!(fake.invalidations.get(), 1, "valid -> changed invalidates");
+            fake.host_excluded = false;
         });
         assert_eq!(fake.calls, 0);
     }
@@ -3184,14 +3207,8 @@ mod guest_descriptor_lane_tests {
         let txn = authority
             .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
             .unwrap();
-        assert!(carrick_hal::el1_editor_exclusion::with_held_exclusion(
-            MM,
-            |witness| witness.is_none()
-        ));
-        excluded(|| {
-            carrick_hal::el1_editor_exclusion::with_held_exclusion(MM + 1, |witness| {
-                assert!(witness.is_none(), "another MM's exclusion is no witness")
-            });
+        excluded(|witness| {
+            assert_eq!(witness.mm(), MM, "the guard lends only its exact-MM proof");
         });
         authority.abandon_guest_descriptor_txn(&txn).unwrap();
     }
@@ -3226,6 +3243,7 @@ mod guest_descriptor_lane_tests {
                 answered: 0,
                 calls: 0,
                 invalidations: std::cell::Cell::new(0),
+                host_excluded: false,
             };
             assert!(
                 carrick_aarch64::descriptor_drain::publish_copyout(
@@ -3282,6 +3300,7 @@ mod guest_descriptor_lane_tests {
             answered: 0,
             calls: 0,
             invalidations: std::cell::Cell::new(0),
+            host_excluded: false,
         };
         let receipt = carrick_aarch64::descriptor_drain::publish_copyout(
             &mut venue,
@@ -3325,6 +3344,7 @@ mod guest_descriptor_lane_tests {
             answered: 0,
             calls: 0,
             invalidations: std::cell::Cell::new(0),
+            host_excluded: false,
         };
         let receipts = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap();
         assert_eq!(receipts.len(), 2);
@@ -3360,6 +3380,7 @@ mod guest_descriptor_lane_tests {
             answered: 0,
             calls: 0,
             invalidations: std::cell::Cell::new(0),
+            host_excluded: false,
         };
         assert!(apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).is_err());
         assert!(
@@ -3406,6 +3427,7 @@ mod guest_descriptor_lane_tests {
                 answered: 0,
                 calls: 0,
                 invalidations: std::cell::Cell::new(0),
+                host_excluded: false,
             };
             let error = apply_guest_descriptor_txns_now(&mut venue, &slots, &arm).unwrap_err();
             assert_eq!(

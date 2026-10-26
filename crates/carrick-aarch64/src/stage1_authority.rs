@@ -101,11 +101,77 @@ pub trait Stage1EditLicense: edit_license_sealed::Sealed {
     fn mm(&self) -> u64;
 }
 
+/// Typed refusal for a stage-1 mutation attempted without the exact MM's
+/// owned Editor exclusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage1EditRefusal {
+    pub authority_mm: Option<u64>,
+    pub license_mm: u64,
+}
+
+impl std::fmt::Display for Stage1EditRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stage-1 Editor license refused: authority_mm={:?} license_mm={}",
+            self.authority_mm, self.license_mm
+        )
+    }
+}
+
+impl std::error::Error for Stage1EditRefusal {}
+
+impl From<Stage1EditRefusal> for PageTableError {
+    fn from(refusal: Stage1EditRefusal) -> Self {
+        Self::EditorLicenseRefused {
+            authority_mm: refusal.authority_mm,
+            license_mm: refusal.license_mm,
+        }
+    }
+}
+
+impl From<Stage1EditRefusal> for carrick_guest_mem::MemoryError {
+    fn from(refusal: Stage1EditRefusal) -> Self {
+        Self::EditorLicenseRefused {
+            authority_mm: refusal.authority_mm,
+            license_mm: refusal.license_mm,
+        }
+    }
+}
+
+impl From<Stage1EditRefusal> for TrapError {
+    fn from(refusal: Stage1EditRefusal) -> Self {
+        Self::Stage1EditorLicenseRefused {
+            authority_mm: refusal.authority_mm,
+            license_mm: refusal.license_mm,
+        }
+    }
+}
+
+impl From<Stage1EditRefusal> for carrick_hal::ForeignMmTransportError {
+    fn from(refusal: Stage1EditRefusal) -> Self {
+        Self::EditorLicenseRefused {
+            authority_mm: refusal.authority_mm,
+            license_mm: refusal.license_mm,
+        }
+    }
+}
+
+impl From<Stage1EditRefusal> for String {
+    fn from(refusal: Stage1EditRefusal) -> Self {
+        refusal.to_string()
+    }
+}
+
+#[cfg(test)]
+impl From<Stage1EditRefusal> for () {
+    fn from(_: Stage1EditRefusal) {}
+}
+
 impl Stage1EditLicense for carrick_hal::el1_editor_exclusion::El1EditorExcluded {
     fn mm(&self) -> u64 {
         self.mm()
     }
-
 }
 
 impl<C> Stage1EditLicense for carrick_sched_core::SpaceEditor<'_, C>
@@ -115,7 +181,6 @@ where
     fn mm(&self) -> u64 {
         self.key()
     }
-
 }
 
 /// Non-cloneable proof that one exact authority image stopped translating
@@ -440,12 +505,16 @@ impl Stage1Authority {
         self.inner.lock().mm
     }
 
-    fn assert_license(&self, license: &impl Stage1EditLicense) {
-        assert_eq!(
-            Some(license.mm()),
-            self.inner.lock().mm,
-            "stage-1 Editor license must name the authority's bound MM"
-        );
+    fn assert_license(&self, license: &impl Stage1EditLicense) -> Result<(), Stage1EditRefusal> {
+        let authority_mm = self.inner.lock().mm;
+        if authority_mm == Some(license.mm()) {
+            Ok(())
+        } else {
+            Err(Stage1EditRefusal {
+                authority_mm,
+                license_mm: license.mm(),
+            })
+        }
     }
 
     /// Capture the exact live leaves a prepared guest retirement transaction
@@ -1274,11 +1343,12 @@ impl Stage1Authority {
     }
 
     /// Discard the open undo journal, committing all edits in the current transaction.
-    pub fn commit_undo(&self, license: &impl Stage1EditLicense) {
-        self.assert_license(license);
+    pub fn commit_undo(&self, license: &impl Stage1EditLicense) -> Result<(), Stage1EditRefusal> {
+        self.assert_license(license)?;
         if let Some(manager) = self.inner.lock().manager.as_mut() {
             manager.commit_undo();
         }
+        Ok(())
     }
 
     /// Revert uncommitted page table edits recorded in the undo journal to shadow and host memory.
@@ -1291,7 +1361,7 @@ impl Stage1Authority {
         license: &impl Stage1EditLicense,
         resolver: impl HostArenaResolver,
     ) -> Result<Vec<u64>, PageTableError> {
-        self.assert_license(license);
+        self.assert_license(license)?;
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
         let live_owner = inner.live_owner;
@@ -1319,8 +1389,9 @@ impl Stage1Authority {
     where
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
+        E: From<Stage1EditRefusal>,
     {
-        self.assert_license(license);
+        self.assert_license(license)?;
         let authority = self.authority_id();
         let mut inner = self.inner.try_lock_until(deadline).ok_or(on_timeout)?;
         if inner.manager.is_none() {
@@ -1378,6 +1449,7 @@ impl Stage1Authority {
     where
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
+        E: From<Stage1EditRefusal>,
     {
         self.try_edit_until(
             license,
@@ -1657,8 +1729,9 @@ impl Stage1Authority {
     where
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
+        E: From<Stage1EditRefusal>,
     {
-        self.assert_license(license);
+        self.assert_license(license)?;
         let authority = self.authority_id();
         {
             let mut inner = self.inner.lock();
@@ -1718,6 +1791,7 @@ impl Stage1Authority {
     where
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
+        E: From<Stage1EditRefusal>,
     {
         self.edit(license, builder, |editor| {
             let plan = editor.image_generation.and_then(|generation| {
@@ -1749,7 +1823,7 @@ impl Stage1Authority {
         image: &mut Option<PageTableManager>,
         site: u32,
     ) -> Result<Option<PageTableManager>, PageTableError> {
-        self.assert_license(license);
+        self.assert_license(license)?;
         let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
@@ -1794,7 +1868,7 @@ impl Stage1Authority {
     where
         H: HostArenaResolver,
     {
-        self.assert_license(license);
+        self.assert_license(license)?;
         let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
@@ -1824,7 +1898,7 @@ impl Stage1Authority {
         license: &impl Stage1EditLicense,
         successor: Self,
     ) -> Result<bool, String> {
-        self.assert_license(license);
+        self.assert_license(license).map_err(String::from)?;
         if self.shares_exact_authority(&successor) {
             return Err("exec successor reused its predecessor table authority".into());
         }
@@ -1862,6 +1936,7 @@ impl Stage1Authority {
     where
         B: FnOnce() -> Result<Option<PageTableManager>, E>,
         R: FnMut(&[carrick_mmu_core::aarch64::TableArenaDetached]) -> Result<(), E>,
+        E: From<Stage1EditRefusal>,
     {
         self.replace_for_exec_internal(license, builder, retirer)
             .map(|(auth, _)| auth)
@@ -1877,8 +1952,9 @@ impl Stage1Authority {
     where
         B: FnOnce() -> Result<Option<PageTableManager>, E>,
         R: FnMut(&[carrick_mmu_core::aarch64::TableArenaDetached]) -> Result<(), E>,
+        E: From<Stage1EditRefusal>,
     {
-        self.assert_license(license);
+        self.assert_license(license)?;
         let is_shared = {
             let mut inner = self.inner.lock();
             if inner.vfork_shares > 0 {
@@ -2505,6 +2581,12 @@ impl<'a> Stage1Editor<'a> {
 pub(crate) mod tests {
     use super::*;
 
+    fn test_authority_with_manager(manager: Option<PageTableManager>) -> Stage1Authority {
+        let authority = Stage1Authority::new_with_manager(manager);
+        assert!(authority.bind_mm(1));
+        authority
+    }
+
     pub(crate) fn test_edit_license() -> &'static carrick_sched_core::SpaceEditor<'static> {
         thread_local! {
             static LICENSE: &'static carrick_sched_core::SpaceEditor<'static> = {
@@ -2519,6 +2601,27 @@ pub(crate) mod tests {
             };
         }
         LICENSE.with(|license| *license)
+    }
+
+    #[test]
+    fn editor_license_mismatch_is_a_typed_refusal_not_a_panic() {
+        let unbound = Stage1Authority::new();
+        assert_eq!(
+            unbound.commit_undo(test_edit_license()),
+            Err(Stage1EditRefusal {
+                authority_mm: None,
+                license_mm: 1,
+            })
+        );
+
+        assert!(unbound.bind_mm(2));
+        assert_eq!(
+            unbound.commit_undo(test_edit_license()),
+            Err(Stage1EditRefusal {
+                authority_mm: Some(2),
+                license_mm: 1,
+            })
+        );
     }
 
     /// Raw `(base, host)` arenas for a VM-free test whose edits publish
@@ -2816,7 +2919,7 @@ pub(crate) mod tests {
         let va = LINUX_MMAP_BASE;
         let old_ipa = 0x009b_5000_0000;
         let new_ipa = old_ipa + 0x20_0000;
-        let authority = Stage1Authority::new_with_manager(Some(test_manager()));
+        let authority = test_authority_with_manager(Some(test_manager()));
         authority
             .edit(
                 test_edit_license(),
@@ -2920,7 +3023,7 @@ pub(crate) mod tests {
     #[test]
     fn image_generation_invalidates_edits_errors_restore_and_replacement() {
         let manager = || test_manager();
-        let mut authority = Stage1Authority::new_with_manager(Some(manager()));
+        let mut authority = test_authority_with_manager(Some(manager()));
         let original = observed_generation(&authority);
         authority.with_manager(|m| m.debug_walk(0x40_0000));
         let image = authority.snapshot_image().unwrap();
@@ -2965,7 +3068,7 @@ pub(crate) mod tests {
         authority.replace_manager(Some(saved));
         let after_replace = observed_generation(&authority);
         assert_ne!(after_replace, after_set);
-        let previous = Stage1Authority::new_with_manager(Some(manager()));
+        let previous = test_authority_with_manager(Some(manager()));
         let previous_generation = observed_generation(&previous);
         authority.adopt_unshared_predecessor(&previous);
         assert_ne!(observed_generation(&previous), previous_generation);
@@ -2998,7 +3101,7 @@ pub(crate) mod tests {
 
     #[test]
     fn image_generation_exhaustion_never_reenables_reuse() {
-        let authority = Stage1Authority::new_with_manager(Some(test_manager()));
+        let authority = test_authority_with_manager(Some(test_manager()));
         authority.inner.lock().manager.generation = std::num::NonZeroU64::new(u64::MAX);
         for _ in 0..2 {
             authority
@@ -3017,7 +3120,7 @@ pub(crate) mod tests {
         // `kernel.fork.stage1-image`: the parent forks, the child owns a
         // private image, the child exits. The image must come back to the
         // parent's pool so the next fork clones into it instead of allocating.
-        let parent = Stage1Authority::new_with_manager(Some(test_manager()));
+        let parent = test_authority_with_manager(Some(test_manager()));
         let pool = parent.image_pool();
         assert_eq!(pool.retained(), 0);
 
@@ -3054,7 +3157,7 @@ pub(crate) mod tests {
         assert_eq!(pool.retained(), 2, "images beyond capacity are dropped");
         assert_eq!(pool.recycled_images(), 2);
 
-        let mut authority = Stage1Authority::new_with_manager(Some(test_manager()));
+        let mut authority = test_authority_with_manager(Some(test_manager()));
         let pool = authority.image_pool();
         authority
             .replace_for_exec(
@@ -3088,7 +3191,7 @@ pub(crate) mod tests {
             returned: Arc::new(Mutex::new(Vec::new())),
         };
         let manager = test_manager();
-        let mut authority = Stage1Authority::new_with_manager(Some(manager));
+        let mut authority = test_authority_with_manager(Some(manager));
         authority
             .install_source(Box::new(old))
             .expect("install the pre-exec source");
@@ -3170,7 +3273,7 @@ pub(crate) mod tests {
 
         let va = LINUX_MMAP_BASE + 600 * TWO_MIB + 0x1000;
 
-        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let authority = test_authority_with_manager(Some(manager));
         authority
             .install_source(Box::new(source))
             .expect("install counting arena source");
@@ -3254,7 +3357,7 @@ pub(crate) mod tests {
 
     #[test]
     fn exec_successor_consumes_only_its_share_without_stealing_parent_capacity() {
-        let parent = Stage1Authority::new_with_manager(Some(test_manager()));
+        let parent = test_authority_with_manager(Some(test_manager()));
         parent
             .install_source(Box::new(CountingArenaSource {
                 id: TableArenaSourceId(SubstrateGpa(LINUX_PAGE_TABLES_BASE)),
@@ -3266,7 +3369,7 @@ pub(crate) mod tests {
         parent.share_with_vfork_child();
         let mut first = parent.clone();
         let mut second = parent.clone();
-        let successor = Stage1Authority::new_with_manager(Some(test_manager_at(0x9a_0020_0000)));
+        let successor = test_authority_with_manager(Some(test_manager_at(0x9a_0020_0000)));
         assert!(
             first
                 .install_exec_successor(test_edit_license(), successor.clone())
@@ -3276,7 +3379,7 @@ pub(crate) mod tests {
         assert!(parent.is_shared_with_vfork_child());
         assert!(parent.has_source());
         assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
-        let successor = Stage1Authority::new_with_manager(Some(test_manager_at(0x9a_0040_0000)));
+        let successor = test_authority_with_manager(Some(test_manager_at(0x9a_0040_0000)));
         assert!(
             second
                 .install_exec_successor(test_edit_license(), successor)
@@ -3289,7 +3392,7 @@ pub(crate) mod tests {
 
     #[test]
     fn exec_successor_refuses_predecessor_authority_without_consuming_its_share() {
-        let mut authority = Stage1Authority::new_with_manager(Some(test_manager()));
+        let mut authority = test_authority_with_manager(Some(test_manager()));
         authority.share_with_vfork_child();
         let retained = authority.clone();
         assert!(
@@ -3314,7 +3417,7 @@ pub(crate) mod tests {
         };
 
         let manager = test_manager();
-        let parent = Stage1Authority::new_with_manager(Some(manager));
+        let parent = test_authority_with_manager(Some(manager));
         parent
             .install_source(Box::new(source))
             .expect("install source");
@@ -3425,7 +3528,7 @@ pub(crate) mod tests {
         };
 
         let manager = test_manager();
-        let parent = Stage1Authority::new_with_manager(Some(manager));
+        let parent = test_authority_with_manager(Some(manager));
         parent
             .install_source(Box::new(source))
             .expect("install source");
@@ -3464,7 +3567,7 @@ pub(crate) mod tests {
     #[test]
     fn stage1_authority_undo_journal_commit_and_rollback() {
         let manager = test_manager();
-        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let authority = test_authority_with_manager(Some(manager));
 
         let mut host_arena0 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         let p0 = host_arena0.as_mut_ptr();
@@ -3538,7 +3641,9 @@ pub(crate) mod tests {
             )
             .expect("edit");
 
-        authority.commit_undo(test_edit_license());
+        authority
+            .commit_undo(test_edit_license())
+            .expect("test Editor license names the authority MM");
 
         authority
             .edit(
@@ -3615,7 +3720,7 @@ pub(crate) mod tests {
             }) as Arc<dyn HostArenaResolver + Send + Sync>
         };
 
-        let authority = Stage1Authority::new_with_manager(Some(test_manager()));
+        let authority = test_authority_with_manager(Some(test_manager()));
         assert_eq!(
             authority.select_guest_descriptor_owner(),
             Ok(GuestLaneSelection::Deferred)
@@ -3641,7 +3746,7 @@ pub(crate) mod tests {
         );
 
         // Already bound: the selection is immediate.
-        let bound = Stage1Authority::new_with_manager(Some(test_manager()));
+        let bound = test_authority_with_manager(Some(test_manager()));
         assert!(!unsafe { bound.bind_live_backing(resolver()) });
         assert_eq!(
             bound.select_guest_descriptor_owner(),
@@ -3656,7 +3761,7 @@ pub(crate) mod tests {
             staged.has_unsynced_edits(),
             "fixture must hold unsynced edits"
         );
-        let dirty = Stage1Authority::new_with_manager(Some(staged));
+        let dirty = test_authority_with_manager(Some(staged));
         dirty.inner.lock().host_resolver = Some(resolver());
         assert_eq!(
             dirty.select_guest_descriptor_owner(),
@@ -3683,7 +3788,7 @@ pub(crate) mod tests {
         assert!(staged.has_unsynced_edits(), "fixture must hold host edits");
         let owned_walk = staged.debug_walk(LINUX_MMAP_BASE);
         assert_ne!(owned_walk[0], 0, "fixture edit must be visible offline");
-        let authority = Stage1Authority::new_with_manager(Some(staged));
+        let authority = test_authority_with_manager(Some(staged));
         assert_eq!(
             authority.select_guest_descriptor_owner(),
             Ok(GuestLaneSelection::Deferred)
@@ -3728,7 +3833,7 @@ pub(crate) mod tests {
     #[test]
     fn stage1_authority_live_restore_and_rollback_updates_hardware_backing() {
         let manager = test_manager();
-        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let authority = test_authority_with_manager(Some(manager));
 
         let resolver = Arc::new(BufferResolver {
             buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
@@ -3810,7 +3915,7 @@ pub(crate) mod tests {
     #[test]
     fn stage1_authority_snapshot_fails_on_unresolved_live_backing() {
         let manager = test_manager();
-        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let authority = test_authority_with_manager(Some(manager));
         let resolver = Arc::new(FailingResolver);
         unsafe {
             authority.bind_live_backing(resolver);
@@ -3824,7 +3929,7 @@ pub(crate) mod tests {
     #[test]
     fn stage1_authority_restore_and_rollback_fail_and_preserve_on_unresolved_arena() {
         let manager = test_manager();
-        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let authority = test_authority_with_manager(Some(manager));
         let snap = authority.snapshot_image().expect("initial snapshot");
 
         // Attempt restore with a failing resolver
@@ -3991,7 +4096,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         image.rebase(old, None).unwrap();
-        let authority = Stage1Authority::new_with_manager(Some(image));
+        let authority = test_authority_with_manager(Some(image));
         let returned = Arc::new(Mutex::new(Vec::new()));
         authority
             .install_source(Box::new(CountingArenaSource {
@@ -4246,7 +4351,7 @@ pub(crate) mod tests {
     #[test]
     fn stage1_authority_metadata_refusal_propagation() {
         let manager = test_manager();
-        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let authority = test_authority_with_manager(Some(manager));
         let resolver = Arc::new(BufferResolver {
             buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
             base: LINUX_PAGE_TABLES_BASE,
@@ -4379,7 +4484,7 @@ pub(crate) mod tests {
         let mut multi_mgr =
             PageTableManager::new(stage1_hvpatch_page_tables(), LINUX_PAGE_TABLES_BASE, layout);
         multi_mgr.arenas[0].next_free = multi_mgr.arenas[0].capacity as u64;
-        let multi_authority = Stage1Authority::new_with_manager(Some(multi_mgr));
+        let multi_authority = test_authority_with_manager(Some(multi_mgr));
         let ext_bases: Vec<Gpa> = (0..30)
             .map(|i| Gpa::new(0x90_0000_0000 + (i as u64) * 0x20_0000))
             .collect();
@@ -4450,7 +4555,7 @@ pub(crate) mod tests {
 
     #[test]
     fn guest_owned_authority_loads_an_absent_manager_without_an_edit() {
-        let authority = Stage1Authority::new_with_manager(None);
+        let authority = test_authority_with_manager(None);
         authority.select_live_descriptor_owner(LiveDescriptorOwner::Guest);
         assert!(authority.is_none());
         // `edit` would refuse the guest lane at the engine funnel; the load
@@ -4496,7 +4601,7 @@ pub(crate) mod tests {
             buf: std::sync::Mutex::new(boot),
             base: LINUX_PAGE_TABLES_BASE,
         });
-        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let authority = test_authority_with_manager(Some(manager));
         unsafe {
             authority.bind_live_backing(
                 Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
@@ -4649,7 +4754,7 @@ pub(crate) mod tests {
         assert!(retired.names(ipa, 4096));
 
         // The host-owned lane never builds guest transactions.
-        let host_lane = Stage1Authority::new_with_manager(Some(test_manager()));
+        let host_lane = test_authority_with_manager(Some(test_manager()));
         assert_eq!(
             host_lane.prepare_guest_descriptor_txn(nz(9), op),
             Err(GuestTxnPrepareError::NotGuestOwned)
@@ -4697,7 +4802,7 @@ pub(crate) mod tests {
             buf: std::sync::Mutex::new(boot),
             base: LINUX_PAGE_TABLES_BASE,
         });
-        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let authority = test_authority_with_manager(Some(manager));
         unsafe {
             authority.bind_live_backing(resolver as Arc<dyn HostArenaResolver + Send + Sync>);
         }
@@ -4775,7 +4880,7 @@ pub(crate) mod tests {
 
     #[test]
     fn fork_children_inherit_their_parents_live_descriptor_lane() {
-        let parent = Stage1Authority::new_with_manager(Some(test_manager()));
+        let parent = test_authority_with_manager(Some(test_manager()));
         let host_child = parent.child_with_manager(test_manager());
         assert_eq!(
             host_child.live_descriptor_owner(),
@@ -4802,7 +4907,7 @@ pub(crate) mod tests {
             buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
             base: LINUX_PAGE_TABLES_BASE,
         }) as Arc<dyn HostArenaResolver + Send + Sync>;
-        let parent = Stage1Authority::new_with_manager(Some(test_manager()));
+        let parent = test_authority_with_manager(Some(test_manager()));
         assert_eq!(
             parent.select_guest_descriptor_owner(),
             Ok(GuestLaneSelection::Deferred)
@@ -4820,10 +4925,10 @@ pub(crate) mod tests {
             buf: std::sync::Mutex::new(vec![0u8; LINUX_PAGE_TABLES_SIZE as usize]),
             base: LINUX_PAGE_TABLES_BASE,
         }) as Arc<dyn HostArenaResolver + Send + Sync>;
-        let never = Stage1Authority::new_with_manager(Some(test_manager()));
+        let never = test_authority_with_manager(Some(test_manager()));
         assert_eq!(never.host_lane_cause(), Some(HostLaneCause::NeverSelected));
 
-        let pending = Stage1Authority::new_with_manager(Some(test_manager()));
+        let pending = test_authority_with_manager(Some(test_manager()));
         assert_eq!(
             pending.select_guest_descriptor_owner(),
             Ok(GuestLaneSelection::Deferred)
@@ -4847,7 +4952,7 @@ pub(crate) mod tests {
 
         let mut staged = test_manager();
         staged.set_prot_none(LINUX_MMAP_BASE, 0x1000, None).unwrap();
-        let dirty = Stage1Authority::new_with_manager(Some(staged));
+        let dirty = test_authority_with_manager(Some(staged));
         assert_eq!(
             dirty.select_guest_descriptor_owner(),
             Ok(GuestLaneSelection::Deferred)

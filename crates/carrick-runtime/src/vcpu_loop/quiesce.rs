@@ -1126,9 +1126,11 @@ where
             if !shares_mm {
                 let permit = setup.host_alias_permit();
                 if let Err(error) = kernel.dispatcher.with_kernel_resources(parent_context, || {
-                    kernel
-                        .dispatcher
-                        .reconcile_el1_deferred_returns(&permit, memory, setup.el1_editor_license())
+                    kernel.dispatcher.reconcile_el1_deferred_returns(
+                        &permit,
+                        memory,
+                        setup.el1_editor_license(),
+                    )
                 }) {
                     tracing::warn!(
                         ?error,
@@ -1365,9 +1367,12 @@ where
             .as_mut()
             .is_some_and(|work| !work.begin_publication())
         {
-            if let Err(error) =
-                ops.abort_and_rollback_prepared(prepared_backend, memory, parent_mutation.editor_excluded(), !shares_mm)
-            {
+            if let Err(error) = ops.abort_and_rollback_prepared(
+                prepared_backend,
+                memory,
+                parent_mutation.editor_excluded(),
+                !shares_mm,
+            ) {
                 return Err(ops.fail_stop(error));
             }
             rollback_pidfd(installed_pidfd);
@@ -1406,9 +1411,12 @@ where
                     ?error,
                     "dispatcher fork install rejected stale parent revision; fork(2) = EAGAIN"
                 );
-                if let Err(error) =
-                    ops.abort_and_rollback_prepared(prepared_backend, memory, parent_mutation.editor_excluded(), !shares_mm)
-                {
+                if let Err(error) = ops.abort_and_rollback_prepared(
+                    prepared_backend,
+                    memory,
+                    parent_mutation.editor_excluded(),
+                    !shares_mm,
+                ) {
                     return Err(ops.fail_stop(error));
                 }
                 rollback_pidfd(installed_pidfd);
@@ -1495,9 +1503,12 @@ where
                     );
                 });
             }
-            if let Err(cleanup_error) =
-                ops.abort_and_rollback_prepared(prepared_backend, memory, parent_mutation.editor_excluded(), !shares_mm)
-            {
+            if let Err(cleanup_error) = ops.abort_and_rollback_prepared(
+                prepared_backend,
+                memory,
+                parent_mutation.editor_excluded(),
+                !shares_mm,
+            ) {
                 return Err(ops.fail_stop(cleanup_error));
             }
             rollback_pidfd(installed_pidfd);
@@ -1520,9 +1531,12 @@ where
                             });
                     }
                 }
-                if let Err(error) =
-                    ops.abort_and_rollback_prepared(prepared_backend, memory, parent_mutation.editor_excluded(), !shares_mm)
-                {
+                if let Err(error) = ops.abort_and_rollback_prepared(
+                    prepared_backend,
+                    memory,
+                    parent_mutation.editor_excluded(),
+                    !shares_mm,
+                ) {
                     return Err(ops.fail_stop(error));
                 }
                 drop(topology);
@@ -1565,12 +1579,13 @@ where
                     carrick_fatal!("hvpatch::fork_commit", "owner Fork child authentication refused: child_pid={child_pid}, refusal={refusal:?}")
                 });
             }
-            ops.commit_parent(memory, parent_mutation.editor_excluded()).unwrap_or_else(|error| {
-                carrick_fatal!(
-                    "hvpatch::fork_parent_commit",
-                    "failed to commit parent fork: parent_pid={parent_pid}, error={error}"
-                )
-            });
+            ops.commit_parent(memory, parent_mutation.editor_excluded())
+                .unwrap_or_else(|error| {
+                    carrick_fatal!(
+                        "hvpatch::fork_parent_commit",
+                        "failed to commit parent fork: parent_pid={parent_pid}, error={error}"
+                    )
+                });
             if let PreparedHvpatchProcessMm::Copied(prepared) = &prepared_mm {
                 if let Some((completion, _)) = owner_receipt {
                     let publication = owner_child_publication

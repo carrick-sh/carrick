@@ -1704,128 +1704,133 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let mut outcome = PageTableApplyOutcome::default();
         let mut unpublished = None;
         let edit_res: Result<(), MemoryError> = (|| {
-                let mut edit = Some(edit);
-                let mut apply = |editor: &mut Stage1Editor<'_>| {
-                    if editor.base() != pt_base {
-                        return Err(MemoryError::HostMap(format!(
-                            "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
-                            editor.base()
-                        )));
+            let mut edit = Some(edit);
+            let mut apply = |editor: &mut Stage1Editor<'_>| {
+                if editor.base() != pt_base {
+                    return Err(MemoryError::HostMap(format!(
+                        "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
+                        editor.base()
+                    )));
+                }
+                editor.set_multi_vcpu(unsafe_to_coalesce);
+                editor.set_stage1_exclusive(stage1_exclusive);
+                if let Some((address, len)) = live_range {
+                    let resolver = EngineHostResolver {
+                        vm: &self.vm,
+                        retained: retained.clone(),
+                        pt_base,
+                        host,
+                        size,
+                    };
+                    unsafe {
+                        editor
+                            .manager
+                            .adopt_live_tables_for_range(&resolver, address, len)
                     }
-                    editor.set_multi_vcpu(unsafe_to_coalesce);
-                    editor.set_stage1_exclusive(stage1_exclusive);
-                    if let Some((address, len)) = live_range {
-                        let resolver = EngineHostResolver {
-                            vm: &self.vm,
-                            retained: retained.clone(),
-                            pt_base,
-                            host,
-                            size,
-                        };
-                        unsafe {
-                            editor
-                                .manager
-                                .adopt_live_tables_for_range(&resolver, address, len)
+                    .map_err(page_table_sync_error_to_memory_error)?;
+                }
+                let edit = edit.take().ok_or_else(|| {
+                    MemoryError::HostMap("stage-1 edit closure invoked twice".to_owned())
+                })?;
+                match edit(editor) {
+                    Ok(res) => {
+                        outcome = res;
+                        if outcome.changed {
+                            self.vm
+                                .publish_stage1_extension_arenas(editor.manager)
+                                .map_err(|error| {
+                                    MemoryError::HostMap(format!(
+                                        "publish stage-1 extension arenas failed: {error:?}"
+                                    ))
+                                })?;
+                            let resolver = EngineHostResolver {
+                                vm: &self.vm,
+                                retained: retained.clone(),
+                                pt_base,
+                                host,
+                                size,
+                            };
+                            unsafe { editor.sync_to_host(resolver) }
+                                .map_err(page_table_sync_error_to_memory_error)?;
+                            editor.manager.record_populated_prefixes(|base, prefix| {
+                                self.vm.record_stage1_populated_prefix(base, prefix);
+                            });
                         }
-                        .map_err(page_table_sync_error_to_memory_error)?;
+                        Ok(())
                     }
-                    let edit = edit.take().ok_or_else(|| {
-                        MemoryError::HostMap("stage-1 edit closure invoked twice".to_owned())
-                    })?;
-                    match edit(editor) {
-                        Ok(res) => {
-                            outcome = res;
-                            if outcome.changed {
-                                self.vm
-                                    .publish_stage1_extension_arenas(editor.manager)
-                                    .map_err(|error| {
-                                        MemoryError::HostMap(format!(
-                                            "publish stage-1 extension arenas failed: {error:?}"
-                                        ))
-                                    })?;
-                                let resolver = EngineHostResolver {
-                                    vm: &self.vm,
-                                    retained: retained.clone(),
-                                    pt_base,
-                                    host,
-                                    size,
-                                };
-                                unsafe { editor.sync_to_host(resolver) }
-                                    .map_err(page_table_sync_error_to_memory_error)?;
-                                editor.manager.record_populated_prefixes(|base, prefix| {
-                                    self.vm.record_stage1_populated_prefix(base, prefix);
-                                });
-                            }
-                            Ok(())
-                        }
-                        Err(PageTableError::OutOfTables) => {
-                            let (in_use, free, capacity, arenas) = editor.pool_stats();
-                            let source = editor.has_arena_source();
-                            let pmr = stage1_exclusive;
-                            Err(MemoryError::HostMap(format!(
-                                "stage-1 page-table pool exhausted \
+                    Err(PageTableError::OutOfTables) => {
+                        let (in_use, free, capacity, arenas) = editor.pool_stats();
+                        let source = editor.has_arena_source();
+                        let pmr = stage1_exclusive;
+                        Err(MemoryError::HostMap(format!(
+                            "stage-1 page-table pool exhausted \
                                  (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
                                  reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
-                            )))
-                        }
-                        Err(
-                            error @ (PageTableError::BadAddress
-                            | PageTableError::GicWindowOutput
-                            | PageTableError::CarrickOwnedWindow),
-                        ) => {
-                            carrick_observability::probes::guest_internal_write_fault(
-                                0,
-                                0,
-                                8,
-                                &format!("stage-1 edit refused: {error:?}"),
-                            );
-                            Err(MemoryError::OutOfBounds {
-                                address: 0,
-                                length: 0,
-                            })
-                        }
-                        Err(PageTableError::MissingArenaSource) => Err(MemoryError::HostMap(
-                            "stage-1 page-table manager has no arena source".to_owned(),
-                        )),
-                        Err(PageTableError::ConflictingArenaSource) => Err(MemoryError::HostMap(
-                            "stage-1 page-table manager conflicting arena source".to_owned(),
-                        )),
-                        Err(PageTableError::UnresolvedArena(base)) => Err(MemoryError::HostMap(
-                            format!("stage-1 page-table manager unresolved arena 0x{base:x}",),
-                        )),
-                        Err(PageTableError::MetadataAllocation) => {
-                            Err(MemoryError::MetadataAllocation)
-                        }
-                        Err(PageTableError::GuestOwnsLiveDescriptors) => {
-                            Err(guest_owned_live_edit_error())
-                        }
+                        )))
                     }
-                };
-                if let Some((va, len)) = unpublish_range {
-                    let ((), receipt) = page_tables.edit_unpublishing(
-                        license,
-                        || {
-                            live_mgr.ok_or_else(|| {
-                                MemoryError::HostMap("stage-1 manager absent".to_string())
-                            })
-                        },
-                        va,
-                        len,
-                        &mut apply,
-                    )?;
-                    unpublished = receipt;
-                    Ok(())
-                } else {
-                    page_tables.edit(
-                        license,
-                        || {
-                            live_mgr.ok_or_else(|| {
-                                MemoryError::HostMap("stage-1 manager absent".to_string())
-                            })
-                        },
-                        &mut apply,
-                    )
+                    Err(
+                        error @ (PageTableError::BadAddress
+                        | PageTableError::GicWindowOutput
+                        | PageTableError::CarrickOwnedWindow),
+                    ) => {
+                        carrick_observability::probes::guest_internal_write_fault(
+                            0,
+                            0,
+                            8,
+                            &format!("stage-1 edit refused: {error:?}"),
+                        );
+                        Err(MemoryError::OutOfBounds {
+                            address: 0,
+                            length: 0,
+                        })
+                    }
+                    Err(PageTableError::MissingArenaSource) => Err(MemoryError::HostMap(
+                        "stage-1 page-table manager has no arena source".to_owned(),
+                    )),
+                    Err(PageTableError::ConflictingArenaSource) => Err(MemoryError::HostMap(
+                        "stage-1 page-table manager conflicting arena source".to_owned(),
+                    )),
+                    Err(PageTableError::UnresolvedArena(base)) => Err(MemoryError::HostMap(
+                        format!("stage-1 page-table manager unresolved arena 0x{base:x}",),
+                    )),
+                    Err(PageTableError::MetadataAllocation) => Err(MemoryError::MetadataAllocation),
+                    Err(PageTableError::GuestOwnsLiveDescriptors) => {
+                        Err(guest_owned_live_edit_error())
+                    }
+                    Err(PageTableError::EditorLicenseRefused {
+                        authority_mm,
+                        license_mm,
+                    }) => Err(MemoryError::EditorLicenseRefused {
+                        authority_mm,
+                        license_mm,
+                    }),
                 }
+            };
+            if let Some((va, len)) = unpublish_range {
+                let ((), receipt) = page_tables.edit_unpublishing(
+                    license,
+                    || {
+                        live_mgr.ok_or_else(|| {
+                            MemoryError::HostMap("stage-1 manager absent".to_string())
+                        })
+                    },
+                    va,
+                    len,
+                    &mut apply,
+                )?;
+                unpublished = receipt;
+                Ok(())
+            } else {
+                page_tables.edit(
+                    license,
+                    || {
+                        live_mgr.ok_or_else(|| {
+                            MemoryError::HostMap("stage-1 manager absent".to_string())
+                        })
+                    },
+                    &mut apply,
+                )
+            }
         })();
         edit_res?;
         Ok((outcome, unpublished))
@@ -4158,12 +4163,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             let (va, ipa, chunk_len) = self
                 .syscall_buffer_chunk(address, copied, length)
                 .map_err(|error| report_fault(10, error))?;
-            self.ensure_frame_cow_write(
-                None,
-                va,
-                chunk_len,
-                FrameCowWriteIntent::GuestVisible,
-            )
+            self.ensure_frame_cow_write(None, va, chunk_len, FrameCowWriteIntent::GuestVisible)
                 .map_err(|error| report_fault(11, error))?;
             self.vm
                 .translated_write(va, ipa.raw(), &bytes[copied..copied + chunk_len])
@@ -4204,7 +4204,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 chunk_len,
                 FrameCowWriteIntent::PrivilegedInternal,
             )
-                .map_err(|error| report_fault(1, error))?;
+            .map_err(|error| report_fault(1, error))?;
             self.vm
                 .translated_write_unchecked(va, ipa.raw(), &bytes[copied..copied + chunk_len])
                 .map_err(|error| report_fault(2, error))?;
@@ -4393,12 +4393,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             // ordinary user-copy authority cannot replace it.
             return Err(MemoryError::Unsupported);
         }
-        self.ensure_frame_cow_write(
-            None,
-            address,
-            len,
-            FrameCowWriteIntent::BackingMaintenance,
-        )?;
+        self.ensure_frame_cow_write(None, address, len, FrameCowWriteIntent::BackingMaintenance)?;
         self.vm.zero_backing(address, len)
     }
 
@@ -6631,7 +6626,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         if request.plan.owner_target().is_some() {
             return self.build_owner_process_spec(request);
         }
-        let editor = editor.ok_or_else(|| TrapError::Hypervisor("host fork has no exact-MM EL1 Editor exclusion".into()))?;
+        let editor = editor.ok_or_else(|| {
+            TrapError::Hypervisor("host fork has no exact-MM EL1 Editor exclusion".into())
+        })?;
         if self.pending_process_fork.is_some() {
             return Err(TrapError::Hypervisor(
                 "overlapping in-process parent fork transaction".to_owned(),
@@ -7085,9 +7082,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             drop(receipt);
             return Ok(());
         }
-        let editor = editor.ok_or_else(|| TrapError::Hypervisor("host fork commit has no exact-MM EL1 Editor exclusion".into()))?;
+        let editor = editor.ok_or_else(|| {
+            TrapError::Hypervisor("host fork commit has no exact-MM EL1 Editor exclusion".into())
+        })?;
         let _ = self.pending_process_fork.take();
-        self.page_tables.commit_undo(editor);
+        self.page_tables.commit_undo(editor)?;
         Ok(())
     }
 
@@ -7108,7 +7107,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 .map_err(TrapError::Hypervisor)?;
             return Ok(());
         }
-        let editor = editor.ok_or_else(|| TrapError::Hypervisor("host fork rollback has no exact-MM EL1 Editor exclusion".into()))?;
+        let editor = editor.ok_or_else(|| {
+            TrapError::Hypervisor("host fork rollback has no exact-MM EL1 Editor exclusion".into())
+        })?;
         let Some(rollback) = self.pending_process_fork.take() else {
             return Ok(());
         };
@@ -7309,6 +7310,20 @@ unsafe impl<V: Aarch64Vmm> Send for Aarch64EngineCore<V> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn test_editor_excluded() -> &'static carrick_guest_mem::El1EditorExcluded {
+        static LICENSE: std::sync::OnceLock<&'static carrick_guest_mem::El1EditorExcluded> =
+            std::sync::OnceLock::new();
+        LICENSE.get_or_init(|| {
+            let spaces = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
+            let index = spaces.publish_closed(1, 0x1000, 0).expect("test MM");
+            let excluded = Box::leak(Box::new(spaces.raise_and_wait_for_editor(index, || {})));
+            let held = Box::leak(Box::new(
+                carrick_guest_mem::HeldEl1EditorExclusion::register(excluded),
+            ));
+            held.license()
+        })
+    }
 
     #[test]
     fn lazy_root_copyout_prevalidation_needs_no_host_mapping() {
@@ -9585,6 +9600,7 @@ mod transfer_service_tests {
             let mut engine = engine_fixture();
             let (authority, _publisher) =
                 crate::stage1_authority::tests::boot_root_fixture(old, root);
+            assert!(authority.bind_mm(1));
             engine.page_tables = authority;
             engine.vcpu.get_mut().ttbr0 = old;
             engine.publish_initial_stage1_root(&mut |_| Ok(())).unwrap();
@@ -9605,7 +9621,9 @@ mod transfer_service_tests {
         assert_ne!(leaf(&engines[0]) & 1, 0);
         assert_ne!(leaf(&engines[1]) & 1, 0);
         engines[0]
-            .pt_edit_locked(|editor| editor.set_prot_none(LINUX_MMAP_BASE, 4096))
+            .pt_edit_locked(super::tests::test_editor_excluded(), |editor| {
+                editor.set_prot_none(LINUX_MMAP_BASE, 4096)
+            })
             .expect("first relocated root must resolve its retained table custody");
         assert_eq!(leaf(&engines[0]) & 1, 0);
         assert_ne!(
@@ -9614,7 +9632,9 @@ mod transfer_service_tests {
             "a peer MM at the same VA stays mapped"
         );
         engines[1]
-            .pt_edit_locked(|editor| editor.set_prot_none(LINUX_MMAP_BASE, 4096))
+            .pt_edit_locked(super::tests::test_editor_excluded(), |editor| {
+                editor.set_prot_none(LINUX_MMAP_BASE, 4096)
+            })
             .expect("second relocated root must resolve its own retained table custody");
         assert_eq!(leaf(&engines[1]) & 1, 0);
     }

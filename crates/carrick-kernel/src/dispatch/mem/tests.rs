@@ -210,6 +210,7 @@ fn semantic_arena_fixed_retirement_refuses_before_backend_while_residency_is_pin
     let result = mmap::retire_anonymous_mapping_backing_with_residency_for_test(
         &dispatcher.mem_view(),
         &mut memory,
+        super::test_editor_excluded(),
         (
             identity.semantic_base,
             identity.len,
@@ -239,6 +240,7 @@ fn semantic_arena_fixed_retirement_commits_residency_after_backend_success() {
     mmap::retire_anonymous_mapping_backing_with_residency_for_test(
         &dispatcher.mem_view(),
         &mut memory,
+        super::test_editor_excluded(),
         (
             identity.semantic_base,
             identity.len,
@@ -273,6 +275,7 @@ fn semantic_arena_fixed_retirement_reopens_residency_after_backend_failure() {
     let result = mmap::retire_anonymous_mapping_backing_with_residency_for_test(
         &dispatcher.mem_view(),
         &mut memory,
+        super::test_editor_excluded(),
         (
             identity.semantic_base,
             identity.len,
@@ -327,6 +330,7 @@ impl GuestMemory for CountingMmapMemory {
 
     fn discard_private_anonymous(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         len: usize,
     ) -> Result<bool, carrick_guest_mem::RepointPrivateError> {
@@ -350,7 +354,12 @@ impl GuestMemory for CountingMmapMemory {
         Ok(())
     }
 
-    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn unmap_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         self.unmap_calls.set(self.unmap_calls.get() + 1);
         if self.fail_unmap_at.get() == Some(address) {
             return Err(MemoryError::HostMap(format!(
@@ -367,6 +376,7 @@ impl GuestMemory for CountingMmapMemory {
 
     fn protect_owner_reserved_range(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         len: usize,
         prot: u64,
@@ -377,7 +387,13 @@ impl GuestMemory for CountingMmapMemory {
         Ok(())
     }
 
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
         self.protect_calls.set(self.protect_calls.get() + 1);
         self.protect_log.borrow_mut().push((address, len, prot));
         if (prot != 0 && self.fail_protect_non_zero.get())
@@ -443,11 +459,16 @@ impl GuestMemory for Stage1MmapMemory {
         self.new_mapping = Some((address, len));
     }
 
-    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn unmap_range(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         self.page_tables
             .unmap_aliased(address, len, None)
             .map_err(|error| MemoryError::HostMap(format!("stage-1 retirement: {error:?}")))?;
-        self.inner.unmap_range(address, len)
+        self.inner.unmap_range(editor, address, len)
     }
 
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
@@ -462,7 +483,13 @@ impl GuestMemory for Stage1MmapMemory {
         self.inner.zero_backing(address, len)
     }
 
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
         if self.new_mapping.take() == Some((address, len)) {
             self.page_tables
                 .clear_retired_for_new_mapping(address, len, None)
@@ -582,8 +609,14 @@ impl GuestMemory for ConcurrentExecMemory {
         self.0.write_bytes_raw(address, bytes)
     }
 
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        self.0.protect_range(address, len, prot)
+    fn protect_range(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
+        self.0.protect_range(editor, address, len, prot)
     }
 
     fn supports_concurrent_exec_protection(&self) -> bool {
@@ -671,7 +704,13 @@ impl GuestMemory for DeferredSetterFailureMemory {
         self.pending_failure = true;
     }
 
-    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        _address: u64,
+        _len: usize,
+        _prot: u64,
+    ) -> Result<(), MemoryError> {
         self.protect_calls += 1;
         if std::mem::take(&mut self.pending_failure) {
             Err(MemoryError::HostMap(
@@ -682,7 +721,12 @@ impl GuestMemory for DeferredSetterFailureMemory {
         }
     }
 
-    fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+    fn unmap_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        _address: u64,
+        _len: usize,
+    ) -> Result<(), MemoryError> {
         self.unmap_calls += 1;
         if self.unmap_failures_remaining != 0 {
             self.unmap_failures_remaining -= 1;
@@ -713,7 +757,13 @@ impl GuestMemory for FailingProtectMemory {
         self.inner.write_bytes_raw(address, bytes)
     }
 
-    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        _address: u64,
+        _len: usize,
+        _prot: u64,
+    ) -> Result<(), MemoryError> {
         Err(MemoryError::Unsupported)
     }
 }
@@ -784,12 +834,22 @@ impl GuestMemory for ProtectionTrackingMemory {
         self.inner.zero_backing(address, len)
     }
 
-    fn restore_shared_identity(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn restore_shared_identity(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         self.restored_shared_identity.push((address, len));
         Ok(())
     }
 
-    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn unmap_alias_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         self.unmapped_alias_ranges.push((address, len));
         let unmap_end = address.saturating_add(len as u64);
         self.active_aliases.retain(|(va, _, l)| {
@@ -801,6 +861,7 @@ impl GuestMemory for ProtectionTrackingMemory {
 
     fn repoint_shared_leaf(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         va: u64,
         target_ipa: u64,
         len: usize,
@@ -826,6 +887,7 @@ impl GuestMemory for ProtectionTrackingMemory {
 
     fn repoint_private(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         _overlay_ipa: u64,
         len: usize,
@@ -906,7 +968,13 @@ impl GuestMemory for ProtectionTrackingMemory {
             .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
     }
 
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
         if self.fail_protect {
             return Err(MemoryError::HostMap(
                 "injected private protection failure".into(),
@@ -918,7 +986,7 @@ impl GuestMemory for ProtectionTrackingMemory {
             carrick_abi::LinuxProtFlags::from_bits_truncate(prot)
                 .contains(carrick_abi::LinuxProtFlags::EXEC),
         );
-        self.inner.protect_range(address, len, prot)
+        self.inner.protect_range(editor, address, len, prot)
     }
 }
 

@@ -4249,7 +4249,9 @@ fn reconcile(
 ) -> Result<usize, crate::dispatch::mem::el1_reservations::El1ReturnError> {
     crate::dispatch::mm_mutation::test_support::with_permit(
         dispatcher.mm_mutation_coordinator(),
-        |permit| dispatcher.reconcile_el1_deferred_returns(permit, memory),
+        |permit| {
+            dispatcher.reconcile_el1_deferred_returns(permit, memory, super::test_editor_excluded())
+        },
     )
 }
 
@@ -5281,7 +5283,13 @@ fn delegated_returned_va_carries_no_host_protection_fact_into_its_next_mapping()
     assert_eq!(
         crate::dispatch::mm_mutation::test_support::with_permit(
             dispatcher.mm_mutation_coordinator(),
-            |permit| dispatcher.reconcile_el1_deferred_returns(permit, &mut memory),
+            |permit| {
+                dispatcher.reconcile_el1_deferred_returns(
+                    permit,
+                    &mut memory,
+                    super::test_editor_excluded(),
+                )
+            },
         )
         .unwrap(),
         1

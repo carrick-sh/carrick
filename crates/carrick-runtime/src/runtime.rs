@@ -2578,13 +2578,24 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
         self.mem
             .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
     }
-    fn protect_range(&mut self, editor: &carrick_guest_mem::El1EditorExcluded, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
         self.mem.protect_range(editor, address, len, prot)
     }
     fn supports_concurrent_exec_protection(&self) -> bool {
         self.mem.supports_concurrent_exec_protection()
     }
-    fn unmap_range(&mut self, editor: &carrick_guest_mem::El1EditorExcluded, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn unmap_range(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         self.mem.unmap_range(editor, address, len)
     }
     fn retire_mapping(
@@ -2595,7 +2606,12 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     ) -> Result<(), carrick_guest_mem::MappingRetirementError> {
         self.mem.retire_mapping(editor, address, len)
     }
-    fn unmap_alias_range(&mut self, editor: &carrick_guest_mem::El1EditorExcluded, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn unmap_alias_range(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         self.mem.unmap_alias_range(editor, address, len)
     }
     fn repoint_private(
@@ -2606,7 +2622,8 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
         len: usize,
         content: &[u8],
     ) -> Result<(), carrick_guest_mem::RepointPrivateError> {
-        self.mem.repoint_private(editor, va, overlay_ipa, len, content)
+        self.mem
+            .repoint_private(editor, va, overlay_ipa, len, content)
     }
     fn repoint_shared_leaf(
         &mut self,
@@ -2616,7 +2633,8 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
         len: usize,
         prot: u64,
     ) -> Result<(), MemoryError> {
-        self.mem.repoint_shared_leaf(editor, va, target_ipa, len, prot)
+        self.mem
+            .repoint_shared_leaf(editor, va, target_ipa, len, prot)
     }
     fn translate_va(&self, va: u64) -> Option<u64> {
         self.mem.translate_va(va)
@@ -2652,7 +2670,11 @@ impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
         self.trap.complete_syscall(return_value)
     }
-    fn execve_into(&mut self, editor: &carrick_guest_mem::El1EditorExcluded, new_image: &AddressSpace) -> Result<(), TrapError> {
+    fn execve_into(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        new_image: &AddressSpace,
+    ) -> Result<(), TrapError> {
         self.trap.execve_into(editor, new_image)
     }
     fn is_forked_child(&self) -> bool {
@@ -2682,7 +2704,8 @@ impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
         payload: &[u8],
         backing: carrick_hal::HostAliasBacking,
     ) -> Result<(), TrapError> {
-        self.trap.map_host_alias(editor, va, ipa, len, payload, backing)
+        self.trap
+            .map_host_alias(editor, va, ipa, len, payload, backing)
     }
 }
 
@@ -2780,7 +2803,11 @@ mod tests {
             Ok(())
         }
 
-        fn execve_into(&mut self, _new_image: &AddressSpace) -> Result<(), TrapError> {
+        fn execve_into(
+            &mut self,
+            _editor: &carrick_guest_mem::El1EditorExcluded,
+            _new_image: &AddressSpace,
+        ) -> Result<(), TrapError> {
             self.execve_calls += 1;
             Ok(())
         }

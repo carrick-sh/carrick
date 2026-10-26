@@ -949,9 +949,7 @@ pub(super) struct PublicationContext<'a> {
 }
 
 impl<'a> PublicationContext<'a> {
-    fn editor_excluded(
-        &self,
-    ) -> Result<&carrick_guest_mem::El1EditorExcluded, TrapError> {
+    fn editor_excluded(&self) -> Result<&carrick_guest_mem::El1EditorExcluded, TrapError> {
         self._exclusion
             .as_deref()
             .and_then(carrick_hal::FrameCowQuiesce::editor_excluded)
@@ -1573,25 +1571,28 @@ pub(super) fn publish_replacing(
             })
         };
         if let Err(error) = publication {
-            let rollback = context.state.with_stage1_edit_license(context.editor_excluded()?, |license| {
-                context.state.page_tables_authority().edit(
-                    license,
-                    || {
-                        Err(TrapError::Hypervisor(
-                            "rollback page tables disappeared".to_owned(),
-                        ))
-                    },
-                    |editor| {
-                        let resolver = context
-                            .state
-                            .pinned_stage1_arenas(&context.custody, editor.base())?;
-                        // The owned resolver drops its pins before retirement. Exact-MM
-                        // exclusion remains held through descriptor restore and TLBI.
-                        unsafe {
-                            editor.rollback_undo_retiring(
-                                resolver,
-                                |e| {
-                                    match e {
+            let rollback =
+                context
+                    .state
+                    .with_stage1_edit_license(context.editor_excluded()?, |license| {
+                        context.state.page_tables_authority().edit(
+                            license,
+                            || {
+                                Err(TrapError::Hypervisor(
+                                    "rollback page tables disappeared".to_owned(),
+                                ))
+                            },
+                            |editor| {
+                                let resolver = context
+                                    .state
+                                    .pinned_stage1_arenas(&context.custody, editor.base())?;
+                                // The owned resolver drops its pins before retirement. Exact-MM
+                                // exclusion remains held through descriptor restore and TLBI.
+                                unsafe {
+                                    editor.rollback_undo_retiring(
+                                        resolver,
+                                        |e| {
+                                            match e {
                                 carrick_mmu_core::aarch64::PageTableError::MetadataAllocation => {
                                     TrapError::MetadataAllocation
                                 }
@@ -1599,32 +1600,35 @@ pub(super) fn publish_replacing(
                                     "failed to rollback stage1 undo: {other:?}"
                                 )),
                             }
-                                },
-                                |popped| {
-                                    flush_stage1.flush()?;
-                                    let journal = extension_regions
-                                        .iter()
-                                        .filter_map(|region| {
-                                            region.structural_owner.as_ref().map(|owner| {
-                                                (owner.physical_ipa, std::sync::Arc::clone(owner))
-                                            })
-                                        })
-                                        .collect();
-                                    context.state.retire_rolled_back_arenas(
-                                        &context.custody,
-                                        popped,
-                                        &journal,
-                                        &mut unmap_global_frame_stage2_record,
-                                        &mut release_retired_stage2_ipa,
+                                        },
+                                        |popped| {
+                                            flush_stage1.flush()?;
+                                            let journal = extension_regions
+                                                .iter()
+                                                .filter_map(|region| {
+                                                    region.structural_owner.as_ref().map(|owner| {
+                                                        (
+                                                            owner.physical_ipa,
+                                                            std::sync::Arc::clone(owner),
+                                                        )
+                                                    })
+                                                })
+                                                .collect();
+                                            context.state.retire_rolled_back_arenas(
+                                                &context.custody,
+                                                popped,
+                                                &journal,
+                                                &mut unmap_global_frame_stage2_record,
+                                                &mut release_retired_stage2_ipa,
+                                            )?;
+                                            Ok::<(), TrapError>(())
+                                        },
                                     )?;
-                                    Ok::<(), TrapError>(())
-                                },
-                            )?;
-                        }
-                        Ok::<(), TrapError>(())
-                    },
-                )
-            });
+                                }
+                                Ok::<(), TrapError>(())
+                            },
+                        )
+                    });
             if let Err(rollback_error) = rollback {
                 carrick_fatal!(
                     "hvpatch::sparse_materialization_rollback",
@@ -1638,16 +1642,18 @@ pub(super) fn publish_replacing(
             return Err(error);
         }
         // Publication succeeded: the journalled pre-images are no longer needed.
-        let _ = context.state.with_stage1_edit_license(context.editor_excluded()?, |license| {
-            context.state.page_tables_authority().edit(
-                license,
-                || Err(TrapError::Hypervisor("page tables disappeared".into())),
-                |editor| {
-                    editor.commit_undo();
-                    Ok::<(), TrapError>(())
-                },
-            )
-        });
+        let _ = context
+            .state
+            .with_stage1_edit_license(context.editor_excluded()?, |license| {
+                context.state.page_tables_authority().edit(
+                    license,
+                    || Err(TrapError::Hypervisor("page tables disappeared".into())),
+                    |editor| {
+                        editor.commit_undo();
+                        Ok::<(), TrapError>(())
+                    },
+                )
+            });
         if (replaced_valid_descriptor || context.foreign.is_some())
             && let Err(error) = flush_stage1.flush()
         {
@@ -3065,7 +3071,7 @@ impl<'a> ImportDescriptorUndo<'a> {
         })
     }
     fn commit(&mut self) -> Result<(), TrapError> {
-        self.tables.commit_undo(self.editor_excluded);
+        self.tables.commit_undo(self.editor_excluded)?;
         self.active = false;
         Ok(())
     }
@@ -3076,14 +3082,17 @@ impl<'a> ImportDescriptorUndo<'a> {
         // SAFETY: this owner retains the exact resolver and fresh journal;
         // its caller still holds pre-admission mutation/publication authority.
         let rollback = (|| -> Result<(), TrapError> {
-                unsafe { self.tables.rollback_undo(self.editor_excluded, &self.resolver) }
-                    .map(|_| ())
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "import descriptor rollback failed before physical release: {error:?}"
-                        ))
-                    })
-            })();
+            unsafe {
+                self.tables
+                    .rollback_undo(self.editor_excluded, &self.resolver)
+            }
+            .map(|_| ())
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "import descriptor rollback failed before physical release: {error:?}"
+                ))
+            })
+        })();
         rollback.unwrap_or_else(|error| carrick_fatal!("hvpatch::user_transfer", "{error:?}"));
         self.active = false;
     }
@@ -3293,33 +3302,31 @@ impl PublicationContext<'static> {
         let resolver = &import.descriptor_undo.resolver;
         let ready = import.ready();
         {
-                let license = import.descriptor_undo.editor_excluded;
-                import.descriptor_undo.tables.edit(
-                    license,
-                    || Err(invalid()),
-                    |editor| {
-                        editor
-                            .map_private_aliased(
-                                range.start(),
-                                ready.physical_ipa,
-                                range.len(),
-                                carrick_mmu_core::aarch64::UserLeafAccess {
-                                    writable: protection.bits() & 2 != 0,
-                                    executable: protection.bits() & 4 != 0,
-                                },
-                            )
-                            .map_err(|error| {
-                                TrapError::Hypervisor(format!("import descriptors: {error:?}"))
-                            })?;
-                        // SAFETY: retained resolver names the exact unpublished target.
-                        unsafe { editor.sync_to_host(resolver) }.map_err(|error| {
-                            TrapError::Hypervisor(format!(
-                                "import descriptor publication: {error:?}"
-                            ))
-                        })
-                    },
-                )
-            }?;
+            let license = import.descriptor_undo.editor_excluded;
+            import.descriptor_undo.tables.edit(
+                license,
+                || Err(invalid()),
+                |editor| {
+                    editor
+                        .map_private_aliased(
+                            range.start(),
+                            ready.physical_ipa,
+                            range.len(),
+                            carrick_mmu_core::aarch64::UserLeafAccess {
+                                writable: protection.bits() & 2 != 0,
+                                executable: protection.bits() & 4 != 0,
+                            },
+                        )
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!("import descriptors: {error:?}"))
+                        })?;
+                    // SAFETY: retained resolver names the exact unpublished target.
+                    unsafe { editor.sync_to_host(resolver) }.map_err(|error| {
+                        TrapError::Hypervisor(format!("import descriptor publication: {error:?}"))
+                    })
+                },
+            )
+        }?;
         Ok(import)
     }
 }

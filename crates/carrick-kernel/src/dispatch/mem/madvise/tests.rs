@@ -20,7 +20,13 @@ impl GuestMemory for LazyResidentMemory {
         })
     }
 
-    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        _address: u64,
+        _len: usize,
+        _prot: u64,
+    ) -> Result<(), MemoryError> {
         self.protect_calls += 1;
         Ok(())
     }
@@ -296,7 +302,11 @@ fn eager_lock_paths_populate_mincore_residency() {
         String::new(),
     );
     map_locked
-        .commit_mmap_locked_range(&mut memory, Some(range))
+        .commit_mmap_locked_range(
+            &mut memory,
+            super::super::test_editor_excluded(),
+            Some(range),
+        )
         .expect("populate MAP_LOCKED range");
     assert_eq!(
         map_locked.mincore_residency_vector(&memory, base, 2, LINUX_PAGE_SIZE),
@@ -313,7 +323,7 @@ fn eager_lock_paths_populate_mincore_residency() {
         String::new(),
     );
     mlockall
-        .lock_current_mappings(&mut memory, false)
+        .lock_current_mappings(&mut memory, super::super::test_editor_excluded(), false)
         .expect("populate MCL_CURRENT mappings");
     assert_eq!(
         mlockall.mincore_residency_vector(&memory, base, 2, LINUX_PAGE_SIZE),

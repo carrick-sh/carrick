@@ -3134,94 +3134,93 @@ pub(crate) fn perform_foreign_cow_transaction(
             .editor_excluded()
             .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
         page_tables_authority.try_edit_unpublishing_until(
-                license,
-                deadline,
-                carrick_hal::ForeignMmTransportError::TimedOut,
-                carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
-                || Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable),
-                span.va,
-                span.len,
-                |tables| {
-                    rollback = Some(
-                        HvfVmState::rollback_pre_image(&mut recycled, tables.manager)
-                            .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?,
-                    );
-                    HvfVmState::refresh_stage1_exclusivity(tables.manager);
-                    tables
-                        .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
+            license,
+            deadline,
+            carrick_hal::ForeignMmTransportError::TimedOut,
+            carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
+            || Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable),
+            span.va,
+            span.len,
+            |tables| {
+                rollback = Some(
+                    HvfVmState::rollback_pre_image(&mut recycled, tables.manager)
+                        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?,
+                );
+                HvfVmState::refresh_stage1_exclusivity(tables.manager);
+                tables
+                    .repoint_preserving_attributes(span.va, new_ipa, span.len as u64)
+                    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                // The span is private now: its EL1 COW arm goes with the host
+                // record this commit disarms.
+                tables
+                    .clear_el1_cow_arm(span.va, span.len)
+                    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                let span_end = span.va.saturating_add(span.len as u64);
+                let mut page_va = span.va & !0xfff;
+                while page_va < span_end {
+                    if source_guest_writable
+                        && !lease
+                            .state
+                            .protections
+                            .legacy()
+                            .is_none_or(|protections| protections.range_write_denied(page_va, 1))
+                    {
+                        tables
+                            .set_writable_preserving_attributes(page_va, 0x1000)
+                            .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                    } else if executable_authorized {
+                        // The repointed leaf keeps the source VMA's execute bit; the
+                        // fork arm only withdraws write.
+                        tables
+                            .set_fork_readonly(page_va, 0x1000)
+                            .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                    }
+                    page_va = page_va.saturating_add(0x1000);
+                }
+                unsafe { tables.sync_to_host(resolve_page_table_host) }
+                    .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                // Authenticate the exact live leaves before the TLBI publishes this
+                // foreign COW.  Ptrace text authority permits the host copy; it must
+                // never grant the guest write access that the source VMA did not have.
+                const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+                const AP_MASK: u64 = 0b11 << 6;
+                const AP_USER_RW: u64 = 0b01 << 6;
+                const AP_USER_RO: u64 = 0b11 << 6;
+                let pre_image = rollback
+                    .as_ref()
+                    .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                let mut page_va = span.va & !0xfff;
+                while page_va < span_end {
+                    let shadow = tables.debug_walk(page_va);
+                    let live = unsafe { tables.debug_walk_host(resolve_page_table_host, page_va) }
                         .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-                    // The span is private now: its EL1 COW arm goes with the host
-                    // record this commit disarms.
-                    tables
-                        .clear_el1_cow_arm(span.va, span.len)
-                        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-                    let span_end = span.va.saturating_add(span.len as u64);
-                    let mut page_va = span.va & !0xfff;
-                    while page_va < span_end {
+                    let expected_ipa = new_ipa
+                        .checked_add(page_va.saturating_sub(span.va))
+                        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
+                    let expected_ap =
                         if source_guest_writable
                             && !lease.state.protections.legacy().is_none_or(|protections| {
                                 protections.range_write_denied(page_va, 1)
                             })
                         {
-                            tables
-                                .set_writable_preserving_attributes(page_va, 0x1000)
-                                .map_err(|_| {
-                                    carrick_hal::ForeignMmTransportError::MutationFailed
-                                })?;
-                        } else if executable_authorized {
-                            // The repointed leaf keeps the source VMA's execute bit; the
-                            // fork arm only withdraws write.
-                            tables.set_fork_readonly(page_va, 0x1000).map_err(|_| {
-                                carrick_hal::ForeignMmTransportError::MutationFailed
-                            })?;
-                        }
-                        page_va = page_va.saturating_add(0x1000);
-                    }
-                    unsafe { tables.sync_to_host(resolve_page_table_host) }
-                        .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
-                    // Authenticate the exact live leaves before the TLBI publishes this
-                    // foreign COW.  Ptrace text authority permits the host copy; it must
-                    // never grant the guest write access that the source VMA did not have.
-                    const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
-                    const AP_MASK: u64 = 0b11 << 6;
-                    const AP_USER_RW: u64 = 0b01 << 6;
-                    const AP_USER_RO: u64 = 0b11 << 6;
-                    let pre_image = rollback
-                        .as_ref()
-                        .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-                    let mut page_va = span.va & !0xfff;
-                    while page_va < span_end {
-                        let shadow = tables.debug_walk(page_va);
-                        let live =
-                            unsafe { tables.debug_walk_host(resolve_page_table_host, page_va) }
-                                .map_err(|_| {
-                                    carrick_hal::ForeignMmTransportError::MutationFailed
-                                })?;
-                        let expected_ipa = new_ipa
-                            .checked_add(page_va.saturating_sub(span.va))
-                            .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-                        let expected_ap = if source_guest_writable
-                            && !lease.state.protections.legacy().is_none_or(|protections| {
-                                protections.range_write_denied(page_va, 1)
-                            }) {
                             AP_USER_RW
                         } else if executable_authorized {
                             AP_USER_RO
                         } else {
                             pre_image.debug_walk(page_va)[3] & AP_MASK
                         };
-                        if shadow != live
-                            || live[3] & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
-                            || live[3] & AP_MASK != expected_ap
-                        {
-                            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
-                        }
-                        page_va = page_va.saturating_add(0x1000);
+                    if shadow != live
+                        || live[3] & PA_MASK_4KIB != expected_ipa & PA_MASK_4KIB
+                        || live[3] & AP_MASK != expected_ap
+                    {
+                        return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
                     }
-                    foreign_cow_failpoint(&lease.state, 3)?;
-                    Ok::<(), carrick_hal::ForeignMmTransportError>(())
-                },
-            )
+                    page_va = page_va.saturating_add(0x1000);
+                }
+                foreign_cow_failpoint(&lease.state, 3)?;
+                Ok::<(), carrick_hal::ForeignMmTransportError>(())
+            },
+        )
     };
     let binding = carrick_hal::ForeignMmBinding::for_aarch64(
         requested.binding.asid,
@@ -4917,6 +4916,7 @@ pub mod foreign_cow_test_support {
     pub struct ProductionCarrierForeignCowHarness {
         transport: CarrierForeignMmTransport,
         state: std::sync::Arc<MmAccessState>,
+        editor_exclusion: carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion,
         original_extents: Vec<(u64, u64)>,
         data_va: u64,
         data_len: u64,
@@ -5076,9 +5076,17 @@ pub mod foreign_cow_test_support {
                 container_root: ContainerRootToken::ROOT,
                 persistent_vm_lifecycle: true,
             });
+            let spaces = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
+            let excluded =
+                Box::leak(Box::new(spaces.unpublished(identity.mm).ok_or_else(
+                    || "fixture MM cannot take its Editor exclusion".to_owned(),
+                )?));
+            let editor_exclusion =
+                carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(excluded);
             Ok(Self {
                 transport,
                 state,
+                editor_exclusion,
                 original_extents: vec![root_key, data_key],
                 data_va: shape.data_va,
                 data_len: shape.data_len,
@@ -5170,7 +5178,7 @@ pub mod foreign_cow_test_support {
             match kind {
                 0 => self
                     .state
-                    .with_stage1_edit_license(|license| {
+                    .with_stage1_edit_license(self.editor_exclusion.license(), |license| {
                         self.state.page_tables_authority().edit(
                             license,
                             || {
@@ -5199,7 +5207,7 @@ pub mod foreign_cow_test_support {
                 }
                 2 => self
                     .state
-                    .with_stage1_edit_license(|license| {
+                    .with_stage1_edit_license(self.editor_exclusion.license(), |license| {
                         self.state.page_tables_authority().edit(
                             license,
                             || {
@@ -5264,7 +5272,7 @@ pub mod foreign_cow_test_support {
                     // Deliberately collide numeric generations of DIFFERENT authorities.
                     for _ in 1..generation.get() {
                         self.state
-                            .with_stage1_edit_license(|license| {
+                            .with_stage1_edit_license(self.editor_exclusion.license(), |license| {
                                 replacement.edit(
                                     license,
                                     || Err(TrapError::Hypervisor("absent".into())),
@@ -5278,7 +5286,7 @@ pub mod foreign_cow_test_support {
                 }
                 5 => self
                     .state
-                    .with_stage1_edit_license(|license| {
+                    .with_stage1_edit_license(self.editor_exclusion.license(), |license| {
                         self.state.page_tables_authority().edit(
                             license,
                             || Err(TrapError::Hypervisor("absent".to_owned())),
@@ -5309,7 +5317,7 @@ pub mod foreign_cow_test_support {
                     let authority = self.state.page_tables_authority();
                     let image = authority.snapshot_image().ok_or("absent")?;
                     self.state
-                        .with_stage1_edit_license(|license| {
+                        .with_stage1_edit_license(self.editor_exclusion.license(), |license| {
                             authority
                                 .restore_image(license, &mut Some(image), 0)
                                 .map_err(|e| {
@@ -5337,7 +5345,7 @@ pub mod foreign_cow_test_support {
                     .and_then(GlobalFrameOwnerEntry::live_owner)
                     .ok_or("fixture root owner absent")?;
                 self.state
-                    .with_stage1_edit_license(|license| {
+                    .with_stage1_edit_license(self.editor_exclusion.license(), |license| {
                         self.state.page_tables_authority().edit(
                             license,
                             || {
@@ -5385,7 +5393,7 @@ pub mod foreign_cow_test_support {
 
         pub fn set_source_stage1_writable_for_test(&self) -> Result<(), String> {
             self.state
-                .with_stage1_edit_license(|license| {
+                .with_stage1_edit_license(self.editor_exclusion.license(), |license| {
                     self.state.page_tables_authority().edit(
                         license,
                         || {

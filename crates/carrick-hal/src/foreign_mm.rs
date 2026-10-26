@@ -708,6 +708,13 @@ pub trait ForeignMmReadLease: Debug + Send + Sync {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ForeignMmTransportError {
+    #[error(
+        "foreign MM stage-1 Editor license refused: authority_mm={authority_mm:?} license_mm={license_mm}"
+    )]
+    EditorLicenseRefused {
+        authority_mm: Option<u64>,
+        license_mm: u64,
+    },
     #[error("foreign MM state changed during observation")]
     Retry,
     #[error("foreign MM global-frame owner is missing or stale")]

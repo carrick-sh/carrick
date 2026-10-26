@@ -301,7 +301,12 @@ fn dontneed_first_touch_restores_an_executable_leaf() {
     let reporter = CompatReporter::default();
     let mut memory = Stage1MmapMemory::new(base, page as usize);
     memory
-        .protect_range(base, page as usize, rwx.bits())
+        .protect_range(
+            super::super::test_editor_excluded(),
+            base,
+            page as usize,
+            rwx.bits(),
+        )
         .expect("publish the live RWX VMA");
 
     let outcome = threaded_memory_call(
@@ -320,7 +325,12 @@ fn dontneed_first_touch_restores_an_executable_leaf() {
         .with_resident_fault_plan_for_test(base + 16, |plan| {
             let prot = plan.prot();
             memory
-                .protect_range(plan.page(), page as usize, prot)
+                .protect_range(
+                    super::super::test_editor_excluded(),
+                    plan.page(),
+                    page as usize,
+                    prot,
+                )
                 .expect("publish first-touch leaf");
             prot
         })

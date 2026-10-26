@@ -107,7 +107,13 @@ impl GuestMemory for HeapVmaTrackingMemory {
         Ok(())
     }
 
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
         self.event_log.borrow_mut().push(format!(
             "protect_range({address:#x}, {len:#x}, prot={prot})"
         ));

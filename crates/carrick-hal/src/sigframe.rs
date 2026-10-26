@@ -72,6 +72,7 @@ fn signal_frame_memory_error_code(error: &MemoryError) -> i32 {
         MemoryError::Physical(_) => 7,
         MemoryError::ReadSuspended(_) => 8,
         MemoryError::OwnerRetired(_) => 9,
+        MemoryError::EditorLicenseRefused { .. } => 10,
     }
 }
 

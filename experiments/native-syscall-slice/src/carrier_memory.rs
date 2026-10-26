@@ -89,14 +89,26 @@ impl GuestMemory for CarrierCopyMemory<'_> {
             .and_then(|mm| mm.write_range(GuestVa::new(address), length).map(|_| ()))
             .is_ok()
     }
-    fn protect_range(&mut self, _: u64, _: usize, _: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _: &carrick_guest_mem::El1EditorExcluded,
+        _: u64,
+        _: usize,
+        _: u64,
+    ) -> Result<(), MemoryError> {
         Err(MemoryError::Unsupported)
     }
-    fn unmap_range(&mut self, _: u64, _: usize) -> Result<(), MemoryError> {
+    fn unmap_range(
+        &mut self,
+        _: &carrick_guest_mem::El1EditorExcluded,
+        _: u64,
+        _: usize,
+    ) -> Result<(), MemoryError> {
         Err(MemoryError::Unsupported)
     }
     fn repoint_private(
         &mut self,
+        _: &carrick_guest_mem::El1EditorExcluded,
         _: u64,
         _: u64,
         _: usize,
@@ -104,10 +116,22 @@ impl GuestMemory for CarrierCopyMemory<'_> {
     ) -> Result<(), RepointPrivateError> {
         Err(RepointPrivateError::Clean(MemoryError::Unsupported))
     }
-    fn repoint_shared_leaf(&mut self, _: u64, _: u64, _: usize, _: u64) -> Result<(), MemoryError> {
+    fn repoint_shared_leaf(
+        &mut self,
+        _: &carrick_guest_mem::El1EditorExcluded,
+        _: u64,
+        _: u64,
+        _: usize,
+        _: u64,
+    ) -> Result<(), MemoryError> {
         Err(MemoryError::Unsupported)
     }
-    fn restore_shared_identity(&mut self, _: u64, _: usize) -> Result<(), MemoryError> {
+    fn restore_shared_identity(
+        &mut self,
+        _: &carrick_guest_mem::El1EditorExcluded,
+        _: u64,
+        _: usize,
+    ) -> Result<(), MemoryError> {
         Err(MemoryError::Unsupported)
     }
     fn zero_backing(&mut self, _: u64, _: usize) -> Result<(), MemoryError> {

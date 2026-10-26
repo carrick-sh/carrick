@@ -1202,7 +1202,12 @@ impl<'a> MemView<'a> {
                         .map_err(|_| LINUX_ENOMEM)?;
                 }
                 memory
-                    .protect_range(editor_excluded, source.start, valid_len, segment.prot.bits())
+                    .protect_range(
+                        editor_excluded,
+                        source.start,
+                        valid_len,
+                        segment.prot.bits(),
+                    )
                     .map_err(|_| LINUX_ENOMEM)?;
                 memory.set_mapping_protection(
                     source.start,

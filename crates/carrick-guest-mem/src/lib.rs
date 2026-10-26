@@ -1383,6 +1383,13 @@ impl<M: GuestMemory + ?Sized> Drop for HostWriteGuard<'_, M> {
 
 #[derive(Debug, Clone, PartialEq, Eq, ::thiserror::Error)]
 pub enum MemoryError {
+    #[error(
+        "stage-1 Editor license refused: authority_mm={authority_mm:?} license_mm={license_mm}"
+    )]
+    EditorLicenseRefused {
+        authority_mm: Option<u64>,
+        license_mm: u64,
+    },
     #[error("owner memory incarnation retired: {0:?}")]
     OwnerRetired(carrick_el1_abi::El1MmHandle),
     #[error("owner read retains completed progress: {0:?}")]

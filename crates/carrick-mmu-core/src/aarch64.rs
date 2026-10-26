@@ -1593,6 +1593,11 @@ impl core::ops::BitOrAssign for PageTableApplyOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageTableError {
+    /// A host edit did not carry the exact MM's Editor exclusion.
+    EditorLicenseRefused {
+        authority_mm: Option<u64>,
+        license_mm: u64,
+    },
     /// No spare table pages left to split a block.
     OutOfTables,
     /// A guest VA whose translation path leaves the page-table region, or an
@@ -1622,6 +1627,13 @@ pub enum PageTableError {
 impl core::fmt::Display for PageTableError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::EditorLicenseRefused {
+                authority_mm,
+                license_mm,
+            } => write!(
+                f,
+                "stage-1 Editor license refused: authority_mm={authority_mm:?} license_mm={license_mm}"
+            ),
             Self::OutOfTables => write!(f, "out of page tables"),
             Self::BadAddress => write!(f, "bad address"),
             Self::MissingArenaSource => write!(f, "missing arena source"),

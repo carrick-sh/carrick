@@ -668,7 +668,13 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         Ok(())
     }
 
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+    fn protect_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
         // Guest mmap/mprotect must fail before a VMM touches backing or PML4.
         // The shared dispatcher also serves AArch64's wider address layout.
         if carrick_mem::pml4::X86UserRange::checked(GuestVa::new(address), len as u64).is_err() {
@@ -720,6 +726,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
 
     fn repoint_private(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         va: u64,
         overlay_gpa: u64,
         len: usize,
@@ -743,7 +750,12 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         Ok(())
     }
 
-    fn restore_shared_identity(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
+    fn restore_shared_identity(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        va: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         let result = self.vm.restore_shared_identity(va, len).and_then(|()| {
             self.flush_current_tlb().map_err(|error| {
                 RepointPrivateError::indeterminate(MemoryError::HostMap(format!(
@@ -756,14 +768,24 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         })
     }
 
-    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn unmap_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         self.vm.unmap_range(address, len)?;
         self.flush_current_tlb()?;
         self.protections.set_unmapped(address, len, true);
         Ok(())
     }
 
-    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+    fn unmap_alias_range(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
         self.vm.unmap_alias_range(address, len)?;
         self.flush_current_tlb()?;
         self.protections.set_unmapped(address, len, true);
@@ -1276,7 +1298,11 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         self.is_forked_child
     }
 
-    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+    fn execve_into(
+        &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
+        new_image: &AddressSpace,
+    ) -> Result<(), TrapError> {
         // Delegate the image replacement to the backend (it rebuilds a fresh VM
         // from `new_image` and re-points the live vCPU). The default
         // `X86Vmm::execve_rebuild` is NYI (KVM/NVMM Phase-2 hello do not execve);
@@ -1299,6 +1325,7 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
 
     fn map_host_alias(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         va: GuestVa,
         ipa: Gpa,
         len: u64,
@@ -1689,6 +1716,20 @@ mod tests {
     use carrick_hal::threaded::{GenericVcpuRegistry, VcpuKick, VcpuRegistry};
 
     use crate::vmm::{ForkRamStrategy, MsrInstall, WindowPlan, X86Seg};
+
+    fn test_editor_excluded() -> &'static carrick_guest_mem::El1EditorExcluded {
+        static LICENSE: std::sync::OnceLock<&'static carrick_guest_mem::El1EditorExcluded> =
+            std::sync::OnceLock::new();
+        LICENSE.get_or_init(|| {
+            let spaces = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
+            let index = spaces.publish_closed(1, 0x1000, 0).expect("test MM");
+            let excluded = Box::leak(Box::new(spaces.raise_and_wait_for_editor(index, || {})));
+            let held = Box::leak(Box::new(
+                carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(excluded),
+            ));
+            held.license()
+        })
+    }
 
     #[derive(Clone)]
     struct TestKick;
@@ -2324,19 +2365,24 @@ mod tests {
     #[test]
     fn x86_guest_mmap_and_mprotect_reject_high_half_before_vmm() {
         let mut engine = X86EngineCore::from_parts(TestVmm, TestVcpu::default(), test_layout());
-        assert!(engine.protect_range(0x40_0000, 0x1000, 0).is_ok());
+        assert!(
+            engine
+                .protect_range(test_editor_excluded(), 0x40_0000, 0x1000, 0)
+                .is_ok()
+        );
         for (address, len) in [
             ((1 << 47) - 0x1000, 0x2000),
             (1 << 47, 0x1000),
             (0xffff_ffff_8000_0000, 0x1000),
         ] {
             assert!(matches!(
-                engine.protect_range(address, len, 0),
+                engine.protect_range(test_editor_excluded(), address, len, 0),
                 Err(MemoryError::OutOfBounds { address: denied, length })
                     if denied == address && length == len
             ));
             let error = engine
                 .map_host_alias(
+                    test_editor_excluded(),
                     GuestVa::new(address),
                     Gpa::new(0x10_0000),
                     len as u64,
@@ -2656,7 +2702,8 @@ mod tests {
         };
         let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, layout);
 
-        let result = engine.repoint_private(0x4000, 0x8000, 0x1000, &[0; 0x1000]);
+        let result =
+            engine.repoint_private(test_editor_excluded(), 0x4000, 0x8000, 0x1000, &[0; 0x1000]);
 
         assert!(matches!(
             result,

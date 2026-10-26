@@ -1955,9 +1955,14 @@ where
             )
             .map(Some);
         }
-        let editor_excluded = mutation.as_ref().map(|guard| guard.el1_editor_license()).ok_or_else(|| {
-            RuntimeError::Configuration("exec replacement has no exact-MM EL1 Editor exclusion".to_owned())
-        })?;
+        let editor_excluded = mutation
+            .as_ref()
+            .map(|guard| guard.el1_editor_license())
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "exec replacement has no exact-MM EL1 Editor exclusion".to_owned(),
+                )
+            })?;
         if let Err(error) = engine.execve_into(editor_excluded, &img) {
             drop(replacement_asid_load);
             drop(armed_kernel_exec);

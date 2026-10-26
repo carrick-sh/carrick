@@ -1809,7 +1809,12 @@ impl<'a> MemView<'a> {
         for fault in &faults {
             let len = range_len_usize(fault.range)?;
             memory
-                .protect_range(editor_excluded, fault.range.start().raw(), len, fault.prot.bits())
+                .protect_range(
+                    editor_excluded,
+                    fault.range.start().raw(),
+                    len,
+                    fault.prot.bits(),
+                )
                 .map_err(|_| LINUX_ENOMEM)?;
         }
         let mem_authority_35 = self.mem();

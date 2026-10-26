@@ -143,6 +143,7 @@ impl GuestMemory for SplitForwardMemory {
 
     fn repoint_private(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         va: u64,
         overlay_ipa: u64,
         len: usize,
@@ -548,7 +549,11 @@ impl SyscallTrap for ScriptedTrap {
         Ok(())
     }
 
-    fn execve_into(&mut self, _: &carrick_runtime::memory::AddressSpace) -> Result<(), TrapError> {
+    fn execve_into(
+        &mut self,
+        _: &carrick_guest_mem::El1EditorExcluded,
+        _: &carrick_runtime::memory::AddressSpace,
+    ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "scripted trap does not implement execve".to_owned(),
         ))
@@ -568,6 +573,7 @@ impl SyscallTrap for ScriptedTrap {
 
     fn map_host_alias(
         &mut self,
+        _editor: &carrick_guest_mem::El1EditorExcluded,
         _va: carrick_guest_mem::GuestVa,
         _ipa: carrick_guest_mem::Gpa,
         _len: u64,

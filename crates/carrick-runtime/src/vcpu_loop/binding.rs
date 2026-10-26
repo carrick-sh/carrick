@@ -3433,9 +3433,11 @@ where
                 self.kernel
                     .dispatcher
                     .with_kernel_resources(&context, || {
-                        self.kernel
-                            .dispatcher
-                            .reconcile_el1_deferred_returns(&permit, engine, mutation.el1_editor_license())
+                        self.kernel.dispatcher.reconcile_el1_deferred_returns(
+                            &permit,
+                            engine,
+                            mutation.el1_editor_license(),
+                        )
                     })
                     .map_err(|error| {
                         RuntimeError::Configuration(format!(
