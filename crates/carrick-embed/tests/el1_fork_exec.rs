@@ -76,14 +76,12 @@ fn native_child_exec_after_reusing_a_retired_slot() {
     // deterministic only in the VM-free
     // `first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation`
     // witness because the live allocator hashes the successor MM.
+    let fixture_dir = common::repo_root().join("target/embed-fixtures");
     let result = common::run_or_fail(
         ContainerBuilder::from_image(common::SMOKE_IMAGE)
             .pull_policy(PullPolicy::Missing)
-            .command([
-                "/bin/sh",
-                "-c",
-                "(exit 0) & first=$!; wait $first; (exec /bin/echo reused_slot_exec_ok) & second=$!; wait $second",
-            ])
+            .mount_readonly(fixture_dir.to_string_lossy(), "/opt/carrick")
+            .command(["/opt/carrick/el1-sched-aarch64", "reused-slot-exec"])
             .run_blocking(),
     );
     assert!(
@@ -94,7 +92,7 @@ fn native_child_exec_after_reusing_a_retired_slot() {
         result.stdout_utf8(),
         result.stderr_utf8()
     );
-    assert_eq!(result.stdout_utf8(), "reused_slot_exec_ok\n");
+    assert_eq!(result.stdout_utf8(), "reused-slot-exec ok\n");
 }
 
 #[test]
