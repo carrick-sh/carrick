@@ -321,18 +321,12 @@ impl PendingExecStage2Cleanup {
                 .retire_table_capacity(
                     None,
                     carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff,
-                    |manager| {
-                        if let Some(manager) = manager {
-                            mm_access
-                                .retire_bootstrap_table_root_stage2_in(
-                                    custody,
-                                    manager.base(),
-                                    stage1_unpublished,
-                                )
-                                .map_err(|error| error.to_string())?;
-                        }
-                        Ok(())
+                    |base| {
+                        mm_access
+                            .retire_owned_table_arena_stage2_in(custody, base, stage1_unpublished)
+                            .map_err(|error| error.to_string())
                     },
+                    |_manager| Ok(()),
                 )
                 .map_err(TrapError::Hypervisor)?;
         }

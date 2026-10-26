@@ -489,6 +489,10 @@ struct PendingStage2Retirement {
     owner: PendingStage2RetirementOwner,
     in_flight: bool,
     proof: Option<Stage2RetirementProof>,
+    /// An MM-owned pooled table arena is returned only after this exact
+    /// record reaches terminal stage-2 retirement. Other structural records
+    /// remain held until their own owner transition releases them.
+    pooled_root_release: Option<std::sync::Arc<StructuralBackingCustodyEntry>>,
 }
 
 #[derive(
@@ -1980,6 +1984,7 @@ impl CarrierVmCustody {
                             owner: PendingStage2RetirementOwner::ExactClaimant,
                             in_flight: false,
                             proof: Some(proof),
+                            pooled_root_release: None,
                         },
                     );
                 }
@@ -2025,8 +2030,33 @@ impl CarrierVmCustody {
                         owner: PendingStage2RetirementOwner::CarrierSafePoint,
                         in_flight: false,
                         proof: None,
+                        pooled_root_release: None,
                     },
                 );
+            }
+        }
+    }
+
+    pub(crate) fn attach_pooled_root_release(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        backing: std::sync::Arc<StructuralBackingCustodyEntry>,
+    ) -> bool {
+        let mut pending = self.pending_carrier_stage2_retirements.lock();
+        let Some(entry) = pending.get_mut(&identity.record_id) else {
+            return false;
+        };
+        if entry.identity != identity
+            || entry.owner != PendingStage2RetirementOwner::CarrierSafePoint
+            || entry.in_flight
+        {
+            return false;
+        }
+        match &entry.pooled_root_release {
+            Some(current) => std::sync::Arc::ptr_eq(current, &backing),
+            None => {
+                entry.pooled_root_release = Some(backing);
+                true
             }
         }
     }
@@ -2062,17 +2092,29 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
         complete: bool,
     ) {
-        let mut pending = self.pending_carrier_stage2_retirements.lock();
-        if pending.get(&identity.record_id).map(|entry| entry.identity) != Some(identity) {
-            return;
-        }
+        let release = {
+            let mut pending = self.pending_carrier_stage2_retirements.lock();
+            if pending.get(&identity.record_id).map(|entry| entry.identity) != Some(identity) {
+                return;
+            }
+            if complete {
+                pending
+                    .remove(&identity.record_id)
+                    .and_then(|entry| entry.pooled_root_release)
+            } else {
+                if let Some(entry) = pending.get_mut(&identity.record_id) {
+                    entry.in_flight = false;
+                }
+                None
+            }
+        };
         if complete {
-            pending.remove(&identity.record_id);
             self.terminal_carrier_stage2_retirements
                 .lock()
                 .remove(&identity.record_id);
-        } else if let Some(entry) = pending.get_mut(&identity.record_id) {
-            entry.in_flight = false;
+            if let Some(backing) = release {
+                backing.release_pooled_root_slot();
+            }
         }
     }
 

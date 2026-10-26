@@ -8269,7 +8269,7 @@ fn relocate_exit_fixture_root_with_extensions(
 }
 
 #[test]
-fn bootstrap_clean_exit_returns_extension_arena_for_next_bootstrap() {
+fn bootstrap_exec_then_clean_exit_requests_primary_arena_retirement_before_reuse() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
@@ -8280,53 +8280,67 @@ fn bootstrap_clean_exit_returns_extension_arena_for_next_bootstrap() {
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let base = pool.base_ipa();
-    let extension = base + 0x20_0000;
     let (mut predecessor, _, _, _) =
         exit_task_holding_owned_lease(791, 0x4000, 791, 792, &kernel, &frames);
-    relocate_exit_fixture_root_with_extensions(&mut predecessor, base, &[extension]);
+    assert_eq!(
+        pool.allocated_count(),
+        0,
+        "fixture task must not preclaim a root slot"
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &pool,
+        &custody.root_slot_pool().expect("installed root-slot pool")
+    ));
+    let primary_record = relocate_exit_fixture_root(&mut predecessor, base);
+    assert_eq!(pool.allocated_count(), 1);
 
-    let tables = predecessor.page_tables_authority();
-    let mut block = crate::memory::LINUX_MMAP_BASE + 64 * 0x20_0000;
+    // The persistent root's exec transition hands live descriptor service to
+    // EL1 and may leave no host `PageTableManager`. The owned published-arena
+    // obligation must survive that handoff until the root's clean exit.
+    let mut tables = predecessor.page_tables_authority();
+    let license = crate::trap::test_stage1_edit_license_for(&tables);
     tables
-        .edit(
-            crate::trap::test_stage1_edit_license_for(&tables),
-            || Err(TrapError::Hypervisor("manager must be present".to_owned())),
-            |editor| {
-                while editor.pool_stats().3 < 2 {
-                    editor
-                        .set_rw(block + 0x1000, 0x1000, false)
-                        .map_err(|error| {
-                            TrapError::Hypervisor(format!(
-                                "grow predecessor table arena: {error:?}"
-                            ))
-                        })?;
-                    block += 0x20_0000;
-                }
-                editor.publish_extension_arenas(|manager| {
-                    predecessor.publish_stage1_extension_arenas(manager)
-                })
-            },
+        .replace_for_exec(
+            license,
+            || Ok::<Option<carrick_mmu_core::aarch64::PageTableManager>, TrapError>(None),
+            |_| Ok(()),
         )
-        .expect("bootstrap publishes its extension through the production owner");
-    let extension_record = custody
-        .stage2_record_covering(extension, 1)
-        .expect("extension arena has exact stage-2 authority");
-    assert_eq!(pool.allocated_count(), 2);
+        .expect("root exec relinquishes the host table image");
+    assert!(
+        tables.is_none(),
+        "fixture must match the hardware guest-owned exit"
+    );
+    let pin = custody
+        .pin_stage2_record(primary_record)
+        .expect("observe the retirement request before backend completion");
 
     retire_test_process_mappings(&mut predecessor)
-        .expect("clean exit owns stage-1 and physical arena retirement");
+        .expect("clean root exit owns stage-1 and physical arena retirement");
     assert!(
         custody
-            .stage2_record_snapshot(extension_record.record_id)
+            .stage2_record_snapshot(primary_record.record_id)
+            .is_some_and(|record| record.retirement_requested),
+        "the owned clean-exit transition must request primary arena retirement"
+    );
+    drop(pin);
+    retry_pending_global_frame_retirements_at_idle_in_using(custody, &mut |_, _| Ok(()));
+    assert!(
+        custody
+            .stage2_record_snapshot(primary_record.record_id)
             .is_none(),
-        "clean exit must retire extension backing before its slot is reusable"
+        "clean exit must finish primary backing retirement before reuse"
+    );
+    assert_eq!(
+        pool.allocated_count(),
+        0,
+        "terminal primary record must release its root-slot pool hold"
     );
 
     let (mut successor, _, _, _) =
         exit_task_holding_owned_lease(793, 0x8000, 793, 794, &kernel, &frames);
-    relocate_exit_fixture_root(&mut successor, extension);
+    relocate_exit_fixture_root(&mut successor, base);
     retire_test_process_mappings(&mut successor)
-        .expect("next bootstrap retires the reused extension slot");
+        .expect("next bootstrap retires the reused primary slot");
     assert_eq!(pool.allocated_count(), 0);
 }
 

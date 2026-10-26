@@ -1338,9 +1338,11 @@ impl Stage1Authority {
     }
 
     /// Retire this authority's published physical table capacity after its MM
-    /// has stopped. An exact root retirement receipt may retain the primary
-    /// for the callback to retire under the same exclusion. The publisher
-    /// must prove terminal
+    /// has stopped. `retire_owned` consumes every still-published arena other
+    /// than an exact separately-owned root; this obligation is independent of
+    /// whether a host `PageTableManager` remains installed. An exact root
+    /// retirement receipt may retain the primary for `retire_root` to retire
+    /// under the same exclusion. The publisher must prove terminal
     /// physical custody before acknowledging each arena; failure quarantines
     /// the remaining capacity. No other MM's structural backing is selected.
     /// The callback also runs without a software image and must not re-enter
@@ -1349,6 +1351,7 @@ impl Stage1Authority {
         &self,
         root: Option<u64>,
         disposition: TableArenaRetirement,
+        mut retire_owned: impl FnMut(u64) -> Result<(), String>,
         retire_root: impl FnOnce(Option<&PageTableManager>) -> Result<R, String>,
     ) -> Result<R, String> {
         let (result, image, source) = {
@@ -1371,6 +1374,21 @@ impl Stage1Authority {
                             .retain(|candidate| *candidate != base);
                     }
                 }
+            }
+            // The host image can be relinquished to the guest descriptor lane
+            // before process exit. `published_arenas`, not `manager`, is the
+            // durable physical-retirement obligation carried by this MM.
+            let remaining = inner
+                .published_arenas
+                .iter()
+                .copied()
+                .filter(|base| Some(*base) != root)
+                .collect::<Vec<_>>();
+            for base in remaining {
+                retire_owned(base)?;
+                inner
+                    .published_arenas
+                    .retain(|candidate| *candidate != base);
             }
             let result = retire_root(inner.manager.as_ref())?;
             let (image, source) = if disposition == TableArenaRetirement::Terminal {

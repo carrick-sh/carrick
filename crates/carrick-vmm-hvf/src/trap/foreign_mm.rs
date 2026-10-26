@@ -1524,12 +1524,12 @@ impl MmAccessState {
         )
     }
 
-    /// Retire the physically published primary owned by a bootstrap table
-    /// source. Unlike fork/exec roots, that primary has no prepared
+    /// Retire physical table capacity still owned by the MM's published-arena
+    /// obligation. Unlike fork/exec roots, bootstrap capacity has no prepared
     /// `mm_root_stage2` slot: it was published before the task-only process
     /// plan existed. The whole-MM receipt is therefore the exact stage-1
-    /// unpublication proof for its structural reference.
-    pub(crate) fn retire_bootstrap_table_root_stage2_in(
+    /// unpublication proof for each remaining structural reference.
+    pub(crate) fn retire_owned_table_arena_stage2_in(
         &self,
         custody: &CarrierVmCustody,
         base: u64,
@@ -1549,7 +1549,7 @@ impl MmAccessState {
                 return Ok(());
             }
             return Err(TrapError::Hypervisor(
-                "bootstrap table primary lost exact structural owner".to_owned(),
+                "owned table arena lost its exact structural owner".to_owned(),
             ));
         };
         let identity = owner.record_identity();
@@ -1567,12 +1567,18 @@ impl MmAccessState {
             Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
         )?;
         custody.enqueue_carrier_stage2_retirement(identity);
+        if !custody.attach_pooled_root_release(identity, std::sync::Arc::clone(&owner.retained)) {
+            custody.cancel_carrier_stage2_retirement(identity);
+            return Err(TrapError::Hypervisor(
+                "owned table arena lost its terminal pool-release obligation".to_owned(),
+            ));
+        }
         if custody.request_released_stage2_record_retirement(identity, stage1)
             != CarrierStage2RetireOutcome::DeferredActivePins
         {
             custody.cancel_carrier_stage2_retirement(identity);
             return Err(TrapError::Hypervisor(
-                "bootstrap table primary could not authorize retirement".to_owned(),
+                "owned table arena could not authorize retirement".to_owned(),
             ));
         }
         owner.commit_stage1_publication();
@@ -1730,9 +1736,15 @@ impl MmAccessState {
             carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff
         };
         page_tables
-            .retire_table_capacity(Some(expected_root_slot.0), disposition, |manager| {
-                retire(manager).map_err(|error| error.to_string())
-            })
+            .retire_table_capacity(
+                Some(expected_root_slot.0),
+                disposition,
+                |base| {
+                    self.retire_owned_table_arena_stage2_in(custody, base, stage1_unpublished)
+                        .map_err(|error| error.to_string())
+                },
+                |manager| retire(manager).map_err(|error| error.to_string()),
+            )
             .map_err(TrapError::Hypervisor)
     }
 

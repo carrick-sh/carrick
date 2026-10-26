@@ -4126,18 +4126,12 @@ impl HvfVmState {
             .retire_table_capacity(
                 None,
                 carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-                |manager| {
-                    if let Some(manager) = manager {
-                        task.mm_access
-                            .retire_bootstrap_table_root_stage2_in(
-                                custody,
-                                manager.base(),
-                                stage1_unpublished,
-                            )
-                            .map_err(|error| error.to_string())?;
-                    }
-                    Ok(())
+                |base| {
+                    task.mm_access
+                        .retire_owned_table_arena_stage2_in(custody, base, stage1_unpublished)
+                        .map_err(|error| error.to_string())
                 },
+                |_manager| Ok(()),
             )
             .map_err(TrapError::Hypervisor)?;
         Ok(None)
@@ -4158,22 +4152,16 @@ impl HvfVmState {
             .retire_table_capacity(
                 None,
                 carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-                |manager| {
-                    if let Some(manager) = manager {
-                        #[cfg(not(test))]
-                        let custody = task.custody.as_ref();
-                        #[cfg(test)]
-                        let custody = legacy_test_carrier_vm_custody();
-                        task.mm_access
-                            .retire_bootstrap_table_root_stage2_in(
-                                custody,
-                                manager.base(),
-                                stage1_unpublished,
-                            )
-                            .map_err(|error| error.to_string())?;
-                    }
-                    Ok(())
+                |base| {
+                    #[cfg(not(test))]
+                    let custody = task.custody.as_ref();
+                    #[cfg(test)]
+                    let custody = legacy_test_carrier_vm_custody();
+                    task.mm_access
+                        .retire_owned_table_arena_stage2_in(custody, base, stage1_unpublished)
+                        .map_err(|error| error.to_string())
                 },
+                |_manager| Ok(()),
             )
             .map_err(TrapError::Hypervisor)
     }

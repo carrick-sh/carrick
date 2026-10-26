@@ -1072,6 +1072,12 @@ impl GlobalFrameSharedMapping {
         }
     }
 
+    fn release_pooled_root_slot(&self) {
+        if let GlobalFrameBacking::PooledRoot(handle) = &self.backing {
+            handle.release_slot();
+        }
+    }
+
     pub(crate) fn pin(&self) -> Result<(), CarrierStage2PinError> {
         let mut count = self.logical_pin_count.lock();
         *count = count
@@ -2391,6 +2397,13 @@ pub(crate) struct StructuralBackingCustodyEntry {
     pub(crate) owner_retired: std::sync::atomic::AtomicBool,
     pub(crate) physical_ipa: u64,
     pub(crate) physical_size: usize,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl StructuralBackingCustodyEntry {
+    pub(crate) fn release_pooled_root_slot(&self) {
+        self.mapping.release_pooled_root_slot();
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
