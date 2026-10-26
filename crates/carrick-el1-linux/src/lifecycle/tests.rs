@@ -457,6 +457,10 @@ fn raw_clone_sibling_runs_when_parent_only_sched_yields() {
     const RAW_THREAD_FLAGS: u64 = 0x0005_0f00;
     const SYS_SCHED_YIELD: usize = 124;
     let mut w = World::new(LifecycleHatches::ON);
+    w.task().publish_lifecycle(
+        w.page() as *const _ as u64,
+        w.venue.leader_slot() as *const _ as u64,
+    );
     w.venue.stock(2, CHILD_TID, CHILD_VISIBLE);
     let (action, mut frame) = w.syscall(SYS_CLONE, &clone_args(RAW_THREAD_FLAGS, 0, 0));
     assert_eq!(action, Action::Served);
@@ -470,6 +474,12 @@ fn raw_clone_sibling_runs_when_parent_only_sched_yields() {
     assert_eq!(
         w.task().execution.task.load(Ordering::Acquire),
         u64::from(CHILD_TID)
+    );
+    let child = w.zone.slot(SLOT).current().expect("child selected");
+    assert_eq!(
+        w.venue.child_slot(2).zone_record(),
+        Some(w.zone.record_ref(child)),
+        "the selected in-zone birth must bind its control to the running record"
     );
     assert_eq!(frame.x[0], 0, "the child returns from raw clone");
     assert_eq!(frame.elr, CLONE_PC);
