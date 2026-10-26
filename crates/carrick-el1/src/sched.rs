@@ -655,6 +655,24 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
+        // Pending work on a switched native record is an owner transition,
+        // not one of the host-loaded slot's later scheduling decisions. Settle
+        // it before affinity or any other branch can select a host exit.
+        if self.task.linux.has_pending_host_work()
+            && let Some(record) = self.zone.slot(self.slot).current()
+            && self.zone.record(record).is_native_owned()
+        {
+            self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
+                .fetch_add(1, Ordering::Relaxed);
+            let action = self
+                .cpu
+                .host_work_boundary(self.zone, self.task, self.slot, record, frame);
+            #[cfg(target_os = "none")]
+            if action == carrick_el1_abi::Action::Forward {
+                hw::fatal_entry_binding();
+            }
+            return action;
+        }
         // A RESCHED receipt is only a prompt to inspect the CURRENT loaded
         // authority. A stale SGI cannot mark an allowed successor as owing work.
         if self.zone.slot(self.slot).affinity_excludes_cpu() {
@@ -668,19 +686,6 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if self.task.linux.has_pending_host_work() {
             self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
-            let current = self.zone.slot(self.slot).current();
-            if let Some(record) =
-                current.filter(|record| self.zone.record(*record).is_native_owned())
-            {
-                let action = self
-                    .cpu
-                    .host_work_boundary(self.zone, self.task, self.slot, record, frame);
-                #[cfg(target_os = "none")]
-                if action == carrick_el1_abi::Action::Forward {
-                    hw::fatal_entry_binding();
-                }
-                return action;
-            }
             return carrick_el1_abi::Action::Forward;
         }
         if self.task.mm.key.load(Ordering::Acquire) == 0 {
