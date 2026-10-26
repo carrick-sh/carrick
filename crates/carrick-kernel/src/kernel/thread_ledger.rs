@@ -243,7 +243,7 @@ impl Kernel {
 /// the common libc/Go worker fan-out without reserving a visible gap in the
 /// tid space for a single-threaded process: a pool is primed only after the
 /// task's first thread clone.
-pub const DEFAULT_THREAD_POOL_DEPTH: usize = carrick_el1_abi::THREAD_POOL_STANDING_DEPTH;
+pub const DEFAULT_THREAD_POOL_DEPTH: usize = 4;
 
 /// `CARRICK_THREAD_POOL=0` (exactly) turns the standing reserve off.
 fn pool_depth_from_env() -> usize {
@@ -1164,6 +1164,21 @@ impl Kernel {
     }
 
     pub fn prepare_executable_thread_births(&self, context: &KernelContext) {
+        self.prepare_executable_thread_births_with_demand(context, false);
+    }
+
+    /// A fork child has a fresh lifecycle page but may clone in-zone before
+    /// any host clone creates demand. Seed its executable birth authority at
+    /// bootstrap so the first guest clone has an exact adoption reservation.
+    pub fn prepare_fork_child_thread_births(&self, context: &KernelContext) {
+        self.prepare_executable_thread_births_with_demand(context, true);
+    }
+
+    fn prepare_executable_thread_births_with_demand(
+        &self,
+        context: &KernelContext,
+        immediate: bool,
+    ) {
         if !context
             .thread()
             .control_lease()
@@ -1210,7 +1225,7 @@ impl Kernel {
         // replenishes executable capacity before returning to the caller.
         // Fork/exec-only workloads therefore never reserve unused runtime
         // cells, while subsequent EL1 births keep the existing pool path.
-        if context.thread().control_lease().lifecycle().live() == 1 {
+        if !immediate && context.thread().control_lease().lifecycle().live() == 1 {
             return;
         }
         self.registry()
@@ -3233,6 +3248,61 @@ mod tests {
                 .all(|tid| !kernel.ids().is_reserved_number(tid.raw()))
         );
         drop((sibling, child));
+    }
+
+    #[test]
+    fn fork_child_bootstrap_seeds_exact_first_entry_adoption_capacity() {
+        use crate::kernel::thread_adoption::{
+            ThreadBirthAdoptionFactory, ThreadBirthAdoptionReservation,
+        };
+
+        #[derive(Debug)]
+        struct ExecutableFactory(crate::kernel::TaskKey);
+        impl ThreadBirthAdoptionFactory for ExecutableFactory {
+            fn executable_births(&self) -> bool {
+                true
+            }
+
+            fn owner(&self) -> crate::kernel::TaskKey {
+                self.0
+            }
+
+            fn reserve(
+                &self,
+                thread: crate::kernel::ThreadKey,
+            ) -> Option<ThreadBirthAdoptionReservation> {
+                Some(ThreadBirthAdoptionReservation::new(self.0, thread, ()))
+            }
+        }
+
+        let (kernel, root) = bootstrap(9_555);
+        kernel.registry().thread_ledger().set_pool_depth_for_test(4);
+        let child = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_556),
+                "fork-child-births".to_owned(),
+                None,
+            )
+            .expect("fork");
+        child
+            .task()
+            .install_thread_adoption_factory(Arc::new(ExecutableFactory(child.task().key())))
+            .expect("install child factory");
+
+        kernel.prepare_fork_child_thread_births(&child);
+
+        assert_eq!(
+            kernel
+                .standing_thread_identities(child.task().key().id)
+                .len(),
+            4,
+            "a singleton fork child needs exact adoption capacity before its first in-zone clone"
+        );
+        let page = child.thread().control_lease().lifecycle();
+        let claim = page.claim_any().expect("claim fork-child birth");
+        page.unclaim(claim).expect("return fork-child birth");
     }
 
     #[test]

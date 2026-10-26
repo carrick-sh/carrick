@@ -6474,7 +6474,14 @@ where
             .map_err(|_| {
                 TrapError::Hypervisor("thread adoption factory rejected foreign task owner".into())
             })?;
-        context.kernel().prepare_executable_thread_births(&context);
+        if matches!(
+            &bootstrap_process_child,
+            Some(ProcessChildBootstrap::GuestFork { .. })
+        ) {
+            context.kernel().prepare_fork_child_thread_births(&context);
+        } else {
+            context.kernel().prepare_executable_thread_births(&context);
+        }
     }
     let result = HvpatchLoopResult::pending();
     let completion = continuation::LogicalJobCompletion::pending();
