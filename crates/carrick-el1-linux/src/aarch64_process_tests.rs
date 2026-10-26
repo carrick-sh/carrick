@@ -3466,6 +3466,13 @@ fn unregistered_in_zone_thread_restores_process_identity_across_slots() {
 fn in_zone_clone_reaches_native_owner_on_its_first_entry() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let mut service = fixture.process_service();
+    let peer = SlotId::new(1);
+    fixture.zone.drive(peer, fixture.leader.mm);
+    fixture
+        .zone
+        .publish_slot(peer, fixture.leader.mm, Some(1), 2);
+    fixture.zone.enter_guest(peer);
+    fixture.zone.install_space(peer, fixture.leader.mm).unwrap();
     let mut child = None;
     fixture
         .enter(
@@ -3475,7 +3482,7 @@ fn in_zone_clone_reaches_native_owner_on_its_first_entry() {
             |process| {
                 process
                     .thread_spawned(41, 42, &mut || {
-                        child = Some(imported_thread_on_slot(fixture, fixture.slot, |identity| {
+                        child = Some(imported_thread_on_slot(fixture, peer, |identity| {
                             identity.generation = fixture.leader.generation
                         }));
                         Ok(())
@@ -3486,10 +3493,7 @@ fn in_zone_clone_reaches_native_owner_on_its_first_entry() {
         .unwrap();
     let (child_control, child) = child.unwrap();
     assert!(registry().for_record(fixture.zone, child).is_none());
-    assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
-        child.id
-    );
+    assert_eq!(fixture.zone.switch_in_full(peer).unwrap().record, child.id);
     let identity = fixture.zone.record(child.id).identity();
     fixture.task.set(
         El1TaskId::from_linux_tid(identity.tid as i32),
@@ -3506,17 +3510,25 @@ fn in_zone_clone_reaches_native_owner_on_its_first_entry() {
         .publish_lifecycle(identity.lifecycle_page, identity.control_slot);
     fixture.task.publish_visible_pid(fixture.leader.tid as u32);
     let saved = unsafe { *fixture.zone.record(child.id).ctx_mut() };
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        peer,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
     with_process_entry(
         BornInZoneSource {
             zone: fixture.zone,
-            slot: fixture.slot,
+            slot: peer,
         },
         &fixture.task,
         &saved.native,
         fixture_ttbr0(fixture),
         fixture.page,
         child_control,
-        &mut service,
+        &mut child_service,
         |entry| {
             let result = entry.begin_service(
                 carrick_core_abi::service::ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
@@ -3524,7 +3536,7 @@ fn in_zone_clone_reaches_native_owner_on_its_first_entry() {
                     access: carrick_guest_arch::Access::Write,
                     present: false,
                 }),
-                None,
+                Some(NonZeroU64::MIN),
             )?;
             assert!(entry.take_handoff_receipt().is_some());
             Ok::<_, NativeProcessError>(result)

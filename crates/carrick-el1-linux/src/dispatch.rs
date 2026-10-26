@@ -1175,7 +1175,12 @@ fn arm_native_service_exit(
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
-        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+        .unwrap_or_else(|error| {
+            super::native_run_failure::complete_native_run_failure(
+                super::common_entry::execution_binding(task),
+                error.run_failure_reason(),
+            )
+        });
     let result = super::aarch64_process::with_process_entry(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
@@ -1234,7 +1239,12 @@ fn arm_native_service_exit(
         },
     )
     .and_then(core::convert::identity)
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    .unwrap_or_else(|error| {
+        super::native_run_failure::complete_native_run_failure(
+            super::common_entry::execution_binding(task),
+            error.run_failure_reason(),
+        )
+    });
     Some(match result {
         NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
         NativeResume::NoPending => arm_signal_user_return(frame),
