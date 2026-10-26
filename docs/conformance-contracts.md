@@ -2215,6 +2215,7 @@ The committed native ARM64 oracle and its source fingerprint are preserved.
 Fresh signed HVF execution, live sibling-editor contention, handled-signal
 delivery, final runtime ratios and exact-artifact promotion remain
 director-owned. VM-free evidence does not close those integration gates.
+
 ### Retained executable file services
 
 `process.exec.files` covers executable source selection with retained caller
@@ -2286,3 +2287,17 @@ but keeps the execution gate closed. The host admission adapter calls the same
 `Reservations::import_image` operation; its node-exhaustion witness verifies
 rollback returns nodes rather than confusing allocator high-water with live use.
 This still does not prove installed physical backing or exec commit.
+
+### Native thread alternate-stack mapping (#856)
+
+Linux [mmap(2)](https://man7.org/linux/man-pages/man2/mmap.2.html) treats
+`MAP_STACK` as a no-op. Private anonymous mappings with that flag use the
+same reservation owner, charges and lazy backing as those without it;
+`MAP_GROWSDOWN` and huge-page requests keep their distinct routes.
+`delegated_map_stack_uses_private_anonymous_owner_and_guard` binds Rust's
+alternate-stack setup shape (RW, 16 KiB, flags `0x20022`, then a PROT_NONE
+guard) to the real delegated reservation primitive. Its pre-fix RED is
+Forward instead of Served. The preserved #856 child stack names
+`stack_overflow::make_handler`'s mmap error branch, with errno 38 retained
+in the panic's error record. The later abort null-store reaches fatal exit;
+its native sibling-delivery defect is covered by the exit-drain witness.
