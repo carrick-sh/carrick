@@ -6654,9 +6654,10 @@ where
                 ))));
             }
         };
-        if let super::NativeExecServiceAdmission::Install(native_exec_capability) =
+        if let super::NativeExecServiceAdmission::Install(native_exec_installer) =
             native_exec_admission
         {
+            let native_exec_capability = native_exec_installer.capability();
             let native_exec_registration = match authority.install_native_exec_service(
                 native_exec_capability.id(),
                 native_exec_capability
@@ -6668,7 +6669,7 @@ where
                     return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
                 }
             };
-            if let Err(error) = kernel.install_native_exec_registration(native_exec_registration) {
+            if let Err(error) = native_exec_installer.complete(native_exec_registration) {
                 prepared.fail_exact();
                 return VcpuLoopLaunch::Direct(Err(error));
             }
