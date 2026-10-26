@@ -40,6 +40,7 @@ pub trait ThreadCpu {
         _slot: SlotId,
         _record: RecordId,
         _frame: &mut TrapFrame,
+        _counters: &Counters,
     ) -> carrick_el1_abi::Action {
         carrick_el1_abi::Action::Forward
     }
@@ -702,9 +703,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             .current()
             .filter(|record| self.zone.record(*record).is_native_owned())
         {
-            let action = self
-                .cpu
-                .host_work_boundary(self.zone, self.task, self.slot, record, frame);
+            let action = self.cpu.host_work_boundary(
+                self.zone,
+                self.task,
+                self.slot,
+                record,
+                frame,
+                self.counters,
+            );
             #[cfg(target_os = "none")]
             if action == carrick_el1_abi::Action::Forward {
                 hw::fatal_entry_binding();
@@ -1039,6 +1045,7 @@ impl ThreadCpu for FakeCpu {
         _: SlotId,
         record: RecordId,
         _: &mut TrapFrame,
+        _: &Counters,
     ) -> carrick_el1_abi::Action {
         self.host_work_boundaries.push(record);
         self.host_work_once
