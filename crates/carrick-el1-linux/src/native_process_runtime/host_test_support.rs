@@ -1441,7 +1441,8 @@ impl NativeServiceCapacityFixture {
                 .unwrap();
             assert!(matches!(
                 entry.resume_checkpoint().unwrap(),
-                NativeResume::NoPending
+                NativeResume::Returned(result)
+                    if result.raw() == words.syscall_return() as i64
             ));
             let waiting = fixture.runtime.graph.lock().has_member_wait(&record);
             assert!(!waiting);
@@ -1465,6 +1466,91 @@ fn native_exec_fixture() -> NativeSignalFixture {
         carrick_core_abi::EntryTaskKey::from_raw(41),
         carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap()),
     )
+}
+
+#[cfg(test)]
+#[test]
+fn carrier_work_wake_preserves_the_completed_syscall_result() {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_guest_arch::ProcessContext;
+
+    const COMPLETED: u64 = 0x41;
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let completed = words(fixture.address).with_syscall_return(COMPLETED);
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &completed,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_service(
+                ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                None,
+            ),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    // SAFETY: the fixture retains the exact process control and record named
+    // by this service notice until the completion is consumed below.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(fixture.record.id).identity(),
+        )
+    }
+    .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut resumed = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        resumed.resume_checkpoint(),
+        Ok(NativeResume::Returned(result)) if result.raw() == COMPLETED as i64
+    ));
 }
 
 #[cfg(test)]
