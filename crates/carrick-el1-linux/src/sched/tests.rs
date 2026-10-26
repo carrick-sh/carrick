@@ -827,6 +827,20 @@ fn late_host_work_settles_native_owner_before_host_affinity_exit() {
     let source = unsafe { carrick_sched_core::AffinitySource::from_authority(&affinity) };
     zone.publish_slot_with_affinity(SLOT, 0, Some(0), source);
     assert!(zone.slot(SLOT).affinity_excludes_cpu());
+    let decision = Sched {
+        handoff: None,
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters,
+    }
+    .interrupt_decision_for_test(&mut frame, ETIMEDOUT_RESULT);
+    assert_eq!(decision, carrick_el1_abi::Action::Forward);
+
+    // The request is published after the scheduler selected its action but
+    // before the one neutral IRQ return boundary commits that decision.
     task.linux.mark_pending_host_work();
     task.linux.record_completed_with_work();
     cpu.host_work_once = Some(carrick_el1_abi::Action::Idle);
@@ -841,9 +855,9 @@ fn late_host_work_settles_native_owner_before_host_affinity_exit() {
             user: &HardwareUserWord,
             counters,
         }
-        .serve_irq(&mut frame),
+        .finish_interrupt_for_test(&mut frame, decision),
         carrick_el1_abi::Action::Idle,
-        "host affinity bypassed the native owner boundary"
+        "late work escaped after the host-affinity decision"
     );
     assert_eq!(cpu.host_work_boundaries, [record]);
 }

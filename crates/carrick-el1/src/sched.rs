@@ -655,15 +655,34 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
-        // Pending work on a switched native record is an owner transition,
-        // not one of the host-loaded slot's later scheduling decisions. Settle
-        // it before affinity or any other branch can select a host exit.
-        if self.task.linux.has_pending_host_work()
-            && let Some(record) = self.zone.slot(self.slot).current()
-            && self.zone.record(record).is_native_owned()
+        let action = self.interrupt_decision(frame, timeout_result);
+        self.finish_interrupt(frame, action)
+    }
+
+    /// Commit the IRQ state-machine decision at its one neutral return
+    /// boundary. The vector checks once more after this function returns, so
+    /// work published before this check is settled here and work published
+    /// after it re-enters through another IRQ frame.
+    fn finish_interrupt(
+        &mut self,
+        frame: &mut TrapFrame,
+        action: carrick_el1_abi::Action,
+    ) -> carrick_el1_abi::Action {
+        if !self.task.linux.has_pending_host_work() {
+            if action == carrick_el1_abi::Action::Forward {
+                self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return action;
+        }
+        self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(record) = self
+            .zone
+            .slot(self.slot)
+            .current()
+            .filter(|record| self.zone.record(*record).is_native_owned())
         {
-            self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
-                .fetch_add(1, Ordering::Relaxed);
             let action = self
                 .cpu
                 .host_work_boundary(self.zone, self.task, self.slot, record, frame);
@@ -673,19 +692,23 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             return action;
         }
+        carrick_el1_abi::Action::Forward
+    }
+
+    fn interrupt_decision(
+        &mut self,
+        frame: &mut TrapFrame,
+        timeout_result: u64,
+    ) -> carrick_el1_abi::Action {
         // A RESCHED receipt is only a prompt to inspect the CURRENT loaded
         // authority. A stale SGI cannot mark an allowed successor as owing work.
         if self.zone.slot(self.slot).affinity_excludes_cpu() {
-            self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
-                .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Forward;
         }
         if self.enforce_affinity(frame).is_some() {
             return carrick_el1_abi::Action::Idle;
         }
         if self.task.linux.has_pending_host_work() {
-            self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
-                .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Forward;
         }
         if self.task.mm.key.load(Ordering::Acquire) == 0 {
@@ -728,6 +751,24 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         self.program_timer(true);
         carrick_el1_abi::Action::Served
+    }
+
+    #[cfg(feature = "host-test")]
+    pub fn interrupt_decision_for_test(
+        &mut self,
+        frame: &mut TrapFrame,
+        timeout_result: u64,
+    ) -> carrick_el1_abi::Action {
+        self.interrupt_decision(frame, timeout_result)
+    }
+
+    #[cfg(feature = "host-test")]
+    pub fn finish_interrupt_for_test(
+        &mut self,
+        frame: &mut TrapFrame,
+        action: carrick_el1_abi::Action,
+    ) -> carrick_el1_abi::Action {
+        self.finish_interrupt(frame, action)
     }
 
     /// The idle entry (EL1 plan 1d): the executor of this vCPU has no thread
