@@ -1,5 +1,90 @@
 # Issue #847 signed hardware evidence
 
+## Exact `14abec7f3` smoke exposes an unregistered structural reference (2026-10-26)
+
+The exact bundle for evidence head
+`14abec7f3fe74ad90696ecd2ce7460bb37c59384` verified, restored, and
+verified again with 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/14abec7f3fe74ad90696ecd2ce7460bb37c59384/203f0b50782085af3f7e87a46e00268858053634b7ad408ecdd93a5ad73e28d4.tar.gz
+bundle identity: 203f0b50782085af3f7e87a46e00268858053634b7ad408ecdd93a5ad73e28d4
+archive SHA-256: 25a0a62a76b6e5527e43dada95f9491b81660884c86ad860cdcac1e91b1ecdd0
+input identity: e7dee9818f2fcc6a6bdc51a4abb6acb5e8a8a008efc599db45cbccc61358c766
+```
+
+Mandatory bootstrap smoke `847-14ab-smoke-01` failed 0/1. Each of its four
+`sock-pingpong` arms completed the guest workload, but the corresponding root
+MM clean exit emitted a carrier fatal. The first exact error was:
+
+```text
+carrick: FATAL: detached address-space retirement failed (the MM-authority
+drop abort that follows is a CONSEQUENCE of this, not the cause): hypervisor
+operation failed: hypervisor operation failed: release structural stage-2
+reference: ReceiptMismatch((661424963584, 2097152))
+```
+
+The subsequent roots failed at `0x9a01200000`, `0x9a01400000`, and
+`0x9a01600000`. The last arm also made the test's operational assertion fail
+at 0.479 host queue claims per round trip. There was no watchdog census. The
+negative entitlement control passed and every harness plus explicit cleanup
+count was zero.
+
+Bounded pid-provider diagnostic `847-14ab-identity-trace-03` attached directly
+to the carrier with `ustack(8)` and ended after two seconds. Its exact MM 1
+sequence was:
+
+```text
+PUBLISH PreMappedRootSlotPool::allocate_slot_at a1=9a00000000
+PUBLISH publish_pooled_exec_root_owner_in
+STRUCT-REGISTER MmAccessState::register_structural_stage2_references
+IDENTITY CarrierForeignMmTransport::register_closed_initial_identity
+         a1=1 a2=9a00000000
+TABLE-RETIRE HvfVmState::retire_task_state_process_mappings
+TABLE-RETIRE HvfVmState::retire_task_table_capacity
+TABLE-RETIRE Stage1Authority::retire_table_capacity
+STRUCT-RELEASE MmAccessState::release_structural_stage2_reference
+STRUCT-RELEASE InventoryFrameRegistry::release_structural_stage2_reference
+               a1=9a00000000 a2=200000 a4=1
+```
+
+The structural-registration call occurs while the state has no MM identity,
+so it returns without inserting the lease. The later closed-initial identity
+publication writes MM 1 and binding `0x9a00000000`, but the trace contains no
+structural-registration call after that identity publication. Exit now
+correctly reaches the table-capacity release added by `113c599ce`; the exact
+registry release finds no `(lease, mm)` entry and returns `ReceiptMismatch`.
+MMs 2, 3, and 4 repeat the identical order. No root record reaches
+`request_record_retirement`.
+
+The trace executable was diagnostic-signed so the macOS pid provider could
+attach:
+
+```text
+path: target/release/deps/el1_sched-775614d8f5f84d25
+SHA-256: de0faa338ee08126aa53cfbc48e971391f59952808ff97bd0a3e61ae51528e52
+CDHash: d2c94631898e42e3a796f5ec3e492d6c88573154
+LC_UUID: C40FA12A-18AF-3682-A3FE-960F4ACC4C34
+entitlements: com.apple.security.hypervisor=true, get-task-allow=true
+USDT: __TEXT,__dof_carrick present
+```
+
+The diagnostic wrapper's receipt says passed because DTrace itself returned
+zero after the child exited; the quoted libtest output is authoritative and
+is failed. Temporary trace-launch harness changes were reverted, and no
+product source was changed. Per the smoke stop condition, the remaining
+matrix did not start:
+
+- bootstrap smoke: 0/1 (`847-14ab-smoke-01`);
+- host-blocked-read acceptance: 0/0 of 20;
+- `native_root_exec_replaces_pid1_shell`: 0/0;
+- `el1_ipc_pipe_blocking_roundtrips`: 0/0 of 3;
+- `el1_fork_cow_resolves_in_guest`: 0/0 of 3.
+
+Full local evidence is
+`/tmp/847-14ab-identity-trace-03.{log,trace}`; the uninstrumented smoke is
+`/tmp/847-14ab-smoke-01.log`.
+
 ## Rebase onto slice 3 main (2026-10-26)
 
 After the signed smoke and post-mortem, this branch rebased from
