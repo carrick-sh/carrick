@@ -2616,6 +2616,43 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
 }
 
 #[test]
+fn native_thread_birth_inherits_its_execution_lane_generation() {
+    let w = World::new(LifecycleHatches::ON);
+    let parent_identity = carrick_sched_core::ThreadIdentity {
+        generation: 11,
+        ..Default::default()
+    };
+    let parent = w.zone.alloc_record(parent_identity).unwrap();
+    assert!(w.zone.mark_native_owned(parent));
+    let binding = crate::common_entry::execution_binding(w.task());
+    let child_identity = carrick_sched_core::ThreadIdentity {
+        generation: 0,
+        ..Default::default()
+    };
+
+    let child =
+        super::child_execution_identity(&w.zone, Some(parent), Some(binding), child_identity)
+            .expect("native child binding");
+
+    assert!(child.native_owned);
+    assert_eq!(child.identity.generation, binding.generation.raw());
+
+    let host_parent = w
+        .zone
+        .alloc_record(carrick_sched_core::ThreadIdentity::default())
+        .unwrap();
+    let host_child = super::child_execution_identity(
+        &w.zone,
+        Some(host_parent),
+        Some(binding),
+        carrick_sched_core::ThreadIdentity::default(),
+    )
+    .expect("host child binding");
+    assert!(!host_child.native_owned);
+    assert_eq!(host_child.identity.generation, 0);
+}
+
+#[test]
 fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
     // ProcessNative's Born callback is under its graph guard. The real queue
     // and timer path must run after that guard, even if it reenters the graph.
