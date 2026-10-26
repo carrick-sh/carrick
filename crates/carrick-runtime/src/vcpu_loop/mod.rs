@@ -584,13 +584,16 @@ impl KernelState {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(crate) fn take_native_exec_capability(
+    pub(crate) fn native_exec_capability(
         &self,
     ) -> Result<Arc<crate::runtime::exec::NativeExecCapability>, crate::linux_abi::LinuxErrno> {
         self.native_exec_capability
             .lock()
-            .take()
+            .as_ref()
             .ok_or(crate::linux_abi::LINUX_ESRCH)?
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|error| *error)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

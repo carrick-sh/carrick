@@ -6645,7 +6645,7 @@ where
             }
         };
 
-        let native_exec_capability = match kernel.take_native_exec_capability() {
+        let native_exec_capability = match kernel.native_exec_capability() {
             Ok(capability) => capability,
             Err(error) => {
                 prepared.fail_exact();
