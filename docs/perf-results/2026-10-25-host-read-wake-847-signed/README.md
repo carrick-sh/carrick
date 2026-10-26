@@ -1,5 +1,73 @@
 # Issue #847 signed hardware evidence
 
+## Exact `98e177408` bootstrap regression (2026-10-25)
+
+The exact bundle for `98e177408103bc79ef5a79306b921a2c31dc2b94`
+verified and restored 1,195 executables before the requested serial proof:
+
+```text
+/Volumes/carrick-build/fixtures/published/98e177408103bc79ef5a79306b921a2c31dc2b94/2c0eeb41b38f1d58d3cb69ccf0c6bed3305b05fdd40e4cd99d243e8c8c0f75d2.tar.gz
+bundle identity: 2c0eeb41b38f1d58d3cb69ccf0c6bed3305b05fdd40e4cd99d243e8c8c0f75d2
+archive SHA-256: 61a512d58226546980f6d2161151183fe848fae9528b649043a6a17cd4213de4
+input identity: 6758fc7d7b8cb90a61068a28cb57ca3f8a0e5af38c46247e7bc268a75fff3651
+```
+
+The first host-read repetition, `847-98e-hostread-01`, failed before the
+workload entered its loop:
+
+```text
+container run failed: runtime failure: filesystem backend error: failed to run ELF from dispatcher: trap engine failed: hypervisor operation failed: reserve sparse HVPatch root mmap arena: host mapping operation failed: stage-1 edit lacks its Editor exclusion
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.11s
+```
+
+Classification: source regression, not the #847 hang. Pass count was 0/1;
+there was no EFAULT, watchdog, carrier fatal, or watchdog census. The harness
+and the explicit `scripts/sudo/kill.sh 847-98e-hostread-01` cleanup both
+reported zero remaining scoped processes. Per the stop condition, the other
+19 host-read repetitions, all three companion populations, and the signed
+counterparts of the new witnesses were not run on this broken artifact.
+The complete log is retained at `/tmp/847-98e-hostread-01.log`.
+
+The signed executable was
+`target/release/deps/el1_sched-a135647895e386e6`:
+
+```text
+SHA-256: 036c9d5f7ddfd0f9cd9807b63219ce11b3e0fb5dd743c9665b318bf43fe2dded
+CDHash: 96972583a6f131404147ba196501beea86f96e9a
+LC_UUID: 220F1BCF-9B93-3879-9141-116C6A305475
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+ad-hoc signing identity: .tmp.83334
+```
+
+The regression was the design's total-Editor revision being enforced on a
+bootstrap stage-1 edit before that not-yet-published MM could acquire its
+Editor exclusion. `b324a2fda` lets an unpublished MM acquire that exact
+bootstrap exclusion and replaces thread-local proof with a process-visible,
+exact-MM owned capability. It also closes the review findings found while
+attributing the failure: real transaction-bound guest descriptor preimages,
+exact-MM whole-inventory receipts, non-optional COW receipts, and total replay
+predecessor handling. `b2a944d85` then propagates an exact-MM bind refusal as
+`TrapError` through both engine layers instead of growing carrier-fatal
+authority; `6c8b805bd` closes the feature-gated production harness caller.
+
+Portable verification on `6c8b805bd`:
+
+- focused exact-MM deferred-owner witness: 1 passed;
+- metadata-retirement population: 17 passed;
+- `carrick-vmm-hvf --lib --no-run`: passed;
+- `just fmt-check`, `just clippy`, `just clippy-linux`, and
+  `just lint-domains`: passed (1,222 authority counters);
+- `just test-kernel`: passed, including 2,638 kernel tests and all
+  kernel-semantics targets;
+- normal EL1 image: 1,053,104 / 1,572,864 bytes, maximum checked stack
+  11,503 / 12,288 (`native wait copy`);
+- all-target clippy EL1 image: 1,081,920 / 1,572,864 bytes, maximum checked
+  stack 12,015 / 12,288 (`signal terminal exit`).
+
+No signed run was made after the source change. The requested 20/20 proof and
+companions require an exact bundle for the new evidence head.
+
 ## Stage-1-first retirement candidate (2026-10-25)
 
 The current candidate supersedes the producer-by-producer corrections recorded
