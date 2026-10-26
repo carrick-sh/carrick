@@ -2189,6 +2189,14 @@ transaction publication and signed replacement witnesses remain #785 work.
 
 ### Uninstalled executable backing
 
+Native exec payload intake authenticates metadata against the exact retained
+MM root using the shared AArch64 translation path. The VM-free
+`native_exec_payload_authenticates_a_live_metadata_block` was red when the
+host-only walker rejected a valid L2 block. It now resolves the occupied
+page in three descriptor loads without reading an absent L3 table; signed
+fork/exit/exec composition remains required.
+
+
 `process.exec.backing` covers the physical preparation leaf shared by the
 existing host exec mapper and its extracted owned preparation. Two real private
 file views survive descriptor closure without sharing writes; dropping one
