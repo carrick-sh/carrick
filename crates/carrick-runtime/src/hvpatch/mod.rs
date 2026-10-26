@@ -169,6 +169,23 @@ pub(crate) fn process_context_for_tests(
     resources
         .publish_root(root.task().key())
         .expect("publish test HVPatch root");
+    let lease = resources
+        .lease(root.task().key())
+        .expect("published test root lease");
+    let mut address_space_published = false;
+    lease.publish_address_space(|ttbr0| {
+        let publication = carrick_kernel::kernel::mm_occupancy::publish_address_space_for_test(
+            root.shared().mm().id(),
+            ttbr0,
+            0,
+        );
+        address_space_published = publication.is_some();
+        publication
+    });
+    assert!(
+        address_space_published,
+        "publish the test root through real sched-core address-space custody"
+    );
     (
         ProcessContext::new(
             resources,

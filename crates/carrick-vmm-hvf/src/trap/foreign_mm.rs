@@ -5269,6 +5269,13 @@ pub mod foreign_cow_test_support {
                         .map_err(|e| format!("readonly: {e:?}"))?;
                     let replacement =
                         carrick_aarch64::Stage1Authority::new_with_manager(Some(image));
+                    let mm = self
+                        .state
+                        .stage1_edit_mm()
+                        .map_err(|error| error.to_string())?;
+                    if !replacement.bind_mm(mm) {
+                        return Err("fixture replacement stage-1 authority rejected its MM".into());
+                    }
                     // Deliberately collide numeric generations of DIFFERENT authorities.
                     for _ in 1..generation.get() {
                         self.state

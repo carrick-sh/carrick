@@ -935,7 +935,7 @@ mod exec_image_verification_tests {
             ))
             .expect("predecessor lease validation");
         let replace = source
-            .rfind("engine.execve_into(&img)")
+            .rfind("engine.execve_into(editor_excluded, &img)")
             .expect("destructive backend replacement");
         assert!(
             retire < replace,
@@ -1244,7 +1244,7 @@ mod exec_image_verification_tests {
             .rfind("retire_execution_authority_for_exec(&retiring_thread")
             .expect("predecessor retirement");
         let replace = source
-            .rfind("engine.execve_into(&img)")
+            .rfind("engine.execve_into(editor_excluded, &img)")
             .expect("destructive engine replacement");
         assert!(arm < retire && retire < replace && replace < publish);
         assert!(

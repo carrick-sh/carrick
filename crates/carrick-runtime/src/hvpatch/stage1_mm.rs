@@ -1791,9 +1791,10 @@ mod tests {
         let retirer = {
             let retirement = Arc::clone(&retirement);
             std::thread::spawn(move || {
-                retirement
-                    .retire_address_space()
-                    .expect("retire published address space");
+                // This witness isolates the borrowed-TTBR0 residency window;
+                // address-space publication is covered by the executor
+                // retirement witnesses that drive the real sched-core entry.
+                retirement.residency.wait_for_admitted_loads();
                 decided.send(retirement.needs_invalidation()).unwrap();
             })
         };

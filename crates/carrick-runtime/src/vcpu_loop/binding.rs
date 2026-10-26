@@ -7523,7 +7523,7 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn child_tid_write_without_an_editor_producer_skips_silently() {
+    fn child_tid_write_without_an_editor_producer_kills_only_the_guest_mm() {
         use carrick_el1_abi::{PortalOwnerWait, PortalWaitCause};
         use carrick_el1_linux::mm_portal::MmPortal;
         use carrick_el1_linux::mm_portal::test_support::{ROOT, Region, admit_notified, nodes};
@@ -7641,10 +7641,11 @@ mod tests {
                 result.is_ok(),
                 "guest fault must not become a carrier error"
             );
-            assert!(
-                kernel.fatal_signal.recorded_for(generation).is_none(),
-                "set_child_tid failure is a silent Linux lifecycle-write skip"
-            );
+            let fatal = kernel
+                .fatal_signal
+                .recorded_for(generation)
+                .expect("an impossible stage-2 authority state kills the guest MM");
+            assert_eq!(fatal.signo, carrick_abi::LINUX_SIGKILL);
             assert_eq!(engine.injected_signals.len(), 0);
             scheduler.close();
         });

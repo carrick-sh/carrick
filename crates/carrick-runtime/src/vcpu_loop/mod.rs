@@ -4932,7 +4932,12 @@ pub(crate) mod tests {
                     None,
                 )
                 .unwrap();
-            carrick_aarch64::Stage1Authority::new_with_manager(Some(manager))
+            let authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
+            assert!(
+                authority.bind_mm(mm.raw()),
+                "production munmap witness binds its exact MM"
+            );
+            authority
         });
 
         let handback_scheduler = Arc::downgrade(&scheduler);

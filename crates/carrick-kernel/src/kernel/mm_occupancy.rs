@@ -59,6 +59,8 @@
 //! process never count each other's executors.
 
 use std::cell::Cell;
+#[cfg(feature = "test-support")]
+use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
 
 use carrick_fatal::carrick_fatal;
@@ -1445,6 +1447,32 @@ fn publish_in(
             },
             reservation_provider: None,
         },
+    )
+}
+
+/// Publish one real host-backed address-space entry for a downstream crate's
+/// VM-free lifecycle witness. The entry uses the production publication and
+/// retirement path; only its process-global test tables are synthetic.
+#[cfg(feature = "test-support")]
+pub fn publish_address_space_for_test(
+    mm: MmId,
+    ttbr0: u64,
+    ttbr1: u64,
+) -> Option<AddressSpacePublication> {
+    static TABLES: OnceLock<(Box<AddressSpaces>, Box<Occupancy>)> = OnceLock::new();
+    let (spaces, occupancy) =
+        TABLES.get_or_init(|| (Box::new(AddressSpaces::new()), Box::new(Occupancy::new())));
+    let fence = Arc::new(carrick_thread::fork_quiesce::PtQuiesce::new());
+    publish_in(
+        SpaceTables {
+            spaces,
+            occupancy,
+            zone: None,
+        },
+        mm,
+        &fence,
+        ttbr0,
+        ttbr1,
     )
 }
 

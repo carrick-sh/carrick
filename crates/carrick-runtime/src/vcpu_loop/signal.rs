@@ -2656,6 +2656,10 @@ mod guest_descriptor_lane_tests {
             buf: parking_lot::Mutex::new(bytes),
         });
         let authority = Stage1Authority::new_with_manager(Some(manager));
+        assert!(
+            authority.bind_mm(MM),
+            "guest-lane fixture binds its exact MM"
+        );
         unsafe {
             authority.bind_live_backing(
                 Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>
@@ -3471,7 +3475,7 @@ mod guest_descriptor_lane_tests {
             .find("let parent_outputs_published")
             .expect("parent copyout");
         let commit = quiesce
-            .find("ops.commit_parent(memory)")
+            .find("ops.commit_parent(memory, parent_mutation.editor_excluded())")
             .expect("fork commit");
         assert!(armed < copyout && copyout < commit);
         let helper = include_str!("signal.rs")
