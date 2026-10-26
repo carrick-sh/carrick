@@ -1852,6 +1852,11 @@ fn arm_in_ring_wait4_wake_resumes_owner_before_eret() {
     arm_child_wait_wake(true, false);
 }
 
+#[test]
+fn arm_physical_retirement_wait4_wake_resumes_owner_before_eret() {
+    arm_child_wait_wake_with_stock(true, false, true);
+}
+
 #[cfg(test)]
 #[test]
 fn arm_registered_sibling_wait4_wakes_through_owner_in_ring() {
