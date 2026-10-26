@@ -1503,10 +1503,10 @@ fn a_raised_gate_sends_the_thread_to_its_executor() {
         Claim::Queued { slot, .. } if slot == SLOT
     ));
     assert_eq!(zone.slot(SLOT).current(), None);
-    // The placement hint already saw the gate raised, so EL1 never left A's
-    // space: the vCPU still holds exactly the space its root translates.
-    assert_eq!(zone.installed_space(SLOT), MM);
-    assert!(cpu.translations.is_empty());
+    // Even an early placement refusal leaves for host service. Its next
+    // idle entry resets hardware roots, so occupancy must leave A as well.
+    assert_eq!(zone.installed_space(SLOT), 0);
+    assert_eq!(cpu.translations, [(IDLE_TTBR, IDLE_TTBR)]);
     assert_eq!(
         zone.take_service_head(SLOT).map(|r| r.id),
         Some(b),
