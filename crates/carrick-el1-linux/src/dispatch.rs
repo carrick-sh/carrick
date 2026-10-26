@@ -529,6 +529,7 @@ pub(super) fn resolve_arm_process_route(
 ) -> Action {
     match route {
         carrick_personality_linux::dispatch::CompletionRoute::HostCustody => Action::HostCustody,
+        carrick_personality_linux::dispatch::CompletionRoute::NativeService => Action::Forward,
         carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
         carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
@@ -1160,6 +1161,7 @@ where
         cache_lookup,
     ) {
         carrick_personality_linux::dispatch::CompletionRoute::HostCustody => Action::HostCustody,
+        carrick_personality_linux::dispatch::CompletionRoute::NativeService => Action::Forward,
         carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
         carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
