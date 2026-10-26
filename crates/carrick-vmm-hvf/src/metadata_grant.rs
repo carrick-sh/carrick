@@ -2522,7 +2522,7 @@ mod tests {
 
         let custody = std::sync::Arc::new(crate::trap::CarrierVmCustody::new_live_fixture());
         let generation = custody.live_generation();
-        let ipa_baseline = crate::trap::execve_rebuild::exec_ipa_lease_count_for_tests();
+        let ipa_baseline = crate::trap::exec_ipa_lease_count_for_tests();
         let frame_baseline = custody.native_frame_backings.lock().len();
         let preparation_baseline = custody.native_exec_preparations.lock().len();
         let prepared =
@@ -2570,7 +2570,7 @@ mod tests {
             frame_baseline + 1
         );
         assert_eq!(
-            crate::trap::execve_rebuild::exec_ipa_lease_count_for_tests(),
+            crate::trap::exec_ipa_lease_count_for_tests(),
             ipa_baseline + 1
         );
 
@@ -2604,10 +2604,7 @@ mod tests {
             preparation_baseline
         );
         assert_eq!(custody.native_frame_backings.lock().len(), frame_baseline);
-        assert_eq!(
-            crate::trap::execve_rebuild::exec_ipa_lease_count_for_tests(),
-            ipa_baseline
-        );
+        assert_eq!(crate::trap::exec_ipa_lease_count_for_tests(), ipa_baseline);
         let replacement = custody.asid_allocator().allocate_unpublished().unwrap();
         assert_eq!(replacement.generation().raw(), prepared_asid.raw());
         assert!(replacement.generation().generation() > prepared_asid.generation());
