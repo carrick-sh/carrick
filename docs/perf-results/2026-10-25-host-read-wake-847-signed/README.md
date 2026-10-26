@@ -1,5 +1,46 @@
 # Issue #847 signed hardware evidence
 
+## Exact `f990f2af5` whole-MM retirement fatal (2026-10-26)
+
+The exact bundle for `f990f2af550881bfbbcf5d75afea942d95e9ec69`
+verified and restored 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/f990f2af550881bfbbcf5d75afea942d95e9ec69/0cb8db16161f7635251780c296f8707b76b7ff2ee79228ba7ca42d5bbd0180ec.tar.gz
+bundle identity: 0cb8db16161f7635251780c296f8707b76b7ff2ee79228ba7ca42d5bbd0180ec
+archive SHA-256: 7df3dded13f8dcd7b07dba0611f285ffd0ae85c8d2e8e253ae6f5a32542778fe
+input identity: 293074b237d1d1b0a2ec3ba5560927dc50a6b24526c35117811014c7003a78b2
+```
+
+The mandatory bootstrap smoke `847-f990-smoke-01` (backend run
+`847-f990-smoke-01-b1`) reached HVF and failed in 0.11 seconds with this exact
+carrier fatal:
+
+```text
+carrick: FATAL: detached address-space retirement failed (the MM-authority drop abort that follows is a CONSEQUENCE of this, not the cause): hypervisor operation failed: whole-MM retirement has no carrier registration for stage-1 proof
+exit 139 signal Some(Signal(11)) stdout "" stderr ""
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.11s
+```
+
+No watchdog census was emitted. The signed harness and explicit cleanup
+reported zero remaining processes for `847-f990-smoke-01-b1`, its CLI scope,
+the negative control, and the outer `847-f990-smoke-01` scope. The entitlement
+negative control passed. Per the stop condition, the additional 20 host-read
+runs and all nine companion runs were not started. The full log is retained
+at `/tmp/847-f990-smoke-01.log`. No source change was made.
+
+The signed executable was
+`target/release/deps/el1_sched-a135647895e386e6`:
+
+```text
+SHA-256: b1ef112f1cd3c37d618c2401bb4a1232124ea13a2cb5c88c53b95b920e1ca5d2
+CDHash: 91fb6fa330cce1ae2ab76fcde3a6afaa7371460e
+LC_UUID: B935226E-EAB7-3840-AAFF-7204AB4D8288
+identifier: el1_sched-a135647895e386e6.tmp.48463
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
 ## Exact `3e5abed72` bootstrap regression and review closure (2026-10-26)
 
 The exact bundle for `3e5abed72a8e9e3c2cc0abf8af68f7fbd0b88b4c`
