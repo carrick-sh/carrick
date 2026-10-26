@@ -56,6 +56,9 @@ pub enum Family {
     Identity(IdentityCall),
     Sysinfo(SysinfoCall),
     Ipc(IpcCall),
+    /// AArch64 image replacement is completed by the carrier's native-exec
+    /// service after the shared entry owner authenticates this handoff.
+    NativeExec,
     Unported,
 }
 
@@ -569,6 +572,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Identity(_) => FamilyCompletion::Forward,
         Family::Sysinfo(_) => FamilyCompletion::Forward,
         Family::Ipc(_) => FamilyCompletion::Forward,
+        Family::NativeExec => FamilyCompletion::Forward,
         Family::Signal(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
@@ -637,6 +641,7 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
         134 => Family::Signal(crate::signal::SignalCall::RtSigaction),
         139 => Family::Signal(crate::signal::SignalCall::RtSigreturn),
+        221 | 281 => Family::NativeExec,
         _ => route_shared(ordinal, allocator_control),
     }
 }
@@ -1189,6 +1194,46 @@ mod ring_first_tests {
             route_aarch64(123, u64::MAX),
             Family::Sched(SchedCall::GetAffinity)
         );
+    }
+
+    #[test]
+    fn native_exec_routes_to_the_arm_carrier_service_only() {
+        for ordinal in [221, 281] {
+            assert_eq!(route_aarch64(ordinal, u64::MAX), Family::NativeExec);
+            assert_eq!(route_x86(ordinal, u64::MAX), Family::Unported);
+        }
+    }
+
+    #[test]
+    fn native_exec_handoff_bypasses_host_crossing_refusal() {
+        for (ordinal, native) in [(221, 221), (281, 281)] {
+            let refused = [const { AtomicU64::new(0) }; 513];
+            let mut pending = CarrierOwned {
+                set: HostCrossingSet::Aarch64,
+                mutate_forward: false,
+                strict: true,
+                state: crate::abi::entry::LinuxTaskState::new(),
+                native: carrick_syscall_abi::NativeNr(native),
+                admitted: true,
+                result: 42,
+                work: false,
+                handback: false,
+                signal_restore_calls: 0,
+                refused: &refused,
+                forwarded: [const { AtomicU64::new(0) }; 512],
+            };
+
+            assert_eq!(
+                dispatch(ordinal, 42, &mut pending),
+                CompletionRoute::Forward
+            );
+            assert_eq!(pending.result, 42);
+            assert_eq!(
+                pending.forwarded[ordinal as usize].load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(pending.refused[ordinal as usize].load(Ordering::Relaxed), 0);
+        }
     }
 
     #[test]
