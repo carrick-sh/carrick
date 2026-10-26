@@ -495,7 +495,7 @@ pub(super) fn arm_process_call_claimed(
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
         || match nr {
-            221 => owner() == NativeThreadGroupOwner::ForkChild,
+            221 | 281 => owner() != NativeThreadGroupOwner::Unowned,
             260 | 93 | 94 | 95 | 58 | 139 => owner() != NativeThreadGroupOwner::Unowned,
             _ => false,
         }
@@ -3062,6 +3062,20 @@ mod tests {
             arm_process_call_claimed(95, 0, || NativeThreadGroupOwner::ForkChild),
             "native child waitid"
         );
+        for ordinal in [221, 281] {
+            assert!(
+                arm_process_call_claimed(ordinal, 0, || NativeThreadGroupOwner::Root),
+                "native root exec ordinal={ordinal}"
+            );
+            assert!(
+                arm_process_call_claimed(ordinal, 0, || NativeThreadGroupOwner::ForkChild),
+                "native child exec ordinal={ordinal}"
+            );
+            assert!(
+                !arm_process_call_claimed(ordinal, 0, || NativeThreadGroupOwner::Unowned),
+                "host-loaded exec ordinal={ordinal}"
+            );
+        }
         assert!(!arm_process_call_claimed(62, 0, || panic!(
             "ordinary lseek queried registry"
         )));
