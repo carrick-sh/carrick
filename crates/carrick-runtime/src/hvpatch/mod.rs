@@ -1155,6 +1155,18 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
             let binding = prepared.mm_binding().ok_or_else(|| {
                 RuntimeError::Configuration("hvpatch root mm backend disappeared".to_owned())
             })?;
+            // Root bootstrap reaches the engine before an ordinary syscall or
+            // fault can mint an `MmMutationGuard`.  The sparse aperture carve
+            // is nevertheless a live stage-1 edit, so acquire the exact root
+            // MM's Editor exclusion here and keep it through ASID setup.
+            let _root_editor = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                root_context.shared().mm().id(),
+            )
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "exclude root EL1 Editor before HVPatch ASID setup".to_owned(),
+                )
+            })?;
             engine.configure_process_asid(binding.asid.raw())?;
             debug_assert_eq!(
                 binding.ttbr0.raw(),
