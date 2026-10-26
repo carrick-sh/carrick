@@ -227,6 +227,10 @@ pub(crate) trait HvpatchProcessBackendOps<E: ThreadedEngine, M: CurrentMmMemory>
     type Prepared;
     type Backend;
 
+    // This is the single process-publication seam: keeping the exact editor
+    // proof beside the inventory, fork request, carrier identity, and both
+    // generations makes the authority crossing explicit at implementations.
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         &mut self,
         memory: &mut M,

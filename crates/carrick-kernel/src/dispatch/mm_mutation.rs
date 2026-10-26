@@ -222,10 +222,11 @@ impl<'authority> MmMutationGuard<'authority> {
     }
 
     /// Borrow the edit proof owned by this exact MM mutation guard.
+    #[allow(clippy::expect_used)] // Owner-only guards are sealed behind OwnerMmTopologyGuard.
     pub fn el1_editor_license(&self) -> &carrick_hal::el1_editor_exclusion::El1EditorExcluded {
         self._el1_editor
             .as_ref()
-            .expect("MM mutation guard always owns an EL1 editor exclusion")
+            .expect("editable MM mutation guards own an EL1 editor exclusion")
             .license()
     }
 

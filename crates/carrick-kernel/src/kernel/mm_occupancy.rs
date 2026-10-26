@@ -818,22 +818,19 @@ impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
 /// its retired shape). Raising the gate refuses new EL1 editors and waits for
 /// an admitted one; EL1 then forwards the fault or syscall to the host.
 pub struct El1EditorExclusion {
-    tables: SpaceTables,
+    tables: Option<SpaceTables>,
     index: Option<SpaceIndex>,
     key: u64,
     /// This thread's witness registration (`carrick_hal::el1_editor_exclusion`):
     /// while it is held, engine code on this thread may store to the MM's
     /// live descriptors itself. Released before the gate is lowered.
-    held: Option<carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion>,
+    held: carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion,
 }
 
 impl El1EditorExclusion {
     /// Borrow the edit proof owned by this exact exclusion guard.
     pub fn license(&self) -> &carrick_hal::el1_editor_exclusion::El1EditorExcluded {
-        self.held
-            .as_ref()
-            .expect("EL1 editor exclusion guard always owns its proof")
-            .license()
+        self.held.license()
     }
 }
 
@@ -855,7 +852,21 @@ pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
     // scheduler-hatch policy.  Bootstrap edits happen after the EL1 region is
     // installed but before guest scheduling is enabled; using `el1_zone::zone`
     // here made those real edits unable to acquire their unpublished proof.
-    let zone = carrick_el1_abi::zone_tables()?;
+    let Some(zone) = carrick_el1_abi::zone_tables() else {
+        // With no EL1 region installed, no guest editor exists or can be
+        // admitted. Mint the same exact-MM unpublished proof from a private
+        // empty directory; the guard carries no gate to lower. This is the
+        // explicit bootstrap/VM-free authority, not an ambient bypass.
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let excluded = spaces.unpublished(mm.raw())?;
+        let held = carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
+        return Some(El1EditorExclusion {
+            tables: None,
+            index: None,
+            key: mm.raw(),
+            held,
+        });
+    };
     exclude_el1_editor_in(
         SpaceTables {
             spaces: &zone.spaces,
@@ -880,9 +891,9 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
         }
         None => tables.spaces.unpublished(key)?,
     };
-    let held = Some(carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded));
+    let held = carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
     Some(El1EditorExclusion {
-        tables,
+        tables: Some(tables),
         index,
         key,
         held,
@@ -891,11 +902,10 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
 
 impl Drop for El1EditorExclusion {
     fn drop(&mut self) {
-        drop(self.held.take());
-        if self.tables.live() {
-            if let Some(index) = self.index {
-                self.tables.lower_after_edit(index);
-            }
+        if let (Some(tables), Some(index)) = (self.tables.as_ref(), self.index)
+            && tables.live()
+        {
+            tables.lower_after_edit(index);
         }
     }
 }

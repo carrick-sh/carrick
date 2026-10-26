@@ -19,23 +19,13 @@ fn retire_anonymous_mapping_backing(
     dispatcher: &MemView<'_>,
     memory: &mut impl CurrentMmMemory,
     editor_excluded: &carrick_guest_mem::El1EditorExcluded,
-    address: u64,
-    length: u64,
-    length_usize: usize,
-    fixed: bool,
-    sparse: bool,
+    request: AnonymousBackingRetirement,
 ) -> Result<(), MemoryError> {
     retire_anonymous_mapping_backing_with_residency(
         dispatcher,
         memory,
         editor_excluded,
-        AnonymousBackingRetirement {
-            address,
-            length,
-            length_usize,
-            fixed,
-            sparse,
-        },
+        request,
         carrick_el1_abi::frame_grant_residency_host(),
     )
 }
@@ -1565,8 +1555,16 @@ impl<'a> MemView<'a> {
             if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 if let Err(error) = retire_anonymous_mapping_backing(
-                    this, memory, editor_excluded, address, length, length_usize,
-                    fixed_anonymous, sparse_anonymous_backing,
+                    this,
+                    memory,
+                    editor_excluded,
+                    AnonymousBackingRetirement {
+                        address,
+                        length,
+                        length_usize,
+                        fixed: fixed_anonymous,
+                        sparse: sparse_anonymous_backing,
+                    },
                 ) {
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("anonymous predecessor retirement failed"),
@@ -1653,8 +1651,16 @@ impl<'a> MemView<'a> {
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 if let Err(error) = retire_anonymous_mapping_backing(
-                    this, memory, editor_excluded, address, length, length_usize,
-                    fixed_anonymous, sparse_anonymous_backing,
+                    this,
+                    memory,
+                    editor_excluded,
+                    AnonymousBackingRetirement {
+                        address,
+                        length,
+                        length_usize,
+                        fixed: fixed_anonymous,
+                        sparse: sparse_anonymous_backing,
+                    },
                 ) {
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("anonymous predecessor retirement failed"),

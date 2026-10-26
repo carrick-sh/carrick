@@ -2822,7 +2822,7 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn fail_stop_partial_process_stage2_rollback(context: &str, error: &TrapError) -> ! {
     eprintln!(
-        "carrick: FATAL: {context}: structural stage-2 rollback could not terminalize before root-slot release: {error}"
+        "carrick: FATAL: {context}: structural rollback could not complete before physical release: {error}"
     );
     #[cfg(test)]
     std::panic::resume_unwind(Box::new(
@@ -2831,7 +2831,7 @@ pub(crate) fn fail_stop_partial_process_stage2_rollback(context: &str, error: &T
     #[cfg(not(test))]
     carrick_fatal!(
         "hvpatch::mm_authority",
-        "{context}: structural stage-2 rollback could not terminalize before root-slot release: {error}"
+        "{context}: structural rollback could not complete before physical release: {error}"
     );
 }
 

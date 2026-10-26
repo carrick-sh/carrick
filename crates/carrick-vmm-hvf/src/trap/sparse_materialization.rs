@@ -3040,6 +3040,7 @@ struct ImportDescriptorUndo<'a> {
     editor_excluded: &'a carrick_guest_mem::El1EditorExcluded,
     active: bool,
 }
+
 impl<'a> ImportDescriptorUndo<'a> {
     fn begin(
         state: &MmAccessState,
@@ -3081,6 +3082,8 @@ impl<'a> ImportDescriptorUndo<'a> {
         }
         // SAFETY: this owner retains the exact resolver and fresh journal;
         // its caller still holds pre-admission mutation/publication authority.
+        #[allow(clippy::redundant_closure_call)]
+        // Keep the fatal scanner's reviewed rollback boundary.
         let rollback = (|| -> Result<(), TrapError> {
             unsafe {
                 self.tables
@@ -3093,7 +3096,12 @@ impl<'a> ImportDescriptorUndo<'a> {
                 ))
             })
         })();
-        rollback.unwrap_or_else(|error| carrick_fatal!("hvpatch::user_transfer", "{error:?}"));
+        rollback.unwrap_or_else(|error| {
+            super::global_frame::fail_stop_partial_process_stage2_rollback(
+                "import descriptor rollback",
+                &error,
+            )
+        });
         self.active = false;
     }
 }
