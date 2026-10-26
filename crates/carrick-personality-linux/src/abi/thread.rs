@@ -1983,11 +1983,23 @@ impl ThreadLifecyclePage {
         index: usize,
         identity: EntryIdentity,
     ) -> Result<EntryRef, TransitionError> {
+        self.stock_bound(index, identity, 0)
+    }
+
+    /// Kernel: [`Self::stock`] with the born thread's control binding
+    /// published in the same `Stocking` window, so no claimant can observe
+    /// the `Reserved` incarnation before its control address exists.
+    pub fn stock_bound(
+        &self,
+        index: usize,
+        identity: EntryIdentity,
+        control: u64,
+    ) -> Result<EntryRef, TransitionError> {
         let e = self.entry(index)?;
         let reference = self.reserve_stock(index)?;
         let next = reference.generation();
         e.tid.store(identity.tid, Ordering::Relaxed);
-        self.controls[index].store(0, Ordering::Relaxed);
+        self.controls[index].store(control, Ordering::Relaxed);
         e.visible_tid.store(identity.visible_tid, Ordering::Relaxed);
         e.thread_serial
             .store(identity.thread_serial, Ordering::Relaxed);

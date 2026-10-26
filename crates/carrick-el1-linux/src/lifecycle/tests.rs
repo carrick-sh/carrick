@@ -1990,6 +1990,123 @@ fn clone_uses_the_exact_stamped_dispatch_identity() {
     assert_eq!(w.zone.slot(SLOT).queued(), 1);
 }
 
+/// A process whose venue owns its thread identities stocks nothing ahead of
+/// demand: its first clone finds an empty pool and the venue issues exactly
+/// one identity at the clone instant. A venue without that authority leaves
+/// the empty pool declined, unchanged.
+#[test]
+fn clone_on_an_empty_pool_issues_one_identity_through_the_owning_venue() {
+    struct OwningVenue {
+        binding: carrick_el1_abi::ExecutionBinding,
+        owns_births: bool,
+        stocked: usize,
+    }
+    impl ProcessNative for OwningVenue {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn stock_thread_birth(&mut self, page: &ThreadLifecyclePage) -> bool {
+            if !self.owns_births {
+                return false;
+            }
+            self.stocked += 1;
+            page.stock(
+                0,
+                carrick_el1_abi::EntryIdentity {
+                    tid: CHILD_TID,
+                    visible_tid: CHILD_VISIBLE,
+                    thread_serial: CHILD_SERIAL,
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                    ),
+                    uid_credit: 1,
+                },
+            )
+            .is_ok()
+        }
+    }
+    for owns_births in [false, true] {
+        let mut w = World::new(LifecycleHatches::ON);
+        w.task().publish_visible_pid(41);
+        assert!(w.venue.leader_slot().publish_visible_tid(41));
+        assert!(
+            (0..w.page().entry_count()).all(|index| w
+                .page()
+                .state(index)
+                .is_some_and(|(_, state)| state == EntryState::Vacant)),
+            "the fixture starts with no identity reserved ahead of demand"
+        );
+        let mut probe = OwningVenue {
+            binding: crate::common_entry::execution_binding(w.task()),
+            owns_births,
+            stocked: 0,
+        };
+        let mut frame = TrapFrame {
+            slot: SLOT_IDX as u64,
+            ..Default::default()
+        };
+        frame.x[..5].copy_from_slice(&clone_args(GO_FLAGS, 0, 0));
+        let names = InotifyNameCache::new();
+        let mut native = super::El1PendingFamilies {
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame,
+            counters: &w.counters,
+            current_tasks: &w.tasks,
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &names,
+            zone: Some(Zone {
+                tables: &w.zone,
+                cpu: &mut w.cpu,
+                user: &HardwareUserWord,
+            }),
+            ipc: None,
+            lifecycle: Some(&*w.venue),
+            process: Some(&mut probe),
+            source: None,
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        let outcome = invoke(LifecycleCall::Clone, &mut native);
+        if owns_births {
+            assert!(
+                matches!(outcome, Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == i64::from(CHILD_VISIBLE))
+            );
+            assert_eq!(probe.stocked, 1, "exactly one identity, at the clone");
+            assert_eq!(w.page().live(), 2);
+            assert_eq!(w.zone.slot(SLOT).queued(), 1);
+        } else {
+            assert!(outcome.is_none());
+            assert_eq!(probe.stocked, 0);
+            assert_eq!(
+                w.counters.lifecycle_declines
+                    [carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(w.page().live(), 1);
+        }
+    }
+}
+
 #[test]
 fn clone_refuses_missing_dispatch_identity_without_registering() {
     struct BirthProbe {

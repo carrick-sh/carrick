@@ -328,6 +328,10 @@ impl<
         self.process_venue()
             .is_some_and(|venue| venue.route_host_thread_exit(verdict))
     }
+    fn stock_thread_birth(&mut self, page: &ThreadLifecyclePage) -> bool {
+        self.process_venue()
+            .is_some_and(|venue| venue.stock_thread_birth(page))
+    }
     fn arguments(&self) -> [u64; 6] {
         [
             self.frame.argument(0).unwrap_or(0),
