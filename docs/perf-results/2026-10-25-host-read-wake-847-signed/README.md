@@ -1,5 +1,92 @@
 # Issue #847 signed hardware evidence
 
+## Exact `403fb1d74` acceptance passes; companion failures traced (2026-10-26)
+
+The exact fixture bundle for source head
+`403fb1d74cea1d1401a696f0e4960b7aee00f8f1` verified, restored, and
+verified again with 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/403fb1d74cea1d1401a696f0e4960b7aee00f8f1/892cb782df0c2ccb4f0e82b7ad7ed75440fde8f20174b069f2ad832f4d84e6bd.tar.gz
+bundle identity: 892cb782df0c2ccb4f0e82b7ad7ed75440fde8f20174b069f2ad832f4d84e6bd
+archive SHA-256: 37eb0e2ef3a979cd0396bbb185e1b7af16c993fbba5b8696655bb6d6a636d093
+input identity: 8186d2ab16e324055deeeacc1afa360885bcab0369524e1a96d5382e3837d750
+```
+
+The bootstrap smoke passed 1/1 (`847-403-smoke-01`). The #847 acceptance
+population then passed 20/20 (`847-403-hostread-01` through `-20`) with zero
+watchdogs, zero EFAULTs, zero `STAGE2INV` events, and zero carrier fatals.
+Every signed harness cleanup and every explicit cleanup for the run and
+`-cli` scopes reported zero remaining processes.
+
+The linked host-read executable identity was:
+
+```text
+path: target/release/deps/el1_sched-775614d8f5f84d25
+last acceptance-run SHA-256: cede6a17f5c777b2e75c42f74668f6fb1a9d1cfb0ec307c60f062f753dc032ef
+last acceptance-run CDHash: a78f5f05bf3e993d7e4da2c3b97f7c95ea89fc0a
+LC_UUID: F3A13A38-C0A5-30D6-896C-007F311DD8D6
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+The signed harness re-signs through a PID-named temporary file on every
+invocation, so SHA-256 and CDHash change while the linked Mach-O and LC_UUID
+remain fixed. The last companion signature on that executable was SHA-256
+`0cc0ff182cd60bf54371f1edf1a3173e684016d4f7fd5022a6d983e9c431334b`,
+CDHash `8d3352931f1b39697e4c8c4180f829680edb71e0`.
+
+The requested root-exec name does not exist in this checkout. The signed
+production test that exercises the stated shape is
+`el1_transparent_fork_exec_shared_backing`: its root shell forks a child,
+waits, and replaces PID 1 with `/bin/echo`. Run `847-403-rootexec-01` failed
+0/1 with guest exit 139, before the workload reached its fork. There was no
+carrier fatal or watchdog. Its exact executable was:
+
+```text
+path: target/release/deps/el1_fork_exec-d73f421504a652ac
+SHA-256: 33cd228d05f755d71457b393b4623655627344fd678ff7c7e4c7da803d19bdc0
+CDHash: 9efc64eef6ebdb40ecc336b1fbed46b35b289fae
+LC_UUID: 6D7F002B-9B47-3DD0-8723-2D174EA9FD1F
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+Bounded trace `847-403-rootexec-trace-06` proved the failing request retained
+its original argument:
+
+```text
+GSF1|entry|lpid=1|ltid=1|nr=214|a0=0x4000021000
+GSF1|ret|lpid=1|ltid=1|nr=214|ret=-12|errno=12
+```
+
+The fault trace then recorded a write to the still-unmapped heap VA
+`0x4000000008`, followed by SIGSEGV. The targeted stable-USDT trace
+`847-403-rootexec-trace-08` placed the refusal in the deferred-return alias
+unmap preceding `brk`: it recorded two live leaves for
+`0x6000004000+0x2000`, but no after-unmap receipt and no stage-2 removal
+before `brk` returned ENOMEM. Reservation-root refusal and page-table pause
+timeout probes did not fire. The pid-provider wildcard emitted zero events
+and is explicitly not used as evidence.
+
+The remaining companion counts are:
+
+- `el1_ipc_pipe_blocking_roundtrips`: 3/3
+  (`847-403-pipe-01` through `-03`);
+- `el1_fork_cow_resolves_in_guest`: 0/3
+  (`847-403-forkcow-01` through `-03`). Each uninstrumented run carrier-
+  fataled in the tracked structural-retirement class with
+  `release alias-retirement stage-2 reference (666797867008, 1048576):
+  ReceiptMismatch((666797867008, 1048576))`;
+- bounded trace `847-403-forkcow-trace-04` perturbed the fork-COW failure to
+  a guest SIGSEGV after the 16-page arm, with zero carrier fatal count. Its
+  169 stable mapping/stage-2 events make it a valid trace, but the different
+  terminal result is not substituted for the three uninstrumented verdicts.
+
+No product source was changed after either failure. The durable trace profile
+is `scripts/dtrace/hvpatch-deferred-return-refusal.d`; local raw evidence is
+under `/tmp/847-403-{rootexec,forkcow}*`.
+
 ## Exact `5db2d9c1b` smoke passes, host-read hits the authority invariant (2026-10-26)
 
 The exact bundle for source head
