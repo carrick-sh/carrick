@@ -112,6 +112,7 @@ pub struct SourceCensus {
     structural_errors: Vec<String>,
     test_ranges: BTreeMap<String, Vec<(LineColumn, LineColumn)>>,
     aliases: BTreeMap<String, Vec<syn::Type>>,
+    alias_resolution: AliasResolution,
     projections: Projections,
     vocabulary: BTreeMap<String, AuthorityOperation>,
 }
@@ -2114,21 +2115,34 @@ fn type_alias_keys(path: &syn::TypePath, scope: &str) -> (String, Vec<String>) {
     (path_name, keys)
 }
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AliasQuery {
+    key: String,
+    scope: String,
+    names: &'static [&'static str],
+    deny_unresolved_projection: bool,
+}
+#[derive(Debug, Default)]
+struct AliasResolution {
+    memo: BTreeMap<AliasQuery, bool>,
+    seen: Vec<String>,
+}
+
 fn authority_type(
     ty: &syn::Type,
     aliases: &BTreeMap<String, Vec<syn::Type>>,
     projections: &Projections,
     scope: &str,
-    seen: &mut Vec<String>,
-    names: &[&str],
+    resolution: &mut AliasResolution,
+    names: &'static [&'static str],
     deny_unresolved_projection: bool,
 ) -> bool {
     struct Types<'a> {
         aliases: &'a BTreeMap<String, Vec<syn::Type>>,
         projections: &'a Projections,
         scope: &'a str,
-        seen: &'a mut Vec<String>,
-        names: &'a [&'a str],
+        resolution: &'a mut AliasResolution,
+        names: &'static [&'static str],
         protected: bool,
         deny_unresolved_projection: bool,
     }
@@ -2145,32 +2159,54 @@ fn authority_type(
                 || path_name.starts_with("Self::")
                 || self.projections.suffixes.contains(&path_name);
             let mut resolved = false;
-            let keys = keys.into_iter().flat_map(|key| {
-                self.projections
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| BTreeSet::from([key]))
+            let keys = keys.iter().flat_map(|key| {
+                let targets = self.projections.get(key);
+                targets
+                    .into_iter()
+                    .flatten()
+                    .chain(targets.is_none().then_some(key))
             });
             for key in keys {
-                if let Some(alternatives) = self.aliases.get(&key) {
+                if let Some(alternatives) = self.aliases.get(key) {
                     resolved = true;
-                    if self.seen.contains(&key) {
+                    if self.resolution.seen.contains(key) {
                         self.protected = true;
                         break;
                     }
-                    self.seen.push(key.clone());
+                    let scope = key.rsplit_once("::").map_or(self.scope, |(scope, _)| scope);
+                    let query = self.resolution.seen.is_empty().then(|| AliasQuery {
+                        key: key.clone(),
+                        scope: scope.to_owned(),
+                        names: self.names,
+                        deny_unresolved_projection: self.deny_unresolved_projection,
+                    });
+                    if let Some(protected) = query
+                        .as_ref()
+                        .and_then(|query| self.resolution.memo.get(query))
+                    {
+                        self.protected |= protected;
+                        continue;
+                    }
+                    self.resolution.seen.push(key.clone());
+                    let mut protected = false;
                     for alias in alternatives {
-                        self.protected |= authority_type(
+                        protected |= authority_type(
                             alias,
                             self.aliases,
                             self.projections,
-                            key.rsplit_once("::").map_or(self.scope, |(scope, _)| scope),
-                            self.seen,
+                            scope,
+                            self.resolution,
                             self.names,
                             self.deny_unresolved_projection,
                         );
                     }
-                    self.seen.pop();
+                    self.resolution.seen.pop();
+                    // Only memoize complete expansions with an empty entry
+                    // stack. Nested cycle shortcuts retain their original context.
+                    if let Some(query) = query {
+                        self.resolution.memo.insert(query, protected);
+                    }
+                    self.protected |= protected;
                 }
             }
             if projection && !resolved && self.deny_unresolved_projection {
@@ -2185,7 +2221,7 @@ fn authority_type(
         aliases,
         projections,
         scope,
-        seen,
+        resolution,
         names,
         protected: false,
         deny_unresolved_projection,
@@ -2216,15 +2252,15 @@ struct Scanner<'a> {
     generic_types: BTreeSet<String>,
 }
 impl Scanner<'_> {
-    fn receiver_authority(&self, ty: &syn::Type) -> ReceiverAuthority {
+    fn receiver_authority(&mut self, ty: &syn::Type) -> ReceiverAuthority {
         let scope = self.scope();
-        let protected = |names: &[&str]| {
+        let mut protected = |names: &'static [&'static str]| {
             authority_type(
                 ty,
                 &self.census.aliases,
                 &self.census.projections,
                 &scope,
-                &mut Vec::new(),
+                &mut self.census.alias_resolution,
                 names,
                 false,
             )
@@ -2354,8 +2390,8 @@ impl Scanner<'_> {
                         if generic { None } else { Some(authority) },
                     );
                 }
-            } else if let Some(ty) = &self.implementation_type {
-                let authority = self.receiver_authority(ty);
+            } else if let Some(ty) = self.implementation_type.clone() {
+                let authority = self.receiver_authority(&ty);
                 self.bindings.insert(
                     "self".into(),
                     if self.generic_types.is_empty() {
@@ -2425,6 +2461,7 @@ impl Scanner<'_> {
                 return;
             }
             let prefix = self.scope().split("::").map(str::to_owned).collect();
+            self.census.alias_resolution.memo.clear();
             AliasCollector {
                 aliases: &mut self.census.aliases,
                 projections: &mut self.census.projections,
@@ -2684,13 +2721,14 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         // A renamed/new guard accessor must not disappear from the closed call
         // census. Existing private implementation helpers and the reservation
         // guard are explicit boundaries rather than migration API calls.
+        let scope = self.scope();
         if self.implementation_type.as_ref().is_some_and(|ty| {
             authority_type(
                 ty,
                 &self.census.aliases,
                 &self.census.projections,
-                &self.scope(),
-                &mut Vec::new(),
+                &scope,
+                &mut self.census.alias_resolution,
                 &["FileTable"],
                 false,
             )
@@ -2700,8 +2738,8 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                     ty,
                     &self.census.aliases,
                     &self.census.projections,
-                    &self.scope(),
-                    &mut Vec::new(),
+                    &scope,
+                    &mut self.census.alias_resolution,
                     &[
                         "RwLock",
                         "Mutex",
@@ -2928,7 +2966,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         } else if let Some(segment) = path.path.segments.last() {
             let operation = segment.ident.unraw().to_string();
             let kind = self.census.vocabulary.get(&operation).copied();
-            let names: &[&str] = match kind {
+            let names: &'static [&'static str] = match kind {
                 Some(AuthorityOperation::FileLifecycle)
                     if operation == "copy_file_table_for_host_fork" =>
                 {
@@ -2943,7 +2981,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             let mut receiver_path = path.path.clone();
             receiver_path.segments.pop();
             receiver_path.segments.pop_punct();
-            let protected_receiver = !receiver_path.segments.is_empty()
+            let scope = self.scope();
+            let protected_receiver = !names.is_empty()
+                && !receiver_path.segments.is_empty()
                 && authority_type(
                     &syn::Type::Path(syn::TypePath {
                         qself: path.qself.clone(),
@@ -2951,8 +2991,8 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                     }),
                     &self.census.aliases,
                     &self.census.projections,
-                    &self.scope(),
-                    &mut Vec::new(),
+                    &scope,
+                    &mut self.census.alias_resolution,
                     names,
                     false,
                 );
@@ -3058,5 +3098,73 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[test]
+    fn alias_memo_keeps_scope_names_projection_policy_and_cycles() -> Result<(), syn::Error> {
+        let aliases = [
+            ("shared", vec!["Local"]),
+            ("plain::Local", vec!["u8"]),
+            ("guarded::Local", vec!["FileTable"]),
+            ("plain::Opaque", vec!["<Self as Unknown>::Slots"]),
+            ("plain::CycleA", vec!["CycleB"]),
+            ("plain::CycleB", vec!["CycleA", "u8"]),
+            ("plain::Choice", vec!["u8", "FileTable"]),
+            ("entry", vec!["Target"]),
+            ("first::Target", vec!["second::Bridge"]),
+            ("second::Bridge", vec!["entry"]),
+            ("second::Target", vec!["u8"]),
+        ]
+        .into_iter()
+        .map(|(key, alternatives)| {
+            Ok((
+                key.into(),
+                alternatives
+                    .into_iter()
+                    .map(syn::parse_str)
+                    .collect::<Result<_, _>>()?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, syn::Error>>()?;
+        let projections = Projections::default();
+        let mut resolution = AliasResolution::default();
+        for _ in 0..2 {
+            for (ty, scope, names, deny, expected) in [
+                ("shared", "plain", &["FileTable"][..], false, false),
+                ("shared", "guarded", &["FileTable"][..], false, true),
+                ("shared", "guarded", &["Kernel"][..], false, false),
+                ("Opaque", "plain", &["RwLock"][..], false, false),
+                ("Opaque", "plain", &["RwLock"][..], true, true),
+                ("CycleA", "plain", &["Kernel"][..], false, true),
+                ("CycleB", "plain", &["Kernel"][..], false, true),
+                ("Choice", "plain", &["FileTable"][..], false, true),
+                ("entry", "first", &["Kernel"][..], false, true),
+                ("second::Bridge", "first", &["Kernel"][..], false, false),
+                ("entry", "first", &["Kernel"][..], false, true),
+            ] {
+                assert_eq!(
+                    authority_type(
+                        &syn::parse_str(ty)?,
+                        &aliases,
+                        &projections,
+                        scope,
+                        &mut resolution,
+                        names,
+                        deny,
+                    ),
+                    expected,
+                    "{ty} in {scope}, names {names:?}, deny {deny}"
+                );
+                assert!(resolution.seen.is_empty());
+            }
+        }
+        assert!(!resolution.memo.is_empty());
+        assert!(
+            resolution
+                .memo
+                .keys()
+                .any(|query| query.key.contains("Cycle"))
+        );
+        Ok(())
     }
 }
