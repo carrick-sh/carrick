@@ -398,9 +398,19 @@ impl<
             .as_ref()
             .ok_or(carrick_sched_core::Exhausted)?
             .tables;
-        zone.alloc_record(identity)
-            .map(|id| zone.record_ref(id))
-            .map_err(|_| carrick_sched_core::Exhausted)
+        let id = zone
+            .alloc_record(identity)
+            .map_err(|_| carrick_sched_core::Exhausted)?;
+        let inherits_native_owner = self
+            .frame
+            .slot()
+            .and_then(|slot| zone.slot(slot).current())
+            .is_some_and(|parent| zone.record(parent).is_native_owned());
+        if inherits_native_owner && !zone.mark_native_owned(id) {
+            zone.free_record(id);
+            return Err(carrick_sched_core::Exhausted);
+        }
+        Ok(zone.record_ref(id))
     }
     fn free_record(&mut self, record: RecordRef) {
         if let Some(zone) = &self.zone
