@@ -3567,20 +3567,28 @@ impl HvfVmState {
         if !task.persistent_vm_lifecycle {
             return Ok(None);
         }
-        let stage1_unpublished = task
-            .registration
-            .as_ref()
-            .ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "whole-MM retirement has no carrier registration for stage-1 proof".to_owned(),
-                )
-            })?
-            .publish_stage1_unpublished(stage1_unpublished.ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "production whole-MM retirement requires stage-1 unpublication proof"
+        let stage1_unpublished = stage1_unpublished.ok_or_else(|| {
+            TrapError::Hypervisor(
+                "production whole-MM retirement requires stage-1 unpublication proof".to_owned(),
+            )
+        })?;
+        let Some(registration) = task.registration.as_ref() else {
+            // Registration is the zero-to-one crossing for every carrier
+            // stage-2 reference owned by this logical MM. A detached or early
+            // bootstrap address space which never crossed it has no carrier
+            // authority to retire; its local staging dies with `task` and the
+            // publication guards roll back independently. In particular,
+            // cleanup after a typed registration refusal must not manufacture
+            // a retirement obligation and then turn its absence into a fatal.
+            if expected_root_slot.is_some() {
+                return Err(TrapError::Hypervisor(
+                    "unregistered address space cannot produce a registered root retirement proof"
                         .to_owned(),
-                )
-            })?)?;
+                ));
+            }
+            return Ok(None);
+        };
+        let stage1_unpublished = registration.publish_stage1_unpublished(stage1_unpublished)?;
         if let Some(mm) = task
             .cow_identity
             .and_then(|identity| carrick_el1_abi::ReservationMm::new(identity.mm))

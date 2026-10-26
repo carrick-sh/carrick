@@ -63,6 +63,18 @@ fn retire_test_process_mappings(task: &mut HvfTaskState) -> Result<(), TrapError
     HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(task, proof)
 }
 
+#[test]
+fn whole_mm_retirement_of_never_registered_detached_space_is_empty() {
+    let mut task = hvpatch_task_state_test_fixture(73, 0x7300_0000, 73);
+    assert!(task.registration.is_none());
+    let proof = test_whole_mm_stage1_proof_for(73);
+
+    HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(&mut task, proof)
+        .expect("an MM that never registered carrier references retires trivially");
+
+    assert!(task.registration.is_none());
+}
+
 fn retire_test_process_mappings_with_root_proof(
     task: &mut HvfTaskState,
     expected_root_slot: (u64, u64),
