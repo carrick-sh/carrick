@@ -819,16 +819,18 @@ pub fn completion_route(completion: FamilyCompletion, pending: bool) -> Completi
     match completion {
         FamilyCompletion::HostCustody => CompletionRoute::HostCustody,
         FamilyCompletion::NativeService => CompletionRoute::NativeService,
-        FamilyCompletion::Complete(_)
-        | FamilyCompletion::Switched(_)
-        | FamilyCompletion::FrameRestored
-            if pending =>
+        FamilyCompletion::Complete(_) | FamilyCompletion::FrameRestored if pending =>
         {
             CompletionRoute::WithWork
         }
         FamilyCompletion::FrameRestored
         | FamilyCompletion::Complete(_)
         | FamilyCompletion::AccountedComplete(_)
+        // A switched frame already belongs to the selected successor. Generic
+        // work observed on the outgoing entry cannot borrow that successor's
+        // completed syscall boundary; the durable doorbell reaches the
+        // successor's own IRQ boundary instead. Work intrinsically produced
+        // by the switched completion uses `SwitchedWithWork` below.
         | FamilyCompletion::Switched(_)
         | FamilyCompletion::AccountedSwitched(_) => CompletionRoute::Served,
         FamilyCompletion::CompleteWithWork(_)
@@ -1556,6 +1558,18 @@ mod ring_first_tests {
         );
         assert_eq!(pending.result, 123);
         assert!(pending.state.has_pending_host_work());
+    }
+
+    #[test]
+    fn switched_successor_does_not_borrow_outgoing_host_work_boundary() {
+        assert_eq!(
+            completion_route(FamilyCompletion::Switched(41), true),
+            CompletionRoute::Served
+        );
+        assert_eq!(
+            completion_route(FamilyCompletion::SwitchedWithWork(41), true),
+            CompletionRoute::WithWork
+        );
     }
 
     #[test]
