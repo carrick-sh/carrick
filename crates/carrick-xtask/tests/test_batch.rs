@@ -85,3 +85,88 @@ fn batch_builds_once_and_preserves_filters_serial_environment_and_failures() {
         "--no-run executed a failing test"
     );
 }
+
+#[test]
+fn exported_batch_runs_without_compiling_and_rejects_missing_or_changed_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname='archived-batch'\nversion='0.1.0'\nedition='2021'\n[features]\nwitness=[]\n").unwrap();
+    std::fs::write(root.join("src/lib.rs"), "#[test] fn green() { assert!(cfg!(feature=\"witness\")); }\n#[test] fn red() { panic!(\"filter lost\"); }\n").unwrap();
+    std::fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"fixture CLI\"); }",
+    )
+    .unwrap();
+    std::fs::create_dir(root.join("tests")).unwrap();
+    std::fs::write(root.join("tests/smoke.rs"), r#"#[test] fn cli_fixture() {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_archived-batch")).output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"fixture CLI\n");
+    }"#).unwrap();
+    std::fs::write(root.join("justfile"), "lanes:\n    cargo test --all-features --lib --test smoke -- --skip red\nred:\n    cargo test --all-features --lib -- red\nchanged:\n    cargo test --lib\n").unwrap();
+    assert!(
+        Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let run = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["--root", root.to_str().unwrap(), "test-batch"])
+            .args(extra)
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .output()
+            .unwrap()
+    };
+    let export = run(&["--export", "target/tests.tar.gz", "lanes"]);
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    std::fs::rename(root.join("target"), root.join("saved-target")).unwrap();
+    let tar = std::fs::File::open(root.join("saved-target/tests.tar.gz")).unwrap();
+    tar::Archive::new(flate2::read::GzDecoder::new(tar))
+        .unpack(root)
+        .unwrap();
+    let import = |recipe| run(&["--artifacts", "target/test-batch.json", recipe]);
+    let green = import("lanes");
+    assert!(
+        green.status.success(),
+        "{}",
+        String::from_utf8_lossy(&green.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&green.stderr).contains("one compile"));
+    assert!(
+        !import("red").status.success(),
+        "test failure must propagate"
+    );
+    assert!(
+        !import("changed").status.success(),
+        "feature drift must fail closed"
+    );
+    let saved_manifest = std::fs::read(root.join("target/test-batch.json")).unwrap();
+    let mut wrong_root: serde_json::Value = serde_json::from_slice(&saved_manifest).unwrap();
+    wrong_root["root"] = "/another/checkout".into();
+    std::fs::write(
+        root.join("target/test-batch.json"),
+        serde_json::to_vec(&wrong_root).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !import("lanes").status.success(),
+        "checkout relocation must fail closed"
+    );
+    std::fs::write(root.join("target/test-batch.json"), &saved_manifest).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("target/test-batch.json")).unwrap())
+            .unwrap();
+    std::fs::remove_file(root.join(manifest["binaries"][0]["path"].as_str().unwrap())).unwrap();
+    assert!(
+        !import("lanes").status.success(),
+        "missing binary must fail closed"
+    );
+}

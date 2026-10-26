@@ -23,6 +23,8 @@ export CARRICK_SCCACHE_SEARCH_PATH := replace_regex(_build_env, _build_env_field
 _cargo := "cargo --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
 _xtask := if env("CARRICK_XTASK_BIN", "") != "" { quote(env("CARRICK_XTASK_BIN")) } else { _cargo + " run --locked -p carrick-xtask --" }
 _admit := _xtask + " worktree-run --"
+# Only xtask test recipes opt into the exact, extracted CI test build.
+_xtask_test_artifacts := if env("CARRICK_XTASK_TEST_MANIFEST", "") != "" { "--artifacts " + quote(env("CARRICK_XTASK_TEST_MANIFEST")) } else { "" }
 
 # Only the command-capture coverage gate may select another host's test recipes.
 # Test execution always uses the actual host; captured Cargo test calls never run.
@@ -50,7 +52,14 @@ default:
 # Derived from `cargo tree` so it self-updates as crates are added/removed.
 [private]
 _platform_crates:
-    @{{_admit}} {{_cargo}} tree -p carrick-cli {{_platform_features}} --prefix none 2>/dev/null | grep -oE '^carrick-[a-z0-9-]+' | sort -u | sed 's/^/-p /' | tr '\n' ' '
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pkgs="$({{_admit}} {{_cargo}} tree -p carrick-cli {{_platform_features}} --prefix none | grep -oE '^carrick-[a-z0-9-]+' | sort -u | sed 's/^/-p /' | tr '\n' ' ')"
+    case " $pkgs " in
+        *" -p carrick-cli "*) ;;
+        *) echo "platform package discovery omitted carrick-cli" >&2; exit 1 ;;
+    esac
+    printf '%s\n' "$pkgs"
 
 # Build the runnable release binary for the host (args go to cargo). macOS codesigns
 # the HVF entitlement; Linux/FreeBSD/NetBSD do a plain build with the backend features.
@@ -204,6 +213,12 @@ clippy *ARGS:
         # macOS lints the whole workspace (HVF backend included) with default features.
         exec {{_admit}} {{_cargo}} clippy --workspace --all-targets --keep-going {{ARGS}} -- -D warnings
     fi
+    if [ "{{os()}}" = "linux" ]; then
+        # Keep production dependency features separate from dependency test targets.
+        {{_admit}} {{_cargo}} clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
+        {{_admit}} {{_cargo}} clippy -p carrick-xtask --lib --bins --keep-going {{ARGS}} -- -D warnings
+        exec just --justfile {{justfile()}} clippy-linux {{ARGS}}
+    fi
     # Off-macOS: lint carrick-cli + its platform dep-closure (carrick-runtime, the
     # shared x86/aarch64 engines, this host's VMM backend) under the backend feature
     # set, so the kvm/bhyve/nvmm code the macOS gate never sees is linted too. Scoping
@@ -213,7 +228,7 @@ clippy *ARGS:
     {{_admit}} {{_cargo}} clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
     exec {{_admit}} {{_cargo}} clippy -p carrick-xtask --all-features --all-targets --keep-going {{ARGS}} -- -D warnings
 
-# Lint the Linux platform closure and freestanding x86 CPL0 crates across all
+# Lint the Linux platform closure, xtask (all features) and x86 CPL0 across all
 # targets (`tests/`, `benches/`, `examples/`, unit tests). `_platform_crates`
 # derives the `platform-linux` closure from `carrick-cli` and `{{_platform_features}}`;
 # `carrick-embed` is linted over `--lib --bins --examples` because its `tests/`
@@ -223,7 +238,7 @@ clippy-linux *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     pkgs="$(just --justfile {{justfile()}} _platform_crates | sed -E 's/-p carrick-embed //g')"
-    {{_admit}} {{_cargo}} clippy $pkgs -p carrick-x86-cpl0 -p carrick-x86-carrier -p carrick-conformance-next {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
+    {{_admit}} {{_cargo}} clippy $pkgs -p carrick-x86-cpl0 -p carrick-x86-carrier -p carrick-conformance-next -p carrick-xtask {{_platform_features}} --features carrick-xtask/impact --all-targets --keep-going {{ARGS}} -- -D warnings
     exec {{_admit}} {{_cargo}} clippy -p carrick-embed {{_platform_features}} --lib --bins --examples --keep-going {{ARGS}} -- -D warnings
 
 # Lint all GitHub Actions workflow files with actionlint.
@@ -261,8 +276,8 @@ lint-domains-source:
 _lint-domains-source:
     ./scripts/lib/test-signed-selection-test.sh
     # Libtest filters are a union; integration targets run without filters.
-    {{_cargo}} test --locked -p carrick-xtask --lib -- terminal_custody copyout_debt
-    {{_cargo}} test --locked -p carrick-xtask --test probe_coverage --test authority_debt
+    {{_xtask}} test-batch {{_xtask_test_artifacts}} _test-xtask-domain-unit
+    {{_xtask}} test-batch {{_xtask_test_artifacts}} _test-xtask-domain-integration
     python3 scripts/conformance/check-next-strategy.py
     ./scripts/closure-assert-vmfree-schedule.sh
     ./scripts/lint-domains.sh
@@ -483,12 +498,43 @@ test-shard-b *ARGS: _test-stdio
 
 # Run carrick-xtask unit and CI gate tests on Linux so ci-xtask changes are verified even when macos=false.
 test-xtask *ARGS:
-    {{_admit}} {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
+    {{_admit}} {{_xtask}} test-batch {{_xtask_test_artifacts}} _test-xtask -- {{ARGS}}
+
+[private]
+_test-xtask *ARGS:
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
 
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:
-    cargo test --locked -p carrick-xtask --test test_shards
+    {{_xtask}} test-batch {{_xtask_test_artifacts}} _test-xtask-shards
     {{_xtask}} check-test-shards
+
+# Compile the exact union used by all hosted Linux xtask test consumers.
+ci-build-xtask-tests:
+    {{_admit}} {{_xtask}} test-batch --export target/xtask-tests.tar.gz _test-xtask-ci
+
+[private]
+_test-xtask-ci: _test-xtask _test-xtask-shards _test-xtask-domain-unit _test-xtask-domain-integration
+
+[private]
+_test-xtask-shards:
+    {{_cargo}} test --locked -p carrick-xtask --all-features --test test_shards
+
+[private]
+_test-xtask-domain-unit:
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib -- terminal_custody copyout_debt
+
+[private]
+_test-xtask-domain-integration:
+    {{_cargo}} test --locked -p carrick-xtask --all-features --test probe_coverage --test authority_debt
+
+# The fallback fixture makes sccache unavailable itself, independently of CI setup.
+check-build-cache:
+    {{_xtask}} test-batch {{_xtask_test_artifacts}} _test-xtask-build-cache
+
+[private]
+_test-xtask-build-cache:
+    {{_cargo}} test --locked -p carrick-xtask --all-features --test build_cache
 
 [private]
 _test-stdio:
@@ -1341,10 +1387,8 @@ ci-changes:
     : "${GITHUB_OUTPUT:?}"
     if [[ -n "${CARRICK_XTASK_BIN:-}" ]]; then
         exec "$CARRICK_XTASK_BIN" --root . ci-changes
-    elif [[ -x target/debug/carrick-xtask ]]; then
-        exec target/debug/carrick-xtask --root . ci-changes
     else
-        exec {{_admit}} {{_xtask}} --root . ci-changes
+        exec {{_cargo}} run --locked -p carrick-xtask -- --root . ci-changes
     fi
 
 # Fail closed: GitHub considers skipped required jobs successful on their own.
@@ -1353,7 +1397,7 @@ ci-results:
     #!/usr/bin/env bash
     set -euo pipefail
     jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" '
-      has("lint-clippy") and has("lint-gates") and has("loom") and
+      has("lint-clippy") and has("lint-gates") and has("xtask-tests-build") and has("loom") and
       .changes.result == "success" and
       .["xtask-build"].result == "success" and
       (.["macos-authority"].result ==
@@ -1365,14 +1409,14 @@ ci-results:
          (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key | startswith("macos-")))
            | if ($root.changes.outputs.heavy // "true") == "true" and ($root.changes.outputs.macos // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
-         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key == "lint-clippy" or .key == "lint-gates"))
-           | select(length == 2)
+         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key == "lint-clippy" or .key == "lint-gates" or .key == "xtask-tests-build"))
+           | select(length == 3)
            | if ($root.changes.outputs.heavy // "true") == "true" then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (del(.changes, .["xtask-build"], .["macos-authority"])["lint-domains"]
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
-         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint-clippy" and .key != "lint-gates" and .key != "lint-domains"))
+         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint-clippy" and .key != "lint-gates" and .key != "xtask-tests-build" and .key != "lint-domains"))
            | if ($root.changes.outputs.heavy // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and

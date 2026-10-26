@@ -249,3 +249,63 @@ fn warm_apt_cache_installs_without_contacting_the_mirror() {
     assert!(partial.join("kept_1.0_amd64.deb").exists());
     assert!(!partial.join("complete").exists());
 }
+
+#[test]
+fn linux_test_consumers_share_one_artifact_and_clippy_union() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let docs = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
+    assert_eq!(docs[0]["env"]["CARGO_INCREMENTAL"].as_str(), Some("0"));
+    let jobs = &docs[0]["jobs"];
+    assert!(
+        jobs["xtask-tests-build"]["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .any(|s| s["run"].as_str() == Some("just ci-build-xtask-tests"))
+    );
+    for job in ["lint-gates", "lint-domains", "portable"] {
+        assert!(
+            jobs[job]["needs"]
+                .as_vec()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_str() == Some("xtask-tests-build"))
+        );
+        assert!(
+            jobs[job]["steps"]
+                .as_vec()
+                .unwrap()
+                .iter()
+                .any(|s| s["with"]["name"].as_str() == Some("xtask-tests-linux-x64"))
+        );
+    }
+    let changes = &jobs["changes"];
+    assert!(
+        changes["needs"].is_badvalue(),
+        "early checks must not wait on xtask-build"
+    );
+    assert!(!changes["steps"].as_vec().unwrap().iter().any(|s| {
+        s["uses"]
+            .as_str()
+            .is_some_and(|action| action.starts_with("actions/download-artifact@"))
+    }));
+    assert!(
+        !changes["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .any(|s| s["run"].as_str() == Some("just ci-prebuild-xtask"))
+    );
+    let steps = jobs["lint-clippy"]["steps"].as_vec().unwrap();
+    assert!(
+        steps
+            .iter()
+            .any(|s| s["run"].as_str() == Some("just clippy"))
+    );
+    assert!(
+        !steps
+            .iter()
+            .any(|s| s["run"].as_str() == Some("just clippy-linux"))
+    );
+}
