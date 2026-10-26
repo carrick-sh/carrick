@@ -17,6 +17,16 @@ use carrick_image::PullPolicy;
 /// AGENTS.md's default guest (frame pointers, so `carrick trace` can walk it).
 pub const SMOKE_IMAGE: &str = "docker.io/library/ubuntu:24.04";
 
+/// Qualify native exec stability on one signed executable identity. Every
+/// round is mandatory; a panic stops the population at its first failure.
+pub fn native_exec_three_rounds(name: &str, mut run: impl FnMut()) {
+    for round in 1..=3 {
+        println!("native-exec-round case={name} round={round} started");
+        run();
+        println!("native-exec-round case={name} round={round} passed");
+    }
+}
+
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Serialize guest-running tests inside one process: HVF allows one VM per
