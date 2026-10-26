@@ -1077,6 +1077,7 @@ fn serve_clone<'a>(
         }
         return None;
     }
+    child_slot.bind_zone_record(record);
     if !outputs.publish(identity.visible_tid, native) {
         native.free_record(record);
         if page.unclaim(claimed).is_err() {
