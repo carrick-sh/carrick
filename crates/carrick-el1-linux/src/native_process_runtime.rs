@@ -2230,6 +2230,42 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime.task_binding(process).map(|binding| binding.address)
     }
 
+    /// Resolve the process identity for a native-owned record that the ring
+    /// has selected before its first native-registry entry. The lifecycle page
+    /// and MM generation make this a thread-group lookup, not an MM-only
+    /// adoption; ambiguity fails closed.
+    #[cfg(any(test, target_os = "none"))]
+    pub(super) fn unregistered_visible_pid(
+        &self,
+        zone: &ZoneTables<C>,
+        record: RecordRef,
+    ) -> Option<u32> {
+        if !signal_record_exists(zone, record) {
+            return None;
+        }
+        let identity = zone.record(record.id).identity();
+        let carrier = core::ptr::from_ref(zone).addr();
+        let page = usize::try_from(identity.lifecycle_page).ok()?;
+        let state = self.state.lock();
+        let mut found = None;
+        for (&(_, mm, _, group_page, visible_pid), (runtime, _)) in state
+            .groups
+            .range((carrier, 0, 0, 0, 0)..=(carrier, u64::MAX, u64::MAX, usize::MAX, u32::MAX))
+        {
+            if mm != identity.mm || group_page != page {
+                continue;
+            }
+            // SAFETY: the caller owns the selected record through its
+            // first-entry checkpoint.
+            if unsafe { runtime.resume_visible_pid(record) } != Some(visible_pid)
+                || found.replace(visible_pid).is_some()
+            {
+                return None;
+            }
+        }
+        found
+    }
+
     /// Classify the admitted thread group at whatever address incarnation.
     /// Root and fork-child groups have distinct exec authority until native
     /// child exec is implemented.

@@ -3430,6 +3430,39 @@ fn imported_thread_on_control_and_slot(
 }
 
 #[test]
+fn unregistered_in_zone_thread_restores_process_identity_across_slots() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+
+    let peer = SlotId::new(1);
+    fixture.zone.drive(peer, fixture.leader.mm);
+    fixture
+        .zone
+        .publish_slot(peer, fixture.leader.mm, Some(1), 2);
+    fixture.zone.enter_guest(peer);
+    fixture.zone.install_space(peer, fixture.leader.mm).unwrap();
+    let (_, record) = imported_thread_on_slot(fixture, peer, |identity| {
+        identity.generation = fixture.leader.generation;
+    });
+    assert!(registry().for_record(fixture.zone, record).is_none());
+
+    fixture.task.publish_visible_pid(99);
+    let visible_pid = registry()
+        .unregistered_visible_pid(fixture.zone, record)
+        .expect("exact lifecycle page and address must recover the process identity");
+    fixture.task.publish_visible_pid(visible_pid);
+    assert_eq!(fixture.task.visible_pid(), Some(fixture.leader.tid as u32));
+}
+
+#[test]
 fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
     for notified in [false, true] {
         let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
