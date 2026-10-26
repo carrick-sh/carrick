@@ -1842,7 +1842,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
 
 #[cfg(test)]
 #[test]
-fn arm_terminal_child_retirement_and_parent_handback_once() {
+fn arm_terminal_child_retirement_places_stopped_slot_waiter() {
     arm_child_wait_wake(false, false);
 }
 
@@ -1855,6 +1855,11 @@ fn arm_in_ring_wait4_wake_resumes_owner_before_eret() {
 #[test]
 fn arm_physical_retirement_wait4_wake_resumes_owner_before_eret() {
     arm_child_wait_wake_with_stock(true, false, true);
+}
+
+#[test]
+fn arm_stopped_slot_physical_retirement_wait4_wake_resumes_owner_before_eret() {
+    arm_child_wait_wake_with_stock(false, false, true);
 }
 
 #[cfg(test)]
@@ -1871,9 +1876,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
 #[cfg(test)]
 fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) {
     let fixture = Fixture::new(0x10000, asid(1));
-    if in_ring || physical {
-        fixture.zone.spaces.set_idle_ttbr(0x30000);
-    }
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -2067,6 +2070,9 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         // continuation, and the child is the last execution on this slot.
         if !in_ring {
             fixture.zone.publish_slot(fixture.slot, 0, Some(0), 1);
+            fixture
+                .zone
+                .leave_guest(fixture.slot, &carrick_sched_core::ShortLockSpin);
         }
         let exit_outcome = child_entry.exit_group(9);
         assert_eq!(child_entry.take_run_failure(), None);
@@ -2154,33 +2160,61 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         assert_eq!(frame.x[0], u64::from(child_pid));
         assert_eq!(fixture.task.visible_pid(), Some(41));
     } else {
-        assert_eq!(crossing.handbacks.load(Ordering::Acquire), 1);
+        assert_eq!(crossing.handbacks.load(Ordering::Acquire), 0);
         assert_eq!(
             fixture.zone.record(parent_binding.record.id).claim(),
-            carrick_sched_core::Claim::Host {
+            carrick_sched_core::Claim::Queued {
+                slot: fixture.slot,
                 seq: fixture
                     .zone
                     .next_seq(parent_binding.record.id)
                     .wrapping_sub(1)
             }
         );
-        fixture.zone.publish_slot(fixture.slot, 1, Some(0), 1);
-        fixture.zone.install_space(fixture.slot, 1).unwrap();
         assert!(
             fixture
                 .zone
-                .place_from_host(parent_binding.record.id)
-                .is_some()
+                .record(parent_binding.record.id)
+                .is_native_owned()
         );
-        let parent_binding = runtime.task_binding(parent_key).unwrap();
-        activate(source, &fixture.task, &parent_binding);
-        let mut parent_entry = runtime
-            .enter(source, &fixture.task, parked, &mut service)
-            .unwrap();
-        assert!(matches!(
-            parent_entry.resume_pending_wait(),
-            Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == child_pid as i64
-        ));
+        assert_eq!(
+            fixture.zone.record(parent_binding.record.id).identity().mm,
+            parent_binding.address.mm.raw().get()
+        );
+        assert!(!fixture.zone.record(parent_binding.record.id).needs_host());
+        assert!(!fixture.zone.head_needs_host(fixture.slot));
+        assert!(
+            fixture
+                .zone
+                .spaces
+                .is_open(parent_binding.address.mm.raw().get())
+        );
+        fixture.zone.enter_guest(fixture.slot);
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        let mut cpu = ResumeCpu {
+            inner: crate::sched::FakeCpu::default(),
+            runtime: &runtime,
+            registry: owner_registry,
+            source,
+            task: &fixture.task,
+            service: &mut service,
+        };
+        let counters = carrick_el1_abi::Counters::new();
+        assert_eq!(
+            (crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot: fixture.slot,
+                task: &fixture.task,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            })
+            .run_next(&mut frame, 0),
+            crate::sched::Served::Returned { switched: true }
+        );
+        assert_eq!(frame.x[0], u64::from(child_pid));
+        assert_eq!(fixture.task.visible_pid(), Some(41));
     }
     assert_eq!(
         status_storage,

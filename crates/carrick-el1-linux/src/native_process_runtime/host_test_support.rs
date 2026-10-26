@@ -1535,7 +1535,8 @@ fn carrier_work_wake_preserves_the_completed_syscall_result() {
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
-        .words;
+        .words
+        .with_syscall_return(0);
     let mut resumed = fixture
         .runtime
         .enter_registered(
