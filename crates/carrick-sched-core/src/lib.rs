@@ -4717,6 +4717,55 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         })
     }
 
+    /// Prompt an exact native-owned member after its semantic owner published
+    /// sticky checkpoint work. Native members have no host continuation to wake.
+    /// The caller retains the member/control incarnation across this call.
+    /// Running/queued producers keep custody; a parked member is detached under
+    /// transfer custody and queued only after all its wait links are removed.
+    pub fn prompt_native_checkpoint(
+        &self,
+        reference: RecordRef,
+        waker: SlotId,
+        effects: &mut WakeEffects,
+    ) -> bool {
+        let rec = self.record(reference.id);
+        loop {
+            if rec.incarnation() != reference.incarnation || !rec.is_native_owned() {
+                return false;
+            }
+            match rec.claim() {
+                from @ Claim::Parked { .. } => {
+                    let Some(transfer) = self.begin_host_transfer(reference, from) else {
+                        continue;
+                    };
+                    self.unlink_all(reference.id, &ShortLockSpin);
+                    self.mark_woken(rec, 0);
+                    if transfer.publish().is_none() {
+                        return false;
+                    }
+                    let Some(placed) = self.requeue_on(waker, reference.id) else {
+                        return false;
+                    };
+                    if placed.resched {
+                        effects.request_reschedule(placed.slot);
+                    }
+                    effects.queued_own = true;
+                    return true;
+                }
+                Claim::Queued { slot, .. }
+                | Claim::OnCpu { slot, .. }
+                | Claim::OnCpuRequested { slot, .. } => {
+                    effects.request_reschedule(slot);
+                    return true;
+                }
+                Claim::Free => return false,
+                // An admitted producer retains delivery. Its next selection
+                // observes the owner's already-published checkpoint work.
+                _ => return true,
+            }
+        }
+    }
+
     /// The host takes `r` for `kind` (a signal, a timeout, a control wake or
     /// a cancellation). With `seq`, only that park may be claimed (a timeout
     /// belongs to the park that armed it). On success every queue entry is

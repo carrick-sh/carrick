@@ -822,32 +822,7 @@ pub trait Lifecycle {
     where
         Self: Sized,
     {
-        loop {
-            let (generation, state) = self.state(r.index()).ok_or(TransitionError::NoSuchEntry)?;
-            if generation != r.generation() {
-                return Err(TransitionError::StaleGeneration);
-            }
-            let target = match state {
-                EntryState::Born => EntryState::ExitingBorn,
-                EntryState::Published => EntryState::ExitingPublished,
-                _ => return Err(TransitionError::WrongState(state)),
-            };
-            match self.transition(r, &[state], target, Ordering::SeqCst) {
-                Err(TransitionError::WrongState(_)) => continue,
-                Err(error) => return Err(error),
-                Ok(()) => break,
-            }
-        }
-        let admission = ExitAdmission {
-            page: self,
-            entry: r,
-            committed: false,
-        };
-        let gate = self.gate();
-        if gate != GateState::Open {
-            return Err(TransitionError::GateClosed(gate));
-        }
-        Ok(admission)
+        begin_member_exit(self, r, MemberExitAdmission::Ordinary)
     }
 
     /// Canonical host retirement of an adopted birth. The host owns execution
@@ -872,9 +847,54 @@ pub trait Lifecycle {
     }
 }
 
+pub(crate) enum MemberExitAdmission {
+    Ordinary,
+    Cancelled,
+}
+
+/// Only terminal custody may admit a cancelled member after process Closing.
+pub(crate) fn begin_member_exit<'a>(
+    page: &'a impl Lifecycle,
+    r: EntryRef,
+    kind: MemberExitAdmission,
+) -> Result<ExitAdmission<'a>, TransitionError> {
+    loop {
+        let (generation, state) = page.state(r.index()).ok_or(TransitionError::NoSuchEntry)?;
+        if generation != r.generation() {
+            return Err(TransitionError::StaleGeneration);
+        }
+        let target = match state {
+            EntryState::Born => EntryState::ExitingBorn,
+            EntryState::Published => EntryState::ExitingPublished,
+            _ => return Err(TransitionError::WrongState(state)),
+        };
+        match page.transition(r, &[state], target, Ordering::SeqCst) {
+            Err(TransitionError::WrongState(_)) => continue,
+            Err(error) => return Err(error),
+            Ok(()) => break,
+        }
+    }
+    let admission = ExitAdmission {
+        page,
+        entry: r,
+        committed: false,
+    };
+    let gate = page.gate();
+    let admitted = match kind {
+        MemberExitAdmission::Ordinary => gate == GateState::Open,
+        MemberExitAdmission::Cancelled => {
+            gate == GateState::Closed && page.process_exit_custody().caller_reserved()
+        }
+    };
+    if !admitted {
+        return Err(TransitionError::GateClosed(gate));
+    }
+    Ok(admission)
+}
+
 #[must_use]
 pub struct NonfinalExitMembership<'a> {
-    page: &'a dyn Lifecycle,
+    pub(crate) page: &'a dyn Lifecycle,
     reserved: Option<ReservedLiveUnit>,
 }
 

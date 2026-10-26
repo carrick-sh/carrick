@@ -960,6 +960,34 @@ impl TerminalCustody<Thread, Exiting> {
 }
 
 impl TerminalCustody<Thread, Terminal> {
+    /// Retire the selected native member under the process's reserved Closing
+    /// custody. This publishes an in-zone receipt, never a host acknowledgment.
+    pub fn cancel_in_zone(
+        self,
+        page: &impl Lifecycle,
+        member: &impl crate::lifecycle::MemberControl,
+        membership: NonfinalExitMembership<'_>,
+    ) -> Result<RetirementVerdict, crate::lifecycle::TransitionError> {
+        let entry = self
+            .identity
+            .entry()
+            .ok_or(crate::lifecycle::TransitionError::StaleGeneration)?;
+        if member.member_entry() != Some(entry)
+            || !core::ptr::addr_eq(page, membership.page)
+            || !member.exit_custody().host_exit_requested()
+        {
+            return Err(crate::lifecycle::TransitionError::StaleGeneration);
+        }
+        crate::lifecycle::begin_member_exit(
+            page,
+            entry,
+            crate::lifecycle::MemberExitAdmission::Cancelled,
+        )?
+        .commit_with_member(member)?;
+        membership.publish();
+        Ok(self.into_verdict(page))
+    }
+
     pub fn into_verdict(self, page: &impl Lifecycle) -> RetirementVerdict {
         RetirementVerdict::RetireThread {
             identity: self.identity,
