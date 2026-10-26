@@ -6645,7 +6645,7 @@ where
             }
         };
 
-        let native_exec_capability = match kernel.native_exec_capability() {
+        let native_exec_capability = match kernel.take_native_exec_capability() {
             Ok(capability) => capability,
             Err(error) => {
                 prepared.fail_exact();
@@ -6654,13 +6654,20 @@ where
                 ))));
             }
         };
-        if let Err(error) = authority.install_native_exec_service(
+        let native_exec_registration = match authority.install_native_exec_service(
             native_exec_capability.id(),
             native_exec_capability
                 as Arc<dyn carrick_vmm_hvf::metadata_grant::NativeExecHostService>,
         ) {
+            Ok(registration) => registration,
+            Err(error) => {
+                prepared.fail_exact();
+                return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
+            }
+        };
+        if let Err(error) = kernel.install_native_exec_registration(native_exec_registration) {
             prepared.fail_exact();
-            return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
+            return VcpuLoopLaunch::Direct(Err(error));
         }
 
         // No guest has entered: its start gate remains held. The extracted
