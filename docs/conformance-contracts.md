@@ -1551,6 +1551,17 @@ Failure stays visible, and a subsequent carrier can acquire a new window. Actual
 remain signed bindings; the production HVF custody owner invalidates that
 pool only after successful VM destruction.
 
+### Idle execution custody (`kernel.el1.thread-lifecycle`)
+
+An idle slot can run a native record without loading a host task. Its installed
+MM is translation authority, not execution custody for host-owned records in
+that MM. Neutral scheduler admission sends such successors and stolen records
+to the executor before publishing `OnCpu`; native successors remain runnable.
+The two `idle_native_mm_*` scheduler witnesses fail on the prior installed-MM
+shortcut and preserve the exact saved context through handback and driver
+release. Signed lifecycle, parked-thread, pipe and fork-COW populations remain
+the hardware binding; VM-free admission alone does not qualify those runs.
+
 ## Native close with a host-loaded member (`kernel.el1.thread-lifecycle`)
 
 A native process close publishes cancellation for every exact outstanding
