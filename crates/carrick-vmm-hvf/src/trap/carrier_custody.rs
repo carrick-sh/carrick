@@ -641,6 +641,12 @@ pub(crate) struct Stage2PublicationAuthority {
 }
 
 impl Stage2PublicationAuthority {
+    /// Commit the publication transaction. Drop performs the wake after the
+    /// caller's directory and stage-1 locks have left scope.
+    pub(crate) fn commit(mut self) {
+        self.identity.take();
+    }
+
     pub(crate) fn rollback(mut self) -> NeverPublishedRecord {
         NeverPublishedRecord {
             identity: self
@@ -1786,7 +1792,10 @@ impl CarrierVmCustody {
         map: impl FnOnce(CarrierStage2RecordIdentity) -> i32,
     ) -> Result<CarrierStage2RecordIdentity, TrapError> {
         self.publish_unpublished_stage2_record_using(spec, map)
-            .map(|(identity, _rollback)| identity)
+            .map(|(identity, publication)| {
+                publication.commit();
+                identity
+            })
     }
 
     /// Map a record inside a larger publication transaction. The returned

@@ -844,8 +844,9 @@ fn replacement_completion_and_rollback_touch_the_right_owner() {
             "retirement.planned_leases != pending.predecessor_leases",
             "FrameRegistryGuard::acquire(",
             "commit_process_alias_retirement(",
-            "&registry)",
+            "&registry,",
             "register_shared_alias(pending.alias)",
+            "publication.commit()",
             "drop(registry)",
         ],
     );

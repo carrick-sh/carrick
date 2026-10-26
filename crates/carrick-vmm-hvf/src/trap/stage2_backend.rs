@@ -1552,7 +1552,10 @@ pub(crate) fn install_ipc_window_using(
     }
     let records: [CarrierStage2RecordIdentity; 2] = records
         .into_iter()
-        .map(|(identity, _rollback)| identity)
+        .map(|(identity, publication)| {
+            publication.commit();
+            identity
+        })
         .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| TrapError::Hypervisor("IPC window installation lost a record".to_owned()))?;

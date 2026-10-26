@@ -29,6 +29,14 @@ pub(super) struct PublishedFrameGrant {
     pub(super) rollback: Option<Stage2PublicationAuthority>,
 }
 
+impl PublishedFrameGrant {
+    fn commit_stage2_publication(&mut self) {
+        if let Some(publication) = self.rollback.take() {
+            publication.commit();
+        }
+    }
+}
+
 pub(super) fn frame_grant_local_lease_is_current(
     lease: (u64, u64, u64),
     mut aliases: impl Iterator<Item = (u64, u64, u64)>,
@@ -2811,7 +2819,9 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
             // Completion callbacks may immediately retire this exact owner.
             // Release the publisher's temporary pin before publishing readiness.
             drop(self.pin.take());
-            self.publication.take();
+            if let Some(mut publication) = self.publication.take() {
+                publication.commit_stage2_publication();
+            }
         } else if let Err(error) = result {
             if let carrick_aarch64::descriptor_drain::GuestPublishError::Unsettled(error) =
                 carrick_aarch64::descriptor_drain::GuestPublishError::from_settle(
@@ -3139,7 +3149,7 @@ impl PendingImport<'_> {
                 "import admission receipt mismatch".into(),
             ));
         }
-        let publication = self.pending.publication.take().unwrap_or_else(|| {
+        let mut publication = self.pending.publication.take().unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::user_transfer",
                 "pending import lost physical publication"
@@ -3147,6 +3157,7 @@ impl PendingImport<'_> {
         });
         self.descriptor_undo.commit();
         drop(self.pending.pin.take());
+        publication.commit_stage2_publication();
         Ok(publication.ready)
     }
 }

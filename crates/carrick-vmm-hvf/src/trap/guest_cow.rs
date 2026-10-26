@@ -250,8 +250,12 @@ pub(crate) fn allocate_grant_extent(
     stage2_perms: applevisor::memory::MemPerms,
     length: u64,
 ) -> Result<(*mut u8, u64, u64), TrapError> {
-    allocate_unpublished_grant_extent(custody, stage2_perms, length)
-        .map(|(host, ipa, generation, _rollback)| (host, ipa, generation))
+    allocate_unpublished_grant_extent(custody, stage2_perms, length).map(
+        |(host, ipa, generation, publication)| {
+            publication.commit();
+            (host, ipa, generation)
+        },
+    )
 }
 
 fn allocate_unpublished_grant_extent(

@@ -1778,10 +1778,13 @@ impl HvfVmState {
                 grant.mm_key, identity.mm
             )));
         }
-        let Some(pending) = self.el1_grant_publications.lock().take(&grant) else {
+        let Some(mut pending) = self.el1_grant_publications.lock().take(&grant) else {
             return Ok(());
         };
         if pending.predecessor_leases.is_empty() {
+            if let Some(publication) = pending.rollback.take() {
+                publication.commit();
+            }
             return Ok(()); // Fresh alias is already installed; receipt proves publication.
         }
         let len = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
@@ -1805,6 +1808,9 @@ impl HvfVmState {
             None,
         )?;
         register_shared_alias(pending.alias);
+        if let Some(publication) = pending.rollback.take() {
+            publication.commit();
+        }
         drop(registry);
         Ok(())
     }

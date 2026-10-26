@@ -1708,13 +1708,14 @@ pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
     perms: u64,
     logical_owner: Option<CarrierLogicalOwner>,
 ) -> Result<CarrierStage2RecordIdentity, TrapError> {
-    let (identity, _rollback) = transfer_unpublished_global_frame_stage2_lease_to_custody(
+    let (identity, publication) = transfer_unpublished_global_frame_stage2_lease_to_custody(
         custody,
         lease,
         host_addr,
         perms,
         logical_owner,
     )?;
+    publication.commit();
     Ok(identity)
 }
 
@@ -1834,7 +1835,10 @@ pub(crate) fn register_global_frame_host_owner_in_using(
         perms,
         rollback_unmap,
     )
-    .map(|(generation, _rollback)| generation)
+    .map(|(generation, publication)| {
+        publication.commit();
+        generation
+    })
 }
 
 pub(crate) fn register_unpublished_global_frame_host_owner_in(
@@ -2033,8 +2037,12 @@ pub(crate) fn register_pooled_global_frame_host_owner_in(
     handle: crate::frame_pool::PooledFrameHandle,
     perms: u64,
 ) -> Result<u64, TrapError> {
-    register_unpublished_pooled_global_frame_host_owner_in(custody, handle, perms)
-        .map(|(generation, _rollback)| generation)
+    register_unpublished_pooled_global_frame_host_owner_in(custody, handle, perms).map(
+        |(generation, publication)| {
+            publication.commit();
+            generation
+        },
+    )
 }
 
 /// Publish the host backing owner for a prepared exec mapping and stamp its
@@ -2582,7 +2590,9 @@ impl StructuralBackingOwner {
     }
 
     pub(crate) fn commit_stage1_publication(&self) {
-        let _ = self.retained.rollback.lock().take();
+        if let Some(publication) = self.retained.rollback.lock().take() {
+            publication.commit();
+        }
     }
 }
 

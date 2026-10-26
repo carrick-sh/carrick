@@ -1759,7 +1759,9 @@ impl GlobalFrameOwnerRollback {
     }
 
     pub(crate) fn commit(mut self) {
-        self.keys.clear();
+        for (_, publication) in self.keys.drain(..) {
+            publication.commit();
+        }
     }
 
     pub(crate) fn take(&mut self, key: (u64, u64)) -> Option<Stage2PublicationAuthority> {
