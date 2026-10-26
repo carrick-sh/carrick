@@ -2,6 +2,11 @@
   "schema": 1,
   "authority_debt": [
     {
+      "from": "carrick_runtime::vcpu_loop::executor::backend::publish_zone_slot",
+      "to": "carrick_runtime::vcpu_loop::executor::backend::fail_zone_slot",
+      "issue": 784
+    },
+    {
       "from": "carrick_vmm_hvf::host_signal::<ThreadWaitersForkGuard as Drop>::drop",
       "to": "carrick_signal_linux::fork_reset::<ForkBackingGuard<T,G> as Drop>::drop",
       "issue": 488
