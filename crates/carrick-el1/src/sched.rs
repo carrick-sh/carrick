@@ -668,6 +668,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         frame: &mut TrapFrame,
         action: carrick_el1_abi::Action,
     ) -> carrick_el1_abi::Action {
+        // `Idle` already parked the running thread (an affinity park, a
+        // preemption park or a failed preempt): the vCPU leaves through the
+        // service exit with no thread loaded, and pending host work rides
+        // that exit. Rewriting it to `Forward` would leave at EL0 with no
+        // host task loaded and retire the executor.
+        if action == carrick_el1_abi::Action::Idle {
+            return action;
+        }
         if !self.task.linux.has_pending_host_work() {
             if action == carrick_el1_abi::Action::Forward {
                 self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
