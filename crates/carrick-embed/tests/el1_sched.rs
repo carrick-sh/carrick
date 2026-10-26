@@ -1143,6 +1143,33 @@ fn el1_sched_exec_from_a_sibling_with_parked_threads() {
     }
 }
 
+/// Root-image replacement must leave the successor's private-fault machinery
+/// fully live: its sparse first touches and its post-fork COW both complete.
+#[test]
+fn native_exec_successor_handles_cow_and_sparse_backing_faults() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let faults_before = read_el1_counters().map_or(0, |counters| {
+        counters
+            .fault_taken
+            .load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let measured = run_fixture(
+        &carrier,
+        &["exec-successor-memory"],
+        Duration::from_secs(90),
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    assert_eq!(measured.result.stdout_utf8(), "exec-successor-memory ok\n");
+    let faults_after = read_el1_counters().map_or(0, |counters| {
+        counters
+            .fault_taken
+            .load(std::sync::atomic::Ordering::Relaxed)
+    });
+    assert!(faults_after.saturating_sub(faults_before) >= 4);
+}
+
 /// Contract `kernel.el1.guest-scheduler` (EL1 plan 1c), part (a): two threads
 /// pinned to different guest CPUs ping-pong through
 /// `FUTEX_WAIT_PRIVATE`/`FUTEX_WAKE_PRIVATE`, each computing for a while with
