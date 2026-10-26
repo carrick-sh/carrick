@@ -202,7 +202,9 @@ jobs:
   changes:
     name: changes
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Restoring the 3 GiB shared compiler cache and building xtask can take
+    # over five minutes on a slow runner; a cancelled `changes` fails ci-ok.
+    timeout-minutes: 12
     permissions:
       contents: read
       pull-requests: read
