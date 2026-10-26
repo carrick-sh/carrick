@@ -523,9 +523,14 @@ pub(crate) struct KernelState {
     control_exec: Mutex<Option<carrick_kernel::kernel::control::ExecRuntime>>,
     external_exec: Mutex<Option<carrick_kernel::kernel::control::ExecWork>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    native_exec_capability: Option<
-        Result<Arc<crate::runtime::exec::NativeExecCapability>, crate::linux_abi::LinuxErrno>,
+    native_exec_capability: Mutex<
+        Option<
+            Result<Arc<crate::runtime::exec::NativeExecCapability>, crate::linux_abi::LinuxErrno>,
+        >,
     >,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    native_exec_registration:
+        Mutex<Option<carrick_vmm_hvf::metadata_grant::NativeExecServiceRegistration>>,
 }
 
 impl KernelState {
@@ -572,20 +577,47 @@ impl KernelState {
             control_exec: Mutex::new(None),
             external_exec: Mutex::new(None),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            native_exec_capability,
+            native_exec_capability: Mutex::new(native_exec_capability),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            native_exec_registration: Mutex::new(None),
         }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(crate) fn native_exec_capability(
+    pub(crate) fn take_native_exec_capability(
         &self,
     ) -> Result<Arc<crate::runtime::exec::NativeExecCapability>, crate::linux_abi::LinuxErrno> {
         self.native_exec_capability
-            .as_ref()
+            .lock()
+            .take()
             .ok_or(crate::linux_abi::LINUX_ESRCH)?
-            .as_ref()
-            .map(Arc::clone)
-            .map_err(|error| *error)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn install_native_exec_registration(
+        &self,
+        registration: carrick_vmm_hvf::metadata_grant::NativeExecServiceRegistration,
+    ) -> Result<(), RuntimeError> {
+        let mut installed = self.native_exec_registration.lock();
+        if installed.is_some() {
+            return Err(RuntimeError::Configuration(
+                "native exec service registration already installed".to_owned(),
+            ));
+        }
+        *installed = Some(registration);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn retire_native_exec_registration(&self) -> Result<(), RuntimeError> {
+        let Some(registration) = self.native_exec_registration.lock().take() else {
+            return Ok(());
+        };
+        registration.retire().map_err(|error| {
+            RuntimeError::Configuration(format!(
+                "native exec service registration retirement failed: {error:?}"
+            ))
+        })
     }
 
     pub(crate) fn pt_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::PtQuiesce> {

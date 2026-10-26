@@ -3,9 +3,14 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod native_service;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use native_service::NativeExecServiceDirectory;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use native_service::settle_native_cow;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub use native_service::{NativeExecHostService, NativeExecPreparation, NativeService};
+pub use native_service::{
+    NativeExecHostService, NativeExecPreparation, NativeExecRegistrationError,
+    NativeExecServiceRegistration, NativeService,
+};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn take_native_service(
     custody: &Arc<crate::trap::CarrierVmCustody>,

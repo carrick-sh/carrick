@@ -580,8 +580,16 @@ where
     if owns_hvpatch_run {
         kernel.dispatcher.cleanup_sysv_ipc_on_run_exit();
     }
+    // The carrier directory, not this local Arc, owns the retained exec file
+    // and loader capabilities after installation.  Release that exact
+    // registration only after every logical process and executor has joined,
+    // and before the outer run retires its container mount table.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let native_exec_retirement = kernel.retire_native_exec_registration();
     let outcome = outcome?;
     process_join?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    native_exec_retirement?;
 
     let result = match terminal? {
         Some(Ok(result)) => result,

@@ -462,12 +462,8 @@ pub struct CarrierVmCustody {
     /// into the state its executors use, never a stale copy found by scan.
     pub(crate) guest_cow_states:
         parking_lot::Mutex<std::collections::HashMap<u64, std::sync::Weak<MmAccessState>>>,
-    pub(crate) native_exec_services: parking_lot::Mutex<
-        Vec<(
-            carrick_core_abi::service::ExecCapabilityId,
-            std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>,
-        )>,
-    >,
+    pub(crate) native_exec_services:
+        std::sync::Arc<crate::metadata_grant::NativeExecServiceDirectory>,
     pub(crate) native_exec_preparations: parking_lot::Mutex<Vec<RetainedNativeExecPreparation>>,
     pub(crate) native_exec_predecessors: parking_lot::Mutex<
         Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<carrick_hal::asid::AsidGeneration>>,
@@ -481,24 +477,18 @@ impl CarrierVmCustody {
         &self,
         capability: carrick_core_abi::service::ExecCapabilityId,
         service: std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>,
-    ) -> Result<(), ()> {
-        let mut services = self.native_exec_services.lock();
-        if services.iter().any(|(id, _)| *id == capability) {
-            return Err(());
-        }
-        services.push((capability, service));
-        Ok(())
+    ) -> Result<
+        crate::metadata_grant::NativeExecServiceRegistration,
+        crate::metadata_grant::NativeExecRegistrationError,
+    > {
+        self.native_exec_services.install(capability, service)
     }
 
     pub(crate) fn native_exec_service(
         &self,
         capability: carrick_core_abi::service::ExecCapabilityId,
     ) -> Option<std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>> {
-        self.native_exec_services
-            .lock()
-            .iter()
-            .find(|(id, _)| *id == capability)
-            .map(|(_, service)| std::sync::Arc::clone(service))
+        self.native_exec_services.service(capability)
     }
 
     pub(crate) fn reserve_native_exec_receipt(
@@ -821,7 +811,9 @@ impl CarrierVmCustody {
             frame_pool: parking_lot::Mutex::new(CarrierFramePoolState::Uninitialized),
             root_slot_pool: parking_lot::Mutex::new(CarrierRootSlotPoolState::Uninitialized),
             guest_cow_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            native_exec_services: parking_lot::Mutex::new(Vec::new()),
+            native_exec_services: std::sync::Arc::new(
+                crate::metadata_grant::NativeExecServiceDirectory::default(),
+            ),
             native_exec_preparations: parking_lot::Mutex::new(Vec::new()),
             native_exec_predecessors: parking_lot::Mutex::new(Vec::new()),
             native_exec_receipt_sequence: std::sync::atomic::AtomicU64::new(0),

@@ -2728,7 +2728,10 @@ impl PersistentExecutorSpec {
         &self,
         capability: carrick_core_abi::service::ExecCapabilityId,
         service: std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>,
-    ) -> Result<(), ()> {
+    ) -> Result<
+        crate::metadata_grant::NativeExecServiceRegistration,
+        crate::metadata_grant::NativeExecRegistrationError,
+    > {
         self.carrier_mappings
             .custody
             .install_native_exec_service(capability, service)
