@@ -426,19 +426,64 @@ impl ForkStockCrossing for TestStockCrossing {
                             core::mem::size_of::<ThreadLifecyclePage>().next_multiple_of(16384);
                         let chunk_bytes = (page_bytes + core::mem::size_of::<ControlsArray>())
                             .next_multiple_of(16384);
-                        let offset = NEXT_OFFSET.fetch_add(chunk_bytes as u64, Ordering::Relaxed);
-                        let hint = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + offset;
-                        let mapped = unsafe {
-                            libc::mmap(
-                                hint as *mut libc::c_void,
-                                chunk_bytes,
-                                libc::PROT_READ | libc::PROT_WRITE,
-                                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                                -1,
-                                0,
-                            )
+                        // Hosts may ignore a hint this low (macOS 27), and an
+                        // unrelated host allocation can already occupy part of
+                        // the window. Take the next chunk an exact,
+                        // non-replacing allocation admits.
+                        /// Map `len` zeroed read-write bytes at exactly `addr`, or `None` when any
+                        /// part of the range is already mapped. Never replaces an existing mapping.
+                        fn map_exact_unreplaced(
+                            addr: u64,
+                            len: usize,
+                        ) -> Option<*mut libc::c_void> {
+                            #[cfg(target_os = "macos")]
+                            {
+                                let mut at = addr as libc::vm_address_t;
+                                // SAFETY: a fixed allocation in this task fails rather than
+                                // replacing anything already mapped.
+                                #[allow(deprecated)]
+                                let status = unsafe {
+                                    libc::vm_allocate(
+                                        libc::mach_task_self(),
+                                        &mut at,
+                                        len,
+                                        libc::VM_FLAGS_FIXED,
+                                    )
+                                };
+                                (status == libc::KERN_SUCCESS).then_some(at as *mut libc::c_void)
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                // SAFETY: MAP_FIXED_NOREPLACE fails rather than replacing a mapping.
+                                let mapped = unsafe {
+                                    libc::mmap(
+                                        addr as *mut libc::c_void,
+                                        len,
+                                        libc::PROT_READ | libc::PROT_WRITE,
+                                        libc::MAP_PRIVATE
+                                            | libc::MAP_ANONYMOUS
+                                            | libc::MAP_FIXED_NOREPLACE,
+                                        -1,
+                                        0,
+                                    )
+                                };
+                                (mapped != libc::MAP_FAILED && mapped as u64 == addr)
+                                    .then_some(mapped)
+                            }
+                        }
+                        let mapped = loop {
+                            let offset =
+                                NEXT_OFFSET.fetch_add(chunk_bytes as u64, Ordering::Relaxed);
+                            assert!(
+                                offset + chunk_bytes as u64
+                                    <= carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
+                                "no free metadata window chunk left"
+                            );
+                            let hint = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + offset;
+                            if let Some(mapped) = map_exact_unreplaced(hint, chunk_bytes) {
+                                break mapped;
+                            }
                         };
-                        assert_ne!(mapped, libc::MAP_FAILED, "metadata mmap failed");
                         let base = mapped as u64;
                         assert!(
                             base.is_multiple_of(16384)
@@ -7752,14 +7797,14 @@ fn serial_host_native_fork_unpublished_parent_ipc_table_succeeds_without_einval(
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 struct LowVaBuffer {
     ptr: *mut u8,
     map_len: usize,
     len: usize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 impl LowVaBuffer {
     fn zeroed(len: usize) -> Self {
         static NEXT_HINT: AtomicU64 = AtomicU64::new(0x2000_0000);
@@ -7804,7 +7849,7 @@ impl LowVaBuffer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 impl Drop for LowVaBuffer {
     fn drop(&mut self) {
         unsafe {
@@ -7813,7 +7858,7 @@ impl Drop for LowVaBuffer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 fn activate_target(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,
@@ -7849,6 +7894,11 @@ fn activate_target(
     panic!("target record {:?} not runnable in slot", binding.record.id);
 }
 
+// Places host memory at the EL1 metadata window (0x2D_0800_0000). macOS 27
+// refuses every user allocation below 0x70_0000_0000 (even a fixed
+// `vm_allocate` in a fresh process), so this runs on Linux hosts, where
+// `just test` and the Linux CI lanes exercise it.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof() {
     use carrick_abi::{
@@ -8281,6 +8331,11 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     drop(reader);
 }
 
+// Places host memory at the EL1 metadata window (0x2D_0800_0000). macOS 27
+// refuses every user allocation below 0x70_0000_0000 (even a fixed
+// `vm_allocate` in a fresh process), so this runs on Linux hosts, where
+// `just test` and the Linux CI lanes exercise it.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe() {
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
