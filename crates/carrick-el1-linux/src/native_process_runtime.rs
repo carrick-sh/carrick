@@ -6001,6 +6001,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 );
             }
         });
+        // Retire descriptors while the stopped lane still retains its MM
+        // grant and control storage. retire_mm can release the space and
+        // reclaim/zero fork stock; no table crossing may follow that release.
+        self.service.retire_fd_table(file_table);
         // Graph removal (`publish_exit`) and member cancellation are complete.
         // Unregister from `NativeProcessRegistry` and release all
         // `MemberControlCustody` references (graph resources, registry member,
@@ -6029,7 +6033,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         {
             self.service.retire_mm(mm);
         }
-        self.service.retire_fd_table(file_table);
         // A parent may scan without waiting for our notification. Publish
         // status readiness only after the child stock and slot absence are
         // retired, so that scan cannot admit a fork against charged stock.

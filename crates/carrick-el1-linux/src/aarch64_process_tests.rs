@@ -163,6 +163,8 @@ struct TestStockCrossing {
     )>,
     #[cfg(test)]
     physical: Option<std::sync::Mutex<native_retirement_tests::PhysicalStock>>,
+    #[cfg(test)]
+    assert_retirement_mm: core::sync::atomic::AtomicBool,
     fd_map: Vec<carrick_el1_abi::FdMapSlot>,
     open_table: Vec<carrick_el1_abi::DelegatedOpenFile>,
     grant_tables: std::sync::Mutex<Vec<RootGpa>>,
@@ -219,6 +221,8 @@ impl TestStockCrossing {
             ),
             #[cfg(test)]
             physical: None,
+            #[cfg(test)]
+            assert_retirement_mm: core::sync::atomic::AtomicBool::new(false),
             total_returned_pages: AtomicU64::new(0),
             loans_requested: AtomicUsize::new(0),
             settlements_reserved: AtomicUsize::new(0),
@@ -252,6 +256,17 @@ impl ForkStockCrossing for TestStockCrossing {
         carrick_el1_abi::ipc::IpcRegion<'_>,
         &carrick_el1_abi::ipc_tables::IpcTableMap,
     )> {
+        if self.assert_retirement_mm.load(Ordering::Acquire) {
+            let zone = self.zone.lock().unwrap().unwrap();
+            let (binding, _) = self.child.lock().unwrap().unwrap();
+            let slot = SlotId::from_index(0).unwrap();
+            assert_eq!(
+                zone.installed_space(slot),
+                binding.mm.raw(),
+                "child IPC retirement must precede address-space release"
+            );
+            assert!(zone.spaces.find(binding.mm.raw()).is_some());
+        }
         self.ipc.as_ref().map(|(owner, map)| (owner.region(), *map))
     }
 
@@ -2067,6 +2082,11 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         child_binding.address,
     ));
 
+    #[cfg(test)]
+    crossing
+        .assert_retirement_mm
+        .store(physical, Ordering::Release);
+
     let mut child_service = Aarch64NativeProcessService::with_crossing(
         &child_task,
         fixture.slot,
@@ -2104,6 +2124,11 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
             }
         ));
     }
+
+    #[cfg(test)]
+    crossing
+        .assert_retirement_mm
+        .store(false, Ordering::Release);
 
     assert_eq!(
         crossing.retirements.load(Ordering::Acquire),
@@ -3123,6 +3148,84 @@ impl super::thread_setup::LifecycleVenue for Fixture {
         self.task.linux.mark_pending_host_work();
         Ok(())
     }
+}
+
+/// kernel.process.exit-owner: a root's pipe table remains in host custody.
+#[test]
+fn arm_nonfork_exit_with_open_pipe_keeps_host_table_custody() {
+    use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
+    use carrick_kernel::el1_zone::HostLockWait;
+
+    let owner = std::sync::Arc::new(carrick_kernel::el1_ipc::HostIpc::new(1 << 20).unwrap());
+    let host_table = carrick_kernel::el1_ipc::HostTable::create(owner.clone(), 64, 8).unwrap();
+    let table = host_table.id();
+    let object = owner.create_pipe(65536).unwrap();
+    let region = owner.region();
+    let authority = region.fd(HostLockWait);
+    for (number, end, access) in [
+        (3, pipe::End::Reader, fd::AccessMode::ReadOnly),
+        (4, pipe::End::Writer, fd::AccessMode::WriteOnly),
+    ] {
+        let description = fd::Description::new(
+            IpcBacking::Pipe { object, end }.encode(),
+            access,
+            fd::StatusFlags::default(),
+        );
+        let pin = authority.create_pinned(description).unwrap();
+        authority
+            .install_pin(table, fd::Fd(number), &pin, false)
+            .unwrap();
+        assert_eq!(authority.unpin(pin).unwrap(), None);
+    }
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let map_storage = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    // SAFETY: TestEl1Region retains aligned, zero-initialized ABI map storage.
+    let map = unsafe {
+        &*map_storage
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish(5, table.to_raw()).unwrap();
+    service.crossing.ipc = Some((owner.clone(), map));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    {
+        let mut entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        assert!(matches!(
+            entry.exit_group(0),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert_eq!(entry.take_run_failure(), None);
+        assert_eq!(
+            entry.take_root_exit(),
+            Some(carrick_personality_linux::lifecycle::LinuxWaitStatus::exited(0))
+        );
+    }
+    if authority.get(table, fd::Fd(3)).is_err() {
+        core::mem::forget(host_table);
+        panic!("native exit retired a host-owned root pipe table");
+    }
+    assert_eq!(map.lookup(5), Some(table.to_raw()));
+    assert_eq!(owner.drain_retired_tables().unwrap(), 0);
+    assert!(authority.get(table, fd::Fd(4)).is_ok());
+    drop(host_table);
 }
 
 #[test]

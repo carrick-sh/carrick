@@ -1522,7 +1522,8 @@ mod tests {
         assert_eq!(leaves(&w, IpcLeave::ObjectBusy), 1);
     }
 
-    #[test]    fn native_child_poll_on_inherited_pipe_parks_and_wakes_in_guest() {
+    #[test]
+    fn native_child_poll_on_inherited_pipe_parks_and_wakes_in_guest() {
         let mut w = world();
         let parent = w.table(w.a_tid);
         let (reader, writer, _) = w.pipe(parent, BLOCK);

@@ -915,6 +915,16 @@ before exit begins, and a rebound reservation with the same numeric transaction
 cannot release old effects or be erased by old rollback. Signed ARM binding and
 the live CPL0 two-MM witness remain open; no runtime-ratio claim is made.
 
+The ARM retirement bindings additionally cover descriptor custody:
+`arm_nonfork_exit_with_open_pipe_keeps_host_table_custody` requires the host-owned root namespace to remain published and usable, with
+both pipe ends open and zero queued native table retirements.
+`native_child_exit_reclaims_stock_before_carrier_structural_shutdown` requires
+the child descriptor-retirement hook while its exact MM is still installed and registered,
+before address-space release and physical fork-stock reclamation. Both use
+the production native exit owner; the first retains real host IPC descriptions,
+and the second composes the real physical-stock retirement owner with the
+VM-free crossing venue. Neither witness claims guest instruction execution.
+
 ## X86 retained shootdown debt (`x86-shootdown-reentry`)
 
 Surface: shared-MM page retirement on two live x86 KVM CPUs. Architectural
