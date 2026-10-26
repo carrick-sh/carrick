@@ -2432,7 +2432,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
                 return false;
             };
-            if s.driver() != Some(driver) || s.state().in_guest() {
+            if s.driver() != Some(driver) || s.state().in_guest() || s.current().is_some() {
                 return false;
             }
             s.drive.store(0, Ordering::Release);
@@ -4096,8 +4096,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let s = self.slot(slot);
         // The run queue is not the loaded thread's: what EL1 queued here
         // stays queued, and EL1 runs it after this thread or steals it.
-        s.terminal[0].store(0, Ordering::Release);
         let clean = s.current.load(Ordering::Acquire) == NIL && self.timer_deadline(slot).is_none();
+        if !clean {
+            return false;
+        }
+        s.terminal[0].store(0, Ordering::Release);
         s.current.store(NIL, Ordering::Release);
         s.host_record.store(NIL, Ordering::Release);
 
@@ -4109,7 +4112,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // preempt it at the first tick, and a slot whose threads all need
         // their executor would then turn over without progress.
         s.queued_since.store(0, Ordering::Release);
-        clean
+        true
     }
 
     /// Publish what the host loaded on `slot`: the zone key of its address
