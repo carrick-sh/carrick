@@ -80,6 +80,18 @@ pub trait TableArenaPublisher: Send + Sync {
 
 pub use carrick_core::mm::retirement::TableArenaRetirement;
 
+/// A table-capacity transaction distinguishes failure of the generic
+/// publisher from refusal by the backend which owns the retired capacity.
+/// Keeping `Backend` typed lets lifecycle policy preserve retryable custody
+/// instead of flattening a refusal into a carrier/hypervisor error.
+#[derive(Debug)]
+pub enum TableCapacityRetirementError<E> {
+    /// The generic table-arena publisher could not discharge its authority.
+    Publisher(String),
+    /// The backend refused the physical retirement while retaining custody.
+    Backend(E),
+}
+
 mod edit_license_sealed {
     pub trait Sealed {}
 
@@ -1347,13 +1359,13 @@ impl Stage1Authority {
     /// the remaining capacity. No other MM's structural backing is selected.
     /// The callback also runs without a software image and must not re-enter
     /// this authority. Terminal disposition revokes the image before unlock.
-    pub fn retire_table_capacity<R>(
+    pub fn retire_table_capacity<R, E>(
         &self,
         root: Option<u64>,
         disposition: TableArenaRetirement,
-        mut retire_owned: impl FnMut(u64) -> Result<(), String>,
-        retire_root: impl FnOnce(Option<&PageTableManager>) -> Result<R, String>,
-    ) -> Result<R, String> {
+        mut retire_owned: impl FnMut(u64) -> Result<(), E>,
+        retire_root: impl FnOnce(Option<&PageTableManager>) -> Result<R, E>,
+    ) -> Result<R, TableCapacityRetirementError<E>> {
         let (result, image, source) = {
             let mut inner = self.inner.lock();
             let detached = inner
@@ -1363,12 +1375,16 @@ impl Stage1Authority {
                 .unwrap_or_default();
             if !detached.is_empty() {
                 let publisher = inner.arena_publisher.clone().ok_or_else(|| {
-                    "published table capacity has no physical retirement authority".to_owned()
+                    TableCapacityRetirementError::Publisher(
+                        "published table capacity has no physical retirement authority".to_owned(),
+                    )
                 })?;
                 for receipt in &detached {
                     let base = receipt.base();
                     if Some(base) != root && inner.published_arenas.contains(&base) {
-                        publisher.retire_published_raw_table_arena(receipt)?;
+                        publisher
+                            .retire_published_raw_table_arena(receipt)
+                            .map_err(TableCapacityRetirementError::Publisher)?;
                         inner
                             .published_arenas
                             .retain(|candidate| *candidate != base);
@@ -1385,12 +1401,13 @@ impl Stage1Authority {
                 .filter(|base| Some(*base) != root)
                 .collect::<Vec<_>>();
             for base in remaining {
-                retire_owned(base)?;
+                retire_owned(base).map_err(TableCapacityRetirementError::Backend)?;
                 inner
                     .published_arenas
                     .retain(|candidate| *candidate != base);
             }
-            let result = retire_root(inner.manager.as_ref())?;
+            let result = retire_root(inner.manager.as_ref())
+                .map_err(TableCapacityRetirementError::Backend)?;
             let (image, source) = if disposition == TableArenaRetirement::Terminal {
                 inner.host_resolver = None;
                 inner.published_arenas.clear();

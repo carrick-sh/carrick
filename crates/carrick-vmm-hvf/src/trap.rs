@@ -3882,7 +3882,7 @@ fn request_carrier_stage2_record_retirements(
                                 stage1_unpublished,
                             ),
                         )
-                        .ok()??;
+                        .ok()?;
                     Some((identity, proof))
                 }
             })

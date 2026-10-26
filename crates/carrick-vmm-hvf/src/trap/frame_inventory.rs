@@ -538,6 +538,17 @@ pub(crate) enum Stage2ReferenceReleaseError {
     ReceiptMismatch((u64, u64)),
 }
 
+fn table_capacity_retirement_error(
+    error: carrick_aarch64::stage1_authority::TableCapacityRetirementError<TrapError>,
+) -> TrapError {
+    match error {
+        carrick_aarch64::stage1_authority::TableCapacityRetirementError::Publisher(detail) => {
+            TrapError::Hypervisor(detail)
+        }
+        carrick_aarch64::stage1_authority::TableCapacityRetirementError::Backend(error) => error,
+    }
+}
+
 /// Authority which owned one stage-1 reference in the reverse-map ledger.
 ///
 /// This value comes from the extent/transaction being retired, not from the
@@ -595,28 +606,45 @@ impl InventoryFrameRegistry {
         identity: CarrierStage2RecordIdentity,
         mm: u64,
         receipt: Stage1UnpublicationReceipt<'_>,
-    ) -> Result<Option<Stage1Unpublished>, Stage2ReferenceReleaseError> {
+    ) -> Result<Stage1Unpublished, Stage2ReferenceReleaseError> {
         let receipt_names_mm = match receipt {
             Stage1UnpublicationReceipt::TableArena(_) => true,
             Stage1UnpublicationReceipt::Inventory(proof) => proof.mm() == mm,
             _ => false,
         };
-        let Some(mm_count) = self.structural_stage2_references.get_mut(&(lease, mm)) else {
+        let Some(&mm_count) = self.structural_stage2_references.get(&(lease, mm)) else {
             return Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease));
         };
-        if !receipt_names_mm || *mm_count == 0 {
+        if !receipt_names_mm || mm_count == 0 {
             return Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease));
-        }
-        *mm_count -= 1;
-        if *mm_count == 0 {
-            self.structural_stage2_references.remove(&(lease, mm));
         }
         let owner = match receipt {
             Stage1UnpublicationReceipt::TableArena(_) => Stage1ReferenceOwner::TableArena(lease.0),
             Stage1UnpublicationReceipt::Inventory(_) => Stage1ReferenceOwner::Mm(mm),
             _ => return Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease)),
         };
-        self.release_stage2_reference(lease, Some(identity), owner, receipt)
+        if !owner.is_named_by(lease, receipt) {
+            return Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease));
+        }
+        let stage2_count = self
+            .stage2_references
+            .get(&lease)
+            .copied()
+            .ok_or(Stage2ReferenceReleaseError::Missing(lease))?;
+        if stage2_count != 1 {
+            return Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease));
+        }
+
+        if mm_count == 1 {
+            self.structural_stage2_references.remove(&(lease, mm));
+        } else {
+            *self
+                .structural_stage2_references
+                .get_mut(&(lease, mm))
+                .expect("validated structural reference remains") -= 1;
+        }
+        self.stage2_references.remove(&lease);
+        Ok(Stage1Unpublished { lease, identity })
     }
 
     /// Drop one carrier-wide stage-2 reference. The exact receipt is checked
@@ -1773,11 +1801,6 @@ impl HvfVmState {
                         TrapError::Hypervisor(format!(
                             "release structural owner reference: {error:?}"
                         ))
-                    })?
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "structural stage-2 owner retains another MM reference".to_owned(),
-                        )
                     })?;
                 let requested = custody.request_released_stage2_record_retirement(identity, proof);
                 if requested != CarrierStage2RetireOutcome::DeferredActivePins {
@@ -1826,11 +1849,6 @@ impl HvfVmState {
                     )
                     .map_err(|error| {
                         TrapError::Hypervisor(format!("release carrier owner reference: {error:?}"))
-                    })?
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "carrier stage-2 owner retains another MM reference".to_owned(),
-                        )
                     })?;
                 let requested = custody.request_released_stage2_record_retirement(identity, proof);
                 if requested != CarrierStage2RetireOutcome::DeferredActivePins {
@@ -4128,13 +4146,15 @@ impl HvfVmState {
                 None,
                 carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
                 |base| {
-                    task.mm_access
-                        .retire_owned_table_arena_stage2_in(custody, base, stage1_unpublished)
-                        .map_err(|error| error.to_string())
+                    task.mm_access.retire_owned_table_arena_stage2_in(
+                        custody,
+                        base,
+                        stage1_unpublished,
+                    )
                 },
-                |_manager| Ok(()),
+                |_manager| Ok::<(), TrapError>(()),
             )
-            .map_err(TrapError::Hypervisor)?;
+            .map_err(table_capacity_retirement_error)?;
         Ok(None)
     }
 
@@ -4158,13 +4178,15 @@ impl HvfVmState {
                     let custody = task.custody.as_ref();
                     #[cfg(test)]
                     let custody = legacy_test_carrier_vm_custody();
-                    task.mm_access
-                        .retire_owned_table_arena_stage2_in(custody, base, stage1_unpublished)
-                        .map_err(|error| error.to_string())
+                    task.mm_access.retire_owned_table_arena_stage2_in(
+                        custody,
+                        base,
+                        stage1_unpublished,
+                    )
                 },
-                |_manager| Ok(()),
+                |_manager| Ok::<(), TrapError>(()),
             )
-            .map_err(TrapError::Hypervisor)
+            .map_err(table_capacity_retirement_error)
     }
 
     pub(crate) fn retire_task_state_mm_root_only(

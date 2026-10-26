@@ -191,9 +191,10 @@ impl CarrierForeignMmTransport {
         // map; preserve that lock order while committing both edges.
         let mut identity = state.identity.write();
         if identity.is_some_and(|current| current != (mm, binding)) {
-            return Err(TrapError::Hypervisor(
-                "closed initial root conflicts with bound MM identity".into(),
-            ));
+            return Err(TrapError::PublicationRefused {
+                operation: "closed initial MM identity",
+                missing: "an unbound or matching address-space identity",
+            });
         }
         let mut states = self.states.write();
         if states
@@ -201,11 +202,17 @@ impl CarrierForeignMmTransport {
             .and_then(std::sync::Weak::upgrade)
             .is_some_and(|current| !std::sync::Arc::ptr_eq(&current, state))
         {
-            return Err(TrapError::Hypervisor(
-                "closed initial root already belongs to another MM state".into(),
-            ));
+            return Err(TrapError::PublicationRefused {
+                operation: "closed initial MM identity",
+                missing: "an unclaimed transport binding",
+            });
         }
-        *identity = Some((mm, binding));
+        state.install_identity_registration(
+            mm,
+            binding,
+            &mut identity,
+            IdentityOwnerValidation::SelectionHeld,
+        )?;
         states.insert(binding, std::sync::Arc::downgrade(state));
         Ok(())
     }
@@ -369,6 +376,37 @@ pub(crate) struct RetiredMmRootStage2 {
     pub(crate) owner: InventoryStage2OwnerIdentity,
 }
 
+/// Structural stage-2 leases published before an MM has an identity cannot be
+/// entered in the reverse-map ledger yet.  Keep that state explicit: identity
+/// installation consumes the pending set and changes the variant only after
+/// every lease is registered under the new MM.
+#[derive(::core::default::Default)]
+struct PreIdentityStructuralStage2References {
+    leases: std::collections::BTreeSet<(u64, u64)>,
+}
+
+struct IdentifiedStructuralStage2References {
+    mm: u64,
+    leases: std::collections::BTreeSet<(u64, u64)>,
+}
+
+enum StructuralStage2ReferenceRegistrations {
+    PreIdentity(PreIdentityStructuralStage2References),
+    Identified(IdentifiedStructuralStage2References),
+}
+
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq)]
+enum IdentityOwnerValidation {
+    QueryPendingOwner,
+    SelectionHeld,
+}
+
+impl ::core::default::Default for StructuralStage2ReferenceRegistrations {
+    fn default() -> Self {
+        Self::PreIdentity(PreIdentityStructuralStage2References::default())
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct MmAccessState {
     pub(crate) host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
@@ -400,7 +438,7 @@ pub(crate) struct MmAccessState {
     pub(crate) structural_owners: parking_lot::RwLock<
         std::collections::BTreeMap<(u64, usize), std::sync::Arc<StructuralBackingOwner>>,
     >,
-    structural_reference_leases: parking_lot::Mutex<std::collections::BTreeSet<(u64, u64)>>,
+    structural_reference_registrations: parking_lot::Mutex<StructuralStage2ReferenceRegistrations>,
     pub(crate) mm_root_stage2: parking_lot::Mutex<Option<MmRootStage2Authority>>,
     pub(crate) mutation_coordinator: parking_lot::Mutex<()>,
     /// First-touch producers held only through synchronous descriptor
@@ -965,7 +1003,9 @@ impl MmAccessState {
             cow_armed,
             cow_deferred_publications,
             structural_owners: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
-            structural_reference_leases: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            structural_reference_registrations: parking_lot::Mutex::new(
+                StructuralStage2ReferenceRegistrations::default(),
+            ),
             mm_root_stage2: parking_lot::Mutex::new(None),
             mutation_coordinator: parking_lot::Mutex::new(()),
             el1_grant_publications: parking_lot::Mutex::new(PendingEl1GrantPublications::default()),
@@ -1043,24 +1083,14 @@ impl MmAccessState {
         mm: carrick_hal::ForeignMmId,
         binding: CarrierForeignMmBinding,
     ) -> Result<(), TrapError> {
-        if self
-            .protections
-            .pending_owner()
-            .is_some_and(|owner| owner.mm().raw() != mm.raw_for_probe())
-        {
-            return Err(TrapError::Hypervisor(format!(
-                "stage-1 authority offered another MM's pending identity {}",
-                mm.raw_for_probe()
-            )));
-        }
-        if !self.page_tables.read().bind_mm(mm.raw_for_probe()) {
-            return Err(TrapError::Hypervisor(format!(
-                "stage-1 authority rebound to MM {}",
-                mm.raw_for_probe()
-            )));
-        }
-        *self.identity.write() = Some((mm, binding));
-        self.register_structural_stage2_references()?;
+        let mut identity = self.identity.write();
+        self.install_identity_registration(
+            mm,
+            binding,
+            &mut identity,
+            IdentityOwnerValidation::QueryPendingOwner,
+        )?;
+        drop(identity);
         // The initial runner may have recorded backing before the kernel
         // publishes its exact MM identity. Revisit only the same pending
         // admission once both are present.
@@ -1070,6 +1100,41 @@ impl MmAccessState {
             let promoted = unsafe { self.bind_backing(&authority, resolver) };
             self.record_guest_lane_promotion(promoted);
         }
+        Ok(())
+    }
+
+    fn install_identity_registration(
+        &self,
+        mm: carrick_hal::ForeignMmId,
+        binding: CarrierForeignMmBinding,
+        identity: &mut Option<(carrick_hal::ForeignMmId, CarrierForeignMmBinding)>,
+        owner_validation: IdentityOwnerValidation,
+    ) -> Result<(), TrapError> {
+        if identity.is_some_and(|current| current != (mm, binding)) {
+            return Err(TrapError::PublicationRefused {
+                operation: "MM identity",
+                missing: "an unbound or matching address-space identity",
+            });
+        }
+        if owner_validation == IdentityOwnerValidation::QueryPendingOwner
+            && self
+                .protections
+                .pending_owner()
+                .is_some_and(|owner| owner.mm().raw() != mm.raw_for_probe())
+        {
+            return Err(TrapError::PublicationRefused {
+                operation: "MM identity",
+                missing: "the pending stage-1 owner's matching MM",
+            });
+        }
+        if !self.page_tables.read().bind_mm(mm.raw_for_probe()) {
+            return Err(TrapError::PublicationRefused {
+                operation: "MM identity",
+                missing: "the stage-1 authority's matching MM",
+            });
+        }
+        self.adopt_structural_stage2_references(mm.raw_for_probe())?;
+        *identity = Some((mm, binding));
         Ok(())
     }
 
@@ -1374,38 +1439,100 @@ impl MmAccessState {
                 .flatten()
         };
         if removed.is_some() {
+            let lease = (key.0, key.1 as u64);
+            if let StructuralStage2ReferenceRegistrations::PreIdentity(pending) =
+                &mut *self.structural_reference_registrations.lock()
+            {
+                pending.leases.remove(&lease);
+            }
             custody.stage2_publication_authority().changed();
         }
         removed
     }
 
     fn register_structural_stage2_references(&self) -> Result<(), TrapError> {
-        let Some(mm) = self
-            .identity
-            .read()
-            .as_ref()
-            .map(|(mm, _)| mm.raw_for_probe())
-        else {
-            return Ok(());
-        };
-        let leases = self
-            .structural_owners
-            .read()
+        let identity = self.identity.read();
+        let owners = self.structural_owners.read();
+        let leases = owners
             .keys()
             .map(|&(ipa, len)| (ipa, len as u64))
-            .collect::<Vec<_>>();
+            .collect::<std::collections::BTreeSet<_>>();
+        let Some(mm) = identity.as_ref().map(|(mm, _)| mm.raw_for_probe()) else {
+            let mut registrations = self.structural_reference_registrations.lock();
+            let StructuralStage2ReferenceRegistrations::PreIdentity(pending) = &mut *registrations
+            else {
+                return Err(TrapError::PublicationRefused {
+                    operation: "pre-identity structural stage-2 reference",
+                    missing: "pre-identity registration custody",
+                });
+            };
+            pending.leases.extend(leases);
+            return Ok(());
+        };
+        let result = self.register_identified_structural_stage2_references(mm, leases);
+        drop(owners);
+        result
+    }
+
+    fn adopt_structural_stage2_references(&self, mm: u64) -> Result<(), TrapError> {
+        let owners = self.structural_owners.read();
+        let leases = owners
+            .keys()
+            .map(|&(ipa, len)| (ipa, len as u64))
+            .collect::<std::collections::BTreeSet<_>>();
+        let result = self.register_identified_structural_stage2_references(mm, leases);
+        drop(owners);
+        result
+    }
+
+    fn register_identified_structural_stage2_references(
+        &self,
+        mm: u64,
+        leases: std::collections::BTreeSet<(u64, u64)>,
+    ) -> Result<(), TrapError> {
         let inventory = self.frame_inventory.lock();
         let mut frames = inventory.frames.lock();
-        let mut registered = self.structural_reference_leases.lock();
+        let mut registrations = self.structural_reference_registrations.lock();
+        let registered = match &mut *registrations {
+            StructuralStage2ReferenceRegistrations::PreIdentity(pending) => {
+                if pending.leases != leases {
+                    return Err(TrapError::PublicationRefused {
+                        operation: "MM identity",
+                        missing: "complete pre-identity structural lease custody",
+                    });
+                }
+                for &lease in &leases {
+                    frames
+                        .register_structural_stage2_reference(lease, mm)
+                        .map_err(|_| TrapError::PublicationRefused {
+                            operation: "MM identity",
+                            missing: "valid structural stage-2 lease registration",
+                        })?;
+                }
+                *registrations = StructuralStage2ReferenceRegistrations::Identified(
+                    IdentifiedStructuralStage2References { mm, leases },
+                );
+                return Ok(());
+            }
+            StructuralStage2ReferenceRegistrations::Identified(registered) => {
+                if registered.mm != mm {
+                    return Err(TrapError::PublicationRefused {
+                        operation: "structural stage-2 reference",
+                        missing: "the registered MM identity",
+                    });
+                }
+                &mut registered.leases
+            }
+        };
         for lease in leases {
-            if registered.insert(lease) {
+            if !registered.contains(&lease) {
                 frames
                     .register_structural_stage2_reference(lease, mm)
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "register structural stage-2 reference: {error:?}"
-                        ))
+                    .map_err(|_| TrapError::PublicationRefused {
+                        operation: "structural stage-2 reference",
+                        missing: "valid reverse-map registration",
                     })?;
+                registered.insert(lease);
             }
         }
         Ok(())
@@ -1426,28 +1553,45 @@ impl MmAccessState {
         identity: CarrierStage2RecordIdentity,
         receipt: Stage1UnpublicationReceipt<'_>,
     ) -> Result<Stage1Unpublished, TrapError> {
-        let snapshot = custody
-            .stage2_record_snapshot(identity.record_id)
-            .ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "structural reference release lost its exact stage-2 record".to_owned(),
-                )
-            })?;
+        let snapshot = custody.stage2_record_snapshot(identity.record_id).ok_or(
+            TrapError::RetirementRefused {
+                operation: "structural stage-2 reference",
+                missing: "the exact carrier record",
+            },
+        )?;
         let lease = (snapshot.ipa, snapshot.len as u64);
-        let inventory = self.frame_inventory.lock();
-        let proof = inventory
-            .frames
-            .lock()
-            .release_structural_stage2_reference(lease, identity, self.stage1_edit_mm()?, receipt)
-            .and_then(|proof| {
-                proof.ok_or(
-                    super::frame_inventory::Stage2ReferenceReleaseError::ReceiptMismatch(lease),
-                )
-            })
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("release structural stage-2 reference: {error:?}"))
+        let mm = self
+            .identity
+            .read()
+            .as_ref()
+            .map(|(mm, _)| mm.raw_for_probe())
+            .ok_or(TrapError::RetirementRefused {
+                operation: "structural stage-2 reference",
+                missing: "the MM identity which owns the lease",
             })?;
-        self.structural_reference_leases.lock().remove(&lease);
+        let inventory = self.frame_inventory.lock();
+        let mut frames = inventory.frames.lock();
+        let mut registrations = self.structural_reference_registrations.lock();
+        let StructuralStage2ReferenceRegistrations::Identified(registered) = &mut *registrations
+        else {
+            return Err(TrapError::RetirementRefused {
+                operation: "structural stage-2 reference",
+                missing: "an adopted MM registration",
+            });
+        };
+        if registered.mm != mm || !registered.leases.contains(&lease) {
+            return Err(TrapError::RetirementRefused {
+                operation: "structural stage-2 reference",
+                missing: "the matching MM lease receipt",
+            });
+        }
+        let proof = frames
+            .release_structural_stage2_reference(lease, identity, mm, receipt)
+            .map_err(|_| TrapError::RetirementRefused {
+                operation: "structural stage-2 reference",
+                missing: "the matching unpublication receipt",
+            })?;
+        registered.leases.remove(&lease);
         Ok(proof)
     }
 
@@ -1625,7 +1769,7 @@ impl MmAccessState {
         // through backend retirement and pool release. A cached owner Arc keeps
         // storage resident, but does not stop a pooled slot being reissued.
         let page_tables = self.page_tables.read();
-        let mut retire = |manager: Option<&carrick_mmu_core::aarch64::PageTableManager>| {
+        let retire = |manager: Option<&carrick_mmu_core::aarch64::PageTableManager>| {
             // Descriptor publication records the root high-water mark while
             // holding this authority, then takes mm_root_stage2. Match that
             // order so retirement cannot wait for the publisher while holding
@@ -1739,13 +1883,17 @@ impl MmAccessState {
             .retire_table_capacity(
                 Some(expected_root_slot.0),
                 disposition,
-                |base| {
-                    self.retire_owned_table_arena_stage2_in(custody, base, stage1_unpublished)
-                        .map_err(|error| error.to_string())
-                },
-                |manager| retire(manager).map_err(|error| error.to_string()),
+                |base| self.retire_owned_table_arena_stage2_in(custody, base, stage1_unpublished),
+                retire,
             )
-            .map_err(TrapError::Hypervisor)
+            .map_err(|error| match error {
+                carrick_aarch64::stage1_authority::TableCapacityRetirementError::Publisher(
+                    detail,
+                ) => TrapError::Hypervisor(detail),
+                carrick_aarch64::stage1_authority::TableCapacityRetirementError::Backend(error) => {
+                    error
+                }
+            })
     }
 
     pub(crate) fn retain_physical_backing_in(

@@ -160,6 +160,74 @@ fn whole_mm_receipt_cannot_release_another_mms_structural_reference() {
         Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease))
     );
     assert_eq!(frames.stage2_references.get(&lease), Some(&1));
+    assert_eq!(
+        frames.structural_stage2_references.get(&(lease, 41)),
+        Some(&1),
+        "a receipt mismatch must leave structural custody intact"
+    );
+}
+
+#[test]
+fn missing_stage2_release_keeps_structural_custody_for_retry() {
+    let lease = (0xa300_0010_0000, 0x20_0000);
+    let identity = CarrierStage2RecordIdentity {
+        vm_generation: CarrierVmGeneration(1),
+        record_id: CarrierStage2RecordId(2),
+        logical_owner: None,
+    };
+    let mut frames = InventoryFrameRegistry::default();
+    frames
+        .register_structural_stage2_reference(lease, 43)
+        .unwrap();
+    frames.stage2_references.remove(&lease);
+    let receipt = test_whole_mm_stage1_proof_for(43);
+
+    assert_eq!(
+        frames.release_structural_stage2_reference(
+            lease,
+            identity,
+            43,
+            Stage1UnpublicationReceipt::Inventory(&receipt),
+        ),
+        Err(Stage2ReferenceReleaseError::Missing(lease))
+    );
+    assert_eq!(
+        frames.structural_stage2_references.get(&(lease, 43)),
+        Some(&1),
+        "a refused release must preserve its retryable structural reference"
+    );
+}
+
+#[test]
+fn nonfinal_structural_release_keeps_both_references_for_retry() {
+    let lease = (0xa300_0030_0000, 0x20_0000);
+    let identity = CarrierStage2RecordIdentity {
+        vm_generation: CarrierVmGeneration(1),
+        record_id: CarrierStage2RecordId(3),
+        logical_owner: None,
+    };
+    let mut frames = InventoryFrameRegistry::default();
+    frames
+        .register_structural_stage2_reference(lease, 44)
+        .unwrap();
+    *frames.stage2_references.get_mut(&lease).unwrap() += 1;
+    let receipt = test_whole_mm_stage1_proof_for(44);
+
+    assert_eq!(
+        frames.release_structural_stage2_reference(
+            lease,
+            identity,
+            44,
+            Stage1UnpublicationReceipt::Inventory(&receipt),
+        ),
+        Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease))
+    );
+    assert_eq!(frames.stage2_references.get(&lease), Some(&2));
+    assert_eq!(
+        frames.structural_stage2_references.get(&(lease, 44)),
+        Some(&1),
+        "a nonfinal release must leave all custody available for its real owner"
+    );
 }
 
 #[test]
@@ -8218,6 +8286,55 @@ fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStag
     relocate_exit_fixture_root_with_extensions(task, base, &[])
 }
 
+fn relocate_exit_fixture_root_before_closed_identity(
+    task: &mut HvfTaskState,
+    base: u64,
+) -> CarrierStage2RecordIdentity {
+    task.mm_root_slot = None; // Bootstrap roots use their source's table capacity.
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let (process_identity, mm) = predecessor_test_identity(task);
+    let manager = carrick_mmu_core::aarch64::PageTableManager::new(
+        carrick_mem::memory::stage1_hvpatch_page_tables(),
+        carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    let tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
+    task.mm_access = MmAccessState::new(
+        tables.clone(),
+        task.protections.clone(),
+        task.frame_inventory.shared_ledger(),
+        task.cow_armed.clone(),
+        task.cow_deferred_publications.clone(),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
+        crate::trap::foreign_mm::LiveBacking::deferred(custody.clone()),
+    );
+    tables
+        .install_source(Box::new(BootstrapRetirementArenaSource(vec![
+            carrick_mmu_core::aarch64::SubstrateGpa(base),
+        ])))
+        .unwrap();
+    assert_eq!(tables.publish_initial_table_root(|_| Ok(())).unwrap(), base);
+    assert!(
+        task.mm_access.identity.read().is_none(),
+        "the pooled root must be published before the closed identity"
+    );
+    CarrierForeignMmTransport::new()
+        .register_closed_initial_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(
+                std::num::NonZeroU64::new(mm).unwrap(),
+            ),
+            CarrierForeignMmBinding {
+                asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                    std::num::NonZeroU16::new(process_identity.asid).unwrap(),
+                ),
+                stage1_root: carrick_guest_mem::Gpa::new(base),
+            },
+            &task.mm_access,
+        )
+        .expect("closed identity adopts the already-published pooled root");
+    custody.stage2_record_covering(base, 1).unwrap()
+}
+
 fn relocate_exit_fixture_root_with_extensions(
     task: &mut HvfTaskState,
     base: u64,
@@ -8269,7 +8386,7 @@ fn relocate_exit_fixture_root_with_extensions(
 }
 
 #[test]
-fn bootstrap_root_without_inventory_registration_retires_before_reuse() {
+fn bootstrap_root_published_before_identity_retires_before_reuse() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
@@ -8284,7 +8401,7 @@ fn bootstrap_root_without_inventory_registration_retires_before_reuse() {
         predecessor.registration.is_none(),
         "production bootstrap root has no task inventory registration"
     );
-    let primary_record = relocate_exit_fixture_root(&mut predecessor, base);
+    let primary_record = relocate_exit_fixture_root_before_closed_identity(&mut predecessor, base);
     assert!(predecessor.registration.is_none());
     let pin = custody
         .pin_stage2_record(primary_record)
@@ -8314,7 +8431,7 @@ fn bootstrap_root_without_inventory_registration_retires_before_reuse() {
 
     let mut successor = hvpatch_task_state_test_fixture(797, 0x7970_0000, 797);
     assert!(successor.registration.is_none());
-    relocate_exit_fixture_root(&mut successor, base);
+    relocate_exit_fixture_root_before_closed_identity(&mut successor, base);
     assert!(successor.registration.is_none());
     let successor_stage1 = test_whole_mm_stage1_proof_for(797);
     HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(
@@ -8322,6 +8439,48 @@ fn bootstrap_root_without_inventory_registration_retires_before_reuse() {
         successor_stage1,
     )
     .expect("the next production bootstrap reuses and retires the same slot");
+    assert_eq!(pool.allocated_count(), 0);
+}
+
+#[test]
+fn mismatched_bootstrap_structural_release_is_typed_and_keeps_custody() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        1,
+    ));
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
+    let base = pool.base_ipa();
+    let mut task = hvpatch_task_state_test_fixture(799, 0x7990_0000, 799);
+    let record = relocate_exit_fixture_root_before_closed_identity(&mut task, base);
+
+    let error = HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(
+        &mut task,
+        test_whole_mm_stage1_proof_for(800),
+    )
+    .expect_err("another MM's receipt must be refused");
+    assert!(
+        matches!(error, TrapError::RetirementRefused { .. }),
+        "unexpected refusal: {error:?}"
+    );
+    assert!(
+        custody.stage2_record_snapshot(record.record_id).is_some(),
+        "typed refusal must retain the exact carrier record"
+    );
+    assert_eq!(
+        pool.allocated_count(),
+        1,
+        "typed refusal must retain the root-slot pool hold"
+    );
+
+    HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(
+        &mut task,
+        test_whole_mm_stage1_proof_for(799),
+    )
+    .expect("the retained custody accepts the matching retry");
+    retry_pending_global_frame_retirements_at_idle_in_using(custody, &mut |_, _| Ok(()));
+    assert!(custody.stage2_record_snapshot(record.record_id).is_none());
     assert_eq!(pool.allocated_count(), 0);
 }
 
@@ -8780,8 +8939,7 @@ fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
             stage1_unpublished.mm(),
             Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
         )
-        .expect("whole-MM inventory proof covers its exact table record")
-        .expect("whole-MM inventory proof releases the last table reference");
+        .expect("whole-MM inventory proof releases the exact table reference");
     assert_eq!(
         custody.request_released_stage2_record_retirement(record, stage1),
         CarrierStage2RetireOutcome::DeferredActivePins

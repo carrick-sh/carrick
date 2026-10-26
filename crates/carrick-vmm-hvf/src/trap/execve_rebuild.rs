@@ -322,13 +322,22 @@ impl PendingExecStage2Cleanup {
                     None,
                     carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff,
                     |base| {
-                        mm_access
-                            .retire_owned_table_arena_stage2_in(custody, base, stage1_unpublished)
-                            .map_err(|error| error.to_string())
+                        mm_access.retire_owned_table_arena_stage2_in(
+                            custody,
+                            base,
+                            stage1_unpublished,
+                        )
                     },
-                    |_manager| Ok(()),
+                    |_manager| Ok::<(), TrapError>(()),
                 )
-                .map_err(TrapError::Hypervisor)?;
+                .map_err(|error| match error {
+                    carrick_aarch64::stage1_authority::TableCapacityRetirementError::Publisher(
+                        detail,
+                    ) => TrapError::Hypervisor(detail),
+                    carrick_aarch64::stage1_authority::TableCapacityRetirementError::Backend(
+                        error,
+                    ) => error,
+                })?;
         }
         if let (Some(mm_access), Some(root_slot)) = (&self.mm_access, self.mm_root_slot) {
             let stage1_unpublished = stage1_unpublished.ok_or_else(|| {

@@ -25,6 +25,21 @@ use carrick_kernel::kernel::objects::ThreadKey;
 use carrick_kernel::kernel::continuation::next_nonzero;
 
 static NEXT_RUNNER_JOB_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Backends whose physical retirement was refused keep their exact custody
+/// for the carrier lifetime.  The task is failed closed, but dropping this
+/// authority would turn a typed lifecycle refusal into a carrier abort and
+/// could make its IPA reusable without a matching retirement receipt.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn quarantine_refused_retirement_backend(backend: Box<dyn std::any::Any + Send>) {
+    static QUARANTINE: std::sync::OnceLock<Mutex<Vec<Box<dyn std::any::Any + Send>>>> =
+        std::sync::OnceLock::new();
+    QUARANTINE
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .push(backend);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuantumExit {
     Runnable,
@@ -553,16 +568,29 @@ impl HvpatchTaskBinding {
                 },
                 |commit| self.quantum.apply_detached_address_space_retirement(commit),
             );
-            if let Err(error) = &retired {
-                eprintln!(
-                    "carrick: FATAL: detached address-space retirement failed \
-                     (the MM-authority drop abort that follows is a CONSEQUENCE of \
-                     this, not the cause): {error}"
-                );
+            match retired {
+                Ok(root_receipt) => {
+                    drop(backend);
+                    Ok(root_receipt)
+                }
+                Err(error @ crate::trap::TrapError::RetirementRefused { .. }) => {
+                    // The executor fails this task and immediately retires its
+                    // binding, so putting the backend back would merely defer
+                    // its drop until the end of this settlement. Retain it in
+                    // the carrier quarantine instead: the exact authority and
+                    // its non-reusable IPAs stay live without aborting peers.
+                    quarantine_refused_retirement_backend(backend);
+                    Err(error)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "carrick: FATAL: detached address-space retirement failed \
+                         (the MM-authority drop abort that follows is a CONSEQUENCE of \
+                         this, not the cause): {error}"
+                    );
+                    Err(error)
+                }
             }
-            let root_receipt = retired?;
-            drop(backend);
-            Ok(root_receipt)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         Err(crate::trap::TrapError::Hypervisor(
@@ -981,6 +1009,24 @@ mod tests {
     use carrick_kernel::kernel::Scheduler;
 
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn typed_retirement_refusal_quarantines_backend_custody() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        quarantine_refused_retirement_backend(Box::new(DropProbe(Arc::clone(&dropped))));
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "typed retirement refusal must retain backend custody for the carrier lifetime"
+        );
+    }
     use carrick_kernel::kernel::continuation::test_support::bootstrap;
     #[test]
     fn hvpatch_persistent_quantum_and_binding_exclude_executor_authority() {
