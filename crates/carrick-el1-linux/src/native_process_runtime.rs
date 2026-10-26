@@ -3177,10 +3177,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
-        let owner_continuation = graph
-            .pending
-            .exit(&key)
-            .is_some_and(|pending| core::ptr::eq(pending.caller.control(), control));
+        let owner_continuation = graph.pending.contains_key(&key)
+            || graph
+                .pending
+                .exit(&key)
+                .is_some_and(|pending| core::ptr::eq(pending.caller.control(), control));
         drop(graph);
         Ok(NativeProcessEntry {
             runtime: self,
@@ -3334,10 +3335,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
-        let owner_continuation = graph
-            .pending
-            .exit(&member.process)
-            .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
+        let owner_continuation = graph.pending.contains_key(&member.process)
+            || graph
+                .pending
+                .exit(&member.process)
+                .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
         drop(graph);
         Ok((
             binding,
@@ -4285,7 +4287,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let sequence = zone.next_seq(record);
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
             .map_err(|_| NativeProcessError::Exhausted)?;
-        unsafe { *zone.record(record).ctx_mut() = *self.words };
+        // SAFETY: the prepared handoff still owns this exact running record.
+        unsafe {
+            *zone.record(record).ctx_mut() = *self.words;
+            zone.record(record)
+                .publish_owner_continuation(OwnerEntry::Syscall);
+        };
         self.runtime
             .graph
             .lock()
@@ -4298,6 +4305,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         if receipt.is_none() {
             self.runtime.graph.lock().pending.remove(&self.key);
+            // SAFETY: no handoff was published; this entry retains the record.
+            unsafe {
+                zone.record(record).consume_owner_continuation();
+            }
             return Err(NativeProcessError::Busy);
         }
         drop(guard);
@@ -4465,7 +4476,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 zone.cancel_timer_admission(self.record);
                 NativeProcessError::Exhausted.errno()
             })?;
-        unsafe { *zone.record(record).ctx_mut() = *self.words };
+        // SAFETY: the prepared handoff still owns this exact running record.
+        unsafe {
+            *zone.record(record).ctx_mut() = *self.words;
+            zone.record(record)
+                .publish_owner_continuation(OwnerEntry::Syscall);
+        };
         graph.pending.insert(
             self.key,
             PendingContinuation::Ipc(PendingIpc {
@@ -4484,6 +4500,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if receipt.is_none() {
             self.runtime.graph.lock().pending.remove(&self.key);
             zone.cancel_timer_admission(self.record);
+            // SAFETY: no handoff was published; this entry retains the record.
+            unsafe {
+                zone.record(record).consume_owner_continuation();
+            }
             return Err(NativeProcessError::Busy.errno());
         }
         drop(guard);
@@ -4722,11 +4742,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .record(self.record.id)
                     .consume_owner_continuation();
             }
-            let status = self.pending_close_status()?;
-            return Some(match self.retire_closing_member(status) {
-                Ok(outcome) => outcome,
-                Err(error) => self.run_failed(error.run_failure_reason()),
-            });
+            if let Some(status) = self.pending_close_status() {
+                return Some(match self.retire_closing_member(status) {
+                    Ok(outcome) => outcome,
+                    Err(error) => self.run_failed(error.run_failure_reason()),
+                });
+            }
+            // Wait/IPC handbacks re-enter the saved syscall instruction too.
+            // Their owned operation, rather than a readiness scalar or a new
+            // dispatch, decides completion below.
         }
         self.resume_pending_wait()
     }
