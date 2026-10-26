@@ -343,11 +343,29 @@ pub const ZONE_IDLE_ESR: u8 = 83;
 pub const ZONE_IDLE_FAR: u8 = 84;
 /// A current unchanged stage-1 selection lost its required stage-2 authority.
 /// `a` is the low 32 bits of the MM key, `b` the guest TID, and `c` the
-/// selected Editor revision. The runtime terminates only this MM with SIGKILL.
+/// selected Editor revision. [`STAGE2_AUTHORITY_INVARIANT_EDITOR`] follows.
+/// The runtime terminates only this MM with SIGKILL.
 pub const STAGE2_AUTHORITY_INVARIANT: u8 = 85;
 
-pub fn rec_stage2_authority_invariant(mm: u64, tid: i32, revision: u64) {
-    rec(STAGE2_AUTHORITY_INVARIANT, low32(mm), tid, low32(revision));
+pub fn rec_stage2_authority_invariant(
+    mm: u64,
+    tid: i32,
+    selected_revision: u64,
+    current_revision: u64,
+    editor_held: bool,
+) {
+    rec(
+        STAGE2_AUTHORITY_INVARIANT,
+        low32(mm),
+        tid,
+        low32(selected_revision),
+    );
+    rec(
+        STAGE2_AUTHORITY_INVARIANT_EDITOR,
+        low32(mm),
+        low32(current_revision),
+        i32::from(editor_held),
+    );
 }
 
 /// A never-published stage-2 record lost its consume-once rollback authority.
@@ -380,6 +398,11 @@ pub fn rec_stage1_editor_license_refusal(authority_mm: Option<u64>, license_mm: 
         0,
     );
 }
+
+/// Editor state sampled at [`STAGE2_AUTHORITY_INVARIANT`]. `a` is the MM key,
+/// `b` the current Editor revision and `c` whether an editor was held. This is
+/// a companion record because the summary preserves the guest TID.
+pub const STAGE2_AUTHORITY_INVARIANT_EDITOR: u8 = 88;
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,7 +437,7 @@ fn clone_refusal_label(producer: i32) -> &'static str {
 }
 
 /// Highest event kind a reader accepts.
-const LAST_KIND: u8 = STAGE1_EDITOR_LICENSE_REFUSAL;
+const LAST_KIND: u8 = STAGE2_AUTHORITY_INVARIANT_EDITOR;
 
 /// At most this many [`FAULTSIG_MBOX`] records follow one fault signal, so a
 /// census of all mailboxes never floods the ring.
@@ -1905,10 +1928,16 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         ),
         STAGE2_AUTHORITY_INVARIANT => {
             format!(
-                "STAGE2_AUTHORITY_INVARIANT mm={} tid={b} revision={}",
+                "STAGE2_AUTHORITY_INVARIANT mm={} tid={b} selected_revision={}",
                 a as u32, c as u32
             )
         }
+        STAGE2_AUTHORITY_INVARIANT_EDITOR => format!(
+            "STAGE2_AUTHORITY_INVARIANT_EDITOR mm={} current_revision={} editor_held={}",
+            a as u32,
+            b as u32,
+            c != 0
+        ),
         STAGE2_ROLLBACK_INVARIANT => format!(
             "STAGE2_ROLLBACK_INVARIANT record={} vm_generation={} logical_owner={}",
             a as u32, b as u32, c as u32
@@ -3064,6 +3093,29 @@ mod tests {
         assert_eq!(
             decode(event.kind, event.a, event.b, event.c),
             "STAGE1_EDITOR_LICENSE_REFUSAL authority_mm=4660 license_mm=22136"
+        );
+    }
+
+    #[test]
+    fn stage2_authority_invariant_records_both_editor_observations() {
+        rec_stage2_authority_invariant(0x1234, 74001, 13_121, 13_121, false);
+        let event = drain_recent(N)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|event| event.kind == STAGE2_AUTHORITY_INVARIANT && event.b == 74001)
+            .expect("invariant summary");
+        assert_eq!(
+            decoded(event),
+            "STAGE2_AUTHORITY_INVARIANT mm=4660 tid=74001 selected_revision=13121"
+        );
+        let detail = drain_recent(N)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|event| event.kind == STAGE2_AUTHORITY_INVARIANT_EDITOR && event.a == 0x1234)
+            .expect("invariant editor detail");
+        assert_eq!(
+            decoded(detail),
+            "STAGE2_AUTHORITY_INVARIANT_EDITOR mm=4660 current_revision=13121 editor_held=false"
         );
     }
 }

@@ -3012,6 +3012,20 @@ mod hvpatch_guest_probe_abi {
     }
 
     #[test]
+    fn host_read_retention_detail_keeps_six_scalar_shape() {
+        let source = include_str!("probes.rs");
+        for declaration in [
+            "fn hvpatch__el1__host__read__retention__detail(_: u64, _: u32, _: u64, _: u64, _: u64, _: u64) {}",
+            "pub fn hvpatch_el1_host_read_retention_detail_with(",
+        ] {
+            assert!(
+                source.matches(declaration).count() >= 2,
+                "missing host-read retention detail ABI declaration {declaration}"
+            );
+        }
+    }
+
+    #[test]
     fn mapping_index_census_provider_and_stub_keep_the_same_shape() {
         let source = include_str!("probes.rs");
         for declaration in [
@@ -5762,6 +5776,18 @@ mod real {
         /// reason (1 no indexed stage-2 record, 3 missing, 4 unmapped,
         /// 5 retiring). Diagnostic only; it grants no custody.
         fn hvpatch__el1__host__read__retention(_: u64, _: u32) {}
+        /// Failure-only detail for the preceding retention refusal: IPA,
+        /// reason, record id, VM generation, logical-owner generation and
+        /// packed record state. A zero record id means no indexed record.
+        fn hvpatch__el1__host__read__retention__detail(
+            _: u64,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) {
+        }
 
         /// phase, mailbox host address, generation, request sequence, state.
         fn syscall__mailbox__lifecycle(_: u32, _: u64, _: u64, _: u64, _: u32) {}
@@ -7316,6 +7342,23 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_el1_host_read_retention(ipa: u64, reason: u32) {
         carrick_usdt::hvpatch__el1__host__read__retention!(|| (ipa, reason));
+    }
+
+    /// Read the stage-2 record only when the failure-only probe is enabled.
+    /// Packed state: mapped bit 0, backend mapping bit 1, retirement requested
+    /// bit 2, terminal bit 3, superseded bit 4, release in flight bit 5,
+    /// release retry bit 6, sampled publication authority bit 7, and pin count
+    /// in bits 63:16.
+    #[inline(never)]
+    pub fn hvpatch_el1_host_read_retention_detail_with(
+        ipa: u64,
+        reason: u32,
+        diagnostic: impl FnOnce() -> (u64, u64, u64, u64),
+    ) {
+        carrick_usdt::hvpatch__el1__host__read__retention__detail!(|| {
+            let (record, vm_generation, owner_generation, state) = diagnostic();
+            (ipa, reason, record, vm_generation, owner_generation, state)
+        });
     }
 
     /// Read diagnostic payload only when the lifecycle probe is enabled.
@@ -9837,6 +9880,13 @@ mod stub {
     stub!(el1_native_fork_refusal(cpu: u32, mm: u64, root: u64, reason: &str));
     stub!(el1_native_fork_stock_refusal(reason: &str, requested: &str, cached: &str, requested_context: &str, cached_context: &str));
     stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
+
+    pub fn hvpatch_el1_host_read_retention_detail_with(
+        _ipa: u64,
+        _reason: u32,
+        _diagnostic: impl FnOnce() -> (u64, u64, u64, u64),
+    ) {
+    }
 
     pub fn syscall_mailbox_lifecycle_with(
         _phase: super::SyscallMailboxPhase,

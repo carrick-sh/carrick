@@ -43,6 +43,8 @@ pub(super) enum OwnerMemoryPark {
     Stage2AuthorityInvariant {
         action: OwnerMemoryAction,
         wait: carrick_el1_abi::PortalOwnerWait,
+        current_revision: u64,
+        editor_held: bool,
     },
 }
 
@@ -963,11 +965,9 @@ where
             return Ok(OwnerMemoryPark::Recheck(action));
         }
         if cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor {
-            match editor_refusal_disposition(
-                enrollment.revision(),
-                enrollment.current_revision(),
-                editor_is_held(zone, wait_mm),
-            ) {
+            let current_revision = enrollment.current_revision();
+            let editor_held = editor_is_held(zone, wait_mm);
+            match editor_refusal_disposition(enrollment.revision(), current_revision, editor_held) {
                 EditorRefusalDisposition::Reselect => {
                     zone.free_record(record);
                     return Ok(OwnerMemoryPark::Recheck(action));
@@ -975,7 +975,12 @@ where
                 EditorRefusalDisposition::Park => {}
                 EditorRefusalDisposition::Invariant => {
                     zone.free_record(record);
-                    return Ok(OwnerMemoryPark::Stage2AuthorityInvariant { action, wait });
+                    return Ok(OwnerMemoryPark::Stage2AuthorityInvariant {
+                        action,
+                        wait,
+                        current_revision,
+                        editor_held,
+                    });
                 }
             }
         }

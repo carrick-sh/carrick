@@ -2,8 +2,8 @@
 //! this adapter resolves only its IPA through existing carrier directories.
 use super::{
     CarrierForeignMmBinding, CarrierForeignMmTransport, CarrierStage2Pin, CarrierStage2PinError,
-    CarrierVmCustody, GlobalFrameSharedMapping, OwnedCodeContent, PersistentCarrierMappings,
-    TrapError, code_content, sparse_materialization,
+    CarrierStage2RecordIdentity, CarrierVmCustody, GlobalFrameSharedMapping, OwnedCodeContent,
+    PersistentCarrierMappings, TrapError, code_content, sparse_materialization,
 };
 use carrick_aarch64::user_transfer::{TransferCustody, TransferPin, TransferRetention};
 use carrick_el1_abi::{PortalRetainedData, PortalSelectedData, PortalTransferIntent};
@@ -419,6 +419,51 @@ impl UserTransferCustody {
         self.retain_exact_for(None, selected, len, intent, None)
     }
 
+    fn trace_host_read_retention(
+        &self,
+        ipa: u64,
+        reason: u32,
+        identity: Option<CarrierStage2RecordIdentity>,
+        publication_authority: bool,
+    ) {
+        carrick_observability::probes::hvpatch_el1_host_read_retention(ipa, reason);
+        carrick_observability::probes::hvpatch_el1_host_read_retention_detail_with(
+            ipa,
+            reason,
+            || {
+                let snapshot = identity
+                    .and_then(|identity| self.custody.stage2_record_snapshot(identity.record_id))
+                    .or_else(|| self.custody.stage2_record_covering_any(ipa));
+                if let Some(snapshot) = snapshot {
+                    let mut state = u64::from(snapshot.mapped)
+                        | (u64::from(snapshot.backend_map_installed) << 1)
+                        | (u64::from(snapshot.retirement_requested) << 2)
+                        | (u64::from(snapshot.terminalized_by_vm_destroy) << 3)
+                        | (u64::from(snapshot.superseded_by_rebind) << 4)
+                        | (u64::from(snapshot.release_in_flight) << 5)
+                        | (u64::from(snapshot.release_retry_pending) << 6)
+                        | (u64::from(publication_authority) << 7);
+                    state |= snapshot.pin_count.min(u64::MAX >> 16) << 16;
+                    (
+                        snapshot.record_id.0,
+                        snapshot.vm_generation.0,
+                        snapshot.logical_owner.map_or(0, |owner| owner.generation),
+                        state,
+                    )
+                } else if let Some(identity) = identity {
+                    (
+                        identity.record_id.0,
+                        identity.vm_generation.0,
+                        identity.logical_owner.map_or(0, |owner| owner.generation),
+                        u64::from(publication_authority) << 7,
+                    )
+                } else {
+                    (0, 0, 0, u64::from(publication_authority) << 7)
+                }
+            },
+        );
+    }
+
     fn retain_exact_for(
         &self,
         _target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
@@ -458,7 +503,7 @@ impl UserTransferCustody {
         // Select the record containing the first byte so a range crossing its
         // end cannot be mistaken for absent backing (and endlessly reselected).
         let Some(identity) = self.custody.stage2_record_covering(selected.ipa, 1) else {
-            carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 1);
+            self.trace_host_read_retention(selected.ipa, 1, None, publication_authority);
             if publication_authority {
                 return Ok(TransferRetention::Physical(
                     self.custody.stage2_publication_wait(selected.ipa),
@@ -492,7 +537,7 @@ impl UserTransferCustody {
             && selected.ipa >= carrick_el1_abi::EL1_REGION_BASE
             && selected.ipa + len as u64 <= carrick_el1_abi::EL1_REGION_BASE + 4096;
         if mapping.is_none() && publication_authority && !internal_read {
-            carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 6);
+            self.trace_host_read_retention(selected.ipa, 6, Some(identity), publication_authority);
             return Ok(TransferRetention::Physical(
                 self.custody.stage2_publication_wait(selected.ipa),
             ));
@@ -500,13 +545,15 @@ impl UserTransferCustody {
         let pin = match self.custody.pin_stage2_record(identity) {
             Ok(pin) => pin,
             Err(reason @ (CarrierStage2PinError::NotFound | CarrierStage2PinError::NotMapped)) => {
-                carrick_observability::probes::hvpatch_el1_host_read_retention(
+                self.trace_host_read_retention(
                     selected.ipa,
                     match reason {
                         CarrierStage2PinError::NotFound => 3,
                         CarrierStage2PinError::NotMapped => 4,
                         _ => unreachable!(),
                     },
+                    Some(identity),
+                    publication_authority,
                 );
                 if publication_authority {
                     return Ok(TransferRetention::Physical(
@@ -516,7 +563,12 @@ impl UserTransferCustody {
                 return retry.map(TransferRetention::Editor).ok_or_else(error);
             }
             Err(CarrierStage2PinError::RetirementRequested) => {
-                carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 5);
+                self.trace_host_read_retention(
+                    selected.ipa,
+                    5,
+                    Some(identity),
+                    publication_authority,
+                );
                 return retry.map(TransferRetention::Editor).ok_or_else(error);
             }
             Err(reason) => {

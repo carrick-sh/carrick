@@ -1750,6 +1750,8 @@ where
                         super::zone::OwnerMemoryPark::Stage2AuthorityInvariant {
                             action: super::zone::OwnerMemoryAction::Retained,
                             wait,
+                            current_revision,
+                            editor_held,
                         } => {
                             let _ = self.take_retained_memory_action()?;
                             let context = self
@@ -1766,6 +1768,8 @@ where
                                 wait.handle().mm().raw(),
                                 context.thread().key().tid.raw(),
                                 wait.revision(),
+                                current_revision,
+                                editor_held,
                             );
                             self.kernel.record_fatal_signal(FatalSignalRecord {
                                 image_generation: self.state.fatal_image_generation,
@@ -3783,12 +3787,16 @@ where
                             resume: _,
                         },
                     wait,
+                    current_revision,
+                    editor_held,
                 } => {
                     debug_assert_eq!(retry_frame, frame);
                     carrick_kernel::event_ring::rec_stage2_authority_invariant(
                         wait.handle().mm().raw(),
                         self.state.linux_tid.raw(),
                         wait.revision(),
+                        current_revision,
+                        editor_held,
                     );
                     return self
                         .service_outcome(

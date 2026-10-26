@@ -1870,6 +1870,26 @@ impl CarrierVmCustody {
         })
     }
 
+    /// Diagnostic-only snapshot of the newest indexed record covering `ipa`,
+    /// including unmapped and terminal records that production selection must
+    /// refuse. Call only from a probe-gated closure.
+    pub(crate) fn stage2_record_covering_any(
+        &self,
+        ipa: u64,
+    ) -> Option<CarrierStage2RecordSnapshot> {
+        let state = self.state.lock();
+        let (&(base, length), ids) = state
+            .stage2_extent_index
+            .range(..=(ipa, u64::MAX))
+            .next_back()?;
+        if ipa >= base.checked_add(length)? {
+            return None;
+        }
+        ids.iter()
+            .rev()
+            .find_map(|id| state.stage2_records.get(id).map(|record| record.snapshot))
+    }
+
     pub(crate) fn stage2_identity_mismatch(
         record: &CarrierStage2Record,
         identity: CarrierStage2RecordIdentity,
