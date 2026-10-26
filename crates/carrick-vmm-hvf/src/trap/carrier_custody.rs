@@ -442,11 +442,6 @@ pub(crate) struct DirectStage1RetirementProof {
 }
 
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
-pub(crate) struct Stage2RetirementAuthorization {
-    identity: CarrierStage2RecordIdentity,
-}
-
-#[derive(::core::fmt::Debug)]
 pub(crate) struct NeverPublishedRecord {
     identity: CarrierStage2RecordIdentity,
 }
@@ -457,22 +452,17 @@ impl NeverPublishedRecord {
     }
 }
 
+#[derive(::core::fmt::Debug)]
 pub(crate) enum Stage2RetirementProof {
     Unpublished(DirectStage1RetirementProof),
     Released(super::frame_inventory::Stage1Unpublished),
     NeverPublished(NeverPublishedRecord),
-    Authorized(std::sync::Arc<Stage2RetirementAuthorization>),
+    Metadata(CarrierStage2RecordIdentity),
 }
 
 impl From<DirectStage1RetirementProof> for Stage2RetirementProof {
     fn from(value: DirectStage1RetirementProof) -> Self {
         Self::Unpublished(value)
-    }
-}
-
-impl From<std::sync::Arc<Stage2RetirementAuthorization>> for Stage2RetirementProof {
-    fn from(value: std::sync::Arc<Stage2RetirementAuthorization>) -> Self {
-        Self::Authorized(value)
     }
 }
 
@@ -507,9 +497,85 @@ impl DirectStage1RetirementProof {
     }
 }
 
-impl Stage2RetirementAuthorization {
-    pub(super) fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
+impl Stage2RetirementProof {
+    fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
+        match self {
+            Self::Unpublished(proof) => proof.matches(identity),
+            Self::Released(proof) => proof.identity() == identity,
+            Self::NeverPublished(proof) => proof.identity() == identity,
+            Self::Metadata(proof_identity) => *proof_identity == identity,
+        }
+    }
+}
+
+#[derive(::core::fmt::Debug)]
+struct PendingStage2Retirement {
+    identity: CarrierStage2RecordIdentity,
+    in_flight: bool,
+    proof: Option<Stage2RetirementProof>,
+}
+
+/// Exclusive access to one pending retirement's consume-once proof.
+///
+/// Dropping an unfinished claim returns the proof to the pending owner. A
+/// second retirement driver therefore cannot replay or clone authorization
+/// while the first is unmapping or finalizing the record.
+#[derive(::core::fmt::Debug)]
+pub(crate) struct Stage2RetirementClaim<'a> {
+    custody: &'a CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+    proof: Option<Stage2RetirementProof>,
+    completed: bool,
+}
+
+impl Stage2RetirementClaim<'_> {
+    fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
         self.identity == identity
+            && self
+                .proof
+                .as_ref()
+                .is_some_and(|proof| proof.matches(identity))
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+        self.proof.take();
+    }
+
+    fn into_proof(mut self) -> Stage2RetirementProof {
+        self.completed = true;
+        self.custody
+            .pending_carrier_stage2_retirements
+            .lock()
+            .remove(&self.identity.record_id);
+        self.proof
+            .take()
+            .expect("pending retirement claim owns its proof")
+    }
+}
+
+impl<'a> From<Stage2RetirementClaim<'a>> for Stage2RetirementProof {
+    fn from(value: Stage2RetirementClaim<'a>) -> Self {
+        value.into_proof()
+    }
+}
+
+impl Drop for Stage2RetirementClaim<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.custody.pending_carrier_stage2_retirements.lock();
+        let Some(entry) = pending.get_mut(&self.identity.record_id) else {
+            return;
+        };
+        if entry.identity != self.identity || !entry.in_flight {
+            return;
+        }
+        if self.completed {
+            pending.remove(&self.identity.record_id);
+        } else {
+            debug_assert!(entry.proof.is_none());
+            entry.proof = self.proof.take();
+            entry.in_flight = false;
+        }
     }
 }
 
@@ -643,14 +709,7 @@ pub struct CarrierVmCustody {
     /// retirement. Request and last-pin-drop only arm this queue; backend
     /// unmap runs at the persistent executor's carrier-safe boundary.
     pending_carrier_stage2_retirements: parking_lot::Mutex<
-        std::collections::BTreeMap<
-            CarrierStage2RecordId,
-            (
-                CarrierStage2RecordIdentity,
-                bool,
-                std::sync::Arc<Stage2RetirementAuthorization>,
-            ),
-        >,
+        std::collections::BTreeMap<CarrierStage2RecordId, PendingStage2Retirement>,
     >,
     /// Exact retirements whose backend operation failed at a carrier-safe
     /// boundary. Their waiters wake and reselect/fault instead of parking on a
@@ -957,7 +1016,7 @@ impl CarrierVmCustody {
             self.stage2_retirement_authorization(identity)
                 .expect("test retirement request retained its stage-1 proof")
         };
-        self.retire_stage2_record_using(identity, stage1, unmap)
+        self.retire_stage2_record_using(identity, &stage1, unmap)
     }
 
     fn stage2_record_removal(&self) -> Stage2RecordRemoval<'_> {
@@ -1573,9 +1632,34 @@ impl CarrierVmCustody {
     pub(crate) fn remove_terminal_stage2_record(
         &self,
         identity: CarrierStage2RecordIdentity,
-        stage1: std::sync::Arc<Stage2RetirementAuthorization>,
+        mut stage1: Stage2RetirementClaim<'_>,
     ) -> Option<CarrierStage2RecordSnapshot> {
         if !stage1.matches(identity) {
+            return None;
+        }
+        let mut removal = self.stage2_record_removal();
+        let record = removal.state().stage2_records.get(&identity.record_id)?;
+        if Self::stage2_identity_mismatch(record, identity).is_some()
+            || record.snapshot.pin_count != 0
+            || (record.snapshot.mapped && !record.snapshot.terminalized_by_vm_destroy)
+        {
+            return None;
+        }
+        let removed = removal
+            .remove_record(identity.record_id)
+            .map(|record| record.snapshot);
+        if removed.is_some() {
+            stage1.complete();
+        }
+        removed
+    }
+
+    pub(crate) fn remove_never_published_terminal_stage2_record(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        proof: NeverPublishedRecord,
+    ) -> Option<CarrierStage2RecordSnapshot> {
+        if proof.identity() != identity {
             return None;
         }
         let mut removal = self.stage2_record_removal();
@@ -1806,16 +1890,7 @@ impl CarrierVmCustody {
         old_identity: CarrierStage2RecordIdentity,
         host_addr: usize,
         perms: u64,
-    ) -> Result<
-        (
-            CarrierStage2RecordIdentity,
-            std::sync::Arc<Stage2RetirementAuthorization>,
-        ),
-        CarrierStage2RecordError,
-    > {
-        let predecessor = self
-            .stage2_retirement_authorization(old_identity)
-            .ok_or(CarrierStage2RecordError::RecordNotTerminal)?;
+    ) -> Result<(CarrierStage2RecordIdentity, NeverPublishedRecord), CarrierStage2RecordError> {
         let mut state = self.state.lock();
         let live_generation = match state.lifecycle {
             CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation) => {
@@ -1889,7 +1964,15 @@ impl CarrierVmCustody {
             .ok_or(CarrierStage2RecordError::RecordNotFound)?;
         old.snapshot.release_ipa = false;
         old.snapshot.superseded_by_rebind = true;
-        Ok((identity, predecessor))
+        self.pending_carrier_stage2_retirements
+            .lock()
+            .remove(&old_identity.record_id);
+        Ok((
+            identity,
+            NeverPublishedRecord {
+                identity: old_identity,
+            },
+        ))
     }
 
     pub(crate) fn stage2_record_snapshot(
@@ -1972,7 +2055,10 @@ impl CarrierVmCustody {
         if !stage1.matches(identity) {
             return CarrierStage2RetireOutcome::NotFound;
         }
-        self.request_stage2_record_retirement_by_identity(identity)
+        self.request_stage2_record_retirement_with_proof(
+            identity,
+            Stage2RetirementProof::Unpublished(stage1),
+        )
     }
 
     pub(crate) fn request_never_published_stage2_record_retirement(
@@ -1983,7 +2069,10 @@ impl CarrierVmCustody {
         if proof.identity != identity {
             return CarrierStage2RetireOutcome::NotFound;
         }
-        self.request_stage2_record_retirement_by_identity(identity)
+        self.request_stage2_record_retirement_with_proof(
+            identity,
+            Stage2RetirementProof::NeverPublished(proof),
+        )
     }
 
     pub(crate) fn request_el1_metadata_stage2_record_retirement(
@@ -1994,13 +2083,20 @@ impl CarrierVmCustody {
         if !proof.matches(identity) {
             return CarrierStage2RetireOutcome::NotFound;
         }
-        self.request_stage2_record_retirement_by_identity(identity)
+        self.request_stage2_record_retirement_with_proof(
+            identity,
+            Stage2RetirementProof::Metadata(identity),
+        )
     }
 
-    fn request_stage2_record_retirement_by_identity(
+    fn request_stage2_record_retirement_with_proof(
         &self,
         identity: CarrierStage2RecordIdentity,
+        proof: Stage2RetirementProof,
     ) -> CarrierStage2RetireOutcome {
+        if !proof.matches(identity) {
+            return CarrierStage2RetireOutcome::NotFound;
+        }
         let mut state = self.state.lock();
         let Some(record) = state.stage2_records.get(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
@@ -2008,7 +2104,6 @@ impl CarrierVmCustody {
         if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
             return mismatch;
         }
-        let authorization = std::sync::Arc::new(Stage2RetirementAuthorization { identity });
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
@@ -2020,9 +2115,14 @@ impl CarrierVmCustody {
                 | CarrierStage2RetireOutcome::RetryPending(_)
                 | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
         ) {
-            self.pending_carrier_stage2_retirements
-                .lock()
-                .insert(identity.record_id, (identity, false, authorization));
+            self.pending_carrier_stage2_retirements.lock().insert(
+                identity.record_id,
+                PendingStage2Retirement {
+                    identity,
+                    in_flight: false,
+                    proof: Some(proof),
+                },
+            );
         }
         outcome
     }
@@ -2041,7 +2141,10 @@ impl CarrierVmCustody {
         if stage1.lease() != (snapshot.ipa, snapshot.len as u64) {
             return CarrierStage2RetireOutcome::NotFound;
         }
-        self.request_stage2_record_retirement(identity, DirectStage1RetirementProof { identity })
+        self.request_stage2_record_retirement_with_proof(
+            identity,
+            Stage2RetirementProof::Released(stage1),
+        )
     }
 
     pub(crate) fn enqueue_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {
@@ -2052,7 +2155,7 @@ impl CarrierVmCustody {
 
     pub(crate) fn cancel_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {
         let mut pending = self.pending_carrier_stage2_retirements.lock();
-        if pending.get(&identity.record_id).map(|entry| entry.0) == Some(identity) {
+        if pending.get(&identity.record_id).map(|entry| entry.identity) == Some(identity) {
             pending.remove(&identity.record_id);
         }
     }
@@ -2060,16 +2163,20 @@ impl CarrierVmCustody {
     pub(crate) fn claim_carrier_stage2_retirement(
         &self,
         identity: CarrierStage2RecordIdentity,
-    ) -> bool {
+    ) -> Option<Stage2RetirementClaim<'_>> {
         let mut pending = self.pending_carrier_stage2_retirements.lock();
-        let Some((expected, in_flight, _)) = pending.get_mut(&identity.record_id) else {
-            return false;
+        let entry = pending.get_mut(&identity.record_id)?;
+        if entry.identity != identity || entry.in_flight {
+            return None;
         };
-        if *expected != identity || *in_flight {
-            return false;
-        }
-        *in_flight = true;
-        true
+        let proof = entry.proof.take()?;
+        entry.in_flight = true;
+        Some(Stage2RetirementClaim {
+            custody: self,
+            identity,
+            proof: Some(proof),
+            completed: false,
+        })
     }
 
     pub(crate) fn settle_carrier_stage2_retirement(
@@ -2078,7 +2185,7 @@ impl CarrierVmCustody {
         complete: bool,
     ) {
         let mut pending = self.pending_carrier_stage2_retirements.lock();
-        if pending.get(&identity.record_id).map(|entry| entry.0) != Some(identity) {
+        if pending.get(&identity.record_id).map(|entry| entry.identity) != Some(identity) {
             return;
         }
         if complete {
@@ -2086,8 +2193,8 @@ impl CarrierVmCustody {
             self.terminal_carrier_stage2_retirements
                 .lock()
                 .remove(&identity.record_id);
-        } else if let Some((_, in_flight, _)) = pending.get_mut(&identity.record_id) {
-            *in_flight = false;
+        } else if let Some(entry) = pending.get_mut(&identity.record_id) {
+            entry.in_flight = false;
         }
     }
 
@@ -2122,7 +2229,7 @@ impl CarrierVmCustody {
         self.pending_carrier_stage2_retirements
             .lock()
             .values()
-            .filter_map(|(identity, in_flight, _)| (!*in_flight).then_some(*identity))
+            .filter_map(|entry| (!entry.in_flight).then_some(entry.identity))
             .take(limit)
             .collect()
     }
@@ -2139,7 +2246,7 @@ impl CarrierVmCustody {
             .pending_carrier_stage2_retirements
             .lock()
             .get(&identity.record_id)
-            .is_some_and(|entry| entry.0 == identity && !entry.1);
+            .is_some_and(|entry| entry.identity == identity && !entry.in_flight);
         requested
             && self
                 .stage2_record_snapshot(identity.record_id)
@@ -2149,7 +2256,7 @@ impl CarrierVmCustody {
     pub(crate) fn retire_stage2_record_using(
         &self,
         identity: CarrierStage2RecordIdentity,
-        stage1: std::sync::Arc<Stage2RetirementAuthorization>,
+        stage1: &Stage2RetirementClaim<'_>,
         unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> CarrierStage2RetireOutcome {
         if !stage1.matches(identity) {
@@ -2216,12 +2323,8 @@ impl CarrierVmCustody {
     pub(crate) fn stage2_retirement_authorization(
         &self,
         identity: CarrierStage2RecordIdentity,
-    ) -> Option<std::sync::Arc<Stage2RetirementAuthorization>> {
-        self.pending_carrier_stage2_retirements
-            .lock()
-            .get(&identity.record_id)
-            .filter(|(expected, _, proof)| *expected == identity && proof.matches(identity))
-            .map(|(_, _, proof)| std::sync::Arc::clone(proof))
+    ) -> Option<Stage2RetirementClaim<'_>> {
+        self.claim_carrier_stage2_retirement(identity)
     }
 }
 
@@ -4509,6 +4612,35 @@ mod carrier_vm_custody_tests {
             .is_err()
         );
         assert_eq!(releases, 2, "removed identity cannot release twice");
+    }
+
+    #[test]
+    fn pending_retirement_owns_one_proof_and_returns_an_unfinished_claim() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let (custody, generation) = live_custody();
+        let (identity, publication) = custody
+            .register_unpublished_stage2_record(stage2_spec(generation, 89))
+            .expect("register never-published record");
+        assert_eq!(
+            custody.request_never_published_stage2_record_retirement(
+                identity,
+                publication.rollback(),
+            ),
+            super::CarrierStage2RetireOutcome::DeferredActivePins
+        );
+
+        let claim = custody
+            .claim_carrier_stage2_retirement(identity)
+            .expect("pending owner lends its consume-once proof");
+        assert!(
+            custody.claim_carrier_stage2_retirement(identity).is_none(),
+            "a second driver cannot replay an in-flight proof"
+        );
+        drop(claim);
+        assert!(
+            custody.claim_carrier_stage2_retirement(identity).is_some(),
+            "dropping an unfinished claim returns the proof to its owner"
+        );
     }
 
     #[test]

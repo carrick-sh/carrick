@@ -1635,7 +1635,7 @@ impl HvfVmState {
         let outcome = if let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length)
         {
             let proof = if let Some(proof) = custody.stage2_retirement_authorization(identity) {
-                Stage2RetirementProof::Authorized(proof)
+                Stage2RetirementProof::from(proof)
             } else {
                 Stage2RetirementProof::Unpublished(
                     custody
@@ -2349,7 +2349,7 @@ impl HvfVmState {
             };
             let stage1 =
                 if let Some(stage1) = custody.stage2_retirement_authorization(record_identity) {
-                    Stage2RetirementProof::Authorized(stage1)
+                    Stage2RetirementProof::from(stage1)
                 } else {
                     let absence =
                         Stage1UnpublishedFrames::after_declined_retirement(authority, &remainder)?;

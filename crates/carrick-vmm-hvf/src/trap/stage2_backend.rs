@@ -1529,11 +1529,7 @@ pub(crate) fn install_ipc_window_using(
                                 "IPC rollback lost exact retirement authority".to_owned(),
                             )
                         })?;
-                    match custody.retire_stage2_record_using(
-                        identity,
-                        std::sync::Arc::clone(&stage1),
-                        &mut unmap,
-                    ) {
+                    match custody.retire_stage2_record_using(identity, &stage1, &mut unmap) {
                         CarrierStage2RetireOutcome::RetiredUnmapped
                         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                             if custody
