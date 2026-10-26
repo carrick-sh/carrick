@@ -90,6 +90,64 @@ setup runs `-02` through `-05` either did not launch a guest or stopped at the
 same site without saving a core; every one cleaned to zero and none is a
 functional verdict.
 
+## Root clean exit owns the primary-arena retirement request (2026-10-26)
+
+Commit `784070b25dff47d41163d65dadc350c5e2c42c3e` fixes the exact
+`847-e6-postmortem-06` sequence. The root clean-exit owner is responsible for
+requesting retirement: runtime terminal publication calls
+`begin_address_space_retirement`, the executor retires the resident task and
+unpublishes stage 1, and detached whole-MM retirement reaches
+`HvfVmState::retire_task_table_capacity`. Neither root-thread exit by itself,
+carrier teardown, nor successor bootstrap owns this request; successor
+bootstrap only exposed the leaked obligation.
+
+The skipped condition was the optional host image in
+`HvfVmState::retire_task_table_capacity`: the implementation added by
+`c8a1a3e54` called the primary retirement only under
+`if let Some(manager)`. A persistent root's exec transition can legitimately
+leave `Stage1Authority::manager == None` while `published_arenas` still owns
+primary IPA `0x9a00000000`. The hardware exit therefore completed without
+calling `request_released_stage2_record_retirement`, which is why record 14
+showed `retirement_requested=false`.
+
+`Stage1Authority::retire_table_capacity` now consumes every base in its owned
+`published_arenas` set independently of the optional manager. Each exact
+record is enqueued and requested by the whole-MM transition, and its pooled
+root release travels in the pending carrier retirement until that same record
+becomes terminal. A terminal refusal quarantines the slot instead of making it
+reusable; unrelated structural retirements do not release pooled roots.
+
+The production-shape VM-free witness is
+`bootstrap_exec_then_clean_exit_requests_primary_arena_retirement_before_reuse`.
+It bootstraps the root from the primary pool slot, performs the exec handoff
+that removes the host manager, pins the exact stage-2 record, drives the
+production clean-exit retirement, and asserts `retirement_requested=true`.
+After releasing the pin and driving the safe-point owner, it asserts both the
+record and pool hold are gone, then bootstraps and retires a successor from the
+same primary base. Red-first on the prior head, it failed at the request
+assertion; on the fix it passes 1/1.
+
+Portable verification:
+
+- serialized `carrick-vmm-hvf --lib`: 804 passed, 0 failed, 3 ignored;
+- `carrick-aarch64 --lib`: 124 passed, 0 failed;
+- the new root-exit witness and three adjacent two-live-MM retirement
+  witnesses passed individually;
+- `just fmt-check`, `just clippy`, `just clippy-linux`, `just lint-domains`,
+  and `just test-kernel`: passed;
+- contract-change check against
+  `bec60cc3a907002f79a3513e1d3c6d2be3f5075d`: passed;
+- macOS all-target EL1 image: 1,120,112 / 1,572,864 bytes; maximum checked
+  stack 11,758 / 12,288 bytes (`native backing reply`);
+- Linux portable EL1 image: 1,116,032 / 1,572,864 bytes; maximum checked
+  stack 11,758 / 12,288 bytes (`native backing reply`).
+
+The first `just test-kernel` attempt reached kernel-semantics after the kernel
+library passed, then its linker returned ENOSPC. The worktree's `target/` was
+66 GiB, including 49 GiB of stale release output. `cargo clean --release`
+removed only recoverable release artifacts; the complete clean retry passed.
+No signed test was run because this source requires an exact fixture bundle.
+
 ## Clean-exit extension-arena retirement repair (2026-10-26)
 
 Commit `58df7db5af223fa6993fcd1d1994e93a2a09a45e` closes the root-slot
