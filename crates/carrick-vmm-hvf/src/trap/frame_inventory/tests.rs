@@ -8269,6 +8269,63 @@ fn relocate_exit_fixture_root_with_extensions(
 }
 
 #[test]
+fn bootstrap_root_without_inventory_registration_retires_before_reuse() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        1,
+    ));
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
+    let base = pool.base_ipa();
+
+    let mut predecessor = hvpatch_task_state_test_fixture(795, 0x7950_0000, 795);
+    assert!(
+        predecessor.registration.is_none(),
+        "production bootstrap root has no task inventory registration"
+    );
+    let primary_record = relocate_exit_fixture_root(&mut predecessor, base);
+    assert!(predecessor.registration.is_none());
+    let pin = custody
+        .pin_stage2_record(primary_record)
+        .expect("observe the owned clean-exit request");
+
+    let predecessor_stage1 = test_whole_mm_stage1_proof_for(795);
+    HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(
+        &mut predecessor,
+        predecessor_stage1,
+    )
+    .expect("clean bootstrap exit retires its independently published root");
+    assert!(
+        custody
+            .stage2_record_snapshot(primary_record.record_id)
+            .is_some_and(|record| record.retirement_requested),
+        "the exact production bootstrap publication must travel with clean exit"
+    );
+    drop(pin);
+    retry_pending_global_frame_retirements_at_idle_in_using(custody, &mut |_, _| Ok(()));
+    assert!(
+        custody
+            .stage2_record_snapshot(primary_record.record_id)
+            .is_none(),
+        "bootstrap root retirement must become terminal before reuse"
+    );
+    assert_eq!(pool.allocated_count(), 0);
+
+    let mut successor = hvpatch_task_state_test_fixture(797, 0x7970_0000, 797);
+    assert!(successor.registration.is_none());
+    relocate_exit_fixture_root(&mut successor, base);
+    assert!(successor.registration.is_none());
+    let successor_stage1 = test_whole_mm_stage1_proof_for(797);
+    HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(
+        &mut successor,
+        successor_stage1,
+    )
+    .expect("the next production bootstrap reuses and retires the same slot");
+    assert_eq!(pool.allocated_count(), 0);
+}
+
+#[test]
 fn bootstrap_exec_then_clean_exit_requests_primary_arena_retirement_before_reuse() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();

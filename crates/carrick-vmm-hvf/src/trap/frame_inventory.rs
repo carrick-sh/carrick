@@ -3658,20 +3658,21 @@ impl HvfVmState {
             )
         })?;
         let Some(registration) = task.registration.as_ref() else {
-            // Registration is the zero-to-one crossing for every carrier
-            // stage-2 reference owned by this logical MM. A detached or early
-            // bootstrap address space which never crossed it has no carrier
-            // authority to retire; its local staging dies with `task` and the
-            // publication guards roll back independently. In particular,
-            // cleanup after a typed registration refusal must not manufacture
-            // a retirement obligation and then turn its absence into a fatal.
+            // Task inventory registration is not the zero-to-one crossing for
+            // table arenas: the root bootstrap publishes its stage-1 primary
+            // through `publish_raw_stage1_arenas_into` before that registration
+            // exists. The authority-owned arena set is the exact retirement
+            // obligation, so an unregistered clean exit must consume it before
+            // acknowledging retirement. A truly never-published MM has an
+            // empty set and this remains a trivial retirement.
             if expected_root_slot.is_some() {
                 return Err(TrapError::RetirementRefused {
                     operation: "unregistered address-space root",
                     missing: "carrier registration",
                 });
             }
-            return Ok(None);
+            return Self::retire_task_table_capacity(task, custody, None, &stage1_unpublished)
+                .map(|root| root.map(|root| root.proof));
         };
         let stage1_unpublished = registration.publish_stage1_unpublished(stage1_unpublished)?;
         if let Some(mm) = task
