@@ -2419,7 +2419,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// queued there leaves: threads ready at EL0 straight to other slots
     /// (their reschedules to `placed`), the rest host-owned, passed to `take`
     /// for the caller to place or hand back. False if another executor
-    /// drives it now.
+    /// drives it now, the vCPU is running, or a switched record still needs
+    /// this driver. A current record and its driver are one state-machine
+    /// state: callers must retain the lease when this transition is refused.
+    #[must_use]
     pub fn leave_slot(
         &self,
         slot: SlotId,

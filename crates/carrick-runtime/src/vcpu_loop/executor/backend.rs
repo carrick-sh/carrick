@@ -1405,7 +1405,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         // No address space is installed at entry. A host-owned thread leaves
         // for this executor to load; a record with a published native owner
         // may install its own MM and run directly from the zone.
-        drive_zone_slot(slot, zone_driver(self.executor_id));
+        drive_zone_slot(slot, zone_driver(self.executor_id))?;
         zone.publish_slot_with_affinity(
             slot,
             0,
@@ -1627,21 +1627,34 @@ pub(crate) fn zone_driver(executor: ExecutorId) -> u64 {
 /// before and left (its lease went with the task it unloaded) is vacated,
 /// unless another executor took it over, so nothing waits on a vCPU nobody
 /// runs.
-pub(crate) fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) {
-    let previous = DRIVEN_ZONE_SLOT.with(|cell| cell.replace(Some((slot, driver))));
+pub(crate) fn drive_zone_slot(slot: carrick_el1_abi::SlotId, driver: u64) -> Result<(), TrapError> {
+    let previous = DRIVEN_ZONE_SLOT.with(std::cell::Cell::get);
     if let Some((previous, previous_driver)) = previous.filter(|(previous, _)| *previous != slot) {
-        carrick_kernel::el1_zone::leave_slot(previous, previous_driver, Some(slot));
+        if !carrick_kernel::el1_zone::leave_slot(previous, previous_driver, Some(slot)) {
+            return Err(TrapError::Hypervisor(format!(
+                "EL1 zone driver {previous_driver} cannot leave {previous:?} while it retains a switched record"
+            )));
+        }
     }
+    DRIVEN_ZONE_SLOT.with(|cell| cell.set(Some((slot, driver))));
     if let Some(zone) = carrick_kernel::el1_zone::zone() {
         zone.drive(slot, driver);
     }
+    Ok(())
 }
 
 /// The calling executor stops driving any slot: it parks with no guest CPU,
 /// or its loop ends. Whatever waits on its slot goes elsewhere.
 pub(crate) fn leave_driven_zone_slot() {
-    if let Some((slot, driver)) = DRIVEN_ZONE_SLOT.with(std::cell::Cell::take) {
-        carrick_kernel::el1_zone::leave_slot(slot, driver, None);
+    if let Some((slot, driver)) = DRIVEN_ZONE_SLOT.with(std::cell::Cell::get) {
+        if carrick_kernel::el1_zone::leave_slot(slot, driver, None) {
+            DRIVEN_ZONE_SLOT.with(|cell| cell.set(None));
+        } else {
+            carrick_fatal!(
+                "vcpu_loop::el1_zone",
+                "EL1 zone driver {driver} tried to park while {slot:?} retained a switched record"
+            );
+        }
     }
 }
 
@@ -1701,7 +1714,7 @@ fn publish_zone_slot(
         // publishing this only in EL1 idle would lose a remote affinity kick.
         zone.slot(zone_slot)
             .set_sgi_target(carrick_vmm_hvf::gic::reschedule_target(vcpu)?);
-        drive_zone_slot(zone_slot, driver);
+        drive_zone_slot(zone_slot, driver)?;
         // What the slot still holds, for the fatal below: the record EL1
         // left switched in, its claim, identity, pending object operation and
         // handback, and the slot's queue.

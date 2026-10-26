@@ -8952,7 +8952,12 @@ mod tests {
         }
 
         fn parking_spare(&self) {
-            crate::el1_zone::leave_slot_in(&self.zone, self.slot, self.driver, None);
+            assert!(crate::el1_zone::leave_slot_in(
+                &self.zone,
+                self.slot,
+                self.driver,
+                None
+            ));
         }
     }
 
