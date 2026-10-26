@@ -6301,15 +6301,18 @@ where
             tid,
         );
         let (kernel, mm) = self.take_terminal_inventory_authority()?;
-        let result = kernel
-            .frame_inventory()
-            .apply(mm, commit)
-            .map(|_| ())
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "publish detached terminal inventory retirement: {error}"
-                ))
-            });
+        let result = apply_nonempty_detached_inventory_commit(commit, |commit| {
+            kernel
+                .frame_inventory()
+                .apply(mm, commit)
+                .map(|_| ())
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "publish detached terminal inventory retirement: {error}"
+                    ))
+                })
+        })
+        .map(|_| ());
         drop(registry);
         result
     }
@@ -6333,17 +6336,40 @@ where
             tid,
         );
         let (kernel, mm) = self.take_terminal_inventory_authority()?;
-        let result = kernel
-            .frame_inventory()
-            .apply_retirement_with_receipt(mm, commit)
-            .map(|(_, receipt)| receipt)
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "publish detached terminal inventory retirement receipt: {error}"
-                ))
-            });
+        let result = apply_nonempty_detached_inventory_commit(commit, |commit| {
+            kernel
+                .frame_inventory()
+                .apply_retirement_with_receipt(mm, commit)
+                .map(|(_, receipt)| receipt)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "publish detached terminal inventory retirement receipt: {error}"
+                    ))
+                })
+        })
+        .and_then(|receipt| {
+            receipt.ok_or(TrapError::RetirementRefused {
+                operation: "detached terminal inventory receipt",
+                missing: "retirement events",
+            })
+        });
         drop(registry);
         result
+    }
+}
+
+/// Consume a detached task's inventory transaction without asking the Kernel
+/// inventory owner to publish an eventless batch. An unregistered task has no
+/// frame state to mutate; committing its reservation closes the backend
+/// transaction, while this boundary closes the publication transaction.
+fn apply_nonempty_detached_inventory_commit<R>(
+    commit: carrick_hal::FrameInventoryCommit<()>,
+    apply: impl FnOnce(carrick_hal::FrameInventoryCommit<()>) -> Result<R, TrapError>,
+) -> Result<Option<R>, TrapError> {
+    if commit.batch().events().is_empty() {
+        Ok(None)
+    } else {
+        apply(commit).map(Some)
     }
 }
 
@@ -7441,6 +7467,31 @@ mod tests {
     use carrick_guest_mem::GuestMemory;
     use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn empty_detached_inventory_commit_skips_kernel_publication() {
+        let transaction = carrick_hal::KernelTransactionId::from_kernel_allocation(
+            NonZeroU64::new(0x847).expect("transaction"),
+        );
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(1).expect("capacity");
+        let reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x84; 32]),
+            carrick_hal::FrameInventoryBatch::prepare(transaction, capacity).expect("batch"),
+            Vec::new(),
+            Vec::new(),
+        );
+        let commit = reservation.commit(());
+        let called = std::cell::Cell::new(false);
+
+        let result = apply_nonempty_detached_inventory_commit(commit, |_| {
+            called.set(true);
+            Ok::<(), TrapError>(())
+        })
+        .expect("an empty detached transaction retires trivially");
+
+        assert!(result.is_none());
+        assert!(!called.get(), "the Kernel rejects eventless publication");
+    }
 
     #[test]
     fn editor_license_refusal_reaches_terminal_event_ring() {
