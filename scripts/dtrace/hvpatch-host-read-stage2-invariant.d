@@ -61,26 +61,17 @@ carrick*:::hvpatch-el1-host-read-retention-detail
 carrick*:::hvpatch-el1-host-read-editor-wait
 /pid == $target || progenyof($target)/
 {
-    printf("EDITOR-WAIT ts=%lld pid=%d tid=%d address=0x%llx source=%u revision=%llu\n",
-        walltimestamp, pid, tid, (uint64_t)arg0, arg1, (uint64_t)arg2);
-    ustack(8);
+    editor_source[arg2] = arg1;
+    editor_address[arg2] = arg0;
+    @editor_waits[arg1] = count();
 }
 
 pid$target::*rec_stage2_authority_invariant*:entry
 {
-    printf("INVARIANT ts=%lld pid=%d tid=%d mm=%llu guest_tid=%d selected_revision=%llu current_revision=%llu editor_held=%u\n",
+    printf("INVARIANT ts=%lld pid=%d tid=%d mm=%llu guest_tid=%d selected_revision=%llu current_revision=%llu editor_held=%u wait_source=%u address=0x%llx\n",
         walltimestamp, pid, tid, (uint64_t)arg0, arg1,
-        (uint64_t)arg2, (uint64_t)arg3, arg4);
-    ustack(8);
-}
-
-pid$target::*register_stage2_record_locked*:entry,
-pid$target::*rebind_stage2_record*:entry,
-pid$target::*remove_record*:entry,
-pid$target::*remove_terminal_stage2_record*:entry
-{
-    printf("STAGE2-LIFECYCLE ts=%lld pid=%d tid=%d fn=%s a0=%p a1=%p a2=%p a3=%p a4=%p a5=%p\n",
-        walltimestamp, pid, tid, probefunc, arg0, arg1, arg2, arg3, arg4, arg5);
+        (uint64_t)arg2, (uint64_t)arg3, arg4,
+        editor_source[arg2], (uint64_t)editor_address[arg2]);
     ustack(8);
 }
 
@@ -88,17 +79,7 @@ pid$target::*request_record_retirement*:entry,
 pid$target::*prepare_record_retirement*:entry,
 pid$target::*terminalize_record*:entry
 {
-    this->record = (uint64_t *)copyin(arg0, 8);
-    printf("STAGE2-RETIRE ts=%lld pid=%d tid=%d fn=%s record=%llu a0=%p a1=%p a2=%p a3=%p\n",
-        walltimestamp, pid, tid, probefunc, this->record[0], arg0, arg1, arg2, arg3);
-    ustack(8);
-}
-
-pid$target::*edit_unpublishing*:entry,
-pid$target::*finish_release*:entry,
-pid$target::*close_and_wait_for_editor*:entry
-{
-    printf("EDITOR-LIFECYCLE ts=%lld pid=%d tid=%d fn=%s a0=%p a1=%p a2=%p a3=%p\n",
+    printf("STAGE2-RETIRE ts=%lld pid=%d tid=%d fn=%s a0=%p a1=%p a2=%p a3=%p\n",
         walltimestamp, pid, tid, probefunc, arg0, arg1, arg2, arg3);
     ustack(8);
 }
@@ -124,4 +105,5 @@ tick-1s
 dtrace:::END
 {
     printf("TRACE end seconds=%d\n", secs);
+    printa("EDITOR-WAIT-COUNT source=%u count=%@d\n", @editor_waits);
 }
