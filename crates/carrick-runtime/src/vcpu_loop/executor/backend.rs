@@ -910,6 +910,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 generation,
                 file_table,
                 visible_pid,
+                task.lease().ptrace_traced(),
                 root_generation,
             );
             if let Some(mappings) = &self.lifecycle_mappings {
