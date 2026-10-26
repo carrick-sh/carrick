@@ -193,12 +193,19 @@ pub fn resume_production(
     };
     let source = BornInZoneSource { zone, slot };
     let mut service = Aarch64NativeProcessService::new(task, slot).unwrap_or_else(|_| fatal());
-    map_resume(
-        resume_selected(&runtime, registry(), source, task, record, &mut service),
-        &mut service,
-        task,
-        slot,
-    )
+    let resumed = resume_selected(&runtime, registry(), source, task, record, &mut service);
+    unsafe {
+        (&*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters)).refused
+            [match resumed {
+                NativeResume::Returned(_) => 509,
+                NativeResume::NoPending => 510,
+                NativeResume::Left(_) => 511,
+                NativeResume::RetrySyscall => 512,
+                NativeResume::Invalid => 500,
+            }]
+        .fetch_add(1, Ordering::Relaxed);
+    }
+    map_resume(resumed, &mut service, task, slot)
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]

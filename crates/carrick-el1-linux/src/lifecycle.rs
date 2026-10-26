@@ -155,6 +155,12 @@ impl<
         if let LifecycleOutcome::Transferred { progress, .. } = &mut outcome
             && matches!(progress, carrick_core::Served::Idle)
         {
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            unsafe {
+                (&*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters))
+                    .refused[506]
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
             let task_index = self.frame.task_index();
             let slot = self.frame.slot();
             if let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
@@ -172,7 +178,22 @@ impl<
                     native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
                         .run_ready(frame)
                 {
+                    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                    unsafe {
+                        (&*(carrick_el1_abi::EL1_COUNTERS_BASE
+                            as *const carrick_el1_abi::Counters))
+                            .refused[507]
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                     *progress = ready;
+                } else {
+                    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                    unsafe {
+                        (&*(carrick_el1_abi::EL1_COUNTERS_BASE
+                            as *const carrick_el1_abi::Counters))
+                            .refused[508]
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }
