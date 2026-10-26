@@ -486,8 +486,18 @@ impl Stage2RetirementProof {
 #[derive(::core::fmt::Debug)]
 struct PendingStage2Retirement {
     identity: CarrierStage2RecordIdentity,
+    owner: PendingStage2RetirementOwner,
     in_flight: bool,
     proof: Option<Stage2RetirementProof>,
+}
+
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, Eq, PartialEq)]
+enum PendingStage2RetirementOwner {
+    /// The subsystem whose directory still owns the physical record drives
+    /// its exact retirement and finalization.
+    ExactClaimant,
+    /// Whole-MM teardown handed the record to the carrier safe-point queue.
+    CarrierSafePoint,
 }
 
 /// Exclusive access to one pending retirement's consume-once proof.
@@ -1951,14 +1961,29 @@ impl CarrierVmCustody {
                 | CarrierStage2RetireOutcome::RetryPending(_)
                 | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
         ) {
-            self.pending_carrier_stage2_retirements.lock().insert(
-                identity.record_id,
-                PendingStage2Retirement {
-                    identity,
-                    in_flight: false,
-                    proof: Some(proof),
-                },
-            );
+            let mut pending = self.pending_carrier_stage2_retirements.lock();
+            match pending.get_mut(&identity.record_id) {
+                Some(entry) if entry.identity == identity && !entry.in_flight => {
+                    debug_assert!(
+                        entry.proof.is_none(),
+                        "a consume-once retirement proof cannot replace a pending proof"
+                    );
+                    if entry.proof.is_none() {
+                        entry.proof = Some(proof);
+                    }
+                }
+                _ => {
+                    pending.insert(
+                        identity.record_id,
+                        PendingStage2Retirement {
+                            identity,
+                            owner: PendingStage2RetirementOwner::ExactClaimant,
+                            in_flight: false,
+                            proof: Some(proof),
+                        },
+                    );
+                }
+            }
         }
         outcome
     }
@@ -1987,6 +2012,23 @@ impl CarrierVmCustody {
         self.terminal_carrier_stage2_retirements
             .lock()
             .remove(&identity.record_id);
+        let mut pending = self.pending_carrier_stage2_retirements.lock();
+        match pending.get_mut(&identity.record_id) {
+            Some(entry) if entry.identity == identity => {
+                entry.owner = PendingStage2RetirementOwner::CarrierSafePoint;
+            }
+            _ => {
+                pending.insert(
+                    identity.record_id,
+                    PendingStage2Retirement {
+                        identity,
+                        owner: PendingStage2RetirementOwner::CarrierSafePoint,
+                        in_flight: false,
+                        proof: None,
+                    },
+                );
+            }
+        }
     }
 
     pub(crate) fn cancel_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {
@@ -2065,7 +2107,12 @@ impl CarrierVmCustody {
         self.pending_carrier_stage2_retirements
             .lock()
             .values()
-            .filter_map(|entry| (!entry.in_flight).then_some(entry.identity))
+            .filter_map(|entry| {
+                (entry.owner == PendingStage2RetirementOwner::CarrierSafePoint
+                    && !entry.in_flight
+                    && entry.proof.is_some())
+                .then_some(entry.identity)
+            })
             .take(limit)
             .collect()
     }
@@ -3855,6 +3902,11 @@ mod carrier_vm_custody_tests {
             ));
             directory.push((key, generation));
         }
+        assert_eq!(
+            custody.pending_carrier_stage2_retirement_count(),
+            directory.len(),
+            "each retryable directory owner must retain its consume-once proof",
+        );
 
         let collision_key = (0xa083_0000_0000, 0x4000);
         let incumbent_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -3934,11 +3986,24 @@ mod carrier_vm_custody_tests {
         )
         .expect("reuse retired ready key");
 
-        while super::retry_pending_global_frame_retirements_at_idle_in_using(
-            &custody,
-            &mut |_, _| Ok(()),
-        ) != 0
-        {}
+        for _ in 0..128 {
+            if super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |_, _| Ok(()),
+            ) == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            super::retry_pending_global_frame_retirements_at_idle_in_using(
+                &custody,
+                &mut |_, _| Ok(()),
+            ),
+            0,
+            "green backend retirement must drain rather than poll forever: carrier_pending={}",
+            custody.pending_carrier_stage2_retirement_count(),
+        );
         assert_eq!(
             super::global_frame_host_owner_generation_in(&custody, ready_key.0, ready_key.1),
             replacement_generation,

@@ -5251,8 +5251,7 @@ pub(crate) mod tests {
                             .filter_map(Result::ok)
                             .rev()
                             .find(|event| {
-                                event.kind
-                                    == carrick_kernel::event_ring::STAGE2_AUTHORITY_INVARIANT
+                                event.kind == carrick_kernel::event_ring::STAGE2_AUTHORITY_INVARIANT
                             })
                             .expect("the MM-local invariant must leave a terminal event receipt");
                         assert_eq!(
