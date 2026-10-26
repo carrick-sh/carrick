@@ -86,7 +86,10 @@ def lex(source, dialect):
                 group, text, end = 'word', 'c', pos + 1
             else:
                 # The old loops skipped a newline immediately after a backslash.
-                line += text.count('\n') - sum(e.group().endswith('\n') for e in _ESCAPES.finditer(text)) if '\n' in text else 0
+                if '\n' in text:
+                    line += text.count('\n') - sum(
+                        e.group().endswith('\n') for e in _ESCAPES.finditer(text)
+                    )
                 kind = 'string'
                 token_line = line
         if group == 'quote':
