@@ -45,6 +45,33 @@ impl<
         let venue = self.process.as_deref_mut()?;
         (venue.binding() == binding).then_some(venue)
     }
+
+    fn run_ready_after_native_transfer(&mut self, outcome: &mut LifecycleOutcome) {
+        if let LifecycleOutcome::Transferred { progress, .. } = outcome
+            && matches!(progress, carrick_core::Served::Idle)
+        {
+            let task_index = self.frame.task_index();
+            let slot = self.frame.slot();
+            if let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
+                let task = self.current_tasks.get(task_index).unwrap_or_else(|| {
+                    super::dispatch::invalid_completion(
+                        super::dispatch::NativeInvariant::EntryBinding,
+                    )
+                });
+                let slot = slot.unwrap_or_else(|| {
+                    super::dispatch::invalid_completion(
+                        super::dispatch::NativeInvariant::EntryBinding,
+                    )
+                });
+                if let Some(ready) =
+                    native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+                        .run_ready(frame)
+                {
+                    *progress = ready;
+                }
+            }
+        }
+    }
 }
 
 impl<
@@ -152,51 +179,7 @@ impl<
         rusage: UserVa,
     ) -> Option<LifecycleOutcome> {
         let mut outcome = self.process_venue()?.wait4(pid, status, options, rusage);
-        if let LifecycleOutcome::Transferred { progress, .. } = &mut outcome
-            && matches!(progress, carrick_core::Served::Idle)
-        {
-            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-            unsafe {
-                (&*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters))
-                    .refused[506]
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            }
-            let task_index = self.frame.task_index();
-            let slot = self.frame.slot();
-            if let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
-                let task = self.current_tasks.get(task_index).unwrap_or_else(|| {
-                    super::dispatch::invalid_completion(
-                        super::dispatch::NativeInvariant::EntryBinding,
-                    )
-                });
-                let slot = slot.unwrap_or_else(|| {
-                    super::dispatch::invalid_completion(
-                        super::dispatch::NativeInvariant::EntryBinding,
-                    )
-                });
-                if let Some(ready) =
-                    native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-                        .run_ready(frame)
-                {
-                    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-                    unsafe {
-                        (&*(carrick_el1_abi::EL1_COUNTERS_BASE
-                            as *const carrick_el1_abi::Counters))
-                            .refused[507]
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    }
-                    *progress = ready;
-                } else {
-                    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-                    unsafe {
-                        (&*(carrick_el1_abi::EL1_COUNTERS_BASE
-                            as *const carrick_el1_abi::Counters))
-                            .refused[508]
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
-        }
+        self.run_ready_after_native_transfer(&mut outcome);
         Some(outcome)
     }
     fn process_waitid(
@@ -233,7 +216,9 @@ impl<
         Some(outcome)
     }
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
-        Some(self.process_venue()?.exit_group(status))
+        let mut outcome = self.process_venue()?.exit_group(status);
+        self.run_ready_after_native_transfer(&mut outcome);
+        Some(outcome)
     }
     fn process_exit_binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
         let binding = LifecycleNative::binding(self)?;
