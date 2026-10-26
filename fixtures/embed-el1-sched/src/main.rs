@@ -16,6 +16,7 @@
 //!   and a pair is handing off.
 //! - `exec`: `execve` from a non-leader thread while siblings are parked.
 //! - `exec-child`: the image `exec` runs.
+//! - `reused-slot-exec`: reap one fork child, then exec from a second child.
 //! - `exec-successor-memory`: execs this static image, then the successor
 //!   faults the far end of a sparse anonymous mapping and resolves fork COW.
 //! - `epoll-pingpong <iters>`: two threads hand a turn back and forth through
@@ -466,6 +467,47 @@ fn exec_successor_memory(argv0: &str) -> i32 {
     let rc = unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
     println!("exec-successor-memory failed rc={rc}");
     3
+}
+
+fn reused_slot_exec(argv0: &str) -> i32 {
+    let first = unsafe { libc::fork() };
+    if first < 0 {
+        return 2;
+    }
+    if first == 0 {
+        unsafe { libc::_exit(0) };
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(first, &mut status, 0) } != first
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 3;
+    }
+
+    let second = unsafe { libc::fork() };
+    if second < 0 {
+        return 4;
+    }
+    if second == 0 {
+        let path = std::ffi::CString::new(argv0).expect("argv0");
+        let arg0 = std::ffi::CString::new("el1-sched").expect("arg0");
+        let arg1 = std::ffi::CString::new("reused-slot-exec-child").expect("arg1");
+        let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
+        let envp = [std::ptr::null::<libc::c_char>()];
+        unsafe {
+            libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            libc::_exit(5);
+        }
+    }
+    status = 0;
+    if unsafe { libc::waitpid(second, &mut status, 0) } != second
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return 6;
+    }
+    0
 }
 
 fn exec_successor_memory_child() -> i32 {
@@ -3739,6 +3781,11 @@ fn main() {
         }
         "exec-child" => {
             println!("exec-child ok");
+            0
+        }
+        "reused-slot-exec" => reused_slot_exec(&args[0]),
+        "reused-slot-exec-child" => {
+            println!("reused-slot-exec ok");
             0
         }
         other => {
