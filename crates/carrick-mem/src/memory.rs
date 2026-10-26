@@ -4863,8 +4863,16 @@ fn write_el1_vector_hook(
     hook_offset: usize,
     mailbox_capture: usize,
     irq: El1IrqMode,
+    scheduler_irq_entry: Option<usize>,
 ) {
-    let _ = write_el1_hook(bytes, hook_offset, mailbox_capture, irq, HookEntry::Syscall);
+    let _ = write_el1_hook(
+        bytes,
+        hook_offset,
+        mailbox_capture,
+        irq,
+        HookEntry::Syscall,
+        scheduler_irq_entry,
+    );
 }
 
 fn write_el1_hook(
@@ -4873,6 +4881,7 @@ fn write_el1_hook(
     mailbox_capture: usize,
     irq: El1IrqMode,
     entry: HookEntry,
+    scheduler_irq_entry: Option<usize>,
 ) -> usize {
     let put = |bytes: &mut [u8], off: usize, op: u32| {
         bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
@@ -5082,10 +5091,10 @@ fn write_el1_hook(
     // the vCPU at any instruction here. The engine owes such a kick to the
     // EL0 boundary (`carrick_aarch64::owed_kick`): it publishes the kick to
     // this slot's `pending_host_work` and clears `I` in the live SPSR_EL1.
-    // A kick absorbed before the check is seen by the check, and the syscall
-    // leaves through the host. A kick absorbed after the check finds SPSR_EL1
-    // already final, so its unmask survives to `eret` and the kick IRQ is
-    // taken at the first EL0 instruction. With the check before the reload
+    // A kick absorbed before the check is seen by the check and re-enters the
+    // scheduler through its IRQ boundary. A kick absorbed after the check
+    // finds SPSR_EL1 already final, so its unmask survives to `eret` and the
+    // kick IRQ is taken at the first EL0 instruction. With the check before the reload
     // (as it once was), a kick absorbed between the two had its unmask
     // overwritten by the saved, masked copy: EL0 ran on with the kick
     // pending and masked, and a page-table drain waiting on that vCPU waited
@@ -5108,6 +5117,9 @@ fn write_el1_hook(
     if irq == El1IrqMode::Gic {
         emit(bytes, &mut cursor, enc_movz_xn(2, 0x80, 0)); // mov x2, #PSTATE.I
         emit(bytes, &mut cursor, enc_bic_xd_xn_xm(1, 1, 2)); // bic x1, x1, x2
+        // A late-work scheduler re-entry reuses this frame. Keep its saved
+        // return state identical to the finalized live SPSR_EL1.
+        emit(bytes, &mut cursor, enc_str_xt_xn(1, 16, 256));
     }
     emit(bytes, &mut cursor, 0xD518_4001); // msr spsr_el1, x1
 
@@ -5143,8 +5155,17 @@ fn write_el1_hook(
         emit(bytes, &mut cursor, (enc_movz_w16(1) & !31) | 2); // cause bits are not replay policy
         emit(bytes, &mut cursor, 0x889F_FC22); // stlr w2, [x1] (mark served_with_work = 1)
     }
-    let branch_to_forward = cursor;
-    emit(bytes, &mut cursor, 0); // b forward_target (placeholder)
+    // In GIC mode late host work is a scheduler event, even when the handler
+    // just served the original frame. Recast the retained frame as an IRQ and
+    // re-enter the common scheduler boundary. A native owner can then park
+    // and publish its handoff before the driver reaches any host boundary.
+    // The IRQ hook itself uses its own frame entry, closing the same race if
+    // work arrives after an IRQ handler returned `Served`.
+    if irq == El1IrqMode::Gic {
+        emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264)); // esr = 0 (IRQ)
+    }
+    let late_work_branch = cursor;
+    emit(bytes, &mut cursor, 0); // b scheduler IRQ entry or forward target
     let skip_label = cursor;
     put(
         bytes,
@@ -5189,10 +5210,18 @@ fn write_el1_hook(
         forward_branch,
         enc_bne(forward_branch as u64, forward_target as u64),
     );
+    let late_work_target = if irq == El1IrqMode::Gic {
+        scheduler_irq_entry.unwrap_or_else(|| {
+            assert_eq!(entry, HookEntry::Irq);
+            frame_entry
+        })
+    } else {
+        forward_target
+    };
     put(
         bytes,
-        branch_to_forward,
-        enc_b(branch_to_forward as u64, forward_target as u64),
+        late_work_branch,
+        enc_b(late_work_branch as u64, late_work_target as u64),
     );
 
     emit(bytes, &mut cursor, 0x9100_03F0); // mov x16, sp (TrapFrame pointer)
@@ -5322,7 +5351,7 @@ fn write_el0_irq_hook(bytes: &mut [u8], hook_offset: usize) -> usize {
     let put = |bytes: &mut [u8], off: usize, op: u32| {
         bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
     };
-    let frame_entry = write_el1_hook(bytes, hook_offset, 0, El1IrqMode::Gic, HookEntry::Irq);
+    let frame_entry = write_el1_hook(bytes, hook_offset, 0, El1IrqMode::Gic, HookEntry::Irq, None);
     let slot = AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET;
     put(bytes, slot, enc_b(slot as u64, hook_offset as u64));
     put(bytes, slot + 4, AARCH64_NOP_OPCODE);
@@ -6071,13 +6100,22 @@ fn el1_vectors_bytes_mailbox_with_layout(
 
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
     if el1_enabled {
-        write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, mailbox_capture, irq);
+        let scheduler_irq_entry =
+            (irq == El1IrqMode::Gic).then(|| write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET));
+        write_el1_vector_hook(
+            &mut bytes,
+            EL1_VECTOR_HOOK_OFFSET,
+            mailbox_capture,
+            irq,
+            scheduler_irq_entry,
+        );
         write_el1_hook(
             &mut bytes,
             EL0_FAULT_HOOK_OFFSET,
             legacy_hvc,
             irq,
             HookEntry::Fault,
+            scheduler_irq_entry,
         );
         write_el1_hook(
             &mut bytes,
@@ -6085,6 +6123,7 @@ fn el1_vectors_bytes_mailbox_with_layout(
             legacy_hvc,
             irq,
             HookEntry::SignalCheck,
+            scheduler_irq_entry,
         );
         // The source executor's Idle mailbox is not task state. Reconstruct
         // the fatal selector after a reload instead of relying on its payload.
@@ -6107,9 +6146,6 @@ fn el1_vectors_bytes_mailbox_with_layout(
                 NATIVE_OWNER_CANCEL_ENTRY_OFFSET + index * 4,
                 opcode,
             );
-        }
-        if irq == El1IrqMode::Gic {
-            let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
         }
     }
     // `portal_hvc` loads x16 and x17, then traps: the hvc returns 12 bytes on.
@@ -8391,6 +8427,40 @@ mod syscall_mailbox_tests {
                 .count(),
             1,
             "only the unreachable idle-exit sentinel may fail as a fault"
+        );
+    }
+
+    /// A host request can arrive after the EL1 syscall handler returned
+    /// `Served`, while a native-owned switched record still owns the frame.
+    /// Re-enter the existing IRQ scheduler boundary so that owner can park
+    /// and publish its handoff before any host exit.
+    #[test]
+    fn served_native_frame_with_late_host_work_reenters_irq_boundary() {
+        let bytes = el1_vectors_bytes_mailbox_irq(false, false, true, El1IrqMode::Gic);
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
+        let pending_load = words[EL1_VECTOR_HOOK_OFFSET / 4..(EL1_VECTOR_HOOK_OFFSET + 0x1000) / 4]
+            .iter()
+            .position(|word| *word == enc_ldar_wt_xn(2, 1))
+            .map(|index| index + EL1_VECTOR_HOOK_OFFSET / 4)
+            .expect("syscall return pending-host-work load");
+        let mut scratch = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
+        let irq_frame_entry = write_el0_irq_hook(&mut scratch, EL0_IRQ_HOOK_OFFSET) / 4;
+
+        assert_eq!(
+            words[pending_load + 5],
+            enc_str_xt_xn(31, 16, 264),
+            "late work must become an IRQ frame before scheduler re-entry"
+        );
+        let branch = words[pending_load + 6];
+        assert_eq!(branch & 0xfc00_0000, 0x1400_0000, "expected branch");
+        let displacement = ((branch & 0x03ff_ffff) as i32) << 6 >> 6;
+        assert_eq!(
+            (pending_load + 6) as i32 + displacement,
+            irq_frame_entry as i32,
+            "late work bypassed the scheduler IRQ ownership boundary"
         );
     }
 

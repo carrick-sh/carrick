@@ -1562,6 +1562,17 @@ shortcut and preserve the exact saved context through handback and driver
 release. Signed lifecycle, parked-thread, pipe and fork-COW populations remain
 the hardware binding; VM-free admission alone does not qualify those runs.
 
+A served EL1 frame may observe host work only after its handler has returned.
+In GIC mode that late edge is still scheduler work: the vector preserves the
+final EL0 return state, recasts the retained frame as an IRQ, and re-enters the
+common scheduler IRQ boundary. A native owner therefore parks and publishes
+its handoff before the driver can reach a host boundary. The emitted-byte
+`served_native_frame_with_late_host_work_reenters_irq_boundary` witness and
+the instruction-boundary interpreter's
+`native_signal_work_cause_never_replays_a_served_syscall` row bind the
+transition without a VM; the signed populations above remain the hardware
+binding.
+
 ## Native close with a host-loaded member (`kernel.el1.thread-lifecycle`)
 
 A native process close publishes cancellation for every exact outstanding
