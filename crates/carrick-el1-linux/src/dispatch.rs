@@ -492,10 +492,9 @@ pub(super) fn arm_process_call_claimed(
 ) -> bool {
     use super::native_process_runtime::NativeThreadGroupOwner;
 
-    nr == 435
+    matches!(nr, 221 | 281 | 435)
         || (nr == 220 && flags & 0x0001_0000 == 0)
         || match nr {
-            221 | 281 => owner() != NativeThreadGroupOwner::Unowned,
             260 | 93 | 94 | 95 | 58 | 139 => owner() != NativeThreadGroupOwner::Unowned,
             _ => false,
         }
@@ -3072,8 +3071,8 @@ mod tests {
                 "native child exec ordinal={ordinal}"
             );
             assert!(
-                !arm_process_call_claimed(ordinal, 0, || NativeThreadGroupOwner::Unowned),
-                "host-loaded exec ordinal={ordinal}"
+                arm_process_call_claimed(ordinal, 0, || NativeThreadGroupOwner::Unowned),
+                "first native root exec ordinal={ordinal}"
             );
         }
         assert!(!arm_process_call_claimed(62, 0, || panic!(
