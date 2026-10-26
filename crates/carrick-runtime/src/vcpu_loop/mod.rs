@@ -5155,6 +5155,8 @@ pub(crate) mod tests {
                                 .unwrap();
                             drop(release_guard);
                         }
+                        peer.take().unwrap().join().unwrap();
+                        carrick_kernel::el1_zone::hand_back_completions();
                         wait = if released_editor_admission {
                             admission_wait.expect(
                                 "the refused admission must retain its advanced Editor receipt",
@@ -5175,8 +5177,6 @@ pub(crate) mod tests {
                             // revision before losing the still-held word.
                             wait = unsafe { wait.into_editor_admission() };
                         }
-                        peer.take().unwrap().join().unwrap();
-                        carrick_kernel::el1_zone::hand_back_completions();
                         engine.copyout_owner_probe = if released_editor_admission {
                             // The sampled refusal is the first SELECT. Once
                             // its editor releases, the production retry can
@@ -5189,6 +5189,28 @@ pub(crate) mod tests {
                             })
                         };
                         if stale_selection_without_editor {
+                            assert_eq!(
+                                wait.origin(),
+                                carrick_el1_abi::PortalOwnerWaitOrigin::Stage2Authority
+                            );
+                            assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Editor);
+                            assert!(
+                                zone.spaces
+                                    .active_editor(zone.spaces.find(mm.raw()).unwrap())
+                                    .is_none()
+                            );
+                            assert!(!zone.spaces.is_closed(zone.spaces.find(mm.raw()).unwrap()));
+                            assert_eq!(
+                                zone.space_entry(NonZeroU64::new(mm.raw()).unwrap())
+                                    .unwrap()
+                                    .notifications(handle.incarnation())
+                                    .unwrap()
+                                    .observe(
+                                        carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                                    )
+                                    .revision(),
+                                wait.revision()
+                            );
                             engine.prepare_dependency =
                                 Some(carrick_guest_mem::OwnedMemoryWait::new(retirement.clone()));
                         }
@@ -5335,7 +5357,7 @@ pub(crate) mod tests {
                             .unwrap();
                         assert!(
                             !matches!(completed, executor::ExecutorExit::Blocked(_)),
-                            "a producer-free current selection must not park"
+                            "a producer-free current selection must not park: {completed:?}"
                         );
                         let fatal = kernel
                             .fatal_signal
