@@ -319,7 +319,7 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
     assert_eq!(
         libc::WEXITSTATUS(status),
         0,
-        "child status={status} exit={} parent_worker={worker_failure:?}",
+        "child status={status} exit={} panic_stage={panic_stage:?} parent_worker={worker_failure:?}",
         libc::WEXITSTATUS(status)
     );
     assert!(
