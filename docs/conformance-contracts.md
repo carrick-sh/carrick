@@ -1565,11 +1565,12 @@ the hardware binding; VM-free admission alone does not qualify those runs.
 A served EL1 frame may observe host work only after its handler has returned.
 In every interrupt mode that late edge is still scheduler work: the vector
 preserves the final EL0 return state, recasts the retained frame as an IRQ,
-and re-enters the common scheduler IRQ boundary. That neutral boundary settles
-pending work for a native switched record before any host-exit decision: its
-personality owner must settle the completed frame, park the record, and publish
-the handoff first. A concurrent affinity change for the host-loaded task cannot
-bypass that switched owner. The emitted-byte
+and re-enters the common scheduler IRQ boundary. After the scheduler selects an
+IRQ result, one neutral return boundary settles pending work for a native
+switched record before that result can commit: its personality owner must
+settle the completed frame, park the record, and publish the handoff first. A
+request published after a concurrent affinity decision therefore cannot bypass
+that switched owner. The emitted-byte
 `served_native_frame_with_late_host_work_reenters_irq_boundary` witness and
 the instruction-boundary interpreter's
 `native_signal_work_cause_never_replays_a_served_syscall` row bind the vector
