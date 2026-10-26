@@ -309,3 +309,90 @@ fn linux_test_consumers_share_one_artifact_and_clippy_union() {
             .any(|s| s["run"].as_str() == Some("just clippy-linux"))
     );
 }
+
+#[test]
+fn warm_tail_replays_consumer_xtask_builds_after_eviction_pressure() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let documents = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
+    let warmer = &documents[0]["jobs"]["cache-warm"];
+    let families = warmer["strategy"]["matrix"]["include"].as_vec().unwrap();
+    for (family, cap) in [
+        ("linux-x64", "3G"),
+        ("darwin-hosted", "2G"),
+        ("linux-arm64", "512M"),
+    ] {
+        assert_eq!(
+            families
+                .iter()
+                .find(|f| f["family"].as_str() == Some(family))
+                .unwrap()["cache-size"]
+                .as_str(),
+            Some(cap)
+        );
+    }
+    let script = warmer["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["run"].as_str())
+        .find(|run| run.contains("case \"$FAMILY\""))
+        .unwrap();
+    for (family, last) in [
+        ("linux-x64", "just ci-build-xtask-tests"),
+        ("darwin-hosted", "just test-xtask --no-run"),
+    ] {
+        let block = script
+            .split(&format!("{family})"))
+            .nth(1)
+            .unwrap()
+            .split(";;")
+            .next()
+            .unwrap();
+        let commands: Vec<_> = block
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        let clean = commands
+            .iter()
+            .position(|l| *l == "cargo clean")
+            .expect("Cargo freshness must not bypass sccache LRU refresh");
+        let lean = commands
+            .iter()
+            .position(|l| *l == "just ci-prebuild-xtask")
+            .unwrap();
+        let finish = commands.iter().position(|l| *l == last).unwrap();
+        assert!(clean < lean && lean < finish);
+        assert_eq!(
+            commands.last().copied(),
+            Some(last),
+            "nothing may evict the critical tail"
+        );
+        assert!(commands[lean + 1].starts_with("export CARRICK_XTASK_BIN="));
+        assert!(
+            !block.contains("CARGO_TARGET_DIR="),
+            "cache keys must match consumers"
+        );
+    }
+    let justfile = std::fs::read_to_string(root.join("justfile")).unwrap();
+    assert!(justfile.contains("test-batch --export target/xtask-tests.tar.gz _test-xtask-ci"));
+    for recipe in [
+        "_test-xtask *ARGS:",
+        "_test-xtask-shards:",
+        "_test-xtask-domain-unit:",
+        "_test-xtask-domain-integration:",
+    ] {
+        let body = justfile
+            .split(recipe)
+            .nth(1)
+            .unwrap()
+            .split("\n\n")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("--all-features"),
+            "{recipe}: consumer feature set drift"
+        );
+    }
+}
