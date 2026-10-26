@@ -1,5 +1,73 @@
 # Issue #847 signed hardware evidence
 
+## Exact `5db2d9c1b` smoke passes, host-read hits the authority invariant (2026-10-26)
+
+The exact bundle for source head
+`5db2d9c1b6689eb2a9dcd3190e391449133ea4ba` verified, restored, and
+verified again with 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/5db2d9c1b6689eb2a9dcd3190e391449133ea4ba/91e4f090f7f63b2753e9882c19b729f154be8ed24bfbb5108613638442cff0bc.tar.gz
+bundle identity: 91e4f090f7f63b2753e9882c19b729f154be8ed24bfbb5108613638442cff0bc
+archive SHA-256: 962fd75ce1e966df2636538ed7b9a152d657e32400af27399baa47b1d224a789
+input identity: e7dee9818f2fcc6a6bdc51a4abb6acb5e8a8a008efc599db45cbccc61358c766
+```
+
+Mandatory bootstrap smoke `847-5db-smoke-01` passed 1/1. The first
+host-read acceptance run, `847-5db-hostread-01`, also passed. Run
+`847-5db-hostread-02` then completed its first 1,000- and 6,000-iteration
+arms, but its next 1,000-iteration guest exited 137 / SIGKILL with empty
+stdout and stderr. It emitted no watchdog census and no EFAULT. The signed
+harness's entitlement negative control passed, and every harness plus
+explicit scoped cleanup reported zero remaining processes.
+
+The exact failed signed executable was:
+
+```text
+path: target/release/deps/el1_sched-775614d8f5f84d25
+SHA-256: 00d8a14d977190719704688bce0cf8c43ef16272cbd815b338e2d2d3ebc116df
+CDHash: 990e4bb040715c4c9550a4d20f31c77dff13e86f
+LC_UUID: 62CE8F2E-7962-32AA-92BB-FAE3ADDC07F7
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+The signed harness re-signs through a PID-named temporary file on every
+invocation, so its SHA-256 and CDHash change even though the linked Mach-O and
+LC_UUID do not. The diagnostic retained the next harness-signed bytes without
+relinking (SHA-256
+`c62a944b731cd1b79f871d1066b99cb4adc6cb729916c62fb082d4e4cff4e7c6`,
+CDHash `b47fddcc16206efc14d925d5d371f084980692f4`) and placed a pid-provider
+probe on the existing
+`carrick_kernel::event_ring::rec_stage2_authority_invariant` recorder.
+
+Bounded diagnostic runs `847-5db-hostread-dtrace-02` through `-05` passed.
+Run `847-5db-hostread-dtrace-06` reproduced the SIGKILL and fired that recorder
+exactly once:
+
+```text
+STAGE2INV|mm=2|guest_tid=7|revision=13121
+carrick_kernel::event_ring::rec_stage2_authority_invariant
+carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob::drive_owner_resume
+carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob::route_outcome
+carrick_runtime::vcpu_loop::binding::ProductionHvpatchLoopJob::poll_with_engine
+```
+
+This is the design's process-local `Stage2AuthorityInvariant` fail-closed
+path, not an external kill, watchdog, carrier fatal, or EFAULT. The required
+20/20 population therefore stopped rather than retrying until green, and the
+companion tests did not start:
+
+- bootstrap smoke: 1/1 (`847-5db-smoke-01`);
+- host-blocked-read acceptance: 1/2, then stopped
+  (`847-5db-hostread-01` pass, `847-5db-hostread-02` SIGKILL; 18 not started);
+- `native_root_exec_replaces_pid1_shell`: 0/0;
+- `el1_ipc_pipe_blocking_roundtrips`: 0/0 of 3;
+- `el1_fork_cow_resolves_in_guest`: 0/0 of 3.
+
+Full logs are `/tmp/847-5db-{smoke-01,hostread-01,hostread-02}.log` and
+`/tmp/847-5db-hostread-dtrace-06.log`. No product source was changed.
+
 ## Pre-identity pooled-root leases are adopted atomically (2026-10-26)
 
 The `14abec7f3` trace named an identity/publication ordering defect. The
