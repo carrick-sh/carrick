@@ -638,10 +638,9 @@ impl InventoryFrameRegistry {
         if mm_count == 1 {
             self.structural_stage2_references.remove(&(lease, mm));
         } else {
-            *self
-                .structural_stage2_references
-                .get_mut(&(lease, mm))
-                .expect("validated structural reference remains") -= 1;
+            self.structural_stage2_references
+                .entry((lease, mm))
+                .and_modify(|count| *count -= 1);
         }
         self.stage2_references.remove(&lease);
         Ok(Stage1Unpublished { lease, identity })
