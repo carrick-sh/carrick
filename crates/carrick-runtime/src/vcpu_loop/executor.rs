@@ -174,9 +174,6 @@ where
             }
         }
     }));
-    // Stopped, closed or dead, this executor comes back to no vCPU: nothing
-    // may wait on the slot it drove.
-    backend::leave_driven_zone_slot();
     let mut retired = false;
     let mut failure = match lifecycle {
         Ok(Ok(())) => None,
@@ -200,6 +197,9 @@ where
     if let Some(error) = &failure {
         crate::probes::hvpatch_executor_failure(executor_id.raw_for_probe(), error);
     }
+    // Report the original failure before releasing slot custody: a refused
+    // release must not hide the boundary that stopped this driver.
+    backend::leave_driven_zone_slot();
     if !startup_sent {
         let message = failure
             .clone()
