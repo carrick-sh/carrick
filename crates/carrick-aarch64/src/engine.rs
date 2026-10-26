@@ -7309,6 +7309,15 @@ unsafe impl<V: Aarch64Vmm> Send for Aarch64EngineCore<V> {}
 mod tests {
     use super::*;
 
+    fn test_stage1_authority(manager: Option<PageTableManager>) -> Stage1Authority {
+        let authority = Stage1Authority::new_with_manager(manager);
+        assert!(
+            authority.bind_mm(1),
+            "test authority binds to its Editor MM"
+        );
+        authority
+    }
+
     pub(super) fn test_editor_excluded() -> &'static carrick_guest_mem::El1EditorExcluded {
         static LICENSE: std::sync::OnceLock<&'static carrick_guest_mem::El1EditorExcluded> =
             std::sync::OnceLock::new();
@@ -7749,7 +7758,7 @@ mod tests {
                 .and_then(|tail| tail.split("\n    fn ").next())
                 .and_then(|body| body.split("\n    ///").next())
                 .unwrap_or_else(|| panic!("production writer {path}"));
-            assert!(body.contains("self.retire_stage1_range("), "{path}");
+            assert!(body.contains(".retire_stage1_range("), "{path}");
             assert!(
                 !body.contains("pt_edit"),
                 "{path} must not use the host-only funnel"
@@ -7806,19 +7815,26 @@ mod tests {
             .next()
             .expect("production AArch64 engine source");
         let funnel = production
-            .split("fn pt_edit_locked_after_adopting")
+            .split("fn pt_edit_locked_after_adopting_inner")
             .nth(1)
             .and_then(|tail| tail.split("\n    fn ").next())
             .expect("live edit funnel");
         let refusal = funnel
             .find("LiveDescriptorOwner::Guest")
             .expect("funnel refuses the guest-owned lane");
-        let first_edit = funnel.find("page_tables.edit(").expect("funnel edit");
+        let first_edit = funnel
+            .find("page_tables.edit")
+            .expect("funnel edit or unpublication edit");
         assert!(refusal < first_edit, "refusal must precede any staged edit");
         assert_eq!(
             production.matches("page_tables.edit(").count(),
             1,
             "the engine's only live editor is the refusing funnel"
+        );
+        assert_eq!(
+            production.matches("page_tables.edit_unpublishing(").count(),
+            1,
+            "the engine's only retiring live editor is the refusing funnel"
         );
 
         let grant = production
@@ -8604,7 +8620,7 @@ mod tests {
         let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
             carrick_mmu_core::aarch64::SubstrateGpa(0x1000),
         );
-        let parent_authority = Stage1Authority::new_with_manager(Some(manager));
+        let parent_authority = test_stage1_authority(Some(manager));
         parent_authority
             .install_source(Box::new(DummyArenaSource(source_id)))
             .expect("set arena source on parent authority");
@@ -8667,7 +8683,7 @@ mod tests {
         let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
             carrick_mmu_core::aarch64::SubstrateGpa(0x1000),
         );
-        let parent_authority = Stage1Authority::new_with_manager(Some(manager));
+        let parent_authority = test_stage1_authority(Some(manager));
         parent_authority
             .install_source(Box::new(DummyArenaSource(source_id)))
             .expect("set arena source on parent authority");
@@ -8764,9 +8780,9 @@ mod tests {
         };
         let old_root = 0x9a_0020_0000;
         let new_root = 0x9a_0040_0000;
-        let mut engine = Stage1Authority::new_with_manager(Some(manager(old_root)));
+        let mut engine = test_stage1_authority(Some(manager(old_root)));
         let pending_predecessor = engine.clone();
-        let backend_successor = Stage1Authority::new_with_manager(Some(manager(new_root)));
+        let backend_successor = test_stage1_authority(Some(manager(new_root)));
         replace_page_tables_authority(
             &mut engine,
             crate::stage1_authority::tests::test_edit_license(),
@@ -8797,7 +8813,7 @@ mod tests {
         let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
             carrick_mmu_core::aarch64::SubstrateGpa(0x1000),
         );
-        let parent_authority = Stage1Authority::new_with_manager(Some(manager));
+        let parent_authority = test_stage1_authority(Some(manager));
         parent_authority
             .install_source(Box::new(DummyArenaSource(source_id)))
             .expect("set arena source on parent authority");
@@ -8853,7 +8869,7 @@ mod tests {
             carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
             carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
-        let mut authority = Stage1Authority::new_with_manager(Some(manager));
+        let mut authority = test_stage1_authority(Some(manager));
         assert!(authority.is_exclusive());
 
         let mut retired = false;
@@ -8905,7 +8921,7 @@ mod tests {
         let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
             carrick_mmu_core::aarch64::SubstrateGpa(0x3000),
         );
-        let authority = Stage1Authority::new_with_manager(Some(manager));
+        let authority = test_stage1_authority(Some(manager));
         authority
             .install_source(Box::new(DummyArenaSource(source_id)))
             .expect("install source");
@@ -8938,7 +8954,7 @@ mod tests {
         let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
             carrick_mmu_core::aarch64::SubstrateGpa(0x4000),
         );
-        let parent = Stage1Authority::new_with_manager(Some(manager));
+        let parent = test_stage1_authority(Some(manager));
         parent
             .install_source(Box::new(DummyArenaSource(source_id)))
             .expect("install source");
@@ -8965,7 +8981,7 @@ mod tests {
 
     #[test]
     fn stage1_authority_sibling_lazy_build_sees_source() {
-        let authority = Stage1Authority::new();
+        let authority = test_stage1_authority(None);
         let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(
             carrick_mmu_core::aarch64::SubstrateGpa(0x5000),
         );
@@ -9004,7 +9020,7 @@ mod tests {
 
     #[test]
     fn stage1_authority_deferred_install_on_one_clone_then_build_on_another() {
-        let clone1 = Stage1Authority::new();
+        let clone1 = test_stage1_authority(None);
         let clone2 = clone1.clone();
 
         let source_id = carrick_mmu_core::aarch64::TableArenaSourceId(

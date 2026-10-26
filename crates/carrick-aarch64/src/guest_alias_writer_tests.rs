@@ -63,9 +63,7 @@ fn guest_lane_alias_writers_publish_through_el1_before_the_host_funnel() {
     let retire = guest
         .find("self.apply_stage1_rules(")
         .expect("span is retired through the lane-agnostic applier");
-    let unregister = guest
-        .find("self.vm.on_unmap(")
-        .expect("alias is unregistered");
+    let unregister = guest.find(".on_unmap(").expect("alias is unregistered");
     let unmapped = guest
         .find("self.set_unmapped(")
         .expect("range is marked unmapped");
