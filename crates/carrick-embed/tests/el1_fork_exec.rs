@@ -49,6 +49,13 @@ fn el1_transparent_fork_exec_shared_backing() {
 
 #[test]
 fn native_root_exec_replaces_pid1_shell() {
+    common::native_exec_three_rounds(
+        "native_root_exec_replaces_pid1_shell",
+        native_root_exec_replaces_pid1_shell_round,
+    );
+}
+
+fn native_root_exec_replaces_pid1_shell_round() {
     let _guard = common::guest_lock();
     let _watchdog = common::Watchdog::start(Duration::from_secs(90));
     let result = common::run_or_fail(
@@ -70,6 +77,13 @@ fn native_root_exec_replaces_pid1_shell() {
 
 #[test]
 fn native_child_exec_after_reusing_a_retired_slot() {
+    common::native_exec_three_rounds(
+        "native_child_exec_after_reusing_a_retired_slot",
+        native_child_exec_after_reusing_a_retired_slot_round,
+    );
+}
+
+fn native_child_exec_after_reusing_a_retired_slot_round() {
     let _guard = common::guest_lock();
     let _watchdog = common::Watchdog::start(Duration::from_secs(90));
     // Signed smoke for the fork/exit/exec composition. Numeric slot reuse is
@@ -97,6 +111,13 @@ fn native_child_exec_after_reusing_a_retired_slot() {
 
 #[test]
 fn native_exec_successor_blocks_in_nanosleep() {
+    common::native_exec_three_rounds(
+        "native_exec_successor_blocks_in_nanosleep",
+        native_exec_successor_blocks_in_nanosleep_round,
+    );
+}
+
+fn native_exec_successor_blocks_in_nanosleep_round() {
     let _guard = common::guest_lock();
     let _watchdog = common::Watchdog::start(Duration::from_secs(90));
     let result = common::run_or_fail(
@@ -111,6 +132,13 @@ fn native_exec_successor_blocks_in_nanosleep() {
 
 #[test]
 fn native_exec_successor_blocks_on_pipe_until_parent_writes() {
+    common::native_exec_three_rounds(
+        "native_exec_successor_blocks_on_pipe_until_parent_writes",
+        native_exec_successor_blocks_on_pipe_until_parent_writes_round,
+    );
+}
+
+fn native_exec_successor_blocks_on_pipe_until_parent_writes_round() {
     const PARENT: &str = "carrick-linux-aarch64-two-pipes-dup3-exec";
     const CHILD: &str = "carrick-linux-aarch64-read-then-write-via-stdio";
 

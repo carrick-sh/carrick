@@ -1147,6 +1147,13 @@ fn el1_sched_exec_from_a_sibling_with_parked_threads() {
 /// fully live: its sparse first touches and its post-fork COW both complete.
 #[test]
 fn native_exec_successor_handles_cow_and_sparse_backing_faults() {
+    common::native_exec_three_rounds(
+        "native_exec_successor_handles_cow_and_sparse_backing_faults",
+        native_exec_successor_handles_cow_and_sparse_backing_faults_round,
+    );
+}
+
+fn native_exec_successor_handles_cow_and_sparse_backing_faults_round() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
