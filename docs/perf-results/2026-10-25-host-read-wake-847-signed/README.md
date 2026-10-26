@@ -1,5 +1,65 @@
 # Issue #847 signed hardware evidence
 
+## Pre-identity pooled-root leases are adopted atomically (2026-10-26)
+
+The `14abec7f3` trace named an identity/publication ordering defect. The
+bootstrap pooled root was structurally published before its MM identity, so
+`register_structural_stage2_references` had no identity under which to record
+the lease. `register_closed_initial_identity` later installed the identity
+without adopting that lease. Clean exit therefore presented a valid whole-MM
+receipt for a registry entry which did not exist and carrier-fataled with
+`ReceiptMismatch((661424963584, 2097152))`.
+
+The red-first production witness
+`bootstrap_root_published_before_identity_retires_before_reuse` reproduced
+that exact error against `14abec7f3`. It publishes the pooled root first,
+uses the real closed-initial identity path, retires the MM through table
+capacity, and repeats the complete sequence with a second MM reusing the same
+one-slot pool.
+
+Fix head `99591a9ac2970db7cc648dd3a556889ff91eeff6` makes the state structural:
+
+- structural registrations are either a typed pre-identity lease set or an
+  identified MM lease set;
+- identity installation holds the identity and structural-owner transaction,
+  registers the complete pending set under the MM, and only then publishes
+  the identity and transport binding;
+- a missing, mismatched, or nonfinal structural release mutates neither
+  reverse-map ledger;
+- table-capacity retirement preserves backend refusals as `RetirementRefused`
+  rather than stringifying them as hypervisor failures; the runtime fails the
+  task closed and retains the inconsistent backend until carrier process exit,
+  with no lookup or IPA-reuse path and no carrier abort.
+
+Four tests are new:
+
+- `mismatched_bootstrap_structural_release_is_typed_and_keeps_custody`;
+- `missing_stage2_release_keeps_structural_custody_for_retry`;
+- `nonfinal_structural_release_keeps_both_references_for_retry`;
+- `typed_retirement_refusal_quarantines_backend_custody`.
+
+`bootstrap_root_published_before_identity_retires_before_reuse` is a materially
+strengthened and renamed existing bootstrap reuse witness. It now matches the
+hardware publication order and proves two sequential MMs retire with matching
+receipts and return the arena for reuse.
+
+Portable verification:
+
+- serialized `carrick-vmm-hvf --lib`: 808 passed, 3 ignored;
+- serialized `carrick-runtime --lib`: 824 passed, 9 ignored;
+- serialized `carrick-aarch64 --lib`: 124 passed;
+- `just fmt-check`, `just clippy`, `just clippy-linux`, `just lint-domains`,
+  and `just test-kernel`: passed;
+- default EL1 image: 1,099,872 / 1,572,864 bytes; maximum checked stack
+  11,166 / 12,288 bytes (`native backing reply`);
+- allocator-test-control EL1 image: 1,104,064 / 1,572,864 bytes; maximum
+  checked stack 11,150 / 12,288 bytes (`native backing reply`);
+- all-target clippy EL1 image: 1,120,112 / 1,572,864 bytes; maximum checked
+  stack 11,758 / 12,288 bytes (`native backing reply`).
+
+No signed test was run on this source. The bootstrap smoke and #847 20/20
+population require the exact-candidate fixture bundle for this head.
+
 ## Exact `14abec7f3` smoke exposes an unregistered structural reference (2026-10-26)
 
 The exact bundle for evidence head
