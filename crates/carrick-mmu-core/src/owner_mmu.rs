@@ -73,26 +73,22 @@ pub trait OwnerForkMmu: OwnerMmu {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Aarch64Mmu;
-impl OwnerMmu for Aarch64Mmu {
-    fn root(register: u64) -> Result<RootGpa, OwnerMmuRefusal> {
-        RootGpa::page_aligned(FrameGpa::new(register & 0x0000_ffff_ffff_f000))
-            .filter(|root| root.address().raw() != 0)
-            .ok_or(OwnerMmuRefusal::Unreachable)
-    }
-    fn translate<W: LiveDescriptorWords + ?Sized>(
-        words: &W,
+impl Aarch64Mmu {
+    /// Translate through the exact retained root using authenticated descriptor
+    /// loads. Read-only host consumers share the owner's block/page geometry
+    /// without obtaining descriptor mutation authority.
+    pub fn translate_with(
         root: RootGpa,
         va: UserVa,
         access: LeafAccess,
         user: bool,
+        mut load: impl FnMut(u64) -> Result<u64, OwnerMmuRefusal>,
     ) -> Result<Option<OwnerTranslation>, OwnerMmuRefusal> {
         use crate::aarch64::terminal_descriptor_permits_el0;
         const PA: u64 = 0x0000_ffff_ffff_f000;
         let mut table = root.address().raw();
         for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
-            let descriptor = words
-                .load(table + ((va.raw() >> shift) & 511) * 8)
-                .map_err(|_| OwnerMmuRefusal::Unreachable)?;
+            let descriptor = load(table + ((va.raw() >> shift) & 511) * 8)?;
             if descriptor & 1 == 0 {
                 return Ok(None);
             }
@@ -113,6 +109,27 @@ impl OwnerMmu for Aarch64Mmu {
         }
         Err(OwnerMmuRefusal::Unreachable)
     }
+}
+impl OwnerMmu for Aarch64Mmu {
+    fn root(register: u64) -> Result<RootGpa, OwnerMmuRefusal> {
+        RootGpa::page_aligned(FrameGpa::new(register & 0x0000_ffff_ffff_f000))
+            .filter(|root| root.address().raw() != 0)
+            .ok_or(OwnerMmuRefusal::Unreachable)
+    }
+    fn translate<W: LiveDescriptorWords + ?Sized>(
+        words: &W,
+        root: RootGpa,
+        va: UserVa,
+        access: LeafAccess,
+        user: bool,
+    ) -> Result<Option<OwnerTranslation>, OwnerMmuRefusal> {
+        Self::translate_with(root, va, access, user, |address| {
+            words
+                .load(address)
+                .map_err(|_| OwnerMmuRefusal::Unreachable)
+        })
+    }
+
     fn classify_cow<W: LiveDescriptorWords + ?Sized>(
         words: &W,
         root: RootGpa,

@@ -6,10 +6,10 @@ semantic_authority = ["execve(2): failure before replacement preserves the old i
 fixture = "Two real private host mappings, source descriptor release, sparse payload bounds and abandoned preparation"
 scale_points = [1, 2]
 structural_budgets = []
-rationale = "The existing exec mapper consumes one physical backing constructor. Anonymous preparation copies only occupied payload bytes; private executable artifacts retain demand-backed file mappings. The VM-free leaf witnesses prove host backing isolation and cleanup, not native MM publication, IPA/root-slot recovery or process replacement."
+rationale = "The existing exec mapper consumes one physical backing constructor. Anonymous preparation copies only occupied payload bytes; private executable artifacts retain demand-backed file mappings. The VM-free leaf witnesses prove host backing isolation and cleanup, not native MM publication, IPA/root-slot recovery or process replacement. Native exec payload intake also authenticates its retained MM root through the shared AArch64 translator, accepting live L1/L2 blocks as well as L3 pages without granting descriptor mutation authority."
 
 [bindings]
-vm_free = "carrick-host::host_mapping::tests::exec_image_private_artifact_has_two_independent_retained_views; exec_image_sparse_payload_preserves_offsets_and_zero_tail; exec_image_invalid_extent_preserves_an_independent_preparation; exec_image_drop_releases_only_its_own_file_view; carrick-vmm-hvf::trap::execve_rebuild::backing_preparation_tests::exec_backing_partial_preparation_releases_leases_and_preserves_peer"
+vm_free = "carrick-host::host_mapping::tests::exec_image_private_artifact_has_two_independent_retained_views; exec_image_sparse_payload_preserves_offsets_and_zero_tail; exec_image_invalid_extent_preserves_an_independent_preparation; exec_image_drop_releases_only_its_own_file_view; carrick-vmm-hvf::trap::execve_rebuild::backing_preparation_tests::exec_backing_partial_preparation_releases_leases_and_preserves_peer; carrick-vmm-hvf::metadata_grant::native_service::intake_tests::native_exec_payload_authenticates_a_live_metadata_block (three descriptor loads for an L2 block, no L3 access)"
 
 [bindings.unresolved]
 embed_structural = "Native service ticket binding, unpublished successor-MM publication and aggregate IPA/root-slot rollback remain #785 work; physical backing tests do not prove those boundaries."
