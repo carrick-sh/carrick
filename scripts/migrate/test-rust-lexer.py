@@ -65,6 +65,15 @@ class RustLexerTests(unittest.TestCase):
             ('punct', '&&', 1, 9), ('punct', '||', 1, 12),
             ('punct', '+=', 1, 15), ('punct', '-=', 1, 18),
         ])
+        self.check_tokens('== != <= >=', [
+            ('punct', '==', 1, 0), ('punct', '!=', 1, 3),
+            ('punct', '<=', 1, 6), ('punct', '>=', 1, 9),
+        ])
+        self.check_tokens('... ..= *= /= << >>', [
+            ('punct', '...', 1, 0), ('punct', '..=', 1, 4),
+            ('punct', '*=', 1, 8), ('punct', '/=', 1, 11),
+            ('punct', '<<', 1, 14), ('punct', '>>', 1, 17),
+        ], ('global',))
         source = '... ..= *= /= << >> %= &= |= ^='
         self.check_tokens(source, [
             ('punct', '...', 1, 0), ('punct', '..=', 1, 4),
