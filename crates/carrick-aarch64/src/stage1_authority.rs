@@ -250,6 +250,32 @@ pub struct PendingGuestStage1Retirement {
     retired: Vec<(u64, u64)>,
 }
 
+/// Why a verified guest retirement could not be bound to the pre-image that
+/// its exact descriptor transaction captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestRetirementProofError {
+    InvalidRange,
+    ReceiptCount,
+    AuthorityImageAbsent,
+    ReceiptMismatch,
+    OldLeafStillPublished,
+}
+
+impl std::fmt::Display for GuestRetirementProofError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let detail = match self {
+            Self::InvalidRange => "invalid retirement range",
+            Self::ReceiptCount => "retirement plan/receipt count mismatch",
+            Self::AuthorityImageAbsent => "stage-1 authority image absent",
+            Self::ReceiptMismatch => "receipt does not name its captured retirement",
+            Self::OldLeafStillPublished => "captured old leaf remains published",
+        };
+        f.write_str(detail)
+    }
+}
+
+impl std::error::Error for GuestRetirementProofError {}
+
 impl Stage1LeafRetirementPlan {
     fn capture(
         authority: u64,
@@ -574,38 +600,55 @@ impl Stage1Authority {
         len: usize,
         plans: Vec<PendingGuestStage1Retirement>,
         receipts: &[VerifiedDescriptorReceipt],
-    ) -> Option<Stage1LeafRetired> {
-        if len == 0 || plans.len() != receipts.len() {
-            return None;
+    ) -> Result<Option<Stage1LeafRetired>, GuestRetirementProofError> {
+        if len == 0 {
+            return Err(GuestRetirementProofError::InvalidRange);
         }
-        let end = va.checked_add(len as u64)?;
+        if plans.len() != receipts.len() {
+            return Err(GuestRetirementProofError::ReceiptCount);
+        }
+        let end = va
+            .checked_add(len as u64)
+            .ok_or(GuestRetirementProofError::InvalidRange)?;
         let inner = self.inner.lock();
-        let image_generation = inner.manager.generation?;
-        let manager = inner.manager.as_ref()?;
+        let image_generation = inner
+            .manager
+            .generation
+            .ok_or(GuestRetirementProofError::AuthorityImageAbsent)?;
+        let manager = inner
+            .manager
+            .as_ref()
+            .ok_or(GuestRetirementProofError::AuthorityImageAbsent)?;
         let mut retired = Vec::new();
         for (plan, receipt) in plans.into_iter().zip(receipts) {
-            let plan_end = plan.va.checked_add(plan.len as u64)?;
+            let plan_end = plan
+                .va
+                .checked_add(plan.len as u64)
+                .ok_or(GuestRetirementProofError::InvalidRange)?;
             if plan.authority != self.authority_id()
                 || plan.txn_id != receipt.id()
                 || plan.va < va
                 || plan_end > end
-                || plan
-                    .retired
-                    .iter()
-                    .any(|&(page, old_ipa)| manager.translate(page) == Some(old_ipa))
             {
-                return None;
+                return Err(GuestRetirementProofError::ReceiptMismatch);
+            }
+            if plan
+                .retired
+                .iter()
+                .any(|&(page, old_ipa)| manager.translate(page) == Some(old_ipa))
+            {
+                return Err(GuestRetirementProofError::OldLeafStillPublished);
             }
             retired.extend(plan.retired);
         }
-        (!retired.is_empty()).then_some(Stage1LeafRetired {
+        Ok((!retired.is_empty()).then_some(Stage1LeafRetired {
             authority: self.authority_id(),
             image_generation,
             va,
             len,
             retired,
             _tlbi: TlbiComplete,
-        })
+        }))
     }
 
     /// Convert EL1's verified COW transaction into the same exact old-leaf
@@ -4751,7 +4794,67 @@ pub(crate) mod tests {
         let retired = authority
             .complete_guest_retirement_proof(va, 4096, vec![plan], &[verified_retire])
             .expect("verified transaction binds the removed old leaf");
+        let retired = retired.expect("the live leaf yields retirement authority");
         assert!(retired.names(ipa, 4096));
+
+        // A fresh sparse-arena leaf is already inaccessible and names no
+        // published backing. Retiring it is still an authenticated descriptor
+        // transaction, but it must not manufacture stage-2 retirement
+        // authority for the retained output.
+        let sealed_va = va + 4096;
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(sealed_va)),
+            Some(None)
+        );
+        assert!(
+            authority
+                .with_manager(|manager| manager.translate_retained_output(sealed_va))
+                .flatten()
+                .is_some()
+        );
+        let retire_sealed = authority
+            .prepare_guest_descriptor_txn(
+                nz(9),
+                DescriptorOp::Retire(PageSpan::new(sealed_va, 4096)),
+            )
+            .unwrap();
+        let sealed_plan = authority
+            .prepare_guest_retirement_proof(&retire_sealed)
+            .expect("authority captures the empty retirement pre-image");
+        let sealed_receipt = {
+            let mut buf = resolver.buf.lock().unwrap();
+            let maintenance = CallerInvalidatesAsid;
+            let words = unsafe {
+                PrimaryTableWords::new(
+                    buf.as_mut_ptr().cast(),
+                    LINUX_PAGE_TABLES_BASE,
+                    LINUX_PAGE_TABLES_SIZE as usize,
+                    &maintenance,
+                )
+            }
+            .unwrap();
+            let mut journal = InlineJournal::new();
+            execute_descriptor_txn(
+                &words,
+                carrick_mmu_core::aarch64::SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+                &retire_sealed,
+                &mut journal,
+            )
+        };
+        let verified_sealed = authority
+            .settle_guest_descriptor_receipt(&retire_sealed, &sealed_receipt)
+            .unwrap();
+        assert!(
+            authority
+                .complete_guest_retirement_proof(
+                    sealed_va,
+                    4096,
+                    vec![sealed_plan],
+                    &[verified_sealed],
+                )
+                .expect("verified empty retirement is not a proof failure")
+                .is_none()
+        );
 
         // The host-owned lane never builds guest transactions.
         let host_lane = test_authority_with_manager(Some(test_manager()));

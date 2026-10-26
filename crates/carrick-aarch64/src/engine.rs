@@ -2071,12 +2071,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             }
             return tables
                 .complete_guest_retirement_proof(va, len, vec![plan], &receipts)
-                .ok_or_else(|| {
-                    MappingRetirementError::Indeterminate(failure(
-                        "verified retirement did not bind its old leaves".to_owned(),
-                    ))
-                })
-                .map(Some);
+                .map_err(|error| {
+                    MappingRetirementError::Indeterminate(failure(format!(
+                        "verified retirement did not bind its old leaves: {error}"
+                    )))
+                });
         }
         let failure = |what: String| MemoryError::HostMap(format!("guest stage-1 unmap: {what}"));
         let mut progress = crate::descriptor_drain::RetirementProgress::default();
@@ -2159,12 +2158,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         retired.and_then(|()| {
             tables
                 .complete_guest_retirement_proof(va, len, retirement_plans, &retirement_receipts)
-                .ok_or_else(|| {
-                    MappingRetirementError::Indeterminate(failure(
-                        "verified retirement did not bind its old leaves".to_owned(),
-                    ))
+                .map_err(|error| {
+                    MappingRetirementError::Indeterminate(failure(format!(
+                        "verified retirement did not bind its old leaves: {error}"
+                    )))
                 })
-                .map(Some)
         })
     }
 
