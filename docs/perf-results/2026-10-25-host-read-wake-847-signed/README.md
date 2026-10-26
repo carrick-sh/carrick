@@ -19,6 +19,87 @@ hash installed, the production-path VM-free witness
 1/1 (806 filtered). This post-rebase VM-free result does not alter the failed
 pre-rebase signed artifact verdict above.
 
+## Exact `6a20be84e` smoke still skips the primary retirement request (2026-10-26)
+
+The exact bundle for evidence head
+`6a20be84ed6c71bf123f7e7b5fbcfc94ec8424d6` verified, restored, and
+verified again with 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/6a20be84ed6c71bf123f7e7b5fbcfc94ec8424d6/9e3b957201b460d38055073e976e9af9ed14265341ce8cd2ddf5aa10f495984a.tar.gz
+bundle identity: 9e3b957201b460d38055073e976e9af9ed14265341ce8cd2ddf5aa10f495984a
+archive SHA-256: 9bdb96b89c85c3824b3c642cb351d08c735ba1b382fe82357d97fc918da67d1a
+input identity: e7dee9818f2fcc6a6bdc51a4abb6acb5e8a8a008efc599db45cbccc61358c766
+```
+
+Mandatory bootstrap smoke `847-6a20-smoke-01` (backend run `-b1`) reached
+HVF. Its 1,000-iteration `sock-pingpong` arm passed, but successor bootstrap
+for the 6,000-iteration arm failed, so the signed test was 0/1 in 0.44 seconds:
+
+```text
+stage-1 extension arena IPA 0x9a00000000 is still held by the root-slot pool;
+stage2=Some(CarrierStage2RecordSnapshot { record_id:
+CarrierStage2RecordId(14), vm_generation: CarrierVmGeneration(1),
+ipa: 661424963584, len: 2097152, host_addr: 4380311552, mapped: true,
+backend_map_installed: false, release_ipa: false, perms: 3, logical_owner:
+Some(CarrierLogicalOwner { id: 14, generation: 14 }), pin_count: 0,
+retirement_requested: false, retry_eligible: false, retry_pending: None,
+terminalized_by_vm_destroy: false, superseded_by_rebind: false,
+release_in_flight: false, release_retry_pending: false })
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured;
+90 filtered out; finished in 0.44s
+```
+
+This is the same typed publication refusal, not a carrier fatal. The negative
+entitlement control passed, there was no watchdog or watchdog census, and all
+explicit and harness cleanup counts were zero. The required stop condition
+therefore left the remaining matrix unstarted:
+
+- bootstrap smoke: 0/1 (`847-6a20-smoke-01`);
+- host-blocked-read acceptance: 0/0 of 20;
+- `native_root_exec_replaces_pid1_shell`: 0/0;
+- `el1_ipc_pipe_blocking_roundtrips`: 0/0 of 3;
+- `el1_fork_cow_resolves_in_guest`: 0/0 of 3.
+
+The exact signed executable was
+`target/release/deps/el1_sched-775614d8f5f84d25`:
+
+```text
+SHA-256: 4fac7e1b98e5341269565a333a066f8b0c0dde4fb549a5458c7ce5f3882238f4
+CDHash: f813c1c799cf3a1c3b70c845df100653b890010e
+LC_UUID: BC7FAD03-1665-3104-84D9-C41BEC4BFCEA
+identifier: el1_sched-775614d8f5f84d25.tmp.94490
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+Diagnostic run `847-6a20-postmortem-02` launched that unchanged signed
+executable under LLDB and stopped the carrier in
+`publish_raw_stage1_arenas_into` at the exact typed refusal. The frame variable
+again showed record 14 mapped with zero pins and
+`retirement_requested=false`. `CARRICK_LAST_FATAL` had magic and length zero.
+The complete relevant lifecycle tail was:
+
+```text
+# carrick event ring (lifecycle) pid=99451 total=8331 showing=8192 start=139 oldest=139 errors=0
+8316 HVPPEXIT pid=1 tid=1 exit=0 publication=begin
+8317 HVPEXEC  pid=1 tid=1 phase=boundary reason=exited
+8318 HVPPEXIT pid=1 tid=1 exit=0 publication=complete
+8319 HVPSETTLE tid=1 gen=2345 step=1
+8320 HVPSETTLE tid=1 gen=2345 step=2
+8321 HVPSETTLE tid=1 gen=2345 step=3
+8322 HVPSETTLE tid=1 gen=2345 step=4
+8323 HVPEXEC  pid=1 tid=1 phase=settlement state=exited
+8324 HVPSETTLE tid=0 gen=1 step=5
+8325 HVPSETTLE tid=45845696 gen=24576 step=18
+```
+
+The high-rate ring was also complete for its retained range: total 9,570,
+showing 8,192, start/oldest 1,378, `errors=0`. The 44 MiB modified-memory
+core, exact 38 MiB executable, identity, stacks, and both rings are preserved
+under `/tmp/847-6a20-postmortem-02/`. This debugger run is diagnostic, not a
+functional retry. Source was not changed.
+
 ## Exact `e6cfbc5ac` clean-exit arena smoke failure (2026-10-26)
 
 The exact bundle for evidence head
