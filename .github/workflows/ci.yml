@@ -20,6 +20,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Swatinem/rust-cache exports CARGO_INCREMENTAL=0 in the jobs that use it, and
+  # sccache hashes every CARGO_* variable into its key. Pin it workflow-wide so
+  # cache-warm (which has no rust-cache) writes entries the PR/merge-group jobs
+  # can hit.
+  CARGO_INCREMENTAL: "0"
   # Only cache-warm publishes the three bounded hosted compiler caches.
   SCCACHE_CACHE_SIZE: "3G"
   # Harden registry transport against intermittent network errors without retrying tests.
