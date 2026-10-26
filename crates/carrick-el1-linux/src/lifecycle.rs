@@ -31,6 +31,28 @@ pub(super) fn install_raw_exit_before_commit_hook(
     hooks.push((page_address, hook));
 }
 
+struct ChildExecutionIdentity {
+    identity: ThreadIdentity,
+    native_owned: bool,
+}
+
+fn child_execution_identity(
+    zone: &carrick_el1_abi::ZoneTables,
+    parent: Option<carrick_sched_core::RecordId>,
+    binding: Option<carrick_el1_abi::ExecutionBinding>,
+    mut identity: ThreadIdentity,
+) -> Option<ChildExecutionIdentity> {
+    let native_owned = parent.is_some_and(|parent| zone.record(parent).is_native_owned());
+    if native_owned {
+        let binding = binding.filter(|binding| binding.issued())?;
+        identity.generation = binding.generation.raw();
+    }
+    Some(ChildExecutionIdentity {
+        identity,
+        native_owned,
+    })
+}
+
 impl<
     'a,
     F: Fn(u32) -> *mut u8,
@@ -398,15 +420,14 @@ impl<
             .as_ref()
             .ok_or(carrick_sched_core::Exhausted)?
             .tables;
+        let parent = self.frame.slot().and_then(|slot| zone.slot(slot).current());
+        let child =
+            child_execution_identity(zone, parent, LifecycleNative::binding(self), identity)
+                .ok_or(carrick_sched_core::Exhausted)?;
         let id = zone
-            .alloc_record(identity)
+            .alloc_record(child.identity)
             .map_err(|_| carrick_sched_core::Exhausted)?;
-        let inherits_native_owner = self
-            .frame
-            .slot()
-            .and_then(|slot| zone.slot(slot).current())
-            .is_some_and(|parent| zone.record(parent).is_native_owned());
-        if inherits_native_owner && !zone.mark_native_owned(id) {
+        if child.native_owned && !zone.mark_native_owned(id) {
             zone.free_record(id);
             return Err(carrick_sched_core::Exhausted);
         }

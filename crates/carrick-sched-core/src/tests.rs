@@ -1535,25 +1535,6 @@ fn idle_native_mm_steals_host_work_without_switching_it_in() {
     assert!(zone.leave_slot(SLOT, u64::from(SLOT.raw()) + 1, &mut |_| {}, &mut |_| {}));
 }
 
-/// A native process birth already has its execution lane in the zone. Its
-/// zero host generation must not send it to a host-thread adopter that does
-/// not exist.
-#[test]
-fn native_owned_first_entry_runs_without_a_host_adopter() {
-    let zone = zone();
-    enter(&zone, SLOT, 0);
-    let mut native = identity(41);
-    native.generation = 0;
-    native.lifecycle_page = 0x1000;
-    native.control_slot = 0x2000;
-    let record = zone.alloc_record(native).unwrap();
-    assert!(zone.mark_native_owned(record));
-    zone.requeue_preempted(SLOT, record);
-
-    assert!(!zone.head_needs_host(SLOT));
-    assert_eq!(zone.switch_in(SLOT), Some(record));
-}
-
 /// Host placement: a service thread goes to an idle slot of any address
 /// space; a thread ready at EL0 only to a slot running its address space,
 /// else nowhere (the host serves it). A running or WFI target owes a

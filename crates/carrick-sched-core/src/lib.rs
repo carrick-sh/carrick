@@ -885,7 +885,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.generation.load(Ordering::Relaxed) == 0
             && self.lifecycle_page.load(Ordering::Relaxed) != 0
             && self.control_slot.load(Ordering::Relaxed) != 0
-            && !self.is_native_owned()
     }
 
     /// A native process record has no host scheduler thread to adopt it.
