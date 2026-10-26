@@ -2234,7 +2234,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     /// has selected before its first native-registry entry. The lifecycle page
     /// and MM generation make this a thread-group lookup, not an MM-only
     /// adoption; ambiguity fails closed.
-    #[cfg(any(test, target_os = "none"))]
+    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
     pub(super) fn unregistered_visible_pid(
         &self,
         zone: &ZoneTables<C>,
