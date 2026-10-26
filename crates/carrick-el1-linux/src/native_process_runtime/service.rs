@@ -1401,7 +1401,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 ) => {
                     // Bytes/results already committed before suspension. Cancellation
                     // cannot turn that completion into a short transfer or EINTR.
-                    Ok(NativeResume::NoPending)
+                    // Return the retained result explicitly: the service wake's
+                    // scheduling result is only readiness and must not overwrite
+                    // the completed syscall value saved in this continuation.
+                    Ok(NativeResume::Returned(SyscallResult::new(
+                        self.words.syscall_return() as i64,
+                    )))
                 }
                 (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
                     Err(NativeProcessError::Quarantined)
