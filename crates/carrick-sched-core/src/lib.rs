@@ -4287,10 +4287,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 
     /// The host queues `record`, which it owns ([`Claim::Host`]), in the
     /// guest: a thread ready to run at EL0 (woken, preempted) goes to a slot
-    /// running its address space, preferring an idle one; a thread that needs
-    /// its executor ([`Handback::Service`]) goes to an idle slot, else to the
-    /// least loaded slot its affinity allows, in the guest or not (a stopped
-    /// slot's executor serves it before it runs the vCPU again). `None`: an
+    /// running its address space, preferring an idle one. A thread that needs
+    /// its executor ([`Handback::Service`]), or a native-owned thread with no
+    /// host continuation, may also go to a stopped live slot; its driver enters
+    /// the guest and installs the native address space. `None`: an
     /// EL0-ready thread no slot can run now; the caller hands it to its
     /// thread's host continuation instead.
     ///
@@ -4311,6 +4311,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let rec = self.record(record);
         let seq = rec.parked_sequence(from);
         let service = rec.needs_host() || rec.is_unadopted_birth();
+        let driven = service || rec.is_native_owned();
         if let Some(home) = rec.home() {
             // The host believes its thread runs on its home slot: only that
             // slot may run it, and only while it is in the guest.
@@ -4338,7 +4339,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 .filter(|slot| self.accepts(*slot, rec, false)),
             self.find_idle_except(rec, None),
             self.least_loaded(rec, true),
-            if service {
+            if driven {
                 self.least_loaded(rec, false)
             } else {
                 None
@@ -4349,10 +4350,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 continue;
             };
             let state = self.slot(slot).state();
-            let fits = if service {
+            let fits = if driven {
                 // Only a slot whose driver comes back to it takes a thread
-                // that needs an executor: checked under the lock every drive
-                // change holds.
+                // that needs an executor or has no host continuation: checked
+                // under the lock every drive change holds.
                 self.slot(slot).is_live()
                     && rec.allows_cpu(self.slot(slot).cpu.load(Ordering::Relaxed))
             } else {
