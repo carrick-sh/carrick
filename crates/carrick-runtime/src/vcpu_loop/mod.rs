@@ -523,14 +523,21 @@ pub(crate) struct KernelState {
     control_exec: Mutex<Option<carrick_kernel::kernel::control::ExecRuntime>>,
     external_exec: Mutex<Option<carrick_kernel::kernel::control::ExecWork>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    native_exec_capability: Mutex<
-        Option<
-            Result<Arc<crate::runtime::exec::NativeExecCapability>, crate::linux_abi::LinuxErrno>,
-        >,
-    >,
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    native_exec_registration:
-        Mutex<Option<carrick_vmm_hvf::metadata_grant::NativeExecServiceRegistration>>,
+    native_exec_service: Mutex<NativeExecServiceState>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum NativeExecServiceState {
+    Pending(Result<Arc<crate::runtime::exec::NativeExecCapability>, crate::linux_abi::LinuxErrno>),
+    Installing,
+    Installed(carrick_vmm_hvf::metadata_grant::NativeExecServiceRegistration),
+    Retired,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) enum NativeExecServiceAdmission {
+    Install(Arc<crate::runtime::exec::NativeExecCapability>),
+    AlreadyInstalled,
 }
 
 impl KernelState {
@@ -555,9 +562,12 @@ impl KernelState {
             }
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let native_exec_capability = hvpatch_process.as_ref().map(|_| {
-            crate::runtime::exec::capture_native_exec_capability(&dispatcher).map(Arc::new)
-        });
+        let native_exec_service = match hvpatch_process.as_ref() {
+            Some(_) => NativeExecServiceState::Pending(
+                crate::runtime::exec::capture_native_exec_capability(&dispatcher).map(Arc::new),
+            ),
+            None => NativeExecServiceState::Retired,
+        };
         Self {
             dispatcher,
             reporter: CompatReporter::default(),
@@ -577,23 +587,36 @@ impl KernelState {
             control_exec: Mutex::new(None),
             external_exec: Mutex::new(None),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            native_exec_capability: Mutex::new(native_exec_capability),
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            native_exec_registration: Mutex::new(None),
+            native_exec_service: Mutex::new(native_exec_service),
         }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(crate) fn native_exec_capability(
+    pub(crate) fn begin_native_exec_service_admission(
         &self,
-    ) -> Result<Arc<crate::runtime::exec::NativeExecCapability>, crate::linux_abi::LinuxErrno> {
-        self.native_exec_capability
-            .lock()
-            .as_ref()
-            .ok_or(crate::linux_abi::LINUX_ESRCH)?
-            .as_ref()
-            .map(Arc::clone)
-            .map_err(|error| *error)
+    ) -> Result<NativeExecServiceAdmission, crate::linux_abi::LinuxErrno> {
+        let mut state = self.native_exec_service.lock();
+        match std::mem::replace(&mut *state, NativeExecServiceState::Installing) {
+            NativeExecServiceState::Pending(Ok(capability)) => {
+                Ok(NativeExecServiceAdmission::Install(capability))
+            }
+            NativeExecServiceState::Pending(Err(error)) => {
+                *state = NativeExecServiceState::Retired;
+                Err(error)
+            }
+            installed @ NativeExecServiceState::Installed(_) => {
+                *state = installed;
+                Ok(NativeExecServiceAdmission::AlreadyInstalled)
+            }
+            NativeExecServiceState::Installing => {
+                *state = NativeExecServiceState::Installing;
+                Err(crate::linux_abi::LINUX_ESRCH)
+            }
+            NativeExecServiceState::Retired => {
+                *state = NativeExecServiceState::Retired;
+                Err(crate::linux_abi::LINUX_ESRCH)
+            }
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -601,21 +624,24 @@ impl KernelState {
         &self,
         registration: carrick_vmm_hvf::metadata_grant::NativeExecServiceRegistration,
     ) -> Result<(), RuntimeError> {
-        let mut installed = self.native_exec_registration.lock();
-        if installed.is_some() {
+        let mut state = self.native_exec_service.lock();
+        if !matches!(*state, NativeExecServiceState::Installing) {
             return Err(RuntimeError::Configuration(
-                "native exec service registration already installed".to_owned(),
+                "native exec service registration completed outside admission".to_owned(),
             ));
         }
-        *installed = Some(registration);
+        *state = NativeExecServiceState::Installed(registration);
         Ok(())
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn retire_native_exec_registration(&self) -> Result<(), RuntimeError> {
-        let Some(registration) = self.native_exec_registration.lock().take() else {
+        let mut state = self.native_exec_service.lock();
+        let prior = std::mem::replace(&mut *state, NativeExecServiceState::Retired);
+        let NativeExecServiceState::Installed(registration) = prior else {
             return Ok(());
         };
+        drop(state);
         registration.retire().map_err(|error| {
             RuntimeError::Configuration(format!(
                 "native exec service registration retirement failed: {error:?}"
