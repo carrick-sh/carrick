@@ -230,7 +230,7 @@ pub const X86_CPL0_SUPERVISOR_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
 pub const X86_CPL0_SUPERVISOR_IMAGE_GPA: u64 = 0x10_0000;
 pub const X86_CPL0_SUPERVISOR_IMAGE_SIZE: u64 = 0x20_0000;
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x58253450a650c70e);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xb8c46a9b63469ce2);
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_power_of_two());
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_multiple_of(4096));
 };
@@ -4012,7 +4012,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x2192a1701f0ad4d1);
+
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

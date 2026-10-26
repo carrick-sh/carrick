@@ -1,5 +1,24 @@
 # Issue #847 signed hardware evidence
 
+## Rebase onto slice 3 main (2026-10-26)
+
+After the signed smoke and post-mortem, this branch rebased from
+`2da501dcf0cc81aae517e038bb72dbfee1e1a716` onto GitHub main
+`bec60cc3a907002f79a3513e1d3c6d2be3f5075d` (the landed slice 3). The
+pre/post `git range-diff` is `/tmp/847-rebase-range-diff.txt`.
+
+- Kept: 89 of 92 commits replayed with equal patches.
+- Ported: `3b803b2c5`, `67927d9a1`, and `a5d9b1682` retained their behavior
+  while their historical EL1 ABI hash edits were superseded by slice 3's
+  layout. The combined layout is asserted once as `0xb8c46a9b63469ce2`.
+- Dropped: none.
+
+The first rebased compile caught the two stale assertions. With the combined
+hash installed, the production-path VM-free witness
+`bootstrap_clean_exit_returns_extension_arena_for_next_bootstrap` passes
+1/1 (806 filtered). This post-rebase VM-free result does not alter the failed
+pre-rebase signed artifact verdict above.
+
 ## Exact `e6cfbc5ac` clean-exit arena smoke failure (2026-10-26)
 
 The exact bundle for evidence head
