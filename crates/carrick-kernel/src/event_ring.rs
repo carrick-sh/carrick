@@ -383,7 +383,7 @@ fn clone_refusal_label(producer: i32) -> &'static str {
 }
 
 /// Highest event kind a reader accepts.
-const LAST_KIND: u8 = ZONE_IDLE_FAR;
+const LAST_KIND: u8 = STAGE2_AUTHORITY_INVARIANT;
 
 /// At most this many [`FAULTSIG_MBOX`] records follow one fault signal, so a
 /// census of all mailboxes never floods the ring.

@@ -5220,29 +5220,57 @@ pub(crate) mod tests {
                                 carrick_kernel::kernel::objects::BlockedReason::HostWait,
                             )
                             .unwrap();
+                    } else if stale_selection_without_editor {
+                        let invariant_event = (
+                            wait.handle().mm().raw() as u32 as i32,
+                            job.state.linux_tid.raw(),
+                            wait.revision() as u32 as i32,
+                        );
+                        let completed = job
+                            .drive_service_outcome(
+                                &mut engine,
+                                &mut control,
+                                frame,
+                                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                                Some(resume),
+                            )
+                            .unwrap();
+                        assert!(
+                            !matches!(completed, executor::ExecutorExit::Blocked(_)),
+                            "a producer-free current selection must not park"
+                        );
+                        let fatal = kernel
+                            .fatal_signal
+                            .recorded_for(job.state.fatal_image_generation)
+                            .expect("typed stage-2 invariant must terminate this MM");
+                        assert_eq!(fatal.signo, carrick_abi::LINUX_SIGKILL);
+                        assert_eq!(fatal.tid, root.thread().key().tid);
+                        let (event_mm, event_tid, event_revision) = invariant_event;
+                        let event = carrick_kernel::event_ring::drain_recent(1024)
+                            .into_iter()
+                            .filter_map(Result::ok)
+                            .rev()
+                            .find(|event| {
+                                event.kind
+                                    == carrick_kernel::event_ring::STAGE2_AUTHORITY_INVARIANT
+                            })
+                            .expect("the MM-local invariant must leave a terminal event receipt");
+                        assert_eq!(
+                            (event.a, event.b, event.c),
+                            (event_mm, event_tid, event_revision),
+                            "the invariant event must identify the exact MM, TID, and Editor revision",
+                        );
+                        assert!(
+                            peer.as_ref().is_none_or(|peer| peer.is_finished()),
+                            "invariant containment must not strand the carrier peer"
+                        );
+                        scheduler.close();
+                        return;
                     } else {
                         let parked = job
                             .owner_memory_park(&mut engine, &mut control, frame, wait, resume)
                             .unwrap();
-                        if stale_selection_without_editor {
-                            assert!(
-                                !matches!(parked, executor::ExecutorExit::Blocked(_)),
-                                "a producer-free current selection must not park"
-                            );
-                            let fatal = kernel
-                                .fatal_signal
-                                .recorded_for(job.state.fatal_image_generation)
-                                .expect("typed stage-2 invariant must terminate this MM");
-                            assert_eq!(fatal.signo, carrick_abi::LINUX_SIGKILL);
-                            assert_eq!(fatal.tid, root.thread().key().tid);
-                            assert!(
-                                peer.as_ref().is_none_or(|peer| peer.is_finished()),
-                                "invariant containment must not strand the carrier peer"
-                            );
-                            scheduler.close();
-                            return;
-                        }
-                        if free_reservation_redrive || stale_selection_without_editor {
+                        if free_reservation_redrive {
                             assert!(matches!(parked, executor::ExecutorExit::Blocked(_)));
                             running
                                 .restore_lease(submission.take_execution_lease().unwrap())
