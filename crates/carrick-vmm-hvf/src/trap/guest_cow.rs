@@ -422,6 +422,12 @@ pub(crate) fn settle_one(
             .ok_or_else(|| TrapError::Hypervisor("grant owner is not live".to_owned()))?;
 
     // EL1's repoint is what the live graph holds for every page of the span.
+    // The completion bytes are guest-written, but the checks above bind them
+    // to this MM's exact inventory owner and the walk below binds every live
+    // leaf to the claimed replacement. A forged completion can therefore at
+    // worst retire the forging MM's own old reference early and terminate
+    // that MM through the stage-2 invariant; it cannot retire another MM's
+    // frame or turn guest input into carrier authority.
     let tables = state.page_tables_authority();
     tables
         .with_manager(|manager| {

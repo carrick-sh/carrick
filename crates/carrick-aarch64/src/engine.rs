@@ -6514,6 +6514,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         editor: &carrick_guest_mem::El1EditorExcluded,
         asid: u16,
     ) -> Result<(), TrapError> {
+        if !self.page_tables.bind_mm(editor.mm()) {
+            return Err(TrapError::Hypervisor(
+                "bootstrap stage-1 authority refused its exact-MM Editor license".to_owned(),
+            ));
+        }
         if asid == 0 {
             return Err(TrapError::Hypervisor(
                 "hvpatch process ASID zero is reserved".to_owned(),

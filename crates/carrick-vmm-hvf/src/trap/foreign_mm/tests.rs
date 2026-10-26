@@ -399,6 +399,7 @@ impl Drop for OwnerCleanup {
 
 #[derive(Debug)]
 struct TestForeignCowAuthority {
+    mm: u64,
     live: Arc<parking_lot::RwLock<TestSnapshot>>,
     old_frame: carrick_hal::FrameId,
     /// Kernel mappings of the old frame across MMs (2: a fork peer shares it).
@@ -420,6 +421,7 @@ impl TestForeignCowAuthority {
             .expect("data inventory extent")
             .frame;
         Self {
+            mm: installed.snapshot.mm.get(),
             live: Arc::clone(&installed.live.0),
             old_frame,
             old_frame_mappings: std::sync::atomic::AtomicUsize::new(2),
@@ -446,7 +448,9 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>
     {
         if self.allow_quiesce {
-            Ok(Box::new(()))
+            Ok(Box::new(TestFrameCowQuiesce(
+                TestEditorExclusion::unpublished(self.mm),
+            )))
         } else {
             panic!("foreign backend must not reacquire frame-COW quiesce")
         }
@@ -706,9 +710,13 @@ struct TestInvalidator {
     expected: carrick_hal::ForeignMmBinding,
     calls: usize,
     fail_call: Option<usize>,
+    editor: Option<TestEditorExclusion>,
 }
 
 impl carrick_hal::ForeignMmInvalidator for TestInvalidator {
+    fn editor_excluded(&self) -> Option<&carrick_guest_mem::El1EditorExcluded> {
+        self.editor.as_ref().map(TestEditorExclusion::license)
+    }
     fn invalidate_exact_asid(
         &mut self,
         binding: carrick_hal::ForeignMmBinding,
@@ -998,6 +1006,13 @@ struct TestEditorExclusion {
     _held: carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion,
 }
 
+impl std::fmt::Debug for TestEditorExclusion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestEditorExclusion")
+            .finish_non_exhaustive()
+    }
+}
+
 impl TestEditorExclusion {
     fn unpublished(mm: u64) -> Self {
         let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
@@ -1009,6 +1024,18 @@ impl TestEditorExclusion {
             _spaces: spaces,
             _held: held,
         }
+    }
+    fn license(&self) -> &carrick_guest_mem::El1EditorExcluded {
+        self._held.license()
+    }
+}
+
+#[derive(Debug)]
+struct TestFrameCowQuiesce(TestEditorExclusion);
+
+impl carrick_hal::FrameCowQuiesce for TestFrameCowQuiesce {
+    fn editor_excluded(&self) -> Option<&carrick_guest_mem::El1EditorExcluded> {
+        Some(self.0.license())
     }
 }
 
@@ -1096,10 +1123,10 @@ fn prepare_foreign_cow(
         expected: carrick_hal::ForeignMmSnapshot::binding(&installed.snapshot),
         calls: 0,
         fail_call: None,
+        editor: Some(TestEditorExclusion::unpublished(
+            installed.snapshot.mm.get(),
+        )),
     };
-    *installed.editor_exclusion.lock() = Some(TestEditorExclusion::unpublished(
-        installed.snapshot.mm.get(),
-    ));
     (authority, lease, invalidator)
 }
 
@@ -1774,6 +1801,7 @@ fn foreign_el1_publisher_authenticates_the_exact_target_before_submission() {
             expected: carrick_hal::ForeignMmSnapshot::binding(&target.snapshot),
             calls: 0,
             fail_call: None,
+            editor: None,
         },
         caller: Some(ModelCallerEl1::new(
             &target,
@@ -1841,6 +1869,7 @@ fn foreign_el1_publisher_authenticates_the_exact_target_before_submission() {
         expected: carrick_hal::ForeignMmSnapshot::binding(&target.snapshot),
         calls: 0,
         fail_call: None,
+        editor: None,
     };
     assert!(matches!(
         ForeignEl1Publisher::authenticate(
@@ -2484,6 +2513,7 @@ fn rx_ptrace_text_cow_case(guest: bool) {
             expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
             calls: 0,
             fail_call: None,
+            editor: None,
         },
         caller: guest.then(|| ModelCallerEl1::new(&child, Box::new(|| {}))),
     };
@@ -2663,6 +2693,7 @@ fn ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span() {
         expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
         calls: 0,
         fail_call: None,
+        editor: None,
     };
     let rejected = lease.break_cow_prepared_ptrace_text(
         &mut invalidator,
@@ -2803,6 +2834,7 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
         expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
         calls: 0,
         fail_call: None,
+        editor: None,
     };
     let cow = lease
         .break_cow_prepared_ptrace_text(
@@ -3077,6 +3109,7 @@ fn concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit() {
             expected: expected_binding,
             calls: 0,
             fail_call: None,
+            editor: None,
         };
         lease_clone1.break_cow(&mut invalidator, &snap1, GuestVa::new(TEST_VA), 4, deadline)
     });
@@ -3086,6 +3119,7 @@ fn concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit() {
             expected: expected_binding,
             calls: 0,
             fail_call: None,
+            editor: None,
         };
         lease_clone2.break_cow(&mut invalidator, &snap2, GuestVa::new(TEST_VA), 4, deadline)
     });
@@ -5116,6 +5150,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
         returned: std::sync::Arc::clone(&returned),
     };
     let parent_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(parent_manager));
+    assert!(parent_authority.bind_mm(mm.get()));
     parent_authority.install_source(Box::new(source)).unwrap();
 
     // Grow parent page tables to 2 arenas by mapping enough blocks.
@@ -6184,6 +6219,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     let _child_editor_exclusion = TestEditorExclusion::unpublished(child_snapshot.mm.get());
     let child_live = TestLiveAuthority(Arc::new(parking_lot::RwLock::new(child_snapshot.clone())));
     let cow_authority = Arc::new(TestForeignCowAuthority {
+        mm: child_snapshot.mm.get(),
         live: Arc::clone(&child_live.0),
         old_frame: vvar_extent.frame,
         old_frame_mappings: std::sync::atomic::AtomicUsize::new(2),
@@ -12369,23 +12405,33 @@ fn retained_reuse_fixture(
     *installed.editor_exclusion.lock() = Some(TestEditorExclusion::unpublished(
         installed.snapshot.mm.get(),
     ));
+    let editor_exclusion = installed.editor_exclusion.lock();
     installed
         .state
-        .with_stage1_edit_license(|license| {
-            tables
-                .edit(
-                    license,
-                    || Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
-                    |editor| {
-                        editor.manager.invalidate(TEST_VA, OWNER_LEN, None)?;
-                        let resolver =
-                            task.page_table_resolver(editor.base(), Some(root_host as *mut u8));
-                        unsafe { editor.sync_to_host(resolver) }
-                    },
-                )
-                .map_err(|error| TrapError::Hypervisor(format!("retire fixture leaves: {error:?}")))
-        })
+        .with_stage1_edit_license(
+            editor_exclusion
+                .as_ref()
+                .expect("fixture editor exclusion")
+                .license(),
+            |license| {
+                tables
+                    .edit(
+                        license,
+                        || Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
+                        |editor| {
+                            editor.manager.invalidate(TEST_VA, OWNER_LEN, None)?;
+                            let resolver =
+                                task.page_table_resolver(editor.base(), Some(root_host as *mut u8));
+                            unsafe { editor.sync_to_host(resolver) }
+                        },
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("retire fixture leaves: {error:?}"))
+                    })
+            },
+        )
         .expect("retire fixture leaves");
+    drop(editor_exclusion);
     tables.select_live_descriptor_owner(lane);
     let retained = tables
         .with_manager(|manager| manager.translate_retained_output(TEST_VA))
@@ -13974,9 +14020,14 @@ fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
         }
     }
     let owners = owner_keys();
+    let editor_exclusion = fixture.installed.editor_exclusion.lock();
     fixture
         .task
         .reuse_sole_owner_cow_in_place(
+            editor_exclusion
+                .as_ref()
+                .expect("fixture editor exclusion")
+                .license(),
             CowArmedSpan {
                 va: TEST_VA,
                 len: OWNER_LEN,
@@ -14626,6 +14677,7 @@ fn exercise_retained_import(journal_case: u8) {
     struct Owner<'a> {
         spaces: &'a carrick_el1_abi::ZoneTables,
         mm: std::num::NonZeroU64,
+        editor: &'a carrick_guest_mem::El1EditorExcluded,
     }
     // SAFETY: this single-thread physical fixture owns its private tables;
     // production issues the same permit from the kernel's SPACES_LOCK guard.
@@ -14636,21 +14688,26 @@ fn exercise_retained_import(journal_case: u8) {
         fn unpublished(&self) -> bool {
             self.spaces.spaces.find(self.mm.get()).is_none()
         }
+        fn editor_excluded(&self) -> &carrick_guest_mem::El1EditorExcluded {
+            self.editor
+        }
     }
     let zone_layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
     let raw = unsafe { std::alloc::alloc_zeroed(zone_layout) };
     assert!(!raw.is_null());
     let zone = unsafe { Box::from_raw(raw.cast::<carrick_el1_abi::ZoneTables>()) };
-    let guard = Owner {
-        spaces: &zone,
-        mm: nonzero(installed.snapshot.mm.get()),
-    };
+    let mm = nonzero(installed.snapshot.mm.get());
     let excluded = zone
         .spaces
-        .unpublished(guard.mm.get())
+        .unpublished(mm.get())
         .expect("target MM starts unpublished");
-    let _held_editor_exclusion =
+    let held_editor_exclusion =
         carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
+    let guard = Owner {
+        spaces: &zone,
+        mm,
+        editor: held_editor_exclusion.license(),
+    };
     let before = installed.state.frame_inventory.ledger.lock().extents.len();
     let mut stale = receipt;
     stale.owner.as_mut().unwrap().1 = nonzero(stale.owner.unwrap().1.get() + 1);

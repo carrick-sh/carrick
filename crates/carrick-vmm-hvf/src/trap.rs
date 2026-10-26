@@ -6329,6 +6329,13 @@ impl HvpatchTaskRegistration {
         let cow_identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch task lacks live COW identity".to_owned())
         })?;
+        if !page_tables.bind_mm(cow_identity.mm) {
+            return Err(TrapError::Hypervisor(format!(
+                "stage-1 authority refuses task MM binding: expected={:?} actual={}",
+                page_tables.mm(),
+                cow_identity.mm
+            )));
+        }
         let cow_armed = task_mm.cow_armed.as_ref().cloned().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch task lacks COW armed state".to_owned())
         })?;

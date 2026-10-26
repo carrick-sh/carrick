@@ -2733,6 +2733,7 @@ mod carrier_vm_custody_tests {
     #[allow(clippy::expect_used)]
     fn leaf_retirement_receipt(ipa: u64) -> carrick_aarch64::stage1_authority::Stage1LeafRetired {
         let authority = carrick_aarch64::Stage1Authority::new();
+        assert!(authority.bind_mm(1));
         let builder = || {
             Ok::<_, carrick_mmu_core::aarch64::PageTableError>(
                 carrick_mmu_core::aarch64::PageTableManager::new(
@@ -5001,6 +5002,7 @@ mod carrier_vm_custody_tests {
             })
             .unwrap();
         let authority = carrick_aarch64::Stage1Authority::new();
+        assert!(authority.bind_mm(1));
         let builder = || {
             Ok::<_, carrick_mmu_core::aarch64::PageTableError>(
                 carrick_mmu_core::aarch64::PageTableManager::new(
