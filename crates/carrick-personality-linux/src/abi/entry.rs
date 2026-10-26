@@ -285,6 +285,7 @@ mod layout_manifest {
                      lifecycle_page: _,
                      control_slot: _,
                      visible_pid: _,
+                     ptrace_traced: _,
                  }: LinuxTaskMetadata| {};
         field!(LinuxTaskMetadata, lifecycle_page, AtomicU64, 0, 8, 8);
         field!(LinuxTaskMetadata, control_slot, AtomicU64, 8, 8, 8);
