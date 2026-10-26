@@ -1498,6 +1498,14 @@ runtime receipts are separate evidence and are not inferred from unit tests.
 
 ## Terminal native child (`process.native.terminal-child`)
 
+A carrier service wake preserves the distinction between a completed syscall
+and a parked operation. The VM-free `carrier_work_*redrives_parked_wait4*`
+witnesses park a blocking parent wait4, exit the child, then interpose a real
+CarrierWork ticket before the parent resumes. Both supplied and cancelled
+ACKs must re-drive the retained wait owner, copy status once, return the child
+PID and refuse a second reap with ECHILD (10). Readiness alone is never a
+completed wait result. Completed syscall results remain retained separately.
+
 Linux authority is exit(2)/wait(2): release the child's resources before
 notification, retain the parent's wait, and consume its terminal status once.
 The VM-free ARM production service witness
