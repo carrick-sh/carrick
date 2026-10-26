@@ -27,6 +27,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import authority_census_verdict as census_verdict
+from rust_lexer import lex
 
 from typing import Sequence
 
@@ -82,152 +83,10 @@ class RawLockSite:
 
 
 def lex_rust(source: str) -> list[Token]:
-    """Tokenize Rust source while ignoring comments and tracking string/char literals."""
-    tokens: list[Token] = []
-    i = 0
-    line = 1
-    length = len(source)
-
-    while i < length:
-        char = source[i]
-        if char.isspace():
-            if char == "\n":
-                line += 1
-            i += 1
-            continue
-
-        if source[i : i + 2] == "//":
-            i += 2
-            while i < length and source[i] != "\n":
-                i += 1
-            continue
-
-        if source[i : i + 2] == "/*":
-            i += 2
-            depth = 1
-            while i < length and depth:
-                if source[i] == "\n":
-                    line += 1
-                    i += 1
-                elif source[i : i + 2] == "/*":
-                    depth += 1
-                    i += 2
-                elif source[i : i + 2] == "*/":
-                    depth -= 1
-                    i += 2
-                else:
-                    i += 1
-            continue
-
-        raw_prefix = None
-        if char == "r":
-            raw_prefix = 1
-        elif char in {"b", "c"} and i + 1 < length and source[i + 1] == "r":
-            raw_prefix = 2
-        if raw_prefix is not None:
-            cursor = i + raw_prefix
-            hashes = 0
-            while cursor < length and source[cursor] == "#":
-                hashes += 1
-                cursor += 1
-            if cursor < length and source[cursor] == '"':
-                closing = '"' + ("#" * hashes)
-                end = source.find(closing, cursor + 1)
-                if end < 0:
-                    end = length - len(closing)
-                end += len(closing)
-                text = source[i:end]
-                tokens.append(Token("string", text, line, i))
-                line += text.count("\n")
-                i = end
-                continue
-
-        if char == '"' or (
-            char in {"b", "c"} and i + 1 < length and source[i + 1] == '"'
-        ):
-            start = i
-            if char in {"b", "c"}:
-                i += 1
-            i += 1
-            while i < length:
-                if source[i] == "\n":
-                    line += 1
-                if source[i] == "\\":
-                    i += 2
-                elif source[i] == '"':
-                    i += 1
-                    break
-                else:
-                    i += 1
-            tokens.append(Token("string", source[start:i], line, start))
-            continue
-
-        if char == "'" or (
-            char == "b" and i + 1 < length and source[i + 1] == "'"
-        ):
-            start = i
-            byte_char = char == "b"
-            if byte_char:
-                i += 1
-            i += 1
-            if not byte_char and i < length and (
-                source[i].isalpha() or source[i] == "_"
-            ):
-                while i < length and (source[i].isalnum() or source[i] == "_"):
-                    i += 1
-                if i >= length or source[i] != "'":
-                    tokens.append(Token("lifetime", source[start:i], line, start))
-                    continue
-            while i < length:
-                if source[i] == "\\":
-                    i += 2
-                elif source[i] == "'":
-                    i += 1
-                    break
-                else:
-                    i += 1
-            tokens.append(Token("char", source[start:i], line, start))
-            continue
-
-        # Raw identifiers name the same operation as their ordinary spelling.
-        if source.startswith("r#", i) and i + 2 < length and (source[i + 2].isalpha() or source[i + 2] == "_"):
-            start_pos = i
-            i += 2
-            while i < length and (source[i].isalnum() or source[i] == "_"):
-                i += 1
-            tokens.append(Token("ident", source[start_pos + 2:i], line, start_pos))
-            continue
-
-        if char.isalpha() or char == "_":
-            start = i
-            i += 1
-            while i < length and (source[i].isalnum() or source[i] == "_"):
-                i += 1
-            tokens.append(Token("ident", source[start:i], line, start))
-            continue
-
-        if char.isdigit():
-            start = i
-            i += 1
-            while i < length and (source[i].isalnum() or source[i] in "._"):
-                if source[i] == "." and i + 1 < length and source[i + 1] == ".":
-                    break
-                i += 1
-            tokens.append(Token("number", source[start:i], line, start))
-            continue
-
-        two = source[i : i + 2]
-        if two in {"::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "..", "+=", "-="}:
-            tokens.append(Token("punct", two, line, i))
-            i += 2
-            continue
-        tokens.append(Token("punct", char, line, i))
-        i += 1
-
+    """Adapt the shared lexer to this checker's historical token shape."""
     return census_verdict.canonical_tokens([
-        Token(token.kind, token.text, token.line, token.pos,
-              token.pos - source.rfind("\n", 0, token.pos) - 1)
-        for token in tokens
+        Token(kind, text, line, pos, pos - source.rfind("\n", 0, pos) - 1)
+        for kind, text, line, pos in lex(source, "dispatch")
     ], source)
 
 

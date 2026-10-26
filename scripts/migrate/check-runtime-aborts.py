@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import authority_census_verdict as census_verdict
+from rust_lexer import lex
 from typing import Sequence
 
 EXCLUDED_CRATE_PREFIXES = (
@@ -63,175 +64,11 @@ class Scope:
 
 
 def lex_rust(source: str) -> list[Token]:
-    tokens: list[Token] = []
-    i = 0
-    n = len(source)
-    line = 1
-    while i < n:
-        c = source[i]
-        if c.isspace():
-            if c == "\n":
-                line += 1
-            i += 1
-            continue
-        if c == "/" and i + 1 < n:
-            if source[i + 1] == "/":
-                i += 2
-                while i < n and source[i] != "\n":
-                    i += 1
-                continue
-            if source[i + 1] == "*":
-                i += 2
-                depth = 1
-                while i < n and depth > 0:
-                    if source[i] == "\n":
-                        line += 1
-                    if i + 1 < n and source[i : i + 2] == "/*":
-                        depth += 1
-                        i += 2
-                    elif i + 1 < n and source[i : i + 2] == "*/":
-                        depth -= 1
-                        i += 2
-                    else:
-                        i += 1
-                continue
-        if c == "r" or (c in ("b", "c") and i + 1 < n and (source[i + 1] == "r")):
-            prefix_len = 1 if c == "r" else 2
-            if i + prefix_len < n and (
-                source[i + prefix_len] == '"' or source[i + prefix_len] == "#"
-            ):
-                p = i + prefix_len
-                num_hashes = 0
-                while p < n and source[p] == "#":
-                    num_hashes += 1
-                    p += 1
-                if p < n and source[p] == '"':
-                    p += 1
-                    closing = '"' + "#" * num_hashes
-                    end_idx = source.find(closing, p)
-                    if end_idx != -1:
-                        end_pos = end_idx + len(closing)
-                        raw_text = source[i:end_pos]
-                        line += raw_text.count("\n")
-                        tokens.append(Token("string", raw_text, line, i))
-                        i = end_pos
-                        continue
-        if c == '"' or (c in ("b", "c") and i + 1 < n and (source[i + 1] == '"')):
-            start_pos = i
-            if c in ("b", "c"):
-                i += 1
-            i += 1
-            while i < n:
-                if source[i] == "\n":
-                    line += 1
-                if source[i] == "\\":
-                    i += 2
-                    continue
-                if source[i] == '"':
-                    i += 1
-                    break
-                i += 1
-            raw_text = source[start_pos:i]
-            tokens.append(Token("string", raw_text, line, start_pos))
-            continue
-        if c == "'" or (c == "b" and i + 1 < n and (source[i + 1] == "'")):
-            start_pos = i
-            is_byte = c == "b"
-            if is_byte:
-                i += 1
-            i += 1
-            if i < n and source[i] == "\\":
-                i += 1
-                while i < n and source[i] != "'":
-                    if source[i] == "\n":
-                        line += 1
-                    i += 1
-                if i < n and source[i] == "'":
-                    i += 1
-                raw_text = source[start_pos:i]
-                tokens.append(Token("char", raw_text, line, start_pos))
-                continue
-            if i < n and source[i] != "'" and (i + 1 < n) and (source[i + 1] == "'"):
-                i += 2
-                raw_text = source[start_pos:i]
-                tokens.append(Token("char", raw_text, line, start_pos))
-                continue
-            if not is_byte and i < n and (source[i].isalpha() or source[i] == "_"):
-                while i < n and (source[i].isalnum() or source[i] == "_"):
-                    i += 1
-                if i < n and source[i] == "'":
-                    i += 1
-                    tokens.append(Token("char", source[start_pos:i], line, start_pos))
-                else:
-                    tokens.append(
-                        Token("lifetime", source[start_pos:i], line, start_pos)
-                    )
-                continue
-            tokens.append(Token("punct", source[start_pos:i], line, start_pos))
-            continue
-        if c.isdigit():
-            start_pos = i
-            while i < n and (source[i].isalnum() or source[i] in "._"):
-                if (
-                    source[i] == "."
-                    and i + 1 < n
-                    and (source[i + 1] == "." or source[i + 1].isalpha())
-                ):
-                    break
-                i += 1
-            tokens.append(Token("number", source[start_pos:i], line, start_pos))
-            continue
-        if (
-            source.startswith("r#", i)
-            and i + 2 < n
-            and (source[i + 2].isalpha() or source[i + 2] == "_")
-        ):
-            start_pos = i
-            i += 2
-            while i < n and (source[i].isalnum() or source[i] == "_"):
-                i += 1
-            tokens.append(Token("ident", source[start_pos + 2 : i], line, start_pos))
-            continue
-        if c.isalpha() or c == "_":
-            start_pos = i
-            while i < n and (source[i].isalnum() or source[i] == "_"):
-                i += 1
-            tokens.append(Token("ident", source[start_pos:i], line, start_pos))
-            continue
-        three = source[i : i + 3]
-        if three in ("...", "..="):
-            tokens.append(Token("punct", three, line, i))
-            i += 3
-            continue
-        two = source[i : i + 2]
-        if two in (
-            "::",
-            "->",
-            "=>",
-            "==",
-            "!=",
-            "<=",
-            ">=",
-            "&&",
-            "||",
-            "+=",
-            "-=",
-            "*=",
-            "/=",
-            "%=",
-            "&=",
-            "|=",
-            "^=",
-            "<<",
-            ">>",
-            "..",
-        ):
-            tokens.append(Token("punct", two, line, i))
-            i += 2
-            continue
-        tokens.append(Token("punct", c, line, i))
-        i += 1
-    return census_verdict.canonical_tokens(tokens, source)
+    """Adapt the shared lexer to this checker's historical token shape."""
+    return census_verdict.canonical_tokens([
+        Token(kind, text, line, pos)
+        for kind, text, line, pos in lex(source, "aborts")
+    ], source)
 
 
 def normalize_type_tokens(tokens: list[Token]) -> str:
