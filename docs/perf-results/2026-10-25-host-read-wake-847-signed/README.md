@@ -1,5 +1,47 @@
 # Issue #847 signed hardware evidence
 
+## Clean-exit extension-arena retirement repair (2026-10-26)
+
+Commit `58df7db5af223fa6993fcd1d1994e93a2a09a45e` closes the root-slot
+retention shape exposed by `847-d5-smoke-01`. Host stage-1 edits published
+extension backing through the HVF task owner but did not record that physical
+publication in the owning `Stage1Authority`. Whole-MM retirement therefore
+detached the arena from stage 1 while skipping its stage-2 record and pooled
+slot. The next bootstrap collided with record 14 at `0x9a00000000`.
+
+Host editors now publish extension arenas through an owned operation that
+records the arena for terminal retirement. Live descriptor sync refuses a
+grown arena that did not cross that operation, so stage 1 cannot be published
+before committed backing. The check uses the MMU's nonallocating arena
+iterator, preserving metadata-refusal behavior.
+
+The VM-free production-path binding
+`bootstrap_clean_exit_returns_extension_arena_for_next_bootstrap` was red on
+the prior implementation: clean exit left the extension record live. It now
+grows a bootstrap into the second root-slot-pool arena, retires the MM through
+the production whole-MM path, observes the exact stage-2 record disappear,
+and boots a successor from that same physical slot.
+
+Portable verification on the repair:
+
+- `carrick-aarch64 --lib`: 124 passed, 0 failed;
+- serialized `carrick-vmm-hvf --lib`: 804 passed, 0 failed, 3 ignored;
+- serialized `carrick-runtime --lib`: 823 passed, 0 failed, 9 ignored;
+- `just fmt-check`, `just clippy`, `just clippy-linux`, `just lint-domains`,
+  and `just test-kernel`: passed;
+- contract-change check against `2da501dcf0cc81aae517e038bb72dbfee1e1a716`:
+  passed;
+- default EL1 image: 1,053,200 / 1,572,864 bytes; maximum checked stack
+  11,503 / 12,288 bytes (`native wait copy`);
+- all-target clippy EL1 image: 1,082,032 / 1,572,864 bytes; maximum checked
+  stack 12,015 / 12,288 bytes (`signal terminal exit`).
+
+The first `just fmt-check` attempt stopped before formatting with ENOSPC while
+building `carrick-xtask` (441 MiB free). Removing only dev-profile build
+artifacts recovered 11.7 GiB; the clean rerun and every later gate passed.
+No signed test was attempted because this source change needs a new exact
+fixture bundle.
+
 ## Exact `d5c77fa1e` root-slot retention failure and runtime-suite repair (2026-10-26)
 
 The exact `d5c77fa1eca6e4f5f591613ed896fce49fb49f8e` fixture bundle
