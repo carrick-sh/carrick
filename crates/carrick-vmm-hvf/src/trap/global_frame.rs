@@ -1683,11 +1683,9 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point_using(
         .stage2_record_snapshot(identity.record_id)
         .ok_or_else(|| TrapError::Hypervisor("carrier stage-2 record disappeared".to_owned()))?;
     let key = (snapshot.ipa, snapshot.len as u64);
-    let stage1 = custody
-        .stage2_retirement_authorization(identity)
-        .ok_or_else(|| {
-            TrapError::Hypervisor("carrier stage-2 retirement lacks stage-1 proof".to_owned())
-        })?;
+    let stage1 = custody.claim_stage2_retirement(identity).ok_or_else(|| {
+        TrapError::Hypervisor("carrier stage-2 retirement lacks stage-1 proof".to_owned())
+    })?;
     match custody.retire_stage2_record_using(identity, &stage1, unmap) {
         CarrierStage2RetireOutcome::RetiredUnmapped
         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
@@ -1906,7 +1904,7 @@ fn register_unpublished_global_frame_host_owner_in_using(
                 "global-frame lease rollback request failed: {requested:?}"
             )));
         }
-        let Some(stage1) = custody.stage2_retirement_authorization(record_identity) else {
+        let Some(stage1) = custody.claim_stage2_retirement(record_identity) else {
             return Err(TrapError::Hypervisor(
                 "global-frame lease rollback lost its stored proof".to_owned(),
             ));
@@ -1992,7 +1990,7 @@ pub(crate) fn register_unpublished_pooled_global_frame_host_owner_in(
                 "pooled global-frame rollback request failed: {requested:?}"
             )));
         }
-        let Some(stage1) = custody.stage2_retirement_authorization(record_identity) else {
+        let Some(stage1) = custody.claim_stage2_retirement(record_identity) else {
             return Err(TrapError::Hypervisor(
                 "pooled global-frame rollback lost its stored proof".to_owned(),
             ));
@@ -2603,7 +2601,7 @@ impl Drop for StructuralBackingOwner {
         // without issuing a hypervisor operation from Drop. This also releases
         // the pool handle after a container root vanishes without a task-only
         // retirement callback (for example at VM teardown).
-        if custody.stage2_retirement_authorization(identity).is_some()
+        if custody.claim_stage2_retirement(identity).is_some()
             && matches!(
                 self.retained.mapping.backing,
                 GlobalFrameBacking::PooledRoot(_)
@@ -2775,7 +2773,7 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
     // PreparedStage1Mm can return its numeric root slot to the pool.
     drop(structural_owners);
     for &identity in structural_identities {
-        if custody.stage2_retirement_authorization(identity).is_none() {
+        if custody.claim_stage2_retirement(identity).is_none() {
             let Some(never_published) = unpublished_stage1.consume(identity) else {
                 rollback_error.get_or_insert_with(|| {
                     TrapError::Hypervisor(
@@ -2847,7 +2845,7 @@ pub(crate) fn retry_structural_backing_identities_in_using(
         {
             continue;
         }
-        let Some(stage1) = custody.stage2_retirement_authorization(identity) else {
+        let Some(stage1) = custody.claim_stage2_retirement(identity) else {
             return Err(TrapError::Hypervisor(
                 "terminal stage-2 finalization lacks stage-1 proof".to_owned(),
             ));
@@ -3386,7 +3384,7 @@ pub(crate) fn retire_test_global_frame_host_owner_if_generation_in_using(
     let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length) else {
         return GlobalFrameRetirementOutcome::NotFound { ipa, length };
     };
-    let stage1 = if let Some(stage1) = custody.stage2_retirement_authorization(identity) {
+    let stage1 = if let Some(stage1) = custody.claim_stage2_retirement(identity) {
         Stage2RetirementProof::from(stage1)
     } else {
         Stage2RetirementProof::Unpublished(custody.stage1_unpublished_after_editor_unmap(identity))
@@ -3533,7 +3531,7 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
                 error: format!("carrier stage-2 retirement request failed: {outcome:?}"),
             };
         }
-        let Some(stage1) = custody.stage2_retirement_authorization(owner.record_identity) else {
+        let Some(stage1) = custody.claim_stage2_retirement(owner.record_identity) else {
             return GlobalFrameRetirementOutcome::RetryPending {
                 ipa,
                 length,
@@ -3759,7 +3757,7 @@ pub(crate) fn drain_all_global_frame_retirements_in_using(
         let _ = retire_global_frame_host_owner_inner_in_using(
             custody,
             custody
-                .stage2_retirement_authorization(identity)
+                .claim_stage2_retirement(identity)
                 .map(Stage2RetirementProof::from)
                 .unwrap_or_else(|| {
                     Stage2RetirementProof::Unpublished(
@@ -3812,7 +3810,7 @@ pub(crate) fn retry_pending_global_frame_retirements_in_using(
         let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length) else {
             continue;
         };
-        let Some(stage1) = custody.stage2_retirement_authorization(identity) else {
+        let Some(stage1) = custody.claim_stage2_retirement(identity) else {
             continue;
         };
         let _ = retire_global_frame_host_owner_inner_in_using(
@@ -3832,7 +3830,7 @@ pub(crate) fn retry_pending_global_frame_retirements_in_using(
         .cloned()
         .collect::<Vec<_>>();
     for owner in detached {
-        let Some(stage1) = custody.stage2_retirement_authorization(owner.record_identity) else {
+        let Some(stage1) = custody.claim_stage2_retirement(owner.record_identity) else {
             return Err(TrapError::Hypervisor(
                 "detached stage-2 retry lacks stage-1 proof".to_owned(),
             ));
@@ -4069,7 +4067,7 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_and_release_usin
             continue;
         }
         let outcome = global_frame_stage2_identity_in(custody, ipa, length)
-            .and_then(|identity| custody.stage2_retirement_authorization(identity))
+            .and_then(|identity| custody.claim_stage2_retirement(identity))
             .map_or(
                 GlobalFrameRetirementOutcome::RetryPending {
                     ipa,
@@ -4126,7 +4124,7 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_and_release_usin
                 .complete(record_id);
             continue;
         };
-        let Some(stage1) = custody.stage2_retirement_authorization(owner.record_identity) else {
+        let Some(stage1) = custody.claim_stage2_retirement(owner.record_identity) else {
             custody
                 .pending_global_frame_detached_retries
                 .lock()

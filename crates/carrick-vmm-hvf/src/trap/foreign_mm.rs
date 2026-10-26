@@ -516,10 +516,7 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
                 Stage1UnpublicationReceipt::TableArena(receipt),
             )
             .ok_or_else(|| "raw Fork arena receipt names another record".to_owned())?;
-        if self
-            .custody
-            .stage2_retirement_authorization(identity)
-            .is_none()
+        if self.custody.claim_stage2_retirement(identity).is_none()
             && self
                 .custody
                 .request_stage2_record_retirement(identity, stage1)

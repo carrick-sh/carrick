@@ -1522,13 +1522,11 @@ pub(crate) fn install_ipc_window_using(
                             "IPC rollback retirement request failed: {requested:?}"
                         )));
                     }
-                    let stage1 = custody
-                        .stage2_retirement_authorization(identity)
-                        .ok_or_else(|| {
-                            TrapError::Hypervisor(
-                                "IPC rollback lost exact retirement authority".to_owned(),
-                            )
-                        })?;
+                    let stage1 = custody.claim_stage2_retirement(identity).ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "IPC rollback lost exact retirement authority".to_owned(),
+                        )
+                    })?;
                     match custody.retire_stage2_record_using(identity, &stage1, &mut unmap) {
                         CarrierStage2RetireOutcome::RetiredUnmapped
                         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {

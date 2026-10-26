@@ -957,7 +957,7 @@ fn retire_metadata_record_using(
     {
         return false;
     }
-    let Some(stage1) = custody.stage2_retirement_authorization(identity) else {
+    let Some(stage1) = custody.claim_stage2_retirement(identity) else {
         return false;
     };
     match custody.retire_stage2_record_using(identity, &stage1, unmap) {

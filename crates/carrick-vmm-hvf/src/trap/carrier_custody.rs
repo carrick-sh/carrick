@@ -1008,12 +1008,12 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
         unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> CarrierStage2RetireOutcome {
-        let stage1 = if let Some(stage1) = self.stage2_retirement_authorization(identity) {
+        let stage1 = if let Some(stage1) = self.claim_stage2_retirement(identity) {
             stage1
         } else {
             let unpublished = self.stage1_unpublished_after_editor_unmap(identity);
             let _ = self.request_stage2_record_retirement(identity, unpublished);
-            self.stage2_retirement_authorization(identity)
+            self.claim_stage2_retirement(identity)
                 .expect("test retirement request retained its stage-1 proof")
         };
         self.retire_stage2_record_using(identity, &stage1, unmap)
@@ -2320,7 +2320,7 @@ impl CarrierVmCustody {
         outcome
     }
 
-    pub(crate) fn stage2_retirement_authorization(
+    pub(crate) fn claim_stage2_retirement(
         &self,
         identity: CarrierStage2RecordIdentity,
     ) -> Option<Stage2RetirementClaim<'_>> {
@@ -5573,7 +5573,7 @@ mod carrier_vm_custody_tests {
             .nth(1)
             .and_then(|tail| tail.split("\n}\n").next())
             .expect("structural owner Drop body");
-        assert!(structural_drop.contains("stage2_retirement_authorization"));
+        assert!(structural_drop.contains("claim_stage2_retirement"));
         assert!(!structural_drop.contains("request_stage2_record_retirement"));
         assert!(!structural_drop.contains("inventory_hv_vm_unmap"));
         assert!(!prepared.contains("Arc<GlobalFrameHostOwner>"));

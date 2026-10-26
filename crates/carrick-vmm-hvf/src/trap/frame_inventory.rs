@@ -1634,7 +1634,7 @@ impl HvfVmState {
     ) -> Result<(), TrapError> {
         let outcome = if let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length)
         {
-            let proof = if let Some(proof) = custody.stage2_retirement_authorization(identity) {
+            let proof = if let Some(proof) = custody.claim_stage2_retirement(identity) {
                 Stage2RetirementProof::from(proof)
             } else {
                 Stage2RetirementProof::Unpublished(
@@ -1692,7 +1692,7 @@ impl HvfVmState {
                 .retained
                 .owner_retired
                 .store(true, std::sync::atomic::Ordering::Release);
-            if custody.stage2_retirement_authorization(identity).is_none() {
+            if custody.claim_stage2_retirement(identity).is_none() {
                 let proof = custody
                     .stage1_unpublished_from_receipt(identity, stage1_receipt)
                     .ok_or_else(|| {
@@ -1737,7 +1737,7 @@ impl HvfVmState {
         // whose lease was still live, and the lease's `Drop` then released it
         // again.
         if let Some(identity) = take_carrier_stage2_record(custody, ipa, length) {
-            if custody.stage2_retirement_authorization(identity).is_none() {
+            if custody.claim_stage2_retirement(identity).is_none() {
                 let proof = custody
                     .stage1_unpublished_from_receipt(identity, stage1_receipt)
                     .ok_or_else(|| {
@@ -2347,26 +2347,25 @@ impl HvfVmState {
             else {
                 continue;
             };
-            let stage1 =
-                if let Some(stage1) = custody.stage2_retirement_authorization(record_identity) {
-                    Stage2RetirementProof::from(stage1)
-                } else {
-                    let absence =
-                        Stage1UnpublishedFrames::after_declined_retirement(authority, &remainder)?;
-                    Stage2RetirementProof::Unpublished(
-                        custody
-                            .stage1_unpublished_from_receipt(
-                                record_identity,
-                                Stage1UnpublicationReceipt::FrameAbsence(&absence),
+            let stage1 = if let Some(stage1) = custody.claim_stage2_retirement(record_identity) {
+                Stage2RetirementProof::from(stage1)
+            } else {
+                let absence =
+                    Stage1UnpublishedFrames::after_declined_retirement(authority, &remainder)?;
+                Stage2RetirementProof::Unpublished(
+                    custody
+                        .stage1_unpublished_from_receipt(
+                            record_identity,
+                            Stage1UnpublicationReceipt::FrameAbsence(&absence),
+                        )
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "declined stage-2 retirement absence did not cover its record"
+                                    .to_owned(),
                             )
-                            .ok_or_else(|| {
-                                TrapError::Hypervisor(
-                                    "declined stage-2 retirement absence did not cover its record"
-                                        .to_owned(),
-                                )
-                            })?,
-                    )
-                };
+                        })?,
+                )
+            };
             match retire_global_frame_host_owner_if_generation_in(
                 custody,
                 stage1,
