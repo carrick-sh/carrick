@@ -778,10 +778,7 @@ pub(super) fn native_service_operation(
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn native_exec_stage(
-    frame: &TrapFrame,
-    task: &CurrentTask,
-) -> Option<Result<alloc::boxed::Box<[u8]>, carrick_syscall_abi::LinuxErrno>> {
+fn native_exec_stage(frame: &TrapFrame, task: &CurrentTask) -> Option<NativeExecStage> {
     if (frame.esr >> 26) & 0x3f != 0x15 {
         return None;
     }
@@ -803,11 +800,59 @@ fn native_exec_stage(
         },
         _ => return None,
     };
-    let mut user = file::ValidatedCopy {
-        task,
-        validator: &file::HardwareValidator,
+    native_exec_stage_request(task, &file::HardwareValidator, request)
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+enum NativeExecStage {
+    Payload(alloc::boxed::Box<[u8]>),
+    Fault(carrick_guest_arch::FaultInfo),
+    Failed(carrick_syscall_abi::LinuxErrno),
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+struct ExecStageCopy<'a, V: file::MemoryValidator> {
+    inner: file::ValidatedCopy<'a, V>,
+    fault: Option<u64>,
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+impl<V: file::MemoryValidator> file::UserCopy for ExecStageCopy<'_, V> {
+    fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
+        self.inner.copy_out(dst_va, src)
+    }
+
+    fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool {
+        let copied = self.inner.copy_in(dst, src_va);
+        if !copied && self.fault.is_none() {
+            self.fault = Some(src_va);
+        }
+        copied
+    }
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_exec_stage_request<V: file::MemoryValidator>(
+    task: &CurrentTask,
+    validator: &V,
+    request: crate::exec_stage::ExecStageRequest,
+) -> Option<NativeExecStage> {
+    let mut user = ExecStageCopy {
+        inner: file::ValidatedCopy { task, validator },
+        fault: None,
     };
-    Some(crate::exec_stage::stage_exec_payload(&mut user, request))
+    let staged = crate::exec_stage::stage_exec_payload(&mut user, request);
+    Some(match (staged, user.fault) {
+        (Ok(payload), _) => NativeExecStage::Payload(payload),
+        (Err(errno), Some(address)) if errno == carrick_syscall_abi::LINUX_EFAULT => {
+            NativeExecStage::Fault(carrick_guest_arch::FaultInfo {
+                address: carrick_guest_arch::UserVa::new(address),
+                access: carrick_guest_arch::Access::Read,
+                present: false,
+            })
+        }
+        (Err(errno), _) => NativeExecStage::Failed(errno),
+    })
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -849,16 +894,50 @@ fn arm_native_service_exit(
         return Some(arm_signal_user_return(frame));
     }
     let (page, control) = task.lifecycle_refs()?;
-    let (operation, exec_payload) = match native_exec_stage(frame, task) {
-        Some(Ok(payload)) => (None, Some(payload)),
-        Some(Err(errno)) => {
-            frame.x[0] = errno.guest_retval() as u64;
-            return Some(arm_signal_user_return(frame));
+    let mut service_wait = wait;
+    let (operation, exec_payload, retry_exec_stage) = loop {
+        match native_exec_stage(frame, task) {
+            Some(NativeExecStage::Payload(payload)) => {
+                break (None, Some(payload), false);
+            }
+            Some(NativeExecStage::Failed(errno)) => {
+                frame.x[0] = errno.guest_retval() as u64;
+                return Some(arm_signal_user_return(frame));
+            }
+            Some(NativeExecStage::Fault(fault)) => {
+                // `AT S1E0R` reports an inherited sparse page without taking
+                // an EL0 abort. Feed that exact read through the ordinary
+                // owner fault selector, retaining the syscall frame for retry.
+                let mut synthetic = *frame;
+                synthetic.esr = (0x24 << 26) | 0x04;
+                synthetic.far = fault.address.raw();
+                let mut fault_wait = None;
+                match super::cow_resolver::dispatch_fault(&mut synthetic, counters, &mut fault_wait)
+                {
+                    Action::Served => {
+                        continue;
+                    }
+                    Action::Forward | Action::ServedWithWork => {
+                        service_wait = fault_wait;
+                        break (
+                            Some(carrick_core_abi::service::ServiceOperation::Fault(fault)),
+                            None,
+                            true,
+                        );
+                    }
+                    Action::Idle | Action::HostCustody => {
+                        return Some(invalid_completion(NativeInvariant::EntryBinding));
+                    }
+                }
+            }
+            None => {
+                break (
+                    Some(native_service_operation(frame, &task.linux, action)?),
+                    None,
+                    false,
+                );
+            }
         }
-        None => (
-            Some(native_service_operation(frame, &task.linux, action)?),
-            None,
-        ),
     };
     // This CPU still exclusively owns its portal slot. Bind its selection
     // before park, so even a delayed first intake cannot steal a successor.
@@ -888,11 +967,24 @@ fn arm_native_service_exit(
         &mut service,
         |process| {
             let result = if let Some(payload) = exec_payload {
-                if wait.is_some() {
+                if service_wait.is_some() {
                     return Err(super::native_process_runtime::NativeProcessError::Quarantined);
                 }
                 process.begin_exec_service(payload)?
-            } else if let Some(wait) = wait {
+            } else if retry_exec_stage {
+                process.begin_exec_stage_fault_service(
+                    match operation {
+                        Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) => fault,
+                        _ => {
+                            return Err(
+                                super::native_process_runtime::NativeProcessError::Quarantined,
+                            );
+                        }
+                    },
+                    fault_sequence,
+                    service_wait,
+                )?
+            } else if let Some(wait) = service_wait {
                 process.begin_owner_service_wait(
                     operation
                         .ok_or(super::native_process_runtime::NativeProcessError::Quarantined)?,
@@ -916,6 +1008,7 @@ fn arm_native_service_exit(
     Some(match result {
         NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
         NativeResume::NoPending => arm_signal_user_return(frame),
+        NativeResume::RetrySyscall => invalid_completion(NativeInvariant::EntryBinding),
         NativeResume::Returned(result) => {
             frame.x[0] = result.raw() as u64;
             Action::Served
@@ -3026,11 +3119,66 @@ mod tests {
         frame.x[1] = argv.as_ptr().addr() as u64;
         frame.x[2] = envp.as_ptr().addr() as u64;
 
-        let payload = native_exec_stage(&frame, &task).unwrap().unwrap();
+        let payload = match native_exec_stage(&frame, &task).unwrap() {
+            NativeExecStage::Payload(payload) => payload,
+            NativeExecStage::Fault(fault) => {
+                panic!("resident exec payload faulted at {:?}", fault.address)
+            }
+            NativeExecStage::Failed(errno) => {
+                panic!("resident exec payload failed with {errno:?}")
+            }
+        };
         let view = carrick_core_abi::service::ExecPayloadView::parse(&payload).unwrap();
         assert_eq!(view.path(), b"/bin/static");
         assert_eq!(view.argv().collect::<alloc::vec::Vec<_>>(), [b"static"]);
         assert_eq!(view.envp().collect::<alloc::vec::Vec<_>>(), [b"A=B"]);
+    }
+
+    #[test]
+    fn native_exec_capture_routes_a_nonresident_argument_to_fault_supply() {
+        struct RefusePage(u64);
+
+        impl file::MemoryValidator for RefusePage {
+            fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+
+            fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+                if user_va & !4095 == self.0 & !4095 {
+                    0
+                } else {
+                    len
+                }
+            }
+        }
+
+        let task = CurrentTask::new();
+        let path = b"/bin/static\0";
+        let arg = b"static\0";
+        let argv = [arg.as_ptr().addr() as u64, 0];
+        let envp = [0_u64];
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            ..TrapFrame::default()
+        };
+        frame.x[8] = 221;
+        frame.x[0] = path.as_ptr().addr() as u64;
+        frame.x[1] = argv.as_ptr().addr() as u64;
+        frame.x[2] = envp.as_ptr().addr() as u64;
+
+        let request = crate::exec_stage::ExecStageRequest {
+            call: carrick_core_abi::service::ExecCall::Execve,
+            path: frame.x[0],
+            argv: frame.x[1],
+            envp: frame.x[2],
+        };
+        let staged = native_exec_stage_request(&task, &RefusePage(frame.x[1]), request).unwrap();
+        let NativeExecStage::Fault(fault) = staged else {
+            panic!("nonresident argv did not select page supply");
+        };
+        assert_eq!(fault.address.raw(), frame.x[1]);
+        assert_eq!(fault.access, carrick_guest_arch::Access::Read);
+        assert!(!fault.present);
     }
 
     #[test]
