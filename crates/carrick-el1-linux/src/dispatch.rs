@@ -1697,7 +1697,7 @@ impl<
         self.process.as_deref_mut()?.resume_owned_continuation()
     }
     fn may_serve_poll(&self) -> bool {
-        self.frame.may_serve_poll()
+        self.frame.may_serve_poll() || self.native_descriptor_owner()
     }
     fn native_descriptor_owner(&self) -> bool {
         self.ipc

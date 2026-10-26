@@ -1543,11 +1543,50 @@ mod tests {
             events: 0x0001 | 0x0008 | 0x0010,
             revents: 0,
         };
-        let mut frame = syscall(7, 0, 0, 0, A_SVC);
+        let mut frame = syscall(73, 0, 0, 0, A_SVC);
         frame.x[0] = va;
         frame.x[1] = 1;
         frame.x[2] = 5_000;
         let a_regs = frame.x;
+        {
+            use carrick_personality_linux::dispatch::PendingFamilies;
+            let venue = w.venue();
+            let tasks: [_; carrick_el1_abi::EL1_STACK_SLOTS as usize] =
+                core::array::from_fn(|_| CurrentTask::new());
+            tasks[SLOT.index()]
+                .linux
+                .file_table
+                .store(202, Ordering::Release);
+            let name_cache = carrick_el1_abi::InotifyNameCache::new();
+            let mut pending = crate::dispatch::El1PendingFamilies {
+                handoff: None,
+                lifecycle_user: None,
+                frame: &mut frame,
+                counters: w.counters,
+                current_tasks: &tasks,
+                fd_map: &[],
+                object_table: &[],
+                open_table: &[],
+                inotify_table: &[],
+                name_cache: &name_cache,
+                zone: None::<crate::dispatch::Zone<'_, FakeCpu, HardwareUserWord>>,
+                ipc: Some(&venue),
+                lifecycle: None,
+                process: None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative>,
+                source: None,
+                anonymous: None,
+                cache_lookup: |_| core::ptr::null_mut(),
+            };
+            assert!(
+                pending.may_serve_poll(),
+                "owned child reaches the poll family"
+            );
+            pending.ipc = None;
+            assert!(
+                !pending.may_serve_poll(),
+                "unowned ARM poll keeps its venue"
+            );
+        }
         assert_eq!(w.call_poll(&mut frame, &mut pollfd, va, 5_000), SWITCHED);
         assert_eq!(frame.elr, B_SVC);
 
