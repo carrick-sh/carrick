@@ -21,6 +21,7 @@ pub const DEFAULT_LOCK_PATH: &str = "/tmp/carrick-host-lease.lock";
 pub const HOST_LEASE_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
 const INHERITED_SOCKET: &str = "CARRICK_HOST_LEASE_SOCKET";
 pub(crate) const SCOPE_FD: &str = "CARRICK_HOST_LEASE_SCOPE_FD";
+const LEASE_FORMAT_VERSION: u32 = 2;
 const VALIDATION_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +95,7 @@ pub struct HostLease {
 
 #[derive(Serialize, Deserialize)]
 struct LeaseIdentity {
+    format_version: u32,
     dev: u64,
     ino: u64,
     mode: HostLeaseMode,
@@ -288,7 +290,7 @@ fn admission_try(
     mode: HostLeaseMode,
     capacity: usize,
 ) -> io::Result<Option<Admission>> {
-    let exclusive = matches!(mode, HostLeaseMode::Gate | HostLeaseMode::Docker);
+    let exclusive = mode != HostLeaseMode::Functional;
     let _reader_intent = if exclusive {
         None
     } else {
@@ -311,43 +313,16 @@ fn admission_try(
     if exclusive {
         return Ok(Some((turn, Vec::new(), 1)));
     }
-    // This mutex protects both slot selection and the population high-water
-    // mark. Slots remain kernel-owned custody; a crash leaves no stale count.
-    let Some(mut selection) = try_lock(sidecar(path, ".selection")?, libc::LOCK_EX)? else {
+    // Contents are deliberately irrelevant. The selection file is only a
+    // mutex; occupancy is bounded by capacity and authenticated by live flock.
+    let Some(_selection) = try_lock(sidecar(path, ".selection")?, libc::LOCK_EX)? else {
         return Ok(None);
-    };
-    let mut locks = Vec::new();
-    if mode == HostLeaseMode::Functional {
-        let mut selected = None;
-        for index in 0..capacity {
-            if let Some(slot) = try_lock(
-                sidecar(path, &format!(".functional-{index}"))?,
-                libc::LOCK_EX,
-            )? {
-                selected = Some(slot);
-                break;
-            }
-        }
-        let Some(slot) = selected else {
-            return Ok(None);
-        };
-        locks.push(slot);
-    }
-    // Carrick remains unbounded and may coexist with functional. A separate
-    // population slot gives both modes an honest concurrent-holder snapshot.
-    use std::io::{Read, Seek, SeekFrom};
-    let mut text = String::new();
-    selection.read_to_string(&mut text)?;
-    let high_water = if text.is_empty() {
-        0
-    } else {
-        text.parse::<usize>().map_err(io::Error::other)?
     };
     let mut selected = None;
     let mut occupied = 0;
-    for index in 0..high_water {
+    for index in 0..capacity {
         match try_lock(
-            sidecar(path, &format!(".population-{index}"))?,
+            sidecar(path, &format!(".functional-{index}"))?,
             libc::LOCK_EX,
         )? {
             Some(slot) if selected.is_none() => selected = Some(slot),
@@ -355,21 +330,66 @@ fn admission_try(
             None => occupied += 1,
         }
     }
-    if selected.is_none() {
-        selected = try_lock(
-            sidecar(path, &format!(".population-{high_water}"))?,
-            libc::LOCK_EX,
-        )?;
-        if selected.is_none() {
-            return Err(io::Error::other("unpublished population slot is locked"));
-        }
-        selection.seek(SeekFrom::Start(0))?;
-        write!(selection, "{}", high_water + 1)?;
-        let length = selection.stream_position()?;
-        selection.set_len(length)?;
+    // Contended slots, including last-close cleanup still in flight, are a
+    // reason to wait under the existing deadline, never a metadata error.
+    Ok(selected.map(|slot| (turn, vec![slot], occupied + 1)))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseFormat {
+    version: u32,
+    functional_limit: usize,
+}
+
+// The lock itself carries the protocol and capacity authority. A caller
+// choosing another config cannot create a larger independent slot population.
+fn validate_format(path: &Path, fd: &OwnedFd, capacity: usize) -> io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let Some(_publication) = try_lock(sidecar(path, ".format")?, libc::LOCK_EX)? else {
+        return Ok(false);
+    };
+    let file = std::fs::File::from(fd.try_clone()?);
+    let mut bytes = [0; 4096];
+    let length = file.read_at(&mut bytes, 0)?;
+    if length == 0 {
+        // Empty legacy files can only be initialized with idle-host proof.
+        let Some(_idle) = try_lock(file.try_clone()?, libc::LOCK_EX)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "active unversioned host lease; drain and upgrade every participant",
+            ));
+        };
+        let record = serde_json::to_vec(&LeaseFormat {
+            version: LEASE_FORMAT_VERSION,
+            functional_limit: capacity,
+        })?;
+        file.write_all_at(&record, 0)?;
+        file.set_len(record.len() as u64)?;
+        return Ok(true);
     }
-    locks.push(selected.ok_or_else(|| io::Error::other("missing population custody"))?);
-    Ok(Some((turn, locks, occupied + 1)))
+    let record: LeaseFormat = serde_json::from_slice(&bytes[..length]).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid host lease format; drain and upgrade every participant: {error}"),
+        )
+    })?;
+    if record.version != LEASE_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported host lease format; drain and upgrade every participant",
+        ));
+    }
+    if record.functional_limit != capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "functional capacity mismatch: lock records {}, configuration requests {capacity}",
+                record.functional_limit
+            ),
+        ));
+    }
+    Ok(true)
 }
 
 impl HostLease {
@@ -592,16 +612,17 @@ impl HostLease {
         fd: OwnedFd,
     ) -> Result<Self, HostLeaseError> {
         let op = match mode {
-            HostLeaseMode::Carrick | HostLeaseMode::Functional => libc::LOCK_SH,
-            HostLeaseMode::Docker | HostLeaseMode::Gate => libc::LOCK_EX,
+            HostLeaseMode::Functional => libc::LOCK_SH,
+            HostLeaseMode::Carrick | HostLeaseMode::Docker | HostLeaseMode::Gate => libc::LOCK_EX,
         };
 
         let start = Instant::now();
         let capacity = broker::ConfigSource::entry_point()
             .functional_limit()
             .map_err(HostLeaseError::ChildWait)?;
-        let writer = matches!(mode, HostLeaseMode::Gate | HostLeaseMode::Docker);
+        let writer = mode != HostLeaseMode::Functional;
         let mut writer_intent = None;
+        let mut format_validated = false;
         let mut waited = false;
         let mut admission = None;
         let mut auxiliary = Vec::new();
@@ -614,7 +635,15 @@ impl HostLease {
                 )
                 .map_err(HostLeaseError::ChildWait)?;
             }
-            if admission.is_none()
+            if !format_validated {
+                format_validated =
+                    validate_format(path, &fd, capacity).map_err(|source| HostLeaseError::Io {
+                        path: path.into(),
+                        source,
+                    })?;
+            }
+            if format_validated
+                && admission.is_none()
                 && (!writer || writer_intent.is_some())
                 && let Some((turn, locks, count)) =
                     admission_try(path, mode, capacity).map_err(|source| HostLeaseError::Io {
@@ -647,7 +676,7 @@ impl HostLease {
                     source: err,
                 });
             }
-            if matches!(mode, HostLeaseMode::Carrick | HostLeaseMode::Functional) {
+            if mode == HostLeaseMode::Functional {
                 admission = None;
                 auxiliary.clear();
             }
@@ -734,6 +763,7 @@ impl HostLease {
             LeaseCustody::Broker(_) => (0, 0),
         };
         let identity = serde_json::to_vec(&LeaseIdentity {
+            format_version: LEASE_FORMAT_VERSION,
             dev,
             ino,
             mode,
@@ -819,6 +849,11 @@ impl HostLease {
             read_validation_identity(UnixStream::connect(socket)?)
         };
         let identity = validate().map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
+        if identity.format_version != LEASE_FORMAT_VERSION {
+            return Err(HostLeaseError::Inherited(
+                "unsupported host lease format; upgrade every participant".into(),
+            ));
+        }
         if identity.mode != requested && identity.mode != HostLeaseMode::Gate {
             return Err(HostLeaseError::Inherited(format!(
                 "cannot nest {requested} under {}; no lock upgrades",
@@ -1012,6 +1047,7 @@ mod tests {
     fn closed_validation_peer_fixture() {
         let (client, mut server) = UnixStream::pair().unwrap();
         let reply = LeaseIdentity {
+            format_version: LEASE_FORMAT_VERSION,
             dev: 1,
             ino: 2,
             mode: HostLeaseMode::Gate,
@@ -1159,9 +1195,6 @@ mod tests {
                 HostLeaseMode::Docker,
                 HostLeaseMode::Carrick,
             ] {
-                if holder == HostLeaseMode::Carrick && contender == HostLeaseMode::Carrick {
-                    continue;
-                }
                 let temp = NamedTempFile::new().unwrap();
                 let held = HostLease::acquire_path(temp.path(), holder).unwrap();
                 let blocked =
@@ -1236,6 +1269,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nested.mode(), HostLeaseMode::Gate);
+        let functional = HostLease::inherit(
+            &broker::ConfigSource::NoBroker,
+            temp.path(),
+            HostLeaseMode::Functional,
+            &gate.socket,
+        )
+        .unwrap();
+        assert_eq!(functional.mode(), HostLeaseMode::Gate);
+        assert!(functional._holder.is_none());
+
         assert!(nested._holder.is_none());
         assert!(matches!(
             HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Carrick, Duration::ZERO),
@@ -1287,6 +1330,63 @@ mod tests {
                 other.path()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn corrupt_selection_contents_do_not_wedge_functional_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease.lock");
+        std::fs::write(
+            dir.path().join("lease.lock.selection"),
+            "partial-write-garbage",
+        )
+        .unwrap();
+        let lease = HostLease::acquire_path(&path, HostLeaseMode::Functional).unwrap();
+        assert_eq!(lease.concurrent_holders, 1);
+    }
+
+    #[test]
+    fn capacity_mismatch_fails_closed() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), r#"{"version":2,"functional_limit":2}"#).unwrap();
+        let result = HostLease::acquire_path_with_limit(
+            file.path(),
+            HostLeaseMode::Functional,
+            Duration::ZERO,
+        );
+        assert!(
+            matches!(result, Err(HostLeaseError::Io { source, .. }) if source.to_string().contains("capacity mismatch"))
+        );
+    }
+
+    #[test]
+    fn active_unversioned_lease_cannot_be_adopted() {
+        let file = NamedTempFile::new().unwrap();
+        let old = std::fs::File::open(file.path()).unwrap();
+        old.lock_shared().unwrap();
+        let result = HostLease::acquire_path_with_limit(
+            file.path(),
+            HostLeaseMode::Functional,
+            Duration::ZERO,
+        );
+        assert!(
+            matches!(result, Err(HostLeaseError::Io { source, .. }) if source.to_string().contains("active unversioned"))
+        );
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn incompatible_lease_format_fails_loudly() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), r#"{"version":1,"functional_limit":3}"#).unwrap();
+        let result = HostLease::acquire_path_with_limit(
+            file.path(),
+            HostLeaseMode::Functional,
+            Duration::ZERO,
+        );
+        assert!(
+            matches!(result, Err(HostLeaseError::Io { source, .. }) if source.to_string().contains("lease format"))
         );
     }
 
@@ -1374,10 +1474,13 @@ mod tests {
     }
 
     #[test]
-    fn functional_cannot_upgrade_and_carrick_can_coexist() {
+    fn functional_cannot_upgrade_and_carrick_is_excluded() {
         let temp = NamedTempFile::new().unwrap();
         let functional = HostLease::acquire_path(temp.path(), HostLeaseMode::Functional).unwrap();
-        let _carrick = HostLease::acquire_path(temp.path(), HostLeaseMode::Carrick).unwrap();
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Carrick, Duration::ZERO),
+            Err(HostLeaseError::Timeout { .. })
+        ));
         assert!(
             HostLease::inherit(
                 &broker::ConfigSource::NoBroker,
@@ -1399,20 +1502,17 @@ mod tests {
     }
 
     #[test]
-    fn shared_and_shared_coexist() {
+    fn carrick_excludes_another_carrick() {
         let temp = NamedTempFile::new().expect("create temp file");
         let path = temp.path();
 
         let lease1 =
             HostLease::acquire_path(path, HostLeaseMode::Carrick).expect("acquire lease 1");
-        let lease2 =
-            HostLease::acquire_path(path, HostLeaseMode::Carrick).expect("acquire lease 2");
-
-        assert!(lease1._holder.is_some());
-        assert!(lease2._holder.is_some());
-
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(path, HostLeaseMode::Carrick, Duration::ZERO),
+            Err(HostLeaseError::Timeout { .. })
+        ));
         drop(lease1);
-        drop(lease2);
     }
 
     #[test]
@@ -1421,7 +1521,7 @@ mod tests {
         let path = temp.path();
 
         let shared_lease =
-            HostLease::acquire_path(path, HostLeaseMode::Carrick).expect("acquire shared lease");
+            HostLease::acquire_path(path, HostLeaseMode::Functional).expect("acquire shared lease");
 
         // Open a second file description to the same file
         let path_str = path.to_str().unwrap();

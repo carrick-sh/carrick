@@ -38,10 +38,22 @@ fn broker(
     mode: &str,
     wait_ms: u64,
 ) -> (Process, BufReader<std::process::ChildStdout>) {
+    broker_with_limit(path, mode, wait_ms, 2)
+}
+
+fn broker_with_limit(
+    path: &Path,
+    mode: &str,
+    wait_ms: u64,
+    capacity: usize,
+) -> (Process, BufReader<std::process::ChildStdout>) {
+    let config = path.with_extension(format!("limit-{capacity}.toml"));
+    std::fs::write(&config, format!("functional_limit = {capacity}\n")).unwrap();
     let mut child = Command::new(XTASK)
         .args(["host-lease", "broker", "--lock-path"])
         .arg(path)
-        .env("CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT", "2")
+        .env("CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT", "999")
+        .env("CARRICK_HOST_LEASE_CONFIG", config)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -49,7 +61,7 @@ fn broker(
         .unwrap();
     writeln!(
         child.stdin.as_mut().unwrap(),
-        "{{\"mode\":\"{mode}\",\"wait_ms\":{wait_ms}}}"
+        "{{\"format_version\":2,\"mode\":\"{mode}\",\"wait_ms\":{wait_ms}}}"
     )
     .ok(); // A pre-fix binary can exit before reading the request.
     let output = BufReader::new(child.stdout.take().unwrap());
@@ -58,15 +70,15 @@ fn broker(
 
 #[test]
 fn broker_two_clients_contend_then_proceed_for_every_exclusive_pair() {
-    for held in ["gate", "docker", "carrick"] {
-        for requested in ["gate", "docker", "carrick"] {
+    for held in ["gate", "docker", "carrick", "functional"] {
+        for requested in ["gate", "docker", "carrick", "functional"] {
             let temp = tempfile::tempdir().unwrap();
             let lock = temp.path().join("lease.lock");
             std::fs::File::create(&lock).unwrap();
             let (mut first, mut first_out) = broker(&lock, held, 5000);
             assert_eq!(line(&mut first_out), "acquired 1\n");
             let (second, mut second_out) = broker(&lock, requested, 5000);
-            if held == "carrick" && requested == "carrick" {
+            if held == "functional" && requested == "functional" {
                 assert_eq!(line(&mut second_out), "acquired 2\n");
             } else {
                 assert_eq!(line(&mut second_out), "waiting\n");
@@ -254,8 +266,8 @@ fn broker_client_bad_configuration_never_falls_back_to_local_lock() {
 #[test]
 fn broker_rejects_invalid_mode_and_excessive_wait_limit() {
     for request in [
-        "{\"mode\":\"unknown\",\"wait_ms\":0}\n",
-        "{\"mode\":\"gate\",\"wait_ms\":3600001}\n",
+        "{\"format_version\":2,\"mode\":\"unknown\",\"wait_ms\":0}\n",
+        "{\"format_version\":2,\"mode\":\"gate\",\"wait_ms\":3600001}\n",
     ] {
         let mut child = Process(
             Command::new(XTASK)
@@ -303,7 +315,7 @@ fn broker_and_in_process_controller_contend_on_one_inode_without_chmod() {
     let lock = tempfile::NamedTempFile::new().unwrap();
     let lease = HostLease::acquire_path(lock.path(), HostLeaseMode::Gate).unwrap();
     std::fs::set_permissions(lock.path(), std::fs::Permissions::from_mode(0o660)).unwrap();
-    let (_client, mut output) = broker(lock.path(), "docker", 5000);
+    let (_client, mut output) = broker_with_limit(lock.path(), "docker", 5000, 3);
     assert_eq!(line(&mut output), "waiting\n");
     drop(lease);
     assert_eq!(line(&mut output), "acquired 1\n");
@@ -387,6 +399,15 @@ fn broker_ssh_custody_runs_in_isolated_session() {
 
 #[test]
 fn functional_capacity_and_waiting_gate_prevent_new_admissions() {
+    waiting_exclusive_prevents_new_functional("gate");
+}
+
+#[test]
+fn waiting_carrick_prevents_new_functional_admissions() {
+    waiting_exclusive_prevents_new_functional("carrick");
+}
+
+fn waiting_exclusive_prevents_new_functional(mode: &str) {
     let temp = tempfile::tempdir().unwrap();
     let lock = temp.path().join("lease.lock");
     std::fs::File::create(&lock).unwrap();
@@ -396,7 +417,7 @@ fn functional_capacity_and_waiting_gate_prevent_new_admissions() {
     assert_eq!(line(&mut second_out), "acquired 2\n");
     let (mut third, mut third_out) = broker(&lock, "functional", 5000);
     assert_eq!(line(&mut third_out), "waiting\n");
-    let (mut gate, mut gate_out) = broker(&lock, "gate", 5000);
+    let (mut gate, mut gate_out) = broker(&lock, mode, 5000);
     assert_eq!(line(&mut gate_out), "waiting\n");
     drop(first.0.stdin.take());
     assert!(first.0.wait().unwrap().success());
@@ -412,4 +433,89 @@ fn functional_capacity_and_waiting_gate_prevent_new_admissions() {
     assert_eq!(line(&mut third_out), "acquired 1\n");
     drop(third.0.stdin.take());
     assert!(third.0.wait().unwrap().success());
+}
+
+#[test]
+fn killed_functional_holder_releases_slot_and_population() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock = temp.path().join("lease.lock");
+    std::fs::File::create(&lock).unwrap();
+    let (mut first, mut out1) = broker(&lock, "functional", 5000);
+    assert_eq!(line(&mut out1), "acquired 1\n");
+    let (mut second, mut out2) = broker(&lock, "functional", 5000);
+    assert_eq!(line(&mut out2), "acquired 2\n");
+    let (mut third, mut out3) = broker(&lock, "functional", 5000);
+    assert_eq!(line(&mut out3), "waiting\n");
+    first.0.kill().unwrap();
+    first.0.wait().unwrap();
+    assert_eq!(line(&mut out3), "acquired 2\n");
+    second.0.kill().unwrap();
+    second.0.wait().unwrap();
+    drop(third.0.stdin.take());
+    assert!(third.0.wait().unwrap().success());
+    let (_last, mut last_out) = broker(&lock, "functional", 5000);
+    assert_eq!(line(&mut last_out), "acquired 1\n");
+}
+
+#[test]
+fn different_configured_capacity_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock = temp.path().join("lease.lock");
+    std::fs::File::create(&lock).unwrap();
+    let (_first, mut out1) = broker_with_limit(&lock, "functional", 5000, 2);
+    assert_eq!(line(&mut out1), "acquired 1\n");
+    let config = temp.path().join("different.toml");
+    std::fs::write(&config, "functional_limit = 3").unwrap();
+    let mut second = Command::new(XTASK)
+        .args(["host-lease", "broker", "--lock-path"])
+        .arg(&lock)
+        .env("CARRICK_HOST_LEASE_CONFIG", config)
+        .env_remove("CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        second.stdin.take().unwrap(),
+        "{{\"format_version\":2,\"mode\":\"functional\",\"wait_ms\":0}}"
+    )
+    .unwrap();
+    let result = second.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("capacity mismatch"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn broker_rejects_unversioned_wire_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock = temp.path().join("lease.lock");
+    std::fs::File::create(&lock).unwrap();
+    let mut child = Command::new(XTASK)
+        .args(["host-lease", "broker", "--lock-path"])
+        .arg(lock)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("CARRICK_HOST_LEASE_CONFIG")
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{{\"mode\":\"carrick\",\"wait_ms\":0}}"
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "unversioned broker admitted a holder: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("format_version"),
+        "{output:?}"
+    );
+    assert!(output.stdout.is_empty());
 }

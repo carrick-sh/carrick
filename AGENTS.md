@@ -92,7 +92,7 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
 | `just accept --profile linux-portable` | Linux host gate + receipt; signed phase rejected. |
 | `just remote-accept --ref COMMIT --phase host` | Worker gate on cloudmac + fetched receipt; also run signed for macOS/ARM changes. |
-| `just lease MODE +CMD` | Run command under host flock lease (carrick shared, gate/docker exclusive). |
+| `just lease MODE +CMD` | Run command under host flock lease (functional bounded shared; carrick/gate/docker exclusive). |
 
 **Toolchain:** pin, edition, members, `deny`ed lints: [`rust-toolchain.toml`](rust-toolchain.toml) and
 [`Cargo.toml`](Cargo.toml). CI uses moving `@stable`, which can flag lints
@@ -136,28 +136,46 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
 
 **Running**
 - **Never run carrick and Docker concurrently** (VMs starve → wrong verdicts).
-  Two-phase gate; `carrick‖carrick`/`docker‖docker` OK.
-- **Machine quietness:** `just accept` holds the host lease in exclusive `gate`
-  mode for its entire host/signed run; `scripts/test-signed.sh` holds shared
-  `carrick` mode through build, signing, execution and scoped cleanup.
-  Owner decision [#231](https://github.com/carrick-sh/carrick/issues/231) /
-  [#879](https://github.com/carrick-sh/carrick/issues/879) permits explicitly
-  non-timing signed runs to set `CARRICK_SIGNED_FUNCTIONAL=1` for `functional`
-  mode: at most three functional holders by default, configurable with
-  `functional_limit` in `/etc/carrick/host-lease.toml` (or
-  `CARRICK_HOST_LEASE_CONFIG`) and `CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT`.
-  Functional and shared carrick holders may coexist; gate/Docker exclude both
-  and pending exclusive requests block new shared admissions. Acceptance,
-  conformance and perf recipes clear the override and retain exclusive custody.
-  Receipts record actual mode and total holder count at admission; this
-  snapshot is not timing evidence. Functional custody cannot upgrade. Host
-  tests/compilation compete for CPU and memory too. Both refuse `yes`, `stress`
-  and `stress-ng`, reporting PIDs and parent commands. Deliberate load requires
-  `CARRICK_ALLOW_LOAD=1`; logs record detected load and acceptance receipts
-  include it. Contention fails explicitly after `HOST_LEASE_WAIT_LIMIT` (one
-  hour), never skips. `CARRICK_HOST_LEASE_PATH` changes the lock file for tests;
-  every participant on a gate host must use the same path. Never unlink a live
-  lock file.
+  Two-phase gate; concurrent Carrick guests require non-timing functional
+  custody. Docker workers may overlap within one oracle phase.
+- **Machine quietness:** `just accept` holds exclusive `gate` custody for its
+  entire host/signed run. `scripts/test-signed.sh` defaults to exclusive
+  `carrick` custody through build, signing, execution and scoped cleanup:
+  timing-sensitive signed runs get a quiet machine. The former shared
+  carrick mode already allowed unlimited overlap; owner decision
+  [#231](https://github.com/carrick-sh/carrick/issues/231) and correction
+  [#879](https://github.com/carrick-sh/carrick/issues/879) change that policy.
+  Explicitly non-timing callers set `CARRICK_SIGNED_FUNCTIONAL=1` to share
+  `functional` custody, up to `functional_limit` (default three) in the host
+  `/etc/carrick/host-lease.toml` or `CARRICK_HOST_LEASE_CONFIG` file.
+  Capacity is recorded in the versioned primary lock; a different configured
+  limit fails closed. Per-process capacity overrides cannot raise the cap.
+  Carrick, gate and Docker exclude all other holders and block new functional
+  admissions while waiting. Nested gate work reuses its original custody;
+  functional and carrick holders cannot upgrade.
+  Change #879 also gives conformance and perf recipes exclusive custody;
+  acceptance and those recipes strip the functional opt-in. The signed
+  test-embed, test-hvf and test-hvf-trap-engine recipes stay on carrick.
+  Receipts record the actual mode and total holder count **at admission only**,
+  not a peak or timing measurement. Host tests and compilation compete for CPU
+  and memory too. Signed and acceptance runners refuse `yes`, `stress` and
+  `stress-ng`, reporting PIDs and parent commands. Deliberate load requires
+  `CARRICK_ALLOW_LOAD=1`; logs and acceptance receipts record detected load.
+  Contention fails after `HOST_LEASE_WAIT_LIMIT` (one hour), never skips.
+  Every participant must use the same `CARRICK_HOST_LEASE_PATH` and protocol.
+  Drain and upgrade all participants before enabling the new lease format:
+  an unmodified older executable does not consult its version record. Never
+  unlink a live lock file.
+
+Admission matrix (row is the current holder, column is a new caller):
+
+| Holder | carrick | functional | gate | docker |
+|---|---|---|---|---|
+| carrick | blocked | blocked | blocked | blocked |
+| functional | blocked | admitted up to cap | blocked | blocked |
+| gate | blocked | blocked | blocked | blocked |
+| docker | blocked | blocked | blocked | blocked |
+
 - **Contabo leases are per VM, never the whole hypervisor** (owner decision
   [#639](https://github.com/carrick-sh/carrick/issues/639), supersedes #565).
   KVM and agent clones use their in-VM lease; the standing controller takes no

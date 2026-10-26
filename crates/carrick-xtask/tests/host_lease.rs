@@ -651,7 +651,7 @@ fn cancellation_preserves_another_checkout_with_identical_command() {
     let lock = tempfile::NamedTempFile::new().unwrap();
     let spawn = |checkout: &std::path::Path, ready: &std::path::Path| {
         let mut runner = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-            .args(["host-lease", "--mode", "carrick", "--"])
+            .args(["host-lease", "--mode", "functional", "--"])
             .arg(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", FORK_FIXTURE])
             .current_dir(checkout)

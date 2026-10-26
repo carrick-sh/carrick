@@ -763,3 +763,74 @@ fn historical_fixture_evidence_does_not_invent_hash_work_status() {
         "not_recorded"
     );
 }
+
+#[test]
+fn signed_body_uses_functional_only_for_exact_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir().unwrap();
+    for (name, script) in [
+        ("uname", "#!/bin/sh\necho Darwin\n"),
+        ("cargo", "#!/bin/sh\nprintf '%s\\n' \"$@\"\n"),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for (value, expected) in [
+        (None, "carrick"),
+        (Some("1"), "functional"),
+        (Some("0"), "carrick"),
+        (Some("true"), "carrick"),
+        (Some(""), "carrick"),
+    ] {
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg("scripts/lib/test-signed-body.sh")
+            .arg("carrick-embed")
+            .current_dir(&root)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("CARRICK_SCCACHE", "0")
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
+            .env_remove("CARRICK_SIGNED_FUNCTIONAL");
+        if let Some(value) = value {
+            command.env("CARRICK_SIGNED_FUNCTIONAL", value);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let arguments: Vec<_> = stdout.lines().collect();
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--mode", expected]),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn signed_header_records_mode_population_and_snapshot_scope() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("/bin/bash").arg("-c").arg(r#"
+        set -euo pipefail
+        . scripts/lib/test-signed-identity.sh
+        source_head=fixture package=unused pkg=carrick-embed run_id=review-879
+        arguments_json='[]' requested_filter_json=null enabled_features_json='[]' test_target_json=null
+        contract_header_arg=() contract_header_entry=''
+        CARRICK_HOST_LEASE_MODE=functional CARRICK_HOST_LEASE_CONCURRENT_HOLDERS=2
+        test_signed_receipt_header
+    "#).current_dir(root).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let header: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(header["lease_mode"], "functional");
+    assert_eq!(header["concurrent_holders"], 2);
+    assert_eq!(header["holder_count_scope"], "at-admission");
+}

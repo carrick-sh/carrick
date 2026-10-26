@@ -163,20 +163,7 @@ if [ -n "$requested_filter" ]; then
 else
     requested_filter_json="null"
 fi
-jq -nc \
-    --arg schema "carrick.signed-embed-test.v1" \
-    --arg source_head "$source_head" \
-    --arg package "$pkg" \
-    --arg run_id "$run_id" \
-    --arg lease_mode "$CARRICK_HOST_LEASE_MODE" \
-    --argjson concurrent_holders "$CARRICK_HOST_LEASE_CONCURRENT_HOLDERS" \
-    --argjson arguments "$arguments_json" \
-    --argjson requested_filter "$requested_filter_json" \
-    --argjson enabled_features "$enabled_features_json" \
-    --argjson test_target "$test_target_json" \
-    ${contract_header_arg[@]+"${contract_header_arg[@]}"} \
-    "{schema:\$schema,record_type:\"header\",lease_mode:\$lease_mode,concurrent_holders:\$concurrent_holders,source_head:\$source_head,package:\$package,arguments:\$arguments,requested_test_filter:\$requested_filter,carrick_run_id:\$run_id,test_target:\$test_target,enabled_features:\$enabled_features$contract_header_entry}" \
-    >"$receipt_tmp"
+test_signed_receipt_header >"$receipt_tmp"
 scratch=()
 active_exe_run_id=""
 active_exe_pid=""

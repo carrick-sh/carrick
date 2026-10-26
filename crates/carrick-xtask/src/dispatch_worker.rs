@@ -502,7 +502,7 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         Implement and verify this brief. Commit your work with a Why/What/Verified body and\n\
         Co-Authored-By: {}\nDo not push, open a PR, or post comments; the workflow publishes those.\n\
         Never use --no-verify, git stash or git add -A. Keep conformance-probes/target out of commits.\n\
-        This is an ephemeral runner. Use local shared carrick leases for builds.\n\
+        This is an ephemeral runner. Use local carrick leases for builds.\n\
         Contabo leases are per VM under owner decision #639; never acquire a hypervisor lease.\n\
         Run only gates supported by this host; report unavailable Docker, KVM or HVF honestly.\n\
         To propose a PR body, write ../pr-body.md beside result.json (relative to the checkout root).\n\

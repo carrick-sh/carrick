@@ -73,17 +73,7 @@ impl ConfigSource {
             })
             .transpose()?
             .unwrap_or(3);
-        match std::env::var("CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT") {
-            Ok(value) => value
-                .parse::<usize>()
-                .ok()
-                .filter(|value| *value > 0)
-                .ok_or_else(|| {
-                    io::Error::other("CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT must be positive")
-                }),
-            Err(std::env::VarError::NotPresent) => Ok(configured),
-            Err(error) => Err(io::Error::other(error)),
-        }
+        Ok(configured)
     }
 
     pub(super) fn load(&self) -> io::Result<Option<Config>> {
@@ -187,6 +177,7 @@ impl Config {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
+    format_version: u32,
     mode: HostLeaseMode,
     wait_ms: u64,
 }
@@ -284,6 +275,12 @@ pub fn run(args: BrokerArgs) -> Result<(), HostLeaseError> {
         let request: Request = serde_json::from_slice(&bytes).map_err(|e| {
             HostLeaseError::ChildWait(io::Error::new(io::ErrorKind::InvalidData, e))
         })?;
+        if request.format_version != LEASE_FORMAT_VERSION {
+            return Err(HostLeaseError::ChildWait(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported broker lease format_version; upgrade both endpoints",
+            )));
+        }
         let limit = Duration::from_millis(request.wait_ms);
         if limit > HOST_LEASE_WAIT_LIMIT {
             return Err(HostLeaseError::ChildWait(io::Error::new(
@@ -370,6 +367,7 @@ impl Session {
             reaped: AtomicBool::new(false),
         };
         let mut request = serde_json::to_vec(&Request {
+            format_version: LEASE_FORMAT_VERSION,
             mode,
             wait_ms: limit.as_millis().min(u64::MAX as u128) as u64,
         })

@@ -110,7 +110,7 @@ pub enum Commands {
 
     #[command(
         name = "host-lease",
-        about = "Run command under machine-global host lease flock (carrick shared, gate/docker exclusive)",
+        about = "Run command under host lease flock (functional bounded shared; carrick/gate/docker exclusive)",
         long_about = "Run command under machine-global host lease flock. Runner death and supervisor SIGTERM/SIGINT/SIGHUP cancel supervised work before successful release. Cleanup errors or the single five-second cleanup deadline fail the run explicitly and release the lease. On macOS, either supervisor or guardian survives the other's SIGKILL and retains exclusion during cleanup; loss of both releases flock. Linux still has a sole supervisor. On Darwin, detached descendants closing all inherited scope descriptors escape; the final process-start-time check to kill also has a PID reuse window. See docs/host-lease-containment-follow-up.md."
     )]
     HostLease(HostLeaseArgs),
@@ -179,7 +179,7 @@ pub struct HostLeaseArgs {
     #[arg(
         long,
         value_enum,
-        help = "Lock mode: carrick (shared), functional (bounded shared), gate or docker (exclusive)"
+        help = "Lock mode: carrick, gate or docker (exclusive), functional (bounded shared)"
     )]
     pub mode: Option<crate::host_lease::HostLeaseMode>,
 
