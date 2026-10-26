@@ -1001,13 +1001,16 @@ fn serve_clone<'a>(
     let affinity = native.affinity()?;
     let claimed = match page.claim_any() {
         Ok(claimed) => claimed,
-        Err(TransitionError::GateClosed(_)) => {
+        Err(TransitionError::GateClosed(gate)) => {
             // A speculative claim may have been observed by an exit before
             // the gate check backed it out. That rollback also owes a wake.
             if native.lifecycle_admission_settled().is_err() {
                 native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
             }
-            return Some(-11);
+            return match gate {
+                GateState::AwaitingExecBinding | GateState::HostOnly => None,
+                GateState::ForkClosing | GateState::Closed | GateState::Open => Some(-11),
+            };
         }
         Err(error) => {
             if error == TransitionError::PoolEmpty {

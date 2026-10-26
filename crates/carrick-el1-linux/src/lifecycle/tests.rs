@@ -604,7 +604,7 @@ fn clone_forwards_every_other_flag_set_without_effects() {
 }
 
 #[test]
-fn clone_closed_gate_returns_eagain_and_threads_hatch_forwards() {
+fn clone_gate_forwards_when_host_births_remain_legal() {
     let run = |w: &mut World, expected: Action| {
         let entry = w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
         let word = Box::new(0xaaaa_u32);
@@ -630,6 +630,13 @@ fn clone_closed_gate_returns_eagain_and_threads_hatch_forwards() {
     let mut w = World::new(LifecycleHatches::ON);
     w.page().close();
     run(&mut w, Action::Served);
+    let mut w = World::new(LifecycleHatches::ON);
+    w.page().close_for_fork().unwrap();
+    w.page().await_exec_binding().unwrap();
+    run(&mut w, Action::Forward);
+    let mut w = World::new(LifecycleHatches::ON);
+    w.page().decline_to_host();
+    run(&mut w, Action::Forward);
     // CARRICK_EL1_THREADS=0.
     let mut w = World::new(LifecycleHatches {
         threads: false,
