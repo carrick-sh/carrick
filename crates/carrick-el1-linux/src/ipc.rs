@@ -1466,8 +1466,63 @@ mod tests {
         }
     }
 
+    /// Readiness must not wait for a host holder that needs this vCPU out.
+    /// The channel deadline only releases the host lock on the broken path;
+    /// the passing path refuses while that lock is still held.
     #[test]
-    fn native_child_poll_on_inherited_pipe_parks_and_wakes_in_guest() {
+    fn native_child_poll_host_held_object_refuses_without_clearing_running_slot() {
+        let mut w = world();
+        let parent = w.table(w.a_tid);
+        let (reader, _, object) = w.pipe(parent, BLOCK);
+        w.fork_table(parent, 202);
+        let va = 0x2_0000;
+        w.mem.map(MM, va, PAGE);
+        w.mem.map(OTHER_MM, va, PAGE);
+        let mut pollfd = crate::file_table::PollFd {
+            fd: reader,
+            events: 0x0001,
+            revents: 0,
+        };
+        let mut frame = syscall(7, 0, 0, 0, B_SVC);
+        frame.x[0] = va;
+        frame.x[1] = 1;
+        w.queue(202, OTHER_MM, &frame, B_SVC);
+        let mut block_parent = syscall(SYS_READ, reader, va, 1, A_SVC);
+        assert_eq!(w.call(&mut block_parent), SWITCHED);
+        frame = block_parent;
+        reenter(&mut frame, B_SVC);
+        let before = frame;
+        let running = w.zone.slot(SLOT).current().unwrap();
+        let region = w.region;
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (left_tx, left_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(move || {
+                let guard = region.lock(object, &HostWait).unwrap();
+                held_tx.send(()).unwrap();
+                let refused_before_release = left_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_ok();
+                drop(guard);
+                refused_before_release
+            });
+            held_rx.recv().unwrap();
+            // A host holder is refused at the existing deterministic budget.
+            let wait = ObjectLockWait { region, object };
+            assert!(!wait.wait(EL1_GUEST_LOCK_SPINS + 1));
+            let served = w.call_poll(&mut frame, &mut pollfd, va, 0);
+            let _ = left_tx.send(());
+            assert!(holder.join().unwrap(), "readiness waited for the host");
+            assert_eq!(served, IpcServed::Forward);
+        });
+        assert_eq!((frame.x, frame.elr), (before.x, before.elr));
+        assert_eq!(w.zone.slot(SLOT).current(), Some(running));
+        assert!(!w.zone.record(running).has_object_operation());
+        assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), 1);
+        assert_eq!(leaves(&w, IpcLeave::ObjectBusy), 1);
+    }
+
+    #[test]    fn native_child_poll_on_inherited_pipe_parks_and_wakes_in_guest() {
         let mut w = world();
         let parent = w.table(w.a_tid);
         let (reader, writer, _) = w.pipe(parent, BLOCK);
