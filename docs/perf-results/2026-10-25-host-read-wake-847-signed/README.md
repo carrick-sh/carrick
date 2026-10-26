@@ -1,5 +1,114 @@
 # Issue #847 signed hardware evidence
 
+## Exact `89d1a591a` empty-publication fatal and source correction (2026-10-26)
+
+The fixture bundle for `89d1a591a77f8f6e9071040c13c44b305076ee68`
+verified, restored, and verified again with 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/89d1a591a77f8f6e9071040c13c44b305076ee68/8afa7e3e8814d81fde0eee1ca9f3b97693f9741880fb6a5d8e7055bb0208da72.tar.gz
+bundle identity: 8afa7e3e8814d81fde0eee1ca9f3b97693f9741880fb6a5d8e7055bb0208da72
+archive SHA-256: 62dfd65d4a548f769735c42346864114ac5e37b8912245a2c421b249ec35828c
+input identity: 2492797e6f21b47d83c36ca54d70c7d7a1953857010242670b5def177a0e218c
+```
+
+The mandatory bootstrap smoke `847-89d-smoke-01` (backend run
+`847-89d-smoke-01-b1`) reached HVF and failed 0/1 in 2.29 seconds.  Four
+completed guest arms each reported the same carrier fatal before the outer
+cost witness rejected the corrupted population:
+
+```text
+carrick: FATAL: detached address-space retirement failed (the MM-authority drop abort that follows is a CONSEQUENCE of this, not the cause): hypervisor operation failed: publish detached terminal inventory retirement: frame inventory batch is empty
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 90 filtered out; finished in 2.29s
+remaining carrick procs (run-id 847-89d-smoke-01-b1) = 0
+remaining carrick procs (run-id 847-89d-smoke-01-b1-cli) = 0
+remaining carrick procs (run-id 847-89d-smoke-01-neg) = 0
+remaining carrick procs (run-id 847-89d-smoke-01) = 0
+remaining carrick procs (run-id 847-89d-smoke-01-cli) = 0
+```
+
+The entitlement negative control passed.  There was no watchdog and therefore
+no watchdog census.  Per the stop-on-smoke-failure direction, the requested
+population stopped here:
+
+- bootstrap smoke: 0/1 (`847-89d-smoke-01`);
+- host-blocked-read acceptance population: not started (0/0 of 20);
+- `native_root_exec_replaces_pid1_shell`: not started (0/0);
+- `el1_ipc_pipe_blocking_roundtrips`: not started (0/0 of 3);
+- `el1_fork_cow_resolves_in_guest`: not started (0/0 of 3).
+
+Diagnostic run `847-89d-fatalring-03` stopped the signed executable at the
+runtime publication boundary and saved the carrier core.  This run is a
+debugger capture, not a functional pass; its LLDB wrapper terminates the guest
+after collecting evidence.  The stopped thread and ring tail were:
+
+```text
+thread #11, name = 'carrick-executor-0', stop reason = breakpoint 1.14
+HvpatchTaskQuantum::apply_detached_address_space_retirement(
+    commit=FrameInventoryCommit<()> @ 0x00000001710ebd20)
+
+# carrick event ring (lifecycle)  pid=5495  total=8258  showing=512  start=7746  oldest=66  errors=0
+8256 HVPPEXIT pid=1 tid=1 exit=0 publication=begin
+# carrick event ring (high-rate)  pid=5495  total=9534  showing=512  start=9022  oldest=1342  errors=0
+```
+
+The post-mortem is `/tmp/847-89d-fatalring-03/carrier.core`; full LLDB and
+ring output is `/tmp/847-89d-fatalring-03/test.log`.  Its exact signed artifact
+identity was:
+
+```text
+target/release/deps/el1_sched-d8a5a9a0d2511a83
+SHA-256: 611fb9babd880ddc6a6dbbc382c11195cf2a1d254fb94f8ee5a68cd3c58fa475
+CDHash: b82615e7633957c309468a6bb86f4c9411d88660
+LC_UUID: BEEBD13F-3CD9-30B8-92B4-60FE5AC7E91E
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+The smoke executable had already been re-signed by the time the post-mortem
+receipt was captured, so its pre-debugger SHA/CDHash are not recoverable.  The
+identity above is the exact diagnostic artifact built from the same source and
+fixture inputs, not a claim that re-signing preserved the original identity.
+
+The backend correction in `4a8872256` was valid: a never-registered task
+closes its owned reservation with an empty commit.  The remaining defect was
+the consumer.  The runtime unconditionally sent that commit to
+`FrameInventory::apply`, whose public contract rejects an eventless batch.
+Commit `1a502b2e9` consumes an empty detached commit after taking the exact
+terminal authority without invoking the nonempty Kernel batch API.  A
+receipt-bearing published inventory still fails closed if it somehow has no
+retirement events.  The VM-free witness commits a real empty reservation and
+proves the Kernel publication closure is not called.
+
+The 12 `carrick-aarch64` failures reported on this branch were also real branch
+regressions, not pre-existing main failures.  Nine behavioral fixtures used an
+unbound `Stage1Authority` with an exact-MM Editor license; three structural
+witnesses matched pre-refactor formatting or funnel names.  Commit
+`1f0cec40c` binds test authorities to MM 1 and updates those witnesses without
+weakening production authentication.  The full suite is now 124/124.
+
+Portable verification at `1f0cec40c`:
+
+- `cargo test -p carrick-aarch64 --lib`: 124 passed, 0 failed;
+- `empty_detached_inventory_commit_skips_kernel_publication`: 1 passed;
+- `just fmt-check`, `just clippy`, `just clippy-linux`,
+  `just lint-domains`, and `just test-kernel`: passed;
+- `just check-contract-change 2da501dcf0cc81aae517e038bb72dbfee1e1a716 HEAD`:
+  passed;
+- default EL1 image: 1,053,200 / 1,572,864 bytes; maximum checked stack
+  11,503 / 12,288 bytes (`native wait copy`);
+- allocator-test-control EL1 image: 1,057,376 / 1,572,864 bytes; maximum
+  checked stack 11,503 / 12,288 bytes (`native wait copy`).
+
+An additional serialized full `carrick-runtime --lib` diagnostic was not a
+green gate: 811 passed, 12 failed, 9 ignored.  Those separate branch-level
+fixture/structural failures do not invalidate the focused empty-consumer
+witness, but they remain explicit follow-up work rather than being described as
+pre-existing main failures.
+
+No signed post-fix run was attempted because the two source commits require a
+new exact-candidate fixture bundle.
+
 ## `2e26b934d` bootstrap root cause and source correction (2026-10-26)
 
 The guest fault recorded below was not caused by a stage-1 leaf exposing zero
