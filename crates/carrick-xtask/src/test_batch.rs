@@ -211,7 +211,7 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
             let manifest: BatchArtifact = serde_json::from_slice(&std::fs::read(root.join(path))?)?;
             // env!(CARGO_MANIFEST_DIR) and CARGO_BIN_EXE in fixture binaries refer
             // to this path. Never silently run an artifact from another checkout.
-            if manifest.root != root {
+            if manifest.root.canonicalize()? != root {
                 return Err("batch artifact checkout path differs".into());
             }
             Ok(manifest)
@@ -525,7 +525,9 @@ fn compile(
         if msg["reason"] == "compiler-artifact"
             && let Some(exe) = msg["executable"].as_str()
         {
-            files.insert(PathBuf::from(exe));
+            // Cargo may preserve a symlinked CARGO_TARGET_DIR spelling (for
+            // example macOS /var versus /private/var). Match the canonical root.
+            files.insert(Path::new(exe).canonicalize()?);
         }
         if msg["reason"] == "compiler-artifact"
             && msg["profile"]["test"] == true
@@ -542,7 +544,7 @@ fn compile(
                         .ok_or("missing artifact name")?
                         .to_owned(),
                 ),
-                PathBuf::from(exe),
+                Path::new(exe).canonicalize()?,
             );
         }
     }
