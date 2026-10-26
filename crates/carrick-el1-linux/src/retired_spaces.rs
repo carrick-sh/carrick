@@ -66,15 +66,26 @@ impl RetiredSpaces {
         mut ready: impl FnMut(&RetiredSpace) -> bool,
         mut retire: impl FnMut(&RetiredSpace) -> Result<(), NativeProcessError>,
     ) -> Result<(), NativeProcessError> {
-        let pending = core::mem::take(&mut *self.pending.lock());
+        // Take only the entries this drain admits. Entries for another
+        // carrier, zone or still-resident MM stay in the shared queue, so a
+        // concurrent drain never sees its own pending retirement as absent.
+        let admitted = {
+            let mut pending = self.pending.lock();
+            let mut admitted = Vec::new();
+            pending.retain(|space| {
+                if ready(space) {
+                    admitted.push(*space);
+                    false
+                } else {
+                    true
+                }
+            });
+            admitted
+        };
         let mut keep = Vec::new();
         let mut result = Ok(());
-        let mut entries = pending.into_iter();
+        let mut entries = admitted.into_iter();
         for space in entries.by_ref() {
-            if !ready(&space) {
-                keep.push(space);
-                continue;
-            }
             match retire(&space) {
                 Ok(()) => {}
                 Err(NativeProcessError::Busy) => {
@@ -183,6 +194,51 @@ mod tests {
             roots: 2,
             mm: ReservationMm::new(mm).unwrap(),
         }
+    }
+
+    #[test]
+    fn concurrent_drains_cannot_hide_another_carriers_retirement() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let queue = RetiredSpaces::new();
+        let a = space(10);
+        let b = space(11);
+        queue.push(a);
+        queue.push(b);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let queue_ref = &queue;
+        let retired_b = std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                queue_ref.drain(
+                    |space| space.mm == a.mm,
+                    |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(())
+                    },
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut retired = 0;
+            queue
+                .drain(
+                    |space| space.mm == b.mm,
+                    |_| {
+                        retired += 1;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            release_tx.send(()).unwrap();
+            first.join().unwrap().unwrap();
+            retired
+        });
+        assert_eq!(
+            retired_b, 1,
+            "foreign drain hid this carrier's owned retirement"
+        );
+        assert!(queue.is_empty());
     }
 
     #[test]
