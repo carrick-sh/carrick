@@ -243,7 +243,7 @@ impl Kernel {
 /// the common libc/Go worker fan-out without reserving a visible gap in the
 /// tid space for a single-threaded process: a pool is primed only after the
 /// task's first thread clone.
-pub const DEFAULT_THREAD_POOL_DEPTH: usize = 4;
+pub const DEFAULT_THREAD_POOL_DEPTH: usize = carrick_el1_abi::THREAD_POOL_STANDING_DEPTH;
 
 /// `CARRICK_THREAD_POOL=0` (exactly) turns the standing reserve off.
 fn pool_depth_from_env() -> usize {

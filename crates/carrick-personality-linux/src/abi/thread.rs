@@ -58,6 +58,9 @@ pub use carrick_core_abi::lifecycle::*;
 /// Pool entries per process: a task holds up to four identities ahead of use.
 pub const THREAD_POOL_ENTRIES: usize = 8;
 
+/// Standing identities retained by a task once it needs sibling threads.
+pub const THREAD_POOL_STANDING_DEPTH: usize = 4;
+
 /// Why a lifecycle service leaves its unchanged syscall to the host.
 #[repr(usize)]
 #[derive(
