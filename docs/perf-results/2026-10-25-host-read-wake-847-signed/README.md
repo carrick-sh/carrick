@@ -1,5 +1,129 @@
 # Issue #847 signed hardware evidence
 
+## Exact `d5c77fa1e` root-slot retention failure and runtime-suite repair (2026-10-26)
+
+The exact `d5c77fa1eca6e4f5f591613ed896fce49fb49f8e` fixture bundle
+verified, restored, and verified again with 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/d5c77fa1eca6e4f5f591613ed896fce49fb49f8e/aa366be47ac5dca349946df666a2c440be99a79c27d1a12feeb49a6d1586f7bf.tar.gz
+bundle identity: aa366be47ac5dca349946df666a2c440be99a79c27d1a12feeb49a6d1586f7
+archive SHA-256: 68daa7823878e19e79ecdc46a90f33482acda30e6c9df620e7804cf690bbcfec
+input identity: 2492797e6f21b47d83c36ca54d70c7d7a1953857010242670b5def177a0e218c
+```
+
+The mandatory bootstrap smoke `847-d5-smoke-01` (backend run
+`847-d5-smoke-01-b1`) reached HVF and failed 0/1 in 0.33 seconds. This was a
+typed hypervisor error rather than a `carrick: FATAL` abort:
+
+```text
+stage-1 extension arena IPA 0x9a00000000 is still held by the root-slot pool;
+stage2=Some(CarrierStage2RecordSnapshot { record_id: CarrierStage2RecordId(14),
+vm_generation: CarrierVmGeneration(1), ipa: 661424963584, len: 2097152,
+host_addr: 5100273664, mapped: true, backend_map_installed: false,
+release_ipa: false, perms: 3, logical_owner:
+Some(CarrierLogicalOwner { id: 14, generation: 14 }), pin_count: 0,
+retirement_requested: false, retry_eligible: false, retry_pending: None,
+terminalized_by_vm_destroy: false, superseded_by_rebind: false,
+release_in_flight: false, release_retry_pending: false })
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured;
+90 filtered out; finished in 0.33s
+```
+
+The entitlement negative control passed. Run-scoped cleanup was complete:
+
+```text
+remaining carrick procs (run-id 847-d5-smoke-01-b1) = 0
+remaining carrick procs (run-id 847-d5-smoke-01-b1-cli) = 0
+remaining carrick procs (run-id 847-d5-smoke-01-neg) = 0
+remaining carrick procs (run-id 847-d5-smoke-01) = 0
+remaining carrick procs (run-id 847-d5-smoke-01-cli) = 0
+```
+
+There was no watchdog census. Per the stop-on-smoke-failure direction, the
+requested population stopped here:
+
+- bootstrap smoke: 0/1 (`847-d5-smoke-01`);
+- host-blocked-read witness: not started (0/0 of 20);
+- `native_root_exec_replaces_pid1_shell`: not started (0/0);
+- `el1_ipc_pipe_blocking_roundtrips`: not started (0/0 of 3);
+- `el1_fork_cow_resolves_in_guest`: not started (0/0 of 3).
+
+Diagnostic run `847-d5-postmortem-02` stopped the signed executable at
+`sparse_materialization.rs:860` and saved the carrier core. Its stopped thread
+was bootstrapping `/opt/carrick/el1-sched sock-pingpong 6000` through
+`publish_raw_stage1_arenas_into -> reserve_table_arena ->
+publish_initial_table_root -> initialize_root_process`. The lifecycle ring
+showed the predecessor image had completed its exit before the next bootstrap:
+
+```text
+# carrick event ring (lifecycle) pid=48151 total=8382 showing=1024
+# start=7358 oldest=190 errors=0
+8367 HVPPEXIT pid=1 tid=1 exit=0 publication=begin
+8369 HVPPEXIT pid=1 tid=1 exit=0 publication=complete
+# carrick event ring (high-rate) pid=48151 total=9562 showing=1024
+# start=8538 oldest=1370 errors=0
+```
+
+The post-mortem is `/tmp/847-d5-postmortem-02/carrier.core`; full LLDB and
+ring output is `/tmp/847-d5-postmortem-02/test.log`. This debugger run is not
+a functional pass. Its exact signed diagnostic artifact was:
+
+```text
+target/release/deps/el1_sched-d8a5a9a0d2511a83
+SHA-256: 5411f55dc55cff3eae6d1b27f9cbe041c58aea4531ae3e72e9e8cc7724182bc4
+CDHash: c6b5256bdb2a129be0c0ac3ceef242982c5781e0
+LC_UUID: 6054AE0F-20DD-35E1-8906-2C3F266D3185
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+The uninstrumented smoke executable was re-signed before its identity was
+preserved, so the identity above belongs to the exact diagnostic artifact
+built from the same source and fixture inputs.
+
+GitHub main `a12d88a7b0dca37fdf3fd3b38a7ad2f5e96fcc7e` passed its
+`carrick-runtime --lib` population (810 passed, 0 failed, 9 ignored). The
+candidate initially had 811 passed, 12 failed, and 9 ignored, so all twelve
+were branch regressions:
+
+1. `hvpatch::stage1_mm::tests::retirement_waits_for_a_borrowed_ttbr0_window_and_then_owes_its_invalidation`
+2. `vcpu_loop::binding::tests::child_tid_write_without_an_editor_producer_skips_silently`
+3. `vcpu_loop::exec::exec_image_verification_tests::no_return_arming_precedes_destructive_work_and_mm_publication_follows_it`
+4. `vcpu_loop::executor::tests::exit_group_consumes_the_last_resident_entry_before_root_retirement`
+5. `vcpu_loop::executor::tests::saved_replacement_returns_host_wait_slot_before_terminal_retirement`
+6. `vcpu_loop::executor::tests::terminal_retirement_does_not_hold_topology_lock_across_detached_cleanup`
+7. `vcpu_loop::memory::tests::native_buffers::current_read_window_rechecks_live_carrier_authorities`
+8. `vcpu_loop::memory::tests::native_data_activation_rejects_changes_after_preparation`
+9. `vcpu_loop::signal::guest_descriptor_lane_tests::fork_commit_and_syscall_entry_order_guest_descriptor_work`
+10. `vcpu_loop::tests::serial_host_carrier_ipc_physical_owner_wait_cancellation_from_el0`
+11. `vcpu_loop::tests::serial_host_munmap_retirement_races_blocking_read_with_one_executor`
+12. `vcpu_loop::tests::serial_host_native_ipc_physical_owner_wait_cancellation_from_el0`
+
+Commit `64a16d3bb` repairs the witnesses without weakening production
+authentication. Test HVPatch roots now publish through real sched-core
+address-space custody before retirement, synthetic page-table authorities bind
+their exact Kernel MM, and structural order checks match the licensed
+production call shapes. The retained no-producer witness now asserts the
+design's exact-MM invariant SIGKILL rather than treating an impossible
+stage-2 state as an ordinary `ChildTid` write failure.
+
+Portable verification:
+
+- `carrick-runtime --lib`: 823 passed, 0 failed, 9 ignored;
+- serialized `carrick-vmm-hvf --lib`: 803 passed, 0 failed, 3 ignored;
+- `just fmt-check`, `just clippy`, `just clippy-linux`, and
+  `just lint-domains`: passed;
+- `just test-kernel`: passed (kernel 2,639 passed, 0 failed, one ignored;
+  every kernel-semantics target completed without failure);
+- default EL1 image: 1,053,200 / 1,572,864 bytes; maximum checked stack
+  11,503 / 12,288 bytes (`native wait copy`);
+- all-target clippy EL1 image: 1,082,032 / 1,572,864 bytes; maximum checked
+  stack 12,015 / 12,288 bytes (`signal terminal exit`).
+
+No post-fix signed test was attempted because the source correction requires
+a new exact-candidate fixture bundle.
+
 ## Exact `89d1a591a` empty-publication fatal and source correction (2026-10-26)
 
 The fixture bundle for `89d1a591a77f8f6e9071040c13c44b305076ee68`
