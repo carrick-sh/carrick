@@ -4197,14 +4197,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(error) => self.fail(error),
             });
         }
-        let pending = self.runtime.graph.lock().pending.remove(&self.key);
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        unsafe {
-            (&*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters)).refused
-                [if pending.is_some() { 505 } else { 504 }]
-            .fetch_add(1, Ordering::Relaxed);
-        }
-        let pending = pending?;
+        let pending = self.runtime.graph.lock().pending.remove(&self.key)?;
         match pending {
             PendingContinuation::Wait(pending) => {
                 if pending.caller != self.key
@@ -4815,22 +4808,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn resume_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        {
-            let graph = self.runtime.graph.lock();
-            let counters = unsafe {
-                &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters)
-            };
-            if self.key == graph.root_key {
-                counters.refused[494].fetch_add(1, Ordering::Relaxed);
-            }
-            if graph.pending.contains_key(&self.key) {
-                counters.refused[495].fetch_add(1, Ordering::Relaxed);
-            }
-            if graph.pending.contains_key(&graph.root_key) {
-                counters.refused[496].fetch_add(1, Ordering::Relaxed);
-            }
-        }
         if let Some(result) = self.resume_exec_closing() {
             return result.map_err(NativeProcessError::run_failure_reason);
         }
@@ -5591,22 +5568,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .task(self.key)
             .ok()
             .map(|t| t.metadata().namespace_pid);
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        {
-            let graph = self.runtime.graph.lock();
-            let counters = unsafe {
-                &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters)
-            };
-            if self.key == graph.root_key {
-                counters.refused[500].fetch_add(1, Ordering::Relaxed);
-            }
-            if graph.pending.contains_key(&self.key) {
-                counters.refused[501].fetch_add(1, Ordering::Relaxed);
-            }
-            if graph.pending.contains_key(&graph.root_key) {
-                counters.refused[502].fetch_add(1, Ordering::Relaxed);
-            }
-        }
         let _ = self.runtime.graph.lock().pending.remove(&self.key);
         if let Some(pid) = pid {
             let ipc = self.runtime.graph.lock().ipc.clone();
