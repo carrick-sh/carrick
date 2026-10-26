@@ -1964,12 +1964,19 @@ impl CarrierVmCustody {
             let mut pending = self.pending_carrier_stage2_retirements.lock();
             match pending.get_mut(&identity.record_id) {
                 Some(entry) if entry.identity == identity && !entry.in_flight => {
-                    debug_assert!(
-                        entry.proof.is_none(),
-                        "a consume-once retirement proof cannot replace a pending proof"
-                    );
                     if entry.proof.is_none() {
                         entry.proof = Some(proof);
+                    } else {
+                        debug_assert!(
+                            matches!(
+                                (entry.proof.as_ref(), &proof),
+                                (
+                                    Some(Stage2RetirementProof::Metadata(current)),
+                                    Stage2RetirementProof::Metadata(retry),
+                                ) if current == retry
+                            ),
+                            "a consume-once retirement proof cannot replace a pending proof"
+                        );
                     }
                 }
                 _ => {
