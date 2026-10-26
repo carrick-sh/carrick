@@ -1671,6 +1671,9 @@ pub(crate) fn leave_driven_zone_slot() {
 }
 
 /// One carrier-fault boundary for a refused zone-slot custody transition.
+/// It covers two sites under one budgeted fatal: the `publish_zone_slot`
+/// reset and the refused leave in `leave_driven_zone_slot` (owner sign-off
+/// 2026-10-26 on #231). Removing the refused-leave fatal by shape is #885.
 fn fail_zone_slot(message: std::fmt::Arguments<'_>) -> ! {
     carrick_fatal!("vcpu_loop::el1_zone", "{message}");
 }
