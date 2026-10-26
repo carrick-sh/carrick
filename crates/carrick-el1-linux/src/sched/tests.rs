@@ -862,6 +862,44 @@ fn late_host_work_settles_native_owner_before_host_affinity_exit() {
     assert_eq!(cpu.host_work_boundaries, [record]);
 }
 
+/// `Idle` from the IRQ decision means the running thread was already parked
+/// (affinity park, preemption park, failed preempt) and the slot holds no
+/// current record. Host work pending at the return boundary rides the
+/// service exit; rewriting `Idle` to `Forward` would leave at EL0 with no
+/// host task loaded and retire the executor.
+#[test]
+fn a_committed_idle_survives_pending_host_work() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    host_publish(&zone, SLOT, 0, None, 0);
+    zone.enter_guest(SLOT);
+    assert_eq!(zone.slot(SLOT).current(), None);
+    let task = CurrentTask::new();
+    task.linux.mark_pending_host_work();
+    let mut frame = TrapFrame {
+        slot: u64::from(SLOT.raw()),
+        ..TrapFrame::default()
+    };
+    let mut cpu = FakeCpu::default();
+
+    assert_eq!(
+        Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: counters(),
+        }
+        .finish_interrupt_for_test(&mut frame, carrick_el1_abi::Action::Idle),
+        carrick_el1_abi::Action::Idle,
+        "a parked vCPU's Idle was rewritten into a threadless Forward"
+    );
+    assert!(cpu.host_work_boundaries.is_empty());
+    assert!(task.linux.has_pending_host_work());
+}
+
 #[test]
 fn a_wait_on_a_changed_word_returns_eagain_without_parking() {
     let zone = zone();
