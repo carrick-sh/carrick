@@ -32,12 +32,11 @@ static NEXT_RUNNER_JOB_ID: AtomicU64 = AtomicU64::new(1);
 /// could make its IPA reusable without a matching retirement receipt.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn quarantine_refused_retirement_backend(backend: Box<dyn std::any::Any + Send>) {
-    static QUARANTINE: std::sync::OnceLock<Mutex<Vec<Box<dyn std::any::Any + Send>>>> =
-        std::sync::OnceLock::new();
-    QUARANTINE
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .push(backend);
+    // One Carrick run owns one VM carrier. A refused terminal transaction has
+    // no safe reclaim point inside that carrier: retaining this exact backend
+    // until process exit is the quarantine, and deliberately has no lookup or
+    // reuse path which could accidentally recycle its physical identities.
+    std::mem::forget(backend);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
