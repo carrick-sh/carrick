@@ -19,6 +19,84 @@ hash installed, the production-path VM-free witness
 1/1 (806 filtered). This post-rebase VM-free result does not alter the failed
 pre-rebase signed artifact verdict above.
 
+## Record 14 traced to unregistered bootstrap retirement (2026-10-26)
+
+Bounded diagnostic run `847-record14-trace-01` re-signed the exact
+`6a20be84e` `el1_sched-775614d8f5f84d25` executable bytes with the
+repository's diagnostic entitlement (`get-task-allow`) and launched that
+carrier directly under the pid provider. The durable script is
+[`hvpatch-root-slot-retirement.d`](../../../scripts/dtrace/hvpatch-root-slot-retirement.d);
+it records `ustack(8)` and stops after 60 seconds. Probe-qualification run
+`847-record14-probecheck-05` fired allocation and publication probes before
+the failing smoke was traced; earlier zero-event attempts were rejected.
+
+The trace contains 13 stage-2 record admissions followed by this exact
+sequence, making the immediately following registration record 14:
+
+```text
+ROOTSLOT ... PreMappedRootSlotPool::allocate_slot_at ... a1=9a00000000
+  MmAccessState::publish_raw_stage1_arenas_into
+  MmArenaPublisher::publish_raw_table_arena
+  Stage1Authority::publish_initial_table_root
+  Aarch64EngineCore::publish_initial_stage1_root
+  carrick_runtime::hvpatch::initialize_root_process::{closure}
+  CarrierRuntime::boot_kernel_root_prepared
+PUBLISH ... publish_pooled_exec_root_owner_in
+  MmAccessState::publish_raw_stage1_arenas_into
+  Stage1Authority::publish_initial_table_root
+  carrick_runtime::hvpatch::initialize_root_process::{closure}
+REGISTER ... CarrierVmCustody::register_stage2_record_locked
+  CarrierVmCustody::register_unpublished_stage2_record
+  transfer_unpublished_global_frame_stage2_lease_to_custody
+  StructuralBackingOwner::new_pooled_root_in
+  publish_pooled_exec_root_owner_in
+```
+
+Thus record 14 is root MM 1's initial bootstrap root slot, not an exec root or
+fork-child root. At its clean exit the only retirement entry was:
+
+```text
+TABLE ... HvfVmState::retire_task_state_process_mappings
+  HvfVmState::retire_task_state_process_mappings_inner
+  retire_detached_task_engine
+  PersistentTaskBinding::retire_detached_address_space
+  run_executor_loop
+```
+
+There were zero entries to `Stage1Authority::retire_table_capacity`, neutral
+record request/prepare/terminalization, or pooled-root release. The exact
+bypass was `retire_task_state_process_mappings_inner` returning `Ok(None)`
+when `task.registration` was absent. That assumption was false: bootstrap had
+already published record 14 independently through the table-arena publisher.
+The missing owned path was `retire_task_table_capacity` →
+`Stage1Authority::retire_table_capacity` →
+`retire_owned_table_arena_stage2_in` →
+`request_record_retirement(record 14)`.
+
+Commit `113c599ce` consumes the authority-owned table-arena obligation in the
+same whole-MM exit transition even without task inventory registration. A
+never-published MM still has an empty obligation and retires trivially. New
+production-path witness
+`bootstrap_root_without_inventory_registration_retires_before_reuse` calls
+the real `publish_initial_table_root` publisher while registration remains
+absent, pins its exact stage-2 record across clean exit, observes
+`retirement_requested`, completes retirement, and reuses the same pool slot in
+the successor bootstrap. It was red because the record remained unrequested,
+then green on the fix.
+
+VM-free and static evidence at `113c599ce`:
+
+- focused witness: 1/1 (807 filtered);
+- `RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib`: 805 passed,
+  3 ignored;
+- `just fmt-check`, `just clippy`, `just clippy-linux`,
+  `just lint-domains`, and `just test-kernel`: pass;
+- DTrace script compile check: pass.
+
+No signed claim is made for `113c599ce`; it needs an exact rebuilt fixture
+bundle. Full trace and signed output remain at
+`/tmp/847-record14-trace-01.{trace,test.log}`.
+
 ## Exact `6a20be84e` smoke still skips the primary retirement request (2026-10-26)
 
 The exact bundle for evidence head
