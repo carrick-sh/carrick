@@ -3306,9 +3306,10 @@ impl HvfVmState {
 
     pub(crate) fn commit_process_materialization(&mut self) -> Result<(), TrapError> {
         if self.frame_inventory.lock().process_commit.is_none() {
-            return Err(TrapError::Hypervisor(
-                "HVPatch process materialization has no inventory commit".to_owned(),
-            ));
+            return Err(TrapError::PublicationRefused {
+                operation: "HVPatch process materialization",
+                missing: "inventory commit",
+            });
         }
         // Register only after the fresh vCPU register restore succeeds. Until
         // this point the aliases remain an owned, unpublished vector.
@@ -3374,6 +3375,15 @@ impl HvfVmState {
         &mut self,
     ) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         self.frame_inventory.lock().retirement_commit.take()
+    }
+
+    /// Finish the terminal inventory transaction. A task which never crossed
+    /// carrier registration owns no mappings to retire, but still owes the
+    /// Kernel the empty commit for the reservation it was handed.
+    pub(crate) fn finish_retirement_inventory(
+        &mut self,
+    ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+        Self::finish_task_state_retirement_inventory(&mut self.task)
     }
 
     pub(crate) fn bind_stage1_page_tables(
@@ -3493,10 +3503,9 @@ impl HvfVmState {
             Some(expected_root_slot),
             stage1_unpublished,
         )?
-        .ok_or_else(|| {
-            TrapError::Hypervisor(
-                "HVPatch process retirement produced no stage-1 root proof".to_owned(),
-            )
+        .ok_or(TrapError::RetirementRefused {
+            operation: "HVPatch process root",
+            missing: "stage-1 root proof",
         })
     }
 
@@ -3518,11 +3527,13 @@ impl HvfVmState {
         if remainders.is_empty() {
             return Ok(0);
         }
-        let authority = task.cow_authority.clone().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "HVPatch declined-remainder settlement has no frame inventory authority".to_owned(),
-            )
-        })?;
+        let authority = task
+            .cow_authority
+            .clone()
+            .ok_or(TrapError::RetirementRefused {
+                operation: "HVPatch declined-remainder settlement",
+                missing: "frame inventory authority",
+            })?;
         #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&task.custody);
         #[cfg(not(test))]
@@ -3655,10 +3666,10 @@ impl HvfVmState {
             // cleanup after a typed registration refusal must not manufacture
             // a retirement obligation and then turn its absence into a fatal.
             if expected_root_slot.is_some() {
-                return Err(TrapError::Hypervisor(
-                    "unregistered address space cannot produce a registered root retirement proof"
-                        .to_owned(),
-                ));
+                return Err(TrapError::RetirementRefused {
+                    operation: "unregistered address-space root",
+                    missing: "carrier registration",
+                });
             }
             return Ok(None);
         };
@@ -3669,11 +3680,14 @@ impl HvfVmState {
         {
             custody.fork_stock.lock().owner.retire_exited_root(mm);
         }
-        let authority = task.cow_authority.as_ref().cloned().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "HVPatch process retirement has no frame inventory authority".to_owned(),
-            )
-        })?;
+        let authority =
+            task.cow_authority
+                .as_ref()
+                .cloned()
+                .ok_or(TrapError::RetirementRefused {
+                    operation: "HVPatch process",
+                    missing: "frame inventory authority",
+                })?;
         // The runtime holds the process-wide HVPatch topology lock across this
         // method. Stage the backend inventory retirement BEFORE recycling any
         // physical extent. The old order sampled `stage2_references`, dropped
@@ -3696,15 +3710,16 @@ impl HvfVmState {
                     )
                     .map(|root| root.map(|root| root.proof));
                 }
-                return Err(TrapError::Hypervisor(
-                    "HVPatch process retirement has mappings without frame inventory authority"
-                        .to_owned(),
-                ));
+                return Err(TrapError::RetirementRefused {
+                    operation: "HVPatch process mappings",
+                    missing: "frame inventory authority",
+                });
             }
             if inventory.retirement_reservation.is_none() {
-                return Err(TrapError::Hypervisor(
-                    "HVPatch retirement began without frame inventory reservation".to_owned(),
-                ));
+                return Err(TrapError::RetirementRefused {
+                    operation: "HVPatch process inventory",
+                    missing: "retirement reservation",
+                });
             }
 
             // Validate every physical candidate extent in inventory before
@@ -3874,10 +3889,9 @@ impl HvfVmState {
                 &mut reservation,
                 authority.as_ref(),
                 task.cow_identity
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "HVPatch process retirement has no MM identity".to_owned(),
-                        )
+                    .ok_or(TrapError::RetirementRefused {
+                        operation: "HVPatch process inventory",
+                        missing: "MM identity",
                     })?
                     .mm,
             )?;
@@ -4189,10 +4203,28 @@ impl HvfVmState {
         Ok(retired.proof)
     }
 
+    #[cfg(test)]
     pub(crate) fn take_task_state_retirement_inventory(
         task: &mut HvfTaskState,
     ) -> Option<carrick_hal::FrameInventoryCommit<()>> {
         task.frame_inventory.lock().retirement_commit.take()
+    }
+
+    pub(crate) fn finish_task_state_retirement_inventory(
+        task: &mut HvfTaskState,
+    ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
+        let mut inventory = task.frame_inventory.lock();
+        if let Some(commit) = inventory.retirement_commit.take() {
+            return Ok(commit);
+        }
+        inventory
+            .retirement_reservation
+            .take()
+            .map(|reservation| reservation.commit(()))
+            .ok_or(TrapError::RetirementRefused {
+                operation: "detached task inventory",
+                missing: "commit and reservation",
+            })
     }
 
     pub(crate) fn retire_task_state_exec_predecessor(

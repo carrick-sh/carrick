@@ -69,10 +69,14 @@ fn whole_mm_retirement_of_never_registered_detached_space_is_empty() {
     let mut task = hvpatch_task_state_test_fixture(73, 0x7300_0000, 73);
     assert!(task.registration.is_none());
     let proof = test_whole_mm_stage1_proof_for(73);
+    task.frame_inventory.lock().retirement_reservation = Some(empty_inventory_reservation(73));
 
     HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(&mut task, proof)
         .expect("an MM that never registered carrier references retires trivially");
 
+    let empty = HvfVmState::finish_task_state_retirement_inventory(&mut task)
+        .expect("a never-published task commits its empty transaction");
+    assert!(empty.batch().events().is_empty());
     assert!(task.registration.is_none());
 }
 

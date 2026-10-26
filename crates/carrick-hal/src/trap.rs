@@ -417,6 +417,22 @@ pub enum TrapError {
         authority_mm: Option<u64>,
         license_mm: u64,
     },
+    /// A publication transaction was asked to cross without the authority
+    /// which owns that crossing. Callers may roll back or quarantine it; this
+    /// is not a host-hypervisor failure.
+    #[error("{operation} publication refused: missing {missing}")]
+    PublicationRefused {
+        operation: &'static str,
+        missing: &'static str,
+    },
+    /// A terminal transaction was asked to consume authority it never owned.
+    /// The typed refusal keeps lifecycle policy at the neutral/runtime owner
+    /// instead of disguising it as a carrier-HV failure.
+    #[error("{operation} retirement refused: missing {missing}")]
+    RetirementRefused {
+        operation: &'static str,
+        missing: &'static str,
+    },
     /// An authenticated native owner retired its root; never resume the guest.
     #[error("native root exited: {status:?}")]
     NativeRootExit {

@@ -55,11 +55,14 @@ impl PendingExecStage2Cleanup {
                 "shared exec projection cannot consume MM unpublication proof".to_owned(),
             ));
         }
-        let carrier_mm = self.carrier_mm.as_ref().cloned().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "exec predecessor stage-1 proof has no retained carrier MM".to_owned(),
-            )
-        })?;
+        let carrier_mm = self
+            .carrier_mm
+            .as_ref()
+            .cloned()
+            .ok_or(TrapError::RetirementRefused {
+                operation: "exec predecessor stage-1 proof",
+                missing: "retained carrier MM",
+            })?;
         let retired = self
             .retire_with_cleanup_boundary(
                 &mut |event| crate::probes::hvpatch_exec_predecessor_classification(event),
@@ -84,11 +87,14 @@ impl PendingExecStage2Cleanup {
                 "shared exec projection cannot consume MM unpublication proof".to_owned(),
             ));
         }
-        let carrier_mm = self.carrier_mm.as_ref().cloned().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "exec predecessor stage-1 proof has no retained carrier MM".to_owned(),
-            )
-        })?;
+        let carrier_mm = self
+            .carrier_mm
+            .as_ref()
+            .cloned()
+            .ok_or(TrapError::RetirementRefused {
+                operation: "exec predecessor stage-1 proof",
+                missing: "retained carrier MM",
+            })?;
         if self.mm_root_slot != Some(expected_root_slot) {
             return Err(TrapError::Hypervisor(
                 "exec predecessor root retirement coordinates mismatch".to_owned(),
@@ -100,10 +106,9 @@ impl PendingExecStage2Cleanup {
                 &mut |_| {},
                 Some(&stage1_unpublished),
             )?
-            .ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "exec predecessor retirement produced no stage-1 root proof".to_owned(),
-                )
+            .ok_or(TrapError::RetirementRefused {
+                operation: "exec predecessor root",
+                missing: "stage-1 root proof",
             });
         if retired.is_ok() {
             carrier_mm.publish_stage1_unpublished(stage1_unpublished)?;
@@ -143,10 +148,9 @@ impl PendingExecStage2Cleanup {
             &mut |_| {},
             None,
         )?
-        .ok_or_else(|| {
-            TrapError::Hypervisor(
-                "exec predecessor retirement produced no stage-1 root proof".to_owned(),
-            )
+        .ok_or(TrapError::RetirementRefused {
+            operation: "exec predecessor root",
+            missing: "stage-1 root proof",
         })
     }
 
@@ -2090,11 +2094,14 @@ impl HvfVmState {
             // edge sets before touching stage-2. The switch helper restores the
             // exact predecessor on every ordinary failure, so backend inventory,
             // owners and mapping rows remain unchanged until this succeeds.
-            let authority = self.cow_authority.as_ref().cloned().ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "HVPatch exec retirement has no frame inventory authority".to_owned(),
-                )
-            })?;
+            let authority =
+                self.cow_authority
+                    .as_ref()
+                    .cloned()
+                    .ok_or(TrapError::RetirementRefused {
+                        operation: "HVPatch exec",
+                        missing: "frame inventory authority",
+                    })?;
             let extents =
                 final_exec_physical_extents(&self.frame_inventory.lock(), authority.as_ref())?;
             let authority_before = self.exec_authority_fingerprint();
@@ -2124,11 +2131,14 @@ impl HvfVmState {
             published_exec_plan = Some(published.plan);
             published_exec_regions = published.regions;
             if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
-                let authority = self.cow_authority.as_ref().cloned().ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "HVPatch exec retirement has no frame inventory authority".to_owned(),
-                    )
-                })?;
+                let authority =
+                    self.cow_authority
+                        .as_ref()
+                        .cloned()
+                        .ok_or(TrapError::RetirementRefused {
+                            operation: "HVPatch exec inventory",
+                            missing: "frame inventory authority",
+                        })?;
                 let mut inventory = self.frame_inventory.lock();
                 let diagnostic_extents = if cow_refusal_diagnostics_enabled() {
                     inventory
@@ -2144,10 +2154,9 @@ impl HvfVmState {
                     retired,
                     authority.as_ref(),
                     self.cow_identity
-                        .ok_or_else(|| {
-                            TrapError::Hypervisor(
-                                "HVPatch exec retirement has no predecessor MM identity".to_owned(),
-                            )
+                        .ok_or(TrapError::RetirementRefused {
+                            operation: "HVPatch exec inventory",
+                            missing: "predecessor MM identity",
                         })?
                         .mm,
                 )

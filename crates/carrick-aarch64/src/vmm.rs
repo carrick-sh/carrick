@@ -830,9 +830,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
         drop(reservation);
-        Err(TrapError::Hypervisor(
-            "aarch64 backend has no initial frame inventory".to_owned(),
-        ))
+        Err(TrapError::PublicationRefused {
+            operation: "aarch64 initial mappings",
+            missing: "frame inventory backend",
+        })
     }
 
     fn begin_alias_inventory(
@@ -840,9 +841,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         drop(reservation);
-        Err(TrapError::Hypervisor(
-            "aarch64 backend has no alias frame inventory".to_owned(),
-        ))
+        Err(TrapError::PublicationRefused {
+            operation: "aarch64 alias",
+            missing: "frame inventory backend",
+        })
     }
 
     fn take_alias_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {
@@ -865,9 +867,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         replacement: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         drop((retired, replacement));
-        Err(TrapError::Hypervisor(
-            "aarch64 backend has no exec frame inventory".to_owned(),
-        ))
+        Err(TrapError::PublicationRefused {
+            operation: "aarch64 exec",
+            missing: "frame inventory backend",
+        })
     }
 
     fn take_exec_inventory(&mut self) -> Option<carrick_hal::ExecInventoryCommits> {
@@ -894,9 +897,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         drop(reservation);
-        Err(TrapError::Hypervisor(
-            "aarch64 backend has no process frame inventory".to_owned(),
-        ))
+        Err(TrapError::PublicationRefused {
+            operation: "aarch64 process",
+            missing: "frame inventory backend",
+        })
     }
 
     /// Cancel a child-inventory reservation that never reached the backend
@@ -915,9 +919,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         reservation: carrick_hal::FrameInventoryReservation,
     ) -> Result<(), TrapError> {
         drop(reservation);
-        Err(TrapError::Hypervisor(
-            "aarch64 backend has no retirement frame inventory".to_owned(),
-        ))
+        Err(TrapError::RetirementRefused {
+            operation: "aarch64 backend",
+            missing: "frame inventory backend",
+        })
     }
 
     fn take_retirement_inventory(&mut self) -> Option<carrick_hal::FrameInventoryCommit<()>> {

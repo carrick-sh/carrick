@@ -1190,9 +1190,13 @@ pub fn destroy_persistent_vm_at_carrier_exit() -> Result<(), TrapError> {
         drop(carrier);
         return Ok(());
     }
-    let entry = persistent_carrier_cell().lock().take().ok_or_else(|| {
-        TrapError::Hypervisor("carrier-exit live VM has no published carrier custody".to_owned())
-    })?;
+    let entry = persistent_carrier_cell()
+        .lock()
+        .take()
+        .ok_or(TrapError::RetirementRefused {
+            operation: "carrier exit",
+            missing: "published carrier custody",
+        })?;
     let PersistentCarrierCellEntry::Published(carrier) = entry else {
         *persistent_carrier_cell().lock() = Some(entry);
         return Err(TrapError::Hypervisor(
@@ -3792,9 +3796,10 @@ impl HvpatchCarrierMmAuthority {
         };
         let mut lifecycle = stage1_lifecycle.lock();
         if !matches!(*lifecycle, CarrierMmStage1Lifecycle::Unpublished(_)) {
-            return Err(TrapError::Hypervisor(
-                "carrier MM stage-1 publication has no unpublished inventory receipt".to_owned(),
-            ));
+            return Err(TrapError::PublicationRefused {
+                operation: "carrier MM stage-1",
+                missing: "unpublished inventory receipt",
+            });
         }
         *lifecycle = CarrierMmStage1Lifecycle::Published;
         Ok(())
@@ -4837,10 +4842,9 @@ impl HvpatchTaskMmAuthority {
     /// thread's registration drops it still `Active`. After the hand-off the
     /// owner's phase is `Retired`, so every remaining holder drops it inertly.
     fn hand_off_inventory_to_sharer(&self, sharer: &Self) -> Result<(), TrapError> {
-        let mm = (*self.kernel_mm.lock()).ok_or_else(|| {
-            TrapError::Hypervisor(
-                "HVPatch exec predecessor hand-off has no exact Kernel binding".to_owned(),
-            )
+        let mm = (*self.kernel_mm.lock()).ok_or(TrapError::PublicationRefused {
+            operation: "HVPatch exec predecessor hand-off",
+            missing: "exact Kernel binding",
         })?;
         sharer.bind_kernel_mm(mm)?;
         let mut inventory = self.inventory.lock();
@@ -4988,11 +4992,13 @@ fn abort_prepared_task_and_carrier(
     let state_result = state.abort();
     let mut owner_rollback_error = None;
     if let Some(custody) = custody.as_ref() {
-        let rollback_receipt = task.unpublished_stage1.as_ref().ok_or_else(|| {
-            TrapError::Hypervisor(
-                "prepared task rollback has no unpublished inventory receipt".to_owned(),
-            )
-        })?;
+        let rollback_receipt =
+            task.unpublished_stage1
+                .as_ref()
+                .ok_or(TrapError::PublicationRefused {
+                    operation: "prepared task rollback",
+                    missing: "unpublished inventory receipt",
+                })?;
         for &identity in &task.unpublished_structural_identities {
             let never_published = rollback_receipt.consume(identity).ok_or_else(|| {
                 TrapError::Hypervisor(
@@ -6135,15 +6141,12 @@ impl HvpatchCarrierTaskStateDirectory {
                 "cross-directory HVPatch carrier token rejected".to_owned(),
             ));
         }
-        let frames = task_mm
-            .inventory
-            .lock()
-            .shared_frame_registry()
-            .ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "exec replacement has no shared HVPatch frame registry".to_owned(),
-                )
-            })?;
+        let frames = task_mm.inventory.lock().shared_frame_registry().ok_or(
+            TrapError::PublicationRefused {
+                operation: "exec replacement",
+                missing: "shared HVPatch frame registry",
+            },
+        )?;
         let mut inner = self.inner.lock();
         if inner
             .task_mms
@@ -6256,10 +6259,9 @@ impl HvpatchTaskRegistration {
             .get(&self.key)
             .and_then(|row| row._mm.as_ref())
             .cloned()
-            .ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "stage-1 unpublication has no exact carrier MM authority".to_owned(),
-                )
+            .ok_or(TrapError::RetirementRefused {
+                operation: "stage-1 unpublication",
+                missing: "exact carrier MM authority",
             })?;
         carrier_mm.publish_stage1_unpublished(proof)
     }
@@ -6887,9 +6889,10 @@ impl HvpatchCarrierTaskStateDirectory {
                 Some(frames) => Some(frames),
                 None => {
                     abort_prepared_task_and_carrier(task, state)?;
-                    return Err(TrapError::Hypervisor(
-                        "prepared HVPatch task has no shared frame registry".to_owned(),
-                    ));
+                    return Err(TrapError::PublicationRefused {
+                        operation: "prepared HVPatch task",
+                        missing: "shared frame registry",
+                    });
                 }
             },
         };
@@ -6992,9 +6995,14 @@ impl HvpatchCarrierTaskStateDirectory {
                 "prepared HVPatch child retained parent COW authority".to_owned(),
             ));
         }
-        let carrier_custody = task.custody.as_ref().cloned().ok_or_else(|| {
-            TrapError::Hypervisor("prepared HVPatch task has no carrier custody".to_owned())
-        })?;
+        let carrier_custody =
+            task.custody
+                .as_ref()
+                .cloned()
+                .ok_or(TrapError::PublicationRefused {
+                    operation: "prepared HVPatch task",
+                    missing: "carrier custody",
+                })?;
         let (carrier_mm, test_rollbacks): (
             Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
             Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -7109,12 +7117,12 @@ impl HvpatchCarrierTaskStateDirectory {
                         ),
                         stage1_lifecycle: parking_lot::Mutex::new(
                             CarrierMmStage1Lifecycle::Unpublished(
-                                task.unpublished_stage1.take().ok_or_else(|| {
-                                    TrapError::Hypervisor(
-                                        "prepared process has no unpublished inventory receipt"
-                                            .to_owned(),
-                                    )
-                                })?,
+                                task.unpublished_stage1.take().ok_or(
+                                    TrapError::PublicationRefused {
+                                        operation: "prepared process",
+                                        missing: "unpublished inventory receipt",
+                                    },
+                                )?,
                             ),
                         ),
                     })),
@@ -7776,11 +7784,14 @@ impl HvfVmState {
                 stage2_leases.push(lease);
             }
             if mapping.physical_ipa == plan.mm_root_slot.0 {
-                let owner = structural_owner.as_ref().cloned().ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "task-only stage-1 root mapping has no structural owner".to_owned(),
-                    )
-                })?;
+                let owner =
+                    structural_owner
+                        .as_ref()
+                        .cloned()
+                        .ok_or(TrapError::PublicationRefused {
+                            operation: "task-only stage-1 root mapping",
+                            missing: "structural owner",
+                        })?;
                 let candidate = MmRootStage2Authority::new(plan.mm_root_slot, owner)?;
                 if mm_root_stage2.replace(candidate).is_some() {
                     return Err(TrapError::Hypervisor(
@@ -7814,10 +7825,9 @@ impl HvfVmState {
             .lock()
             .process_reservation
             .take()
-            .ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "task-only child has no frame inventory reservation".to_owned(),
-                )
+            .ok_or(TrapError::PublicationRefused {
+                operation: "task-only child",
+                missing: "frame inventory reservation",
             })?;
         let process_transaction = process_reservation.transaction();
         let mut staged_inventory_mappings = Vec::with_capacity(inventory_mappings.len());
