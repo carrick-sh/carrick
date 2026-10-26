@@ -355,12 +355,7 @@ fn add(actual: &mut BTreeMap<Key, u64>, family: Family, operation: &str, owner: 
         })
         .or_default() += 1;
 }
-fn discover(
-    root: &Path,
-    checker: &str,
-    tools: &Path,
-    source: &SourceCensus,
-) -> Result<Value, DebtError> {
+fn discover(root: &Path, checker: &str, tools: &Path, proof: &Path) -> Result<Value, DebtError> {
     // External test modules carry their proof in a parsed parent declaration.
     // Share the strict census result, after genuine production reachability has
     // taken precedence; lexical scanners must not infer this from file names.
@@ -386,8 +381,6 @@ else:
     findings = m.discover(root, verdict=m_verdict)
 print(json.dumps([dataclasses.asdict(f) for f in findings]))
 "#;
-    let proof = tempfile::NamedTempFile::new()?;
-    serde_json::to_writer(proof.as_file(), &source.verdict(root)?)?;
     let output = command::run_checked(
         "python3",
         [
@@ -397,7 +390,7 @@ print(json.dumps([dataclasses.asdict(f) for f in findings]))
                 .join(format!("scripts/migrate/{checker}.py"))
                 .as_os_str(),
             root.as_os_str(),
-            proof.path().as_os_str(),
+            proof.as_os_str(),
         ],
         Some(root),
     )?;
@@ -435,13 +428,30 @@ fn source_counts(
     source: &SourceCensus,
 ) -> Result<BTreeMap<Key, u64>, DebtError> {
     source.verify_task_rules()?;
+    let proof = tempfile::NamedTempFile::new()?;
+    serde_json::to_writer(proof.as_file(), &source.verdict(root)?)?;
+    // The scanners independently validate one source-bound proof. Join every
+    // worker, then consume results in the original order, including errors.
+    let [locks, globals, aborts] = std::thread::scope(|scope| {
+        [
+            "check-dispatch-lock-authority",
+            "check-runtime-global-state",
+            "check-runtime-aborts",
+        ]
+        .map(|checker| {
+            let proof = proof.path();
+            std::thread::Builder::new()
+                .name(checker.into())
+                .spawn_scoped(scope, move || discover(root, checker, tools, proof))
+        })
+        .map(|worker| {
+            worker?
+                .join()
+                .map_err(|_| DebtError::Policy("authority discovery worker panicked".into()))?
+        })
+    });
     let mut actual = BTreeMap::new();
-    for row in rows(&discover(
-        root,
-        "check-dispatch-lock-authority",
-        tools,
-        source,
-    )?)? {
+    for row in rows(&locks?)? {
         let file = text(row, "file")?;
         if source.is_outside_production_at(
             file,
@@ -485,12 +495,7 @@ fn source_counts(
         )?;
         add(&mut actual, family, &site.operation, &site.owner, site.lane);
     }
-    for row in rows(&discover(
-        root,
-        "check-runtime-global-state",
-        tools,
-        source,
-    )?)? {
+    for row in rows(&globals?)? {
         let file = text(row, "file")?;
         if source.is_outside_production_at(
             file,
@@ -514,7 +519,7 @@ fn source_counts(
         )?;
         add(&mut actual, family, &operation, &owner, lane);
     }
-    for row in rows(&discover(root, "check-runtime-aborts", tools, source)?)? {
+    for row in rows(&aborts?)? {
         let owner = finding_owner(source, row)?;
         let operation = format!("fatal:{}", text(row, "domain")?);
         let lane = source.lane(&owner)?;
