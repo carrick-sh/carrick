@@ -816,7 +816,7 @@ pub(super) mod tests {
         assert_eq!(
             custody.request_released_stage2_record_retirement(
                 owner.record_identity,
-                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
                     &custody,
                     owner.record_identity
                 ),
@@ -966,7 +966,7 @@ pub(super) mod tests {
         let owner = backing(&custody, ipa);
         let physical = UserTransferCustody::new(Arc::clone(&custody));
         custody.enqueue_carrier_stage2_retirement(owner.record_identity);
-        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
             &custody,
             owner.record_identity,
         );
@@ -1077,10 +1077,10 @@ pub(super) mod tests {
                     .unwrap();
                 let receipt = receipt.expect("retirement edit removed the exact leaf");
                 let mut frames = crate::trap::frame_inventory::InventoryFrameRegistry::default();
-                frames.stage2_references.insert((ipa, 4096), 1);
+                frames.stage2_references.insert((ipa, 16384), 1);
                 let stage1 = frames
                     .release_stage2_reference(
-                        (ipa, 4096),
+                        (ipa, 16384),
                         Some(owner.record_identity),
                         Stage1UnpublicationReceipt::EditorRange(&receipt),
                     )
@@ -1386,7 +1386,7 @@ pub(super) mod tests {
         // Retirement reaches the existing custodian before any backend unmap.
         let mut unmaps = 0;
         assert_eq!(
-            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            crate::trap::frame_inventory::retire_stage2_record_after_test_mm_close_using(
                 &custody,
                 owner.record_identity,
                 |_, _| {
@@ -1422,7 +1422,7 @@ pub(super) mod tests {
             0
         );
         assert_eq!(
-            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            crate::trap::frame_inventory::retire_stage2_record_after_test_mm_close_using(
                 &custody,
                 owner.record_identity,
                 |_, _| {

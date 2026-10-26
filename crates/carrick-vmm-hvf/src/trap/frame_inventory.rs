@@ -583,7 +583,7 @@ impl InventoryFrameRegistry {
 }
 
 #[cfg(test)]
-pub(crate) fn release_stage2_reference_after_test_unmap(
+pub(crate) fn release_stage2_reference_after_test_mm_close(
     custody: &CarrierVmCustody,
     identity: CarrierStage2RecordIdentity,
 ) -> Stage1Unpublished {
@@ -591,27 +591,27 @@ pub(crate) fn release_stage2_reference_after_test_unmap(
         .stage2_record_snapshot(identity.record_id)
         .expect("test record exists before stage-1 unpublication");
     let lease = (snapshot.ipa, snapshot.len as u64);
-    let receipt = custody.editor_receipt_after_test_unmap(identity);
+    let receipt = tests::test_whole_mm_stage1_proof();
     let mut frames = InventoryFrameRegistry::default();
     frames.stage2_references.insert(lease, 1);
     frames
         .release_stage2_reference(
             lease,
             Some(identity),
-            Stage1UnpublicationReceipt::EditorRange(&receipt),
+            Stage1UnpublicationReceipt::Inventory(&receipt),
         )
         .expect("test edit receipt names the exact stage-2 lease")
         .expect("the test edit releases the last stage-2 reference")
 }
 
 #[cfg(test)]
-pub(crate) fn retire_stage2_record_after_test_unmap_using(
+pub(crate) fn retire_stage2_record_after_test_mm_close_using(
     custody: &CarrierVmCustody,
     identity: CarrierStage2RecordIdentity,
     unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
 ) -> CarrierStage2RetireOutcome {
     if custody.claim_stage2_retirement(identity).is_none() {
-        let proof = release_stage2_reference_after_test_unmap(custody, identity);
+        let proof = release_stage2_reference_after_test_mm_close(custody, identity);
         let _ = custody.request_released_stage2_record_retirement(identity, proof);
     }
     let Some(claim) = custody.claim_stage2_retirement(identity) else {
@@ -1588,7 +1588,7 @@ pub(crate) fn final_exec_physical_extents(
 pub(crate) mod tests;
 
 impl HvfVmState {
-    pub(crate) fn retire_stage2_extent_from_mappings_in(
+    pub(crate) fn retire_unpublished_stage2_lease_from_inventory(
         custody: &CarrierVmCustody,
         frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
         mappings: &mut TaskMappingIndex,
@@ -1777,48 +1777,20 @@ impl HvfVmState {
     }
 
     #[cfg(test)]
-    pub(crate) fn retire_stage2_extent_from_mappings(
-        mappings: &mut TaskMappingIndex,
-        ipa: u64,
-        length: u64,
-    ) -> Result<(), TrapError> {
-        let custody = legacy_test_carrier_vm_custody();
-        let identity = custody
-            .stage2_record_covering(ipa, 1)
-            .expect("test retirement names a registered stage-2 record");
-        let receipt = custody.editor_receipt_after_test_unmap(identity);
-        let frames =
-            std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
-        frames.lock().stage2_references.insert((ipa, length), 1);
-        Self::retire_stage2_extent_from_mappings_in(
-            custody,
-            &frames,
-            mappings,
-            Stage1UnpublicationReceipt::EditorRange(&receipt),
-            ipa,
-            length,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retire_test_stage2_extent_from_mappings_in(
+    pub(crate) fn retire_structural_test_mapping_after_mm_close(
         custody: &CarrierVmCustody,
         mappings: &mut TaskMappingIndex,
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
-        let identity = custody
-            .stage2_record_covering(ipa, 1)
-            .expect("test retirement names a registered stage-2 record");
-        let receipt = custody.editor_receipt_after_test_unmap(identity);
+        let receipt = tests::test_whole_mm_stage1_proof();
         let frames =
             std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
-        frames.lock().stage2_references.insert((ipa, length), 1);
-        Self::retire_stage2_extent_from_mappings_in(
+        Self::retire_unpublished_stage2_lease_from_inventory(
             custody,
             &frames,
             mappings,
-            Stage1UnpublicationReceipt::EditorRange(&receipt),
+            Stage1UnpublicationReceipt::Inventory(&receipt),
             ipa,
             length,
         )
@@ -3867,7 +3839,7 @@ impl HvfVmState {
                 }
             } else {
                 if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
-                    Self::retire_stage2_extent_from_mappings_in(
+                    Self::retire_unpublished_stage2_lease_from_inventory(
                         custody,
                         &frames,
                         &mut task.mappings,

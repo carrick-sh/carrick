@@ -59,7 +59,7 @@ fn retire_test_process_mappings_with_root_proof(
     )
 }
 
-fn test_whole_mm_stage1_proof() -> carrick_core::mm::retirement::Stage1UnpublishedMm {
+pub(super) fn test_whole_mm_stage1_proof() -> carrick_core::mm::retirement::Stage1UnpublishedMm {
     let mut task = hvpatch_neutral_task_state_for_test();
     task.cow_identity = Some(carrick_hal::FrameCowIdentity {
         linux_pid: 1,
@@ -584,6 +584,16 @@ fn unpublished_carrier_mm_authority(
             unpublished,
         )),
     }
+}
+
+fn retire_pending_carrier_lease(key: (u64, u64)) -> Result<(), TrapError> {
+    let custody = legacy_test_carrier_vm_custody();
+    let identity = take_carrier_stage2_record(custody, key.0, key.1).ok_or_else(|| {
+        TrapError::Hypervisor(format!(
+            "pending carrier lease {key:?} lost its exact record"
+        ))
+    })?;
+    retire_carrier_stage2_record_at_safe_point(custody, identity)
 }
 
 enum TestFrameMappingCount {
@@ -3392,11 +3402,7 @@ fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority(
     );
     assert!(
         HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
-            HvfVmState::retire_stage2_extent_from_mappings(
-                &mut TaskMappingIndex::new(),
-                key.0,
-                key.1,
-            )
+            retire_pending_carrier_lease(key)
         })
         .unwrap(),
     );
@@ -3641,7 +3647,7 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
         .expect("old owner exists before exact same-IPA successor publication")
         .owner()
         .record_identity;
-    let old_stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+    let old_stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
         legacy_test_carrier_vm_custody(),
         old_identity,
     );
@@ -3730,10 +3736,11 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
     let successor_identity =
         global_frame_stage2_identity_in(legacy_test_carrier_vm_custody(), key.0, key.1)
             .expect("successor has exact stage-2 identity");
-    let successor_stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
-        legacy_test_carrier_vm_custody(),
-        successor_identity,
-    );
+    let successor_stage1 =
+        crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
+            legacy_test_carrier_vm_custody(),
+            successor_identity,
+        );
     assert!(
         retire_global_frame_host_owner_in(
             legacy_test_carrier_vm_custody(),
@@ -4958,11 +4965,7 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
     );
     assert!(
         HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, old_key, || {
-            HvfVmState::retire_stage2_extent_from_mappings(
-                &mut TaskMappingIndex::new(),
-                old_key.0,
-                old_key.1,
-            )
+            retire_pending_carrier_lease(old_key)
         })
         .unwrap(),
     );
@@ -5026,11 +5029,7 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
     );
     assert!(
         HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
-            HvfVmState::retire_stage2_extent_from_mappings(
-                &mut TaskMappingIndex::new(),
-                key.0,
-                key.1,
-            )
+            retire_pending_carrier_lease(key)
         })
         .unwrap(),
     );
@@ -5096,11 +5095,7 @@ fn final_carrier_mm_drop_keeps_a_backend_referenced_stage2_lease_live() {
     frames.lock().stage2_references.remove(&key);
     assert!(
         HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {
-            HvfVmState::retire_stage2_extent_from_mappings(
-                &mut TaskMappingIndex::new(),
-                key.0,
-                key.1,
-            )
+            retire_pending_carrier_lease(key)
         })
         .unwrap(),
     );
@@ -5370,7 +5365,7 @@ fn directory_failpoint_rolls_back_inventory_before_final_carrier_drop() {
     assert!(ledger.extents.is_empty());
     assert!(ledger.frames.lock().stage2_references.is_empty());
     drop(ledger);
-    HvfVmState::retire_stage2_extent_from_mappings(&mut TaskMappingIndex::new(), key.0, key.1)
+    retire_pending_carrier_lease(key)
         .expect("directory rollback safe point performs requested carrier retirement");
     assert!(
         !carrier_stage2_leases().lock().contains_key(&key),

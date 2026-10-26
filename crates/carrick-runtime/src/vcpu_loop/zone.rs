@@ -63,7 +63,13 @@ fn editor_is_held(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool
         .is_some_and(|index| zone.spaces.active_editor(index).is_some())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum EditorRefusalDisposition {
     Reselect,
     Park,

@@ -256,7 +256,7 @@ impl PendingExecStage2Cleanup {
                     )
                 })?;
                 if owner_generation == 0 {
-                    HvfVmState::retire_stage2_extent_from_mappings_in(
+                    HvfVmState::retire_unpublished_stage2_lease_from_inventory(
                         custody,
                         &self.frames,
                         &mut self.mappings,

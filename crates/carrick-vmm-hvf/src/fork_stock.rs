@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(
             custody.request_released_stage2_record_retirement(
                 owner_b.record_identity(),
-                crate::trap::release_stage2_reference_after_test_unmap(
+                crate::trap::release_stage2_reference_after_test_mm_close(
                     &custody,
                     owner_b.record_identity()
                 ),
@@ -1056,7 +1056,7 @@ mod tests {
         assert_eq!(
             custody.request_released_stage2_record_retirement(
                 owner_a.record_identity(),
-                crate::trap::release_stage2_reference_after_test_unmap(
+                crate::trap::release_stage2_reference_after_test_mm_close(
                     &custody,
                     owner_a.record_identity()
                 ),

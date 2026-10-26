@@ -866,54 +866,6 @@ impl CarrierVmCustody {
         }
     }
 
-    /// Test support that obtains the same non-forgeable editor receipt as a
-    /// production host-side unmap.  The synthetic image first publishes a
-    /// leaf naming the record's exact IPA, then removes that leaf through
-    /// `Stage1Authority::edit_unpublishing`; an already-empty manager is not a
-    /// retirement proof.
-    #[cfg(test)]
-    pub(crate) fn editor_receipt_after_test_unmap(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-    ) -> carrick_aarch64::stage1_authority::Stage1LeafRetired {
-        let authority = carrick_aarch64::Stage1Authority::new();
-        let record = self
-            .stage2_record_snapshot(identity.record_id)
-            .expect("test stage-2 identity names a live record");
-        let builder = || {
-            Ok::<_, carrick_mmu_core::aarch64::PageTableError>(
-                carrick_mmu_core::aarch64::PageTableManager::new(
-                    carrick_mem::memory::stage1_hvpatch_page_tables(),
-                    crate::memory::LINUX_PAGE_TABLES_BASE,
-                    carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
-                ),
-            )
-        };
-        let va = 0x4000_0000_u64;
-        authority
-            .edit(crate::trap::test_stage1_edit_license(), builder, |editor| {
-                editor
-                    .map_aliased(
-                        va,
-                        record.ipa,
-                        0x1000,
-                        carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
-                    )
-                    .map(|_| ())
-            })
-            .expect("test stage-1 leaf publication");
-        let (_, receipt) = authority
-            .edit_unpublishing(
-                crate::trap::test_stage1_edit_license(),
-                builder,
-                va,
-                0x1000,
-                |editor| editor.invalidate(va, 0x1000).map(|_| ()),
-            )
-            .expect("test stage-1 leaf unpublication");
-        receipt.expect("editor removed the exact test stage-1 leaf")
-    }
-
     fn stage2_record_removal(&self) -> Stage2RecordRemoval<'_> {
         Stage2RecordRemoval {
             custody: self,
@@ -2731,6 +2683,43 @@ mod carrier_vm_custody_tests {
         InventoryFrameRegistry, Stage1Unpublished, Stage2ReferenceReleaseError,
     };
 
+    fn leaf_retirement_receipt(ipa: u64) -> carrick_aarch64::stage1_authority::Stage1LeafRetired {
+        let authority = carrick_aarch64::Stage1Authority::new();
+        let builder = || {
+            Ok::<_, carrick_mmu_core::aarch64::PageTableError>(
+                carrick_mmu_core::aarch64::PageTableManager::new(
+                    carrick_mem::memory::stage1_hvpatch_page_tables(),
+                    crate::memory::LINUX_PAGE_TABLES_BASE,
+                    carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+                ),
+            )
+        };
+        let va = 0x4000_0000_u64;
+        authority
+            .edit(crate::trap::test_stage1_edit_license(), builder, |editor| {
+                editor
+                    .map_aliased(
+                        va,
+                        ipa,
+                        0x1000,
+                        carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+                    )
+                    .map(|_| ())
+            })
+            .expect("test stage-1 leaf publication");
+        authority
+            .edit_unpublishing(
+                crate::trap::test_stage1_edit_license(),
+                builder,
+                va,
+                0x1000,
+                |editor| editor.invalidate(va, 0x1000).map(|_| ()),
+            )
+            .expect("test stage-1 leaf unpublication")
+            .1
+            .expect("editor removed the exact test stage-1 leaf")
+    }
+
     #[test]
     fn retirement_request_signature_requires_stage1_unpublished_witness() {
         let request: fn(
@@ -2761,7 +2750,8 @@ mod carrier_vm_custody_tests {
         let mut frames = InventoryFrameRegistry::default();
         frames.stage2_references.insert(lease, 2);
 
-        let wrong = custody.editor_receipt_after_test_unmap(other);
+        let wrong_ipa = custody.stage2_record_snapshot(other.record_id).unwrap().ipa;
+        let wrong = leaf_retirement_receipt(wrong_ipa);
         assert_eq!(
             frames.release_stage2_reference(
                 lease,
@@ -2772,7 +2762,7 @@ mod carrier_vm_custody_tests {
         );
         assert_eq!(frames.stage2_references.get(&lease), Some(&2));
 
-        let exact = custody.editor_receipt_after_test_unmap(identity);
+        let exact = leaf_retirement_receipt(lease.0);
         assert!(
             frames
                 .release_stage2_reference(
@@ -4459,7 +4449,7 @@ mod carrier_vm_custody_tests {
             .clone();
         let identity = owner.record_identity;
         assert_eq!(
-            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            crate::trap::frame_inventory::retire_stage2_record_after_test_mm_close_using(
                 &custody,
                 identity,
                 |_, _| Ok(())
@@ -4637,7 +4627,7 @@ mod carrier_vm_custody_tests {
         assert_eq!(
             custody.request_released_stage2_record_retirement(
                 old_identity,
-                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
                     &custody,
                     old_identity
                 ),
@@ -4904,7 +4894,7 @@ mod carrier_vm_custody_tests {
         let frames = std::sync::Arc::new(parking_lot::Mutex::new(
             super::InventoryFrameRegistry::default(),
         ));
-        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
             &custody,
             new_identity,
         );
@@ -5083,7 +5073,7 @@ mod carrier_vm_custody_tests {
         )
         .expect("publish structural custody");
         let identity = *owner.retained.record_identity.lock();
-        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
             &custody, identity,
         );
         assert_eq!(
@@ -5172,7 +5162,7 @@ mod carrier_vm_custody_tests {
 
         let exact_generation = mappings.first().unwrap().owner_generation;
         mappings.first_mut().unwrap().owner_generation = exact_generation.saturating_add(1);
-        let drift_error = super::HvfVmState::retire_test_stage2_extent_from_mappings_in(
+        let drift_error = super::HvfVmState::retire_structural_test_mapping_after_mm_close(
             &custody,
             &mut mappings,
             ipa,
@@ -5203,7 +5193,7 @@ mod carrier_vm_custody_tests {
         );
         mappings.first_mut().unwrap().owner_generation = exact_generation;
 
-        let subextent_error = super::HvfVmState::retire_test_stage2_extent_from_mappings_in(
+        let subextent_error = super::HvfVmState::retire_structural_test_mapping_after_mm_close(
             &custody,
             &mut mappings,
             ipa + 0x1000,
@@ -5221,7 +5211,7 @@ mod carrier_vm_custody_tests {
             "failed-closed subextent retirement must preserve the whole structural map",
         );
 
-        super::HvfVmState::retire_test_stage2_extent_from_mappings_in(
+        super::HvfVmState::retire_structural_test_mapping_after_mm_close(
             &custody,
             &mut mappings,
             ipa,
@@ -5311,7 +5301,7 @@ mod carrier_vm_custody_tests {
             .expect("pin structural root slot");
         let mut mappings = super::TaskMappingIndex::from_region(region);
 
-        let retirement_error = super::HvfVmState::retire_test_stage2_extent_from_mappings_in(
+        let retirement_error = super::HvfVmState::retire_structural_test_mapping_after_mm_close(
             &custody,
             &mut mappings,
             ipa,
@@ -5419,7 +5409,7 @@ mod carrier_vm_custody_tests {
         );
         assert!(super::alias_backing_is_live(host_addr));
 
-        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
             &custody,
             new_identity,
         );
@@ -5671,7 +5661,7 @@ mod carrier_vm_custody_tests {
         let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
 
         assert_eq!(
-            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            crate::trap::frame_inventory::retire_stage2_record_after_test_mm_close_using(
                 &custody,
                 identity,
                 |_, _| Err(injected)
@@ -5691,7 +5681,7 @@ mod carrier_vm_custody_tests {
         assert_eq!(retained.retry_pending, Some(injected));
 
         assert_eq!(
-            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            crate::trap::frame_inventory::retire_stage2_record_after_test_mm_close_using(
                 &custody,
                 identity,
                 |_, _| Ok(())
@@ -5716,7 +5706,7 @@ mod carrier_vm_custody_tests {
         let key = (0x4000, 0x4000);
         custody.carrier_stage2_records.lock().insert(key, identity);
         let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
-        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
             &custody, identity,
         );
         assert_eq!(
@@ -5774,7 +5764,7 @@ mod carrier_vm_custody_tests {
         let unmap_calls = std::cell::Cell::new(0_u32);
 
         assert_eq!(
-            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            crate::trap::frame_inventory::retire_stage2_record_after_test_mm_close_using(
                 &custody,
                 identity,
                 |_, _| {
@@ -5798,7 +5788,7 @@ mod carrier_vm_custody_tests {
         assert!(eligible.mapped);
 
         assert_eq!(
-            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            crate::trap::frame_inventory::retire_stage2_record_after_test_mm_close_using(
                 &custody,
                 identity,
                 |_, _| {
@@ -5833,7 +5823,7 @@ mod carrier_vm_custody_tests {
             assert_eq!(
                 custody.request_released_stage2_record_retirement(
                     identity,
-                    crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                    crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
                         &custody, identity
                     ),
                 ),
@@ -5884,7 +5874,7 @@ mod carrier_vm_custody_tests {
         assert_eq!(
             custody.request_released_stage2_record_retirement(
                 identity,
-                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
                     &custody, identity
                 ),
             ),
@@ -6143,7 +6133,7 @@ mod carrier_vm_custody_tests {
         let post_destroy_unmaps = std::cell::Cell::new(0_u32);
         for identity in [first, second] {
             assert_eq!(
-                crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                crate::trap::frame_inventory::retire_stage2_record_after_test_mm_close_using(
                     &custody,
                     identity,
                     |_, _| {
@@ -6184,7 +6174,7 @@ mod carrier_vm_custody_tests {
             Some(before)
         );
         assert_eq!(
-            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            crate::trap::frame_inventory::retire_stage2_record_after_test_mm_close_using(
                 &custody,
                 identity,
                 |_, _| Ok(())
@@ -6203,7 +6193,7 @@ mod carrier_vm_custody_tests {
         assert_eq!(
             custody.request_released_stage2_record_retirement(
                 first,
-                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
                     &custody, first
                 ),
             ),
@@ -6232,7 +6222,7 @@ mod carrier_vm_custody_tests {
         assert_eq!(
             custody.request_released_stage2_record_retirement(
                 stale_vm,
-                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
                     &custody, stale_vm
                 ),
             ),
@@ -6249,7 +6239,7 @@ mod carrier_vm_custody_tests {
         assert_eq!(
             custody.request_released_stage2_record_retirement(
                 stale_owner,
-                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
                     &custody,
                     stale_owner
                 ),

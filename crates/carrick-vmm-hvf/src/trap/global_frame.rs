@@ -1255,7 +1255,7 @@ impl GlobalFrameHostOwner {
         let custody = self.custody.upgrade().ok_or_else(|| {
             TrapError::Hypervisor("global owner carrier custody disappeared".to_owned())
         })?;
-        match super::frame_inventory::retire_stage2_record_after_test_unmap_using(
+        match super::frame_inventory::retire_stage2_record_after_test_mm_close_using(
             &custody,
             self.record_identity,
             unmap_global_frame_stage2_record,
@@ -1524,7 +1524,7 @@ pub(crate) fn carrier_frame_cow_owner_inventory_in(
 /// A forked process's fresh kernel-state frames are reserved by the fork path
 /// and must outlive every per-task mapping projection, which are `unowned` and
 /// carry no lease. Parking them in the carrier alone made them invisible to
-/// `retire_stage2_extent_from_mappings`, whose fallback then released the IPA
+/// the inventory-owned retirement transaction, whose old fallback released the IPA
 /// while the lease was still live — and the lease's own `Drop` released it a
 /// second time, tripping the allocator's exact-extent check and aborting the
 /// carrier. Keying them here makes the owner findable, so the extent is
@@ -3381,7 +3381,7 @@ pub(crate) fn retire_test_global_frame_host_owner_if_generation_in_using(
         Stage2RetirementProof::from(stage1)
     } else {
         Stage2RetirementProof::Released(
-            super::frame_inventory::release_stage2_reference_after_test_unmap(custody, identity),
+            super::frame_inventory::release_stage2_reference_after_test_mm_close(custody, identity),
         )
     };
     retire_global_frame_host_owner_if_generation_in_using(
@@ -3745,7 +3745,7 @@ pub(crate) fn drain_all_global_frame_retirements_in_using(
                 .map(Stage2RetirementProof::from)
                 .unwrap_or_else(|| {
                     Stage2RetirementProof::Released(
-                        super::frame_inventory::release_stage2_reference_after_test_unmap(
+                        super::frame_inventory::release_stage2_reference_after_test_mm_close(
                             custody, identity,
                         ),
                     )
@@ -4406,7 +4406,7 @@ pub(crate) fn retire_global_frame_host_owner(
         return GlobalFrameRetirementOutcome::NotFound { ipa, length };
     };
     let stage1 =
-        super::frame_inventory::release_stage2_reference_after_test_unmap(custody, identity);
+        super::frame_inventory::release_stage2_reference_after_test_mm_close(custody, identity);
     retire_global_frame_host_owner_in(custody, stage1, ipa, length)
 }
 

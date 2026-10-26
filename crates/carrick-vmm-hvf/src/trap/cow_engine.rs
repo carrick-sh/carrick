@@ -7439,7 +7439,7 @@ impl HvfTaskState {
         let frames = std::sync::Arc::clone(&self.frame_inventory.lock().frames);
         for stage1 in detached {
             let base = stage1.base();
-            HvfVmState::retire_stage2_extent_from_mappings_in(
+            HvfVmState::retire_unpublished_stage2_lease_from_inventory(
                 &custody,
                 &frames,
                 &mut self.mappings,

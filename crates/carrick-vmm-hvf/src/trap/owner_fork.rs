@@ -1150,7 +1150,7 @@ mod tests {
         drop((a, b, both));
         for ipa in [ipa_a, ipa_b] {
             let identity = global_frame_stage2_identity_in(&custody, ipa, 0x4000).unwrap();
-            let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+            let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
                 &custody, identity,
             );
             assert!(matches!(

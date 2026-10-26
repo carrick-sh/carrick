@@ -343,3 +343,19 @@ rules:
       authenticated by `ExtentTable` into an `AuthenticatedGpa` before calling
       `LinearPlacement::host`.
 
+  # #847: retirement authorization comes only from the stage-1 edit receipt,
+  # the carrier-wide zero-reference crossing, or the publication transaction.
+  # These names are the deleted identity-derived and polling paths; keeping the
+  # census here prevents a later "temporary" helper from reopening the hole.
+  - id: carrick-hvpatch-no-derived-stage2-retirement-authority
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "crates/**/*.rs"
+    pattern-regex: '(?:Stage1UnpublishedRange::retire_extension_arenas|\b(?:AuthoritativeAbsence|InventoryRollback|Stage1UnpublishedSource|stage1_unpublished_for_retirement|stage1_selection_changed|ImmediateStage1Reselect|OWNER_REDRIVE_MAX_STALLED_PASSES|after_engine_edit|stage1_unpublished_after_editor_unmap|retire_test_stage2_record_using|retire_stage2_extent_from_mappings|retire_test_stage2_extent_from_mappings_in|DirectStage1RetirementProof|Stage1UnpublishedFrames|FrameAbsence|LeaseTest)\b)'
+    message: |
+      #847 requires stage-1-first retirement with a consume-once proof. Do not
+      restore an identity-derived proof, an always-ready reselect, or a test
+      retirement bypass; use the Editor/inventory/publication transaction.
+

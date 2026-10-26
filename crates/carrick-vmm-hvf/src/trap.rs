@@ -3673,7 +3673,7 @@ enum HvpatchCarrierTaskState {
         order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
     },
     #[cfg(test)]
-    LeaseTest {
+    PreparedTest {
         stage2_leases: Vec<GlobalFrameStage2Lease>,
     },
 }
@@ -7076,7 +7076,7 @@ impl HvpatchCarrierTaskStateDirectory {
                 )
             }
             #[cfg(test)]
-            HvpatchCarrierTaskState::LeaseTest { mut stage2_leases } => {
+            HvpatchCarrierTaskState::PreparedTest { mut stage2_leases } => {
                 let owner_hosts =
                     match collect_carrier_stage2_owner_hosts(task.mappings.iter().map(|mapping| {
                         (
@@ -7088,7 +7088,7 @@ impl HvpatchCarrierTaskStateDirectory {
                         Err(error) => {
                             abort_prepared_task_and_carrier(
                                 task,
-                                HvpatchCarrierTaskState::LeaseTest { stage2_leases },
+                                HvpatchCarrierTaskState::PreparedTest { stage2_leases },
                             )?;
                             return Err(error);
                         }
@@ -7108,7 +7108,7 @@ impl HvpatchCarrierTaskStateDirectory {
                     Err(error) => {
                         abort_prepared_task_and_carrier(
                             task,
-                            HvpatchCarrierTaskState::LeaseTest { stage2_leases },
+                            HvpatchCarrierTaskState::PreparedTest { stage2_leases },
                         )?;
                         return Err(error);
                     }
@@ -7264,7 +7264,7 @@ impl HvpatchCarrierTaskState {
                 Ok(())
             }
             #[cfg(test)]
-            Self::LeaseTest { mut stage2_leases } => {
+            Self::PreparedTest { mut stage2_leases } => {
                 for lease in &mut stage2_leases {
                     lease.try_retire()?;
                 }
@@ -7409,7 +7409,7 @@ impl HvfVmState {
     ) -> Result<(HvpatchCarrierTaskState, HvpatchPreparedTaskAuthority), TrapError> {
         let (stage2_leases, prepared_task) = Self::prepare_task_only_plan(plan)?;
         Ok((
-            HvpatchCarrierTaskState::LeaseTest { stage2_leases },
+            HvpatchCarrierTaskState::PreparedTest { stage2_leases },
             prepared_task,
         ))
     }
