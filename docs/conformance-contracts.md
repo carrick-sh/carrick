@@ -1441,6 +1441,23 @@ visits each quarantined child once per loan. Signed HVF execution and
 Docker timing are not claimed by these bindings; the signed ARM fork gate
 records `withdrawn_lifecycle` and `retire_refusal` as zero.
 
+## Native inherited-pipe poll admission (`kernel.ipc.native-poll`)
+
+A native fork child's complete descriptor namespace owns its one-description
+pipe poll wait. ARM routing must admit that existing object-wait adapter from
+the published directory-owned table; a native child has no host task graph
+that can replay an unserved `ppoll`. Borrowed host tables keep their existing
+venue. Linux authority is poll(2): readiness on the inherited open description
+and a bounded timeout belong to the calling task.
+
+`native_child_poll_on_inherited_pipe_parks_and_wakes_in_guest` checks production
+family admission for the owned ARM table and refusal without that venue, then
+parks the exact operation, runs a writer in another live process, and resumes
+with POLLIN. The routing-gate red fails before the adapter is reached. Work
+is one bounded table lookup, one description pin and one object enrollment;
+there is no host readiness descriptor or retry loop. The signed binding is
+`el1_ipc_two_processes_blocking`.
+
 ## Native short-lock contention (`process.native.short-lock`)
 
 Surface: wait4, signal waits, SysV IPC enrollment, committed exit and record
