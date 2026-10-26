@@ -539,9 +539,12 @@ impl Stage2RetirementClaim<'_> {
             .pending_carrier_stage2_retirements
             .lock()
             .remove(&self.identity.record_id);
-        self.proof
-            .take()
-            .expect("pending retirement claim owns its proof")
+        self.proof.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::stage2_retirement",
+                "exclusive pending retirement claim lost its consume-once proof"
+            )
+        })
     }
 }
 
@@ -627,23 +630,18 @@ impl Drop for Stage2AvailabilityPublication<'_> {
 /// never-published retirement receipt.
 #[derive(::core::fmt::Debug)]
 pub(crate) struct Stage2PublicationAuthority {
-    identity: Option<CarrierStage2RecordIdentity>,
+    identity: CarrierStage2RecordIdentity,
     publication: carrick_thread::completion::CompletionCallbacks,
 }
 
 impl Stage2PublicationAuthority {
     /// Commit the publication transaction. Drop performs the wake after the
     /// caller's directory and stage-1 locks have left scope.
-    pub(crate) fn commit(mut self) {
-        self.identity.take();
-    }
+    pub(crate) fn commit(self) {}
 
-    pub(crate) fn rollback(mut self) -> NeverPublishedRecord {
+    pub(crate) fn rollback(self) -> NeverPublishedRecord {
         NeverPublishedRecord {
-            identity: self
-                .identity
-                .take()
-                .expect("stage-2 publication authority consumed once"),
+            identity: self.identity,
         }
     }
 }
@@ -1634,7 +1632,7 @@ impl CarrierVmCustody {
         Ok((
             identity,
             Stage2PublicationAuthority {
-                identity: Some(identity),
+                identity,
                 publication: self.stage2_publication_changed.clone(),
             },
         ))
@@ -1680,7 +1678,7 @@ impl CarrierVmCustody {
         Ok((
             identity,
             Stage2PublicationAuthority {
-                identity: Some(identity),
+                identity,
                 publication: self.stage2_publication_changed.clone(),
             },
         ))
@@ -2743,6 +2741,7 @@ mod carrier_vm_custody_tests {
         InventoryFrameRegistry, Stage1Unpublished, Stage2ReferenceReleaseError,
     };
 
+    #[allow(clippy::expect_used)]
     fn leaf_retirement_receipt(ipa: u64) -> carrick_aarch64::stage1_authority::Stage1LeafRetired {
         let authority = carrick_aarch64::Stage1Authority::new();
         let builder = || {

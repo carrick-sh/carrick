@@ -1653,7 +1653,11 @@ impl HvfVmState {
             .as_ref()
             .is_some_and(|pending| !pending.predecessor_leases.is_empty())
         {
-            let pending = pending.as_mut().expect("pending replacement exists");
+            let Some(pending) = pending.as_mut() else {
+                return Err(TrapError::Hypervisor(
+                    "EL1 frame-grant rollback lost its pending replacement".to_owned(),
+                ));
+            };
             let never_published = pending
                 .rollback
                 .take()
@@ -6491,7 +6495,7 @@ impl HvfVmState {
             None => {
                 let end = va
                     .checked_add(len as u64)
-                    .ok_or_else(|| TrapError::MappingTooLarge(len as u64))?;
+                    .ok_or(TrapError::MappingTooLarge(len as u64))?;
                 let mut retired = Vec::new();
                 for row in &read_rows {
                     let row_end = row.start.saturating_add(row.size as u64);

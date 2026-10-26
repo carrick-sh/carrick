@@ -380,7 +380,7 @@ impl Drop for OwnerCleanup {
                 continue;
             };
             let proof = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
-                &custody, identity,
+                custody, identity,
             );
             let outcome = retire_global_frame_host_owner_in(custody, proof, key.0, key.1);
             assert!(
@@ -3730,7 +3730,7 @@ fn foreign_mm_read_rejects_reused_owner_generation() {
     let identity = global_frame_stage2_identity_in(custody, data_key.0, data_key.1)
         .expect("old data owner has exact stage-2 custody");
     let proof = crate::trap::frame_inventory::release_stage2_reference_after_test_mm_close(
-        &custody, identity,
+        custody, identity,
     );
     assert!(
         retire_global_frame_host_owner_in(custody, proof, data_key.0, data_key.1).is_retired(),

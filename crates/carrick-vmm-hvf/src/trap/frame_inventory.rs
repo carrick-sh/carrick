@@ -353,19 +353,19 @@ pub(crate) struct StagedProcessStage2Retirement {
     pub(crate) reference_releases: std::collections::BTreeMap<(u64, u64), usize>,
 }
 
+type Stage2RetirementProofs = std::collections::BTreeMap<(u64, u64), Stage1Unpublished>;
+type StagedStage2RetirementRelease = (
+    std::collections::BTreeSet<(u64, u64)>,
+    Stage2RetirementProofs,
+);
+
 impl StagedProcessStage2Retirement {
     pub(crate) fn release_with(
         self,
         registry: &mut InventoryFrameRegistry,
         receipt: Stage1UnpublicationReceipt<'_>,
         mut identity_for: impl FnMut((u64, u64)) -> Option<CarrierStage2RecordIdentity>,
-    ) -> Result<
-        (
-            std::collections::BTreeSet<(u64, u64)>,
-            std::collections::BTreeMap<(u64, u64), Stage1Unpublished>,
-        ),
-        TrapError,
-    > {
+    ) -> Result<StagedStage2RetirementRelease, TrapError> {
         let mut proofs = std::collections::BTreeMap::new();
         for (lease, count) in self.reference_releases {
             for _ in 0..count {
@@ -2185,7 +2185,7 @@ impl HvfVmState {
         receipt: Stage1UnpublicationReceipt<'_>,
         mut reservation: carrick_hal::FrameInventoryReservation,
         apply: impl FnOnce(carrick_hal::FrameInventoryCommit<()>) -> Result<R, TrapError>,
-    ) -> Result<(R, std::collections::BTreeMap<(u64, u64), Stage1Unpublished>), TrapError> {
+    ) -> Result<(R, Stage2RetirementProofs), TrapError> {
         let mut inventory = ledger.lock();
         let frames = std::sync::Arc::clone(&inventory.frames);
         let mut registry = frames.lock();
@@ -2210,9 +2210,11 @@ impl HvfVmState {
             .filter(|lease| !retirement.stage2_leases.contains(lease))
             .collect::<Vec<_>>();
         for lease in deferred {
-            let proof = proofs
-                .remove(&lease)
-                .expect("deferred zero-reference proof remains owned");
+            let Some(proof) = proofs.remove(&lease) else {
+                return Err(TrapError::Hypervisor(format!(
+                    "deferred alias retirement {lease:?} lost its zero-reference proof"
+                )));
+            };
             let identity = proof.identity();
             if custody.request_released_stage2_record_retirement(identity, proof)
                 != CarrierStage2RetireOutcome::DeferredActivePins
