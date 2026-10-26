@@ -437,9 +437,6 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// The next thread on this vCPU needs its executor: leave for the host
     /// with no thread on the vCPU; the executor takes it from the run queue.
     fn service_exit(&mut self) -> Served {
-        // The host idle entry resets the hardware roots. Release the same
-        // occupancy now so a queued native successor must install its MM.
-        self.leave_space();
         self.counters.exit_reasons[El1ExitReason::Service as usize].fetch_add(1, Ordering::Relaxed);
         self.zone
             .counters
@@ -580,7 +577,6 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                     .fetch_add(1, Ordering::Relaxed);
                 zone.leave_idle(slot);
                 zone.counters.el1_idle_exits.fetch_add(1, Ordering::Relaxed);
-                self.leave_space();
                 return Served::Idle;
             }
             let now = self.cpu.now();
@@ -815,7 +811,6 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         {
             self.counters.exit_reasons[El1ExitReason::IdleEntryHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
-            self.leave_space();
             return carrick_el1_abi::Action::Idle;
         }
         match self.idle(frame, timeout_result) {
@@ -947,6 +942,21 @@ pub struct FakeRegs {
     pub v: [u128; 32],
     pub fpsr: u64,
     pub fpcr: u64,
+}
+
+/// The final entry return toward the host or EL0, after all personality,
+/// descriptor and service decisions. An idle return has no running record;
+/// the next host entry resets hardware roots to the maintenance root.
+pub fn finish_entry(
+    zone: &ZoneTables,
+    slot: SlotId,
+    cpu: &mut impl ThreadCpu,
+    action: carrick_el1_abi::Action,
+) -> carrick_el1_abi::Action {
+    if action == carrick_el1_abi::Action::Idle {
+        leave_space(zone, slot, cpu);
+    }
+    action
 }
 
 /// Leave a process's translations before releasing its installed occupancy.

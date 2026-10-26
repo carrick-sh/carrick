@@ -1931,14 +1931,16 @@ and retained physical-source controls cover the owner and revocation protocol.
 No receiver authentication, wait4 behavior, work budget or graph-lock scope is
 weakened. See the carrier issuer handoff for custody and per-ticket costs.
 
-Scheduler service exits and idle exits for host work release installed MM
-occupancy after switching to maintenance roots. The host's next idle entry
+One final entry-return owner releases installed MM occupancy after switching
+to maintenance roots for every idle host exit, including scheduler service,
+object waits and signal suspension. The host's next idle entry
 resets hardware roots, so retaining occupancy could let the same native child
 skip its root installation and repeatedly fault fetching valid instructions.
 `arm_native_preemption_service_exit_reinstalls_child_root` creates a real fork
 child, selects it on a timer, preempts it for a host-owned parent's service,
-and re-enters that child with exactly one root installation. Its red retains
-MM 2 at the service boundary. The signed bindings are
+and re-enters that child with exactly one root installation. It then parks
+and resumes the same child through an owned object wait, retaining its exact
+operation token. Its red retains MM 2 at the service boundary. The signed bindings are
 `el1_ipc_two_processes_blocking` and `el1_fork_cow_resolves_in_guest`.
 
 ### First-entry claim custody under Closing

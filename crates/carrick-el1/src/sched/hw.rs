@@ -473,3 +473,14 @@ pub fn fatal_entry_binding() -> ! {
 pub fn fatal_entry_binding() -> ! {
     crate::isa::x86::fatal_entry_binding()
 }
+
+/// Commit the final return decision after every entry producer has settled.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn finish_entry(frame: &TrapFrame, action: carrick_el1_abi::Action) -> carrick_el1_abi::Action {
+    let Some(slot) = carrick_el1_abi::SlotId::from_index(frame.slot as usize) else {
+        fatal_entry_binding();
+    };
+    // SAFETY: initialized carrier-owned tables are mapped in every EL1 root.
+    let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
+    super::finish_entry(zone, slot, &mut HardwareCpu, action)
+}

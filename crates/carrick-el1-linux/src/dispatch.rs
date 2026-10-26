@@ -1246,7 +1246,7 @@ fn arm_native_service_exit(
         )
     });
     Some(match result {
-        NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
+        NativeResume::Left(None) => Action::Idle,
         NativeResume::NoPending => arm_signal_user_return(frame),
         NativeResume::RetrySyscall => invalid_completion(NativeInvariant::EntryBinding),
         NativeResume::Returned(result) => {
@@ -1255,17 +1255,6 @@ fn arm_native_service_exit(
         }
         _ => invalid_completion(NativeInvariant::EntryBinding),
     })
-}
-
-/// Finish the native service park before handing the executor to the host.
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-pub(super) fn native_service_idle(
-    zone: &ZoneTables,
-    slot: SlotId,
-    cpu: &mut impl sched::ThreadCpu,
-) -> Action {
-    sched::leave_space(zone, slot, cpu);
-    Action::Idle
 }
 
 /// The one native signal checkpoint at the actual EL0 return boundary. The

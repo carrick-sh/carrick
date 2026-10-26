@@ -1503,6 +1503,7 @@ fn a_raised_gate_sends_the_thread_to_its_executor() {
         Claim::Queued { slot, .. } if slot == SLOT
     ));
     assert_eq!(zone.slot(SLOT).current(), None);
+    crate::sched::finish_entry(&zone, SLOT, &mut cpu, carrick_el1_abi::Action::Idle);
     // Even an early placement refusal leaves for host service. Its next
     // idle entry resets hardware roots, so occupancy must leave A as well.
     assert_eq!(zone.installed_space(SLOT), 0);
