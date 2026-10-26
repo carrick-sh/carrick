@@ -1160,16 +1160,7 @@ fn native_exec_successor_handles_cow_and_sparse_backing_faults() {
         &["exec-successor-memory"],
         Duration::from_secs(90),
     );
-    assert!(
-        measured.result.success(),
-        "{} wait_diag={:?}",
-        describe(&measured),
-        read_el1_counters().map(|counters| {
-            (490..=512)
-                .map(|index| counters.refused[index].load(std::sync::atomic::Ordering::Relaxed))
-                .collect::<Vec<_>>()
-        })
-    );
+    assert!(measured.result.success(), "{}", describe(&measured));
     assert_eq!(measured.result.stdout_utf8(), "exec-successor-memory ok\n");
     let faults_after = read_el1_counters().map_or(0, |counters| {
         counters

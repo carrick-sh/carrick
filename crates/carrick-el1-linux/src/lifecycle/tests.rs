@@ -3013,6 +3013,93 @@ fn clone_unclaim_failure_never_leaves_exit_waiting() {
 }
 
 #[test]
+fn native_exit_group_runs_the_woken_successor_before_returning_idle() {
+    struct Exiting {
+        binding: carrick_el1_abi::ExecutionBinding,
+    }
+    impl ProcessNative for Exiting {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self, _: ProcessForkChildTid) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            }
+        }
+    }
+
+    let mut w = World::new(LifecycleHatches::ON);
+    let record = w
+        .zone
+        .alloc_record(ThreadIdentity {
+            tid: 77,
+            serial: 1077,
+            mm: MM,
+            file_table: 5,
+            generation: 2,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1 << SLOT_IDX,
+            lifecycle_page: w.page() as *const _ as u64,
+            control_slot: w.venue.leader_slot() as *const _ as u64,
+        })
+        .unwrap();
+    assert!(w.zone.mark_native_owned(record));
+    w.zone.requeue_preempted(SLOT, record);
+    let mut owner = Exiting {
+        binding: crate::common_entry::execution_binding(w.task()),
+    };
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    let names = InotifyNameCache::new();
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        lifecycle_user: None,
+        frame: &mut frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &names,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(&mut owner),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+    };
+    assert!(matches!(
+        LifecycleNative::process_exit_group(&mut native, 0),
+        Some(LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Returned { switched: true },
+            ..
+        })
+    ));
+    assert_eq!(w.zone.slot(SLOT).current(), Some(record));
+}
+
+#[test]
 fn arm_dispatch_consumes_native_run_failure_before_return() {
     struct Failed {
         binding: carrick_el1_abi::ExecutionBinding,
