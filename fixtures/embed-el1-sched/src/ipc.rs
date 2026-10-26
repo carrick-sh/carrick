@@ -214,11 +214,13 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
             .try_close_write_end("parent diagnostic")
             .expect("close parent diagnostic writer");
     }
+    let child_diagnostic_fd = diagnostic.write;
     let workers: Vec<_> = channels
         .into_iter()
         .enumerate()
         .map(|(pair, (mut request, mut response))| {
-            std::thread::spawn(move || {
+            std::thread::Builder::new()
+                .spawn(move || {
                 if child {
                     PROCESS_PANIC_STAGE.store(20, Ordering::Relaxed);
                 }
@@ -258,8 +260,23 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
                 if child {
                     PROCESS_PANIC_STAGE.store(40, Ordering::Relaxed);
                 }
-                Ok::<usize, String>(rounds)
-            })
+                    Ok::<usize, String>(rounds)
+                })
+                .unwrap_or_else(|error| {
+                    if child {
+                        let errno = error.raw_os_error().unwrap_or(0) as u64;
+                        let receipt = (1_000 + errno).to_ne_bytes();
+                        unsafe {
+                            libc::write(
+                                child_diagnostic_fd,
+                                receipt.as_ptr().cast(),
+                                receipt.len(),
+                            );
+                            libc::_exit(103)
+                        }
+                    }
+                    panic!("parent worker spawn: {error}")
+                })
         })
         .collect();
     let mut completed = 0usize;
@@ -289,7 +306,7 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
         pid,
         "wait child"
     );
-    let panic_stage = if libc::WIFSIGNALED(status) {
+    let panic_stage = if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
         diagnostic.receive_bounded("child panic stage").ok()
     } else {
         None
