@@ -382,12 +382,6 @@ enum AliasRetirementRows {
     NeverRegistered,
 }
 
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
-enum AliasRetirementAuthorityState {
-    Pending,
-    AppliedWithReplacement,
-}
-
 /// A retirement attempt whose plan an out-of-guard writer made stale; it
 /// mutated nothing. `writers` names who changed the window.
 #[derive(::core::fmt::Debug)]
@@ -1553,43 +1547,18 @@ impl HvfVmState {
             }
             Some(planned)
         };
-        // Host lane: retired inside the grant's commit. Guest lane: only the
-        // planned leases travel, and the retirement is re-prepared against
-        // the live inventory when EL1's receipt settles.
-        let (mut retirement, predecessor_leases) = match planned {
-            None => (None, None),
-            Some(planned) if guest_lane => (None, Some(planned.planned_leases)),
-            Some(planned) => (Some(planned), None),
-        };
+        // A replacement may retire its predecessor only after EL1's stage-1
+        // receipt settles. Carry every lane's exact predecessor set to
+        // completion; folding host-lane inventory retirement into preparation
+        // was stage-2-first ordering.
+        let predecessor_leases = planned.map(|planned| planned.planned_leases);
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
             carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
             identity.linux_pid,
             identity.linux_tid,
         );
-        let mut published = sparse_materialization::publish_frame_grant(
-            &publication,
-            request,
-            retirement
-                .as_ref()
-                .and_then(|retirement| retirement.inventory.as_ref()),
-            &registry,
-        )?;
-        if let Some(retirement) = retirement.take() {
-            self.commit_preapplied_process_alias_retirement(
-                request.semantic_base,
-                semantic_len,
-                retirement,
-                &registry,
-            )
-            .unwrap_or_else(|error| {
-                carrick_fatal!(
-                    "hvpatch::el1_frame_grant",
-                    "committed EL1 frame-grant replacement could not retire its predecessor: start=0x{:x} len=0x{:x} error={error}",
-                    request.semantic_base,
-                    request.len,
-                );
-            });
-        }
+        let mut published =
+            sparse_materialization::publish_frame_grant(&publication, request, &registry)?;
         if predecessor_leases.is_none() {
             register_shared_alias(published.alias);
         }
@@ -1868,7 +1837,6 @@ impl HvfVmState {
             len,
             prepared,
             Some(registry),
-            AliasRetirementAuthorityState::Pending,
             AliasRetirementRows::NeverRegistered,
             Some(Stage1UnpublicationReceipt::NeverPublished(never_published)),
         )
@@ -6202,7 +6170,6 @@ impl HvfVmState {
                 len,
                 prepared,
                 None,
-                AliasRetirementAuthorityState::Pending,
                 AliasRetirementRows::Registered,
                 stage1,
             )
@@ -6349,27 +6316,8 @@ impl HvfVmState {
             len,
             prepared,
             Some(registry),
-            AliasRetirementAuthorityState::Pending,
             AliasRetirementRows::Registered,
             stage1,
-        )
-    }
-
-    fn commit_preapplied_process_alias_retirement(
-        &mut self,
-        va: u64,
-        len: usize,
-        prepared: PreparedProcessAliasRetirement,
-        registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
-    ) -> Result<(), TrapError> {
-        self.commit_process_alias_retirement_inner(
-            va,
-            len,
-            prepared,
-            Some(registry),
-            AliasRetirementAuthorityState::AppliedWithReplacement,
-            AliasRetirementRows::Registered,
-            None,
         )
     }
 
@@ -6393,22 +6341,14 @@ impl HvfVmState {
         len: usize,
         prepared: PreparedProcessAliasRetirement,
         registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
-        authority_state: AliasRetirementAuthorityState,
         rows: AliasRetirementRows,
         stage1: Option<Stage1UnpublicationReceipt<'_>>,
     ) -> Result<(), TrapError> {
         let mut prepared = prepared;
         loop {
             let read = prepared.read_rows.len();
-            let Some(stale) = self.try_commit_process_alias_retirement(
-                va,
-                len,
-                prepared,
-                registry,
-                authority_state,
-                rows,
-                stage1,
-            )?
+            let Some(stale) = self
+                .try_commit_process_alias_retirement(va, len, prepared, registry, rows, stage1)?
             else {
                 return Ok(());
             };
@@ -6435,7 +6375,6 @@ impl HvfVmState {
         len: usize,
         prepared: PreparedProcessAliasRetirement,
         registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
-        authority_state: AliasRetirementAuthorityState,
         rows: AliasRetirementRows,
         stage1: Option<Stage1UnpublicationReceipt<'_>>,
     ) -> Result<Option<StaleAliasRetirement>, TrapError> {
@@ -6480,22 +6419,12 @@ impl HvfVmState {
                 },
             ) {
                 AliasUnmapCommit::Retired(actual) => actual,
-                AliasUnmapCommit::Stale { live_leases } => {
+                AliasUnmapCommit::Stale { live_leases: _ } => {
                     let writers = visible_revisions.map_or_else(
                         || "[unplanned registered retirement]".to_owned(),
                         |revisions| revisions.writers_since(&aliases),
                     );
                     drop(aliases);
-                    // A pre-applied retirement already committed its inventory
-                    // with this plan inside the replacement's own commit; it
-                    // cannot restart.
-                    if authority_state != AliasRetirementAuthorityState::Pending {
-                        carrick_fatal!(
-                            "hvpatch::host_alias",
-                            "HVPatch pre-applied alias retirement went stale: va={va:#x} len={len:#x} mm={:?} planned={planned_leases:x?} live={live_leases:x?} writers={writers}",
-                            self.mm_root_slot,
-                        );
-                    }
                     return Ok(Some(StaleAliasRetirement { writers }));
                 }
             };
@@ -6558,39 +6487,55 @@ impl HvfVmState {
             }
             return Ok(None);
         };
-        let apply_result = match authority_state {
-            AliasRetirementAuthorityState::Pending => {
-                let reservation = reservation.ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "alias retirement has no prepared inventory reservation".to_owned(),
-                    )
-                })?;
-                // Kernel publication and backend decrement are one step under
-                // the frame registry; see `apply_inventory_lease_retirement`.
-                Self::apply_inventory_lease_retirement(
-                    &self.frame_inventory.ledger,
-                    &retirement,
-                    reservation,
-                    |commit| {
-                        authority
-                            .apply(commit)
-                            .map_err(|error| TrapError::Hypervisor(error.to_string()))
-                    },
-                )
-            }
-            AliasRetirementAuthorityState::AppliedWithReplacement => {
-                if reservation.is_some() {
-                    return Err(TrapError::Hypervisor(
-                        "preapplied alias retirement retained a second inventory reservation"
-                            .to_owned(),
-                    ));
+        let derived_stage1;
+        let stage1 = match stage1 {
+            Some(receipt) => receipt,
+            None => {
+                let end = va
+                    .checked_add(len as u64)
+                    .ok_or_else(|| TrapError::MappingTooLarge(len as u64))?;
+                let mut retired = Vec::new();
+                for row in &read_rows {
+                    let row_end = row.start.saturating_add(row.size as u64);
+                    let mut page = va.max(row.start) & !0xfff;
+                    let limit = end.min(row_end);
+                    while page < limit {
+                        retired.push((page, row.ipa + (page - row.start)));
+                        page = page.saturating_add(4096);
+                    }
                 }
-                // `publish_frame_grant` applied and committed it with the
-                // grant, through the same single step.
-                Ok(())
+                derived_stage1 = self
+                    .page_tables_authority()
+                    .verified_replacement_unpublication(va, len, retired)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "alias retirement did not verify its exact displaced stage-1 leaves"
+                                .to_owned(),
+                        )
+                    })?;
+                Stage1UnpublicationReceipt::EditorRange(&derived_stage1)
             }
         };
-        if let Err(error) = apply_result {
+        let reservation = reservation.ok_or_else(|| {
+            TrapError::Hypervisor(
+                "alias retirement has no prepared inventory reservation".to_owned(),
+            )
+        })?;
+        // Kernel publication and backend decrement are one step under the
+        // frame registry; see `apply_inventory_lease_retirement`.
+        let apply_result = Self::apply_inventory_lease_retirement(
+            &custody,
+            &self.frame_inventory.ledger,
+            &retirement,
+            stage1,
+            reservation,
+            |commit| {
+                authority
+                    .apply(commit)
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))
+            },
+        );
+        if let Err(error) = &apply_result {
             // Name the retirement, not just the id that failed. This abort used
             // to print one MappingId and nothing else, which cannot distinguish
             // a double-retire from a mapping the authority never saw, and gives
@@ -6621,16 +6566,7 @@ impl HvfVmState {
                 inventory.extents.len(),
             );
         }
-        let frame_absence = if stage1.is_none() {
-            Some(
-                crate::trap::frame_inventory::Stage1UnpublishedFrames::after_alias_retirement(
-                    authority.as_ref(),
-                    &retirement,
-                )?,
-            )
-        } else {
-            None
-        };
+        let (_, mut stage1_reference_proofs) = apply_result?;
         let scope = CowInventoryLifecycleScope {
             custody: &custody,
             identity: Some(identity),
@@ -6667,17 +6603,12 @@ impl HvfVmState {
                         "HVPatch alias retirement IPA 0x{ipa:x} size {length} has no exact inventory owner"
                     ))
             })?;
-            let receipt = if let Some(stage1) = stage1 {
-                stage1
-            } else {
-                let absence = frame_absence.as_ref().ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "grant rollback lost its frame-absence fallback".to_owned(),
-                    )
-                })?;
-                Stage1UnpublicationReceipt::FrameAbsence(absence)
-            };
-            self.retire_stage2_extent(receipt, ipa, length)?;
+            let proof = stage1_reference_proofs.remove(&(ipa, length)).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "alias retirement {ipa:#x}/{length:#x} did not cross the stage-1 reference ledger"
+                ))
+            })?;
+            retire_released_cow_stage2_owner(&custody, Some(proof), ipa, length)?;
             let retired = [retired];
             let cleanup = mutate_known_external_alias_state(
                 AliasWriterActor::Mm {

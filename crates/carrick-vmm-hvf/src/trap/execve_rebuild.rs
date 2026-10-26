@@ -219,7 +219,7 @@ impl PendingExecStage2Cleanup {
                 .release_with(
                     &mut registry,
                     Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
-                    |lease| custody.carrier_stage2_records.lock().get(&lease).copied(),
+                    |lease| global_frame_stage2_identity_in(custody, lease.0, lease.1),
                 )?
                 .1
         };

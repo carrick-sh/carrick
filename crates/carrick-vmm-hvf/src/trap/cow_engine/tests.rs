@@ -795,12 +795,12 @@ fn in_order(body: &str, needles: &[&str]) {
     }
 }
 
-/// The guest lane publishes a replacement grant instead of declining it,
-/// but retires nothing before EL1's receipt: the grant's alias is held back
-/// in the MM's ledger (never registered beside its predecessor), and only
-/// the host lane folds the retirement into the grant's commit.
+/// Every lane publishes a replacement grant without retiring its predecessor
+/// before EL1's receipt: the grant's alias is held back in the MM's ledger
+/// (never registered beside its predecessor), then completion retires through
+/// the exact old-leaf and reference-ledger crossing.
 #[test]
-fn guest_lane_replacement_grant_defers_retirement_and_registration() {
+fn replacement_grant_defers_retirement_and_registration_until_stage1_completion() {
     let source = include_str!("../cow_engine.rs");
     let prepare = fn_body(source, "fn prepare_el1_frame_grant(");
     assert!(
@@ -810,15 +810,16 @@ fn guest_lane_replacement_grant_defers_retirement_and_registration() {
     in_order(
         prepare,
         &[
-            "Some(planned) if guest_lane => (None, Some(planned.planned_leases))",
-            "Some(planned) => (Some(planned), None)",
+            "let predecessor_leases = planned.map(|planned| planned.planned_leases)",
             "publish_frame_grant(",
-            "if let Some(retirement) = retirement.take()",
-            "commit_preapplied_process_alias_retirement(",
             "if predecessor_leases.is_none()",
             "self.el1_grant_publications.lock().insert(pending)",
             "transition.commit()",
         ],
+    );
+    assert!(
+        !prepare.contains("commit_process_alias_retirement("),
+        "preparation must not retire stage-2 before EL1 settles stage-1"
     );
     assert_eq!(
         prepare.matches("register_shared_alias(").count(),

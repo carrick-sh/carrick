@@ -357,6 +357,42 @@ fn stage1_primary_in_pool(base: u64) -> bool {
 }
 
 impl Stage1Authority {
+    /// Authenticate a completed replacement against the live stage-1 image
+    /// and bind the exact former translations to a retirement receipt.
+    ///
+    /// EL1 descriptor publication and host sparse publication both settle
+    /// before their displaced physical owners retire.  Their callers retain
+    /// the former `(va, ipa)` leaves from the admitted replacement plan; this
+    /// conversion succeeds only when none of those leaves remains current in
+    /// the same authority image.
+    pub fn verified_replacement_unpublication(
+        &self,
+        va: u64,
+        len: usize,
+        retired: Vec<(u64, u64)>,
+    ) -> Option<Stage1LeafRetired> {
+        if len == 0 || retired.is_empty() {
+            return None;
+        }
+        let end = va.checked_add(len as u64)?;
+        let inner = self.inner.lock();
+        let image_generation = inner.manager.generation?;
+        let manager = inner.manager.as_ref()?;
+        if retired.iter().any(|&(page, old_ipa)| {
+            page < va || page >= end || manager.translate(page) == Some(old_ipa)
+        }) {
+            return None;
+        }
+        Some(Stage1LeafRetired {
+            authority: self.authority_id(),
+            image_generation,
+            va,
+            len,
+            retired,
+            _tlbi: TlbiComplete,
+        })
+    }
+
     /// Convert EL1's verified COW transaction into the same exact old-leaf
     /// retirement capability as a host `edit_unpublishing`. The descriptor
     /// receipt authenticates the transaction and completed TLBI; the live

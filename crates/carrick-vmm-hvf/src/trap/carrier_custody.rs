@@ -485,7 +485,6 @@ impl From<NeverPublishedRecord> for Stage2RetirementProof {
 pub(crate) enum Stage1UnpublicationReceipt<'a> {
     EditorRange(&'a carrick_aarch64::stage1_authority::Stage1LeafRetired),
     TableArena(&'a carrick_mmu_core::aarch64::TableArenaDetached),
-    FrameAbsence(&'a super::frame_inventory::Stage1UnpublishedFrames),
     Inventory(&'a carrick_core::mm::retirement::Stage1UnpublishedMm),
     #[allow(dead_code)] // consumed by the frame-ledger path as callers migrate
     NeverPublished(&'a NeverPublishedRecord),
@@ -895,12 +894,6 @@ impl CarrierVmCustody {
             }
             Stage1UnpublicationReceipt::TableArena(receipt) => {
                 self.stage1_unpublished_by_retired_arena(identity, receipt)
-            }
-            Stage1UnpublicationReceipt::FrameAbsence(receipt) => {
-                let snapshot = self.stage2_record_snapshot(identity.record_id)?;
-                receipt
-                    .covers(snapshot.ipa, snapshot.len)
-                    .then_some(DirectStage1RetirementProof { identity })
             }
             Stage1UnpublicationReceipt::Inventory(receipt) => {
                 Some(self.stage1_unpublished_by_inventory_commit(identity, receipt))

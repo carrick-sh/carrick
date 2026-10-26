@@ -271,76 +271,6 @@ pub(crate) struct CowInventorySplit {
     pub(crate) retirement: CowInventoryRetirementDecision,
 }
 
-/// VM-wide proof that the frame inventory no longer publishes any stage-1
-/// mapping backed by these exact stage-2 extents. The fields are private so a
-/// caller cannot substitute a per-MM page-table sample for the Kernel's global
-/// reverse-map count.
-#[derive(::core::fmt::Debug)]
-pub(crate) struct Stage1UnpublishedFrames {
-    extents: std::collections::BTreeSet<(u64, u64)>,
-}
-
-impl Stage1UnpublishedFrames {
-    pub(crate) fn covers(&self, ipa: u64, len: usize) -> bool {
-        self.extents.contains(&(ipa, len as u64))
-    }
-
-    pub(crate) fn after_alias_retirement(
-        authority: &dyn carrick_hal::FrameCowAuthority,
-        retirement: &InventoryLeaseRetirement,
-    ) -> Result<Self, TrapError> {
-        for &frame in &retirement.frames {
-            if authority
-                .frame_mapping_count(frame)
-                .map_err(|error| TrapError::Hypervisor(error.to_string()))?
-                != Some(0)
-            {
-                return Err(TrapError::Hypervisor(format!(
-                    "alias stage-2 retirement retained a live VM-wide mapping for {frame:?}"
-                )));
-            }
-        }
-        let extents = retirement
-            .stage2_leases
-            .iter()
-            .copied()
-            .filter(|lease| {
-                retirement
-                    .mappings
-                    .iter()
-                    .filter(|(_, extent)| (extent.stage2_base, extent.stage2_length) == *lease)
-                    .all(|(_, extent)| retirement.frames.contains(&extent.frame))
-            })
-            .collect();
-        Ok(Self { extents })
-    }
-
-    fn after_declined_retirement(
-        authority: &dyn carrick_hal::FrameCowAuthority,
-        remainder: &DeclinedLeaseRemainder,
-    ) -> Result<Self, TrapError> {
-        for &frame in &remainder.frames {
-            if authority
-                .frame_mapping_count(frame)
-                .map_err(|error| TrapError::Hypervisor(error.to_string()))?
-                .is_some()
-            {
-                return Err(TrapError::Hypervisor(format!(
-                    "declined stage-2 retirement retained a live VM-wide mapping for {frame:?}"
-                )));
-            }
-        }
-        Ok(Self {
-            extents: [(
-                remainder.projection.physical_ipa,
-                remainder.projection.physical_length,
-            )]
-            .into_iter()
-            .collect(),
-        })
-    }
-}
-
 /// A stage-2 lease as one alias row names it: the physical extent and the
 /// exact global-owner incarnation the row was published under. Inventory
 /// retirement selects only extents of that incarnation. An IPA is recycled to
@@ -603,9 +533,6 @@ impl InventoryFrameRegistry {
                 receipt.names(lease.0, lease.1 as usize)
             }
             Stage1UnpublicationReceipt::TableArena(receipt) => receipt.base() == lease.0,
-            Stage1UnpublicationReceipt::FrameAbsence(receipt) => {
-                receipt.covers(lease.0, lease.1 as usize)
-            }
             Stage1UnpublicationReceipt::Inventory(_) => true,
             Stage1UnpublicationReceipt::NeverPublished(receipt) => {
                 identity == Some(receipt.identity())
@@ -1596,35 +1523,6 @@ pub(crate) fn final_exec_physical_extents(
 pub(crate) mod tests;
 
 impl HvfVmState {
-    pub(crate) fn retire_stage2_extent(
-        &mut self,
-        stage1: Stage1UnpublicationReceipt<'_>,
-        ipa: u64,
-        length: u64,
-    ) -> Result<(), TrapError> {
-        #[cfg(not(test))]
-        {
-            let custody = std::sync::Arc::clone(&self.custody);
-            Self::retire_stage2_extent_from_mappings_in(
-                &custody,
-                &mut self.mappings,
-                stage1,
-                ipa,
-                length,
-            )
-        }
-        #[cfg(test)]
-        {
-            Self::retire_stage2_extent_from_mappings_in(
-                legacy_test_carrier_vm_custody(),
-                &mut self.mappings,
-                stage1,
-                ipa,
-                length,
-            )
-        }
-    }
-
     pub(crate) fn retire_stage2_extent_from_mappings_in(
         custody: &CarrierVmCustody,
         mappings: &mut TaskMappingIndex,
@@ -2152,19 +2050,29 @@ impl HvfVmState {
     /// tests of the ledger arithmetic alone.
     #[cfg(test)]
     pub(crate) fn commit_inventory_lease_retirement(
+        custody: &CarrierVmCustody,
         inventory: &mut HvpatchFrameInventory,
         retirement: &InventoryLeaseRetirement,
-    ) -> Result<(), TrapError> {
+        receipt: Stage1UnpublicationReceipt<'_>,
+    ) -> Result<std::collections::BTreeMap<(u64, u64), Stage1Unpublished>, TrapError> {
         let frames = std::sync::Arc::clone(&inventory.frames);
         let mut registry = frames.lock();
-        Self::commit_inventory_lease_retirement_in(inventory, &mut registry, retirement)
+        Self::commit_inventory_lease_retirement_in(
+            inventory,
+            &mut registry,
+            retirement,
+            receipt,
+            |lease| global_frame_stage2_identity_in(custody, lease.0, lease.1),
+        )
     }
 
     fn commit_inventory_lease_retirement_in(
         inventory: &mut HvpatchFrameInventory,
         registry: &mut InventoryFrameRegistry,
         retirement: &InventoryLeaseRetirement,
-    ) -> Result<(), TrapError> {
+        receipt: Stage1UnpublicationReceipt<'_>,
+        mut identity_for: impl FnMut((u64, u64)) -> Option<CarrierStage2RecordIdentity>,
+    ) -> Result<std::collections::BTreeMap<(u64, u64), Stage1Unpublished>, TrapError> {
         let mut removed = Vec::with_capacity(retirement.mappings.len());
         for &(key, expected) in &retirement.mappings {
             let actual = inventory.extents.remove(&key).ok_or_else(|| {
@@ -2179,16 +2087,24 @@ impl HvfVmState {
             }
             removed.push((key, actual));
         }
+        let mut proofs = std::collections::BTreeMap::new();
         for (key, extent) in removed {
             decrement_inventory_reference(&mut registry.references, extent.frame)?;
             decrement_inventory_reference(
                 &mut registry.extent_references,
                 (extent.frame, key.0, key.1),
             )?;
-            decrement_inventory_reference(
-                &mut registry.stage2_references,
-                (extent.stage2_base, extent.stage2_length),
-            )?;
+            let lease = (extent.stage2_base, extent.stage2_length);
+            if let Some(proof) = registry
+                .release_stage2_reference(lease, identity_for(lease), receipt)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "release alias-retirement stage-2 reference {lease:?}: {error:?}"
+                    ))
+                })?
+            {
+                proofs.insert(lease, proof);
+            }
             if retirement.frames.contains(&extent.frame)
                 && matches!(extent.backing, InventoryBackingIdentity::SharedFile { .. })
             {
@@ -2212,7 +2128,7 @@ impl HvfVmState {
         for (&lease, &population_complete) in &retirement.stage2_population_complete {
             reconcile_carrier_stage2_authority_retention(registry, lease, population_complete);
         }
-        Ok(())
+        Ok(proofs)
     }
 
     /// Apply an unmap/alias lease retirement's Kernel commit and drop its
@@ -2235,25 +2151,51 @@ impl HvfVmState {
     /// ledger refusal then is a carrier fault. `reservation` must have room
     /// for [`InventoryLeaseRetirement::event_count`] events.
     pub(crate) fn apply_inventory_lease_retirement<R>(
+        custody: &CarrierVmCustody,
         ledger: &parking_lot::Mutex<HvpatchFrameInventory>,
         retirement: &InventoryLeaseRetirement,
+        receipt: Stage1UnpublicationReceipt<'_>,
         mut reservation: carrick_hal::FrameInventoryReservation,
         apply: impl FnOnce(carrick_hal::FrameInventoryCommit<()>) -> Result<R, TrapError>,
-    ) -> Result<R, TrapError> {
+    ) -> Result<(R, std::collections::BTreeMap<(u64, u64), Stage1Unpublished>), TrapError> {
         let mut inventory = ledger.lock();
         let frames = std::sync::Arc::clone(&inventory.frames);
         let mut registry = frames.lock();
         Self::stage_conditional_lease_retirement(&registry, &mut reservation, retirement)?;
         let applied = apply(reservation.commit(()))?;
-        if let Err(error) =
-            Self::commit_inventory_lease_retirement_in(&mut inventory, &mut registry, retirement)
-        {
+        let mut proofs = Self::commit_inventory_lease_retirement_in(
+            &mut inventory,
+            &mut registry,
+            retirement,
+            receipt,
+            |lease| global_frame_stage2_identity_in(custody, lease.0, lease.1),
+        )
+        .unwrap_or_else(|error| {
             carrick_fatal!(
                 "hvpatch::frame_inventory",
                 "commit HVPatch lease retirement backend ledger after its Kernel apply: {error}"
-            );
+            )
+        });
+        let deferred = proofs
+            .keys()
+            .copied()
+            .filter(|lease| !retirement.stage2_leases.contains(lease))
+            .collect::<Vec<_>>();
+        for lease in deferred {
+            let proof = proofs
+                .remove(&lease)
+                .expect("deferred zero-reference proof remains owned");
+            let identity = proof.identity();
+            if custody.request_released_stage2_record_retirement(identity, proof)
+                != CarrierStage2RetireOutcome::DeferredActivePins
+            {
+                carrick_fatal!(
+                    "hvpatch::frame_inventory",
+                    "deferred alias retirement {lease:?} could not retain its zero-reference proof"
+                );
+            }
         }
-        Ok(applied)
+        Ok((applied, proofs))
     }
 
     /// Push `RetireFrameIfLastUnmap` for each frame this retirement unmaps
@@ -2347,25 +2289,14 @@ impl HvfVmState {
             else {
                 continue;
             };
-            let stage1 = if let Some(stage1) = custody.claim_stage2_retirement(record_identity) {
-                Stage2RetirementProof::from(stage1)
-            } else {
-                let absence =
-                    Stage1UnpublishedFrames::after_declined_retirement(authority, &remainder)?;
-                Stage2RetirementProof::Unpublished(
-                    custody
-                        .stage1_unpublished_from_receipt(
-                            record_identity,
-                            Stage1UnpublicationReceipt::FrameAbsence(&absence),
-                        )
-                        .ok_or_else(|| {
-                            TrapError::Hypervisor(
-                                "declined stage-2 retirement absence did not cover its record"
-                                    .to_owned(),
-                            )
-                        })?,
-                )
-            };
+            let stage1 = custody
+                .claim_stage2_retirement(record_identity)
+                .map(Stage2RetirementProof::from)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(format!(
+                        "declined stage-2 retirement {lease:?} lost its pending zero-reference proof"
+                    ))
+                })?;
             match retire_global_frame_host_owner_if_generation_in(
                 custody,
                 stage1,
@@ -3775,7 +3706,7 @@ impl HvfVmState {
             staged.release_with(
                 &mut registry,
                 Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
-                |lease| custody.carrier_stage2_records.lock().get(&lease).copied(),
+                |lease| global_frame_stage2_identity_in(custody, lease.0, lease.1),
             )?
         };
 

@@ -5,6 +5,43 @@
 use super::*;
 use crate::trap::frame_inventory_backend_tests::*;
 
+fn test_leaf_retirement_receipt(ipa: u64) -> carrick_aarch64::stage1_authority::Stage1LeafRetired {
+    let authority = carrick_aarch64::Stage1Authority::new();
+    let builder = || {
+        Ok::<_, carrick_mmu_core::aarch64::PageTableError>(
+            carrick_mmu_core::aarch64::PageTableManager::new(
+                carrick_mem::memory::stage1_hvpatch_page_tables(),
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            ),
+        )
+    };
+    let va = 0x5000_0000;
+    authority
+        .edit(crate::trap::test_stage1_edit_license(), builder, |editor| {
+            editor
+                .map_aliased(
+                    va,
+                    ipa,
+                    0x1000,
+                    carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    authority
+        .edit_unpublishing(
+            crate::trap::test_stage1_edit_license(),
+            builder,
+            va,
+            0x1000,
+            |editor| editor.invalidate(va, 0x1000).map(|_| ()),
+        )
+        .unwrap()
+        .1
+        .unwrap()
+}
+
 fn retire_test_process_mappings(task: &mut HvfTaskState) -> Result<(), TrapError> {
     let proof = prepare_test_whole_mm_retirement(task);
     HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(task, proof)
@@ -115,7 +152,7 @@ fn el1_partial_discard_peer_retention_three_scales() {
             .release_with(
                 &mut parent.frames.lock(),
                 Stage1UnpublicationReceipt::Inventory(&parent_proof),
-                |lease| custody.carrier_stage2_records.lock().get(&lease).copied(),
+                |lease| global_frame_stage2_identity_in(&custody, lease.0, lease.1),
             )
             .unwrap()
             .0;
@@ -147,7 +184,7 @@ fn el1_partial_discard_peer_retention_three_scales() {
             .release_with(
                 &mut child.frames.lock(),
                 Stage1UnpublicationReceipt::Inventory(&child_proof),
-                |lease| custody.carrier_stage2_records.lock().get(&lease).copied(),
+                |lease| global_frame_stage2_identity_in(&custody, lease.0, lease.1),
             )
             .unwrap()
             .0;
@@ -4934,8 +4971,15 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
     .expect("plan alias retirement with an out-of-population Kernel mapping");
     assert!(retirement.stage2_leases.is_empty());
 
-    HvfVmState::commit_inventory_lease_retirement(&mut inventory, &retirement)
-        .expect("commit alias backend retirement");
+    let custody = legacy_test_carrier_vm_custody();
+    let receipt = test_leaf_retirement_receipt(key.0);
+    HvfVmState::commit_inventory_lease_retirement(
+        custody,
+        &mut inventory,
+        &retirement,
+        Stage1UnpublicationReceipt::EditorRange(&receipt),
+    )
+    .expect("commit alias backend retirement");
     assert!(
         !frames.lock().stage2_references.contains_key(&key),
         "alias retirement must remove its last backend reference",
@@ -8341,9 +8385,14 @@ fn an_unmap_retirement_racing_a_sibling_unmap_carries_the_conditional_retire() {
     );
     HvfVmState::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
     let mut carried = false;
+    let custody = legacy_test_carrier_vm_custody();
+    let receipt = test_leaf_retirement_receipt(key.0);
+    assert!(receipt.names(key.0, key.1 as usize));
     HvfVmState::apply_inventory_lease_retirement(
+        custody,
         &unmapping.frame_inventory.ledger,
         &retirement,
+        Stage1UnpublicationReceipt::EditorRange(&receipt),
         reservation,
         |commit| {
             carried = commit.batch().events().iter().any(|event| {
@@ -8563,11 +8612,7 @@ pub(crate) fn assert_fork_child_exec_retirement(
             &mut child.frames.lock(),
             Stage1UnpublicationReceipt::Inventory(&stage1),
             |lease| {
-                legacy_test_carrier_vm_custody()
-                    .carrier_stage2_records
-                    .lock()
-                    .get(&lease)
-                    .copied()
+                global_frame_stage2_identity_in(legacy_test_carrier_vm_custody(), lease.0, lease.1)
             },
         )
         .expect("release child stage-2 references after stage-1")
@@ -8637,9 +8682,14 @@ fn a_sibling_exit_cannot_decide_between_an_unmap_apply_and_its_backend_decrement
         carrick_hal::FrameCowAuthority::reserve(kernel.as_ref(), 0, 0, retirement.event_count())
             .unwrap();
     HvfVmState::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
+    let custody = legacy_test_carrier_vm_custody();
+    let receipt = test_leaf_retirement_receipt(key.0);
+    assert!(receipt.names(key.0, key.1 as usize));
     HvfVmState::apply_inventory_lease_retirement(
+        custody,
         &unmapping.frame_inventory.ledger,
         &retirement,
+        Stage1UnpublicationReceipt::EditorRange(&receipt),
         reservation,
         |commit| {
             carrick_hal::FrameCowAuthority::apply(kernel.as_ref(), commit)

@@ -301,22 +301,14 @@ pub(super) fn prepare(
 pub(super) fn publish_frame_grant(
     context: &PublicationContext<'_>,
     request: carrick_hal::El1FrameGrantRequest,
-    retirement: Option<&InventoryLeaseRetirement>,
     _registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
 ) -> Result<PublishedFrameGrant, TrapError> {
-    publish_frame_grant_backing(
-        context,
-        request,
-        retirement,
-        SparseExtentBacking::Anon,
-        _registry,
-    )
+    publish_frame_grant_backing(context, request, SparseExtentBacking::Anon, _registry)
 }
 
 fn publish_frame_grant_backing(
     context: &PublicationContext<'_>,
     request: carrick_hal::El1FrameGrantRequest,
-    retirement: Option<&InventoryLeaseRetirement>,
     backing: SparseExtentBacking<'_>,
     _registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
 ) -> Result<PublishedFrameGrant, TrapError> {
@@ -326,16 +318,9 @@ fn publish_frame_grant_backing(
         .ok_or_else(|| TrapError::Hypervisor("EL1 frame-grant range overflow".to_owned()))?;
     let semantic_len =
         usize::try_from(request.len).map_err(|_| TrapError::MappingTooLarge(request.len))?;
-    let retirement_events = retirement.map_or(0, InventoryLeaseRetirement::event_count);
-    let mut reservation = context
-        .authority
-        .reserve(1, 1, 2usize.saturating_add(retirement_events))
-        .map_err(|error| {
-            TrapError::Hypervisor(format!("reserve EL1 frame-grant inventory: {error}"))
-        })?;
-    if let Some(retirement) = retirement {
-        HvfVmState::stage_inventory_lease_retirement(&mut reservation, retirement)?;
-    }
+    let mut reservation = context.authority.reserve(1, 1, 2).map_err(|error| {
+        TrapError::Hypervisor(format!("reserve EL1 frame-grant inventory: {error}"))
+    })?;
     let PreparedSparseBacking {
         physical_host,
         semantic_host,
@@ -407,17 +392,7 @@ fn publish_frame_grant_backing(
             .map(|applied| (challenge, applied))
             .map_err(|error| TrapError::Hypervisor(error.to_string()))
     };
-    // A folded predecessor retirement publishes and drops its backend
-    // references as one step with the grant (`apply_inventory_lease_retirement`).
-    let applied = match retirement {
-        None => apply_grant(reservation.commit(())),
-        Some(retirement) => HvfVmState::apply_inventory_lease_retirement(
-            &context.state.frame_inventory.ledger,
-            retirement,
-            reservation,
-            apply_grant,
-        ),
-    };
+    let applied = apply_grant(reservation.commit(()));
     let (challenge, (receipt, authenticated_owner_generation)) = match applied {
         Ok(applied) => applied,
         Err(error) => {
@@ -445,15 +420,6 @@ fn publish_frame_grant_backing(
         || !receipt.authorizes(inventory_mapping.mapping, inventory_mapping.frame)
         || authenticated_owner_generation.raw_for_probe() != owner_generation
     {
-        if retirement.is_some() {
-            carrick_fatal!(
-                "hvpatch::el1_frame_grant",
-                "combined replacement grant failed post-commit authentication: mm={} semantic_base=0x{:x} len=0x{:x}",
-                request.mm_key,
-                request.semantic_base,
-                request.len,
-            );
-        }
         if let Err(error) = context.authority.rollback_frame_grant(&receipt) {
             carrick_fatal!(
                 "hvpatch::el1_frame_grant",
@@ -2662,7 +2628,6 @@ impl PublicationContext<'static> {
                 len: window.range.len(),
                 permissions: window.protection.bits(),
             },
-            None,
             match source_bytes.as_deref() {
                 Some(bytes) => SparseExtentBacking::SeededAnon { bytes },
                 None => SparseExtentBacking::Anon,
@@ -3252,7 +3217,6 @@ impl PublicationContext<'static> {
                 len: range.len(),
                 permissions: protection.bits(),
             },
-            None,
             SparseExtentBacking::SeededAnon { bytes: &bytes },
             &registry,
         )?;
