@@ -1007,6 +1007,7 @@ pub(super) mod tests {
 
         for mm in [901_u64, 902] {
             let tables = carrick_aarch64::Stage1Authority::new();
+            assert!(tables.bind_mm(mm));
             let manager = carrick_mmu_core::aarch64::PageTableManager::new(
                 carrick_mem::memory::stage1_hvpatch_page_tables(),
                 crate::memory::LINUX_PAGE_TABLES_BASE,
@@ -1037,7 +1038,7 @@ pub(super) mod tests {
                 let owner = backing(&custody, ipa);
                 tables
                     .edit(
-                        crate::trap::test_stage1_edit_license(),
+                        crate::trap::test_stage1_edit_license_for(&tables),
                         || unreachable!("installed manager"),
                         |editor| {
                             editor
@@ -1068,7 +1069,7 @@ pub(super) mod tests {
                 ));
                 let (_, receipt) = tables
                     .edit_unpublishing(
-                        crate::trap::test_stage1_edit_license(),
+                        crate::trap::test_stage1_edit_license_for(&tables),
                         || unreachable!("installed manager"),
                         va,
                         4096,

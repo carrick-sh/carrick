@@ -1316,6 +1316,10 @@ struct LendingInvalidator {
 }
 
 impl carrick_hal::ForeignMmInvalidator for LendingInvalidator {
+    fn editor_excluded(&self) -> Option<&carrick_guest_mem::El1EditorExcluded> {
+        self.inner.editor_excluded()
+    }
+
     fn invalidate_exact_asid(
         &mut self,
         binding: carrick_hal::ForeignMmBinding,
@@ -2513,7 +2517,7 @@ fn rx_ptrace_text_cow_case(guest: bool) {
             expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
             calls: 0,
             fail_call: None,
-            editor: None,
+            editor: (!guest).then(|| TestEditorExclusion::unpublished(child.snapshot.mm.get())),
         },
         caller: guest.then(|| ModelCallerEl1::new(&child, Box::new(|| {}))),
     };
@@ -2693,7 +2697,7 @@ fn ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span() {
         expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
         calls: 0,
         fail_call: None,
-        editor: None,
+        editor: Some(TestEditorExclusion::unpublished(child.snapshot.mm.get())),
     };
     let rejected = lease.break_cow_prepared_ptrace_text(
         &mut invalidator,
@@ -2834,7 +2838,7 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
         expected: carrick_hal::ForeignMmSnapshot::binding(&child.snapshot),
         calls: 0,
         fail_call: None,
-        editor: None,
+        editor: Some(TestEditorExclusion::unpublished(child.snapshot.mm.get())),
     };
     let cow = lease
         .break_cow_prepared_ptrace_text(
@@ -3109,7 +3113,7 @@ fn concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit() {
             expected: expected_binding,
             calls: 0,
             fail_call: None,
-            editor: None,
+            editor: Some(TestEditorExclusion::unpublished(snap1.mm.get())),
         };
         lease_clone1.break_cow(&mut invalidator, &snap1, GuestVa::new(TEST_VA), 4, deadline)
     });
@@ -3119,7 +3123,7 @@ fn concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit() {
             expected: expected_binding,
             calls: 0,
             fail_call: None,
-            editor: None,
+            editor: Some(TestEditorExclusion::unpublished(snap2.mm.get())),
         };
         lease_clone2.break_cow(&mut invalidator, &snap2, GuestVa::new(TEST_VA), 4, deadline)
     });
@@ -9100,6 +9104,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
         .expect("register global frame host owner");
 
     let mut task = HvfTaskState::neutral();
+    assert!(task.page_tables_authority().bind_mm(1));
     task.persistent_vm_lifecycle = true;
     task.mm_root_slot = Some((0x9a00_f000_0000, 0x20_0000));
     task.container_root = ContainerRootToken::from_raw(250);
