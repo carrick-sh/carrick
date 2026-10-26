@@ -1434,6 +1434,52 @@ fn a_service_record_is_never_switched_in() {
     assert_eq!(zone.record(service).handback(), Some(Handback::Service));
 }
 
+/// An idle executor may install a native record's MM. That installation is
+/// not host execution custody for another record sharing the same MM.
+/// Otherwise the next host-owned thread can fault/forward with no executor
+/// to settle it, and the driver's error path parks with that record OnCpu.
+#[test]
+fn idle_native_mm_does_not_license_a_host_owned_successor() {
+    for native_successor in [false, true] {
+        let zone = zone();
+        host_publish(&zone, SLOT, 0, Some(0), 0);
+        zone.enter_guest(SLOT);
+        let space = zone.spaces.publish_closed(MM, 0x1000, 0x1000).unwrap();
+        zone.spaces.open(space);
+        let first = zone.alloc_record(identity(1)).unwrap();
+        assert!(zone.mark_native_owned(first));
+        zone.requeue_preempted(SLOT, first);
+        assert_eq!(zone.switch_in(SLOT), Some(first));
+        assert!(zone.install_space(SLOT, MM).is_some());
+        assert_eq!(
+            zone.release_current(SLOT, first, &HostWait),
+            CurrentRelease::Released
+        );
+
+        let next = zone.alloc_record(identity(2)).unwrap();
+        if native_successor {
+            assert!(zone.mark_native_owned(next));
+        }
+        zone.requeue_preempted(SLOT, next);
+        assert!(!zone.executor_has_task(SLOT));
+        assert_eq!(zone.installed_space(SLOT), MM);
+        if native_successor {
+            assert!(!zone.head_needs_host(SLOT));
+            assert_eq!(zone.switch_in(SLOT), Some(next));
+        } else {
+            assert!(
+                zone.head_needs_host(SLOT),
+                "same MM cannot supply host custody"
+            );
+            assert_eq!(zone.switch_in(SLOT), None);
+            assert_eq!(zone.slot(SLOT).current(), None);
+            zone.leave_guest(SLOT, &HostWait);
+            assert_eq!(zone.take_service_head(SLOT).unwrap().id, next);
+            assert!(zone.leave_slot(SLOT, u64::from(SLOT.raw()) + 1, &mut |_| {}, &mut |_| {}));
+        }
+    }
+}
+
 /// Host placement: a service thread goes to an idle slot of any address
 /// space; a thread ready at EL0 only to a slot running its address space,
 /// else nowhere (the host serves it). A running or WFI target owes a
