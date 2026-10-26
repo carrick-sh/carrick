@@ -1650,12 +1650,16 @@ pub(crate) fn leave_driven_zone_slot() {
         if carrick_kernel::el1_zone::leave_slot(slot, driver, None) {
             DRIVEN_ZONE_SLOT.with(|cell| cell.set(None));
         } else {
-            carrick_fatal!(
-                "vcpu_loop::el1_zone",
+            fail_zone_slot(format_args!(
                 "EL1 zone driver {driver} tried to park while {slot:?} retained a switched record"
-            );
+            ));
         }
     }
+}
+
+/// One carrier-fault boundary for a refused zone-slot custody transition.
+fn fail_zone_slot(message: std::fmt::Arguments<'_>) -> ! {
+    carrick_fatal!("vcpu_loop::el1_zone", "{message}");
 }
 
 /// Load and exec attach through one entry-admission decision. Without a
@@ -1734,12 +1738,11 @@ fn publish_zone_slot(
         // thread left on it goes to the host first.
         carrick_kernel::el1_zone::hand_back_foreign_timer(zone_slot);
         if !zone.reset_slot(zone_slot) {
-            carrick_fatal!(
-                "vcpu_loop::el1_zone",
+            fail_zone_slot(format_args!(
                 "EL1 zone slot {slot} still held threads when a task was loaded on it: \
                  current={held:?} host_record={host_record:?} queued={queued} \
                  loading mm={mm:#x} serial={serial} driver={driver}"
-            );
+            ));
         }
         // Threads queued here for another address space stay: EL1 leaves
         // the vCPU for this executor when one reaches the head, and the

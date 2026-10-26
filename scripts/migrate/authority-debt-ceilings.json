@@ -3525,7 +3525,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:vcpu_loop::el1_zone",
-      "owner": "carrick_runtime::vcpu_loop::executor::backend::publish_zone_slot",
+      "owner": "carrick_runtime::vcpu_loop::executor::backend::fail_zone_slot",
       "lane": "shared",
       "ceiling": 1
     },
