@@ -1461,9 +1461,22 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         }
         match exit? {
             carrick_aarch64::Aarch64Exit::Halt => Ok(GuestIdleExit::Idle),
-            other => Err(TrapError::Hypervisor(format!(
-                "a vCPU waiting in the guest left at EL0 ({other:?}) with no address space installed"
-            ))),
+            other => {
+                let held = zone.slot(slot).current().map(|record| {
+                    let rec = zone.record(record);
+                    (
+                        zone.record_ref(record),
+                        rec.claim(),
+                        rec.is_native_owned(),
+                        rec.identity(),
+                    )
+                });
+                Err(TrapError::Hypervisor(format!(
+                    "a vCPU waiting in the guest left at EL0 ({other:?}) with no host task loaded: \
+                     slot={slot:?} installed_mm={} current=(reference, claim, native, identity) {held:?}",
+                    zone.installed_space(slot),
+                )))
+            }
         }
     }
 
