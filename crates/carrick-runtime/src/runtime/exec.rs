@@ -777,7 +777,8 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let dispatcher = SyscallDispatcher::new();
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
-        drop(dispatcher);
+        // A released origin cannot prove a native child's authority.
+        let _origin = dispatcher;
         let load_errno = || {
             let spelling = path.to_str().unwrap();
             let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
@@ -876,7 +877,8 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let dispatcher = SyscallDispatcher::new();
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
-        drop(dispatcher);
+        // A released origin cannot prove a native child's authority.
+        let _origin = dispatcher;
 
         let spelling = path.to_str().unwrap();
         let argv = b"static-successor\0";
