@@ -3893,6 +3893,7 @@ fn main() {
         }
         "stack-guard" => stack_guard_mode(2),
         "stack-guard-armed" => stack_guard_mode(3),
+        "stack-guard-armed-store" => stack_guard_mode(5),
         "guard-user-pointer" => guard_user_pointer_mode(),
         "exec-child" => {
             println!("exec-child ok");
