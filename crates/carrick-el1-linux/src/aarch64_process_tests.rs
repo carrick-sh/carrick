@@ -1167,13 +1167,33 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
             .bind_initial_root(index, successor_mm.raw(), ttbr, ttbr)
     );
 
-    assert!(
-        service
-            .adopt_exec_successor(identity, receipt, &manifest)
-            .is_ok(),
-        "the first exec after a fork/exit must use slot 7 incarnation 2"
-    );
+    let admitted = slot.prepare_adoption().unwrap();
+    assert_eq!(admitted.incarnation(), NonZeroU64::new(2).unwrap());
+    let successor = service
+        .adopt_exec_successor(identity, receipt, &manifest)
+        .expect("the first exec after a fork/exit must use slot 7 incarnation 2");
     slot.commit();
+    let notifications = fixture
+        .zone
+        .space_entry(NonZeroU64::new(successor_mm.raw()).unwrap())
+        .unwrap()
+        .notifications(NonZeroU64::new(2).unwrap())
+        .unwrap();
+    let cause = carrick_sched_core::spaces::notification::SpaceWaitCause::Gate;
+    let before = notifications.observe(cause).revision();
+    // Exercise the production physical switch with the admitted successor's
+    // notification source. The test crossing deliberately refuses only the
+    // final host settlement, after the real gate and install transitions.
+    assert_eq!(
+        service.finish_exec_successor(fixture.address, successor.address),
+        Err(NativeProcessError::Unsupported),
+    );
+    assert!(fixture.zone.spaces.is_open(successor_mm.raw()));
+    assert_eq!(notifications.observe(cause).revision(), before + 1);
+    assert_eq!(
+        fixture.zone.installed_space(fixture.slot),
+        successor_mm.raw()
+    );
 }
 
 #[test]

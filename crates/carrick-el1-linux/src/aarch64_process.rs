@@ -1399,7 +1399,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             crate::sched::ThreadCpu::set_translation(&mut crate::sched::HardwareCpu, idle, idle);
         }
         self.zone.release_space(self.slot);
-        self.zone.spaces.open(successor_index);
+        Aarch64Venue::space_access(self.zone, self.slot).open(successor_index);
         let successor_grant = self
             .zone
             .install_space(self.slot, successor_mm.raw())
