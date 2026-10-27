@@ -4728,12 +4728,46 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         waker: SlotId,
         effects: &mut WakeEffects,
     ) -> bool {
+        self.prompt_native(reference, None, waker, effects)
+    }
+
+    /// A slot whose executor leaves EL1 took `timer` off its timer
+    /// ([`Self::take_foreign_timer`]). A native-owned member has no host
+    /// thread to re-run its timed call, so it stays in the zone: its exact
+    /// park is detached and queued on `waker` like a checkpoint prompt, and
+    /// its retained operation re-parks with what is left of its deadline
+    /// (an untimed wake is a permitted spurious return for a futex). `None`:
+    /// not a native member, so the host claims it. `Some(false)`: a waker or
+    /// a later park won the record first.
+    pub fn requeue_native_timed_park(
+        &self,
+        timer: ForeignTimer,
+        waker: SlotId,
+        effects: &mut WakeEffects,
+    ) -> Option<bool> {
+        let rec = self.record(timer.record.id);
+        if rec.incarnation() != timer.record.incarnation || !rec.is_native_owned() {
+            return None;
+        }
+        Some(self.prompt_native(timer.record, Some(timer.seq), waker, effects))
+    }
+
+    fn prompt_native(
+        &self,
+        reference: RecordRef,
+        exact_park: Option<u32>,
+        waker: SlotId,
+        effects: &mut WakeEffects,
+    ) -> bool {
         let rec = self.record(reference.id);
         loop {
             if rec.incarnation() != reference.incarnation || !rec.is_native_owned() {
                 return false;
             }
             match rec.claim() {
+                Claim::Parked { seq } if exact_park.is_some_and(|exact| exact != seq) => {
+                    return false;
+                }
                 from @ Claim::Parked { .. } => {
                     let Some(transfer) = self.begin_host_transfer(reference, from) else {
                         continue;
@@ -4752,6 +4786,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     effects.queued_own = true;
                     return true;
                 }
+                // The timed park this exact ticket named already ended.
+                _ if exact_park.is_some() => return false,
                 Claim::Queued { slot, .. }
                 | Claim::OnCpu { slot, .. }
                 | Claim::OnCpuRequested { slot, .. } => {
