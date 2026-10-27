@@ -1276,3 +1276,195 @@ fn composed_native_supply(
     );
     stock.shutdown();
 }
+
+/// #856: a native fork child's anonymous-memory call that finds its MM's
+/// root held by a sibling edit made no effect. It has no host venue, so a
+/// forward ends as ENOSYS (musl then leaves a new thread's stack PROT_NONE
+/// and the child takes SIGSEGV). It must wait for the root's release and
+/// run the unchanged call again from its own `svc`.
+#[test]
+fn native_contended_memory_edit_waits_and_replays_the_unchanged_call() {
+    use carrick_personality_linux::lifecycle::{MemoryEditWait, ProcessNative};
+    for release_before_enroll in [false, true] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        fixture.zone.spaces.set_idle_ttbr(0x30000);
+        let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+        let pages: Vec<_> = (0..16).map(|index| 0x20000 + index * 4096).collect();
+        let crossing = TestStockCrossing::new(&pages);
+        *crossing.zone.lock().unwrap() = Some(fixture.zone);
+        let crossing = Box::leak(Box::new(crossing));
+        let mut service = Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &*crossing,
+        )
+        .with_words(words);
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        let mut cpu = crate::sched::FakeCpu::default();
+        frame.x[8] = 220;
+        frame.x[0] = 17;
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+        assert!((frame.x[0] as i64) > 0);
+        fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+        fixture.task.mm.key.store(0, Ordering::Release);
+        let counters = carrick_el1_abi::Counters::new();
+        let mut handoff = None;
+        let mut zone = crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        };
+        assert_eq!(
+            crate::dispatch::native_scheduler(
+                &mut zone,
+                &fixture.task,
+                &counters,
+                fixture.slot,
+                &mut handoff
+            )
+            .idle_entry(&mut frame, 0),
+            carrick_el1_abi::Action::Served
+        );
+        let child = fixture.zone.slot(fixture.slot).current().unwrap();
+        let identity = fixture.zone.record(child).identity();
+        let owner = registry()
+            .for_record(fixture.zone, fixture.zone.record_ref(child))
+            .unwrap();
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        assert!(matches!(
+            resume_selected(
+                &owner,
+                registry(),
+                source,
+                &fixture.task,
+                child,
+                &mut service
+            ),
+            super::super::native_process_runtime::NativeResume::NoPending
+        ));
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+        let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+        let index = access.find(identity.mm).unwrap();
+        let child_root = access.grant(index, identity.mm).unwrap().ttbr0;
+        let mm = ReservationMm::new(identity.mm).unwrap();
+        // The child's mprotect trapped at its svc; the sibling holds the root.
+        frame = carrick_el1_abi::TrapFrame::default();
+        frame.esr = 0x5600_0000;
+        frame.elr = 0x40_1238;
+        frame.x[8] = 226;
+        frame.x[0] = VA;
+        frame.x[1] = 4096;
+        frame.x[2] = 3;
+        let mut sibling = Some(
+            fixture
+                .region
+                .table()
+                .lock_in(access, index.index(), mm, 7)
+                .unwrap(),
+        );
+        let mut saved = Aarch64ParkedContext::ZERO;
+        crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+        let waited = with_process_entry(
+            source,
+            &fixture.task,
+            &saved.native,
+            child_root,
+            page,
+            control,
+            &mut service,
+            |entry| {
+                let wait = entry
+                    .observe_memory_edit(carrick_el1_abi::PortalWaitCause::Reservations)
+                    .expect("a native member samples its exact MM before the edit");
+                if release_before_enroll {
+                    drop(sibling.take());
+                }
+                let waited = entry.wait_memory_edit(wait).unwrap();
+                assert_eq!(
+                    entry.take_handoff_receipt().is_some(),
+                    !release_before_enroll
+                );
+                waited
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.task.service_notice.take().unwrap(),
+            None,
+            "ring contention must not request host service"
+        );
+        if release_before_enroll {
+            assert!(
+                matches!(waited, MemoryEditWait::Ready),
+                "a release in the sample gap retries the call at once"
+            );
+            assert_eq!(page.claimed_count(), 0);
+            continue;
+        }
+        assert!(matches!(
+            waited,
+            MemoryEditWait::Parked(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            })
+        ));
+        // Parked on the root's release with the unchanged call, resuming at
+        // its own svc instead of skipping it.
+        let parked = unsafe { *fixture.zone.record(child).ctx_mut() };
+        assert_eq!(parked.native.pc, 0x40_1234, "the call replays from its svc");
+        assert_eq!(
+            (
+                parked.native.x[0],
+                parked.native.x[1],
+                parked.native.x[2],
+                parked.native.x[8]
+            ),
+            (VA, 4096, 3, 226)
+        );
+        crate::sched::finish_entry(
+            fixture.zone,
+            fixture.slot,
+            &mut cpu,
+            carrick_el1_abi::Action::Idle,
+        );
+        drop(sibling.take());
+        let mut handoff = None;
+        let mut zone = crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        };
+        assert_eq!(
+            crate::dispatch::native_scheduler(
+                &mut zone,
+                &fixture.task,
+                &counters,
+                fixture.slot,
+                &mut handoff
+            )
+            .idle_entry(&mut frame, 0),
+            carrick_el1_abi::Action::Served
+        );
+        assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+        assert!(matches!(
+            resume_selected(
+                &owner,
+                registry(),
+                source,
+                &fixture.task,
+                child,
+                &mut service
+            ),
+            super::super::native_process_runtime::NativeResume::NoPending
+        ));
+        assert_eq!(page.claimed_count(), 0);
+        assert!(!fixture.zone.record(child).has_object_operation());
+    }
+}

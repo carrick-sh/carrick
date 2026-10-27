@@ -810,6 +810,11 @@ pub enum DelegatedAnonymous {
     /// The host venue runs the same root for the unchanged syscall. Any
     /// proposal was refused first, so the root is exactly as before.
     Forward,
+    /// No effect occurred: another vCPU held this MM's root or descriptor
+    /// editor for its own short edit. A thread with a host venue forwards
+    /// as for [`Self::Forward`]; a native member, which has none, waits for
+    /// the named cause and runs the unchanged call again.
+    Contended(carrick_el1_abi::PortalWaitCause),
 }
 
 /// brk/mmap/munmap/mprotect for an MM whose shared reservation root is
@@ -942,9 +947,16 @@ pub fn serve_delegated_anonymous<
         DelegatedAnonymous::Forward
     };
     use carrick_el1_abi::AnonymousLeave as Leave;
-    // Busy: the host venue holds the root; it serves the syscall itself.
+    let contended = |why: carrick_el1_abi::AnonymousLeave, cause| {
+        counters.anonymous_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
+        DelegatedAnonymous::Contended(cause)
+    };
+    // Busy: the host venue or a sibling EL1 edit holds the root.
     let Ok(mut model) = table.lock_in(spaces, index.index(), mm, frame.slot as u32) else {
-        return forward(Leave::RootBusy);
+        return contended(
+            Leave::RootBusy,
+            carrick_el1_abi::PortalWaitCause::Reservations,
+        );
     };
     let mut pending = match decide_reservation_syscall(frame, current, &mut model, file) {
         ReservationDisposition::Return(value) => {
@@ -963,6 +975,9 @@ pub fn serve_delegated_anonymous<
         |pending: PendingReservationSyscall, model: &mut ReservationModel<'_, G, C>, why: Leave| {
             // The proposal is this guard's own; refusing it cannot be stale.
             let _ = pending.cancel(model);
+            if why == Leave::EditorBusy {
+                return contended(why, carrick_el1_abi::PortalWaitCause::Editor);
+            }
             forward(why)
         };
     let (Some(grant), Some(owner)) = (spaces.grant(index, mm_key), NonZeroU64::new(frame.slot + 1))
@@ -2448,7 +2463,7 @@ mod tests {
         }
 
         #[test]
-        fn delegated_busy_root_or_unservable_step_forwards_with_the_root_unchanged() {
+        fn delegated_busy_root_or_editor_is_contended_and_unservable_step_forwards() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
             let task = mm(&spaces, &table, 17, true);
             let mut editor = Editor::over(RangeBacking::Empty);
@@ -2461,7 +2476,9 @@ mod tests {
                 SYS_MMAP,
                 mmap_fixed(ARENA, 0x2000),
             );
-            // The host venue holds the root: forward, the host runs it.
+            // Another holder has the root: no effect, contended on the
+            // root's release. A host-venue caller forwards and the host runs
+            // it; a native member waits and runs it again (#856).
             {
                 let _host = root(&spaces, &table, &task);
                 let (route, _) = syscall(
@@ -2473,7 +2490,38 @@ mod tests {
                     SYS_MUNMAP,
                     [ARENA, 0x2000, 0, 0, 0, 0],
                 );
-                assert_eq!(route, DelegatedAnonymous::Forward);
+                assert_eq!(
+                    route,
+                    DelegatedAnonymous::Contended(carrick_el1_abi::PortalWaitCause::Reservations)
+                );
+            }
+            // A sibling holds the MM's descriptor editor: the proposal is
+            // refused, the root unchanged, and the call contended on it.
+            {
+                let generation = root(&spaces, &table, &task).generation();
+                let _sibling = spaces
+                    .try_begin_edit(
+                        spaces.find(task.key).unwrap(),
+                        task.key,
+                        NonZeroU64::new(99).unwrap(),
+                    )
+                    .unwrap();
+                let (route, _) = syscall(
+                    &task,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MPROTECT,
+                    [ARENA, 0x1000, PROT_READ, 0, 0, 0],
+                );
+                assert_eq!(
+                    route,
+                    DelegatedAnonymous::Contended(carrick_el1_abi::PortalWaitCause::Editor)
+                );
+                let model = root(&spaces, &table, &task);
+                assert!(model.pending().is_none());
+                assert_eq!(model.generation(), generation);
             }
             // A step EL1 cannot take refuses the proposal, then forwards.
             let mut widening = Editor::over(RangeBacking::Private);
@@ -2518,9 +2566,10 @@ mod tests {
                     ReservationRange::new(ARENA, ARENA + 0x2000).unwrap()
                 );
             }
+            // Contended calls made no effect and are not forwards.
             assert_eq!(
                 counters.forwarded[SYS_MUNMAP as usize].load(Ordering::Relaxed),
-                2
+                1
             );
             assert_eq!(
                 counters.forwarded[SYS_MPROTECT as usize].load(Ordering::Relaxed),

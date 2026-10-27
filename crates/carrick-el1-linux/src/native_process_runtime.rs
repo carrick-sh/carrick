@@ -6923,6 +6923,51 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn take_handoff_receipt(&mut self) -> Option<EntryHandoffReceipt<C>> {
         self.handoff.take()
     }
+    fn observe_memory_edit(
+        &self,
+        cause: carrick_core_abi::PortalWaitCause,
+    ) -> Option<carrick_core_abi::PortalOwnerWait> {
+        use carrick_sched_core::spaces::notification::SpaceWaitCause;
+        let handle = self
+            .control
+            .service
+            .bound_mm(self.record, self.binding.thread_generation)
+            .ok()?;
+        let source = self
+            .source
+            .zone
+            .space_entry(NonZeroU64::new(handle.mm().raw())?)?
+            .notifications(handle.incarnation())
+            .ok()?;
+        let revision = source
+            .observe(match cause {
+                carrick_core_abi::PortalWaitCause::Reservations => SpaceWaitCause::Reservations,
+                carrick_core_abi::PortalWaitCause::Editor => SpaceWaitCause::Editor,
+                _ => return None,
+            })
+            .revision();
+        // SAFETY: the exact bound MM's own cause source, sampled before the
+        // caller's edit attempt.
+        Some(unsafe { carrick_core_abi::PortalOwnerWait::from_owner(handle, cause, revision) })
+    }
+    fn wait_memory_edit(
+        &mut self,
+        wait: carrick_core_abi::PortalOwnerWait,
+    ) -> Option<carrick_personality_linux::lifecycle::MemoryEditWait> {
+        use carrick_personality_linux::lifecycle::MemoryEditWait;
+        Some(match self.begin_replay_wait(wait) {
+            Ok(NativeResume::Left(None)) => MemoryEditWait::Parked(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            }),
+            Ok(NativeResume::NoPending) => MemoryEditWait::Ready,
+            Ok(NativeResume::Returned(result)) => MemoryEditWait::Parked(returned(result.raw())),
+            Ok(_) => MemoryEditWait::Parked(
+                self.run_failed(NativeProcessError::Quarantined.run_failure_reason()),
+            ),
+            Err(error) => MemoryEditWait::Parked(self.run_failed(error.run_failure_reason())),
+        })
+    }
     fn fork(&mut self, mut child_tid: ProcessForkChildTid) -> LifecycleOutcome {
         // A suspended parent is woken by the child's in-ring release, which
         // an EL1 waker can place only for a native-owned record. A

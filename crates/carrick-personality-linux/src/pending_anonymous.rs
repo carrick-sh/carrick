@@ -7,6 +7,19 @@ pub enum DelegatedStep {
     PreparedConflict,
     Served(SyscallResult),
     Forward,
+    /// No effect occurred; a sibling edit held the MM's root or editor.
+    /// `Some` is the caller's owner wait, sampled before the attempt, for a
+    /// thread with no host venue; `None` forwards like [`Self::Forward`].
+    Contended(Option<carrick_core_abi::PortalOwnerWait>),
+}
+/// How a contended native edit continued.
+pub enum ContendedPark {
+    /// The thread waits for its cause and then runs the same call again.
+    Parked(FamilyCompletion),
+    /// The cause already moved since the sample: attempt the call again.
+    Retry,
+    /// This venue cannot wait: the call forwards.
+    Unsupported,
 }
 pub enum PermissionStep {
     Forward,
@@ -24,6 +37,10 @@ pub trait PendingAnonymousVenue {
     fn task_state(&self) -> Option<&LinuxTaskState>;
     fn delegated(&mut self) -> DelegatedStep;
     fn park_prepared(&mut self) -> Option<FamilyCompletion>;
+    /// Wait on `wait` and replay the unchanged call (native members only).
+    fn park_contended(&mut self, _wait: carrick_core_abi::PortalOwnerWait) -> ContendedPark {
+        ContendedPark::Unsupported
+    }
     fn permission(&mut self) -> PermissionStep;
     fn retirement(&mut self) -> RetirementStep;
     fn install_result(&mut self, result: SyscallResult);
@@ -36,16 +53,26 @@ pub fn serve(
     venue: &mut (impl PendingAnonymousVenue + ?Sized),
 ) -> FamilyCompletion {
     let original = venue.original_argument0();
-    match venue.delegated() {
-        DelegatedStep::PreparedConflict => {
-            return venue.park_prepared().unwrap_or(FamilyCompletion::Handback);
+    // Each retry follows a sibling edit that completed after the sample.
+    loop {
+        match venue.delegated() {
+            DelegatedStep::PreparedConflict => {
+                return venue.park_prepared().unwrap_or(FamilyCompletion::Handback);
+            }
+            DelegatedStep::Served(result) => {
+                record_original(venue, original);
+                return FamilyCompletion::Complete(result.raw());
+            }
+            DelegatedStep::Contended(Some(wait)) => match venue.park_contended(wait) {
+                ContendedPark::Parked(completion) => return completion,
+                ContendedPark::Retry => continue,
+                ContendedPark::Unsupported => return FamilyCompletion::Forward,
+            },
+            DelegatedStep::Forward | DelegatedStep::Contended(None) => {
+                return FamilyCompletion::Forward;
+            }
+            DelegatedStep::NotDelegated => break,
         }
-        DelegatedStep::Served(result) => {
-            record_original(venue, original);
-            return FamilyCompletion::Complete(result.raw());
-        }
-        DelegatedStep::Forward => return FamilyCompletion::Forward,
-        DelegatedStep::NotDelegated => {}
     }
     match call {
         AnonymousCall::Mprotect => match venue.permission() {

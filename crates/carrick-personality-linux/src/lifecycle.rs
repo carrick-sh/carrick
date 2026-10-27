@@ -346,6 +346,31 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn signal_venue(&mut self) -> Option<&mut dyn crate::signal::ProcessSignals> {
         None
     }
+    /// Sample this thread's exact-MM `cause` before an in-ring memory edit
+    /// that a sibling's edit can hold off. `None`: the thread has a host
+    /// venue, which serves a contended call itself.
+    fn observe_memory_edit(
+        &self,
+        _cause: carrick_core_abi::PortalWaitCause,
+    ) -> Option<carrick_core_abi::PortalOwnerWait> {
+        None
+    }
+    /// Wait on `wait`, sampled before a contended edit, then run the
+    /// unchanged call again. `None`: this venue cannot wait.
+    fn wait_memory_edit(
+        &mut self,
+        _wait: carrick_core_abi::PortalOwnerWait,
+    ) -> Option<MemoryEditWait> {
+        None
+    }
+}
+
+/// How a native thread's wait for a contended memory edit continued.
+pub enum MemoryEditWait {
+    /// Parked; the call runs again when the cause moves.
+    Parked(LifecycleOutcome),
+    /// The cause moved after the sample: attempt the call again now.
+    Ready,
 }
 
 pub use carrick_core::personality::UserCopy;

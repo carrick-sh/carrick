@@ -247,7 +247,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, fault_sequence, None, ServicePayload::None, false)
+        self.begin_service_inner(operation, fault_sequence, None, ServicePayload::None, false, false)
     }
     /// Supply one nonresident user page needed to stage an exec request, then
     /// retry the exact SVC. A refused supply remains an ordinary `EFAULT` from
@@ -264,6 +264,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             owner_wait,
             ServicePayload::None,
             true,
+            false,
         )
     }
     pub fn begin_exec_service(
@@ -367,6 +368,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 map,
             }),
             false,
+            false,
         )
     }
     /// Whether the calling thread's ring credentials are still exactly the
@@ -389,7 +391,45 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         wait: carrick_core_abi::PortalOwnerWait,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, None, Some(wait), ServicePayload::None, false)
+        self.begin_service_inner(operation, None, Some(wait), ServicePayload::None, false, false)
+    }
+    /// Park this syscall, which made no effect, on the producer observed
+    /// before its contended edit; it runs again from its own instruction.
+    pub fn begin_replay_wait(
+        &mut self,
+        wait: carrick_core_abi::PortalOwnerWait,
+    ) -> Result<NativeResume, NativeProcessError> {
+        self.begin_service_inner(
+            ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Exception,
+            },
+            None,
+            Some(wait),
+            ServicePayload::None,
+            false,
+            true,
+        )
+    }
+    /// The process closed while this member trapped, so no service may
+    /// begin: a sibling's exit_group or fatal signal won the race. Linux
+    /// ends the thread with its group; it takes the pending exit here
+    /// instead of failing the carrier.
+    #[inline(never)]
+    fn leave_for_closing(&mut self) -> Result<NativeResume, NativeProcessError> {
+        let outcome = self.resume_pending_lifecycle();
+        if self.run_failure.is_some() {
+            return Err(NativeProcessError::Quarantined);
+        }
+        match outcome {
+            // A root exit stays with the entry owner, which crosses it.
+            Some(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }) => Ok(NativeResume::Left(None)),
+            Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),
+            None => Err(NativeProcessError::Busy),
+            Some(_) => Err(NativeProcessError::Quarantined),
+        }
     }
     #[inline(never)]
     fn begin_service_inner(
@@ -399,6 +439,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
         payload: ServicePayload,
         retry_syscall_after_supply: bool,
+        replay: bool,
     ) -> Result<NativeResume, NativeProcessError> {
         let (exec_payload, host_file) = match (operation, payload) {
             (ServiceOperation::Exec { .. }, ServicePayload::Exec(payload)) => (Some(payload), None),
@@ -509,9 +550,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .transpose()?;
         let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
             .map_err(|_| NativeProcessError::Busy)?;
+        let closing = !claim.admitted();
         let published = {
             let graph = self.runtime.graph.lock();
-            if !claim.admitted() || graph.has_member_wait(&self.record) {
+            if closing || graph.has_member_wait(&self.record) {
                 Err(NativeProcessError::Busy)
             } else if let Some(wait) = owner_wait {
                 self.control
@@ -536,6 +578,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Err(error) => {
                 drop(owner_queue);
                 self.release_service_claim(claim)?;
+                if closing {
+                    return self.leave_for_closing();
+                }
                 return Err(error);
             }
         };
@@ -569,7 +614,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         drop(owner_queue);
         if let Some(wait) = owner_wait {
-            return self.park_owner_wait(&request, wait);
+            return self.park_owner_wait(&request, wait, replay);
         }
         if let Err(error) = self
             .current
@@ -693,7 +738,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         if let Some(result) = completion {
             return match result {
-                ServiceResult::Wait(wait) => self.park_owner_wait(request, wait),
+                ServiceResult::Wait(wait) => self.park_owner_wait(request, wait, false),
                 _ => self.finish_service(
                     request,
                     result,
@@ -742,6 +787,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         request: &ServiceRequest,
         wait: carrick_core_abi::PortalOwnerWait,
+        replay: bool,
     ) -> Result<NativeResume, NativeProcessError> {
         use carrick_sched_core::object_wait::ObjectWaitError;
         let zone = self.source.zone;
@@ -785,9 +831,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 {
                     return Err(ObjectWaitError::Changed);
                 }
+                let mut words = *self.words;
+                if replay && !words.replay_syscall_entry() {
+                    return Err(ObjectWaitError::Stale);
+                }
                 // SAFETY: this slot owns the admitted native record and saved context.
                 unsafe {
-                    *zone.record(self.record.id).ctx_mut() = *self.words;
+                    *zone.record(self.record.id).ctx_mut() = words;
                 }
                 Ok((self.record.id, false))
             },
@@ -1466,7 +1516,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .lock()
                         .insert_member_wait(self.record, MemberWait::Service(pending));
                     drop(queue);
-                    return self.park_owner_wait(&next, wait);
+                    return self.park_owner_wait(&next, wait, false);
                 }
                 Err(_) => result = ServiceResult::Refused,
             }
