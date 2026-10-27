@@ -775,8 +775,25 @@ fn arm_process_registry_moves_bounded_handles() {
     assert!(core::mem::size_of::<Task>() <= 64);
     assert!(core::mem::size_of::<super::process_owner::GuestRetiring<Native>>() <= 128);
 }
+/// The exact thread that parked a process-keyed continuation. Only that
+/// thread's entry may resume it; a sibling's syscall runs normally.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ContinuationOwner {
+    control: usize,
+    tid: u32,
+}
+impl ContinuationOwner {
+    fn of(control: &ThreadControlSlot, tid: u32) -> Self {
+        Self {
+            control: core::ptr::from_ref(control).addr(),
+            tid,
+        }
+    }
+}
+
 struct PendingWait {
     caller: TaskKey,
+    owner: ContinuationOwner,
     query: WaitQuery,
     status: UserVa,
     output: PendingWaitOutput,
@@ -962,6 +979,7 @@ enum PendingIpcPayload {
 #[allow(dead_code)]
 struct PendingIpc {
     caller: TaskKey,
+    owner: ContinuationOwner,
     channel: Arc<WaitChannel>,
     precheck_gen: TaskWakeGeneration,
     payload: PendingIpcPayload,
@@ -1042,6 +1060,13 @@ impl<'a> PendingTable<'a> {
     }
     fn contains_key(&self, key: &TaskKey) -> bool {
         self.get(key).is_some()
+    }
+    /// Whether `key`'s retained wait/IPC continuation belongs to this thread.
+    fn parked_by(&self, key: &TaskKey, owner: ContinuationOwner) -> bool {
+        self.get(key).is_some_and(|pending| match pending {
+            PendingContinuation::Wait(wait) => wait.owner == owner,
+            PendingContinuation::Ipc(ipc) => ipc.owner == owner,
+        })
     }
     fn insert(&mut self, key: TaskKey, pending: PendingContinuation) {
         self.insert_row(PendingKey::Operation(key), PendingState::Operation(pending));
@@ -3177,7 +3202,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
-        let owner_continuation = graph.pending.contains_key(&key)
+        let owner_continuation = graph
+            .pending
+            .parked_by(&key, ContinuationOwner::of(control, calling_tid))
             || graph
                 .pending
                 .exit(&key)
@@ -3335,11 +3362,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
-        let owner_continuation = graph.pending.contains_key(&member.process)
-            || graph
-                .pending
-                .exit(&member.process)
-                .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
+        let owner_continuation = graph.pending.parked_by(
+            &member.process,
+            ContinuationOwner::of(member_control, calling_tid),
+        ) || graph
+            .pending
+            .exit(&member.process)
+            .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
         drop(graph);
         Ok((
             binding,
@@ -3578,6 +3607,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 {
     pub fn calling_tid(&self) -> u32 {
         self.calling_tid
+    }
+    fn continuation_owner(&self) -> ContinuationOwner {
+        ContinuationOwner::of(self.control, self.calling_tid)
+    }
+    /// Whether this entering thread parked the process's retained operation.
+    pub(super) fn owns_parked_operation(&self) -> bool {
+        self.runtime
+            .graph
+            .lock()
+            .pending
+            .parked_by(&self.key, self.continuation_owner())
     }
     pub fn set_calling_tid(&mut self, tid: u32) {
         self.calling_tid = tid;
@@ -3998,6 +4038,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         precheck.wake_generation(),
                         PendingContinuation::Wait(PendingWait {
                             caller: self.key,
+                            owner: self.continuation_owner(),
                             query,
                             status,
                             output,
@@ -4199,7 +4240,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(error) => self.fail(error),
             });
         }
-        let pending = self.runtime.graph.lock().pending.remove(&self.key)?;
+        let pending = {
+            let mut graph = self.runtime.graph.lock();
+            // A sibling's entry never consumes another thread's parked operation.
+            if !graph
+                .pending
+                .parked_by(&self.key, self.continuation_owner())
+            {
+                return None;
+            }
+            graph.pending.remove(&self.key)?
+        };
         match pending {
             PendingContinuation::Wait(pending) => {
                 if pending.caller != self.key
@@ -4486,6 +4537,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.key,
             PendingContinuation::Ipc(PendingIpc {
                 caller: self.key,
+                owner: self.continuation_owner(),
                 channel,
                 precheck_gen,
                 payload,

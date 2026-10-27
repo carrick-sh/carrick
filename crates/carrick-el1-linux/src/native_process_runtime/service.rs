@@ -361,7 +361,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .transpose()?;
         let carrier_continuation =
             matches!(operation, ServiceOperation::CarrierWork { .. }).then(|| {
-                if self.runtime.graph.lock().pending.contains_key(&self.key) {
+                if self.owns_parked_operation() {
                     CarrierContinuation::Parked(self.key)
                 } else {
                     CarrierContinuation::Completed(SyscallResult::new(
@@ -1424,8 +1424,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             Ok(NativeResume::Returned(result))
                         }
                         Some(CarrierContinuation::Parked(caller))
-                            if caller == self.key
-                                && self.runtime.graph.lock().pending.contains_key(&caller) =>
+                            if caller == self.key && self.owns_parked_operation() =>
                         {
                             // Re-drive after releasing the service claim below.
                             // No scheduling scalar can complete this operation.
