@@ -1280,7 +1280,13 @@ pub(crate) fn prepare_global_exec_plan(
 }
 
 /// Who serves the successor's anonymous `mmap` arena.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 enum ExecAnonymousArena {
     /// The host process materializes the sparse arena. Its leaves keep their
     /// identity output as PROT_NONE until the host's own `mmap` replaces it.
