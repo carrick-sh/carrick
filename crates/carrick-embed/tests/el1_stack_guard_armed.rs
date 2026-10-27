@@ -1,5 +1,8 @@
 //! Signed witness (#369): an EL1 stack overflow taken while a user-copy
-//! fixup is armed still fails loud as a typed stack overflow. The guarded
+//! fixup is armed still fails loud as a typed stack overflow. A frame
+//! allocation moves SP into the guard first, so the vector's SP test stops
+//! it before any fixup lookup; `el1_stack_guard_armed_store` covers the FAR
+//! test. The guarded
 //! copies refuse kernel-window user pointers before arming a fixup
 //! (`user_range_overlaps_el1_kernel`), so a guard fault under an armed fixup
 //! can only be the kernel's own overflow; taking the fixup would resume on

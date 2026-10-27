@@ -2249,6 +2249,7 @@ impl<
             // loud; a user pointer into a guard must be EFAULT (#369).
             3 => carrick_el1::alloc::run_armed_stack_guard_witness(cur_task, frame.x[1].min(64)),
             4 => carrick_el1::alloc::run_guard_user_pointer_witness(cur_task),
+            5 => carrick_el1::alloc::run_armed_guard_store_witness(cur_task),
             _ => 1,
         };
         if res == carrick_el1_abi::METADATA_GRANT_PENDING {

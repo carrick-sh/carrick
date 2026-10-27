@@ -725,6 +725,37 @@ pub fn run_armed_stack_guard_witness(
     result
 }
 
+/// Test-control witness (#369): with a user-copy fixup armed, a kernel store
+/// lands in this CPU's own stack guard while SP is still on the stack (a
+/// downward buffer overrun, not a frame allocation). The vector's SP test
+/// cannot see it; its FAR test must still fail it loud instead of taking the
+/// fixup.
+#[cfg(feature = "allocator-test-control")]
+pub fn run_armed_guard_store_witness(task: Option<&carrick_el1_abi::CurrentTask>) -> u64 {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    if let Some(task) = task {
+        unsafe extern "C" {
+            fn carrick_el1_guard_witness_landing();
+        }
+        let Some(slot) = current_el1_slot() else {
+            return 3;
+        };
+        let target = carrick_el1_abi::stack_slot_usable_base(slot) - 16;
+        task.linux.fixup_pc.store(
+            carrick_el1_guard_witness_landing as *const () as usize as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        // SAFETY: deliberately a store into this CPU's unmapped guard; it
+        // faults and never completes.
+        unsafe { core::ptr::write_volatile(target as *mut u64, 0) };
+        task.linux
+            .fixup_pc
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    let _ = task;
+    1
+}
+
 /// Test-control witness (#369): a user pointer into an EL1 stack guard is
 /// EFAULT from the guarded copy (Carrick's access_ok), never a guard fault.
 /// Returns 0 when the copy refused the range.
