@@ -180,19 +180,23 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
         "one bounded child-root installation"
     );
     assert_eq!(fixture.zone.installed_space(fixture.slot), identity.mm);
+    // Acknowledged CarrierWork returns the retained machine word explicitly:
+    // the service wake's readiness scalar is never the guest's x0.
+    let resumed = super::super::aarch64_process::resume_selected(
+        &owner,
+        registry(),
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        },
+        &fixture.task,
+        child,
+        &mut service,
+    );
     assert!(matches!(
-        super::super::aarch64_process::resume_selected(
-            &owner,
-            registry(),
-            BornInZoneSource {
-                zone: fixture.zone,
-                slot: fixture.slot
-            },
-            &fixture.task,
-            child,
-            &mut service,
-        ),
-        super::super::native_process_runtime::NativeResume::NoPending
+        resumed,
+        super::super::native_process_runtime::NativeResume::Returned(result)
+            if result.raw() as u64 == saved.native.x[0]
     ));
     assert_eq!(child_page.claimed_count(), 0);
     frame.x[8] = 172; // getpid, the child's first EL0 syscall.
@@ -759,7 +763,7 @@ fn native_mm_wait_source_release_resumes_the_exact_operation() {
     two_native_children_service_waits(ServiceWitness::MmRelease);
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ServiceWitness {
     MmCancel,
     MmRelease,
@@ -811,13 +815,13 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             NativeThreadGroupOwner::Root
         );
         assert!(
-            !arm_owner_must_serve(
+            arm_owner_must_serve(
                 221,
                 0x6000_0010,
                 || arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
                 carrick_el1_abi::Lifecycle::live(fixture.page),
             ),
-            "the root continues through host exec after two native forks"
+            "strict ring-first exec belongs to the admitted root's native owner"
         );
     }
     fixture.zone.publish_slot(fixture.slot, 0, None, 0);
@@ -1241,20 +1245,35 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             );
             assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
         }
-        assert!(matches!(
-            resume_selected(
-                &owner,
-                registry(),
-                BornInZoneSource {
-                    zone: fixture.zone,
-                    slot: fixture.slot
-                },
-                &fixture.task,
-                child,
-                &mut service
-            ),
-            NativeResume::NoPending
-        ));
+        let resumed = resume_selected(
+            &owner,
+            registry(),
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            child,
+            &mut service,
+        );
+        if matches!(
+            request.operation,
+            carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+        ) {
+            // The retained machine word, not the wake's readiness scalar,
+            // resumes the carrier-work continuation.
+            let retained_x0 = match witness {
+                ServiceWitness::Retry => 42,
+                ServiceWitness::ExecRefusal => (-38_i64) as u64,
+                _ => 73,
+            };
+            assert!(
+                matches!(resumed, NativeResume::Returned(result) if result.raw() as u64 == retained_x0),
+                "{witness:?}"
+            );
+        } else {
+            assert!(matches!(resumed, NativeResume::NoPending), "{witness:?}");
+        }
         if let ServiceWitness::Exception { signal, .. } = witness {
             let signals = owner.current_signals(&fixture.task).unwrap();
             assert_eq!(
