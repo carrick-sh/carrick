@@ -165,8 +165,36 @@ jobs:
       # The job's CARGO_HOME is fresh per run. Restore verifies fixture
       # input identity offline, so populate the cache from every fixture
       # lockfile first; this is the job's only network step for fixtures.
+      # rust-cache above saves only when the whole job succeeds, so keep the
+      # downloaded registry in its own cache, saved as soon as the fetch
+      # succeeds. A warm cache makes the fetch network-free (#899).
+      - name: Locate cargo home
+        id: cargo-home
+        run: echo "dir=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cargo registry
+        id: registry
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ steps.cargo-home.outputs.dir }}/registry/index
+            ${{ steps.cargo-home.outputs.dir }}/registry/cache
+            ${{ steps.cargo-home.outputs.dir }}/git/db
+          key: hvf-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: hvf-cargo-registry-
+
       - name: Fetch fixture lockfile dependencies
         run: just xtask fixtures fetch
+
+      - name: Save cargo registry
+        if: ${{ steps.registry.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ steps.cargo-home.outputs.dir }}/registry/index
+            ${{ steps.cargo-home.outputs.dir }}/registry/cache
+            ${{ steps.cargo-home.outputs.dir }}/git/db
+          key: hvf-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       # Run the host-only source gate before the signed release steps and
       # prune its build tree immediately afterward.
