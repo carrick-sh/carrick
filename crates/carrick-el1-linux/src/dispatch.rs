@@ -836,15 +836,21 @@ fn native_stage_fault_syndrome(fault: carrick_guest_arch::FaultInfo) -> u64 {
     }
 }
 
+/// A staged host-file request, boxed so the service exit frame (a retained
+/// EL1 stack chain) does not carry it by value.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+struct StagedHostFile {
+    record: alloc::boxed::Box<[u8]>,
+    output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+    resolves_path: bool,
+    map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+}
+
 /// One staged native service request, before its owner publishes it.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 enum NativeServiceStage {
     Exec(alloc::boxed::Box<[u8]>),
-    HostFile(
-        alloc::boxed::Box<[u8]>,
-        Option<carrick_personality_linux::native_host_file::HostFileOutput>,
-        bool,
-    ),
+    HostFile(alloc::boxed::Box<StagedHostFile>),
     Fault(carrick_guest_arch::FaultInfo),
     Return(i64),
     Operation,
@@ -869,6 +875,7 @@ impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::Host
 /// its existing route; the descriptor is resolved in the caller's own ring
 /// namespace by `descriptor`.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
 fn native_host_file_stage<V: file::MemoryValidator>(
     frame: &TrapFrame,
     task: &CurrentTask,
@@ -999,6 +1006,10 @@ fn arm_native_service_exit(
                 NativeServiceStage::Return(errno.guest_retval())
             }
             Some(NativeExecStage::Fault(fault)) => NativeServiceStage::Fault(fault),
+            // Only an unserved call crosses. A call served with owed host
+            // work first settles that work (CarrierWork) and is replayed;
+            // staging it here would pre-empt the settlement forever.
+            None if action != Action::Forward => NativeServiceStage::Operation,
             None => match ipc::guest_venue(frame.slot as u32).and_then(|venue| {
                 let table = ipc::native_table(&venue, task)?;
                 native_host_file_stage(frame, task, &file::HardwareValidator, table, |fd| {
@@ -1009,7 +1020,13 @@ fn arm_native_service_exit(
                     record,
                     output,
                     resolves_path,
-                }) => NativeServiceStage::HostFile(record, output, resolves_path),
+                    map,
+                }) => NativeServiceStage::HostFile(alloc::boxed::Box::new(StagedHostFile {
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                })),
                 Some(carrick_personality_linux::native_host_file::HostFileStage::Returned(
                     result,
                 )) => NativeServiceStage::Return(result.raw()),
@@ -1060,8 +1077,8 @@ fn arm_native_service_exit(
         };
         match staged {
             NativeServiceStage::Exec(payload) => break (None, Some(payload), None, false),
-            NativeServiceStage::HostFile(record, output, resolves_path) => {
-                break (None, None, Some((record, output, resolves_path)), false);
+            NativeServiceStage::HostFile(staged) => {
+                break (None, None, Some(staged), false);
             }
             NativeServiceStage::Return(result) => {
                 frame.x[0] = result as u64;
@@ -1136,11 +1153,17 @@ fn arm_native_service_exit(
                     return Err(super::native_process_runtime::NativeProcessError::Quarantined);
                 }
                 process.begin_exec_service(payload)?
-            } else if let Some((record, output, resolves_path)) = host_file {
+            } else if let Some(staged) = host_file {
                 if service_wait.is_some() {
                     return Err(super::native_process_runtime::NativeProcessError::Quarantined);
                 }
-                process.begin_host_file_service(record, output, resolves_path)?
+                let StagedHostFile {
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                } = *staged;
+                process.begin_host_file_service(record, output, resolves_path, map)?
             } else if retry_exec_stage {
                 process.begin_exec_stage_fault_service(
                     match operation {
@@ -2286,6 +2309,22 @@ impl<
             return DelegatedStep::NotDelegated;
         };
         let access = carrick_el1::substrate::sched::object_wait::space_access(zone.tables, slot);
+        // A private file mmap the host-file venue already retained a byte
+        // source for: this is its exact retry.
+        let file = self.frame.arm_frame_ref().and_then(|frame| {
+            let args = [
+                frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+            ];
+            (frame.x[8] == carrick_personality_linux::native_host_file::LINUX_NR_MMAP.raw())
+                .then_some(())
+                .and_then(|()| {
+                    self.process.as_deref_mut().and_then(|process| {
+                        process.take_map_source(
+                            carrick_personality_linux::native_host_file::NativeMapKey::of(&args),
+                        )
+                    })
+                })
+        });
         match memory::serve_delegated_anonymous(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
@@ -2299,6 +2338,7 @@ impl<
             access,
             memory::reservations::shared_guest(),
             &mut memory::HardwareAnonymousEditor,
+            file,
         ) {
             memory::DelegatedAnonymous::PreparedConflict => DelegatedStep::PreparedConflict,
             memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
@@ -3346,6 +3386,7 @@ mod tests {
             mut record,
             output,
             resolves_path,
+            map,
         }) = native_host_file_stage(&frame, &task, &Resident, table, |_| {
             Some(NativeDescriptor::HostBacked {
                 access: DescriptionAccess::ReadWrite,
@@ -3355,6 +3396,7 @@ mod tests {
             panic!("a host-backed stdout write crosses");
         };
         assert_eq!(output, None);
+        assert_eq!(map, None, "a write stashes no mapping source");
         assert!(!resolves_path);
         let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record).unwrap();
         assert_eq!(view.input(), bytes);

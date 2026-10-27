@@ -77,6 +77,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             carrick_core::wait::space_access(zone, slot, initial_release),
             shared_x86_cpl0_guest(),
             &mut editor,
+            None,
         ) {
             carrick_el1::memory::DelegatedAnonymous::Served => {
                 DelegatedStep::Served(SyscallResult::new(self.frame.x[0] as i64))

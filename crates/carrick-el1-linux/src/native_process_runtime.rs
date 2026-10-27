@@ -1205,6 +1205,15 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     /// child and naming the parent. The child's exec commit or exit removes
     /// its row before publishing the parent's channel.
     vfork_parents: BTreeMap<TaskKey, TaskKey>,
+    /// A private file byte source retained by the host-file venue for one
+    /// record's exact `mmap`, consumed by that record's immediate retry.
+    map_sources: BTreeMap<
+        RecordRef,
+        (
+            carrick_personality_linux::native_host_file::NativeMapKey,
+            carrick_core_abi::HostBackingIdentity,
+        ),
+    >,
 }
 impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     fn has_member_wait(&self, record: &RecordRef) -> bool {
@@ -3151,6 +3160,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 uts,
                 ipc,
                 vfork_parents: BTreeMap::new(),
+                map_sources: BTreeMap::new(),
             }),
             zone: source.zone,
             ipc_channels,
@@ -6684,6 +6694,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     }
     fn copy_out_owned(&mut self, dst: UserVa, bytes: &[u8]) -> Option<bool> {
         Some(self.copy_signal_frame(dst, bytes).is_ok())
+    }
+    fn take_map_source(
+        &mut self,
+        key: carrick_personality_linux::native_host_file::NativeMapKey,
+    ) -> Option<carrick_core_abi::HostBackingIdentity> {
+        let mut graph = self.runtime.graph.lock();
+        match graph.map_sources.remove(&self.record) {
+            Some((retained, source)) if retained == key => Some(source),
+            _ => None,
+        }
     }
     fn binding(&self) -> ExecutionBinding {
         self.binding

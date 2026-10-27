@@ -149,7 +149,43 @@ pub enum HostFileCall {
         fd: i32,
         request: u64,
     },
+    /// A private file mapping (`mmap` without `MAP_ANONYMOUS`/`MAP_SHARED`).
+    MapPrivate(NativeMapKey),
 }
+
+/// The exact arguments of a private file `mmap`. The carrier retains the
+/// file as a byte source; the ring's reservation owner then maps it when the
+/// same call is retried with exactly these arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeMapKey {
+    pub address: u64,
+    pub length: u64,
+    pub prot: u64,
+    pub flags: u64,
+    pub fd: i32,
+    pub offset: u64,
+}
+
+impl NativeMapKey {
+    /// The key of an `mmap` call's six arguments.
+    pub const fn of(args: &[u64; 6]) -> Self {
+        Self {
+            address: args[0],
+            length: args[1],
+            prot: args[2],
+            flags: args[3],
+            fd: args[4] as i32,
+            offset: args[5],
+        }
+    }
+}
+
+/// Linux aarch64 `mmap` (canonical number).
+pub const LINUX_NR_MMAP: CanonicalNr = CanonicalNr(222);
+/// Linux `MAP_SHARED`, `MAP_PRIVATE`, `MAP_ANONYMOUS`.
+pub const LINUX_MAP_SHARED: u64 = 0x01;
+pub const LINUX_MAP_PRIVATE: u64 = 0x02;
+pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 
 impl HostFileCall {
     /// Decode a canonical syscall the venue may serve. `None` for every
@@ -228,6 +264,12 @@ impl HostFileCall {
                 fd,
                 request: args[1],
             },
+            c if c == LINUX_NR_MMAP
+                && args[3] & (LINUX_MAP_ANONYMOUS | LINUX_MAP_SHARED | LINUX_MAP_PRIVATE)
+                    == LINUX_MAP_PRIVATE =>
+            {
+                Self::MapPrivate(NativeMapKey::of(args))
+            }
             _ => return None,
         })
     }
@@ -277,6 +319,9 @@ pub enum HostFileStage {
         /// The carrier resolves a path, so the caller's credentials must
         /// be the authority it uses.
         resolves_path: bool,
+        /// A private file mapping: the reply is a byte source the ring maps
+        /// on the exact retried call, not a syscall result.
+        map: Option<NativeMapKey>,
     },
 }
 
@@ -361,6 +406,22 @@ impl Staging<'_, '_> {
         output: Option<HostFileOutput>,
     ) -> HostFileStage {
         let output_cap = output.map_or(0, |output| output.len);
+        self.request_with_reply(op, fd, flags, args, input, output, output_cap)
+    }
+
+    /// A request whose reply area (`output_cap`) is not copied to the user:
+    /// the ring itself consumes it (a private mapping's byte source).
+    #[allow(clippy::too_many_arguments)]
+    fn request_with_reply(
+        &self,
+        op: HostFileOp,
+        fd: i32,
+        flags: u32,
+        args: [u64; 4],
+        input: &[u8],
+        output: Option<HostFileOutput>,
+        output_cap: usize,
+    ) -> HostFileStage {
         let Some(len) = record_len(input.len(), output_cap) else {
             return errno(carrick_syscall_abi::LINUX_EINVAL);
         };
@@ -379,6 +440,7 @@ impl Staging<'_, '_> {
             record,
             output,
             resolves_path: op.resolves_path(),
+            map: None,
         }
     }
 
@@ -761,7 +823,55 @@ fn stage_call(
             // Other requests, and host-backed terminals, keep their route.
             _ => return None,
         },
+        HostFileCall::MapPrivate(key) => match staging.descriptor(key.fd)? {
+            // Linux: a pipe, eventfd or epoll has no mmap operation.
+            NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENODEV),
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { access } if !access.readable() => {
+                errno(carrick_syscall_abi::LINUX_EACCES)
+            }
+            NativeDescriptor::HostBacked { .. }
+                if key.length == 0 || key.offset % PAGE_BYTES != 0 =>
+            {
+                errno(carrick_syscall_abi::LINUX_EINVAL)
+            }
+            NativeDescriptor::HostBacked { .. } => match staging.request_with_reply(
+                HostFileOp::MapPrivate,
+                key.fd,
+                0,
+                [key.offset, key.length, 0, 0],
+                &[],
+                None,
+                host_file::MapSourceReply::BYTES,
+            ) {
+                HostFileStage::Request {
+                    record,
+                    output,
+                    resolves_path,
+                    ..
+                } => HostFileStage::Request {
+                    record,
+                    output,
+                    resolves_path,
+                    map: Some(key),
+                },
+                other => other,
+            },
+        },
     })
+}
+
+/// The byte source a private-mapping reply carries, or the syscall result
+/// that replaces the mapping (an errno, or EIO for a missing reply).
+pub fn map_source(record: &[u8]) -> Result<host_file::MapSourceReply, SyscallResult> {
+    let Some(reply) = host_file::reply(record) else {
+        return Err(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO));
+    };
+    if reply.result < 0 {
+        return Err(SyscallResult::new(reply.result));
+    }
+    host_file::MapSourceReply::decode(reply.output)
+        .ok_or(SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO))
 }
 
 /// Map the carrier's reply to the syscall result, copying any output back

@@ -35,6 +35,14 @@ const _: () = assert!(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeHostFileRefusal;
 
+/// A served record. A private-mapping record also hands the carrier the
+/// retained byte source, which it must register for the caller's MM before
+/// acknowledging (the reply names it).
+#[derive(Default)]
+pub struct NativeHostFileServed {
+    pub retained_source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+}
+
 /// A host description the venue opened for a native process: the host
 /// resource behind its `IpcBacking::Host` token, dropped when the ring
 /// releases the last descriptor naming it.
@@ -60,6 +68,10 @@ impl Drop for NativeOpenFile {
 
 enum Served {
     Reply(i64, Vec<u8>),
+    Source(
+        Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
+        carrick_core_abi::host_file::MapSourceReply,
+    ),
     Refused,
 }
 
@@ -107,7 +119,7 @@ impl SyscallDispatcher {
         &self,
         authority: Option<&NativeFsAuthority>,
         record: &mut [u8],
-    ) -> Result<(), NativeHostFileRefusal> {
+    ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let Some(owner) = self.kernel_binding.read().kernel().existing_ipc() else {
             return Err(NativeHostFileRefusal);
         };
@@ -119,7 +131,7 @@ impl SyscallDispatcher {
         owner: &Arc<HostIpc>,
         authority: Option<&NativeFsAuthority>,
         record: &mut [u8],
-    ) -> Result<(), NativeHostFileRefusal> {
+    ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
         let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal)?;
         let header = view.header();
         let table = fd::TableId::from_raw(fd::RawTableId {
@@ -149,12 +161,14 @@ impl SyscallDispatcher {
                 }
             }
         };
-        let (result, output) = match served {
-            Served::Reply(result, output) => (result, output),
+        let (result, output, retained_source) = match served {
+            Served::Reply(result, output) => (result, output, None),
+            Served::Source(source, reply) => (0, reply.encode().to_vec(), Some(source)),
             Served::Refused => return Err(NativeHostFileRefusal),
         };
         view.reply(result, &output)
-            .map_err(|_| NativeHostFileRefusal)
+            .map_err(|_| NativeHostFileRefusal)?;
+        Ok(NativeHostFileServed { retained_source })
     }
 
     fn serve_native_resource(
@@ -221,6 +235,7 @@ impl SyscallDispatcher {
             },
             // Opened read-only by this slice.
             HostFileOp::Write => Served::errno(carrick_abi::LINUX_EBADF),
+            HostFileOp::MapPrivate => self.native_map_source(description),
             HostFileOp::Openat | HostFileOp::Faccessat | HostFileOp::Newfstatat => Served::Refused,
         }
     }
@@ -401,6 +416,40 @@ impl SyscallDispatcher {
             }
             Err(InstallHostDescriptionError::NoMemory) => Served::errno(carrick_abi::LINUX_ENOMEM),
             Err(InstallHostDescriptionError::Unavailable) => Served::Refused,
+        }
+    }
+
+    /// Retain a carrier-opened regular file as a private-mapping byte source.
+    /// A directory has no mmap operation (ENODEV, as Linux).
+    fn native_map_source(&self, description: &Arc<crate::kernel::FileDescription>) -> Served {
+        let label = match description.inspect_kind(|open| match open {
+            crate::dispatch::OpenDescription::File { path, .. } => Some(Some(path.clone())),
+            crate::dispatch::OpenDescription::HostFile { metadata, .. } => {
+                Some(Some(metadata.path.to_string_lossy().into_owned()))
+            }
+            crate::dispatch::OpenDescription::Directory { .. } => Some(None),
+            _ => None,
+        }) {
+            Some(Some(Some(label))) => label,
+            Some(Some(None)) => return Served::errno(carrick_abi::LINUX_ENODEV),
+            _ => return Served::Refused,
+        };
+        let Some(reference) = description.retain_mapping() else {
+            return Served::errno(carrick_abi::LINUX_EBADF);
+        };
+        match self
+            .mem()
+            .lock()
+            .retain_native_private_source(reference, label)
+        {
+            Some((source, identity)) => Served::Source(
+                source,
+                carrick_core_abi::host_file::MapSourceReply {
+                    handle: identity.handle(),
+                    generation: identity.generation(),
+                },
+            ),
+            None => Served::errno(carrick_abi::LINUX_ENOMEM),
         }
     }
 
@@ -606,6 +655,7 @@ mod tests {
         ) -> Result<(), NativeHostFileRefusal> {
             self.dispatcher
                 .serve_native_host_file_in(&self.owner, authority, bytes)
+                .map(|_| ())
         }
         fn result(
             &self,
@@ -1066,6 +1116,92 @@ mod tests {
         assert!(
             files.native_fs_authority().is_none(),
             "only the admitted superuser identity resolves for native callers"
+        );
+    }
+
+    /// A private file mapping's byte source: the reply names the identity
+    /// the ring maps with, and the retained source reads the file's bytes
+    /// at the mapping's offset as its pages fault in.
+    #[test]
+    fn native_private_map_source_reads_the_opened_file() {
+        use carrick_hal::fork_stock::HostBackingRead;
+        let fixture = rootfs_fixture();
+        let authority = authority_of(&fixture.dispatcher);
+        let mut open = record(
+            fixture.table,
+            HostFileOp::Openat,
+            FDCWD,
+            [0; 4],
+            b"/lib/libc.so.6",
+            0,
+        );
+        fixture.serve(Some(&authority), &mut open).unwrap();
+        let fd = host_file::reply(&open).unwrap().result as i32;
+        let mut map = record(
+            fixture.table,
+            HostFileOp::MapPrivate,
+            fd,
+            [0; 4],
+            &[],
+            carrick_core_abi::host_file::MapSourceReply::BYTES,
+        );
+        let served = fixture
+            .dispatcher
+            .serve_native_host_file_in(&fixture.owner, None, &mut map)
+            .unwrap();
+        let source = served
+            .retained_source
+            .expect("a mapping retains its source");
+        let reply = host_file::reply(&map).unwrap();
+        assert_eq!(reply.result, 0);
+        let named = carrick_core_abi::host_file::MapSourceReply::decode(reply.output).unwrap();
+        let identity = source.identity();
+        assert_eq!(
+            (named.handle, named.generation),
+            (identity.handle(), identity.generation())
+        );
+        let bytes = source
+            .read(HostBackingRead::new(identity.advance(4).unwrap(), 4096).unwrap())
+            .unwrap();
+        // The file's bytes at offset 4, then the zero tail of the last page
+        // within EOF's page (Linux zero-fills a partial final page).
+        assert_eq!(&bytes[..11], b"-libc-bytes", "file bytes at offset 4");
+        assert!(bytes[11..].iter().all(|byte| *byte == 0), "zero page tail");
+
+        // A directory has no mmap operation; stdio is not a mapping source.
+        let mut dir = record(
+            fixture.table,
+            HostFileOp::Openat,
+            FDCWD,
+            [carrick_abi::LINUX_O_DIRECTORY, 0, 0, 0],
+            b"/usr",
+            0,
+        );
+        fixture.serve(Some(&authority), &mut dir).unwrap();
+        let dir = host_file::reply(&dir).unwrap().result as i32;
+        let map_dir = record(
+            fixture.table,
+            HostFileOp::MapPrivate,
+            dir,
+            [0; 4],
+            &[],
+            carrick_core_abi::host_file::MapSourceReply::BYTES,
+        );
+        assert_eq!(
+            fixture.result(None, map_dir).0,
+            carrick_abi::LINUX_ENODEV.guest_retval()
+        );
+        let mut map_stdio = record(
+            fixture.table,
+            HostFileOp::MapPrivate,
+            1,
+            [0; 4],
+            &[],
+            carrick_core_abi::host_file::MapSourceReply::BYTES,
+        );
+        assert_eq!(
+            fixture.serve(None, &mut map_stdio),
+            Err(NativeHostFileRefusal)
         );
     }
 

@@ -39,6 +39,49 @@ pub enum HostFileOp {
     Lseek = 9,
     /// `getdents64` of at most the output capacity.
     Getdents64 = 10,
+    /// Retain the descriptor's file as a private-mapping byte source for the
+    /// caller's MM; output is the source identity ([`MapSourceReply`]). The
+    /// ring then maps it with its own reservation owner.
+    MapPrivate = 11,
+}
+
+/// The byte-source identity a [`HostFileOp::MapPrivate`] reply carries: the
+/// carrier-minted handle and generation of the retained source. The ring
+/// adds the mapping's file offset itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MapSourceReply {
+    pub handle: core::num::NonZeroU64,
+    pub generation: core::num::NonZeroU64,
+}
+
+/// Little-endian wire layout of a [`MapSourceReply`].
+#[derive(zerocopy::IntoBytes, zerocopy::FromBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[repr(C)]
+struct MapSourceWire {
+    handle: zerocopy::little_endian::U64,
+    generation: zerocopy::little_endian::U64,
+}
+
+impl MapSourceReply {
+    pub const BYTES: usize = core::mem::size_of::<MapSourceWire>();
+
+    pub fn encode(self) -> [u8; Self::BYTES] {
+        let wire = MapSourceWire {
+            handle: self.handle.get().into(),
+            generation: self.generation.get().into(),
+        };
+        let mut bytes = [0u8; Self::BYTES];
+        bytes.copy_from_slice(zerocopy::IntoBytes::as_bytes(&wire));
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let wire = <MapSourceWire as zerocopy::FromBytes>::read_from_bytes(bytes).ok()?;
+        Some(Self {
+            handle: core::num::NonZeroU64::new(wire.handle.get())?,
+            generation: core::num::NonZeroU64::new(wire.generation.get())?,
+        })
+    }
 }
 
 impl HostFileOp {
@@ -54,6 +97,7 @@ impl HostFileOp {
             8 => Self::Pread,
             9 => Self::Lseek,
             10 => Self::Getdents64,
+            11 => Self::MapPrivate,
             _ => return None,
         })
     }

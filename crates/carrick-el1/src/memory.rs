@@ -191,6 +191,22 @@ pub fn decide_anonymous_syscall<
     current: &CurrentTask,
     model: &mut ReservationModel<'_, G, C>,
 ) -> ReservationDisposition {
+    decide_reservation_syscall(frame, current, model, None)
+}
+
+/// [`decide_anonymous_syscall`], plus a private file `mmap` whose byte
+/// source the native host-file venue already retained for exactly this call
+/// (`file`, at file offset 0). Without a source a file mapping forwards, as
+/// before.
+pub fn decide_reservation_syscall<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    frame: &TrapFrame,
+    current: &CurrentTask,
+    model: &mut ReservationModel<'_, G, C>,
+    file: Option<carrick_el1_abi::HostBackingIdentity>,
+) -> ReservationDisposition {
     use carrick_el1_abi::{ReservationProtection, ReservationRange};
     use reservations::{Decision, Placement, Refusal};
     let Some(origin) = ReservationOrigin::capture(current) else {
@@ -206,11 +222,33 @@ pub fn decide_anonymous_syscall<
             let flags = frame.x[3];
             // `MAP_STACK` is a placement hint with no effect on the mapping
             // (man 2 mmap); the root serves it as private anonymous memory.
-            let supported =
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_STACK;
-            if flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) != MAP_ANONYMOUS | MAP_PRIVATE
-                || flags & (MAP_GROWSDOWN | MAP_HUGETLB) != 0
-                || flags & !supported != 0
+            // MAP_DENYWRITE and MAP_EXECUTABLE are ignored by Linux (man 2
+            // mmap); the dynamic loader passes MAP_DENYWRITE on its anonymous
+            // image reservation as well as its file segments.
+            const MAP_DENYWRITE: u64 = 0x0800;
+            const MAP_EXECUTABLE: u64 = 0x1000;
+            let supported = MAP_PRIVATE
+                | MAP_ANONYMOUS
+                | MAP_FIXED
+                | MAP_FIXED_NOREPLACE
+                | MAP_STACK
+                | MAP_DENYWRITE
+                | MAP_EXECUTABLE;
+            let file = match file {
+                Some(source)
+                    if flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) == MAP_PRIVATE
+                        && flags & (MAP_GROWSDOWN | MAP_HUGETLB) == 0
+                        && flags & !supported == 0 =>
+                {
+                    Some(source)
+                }
+                _ => None,
+            };
+            if file.is_none()
+                && (flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED)
+                    != MAP_ANONYMOUS | MAP_PRIVATE
+                    || flags & (MAP_GROWSDOWN | MAP_HUGETLB) != 0
+                    || flags & !supported != 0)
             {
                 return ReservationDisposition::Forward;
             }
@@ -232,7 +270,13 @@ pub fn decide_anonymous_syscall<
             } else {
                 Placement::Hint(frame.x[0])
             };
-            model.mmap(placement, frame.x[1], prot)
+            match file {
+                Some(source) => match source.advance(frame.x[5]) {
+                    Some(source) => model.mmap_private_file(placement, frame.x[1], prot, source),
+                    None => return ReservationDisposition::Return(-EINVAL),
+                },
+                None => model.mmap(placement, frame.x[1], prot),
+            }
         }
         SYS_MUNMAP | SYS_MPROTECT => {
             if !frame.x[0].is_multiple_of(PAGE_SIZE) {
@@ -776,6 +820,9 @@ pub enum DelegatedAnonymous {
 /// retirement's frames are journaled as an owed return for the host's bulk
 /// receipt at its next boundary. Everything else refuses the proposal and
 /// forwards. The Linux entry owner publishes the completion/refusal counter.
+/// Serve a delegated anonymous-memory syscall in ring. `file` is a retained
+/// private file byte source for this exact `mmap` (see
+/// [`decide_reservation_syscall`]); `None` everywhere else.
 pub fn serve_delegated_anonymous<
     E: AnonymousDescriptorEditor,
     G: ReservationGeometry,
@@ -787,6 +834,7 @@ pub fn serve_delegated_anonymous<
     spaces: SpaceAccess<'_, C>,
     table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
     editor: &mut E,
+    file: Option<carrick_el1_abi::HostBackingIdentity>,
 ) -> DelegatedAnonymous {
     let nr = frame.x[8];
     let Some((mm, index)) = delegated_anonymous_root(nr, current, spaces, table) else {
@@ -802,7 +850,7 @@ pub fn serve_delegated_anonymous<
     let Ok(mut model) = table.lock_in(spaces, index.index(), mm, frame.slot as u32) else {
         return forward(Leave::RootBusy);
     };
-    let mut pending = match decide_anonymous_syscall(frame, current, &mut model) {
+    let mut pending = match decide_reservation_syscall(frame, current, &mut model, file) {
         ReservationDisposition::Return(value) => {
             frame.x[0] = value as u64;
             return DelegatedAnonymous::Served;
@@ -1634,6 +1682,20 @@ mod tests {
             nr: u64,
             args: [u64; 6],
         ) -> (DelegatedAnonymous, i64) {
+            syscall_with_file(mm, spaces, table, counters, editor, nr, args, None)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn syscall_with_file(
+            mm: &Mm,
+            spaces: &AddressSpaces,
+            table: &SharedReservations,
+            counters: &Counters,
+            editor: &mut Editor,
+            nr: u64,
+            args: [u64; 6],
+            file: Option<carrick_el1_abi::HostBackingIdentity>,
+        ) -> (DelegatedAnonymous, i64) {
             let mut frame = TrapFrame {
                 elr: 0x40004,
                 ..TrapFrame::default()
@@ -1649,6 +1711,7 @@ mod tests {
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(spaces),
                 table,
                 editor,
+                file,
             );
             assert_eq!(
                 counters.served[nr as usize].load(Ordering::Relaxed),
@@ -1738,6 +1801,218 @@ mod tests {
             );
             assert_eq!(route, DelegatedAnonymous::Forward);
             assert!(editor.calls.is_empty());
+        }
+
+        /// `ld.so` maps libc `MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE` over its
+        /// own PROT_NONE reservation. With the byte source the host-file venue
+        /// retained for that exact call, the ring maps it as a private file
+        /// node whose faults supply from the source at the file offset;
+        /// without one the call keeps its old route. The node stays
+        /// ring-editable (munmap/mprotect), like an inherited file mapping.
+        #[test]
+        fn private_file_mmap_with_a_retained_source_is_a_ring_file_node() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let source = carrick_el1_abi::HostBackingIdentity::new(
+                core::num::NonZeroU64::new(7).unwrap(),
+                core::num::NonZeroU64::MIN,
+                0,
+            );
+            const DENYWRITE: u64 = 0x0800;
+            let file_fixed = [
+                ARENA,
+                0x2000,
+                PROT_READ,
+                MAP_PRIVATE | MAP_FIXED | DENYWRITE,
+                3,
+                0x1000,
+            ];
+            let reservation = [ARENA, 0x4000, 0, ANON, u64::MAX, 0];
+            assert_eq!(
+                syscall(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MMAP,
+                    reservation
+                )
+                .0,
+                DelegatedAnonymous::Served
+            );
+            assert_eq!(
+                syscall(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MMAP,
+                    file_fixed
+                )
+                .0,
+                DelegatedAnonymous::Forward,
+                "no retained source: the old route"
+            );
+            let (route, address) = syscall_with_file(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                file_fixed,
+                Some(source),
+            );
+            assert_eq!((route, address), (DelegatedAnonymous::Served, ARENA as i64));
+            {
+                let mut model = root(&spaces, &table, &delegated);
+                let mapping = model.mapping(ARENA).unwrap();
+                assert!(!mapping.anonymous);
+                assert_eq!(mapping.protection, ReservationProtection::READ);
+                assert_eq!(
+                    mapping.host_backing,
+                    Some(source.advance(0x1000).unwrap()),
+                    "faults supply from the file offset"
+                );
+                assert!(model.mapping(ARENA + 0x2000).unwrap().anonymous);
+            }
+            // RELRO-style mprotect and a partial munmap stay in ring.
+            assert_eq!(
+                syscall(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MPROTECT,
+                    [ARENA, 0x1000, 0, 0, 0, 0]
+                )
+                .0,
+                DelegatedAnonymous::Served
+            );
+            assert_eq!(
+                syscall(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MUNMAP,
+                    [ARENA + 0x1000, 0x1000, 0, 0, 0, 0]
+                )
+                .0,
+                DelegatedAnonymous::Served
+            );
+            // A shared file mapping is never served from a private source.
+            let (route, _) = syscall_with_file(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [0, 0x1000, PROT_READ, MAP_SHARED, 3, 0],
+                Some(source),
+            );
+            assert_eq!(route, DelegatedAnonymous::Forward);
+        }
+
+        /// The glibc loader's exact sequence for libc.so.6 (Docker oracle
+        /// strace): reserve the image PROT_NONE, map text and data over it
+        /// from the file, trim, guard the gap, map bss, then make RELRO
+        /// read-only. Every step stays in ring for a native process.
+        #[test]
+        fn loader_maps_libc_with_retained_sources_entirely_in_ring() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let source = carrick_el1_abi::HostBackingIdentity::new(
+                core::num::NonZeroU64::new(9).unwrap(),
+                core::num::NonZeroU64::MIN,
+                0,
+            );
+            const DENYWRITE: u64 = 0x0800;
+            let mut call = |nr: u64, args: [u64; 6], file: bool| {
+                syscall_with_file(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    nr,
+                    args,
+                    file.then_some(source),
+                )
+            };
+            let (route, base) = call(
+                SYS_MMAP,
+                [0, 1892240, 0, ANON | DENYWRITE, u64::MAX, 0],
+                false,
+            );
+            assert_eq!(route, DelegatedAnonymous::Served, "image reservation");
+            let base = base as u64;
+            let text = base + 0x2000;
+            let steps: [(&str, u64, [u64; 6], bool); 7] = [
+                (
+                    "text",
+                    SYS_MMAP,
+                    [
+                        text,
+                        1826704,
+                        PROT_READ | 4,
+                        MAP_PRIVATE | MAP_FIXED | DENYWRITE,
+                        3,
+                        0,
+                    ],
+                    true,
+                ),
+                ("trim head", SYS_MUNMAP, [base, 0x2000, 0, 0, 0, 0], false),
+                (
+                    "trim tail",
+                    SYS_MUNMAP,
+                    [text + 0x1be000, 57232, 0, 0, 0, 0],
+                    false,
+                ),
+                (
+                    "guard gap",
+                    SYS_MPROTECT,
+                    [text + 0x19a000, 77824, 0, 0, 0, 0],
+                    false,
+                ),
+                (
+                    "data",
+                    SYS_MMAP,
+                    [
+                        text + 0x1ad000,
+                        20480,
+                        RW,
+                        MAP_PRIVATE | MAP_FIXED | DENYWRITE,
+                        3,
+                        0x19d000,
+                    ],
+                    true,
+                ),
+                (
+                    "bss",
+                    SYS_MMAP,
+                    [text + 0x1b2000, 49040, RW, ANON | MAP_FIXED, u64::MAX, 0],
+                    false,
+                ),
+                (
+                    "relro",
+                    SYS_MPROTECT,
+                    [text + 0x1ad000, 12288, PROT_READ, 0, 0, 0],
+                    false,
+                ),
+            ];
+            for (name, nr, args, file) in steps {
+                let (route, result) = call(nr, args, file);
+                assert_eq!(route, DelegatedAnonymous::Served, "{name}: {result}");
+                assert!(result >= 0, "{name}: {result}");
+            }
         }
 
         /// Rust std maps its sigaltstack `MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK`
