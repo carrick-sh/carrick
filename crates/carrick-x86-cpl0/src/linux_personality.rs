@@ -1013,6 +1013,12 @@ impl Personality for LinuxPersonality {
             CompletionRoute::InvalidCompletion => {
                 fatal_error(frame);
             }
+            // The x86 router never selects the ARM native-exec service; fail
+            // closed with a counted-unrouted errno rather than forwarding.
+            CompletionRoute::NativeService => {
+                frame.rax = carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64;
+                ControlFlow::Return(())
+            }
             CompletionRoute::Forward | CompletionRoute::HostCustody => {
                 let mut handled_in_ring = false;
                 if [
