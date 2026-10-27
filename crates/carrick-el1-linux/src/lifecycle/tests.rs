@@ -3013,7 +3013,7 @@ fn clone_unclaim_failure_never_leaves_exit_waiting() {
 }
 
 #[test]
-fn native_exit_group_runs_the_woken_successor_before_returning_idle() {
+fn native_exit_group_leaves_the_woken_successor_to_the_scheduler() {
     struct Exiting {
         binding: carrick_el1_abi::ExecutionBinding,
     }
@@ -3089,14 +3089,17 @@ fn native_exit_group_runs_the_woken_successor_before_returning_idle() {
         anonymous: None,
         cache_lookup: |_| core::ptr::null_mut(),
     };
+    // An exiting member with live siblings suspends. The woken successor's
+    // retained wait continuation is resumed by the scheduler's idle entry,
+    // not switched in under the exiting member's completion route.
     assert!(matches!(
         LifecycleNative::process_exit_group(&mut native, 0),
         Some(LifecycleOutcome::Transferred {
-            progress: carrick_core::Served::Returned { switched: true },
+            progress: carrick_core::Served::Idle,
             ..
         })
     ));
-    assert_eq!(w.zone.slot(SLOT).current(), Some(record));
+    assert_eq!(w.zone.slot(SLOT).current(), None);
 }
 
 #[test]
