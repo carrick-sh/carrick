@@ -2012,6 +2012,77 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
     assert!(!task.pending_exec_stage2_cleanup.as_ref().unwrap().armed);
 }
 
+/// #855 review P2-7: the no-proof cleanup entry (`retire`, reached through
+/// `retire_detached_exec_predecessor(None, ..)`) must not depend on a
+/// comment for stage-1-first. With live non-shared backing it is a typed
+/// refusal that releases nothing.
+#[test]
+fn serial_host_exec_predecessor_cleanup_without_stage1_proof_refuses_live_backing() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        0x4000,
+        crate::host_mapping::HostMappingKind::PrivateAnon,
+    )
+    .unwrap();
+    let host_addr = host.as_ptr();
+    let mut lease = GlobalFrameStage2Lease::fixed(0x1235_0000, 0x4000);
+    lease.drop_backing_audit = Some((
+        host_addr as usize,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    ));
+    let mut mapping = thread_sibling_tests::mapped_region(0x1235_0000, 0x1235_4000, 0x1235_0000);
+    mapping.host_addr = host_addr;
+    mapping.host_mapping = Some(host.into());
+    mapping.stage2_lease = Some(lease);
+    let task = hvpatch_task_state_test_fixture(8, 0x4000, 8);
+    let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    frames
+        .lock()
+        .stage2_references
+        .insert((0x1235_0000, 0x4000), 1);
+    let mut cleanup = PendingExecStage2Cleanup {
+        mappings: TaskMappingIndex::from_region(mapping),
+        extents: [(
+            (0x1235_0000, 0x4000),
+            InventoryStage2OwnerIdentity {
+                host_addr: host_addr as usize,
+                generation: 0,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        predecessor_aliases: Vec::new(),
+        frames: std::sync::Arc::clone(&frames),
+        stage2_reference_releases: [((0x1235_0000, 0x4000), 1)].into_iter().collect(),
+        mm_root_slot: task.mm_root_slot,
+        mm_access: None,
+        predecessor_identity,
+        predecessor_mm,
+        shared_projection: false,
+        carrier_mm: None,
+        armed: true,
+    };
+    let result = cleanup.retire();
+    assert!(
+        matches!(result, Err(TrapError::RetirementRefused { .. })),
+        "{result:?}"
+    );
+    assert!(cleanup.armed, "a refused cleanup stays armed for its proof");
+    assert_eq!(cleanup.stage2_reference_releases.len(), 1);
+    assert_eq!(
+        frames.lock().stage2_references.get(&(0x1235_0000, 0x4000)),
+        Some(&1)
+    );
+    assert!(alias_backing_is_live(host_addr as usize));
+    // Settle the fixture through its proof so the armed drop stays quiet.
+    let mut task = task;
+    let stage1_unpublished = prepare_test_whole_mm_retirement(&mut task);
+    cleanup
+        .retire_with_cleanup_boundary(&mut |_| {}, &mut |_| {}, Some(&stage1_unpublished))
+        .expect("the proof-bearing retry retires the backing");
+}
+
 #[test]
 fn shared_exec_predecessor_cleanup_retains_and_emits_exact_classification() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();

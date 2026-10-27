@@ -201,6 +201,32 @@ impl PendingExecStage2Cleanup {
             publish(classification);
             return Ok(None);
         }
+        // Stage-1-first by type, not by comment: a non-shared predecessor
+        // with any reference to release, any live extent this cleanup would
+        // retire, or a bootstrap root to retire needs the whole-MM stage-1
+        // unpublication proof. Without it the cleanup is a typed refusal
+        // decided before anything is released.
+        if stage1_unpublished.is_none() {
+            let retires_an_extent = {
+                let registry = self.frames.lock();
+                self.extents.iter().any(|(&(ipa, size), owner)| {
+                    !(owner.generation == 0 && is_reusable_global_frame_extent(ipa, size as u64))
+                        && global_frame_host_owner_generation_in(custody, ipa, size as u64)
+                            == owner.generation
+                        && !registry.stage2_references.contains_key(&(ipa, size as u64))
+                })
+            };
+            let retires_bootstrap_root = self.mm_access.is_some() && self.mm_root_slot.is_none();
+            if !self.stage2_reference_releases.is_empty()
+                || retires_an_extent
+                || retires_bootstrap_root
+            {
+                return Err(TrapError::RetirementRefused {
+                    operation: "exec predecessor cleanup",
+                    missing: "the whole-MM stage-1 unpublication proof",
+                });
+            }
+        }
         let mut stage1_reference_proofs = if self.stage2_reference_releases.is_empty() {
             std::collections::BTreeMap::new()
         } else {
