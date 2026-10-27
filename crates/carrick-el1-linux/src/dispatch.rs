@@ -814,6 +814,60 @@ enum NativeExecStage {
     Failed(carrick_syscall_abi::LinuxErrno),
 }
 
+/// One staged native service request, before its owner publishes it.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+enum NativeServiceStage {
+    Exec(alloc::boxed::Box<[u8]>),
+    HostFile(
+        alloc::boxed::Box<[u8]>,
+        Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+    ),
+    Fault(carrick_guest_arch::FaultInfo),
+    Return(i64),
+    Operation,
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+struct HostFileCopy<'a, V: file::MemoryValidator>(file::ValidatedCopy<'a, V>);
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::HostFileUser
+    for HostFileCopy<'_, V>
+{
+    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+        file::UserCopy::copy_in(&mut self.0, dst, src)
+    }
+}
+
+/// Route a native SVC through the host-file venue. `None` keeps the call on
+/// its existing route; the descriptor is resolved in the caller's own ring
+/// namespace by `descriptor`.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_host_file_stage<V: file::MemoryValidator>(
+    frame: &TrapFrame,
+    task: &CurrentTask,
+    validator: &V,
+    descriptor: impl FnOnce(
+        i32,
+    )
+        -> Option<carrick_personality_linux::native_host_file::NativeDescriptor>,
+) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
+    use carrick_personality_linux::native_host_file::{HostFileCall, stage};
+    if (frame.esr >> 26) & 0x3f != 0x15 {
+        return None;
+    }
+    // AArch64 native numbers are the canonical Linux numbers.
+    let call = HostFileCall::decode(
+        carrick_syscall_abi::CanonicalNr::new(frame.x[8]),
+        &[
+            frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+        ],
+    )?;
+    let descriptor = descriptor(call.fd())?;
+    let mut user = HostFileCopy(file::ValidatedCopy { task, validator });
+    Some(stage(call, descriptor, &mut user))
+}
+
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 struct ExecStageCopy<'a, V: file::MemoryValidator> {
     inner: file::ValidatedCopy<'a, V>,
@@ -908,16 +962,55 @@ fn arm_native_service_exit(
         return Some(arm_signal_user_return(frame));
     }
     let mut service_wait = wait;
-    let (operation, exec_payload, retry_exec_stage) = loop {
-        match native_exec_stage(frame, task) {
-            Some(NativeExecStage::Payload(payload)) => {
-                break (None, Some(payload), false);
-            }
+    let (operation, exec_payload, host_file, retry_exec_stage) = loop {
+        let staged = match native_exec_stage(frame, task) {
+            Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
             Some(NativeExecStage::Failed(errno)) => {
-                frame.x[0] = errno.guest_retval() as u64;
+                NativeServiceStage::Return(errno.guest_retval())
+            }
+            Some(NativeExecStage::Fault(fault)) => NativeServiceStage::Fault(fault),
+            None => match native_host_file_stage(frame, task, &file::HardwareValidator, |fd| {
+                ipc::guest_venue(frame.slot as u32)
+                    .and_then(|venue| ipc::native_descriptor(&venue, task, fd))
+            }) {
+                Some(carrick_personality_linux::native_host_file::HostFileStage::Request {
+                    record,
+                    output,
+                }) => NativeServiceStage::HostFile(record, output),
+                Some(carrick_personality_linux::native_host_file::HostFileStage::Returned(
+                    result,
+                )) => NativeServiceStage::Return(result.raw()),
+                Some(carrick_personality_linux::native_host_file::HostFileStage::Fault {
+                    address,
+                    access,
+                }) => NativeServiceStage::Fault(carrick_guest_arch::FaultInfo {
+                    address: carrick_guest_arch::UserVa::new(address),
+                    access,
+                    present: false,
+                }),
+                Some(carrick_personality_linux::native_host_file::HostFileStage::InRing) => {
+                    // An in-zone object the ring does not serve yet never
+                    // exits to the host: counted ENOSYS here, in ring.
+                    let nr = frame.x[8] as usize;
+                    if nr < 512 {
+                        counters.refused[nr].fetch_add(1, Ordering::Relaxed);
+                        counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                    }
+                    NativeServiceStage::Return(carrick_syscall_abi::LINUX_ENOSYS.guest_retval())
+                }
+                None => NativeServiceStage::Operation,
+            },
+        };
+        match staged {
+            NativeServiceStage::Exec(payload) => break (None, Some(payload), None, false),
+            NativeServiceStage::HostFile(record, output) => {
+                break (None, None, Some((record, output)), false);
+            }
+            NativeServiceStage::Return(result) => {
+                frame.x[0] = result as u64;
                 return Some(arm_signal_user_return(frame));
             }
-            Some(NativeExecStage::Fault(fault)) => {
+            NativeServiceStage::Fault(fault) => {
                 // `AT S1E0R` reports an inherited sparse page without taking
                 // an EL0 abort. Feed that exact read through the ordinary
                 // owner fault selector, retaining the syscall frame for retry.
@@ -935,6 +1028,7 @@ fn arm_native_service_exit(
                         break (
                             Some(carrick_core_abi::service::ServiceOperation::Fault(fault)),
                             None,
+                            None,
                             true,
                         );
                     }
@@ -943,9 +1037,10 @@ fn arm_native_service_exit(
                     }
                 }
             }
-            None => {
+            NativeServiceStage::Operation => {
                 break (
                     Some(native_service_operation(frame, &task.linux, action)?),
+                    None,
                     None,
                     false,
                 );
@@ -984,6 +1079,11 @@ fn arm_native_service_exit(
                     return Err(super::native_process_runtime::NativeProcessError::Quarantined);
                 }
                 process.begin_exec_service(payload)?
+            } else if let Some((record, output)) = host_file {
+                if service_wait.is_some() {
+                    return Err(super::native_process_runtime::NativeProcessError::Quarantined);
+                }
+                process.begin_host_file_service(record, output)?
             } else if retry_exec_stage {
                 process.begin_exec_stage_fault_service(
                     match operation {
@@ -3145,6 +3245,73 @@ mod tests {
         assert_eq!(view.path(), b"/bin/static");
         assert_eq!(view.argv().collect::<alloc::vec::Vec<_>>(), [b"static"]);
         assert_eq!(view.envp().collect::<alloc::vec::Vec<_>>(), [b"A=B"]);
+    }
+
+    #[test]
+    fn native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout() {
+        use carrick_personality_linux::native_host_file::{
+            DescriptionAccess, HostFileStage, NativeDescriptor,
+        };
+        struct Resident;
+        impl file::MemoryValidator for Resident {
+            fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+            fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
+                len
+            }
+        }
+        let task = CurrentTask::new();
+        let bytes = b"bin\nboot\n";
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            ..TrapFrame::default()
+        };
+        frame.x[8] = 64;
+        frame.x[0] = 1;
+        frame.x[1] = bytes.as_ptr().addr() as u64;
+        frame.x[2] = bytes.len() as u64;
+
+        // The same write to an in-zone pipe never builds a host request.
+        let mut asked = None;
+        assert_eq!(
+            native_host_file_stage(&frame, &task, &Resident, |fd| {
+                asked = Some(fd);
+                Some(NativeDescriptor::InZone)
+            }),
+            Some(HostFileStage::InRing)
+        );
+        assert_eq!(asked, Some(1), "the caller's own fd is resolved");
+
+        // Host stdout crosses with the caller's bytes and table.
+        let Some(HostFileStage::Request { mut record, output }) =
+            native_host_file_stage(&frame, &task, &Resident, |_| {
+                Some(NativeDescriptor::HostBacked {
+                    table: [3, 4, 5],
+                    access: DescriptionAccess::ReadWrite,
+                })
+            })
+        else {
+            panic!("a host-backed stdout write crosses");
+        };
+        assert_eq!(output, None);
+        let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record).unwrap();
+        assert_eq!(view.input(), bytes);
+        assert_eq!(view.header().table, [3, 4, 5]);
+
+        // An unpublished or contended namespace keeps the call's old route,
+        // and a non-SVC exit is never a host-file call.
+        assert_eq!(
+            native_host_file_stage(&frame, &task, &Resident, |_| None),
+            None
+        );
+        frame.esr = 0x24 << 26;
+        assert_eq!(
+            native_host_file_stage(&frame, &task, &Resident, |_| {
+                panic!("a fault never resolves descriptors")
+            }),
+            None
+        );
     }
 
     #[test]

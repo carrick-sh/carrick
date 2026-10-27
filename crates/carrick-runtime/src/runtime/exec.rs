@@ -47,6 +47,9 @@ pub(crate) struct NativeExecCapability {
     id: carrick_core_abi::service::ExecCapabilityId,
     files: carrick_kernel::dispatch::exec_files::ExecFiles,
     loader: ExecLoaderCapabilities,
+    /// The native host-file venue's authority over this tree's host-backed
+    /// descriptors (#894).
+    host_files: carrick_kernel::dispatch::native_files::NativeHostFiles,
 }
 
 impl core::fmt::Debug for NativeExecCapability {
@@ -186,6 +189,18 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             plan,
         }))
     }
+
+    fn serve_host_file(
+        &self,
+        _request: carrick_core_abi::service::ServiceRequest,
+        record: &mut [u8],
+    ) -> Result<(), carrick_vmm_hvf::metadata_grant::NativeHostFileRefused> {
+        // The request identity was authenticated by the service cell; the
+        // record names the caller's own ring table, pinned at service time.
+        self.host_files
+            .serve(record)
+            .map_err(|_| carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)
+    }
 }
 
 pub(crate) fn capture_native_exec_capability(
@@ -202,6 +217,7 @@ pub(crate) fn capture_native_exec_capability(
         id,
         files: dispatcher.capture_exec_files(&context)?,
         loader: ExecLoaderCapabilities::capture(dispatcher),
+        host_files: dispatcher.native_host_files()?,
     })
 }
 

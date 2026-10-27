@@ -56,11 +56,27 @@ enum CarrierContinuation {
     Parked(TaskKey),
 }
 
+/// A staged host-file crossing: the ring-owned request/reply record (its
+/// address is published in the request) and the user output it fills.
+struct PendingHostFile {
+    record: Box<[u8]>,
+    output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+}
+
+/// Ring-owned input of a typed service, retained until completion ACK.
+enum ServicePayload {
+    None,
+    Exec(Box<[u8]>),
+    HostFile(PendingHostFile),
+}
+
 pub(super) struct PendingService<'a> {
     reply: Option<PendingServiceReply>,
     /// Exec input is ring-owned guest memory. Its virtual address is published
     /// in the request and cannot be recycled until completion/cancellation ACK.
     _exec_payload: Option<Box<[u8]>>,
+    /// The same custody for a host-file record, which the carrier also writes.
+    host_file: Option<PendingHostFile>,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     retry_syscall_after_supply: bool,
     carrier_continuation: Option<CarrierContinuation>,
@@ -230,7 +246,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, fault_sequence, None, None, false)
+        self.begin_service_inner(operation, fault_sequence, None, ServicePayload::None, false)
     }
     /// Supply one nonresident user page needed to stage an exec request, then
     /// retry the exact SVC. A refused supply remains an ordinary `EFAULT` from
@@ -245,7 +261,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceOperation::Fault(fault),
             fault_sequence,
             owner_wait,
-            None,
+            ServicePayload::None,
             true,
         )
     }
@@ -282,7 +298,35 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             },
             None,
             None,
-            Some(payload),
+            ServicePayload::Exec(payload),
+            false,
+        )
+    }
+    /// Stage one typed host-file crossing for the carrier venue. Fd-based
+    /// calls carry no credential decision: the open description's access
+    /// mode, checked by the staging step, is the authority Linux applies.
+    pub fn begin_host_file_service(
+        &mut self,
+        record: Box<[u8]>,
+        output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let capability = self
+            .runtime
+            .exec_capability()
+            .ok_or(NativeProcessError::Stale)?;
+        let payload = carrick_core_abi::service::HostFilePayloadDescriptor::checked(
+            carrick_guest_arch::GuestVa::new(record.as_ptr().addr() as u64),
+            carrick_guest_arch::GuestLen::new(record.len() as u64),
+        )
+        .ok_or(NativeProcessError::Exhausted)?;
+        self.begin_service_inner(
+            ServiceOperation::HostFile {
+                capability,
+                payload,
+            },
+            None,
+            None,
+            ServicePayload::HostFile(PendingHostFile { record, output }),
             false,
         )
     }
@@ -306,7 +350,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         wait: carrick_core_abi::PortalOwnerWait,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, None, Some(wait), None, false)
+        self.begin_service_inner(operation, None, Some(wait), ServicePayload::None, false)
     }
     #[inline(never)]
     fn begin_service_inner(
@@ -314,12 +358,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
-        exec_payload: Option<Box<[u8]>>,
+        payload: ServicePayload,
         retry_syscall_after_supply: bool,
     ) -> Result<NativeResume, NativeProcessError> {
-        if matches!(operation, ServiceOperation::Exec { .. }) != exec_payload.is_some() {
-            return Err(NativeProcessError::Stale);
-        }
+        let (exec_payload, host_file) = match (operation, payload) {
+            (ServiceOperation::Exec { .. }, ServicePayload::Exec(payload)) => (Some(payload), None),
+            (ServiceOperation::HostFile { .. }, ServicePayload::HostFile(pending)) => {
+                (None, Some(pending))
+            }
+            (ServiceOperation::Exec { .. } | ServiceOperation::HostFile { .. }, _)
+            | (_, ServicePayload::Exec(_) | ServicePayload::HostFile(_)) => {
+                return Err(NativeProcessError::Stale);
+            }
+            (_, ServicePayload::None) => (None, None),
+        };
         let (page, control, mm) = {
             let graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
@@ -466,6 +518,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             MemberWait::Service(Box::new(PendingService {
                 reply,
                 _exec_payload: exec_payload,
+                host_file,
                 exec_successor,
                 retry_syscall_after_supply,
                 carrier_continuation,
@@ -546,9 +599,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 OwnerEntry::Syscall
             }
             ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => OwnerEntry::Exception,
-            ServiceOperation::Crossing { .. } | ServiceOperation::Exec { .. } => {
-                OwnerEntry::Syscall
-            }
+            ServiceOperation::Crossing { .. }
+            | ServiceOperation::Exec { .. }
+            | ServiceOperation::HostFile { .. } => OwnerEntry::Syscall,
             ServiceOperation::CarrierWork { entry } => entry,
         };
         let mut completion = None;
@@ -1334,9 +1387,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => {
                                 OwnerEntry::Exception
                             }
-                            ServiceOperation::Crossing { .. } | ServiceOperation::Exec { .. } => {
-                                OwnerEntry::Syscall
-                            }
+                            ServiceOperation::Crossing { .. }
+                            | ServiceOperation::Exec { .. }
+                            | ServiceOperation::HostFile { .. } => OwnerEntry::Syscall,
                             ServiceOperation::CarrierWork { entry } => entry,
                         }
                     });
@@ -1539,6 +1592,48 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 (ServiceOperation::Crossing { .. }, ServiceResult::Supplied) => {
                     // No generic host syscall dispatcher owns native semantics.
                     Err(NativeProcessError::Quarantined)
+                }
+                (ServiceOperation::HostFile { .. }, ServiceResult::Supplied)
+                | (ServiceOperation::HostFile { .. }, ServiceResult::Cancelled)
+                    if pending.host_file.as_ref().is_some_and(|file| {
+                        carrick_core_abi::host_file::reply(&file.record).is_some()
+                    }) =>
+                {
+                    // The carrier writes its reply before acknowledging. A
+                    // cancellation that lost the race to an effect still
+                    // reports that effect (bytes written stay written); the
+                    // ring maps it and copies output to its own user memory.
+                    let pending_file = pending
+                        .host_file
+                        .as_ref()
+                        .ok_or(NativeProcessError::Stale)?;
+                    let mut copy_out = |address: u64, bytes: &[u8]| {
+                        self.copy_signal_frame(carrick_guest_arch::UserVa::new(address), bytes)
+                            .is_ok()
+                    };
+                    Ok(NativeResume::Returned(
+                        carrick_personality_linux::native_host_file::complete(
+                            &pending_file.record,
+                            pending_file.output,
+                            &mut copy_out,
+                        ),
+                    ))
+                }
+                (ServiceOperation::HostFile { .. }, ServiceResult::Supplied) => {
+                    // Supplied without a reply is a transport violation.
+                    Err(NativeProcessError::Quarantined)
+                }
+                (ServiceOperation::HostFile { .. }, ServiceResult::Refused) => {
+                    // The venue does not serve this exact request: counted
+                    // ENOSYS (hvpatch-native-crossing-refused), never a guess.
+                    Ok(NativeResume::Returned(SyscallResult::new(
+                        carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+                    )))
+                }
+                (ServiceOperation::HostFile { .. }, ServiceResult::Cancelled) => {
+                    Ok(NativeResume::Returned(SyscallResult::new(
+                        carrick_syscall_abi::LINUX_EINTR.guest_retval(),
+                    )))
                 }
                 (ServiceOperation::Exception(_), ServiceResult::Supplied) => {
                     Err(NativeProcessError::Quarantined)

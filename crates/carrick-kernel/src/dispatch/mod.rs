@@ -822,6 +822,7 @@ pub(crate) mod budget_meter;
 pub mod mm_authority;
 pub mod mm_quiesce;
 pub mod native_execution;
+pub mod native_files;
 #[cfg(test)]
 pub(crate) use carrick_abi::LINUX_FUTEX_PRIVATE_FLAG;
 #[allow(unused_imports)]

@@ -120,6 +120,38 @@ pub enum ServiceOperation {
         capability: ExecCapabilityId,
         payload: ExecPayloadDescriptor,
     },
+    /// Serve one host-file crossing staged by the ring
+    /// ([`crate::host_file`]). The payload is one ring-owned request/reply
+    /// record; the carrier writes only its reply area, before acknowledgment.
+    /// The capability selects the process tree's retained file authority.
+    HostFile {
+        capability: ExecCapabilityId,
+        payload: HostFilePayloadDescriptor,
+    },
+}
+
+/// One bounded ring-owned host-file record ([`crate::host_file`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostFilePayloadDescriptor {
+    address: GuestVa,
+    length: GuestLen,
+}
+impl HostFilePayloadDescriptor {
+    pub const fn checked(address: GuestVa, length: GuestLen) -> Option<Self> {
+        if length.raw() < crate::host_file::HOST_FILE_HEADER_BYTES as u64
+            || length.raw() > crate::host_file::MAX_HOST_FILE_RECORD_BYTES
+            || address.raw().checked_add(length.raw()).is_none()
+        {
+            return None;
+        }
+        Some(Self { address, length })
+    }
+    pub const fn address(self) -> GuestVa {
+        self.address
+    }
+    pub const fn length(self) -> GuestLen {
+        self.length
+    }
 }
 
 /// A bounded variable-length input owned by the requesting guest continuation.
@@ -952,6 +984,10 @@ impl ServiceCell {
                 capability: _,
                 payload,
             } => (5, payload.address().raw(), payload.length().raw()),
+            ServiceOperation::HostFile {
+                capability: _,
+                payload,
+            } => (6, payload.address().raw(), payload.length().raw()),
         };
         for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
             self.words[index].store(value, Ordering::Relaxed);
@@ -960,7 +996,8 @@ impl ServiceCell {
         // phases. Claim copies the stamp before acknowledgment writes a result.
         self.result.store(
             match operation {
-                ServiceOperation::Exec { capability, .. } => capability.raw().get(),
+                ServiceOperation::Exec { capability, .. }
+                | ServiceOperation::HostFile { capability, .. } => capability.raw().get(),
                 _ => fault_sequence.map_or(0, NonZeroU64::get),
             },
             Ordering::Relaxed,
@@ -1096,6 +1133,17 @@ impl ServiceCell {
                     )
                     .ok_or(ServiceError::Stale)?,
                 },
+                6 => ServiceOperation::HostFile {
+                    capability: ExecCapabilityId::new(
+                        NonZeroU64::new(cell.result.load(Ordering::Relaxed))
+                            .ok_or(ServiceError::Stale)?,
+                    ),
+                    payload: HostFilePayloadDescriptor::checked(
+                        GuestVa::new(first),
+                        GuestLen::new(cell.words[11].load(Ordering::Relaxed)),
+                    )
+                    .ok_or(ServiceError::Stale)?,
+                },
                 _ => return Err(ServiceError::Stale),
             };
             let fault_sequence = if matches!(operation, ServiceOperation::Fault(_)) {
@@ -1184,11 +1232,22 @@ impl ServiceCell {
                     && cell.words[11].load(Ordering::Relaxed) == payload.length().raw()
                     && cell.result.load(Ordering::Relaxed) == capability.raw().get()
             }
+            ServiceOperation::HostFile {
+                capability,
+                payload,
+            } => {
+                cell.words[9].load(Ordering::Relaxed) == 6
+                    && cell.words[10].load(Ordering::Relaxed) == payload.address().raw()
+                    && cell.words[11].load(Ordering::Relaxed) == payload.length().raw()
+                    && cell.result.load(Ordering::Relaxed) == capability.raw().get()
+            }
         };
         if !operation_matches
-            || (!matches!(request.operation, ServiceOperation::Exec { .. })
-                && cell.result.load(Ordering::Relaxed)
-                    != request.fault_sequence.map_or(0, NonZeroU64::get))
+            || (!matches!(
+                request.operation,
+                ServiceOperation::Exec { .. } | ServiceOperation::HostFile { .. }
+            ) && cell.result.load(Ordering::Relaxed)
+                != request.fault_sequence.map_or(0, NonZeroU64::get))
         {
             cell.state.store(state, Ordering::Release);
             return Err(ServiceError::Stale);

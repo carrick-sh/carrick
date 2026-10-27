@@ -14,6 +14,8 @@ pub mod signal;
 
 pub mod pending_file;
 
+pub mod native_host_file;
+
 pub mod pending_anonymous;
 
 pub mod lifecycle;

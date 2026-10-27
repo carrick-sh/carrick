@@ -36,6 +36,7 @@ pub use root_exit::*;
 mod open_lifetime;
 pub use open_lifetime::*;
 
+pub mod host_file;
 pub mod service;
 
 /// Integrity digest shared by fixed ABI records. This detects torn or

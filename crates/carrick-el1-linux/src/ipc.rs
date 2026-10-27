@@ -265,6 +265,41 @@ impl IpcTables for GuestTables {
 
 const EL1_WAIT: ShortLockSpin = ShortLockSpin;
 
+/// What `fd` names in `task`'s complete ring namespace, for the native
+/// host-file venue. In-zone objects stay with their ring owner; only a
+/// host-backed description crosses. `None` when the namespace is not
+/// published or the table is contended: the call keeps its existing route.
+pub fn native_descriptor(
+    venue: &IpcVenue<'_>,
+    task: &CurrentTask,
+    fd: i32,
+) -> Option<carrick_personality_linux::native_host_file::NativeDescriptor> {
+    use carrick_personality_linux::native_host_file::{DescriptionAccess, NativeDescriptor};
+    let raw = venue.tables.table_of(task)?;
+    match venue
+        .region
+        .fd(EL1_WAIT)
+        .get(TableId::from_raw(raw), Fd(fd))
+    {
+        Ok(description) => Some(match IpcBacking::decode(description.backing)? {
+            IpcBacking::Host(_) => NativeDescriptor::HostBacked {
+                table: [raw.authority, raw.index, raw.generation],
+                access: match description.access {
+                    AccessMode::ReadOnly => DescriptionAccess::ReadOnly,
+                    AccessMode::WriteOnly => DescriptionAccess::WriteOnly,
+                    AccessMode::ReadWrite => DescriptionAccess::ReadWrite,
+                    AccessMode::Path => DescriptionAccess::Path,
+                },
+            },
+            IpcBacking::Pipe { .. } | IpcBacking::EventFd { .. } | IpcBacking::Epoll { .. } => {
+                NativeDescriptor::InZone
+            }
+        }),
+        Err(FdError::BadFd) => Some(NativeDescriptor::Absent),
+        Err(_) => None,
+    }
+}
+
 /// An object lock's wait, by holder: unbounded while EL1 on another vCPU
 /// holds it, bounded ([`EL1_GUEST_LOCK_SPINS`]) while a host thread does.
 struct ObjectLockWait<'r, 'a> {
