@@ -787,8 +787,11 @@ mod tests {
         let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
         payload.extend_from_slice(spelling.as_bytes());
         payload.push(0);
-        payload.extend_from_slice(argv);
-        payload.extend_from_slice(env);
+        // Each argv/envp string is a u32 length prefix plus its NUL-terminated bytes.
+        for string in [argv.as_slice(), env.as_slice()] {
+            payload.extend_from_slice(&(string.len() as u32).to_le_bytes());
+            payload.extend_from_slice(string);
+        }
         carrick_core_abi::service::encode_exec_payload_header(
             &mut payload,
             carrick_core_abi::service::ExecCall::Execve,
