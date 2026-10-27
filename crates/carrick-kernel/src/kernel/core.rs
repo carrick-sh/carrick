@@ -232,7 +232,30 @@ impl KernelTaskSignalSnapshot {
     }
 }
 
+/// A binding that does not keep the kernel or its task alive.
+#[derive(Clone, Debug)]
+pub struct WeakKernelTaskBinding {
+    kernel: std::sync::Weak<Kernel>,
+    task: TaskKey,
+}
+
+impl WeakKernelTaskBinding {
+    pub fn upgrade(&self) -> Option<KernelTaskBinding> {
+        Some(KernelTaskBinding {
+            kernel: self.kernel.upgrade()?,
+            task: self.task,
+        })
+    }
+}
+
 impl KernelTaskBinding {
+    pub fn downgrade(&self) -> WeakKernelTaskBinding {
+        WeakKernelTaskBinding {
+            kernel: Arc::downgrade(&self.kernel),
+            task: self.task,
+        }
+    }
+
     pub const fn task_id(&self) -> TaskId {
         self.task.id
     }
