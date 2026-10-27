@@ -428,9 +428,19 @@ test-kernel *ARGS:
 test-loom *ARGS: (test-loom-a ARGS) (test-loom-b ARGS)
 
 test-loom-a *ARGS:
+    {{_admit}} {{_xtask}} loom-run _test-loom-a -- {{ARGS}}
+
+# Source selections stay separate so loom-run preserves each feature closure.
+# CARRICK_LOOM_TIMEOUT_SECS overrides the default 20-minute per-binary deadline.
+[private]
+_test-loom-a *ARGS:
     {{_admit}} {{_cargo}} test --locked -p carrick-fd-core --features loom --lib loom_models {{ARGS}}
 
 test-loom-b *ARGS:
+    {{_admit}} {{_xtask}} loom-run _test-loom-b -- {{ARGS}}
+
+[private]
+_test-loom-b *ARGS:
     {{_admit}} {{_cargo}} test --locked -p carrick-sched-core --features loom --lib loom_models {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-kernel --features loom --lib loom_models {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib terminal_clear_loom {{ARGS}}
@@ -510,7 +520,7 @@ test-xtask *ARGS:
 
 [private]
 _test-xtask *ARGS:
-    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test smoke_signed --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test loom_run --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test smoke_signed --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
 
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:

@@ -103,8 +103,8 @@ pub fn run(root: &Path, args: LoomRunArgs) -> Result<()> {
         // Runtime's two filters share exactly one compilation, without unifying
         // features with other packages as test-batch does.
         let key = (lane.cwd.clone(), lane.build.clone());
-        if !binaries.contains_key(&key) {
-            binaries.insert(key, build(lane)?);
+        if let std::collections::btree_map::Entry::Vacant(entry) = binaries.entry(key) {
+            entry.insert(build(lane)?);
         }
     }
     for lane in &lanes {
