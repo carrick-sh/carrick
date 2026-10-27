@@ -907,7 +907,14 @@ impl Drop for El1EditorExclusion {
         if let (Some(tables), Some(index)) = (self.tables.as_ref(), self.index)
             && tables.live()
         {
-            tables.lower_after_edit(index);
+            // Advance the Editor revision (and wake its waiters) only when
+            // this exclusion changed stage-1. Every release still publishes
+            // the Gate notification, which wakes waiters parked on the gate.
+            if self.held.license().stage1_edited() {
+                tables.lower_after_edit(index);
+            } else {
+                tables.lower(index);
+            }
         }
     }
 }

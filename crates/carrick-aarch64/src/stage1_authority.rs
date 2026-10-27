@@ -111,6 +111,10 @@ mod edit_license_sealed {
 /// mutation lane.
 pub trait Stage1EditLicense: edit_license_sealed::Sealed {
     fn mm(&self) -> u64;
+    /// Note that an admitted stage-1 mutation is about to run under this
+    /// license. A host exclusion uses it to decide whether its release must
+    /// advance the Editor revision; a guest `SpaceEditor` publishes its own.
+    fn record_edit(&self) {}
 }
 
 /// Typed refusal for a stage-1 mutation attempted without the exact MM's
@@ -183,6 +187,9 @@ impl From<Stage1EditRefusal> for () {
 impl Stage1EditLicense for carrick_hal::el1_editor_exclusion::El1EditorExcluded {
     fn mm(&self) -> u64 {
         self.mm()
+    }
+    fn record_edit(&self) {
+        self.record_stage1_edit();
     }
 }
 
@@ -578,6 +585,7 @@ impl Stage1Authority {
     fn assert_license(&self, license: &impl Stage1EditLicense) -> Result<(), Stage1EditRefusal> {
         let authority_mm = self.inner.lock().mm;
         if authority_mm == Some(license.mm()) {
+            license.record_edit();
             Ok(())
         } else {
             Err(Stage1EditRefusal {

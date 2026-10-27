@@ -588,6 +588,9 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
         carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
         crate::descriptor_drain::GuestPublishError,
     > {
+        if let Some(license) = self.editor_excluded {
+            license.record_stage1_edit();
+        }
         self.tables
             .settle_guest_descriptor_receipt(txn, receipt)
             .map_err(|error| {
@@ -1937,6 +1940,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         adopt: (u64, usize),
         rules: &[(u64, usize, TerminalRule)],
     ) -> Result<(), MemoryError> {
+        if let Some(license) = license {
+            license.record_stage1_edit();
+        }
         if self.page_tables.live_descriptor_owner() != LiveDescriptorOwner::Guest {
             let license = license.ok_or_else(|| {
                 MemoryError::HostMap("host stage-1 rules lack their Editor exclusion".to_owned())
@@ -2003,6 +2009,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         len: usize,
         reclaim: bool,
     ) -> Result<Option<crate::stage1_authority::Stage1LeafRetired>, MappingRetirementError> {
+        if let Some(license) = license {
+            license.record_stage1_edit();
+        }
         if self.page_tables.live_descriptor_owner() != LiveDescriptorOwner::Guest {
             let license = license.ok_or_else(|| {
                 MappingRetirementError::Indeterminate(MemoryError::HostMap(

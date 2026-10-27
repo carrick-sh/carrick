@@ -4567,6 +4567,119 @@ pub(crate) mod tests {
         );
     }
 
+    /// #855 review P2-1: releasing a host exclusion advanced and published
+    /// the Editor revision even when nothing edited stage-1 (guest-COW
+    /// settlement, backing maintenance), and each Editor wake places and
+    /// kicks a waiter. The revision must advance only after a stage-1 edit
+    /// made under the exclusion's license; the Gate notification is always
+    /// published.
+    #[test]
+    fn serial_host_exclusion_advances_editor_revision_only_after_a_stage1_edit() {
+        use carrick_el1_linux::mm_portal::{
+            MmPortal,
+            test_support::{ROOT, Region, admit_notified, nodes},
+        };
+        use carrick_sched_core::spaces::notification::SpaceWaitCause;
+        use std::num::NonZeroU64;
+
+        let (process, _) = crate::hvpatch::process_context_for_tests(71_202);
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            Some(process.clone()),
+            None,
+        ));
+        let root = kernel.dispatcher.capture_one_task_context().unwrap();
+        let region = Box::leak(Box::new(Region::new()));
+        let zone = region.zone();
+        let mm = admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
+        let view = Box::leak(Box::new(nodes(region)));
+        let portal = Box::leak(Box::new(
+            MmPortal::new(
+                NonZeroU64::new(713).unwrap(),
+                region.table(),
+                &zone.spaces,
+                view,
+            )
+            .with_zone(zone)
+            .unwrap(),
+        ));
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        carrick_el1_abi::record_el1_region_host_ptr(region.ptr.as_ptr() as usize);
+        struct ClearRegion;
+        impl Drop for ClearRegion {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+            }
+        }
+        let _clear_region = ClearRegion;
+        let revisions = || {
+            let source = zone
+                .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+                .unwrap()
+                .notifications(handle.incarnation())
+                .unwrap();
+            (
+                source.observe(SpaceWaitCause::Editor).revision(),
+                source.observe(SpaceWaitCause::Gate).revision(),
+            )
+        };
+        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        manager
+            .map_aliased(
+                0x71_1000,
+                0xa084_7100_0000,
+                4096,
+                carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+                None,
+            )
+            .unwrap();
+        let authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
+        assert!(authority.bind_mm(mm.raw()));
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            let (editor_before, gate_before) = revisions();
+            // An exclusion that only settles state edits nothing.
+            drop(
+                carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(root.shared().mm().id())
+                    .expect("published MM admits a host exclusion"),
+            );
+            let (editor_idle, gate_idle) = revisions();
+            assert_eq!(
+                editor_idle, editor_before,
+                "an exclusion with no stage-1 edit must not advance the Editor revision"
+            );
+            assert_ne!(gate_idle, gate_before, "every release publishes the gate");
+
+            // The production munmap shape: a licensed edit unpublishes stage-1.
+            let exclusion =
+                carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(root.shared().mm().id())
+                    .expect("published MM admits a host exclusion");
+            let (_, receipt) = authority
+                .edit_unpublishing(
+                    exclusion.license(),
+                    || unreachable!("installed manager"),
+                    0x71_1000,
+                    4096,
+                    |editor| editor.invalidate(0x71_1000, 4096).map(|_| ()),
+                )
+                .unwrap();
+            assert!(receipt.is_some());
+            drop(exclusion);
+            let (editor_edited, _) = revisions();
+            assert_ne!(
+                editor_edited, editor_idle,
+                "an exclusion that changed stage-1 must advance the Editor revision"
+            );
+        });
+    }
+
     #[test]
     fn serial_host_mm_exit_close_races_a_parked_sibling_copy_without_invariant_kill() {
         exercise_owner_wait_schedule_at(

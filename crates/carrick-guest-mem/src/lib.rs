@@ -75,7 +75,10 @@ impl HeldEl1EditorExclusion {
     #[must_use]
     pub fn register(excluded: &carrick_sched_core::ExcludedEditor<'_>) -> Self {
         Self {
-            license: El1EditorExcluded { mm: excluded.key() },
+            license: El1EditorExcluded {
+                mm: excluded.key(),
+                stage1_edited: core::sync::atomic::AtomicBool::new(false),
+            },
         }
     }
 
@@ -95,12 +98,30 @@ impl HeldEl1EditorExclusion {
 #[derive(Debug)]
 pub struct El1EditorExcluded {
     mm: u64,
+    /// Set by every stage-1 mutation made under this exclusion. Releasing an
+    /// exclusion advances the Editor revision only when it is set: a copy's
+    /// selection receipt is stale exactly when stage-1 changed.
+    stage1_edited: core::sync::atomic::AtomicBool,
 }
 
 impl El1EditorExcluded {
     #[must_use]
     pub fn mm(&self) -> u64 {
         self.mm
+    }
+
+    /// Record that a stage-1 mutation is being made under this exclusion.
+    /// Called by the stage-1 authority and engine before they edit.
+    pub fn record_stage1_edit(&self) {
+        self.stage1_edited
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether any stage-1 mutation was made under this exclusion.
+    #[must_use]
+    pub fn stage1_edited(&self) -> bool {
+        self.stage1_edited
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 }
 
