@@ -157,6 +157,23 @@ impl ExecFiles {
         })
     }
 
+    /// The filesystem authority a ring-owned native process of this tree
+    /// resolves host paths with: the origin's exact credentials and
+    /// filesystem context, offered only while both are unchanged and the
+    /// credentials are the admitted superuser identity (the ring serves a
+    /// path crossing only while the caller's ring credentials are that same
+    /// identity). Otherwise `None`, and the venue refuses path calls.
+    pub fn native_fs_authority(&self) -> Option<super::resources::NativeFsAuthority> {
+        if !self.origin_authority_unchanged() || !self.origin_is_superuser() {
+            return None;
+        }
+        let origin = self.context.origin.as_ref()?;
+        Some(super::resources::NativeFsAuthority::new(
+            Arc::clone(&origin.credentials),
+            Arc::clone(&origin.fs_context),
+        ))
+    }
+
     /// The access view for a ring-owned native child of the origin task:
     /// identical filesystem authority, but no caller-relative magic views.
     pub fn for_native_child(&self) -> Self {

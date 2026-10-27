@@ -507,6 +507,20 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }
+    /// Copy a completed syscall's output to the caller's user memory on the
+    /// selected record's live address space, with EL0 permissions. The
+    /// staging step already made the range writable (fault supply first), so
+    /// this is the plain user copy a ring pipe read uses; a range a sibling
+    /// made unwritable since (a concurrent fork's COW) faults, and the call
+    /// reports EFAULT.
+    fn copy_syscall_output(
+        &mut self,
+        _mm: &Self::Mm,
+        _address: UserVa,
+        _bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
     fn copy_siginfo(
         &mut self,
         _mm: &Self::Mm,
@@ -4228,6 +4242,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     /// Copy a signal frame through the same exact-MM COW authority as wait status.
+    pub(super) fn copy_syscall_output(
+        &mut self,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        self.service.copy_syscall_output(&mm, address, bytes)
+    }
     pub fn copy_signal_frame(
         &mut self,
         address: UserVa,

@@ -199,6 +199,19 @@ struct HostResources {
     live: BTreeMap<u64, HostResource>,
 }
 
+/// Why a newly opened host resource could not be installed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallHostDescriptionError {
+    /// The caller's descriptor limit (EMFILE).
+    TooManyFiles,
+    /// The zone-wide file table (ENFILE).
+    FileTableFull,
+    /// Host storage could not be provided (ENOMEM).
+    NoMemory,
+    /// The table is contended or inconsistent: never guess an errno.
+    Unavailable,
+}
+
 /// Why a native host-file service could not reach a host resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PinnedHostResourceError {
@@ -995,6 +1008,59 @@ impl HostIpc {
             .live
             .insert(token.get(), HostResource::from(resource));
         Ok(token)
+    }
+
+    /// Install a newly opened host resource as the lowest free descriptor of
+    /// ring table `table` (Linux open(2) numbering), growing the description
+    /// store or the table's slots as fd-core requests. On refusal nothing is
+    /// published and the resource is dropped.
+    pub fn install_host_description(
+        &self,
+        table: fd::TableId,
+        resource: Box<dyn std::any::Any + Send + Sync>,
+        access: fd::AccessMode,
+        flags: fd::StatusFlags,
+        cloexec: bool,
+    ) -> Result<fd::Fd, InstallHostDescriptionError> {
+        let token = self
+            .retain_host_resource(resource)
+            .map_err(|_| InstallHostDescriptionError::NoMemory)?;
+        let backing = carrick_el1_abi::ipc::IpcBacking::Host(token).encode();
+        let forget = |error| {
+            self.resources.lock().live.remove(&token.get());
+            Err(error)
+        };
+        loop {
+            let seen = self.region().ofd_count();
+            let opened = self.region().fd(HostLockWait).open(
+                table,
+                fd::Fd(0),
+                fd::Description::new(backing, access, flags),
+                cloexec,
+            );
+            match opened {
+                Ok(number) => return Ok(number),
+                Err(fd::Error::NeedsOfds) => {
+                    if let Err(error) = self.grow_descriptions(seen) {
+                        return forget(match error {
+                            AdmissionError::Shared(IpcError::ZoneLimit) => {
+                                InstallHostDescriptionError::FileTableFull
+                            }
+                            _ => InstallHostDescriptionError::NoMemory,
+                        });
+                    }
+                }
+                Err(fd::Error::NeedsBacking { descriptors }) => {
+                    if self.ensure_capacity(table, descriptors).is_err() {
+                        return forget(InstallHostDescriptionError::NoMemory);
+                    }
+                }
+                Err(fd::Error::TooManyFiles) => {
+                    return forget(InstallHostDescriptionError::TooManyFiles);
+                }
+                Err(_) => return forget(InstallHostDescriptionError::Unavailable),
+            }
+        }
     }
 
     /// Pin the exact open description `fd` names in ring table `table` and

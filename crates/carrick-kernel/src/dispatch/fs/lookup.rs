@@ -28,11 +28,13 @@ pub(in crate::dispatch) enum FastPathKind {
 
 /// The intent of the path lookup, distinguishing between open, stat, statx, etc.
 pub(in crate::dispatch) enum LookupIntent<'a> {
+    /// `None` names a native (ring-owned) caller: it has no host task, so a
+    /// caller-relative synthetic `/proc` answer is unrouted (ENOSYS).
     Stat {
-        context: &'a crate::kernel::KernelContext,
+        context: Option<&'a crate::kernel::KernelContext>,
     },
     Statx {
-        context: &'a crate::kernel::KernelContext,
+        context: Option<&'a crate::kernel::KernelContext>,
     },
     Open {
         context: &'a crate::kernel::KernelContext,
@@ -602,6 +604,9 @@ impl<'a> FsView<'a> {
             }
             LookupIntent::Stat { context } | LookupIntent::Statx { context } => {
                 if crate::vfs::may_be_synthetic_virtual_path(&resolved) {
+                    let Some(context) = context else {
+                        return Err(carrick_abi::LINUX_ENOSYS);
+                    };
                     let proc_ctx = self.synthetic_proc_context(context);
                     if let Some(contents) = crate::vfs::proc::synthetic_file(&resolved, &proc_ctx) {
                         return Ok(PathLookup {

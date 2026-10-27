@@ -145,6 +145,59 @@ thread_local! {
         const { Cell::new(std::ptr::null()) };
     static RETIRING_FILE_TABLES: RefCell<Vec<Arc<crate::kernel::FileTable>>> =
         const { RefCell::new(Vec::new()) };
+    static NATIVE_FS_SCOPE: RefCell<Option<NativeFsAuthority>> = const { RefCell::new(None) };
+}
+
+/// Filesystem authority of a ring-owned (native) process for one carrier
+/// host-file service: its credentials and its filesystem context (cwd,
+/// root). It deliberately has no host task, file table or MM: a native
+/// process's descriptors live in its ring namespace, so any helper that
+/// reaches for a host fd table inside this scope escapes it and fails closed.
+#[derive(Clone)]
+pub struct NativeFsAuthority {
+    pub(super) credentials: Arc<crate::kernel::Credentials>,
+    pub(super) fs_context: Arc<crate::kernel::FsContext>,
+}
+
+impl std::fmt::Debug for NativeFsAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeFsAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeFsAuthority {
+    pub fn new(
+        credentials: Arc<crate::kernel::Credentials>,
+        fs_context: Arc<crate::kernel::FsContext>,
+    ) -> Self {
+        Self {
+            credentials,
+            fs_context,
+        }
+    }
+}
+
+/// Run `operation` with `authority` as the credentials and filesystem
+/// context the filesystem helpers read. Never nests inside a host task's
+/// captured scope: the two authorities must not mix.
+pub(super) fn with_native_fs_scope<R>(
+    authority: &NativeFsAuthority,
+    operation: impl FnOnce() -> R,
+) -> Option<R> {
+    if !executor_boundary_is_clear() {
+        return None;
+    }
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NATIVE_FS_SCOPE.with(|scope| scope.borrow_mut().take());
+        }
+    }
+    NATIVE_FS_SCOPE.with(|scope| *scope.borrow_mut() = Some(authority.clone()));
+    let _restore = Restore;
+    Some(operation())
 }
 
 /// Exhaustive current-thread resource-scope audit used before an executor is
@@ -153,6 +206,7 @@ pub fn executor_boundary_is_clear() -> bool {
     ACTIVE_CONTEXT.with(|active| active.get().is_null())
         && CAPTURED_RESOURCES.with(|stack| stack.borrow().is_empty())
         && RETIRING_FILE_TABLES.with(|stack| stack.borrow().is_empty())
+        && NATIVE_FS_SCOPE.with(|scope| scope.borrow().is_none())
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -443,11 +497,29 @@ pub(super) fn task() -> Option<crate::kernel::TaskRef> {
 }
 
 pub(super) fn credentials() -> Option<Arc<crate::kernel::Credentials>> {
-    CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::credentials))
+    CAPTURED_RESOURCES
+        .with(|stack| stack.borrow().last().map(CapturedResources::credentials))
+        .or_else(|| {
+            NATIVE_FS_SCOPE.with(|scope| {
+                scope
+                    .borrow()
+                    .as_ref()
+                    .map(|authority| Arc::clone(&authority.credentials))
+            })
+        })
 }
 
 pub(super) fn fs_context() -> Option<Arc<crate::kernel::FsContext>> {
-    CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::fs_context))
+    CAPTURED_RESOURCES
+        .with(|stack| stack.borrow().last().map(CapturedResources::fs_context))
+        .or_else(|| {
+            NATIVE_FS_SCOPE.with(|scope| {
+                scope
+                    .borrow()
+                    .as_ref()
+                    .map(|authority| Arc::clone(&authority.fs_context))
+            })
+        })
 }
 
 pub(super) fn files() -> Option<Arc<crate::kernel::FileTable>> {

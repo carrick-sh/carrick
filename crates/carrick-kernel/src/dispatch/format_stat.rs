@@ -177,6 +177,18 @@ pub(super) fn write_statx_record(
     statxbuf: u64,
     record: &StatRecord,
 ) -> DispatchOutcome {
+    copyout_record(
+        context,
+        memory,
+        statxbuf,
+        &linux_statx(record),
+        DispatchOutcome::Returned { value: 0 },
+    )
+}
+
+/// The Linux `struct statx` for one record: the single encoding shared by
+/// the dispatcher's copyout and the native host-file venue's reply.
+pub(super) fn linux_statx(record: &StatRecord) -> LinuxStatx {
     let zero_time = LinuxStatxTimestamp::zero();
     let stx_ts = |t: (i64, i64)| LinuxStatxTimestamp {
         tv_sec: t.0,
@@ -185,7 +197,7 @@ pub(super) fn write_statx_record(
     };
     let size = record.size_usize();
     let blocks = record.blocks.unwrap_or_else(|| blocks_512(size) as u64);
-    let statx = LinuxStatx {
+    LinuxStatx {
         stx_mask: LINUX_STATX_BASIC_STATS,
         stx_blksize: LINUX_PAGE_SIZE as u32,
         stx_attributes: 0,
@@ -217,14 +229,7 @@ pub(super) fn write_statx_record(
         stx_atomic_write_unit_max_opt: 0,
         __spare2: [0; 1],
         __spare3: [0; 8],
-    };
-    copyout_record(
-        context,
-        memory,
-        statxbuf,
-        &statx,
-        DispatchOutcome::Returned { value: 0 },
-    )
+    }
 }
 
 pub(crate) fn write_synthetic_statx(

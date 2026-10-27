@@ -3,10 +3,11 @@
 //! A ring-owned (native) process has one descriptor namespace, the ring's.
 //! Calls on in-zone objects (pipes, eventfds, epoll, guest sockets) are
 //! served in ring and never leave it. A call whose descriptor names a
-//! host-backed open description genuinely crosses: the ring stages a typed
-//! [`carrick_core_abi::host_file`] record and the carrier serves it with the
-//! caller's authority. This module is the single routing decision and the
-//! single staging step for both ISAs; transports only carry the record.
+//! host-backed open description, or that resolves a host path, genuinely
+//! crosses: the ring stages a typed [`carrick_core_abi::host_file`] record
+//! and the carrier serves it with the caller's authority. This module is the
+//! single routing decision and the single staging step for both ISAs;
+//! transports only carry the record.
 extern crate alloc;
 
 use crate::abi::entry::SyscallResult;
@@ -21,9 +22,18 @@ use carrick_syscall_abi::{CanonicalNr, LinuxErrno};
 
 /// Size of the aarch64 Linux `struct stat` (`asm-generic/stat.h`).
 pub const LINUX_STAT_BYTES: usize = 128;
+/// Size of Linux `struct statx`.
+pub const LINUX_STATX_BYTES: usize = 256;
 /// Linux `UIO_MAXIOV`.
 pub const LINUX_UIO_MAXIOV: u64 = 1024;
+/// Linux `PATH_MAX`, including the terminating NUL.
+pub const LINUX_PATH_MAX: usize = 4096;
+/// Linux `AT_FDCWD`.
+pub const LINUX_AT_FDCWD: i32 = -100;
+/// Linux `AT_EMPTY_PATH`.
+pub const LINUX_AT_EMPTY_PATH: u32 = 0x1000;
 const IOVEC_BYTES: usize = 16;
+const PAGE_BYTES: u64 = 4096;
 
 /// Access mode of the open description a descriptor names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,29 +49,106 @@ impl DescriptionAccess {
     const fn writable(self) -> bool {
         matches!(self, Self::WriteOnly | Self::ReadWrite)
     }
+    const fn readable(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+}
+
+/// The in-zone object kinds the ring owns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InZoneKind {
+    Pipe,
+    EventFd,
+    Epoll,
 }
 
 /// What the caller's descriptor names, resolved in its own ring table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeDescriptor {
     /// An in-zone object; the ring owns every operation on it.
-    InZone,
-    /// A host-backed open description in ring table `table`.
-    HostBacked {
-        table: [u64; 3],
-        access: DescriptionAccess,
-    },
+    InZone(InZoneKind),
+    /// A host-backed open description.
+    HostBacked { access: DescriptionAccess },
     /// No open descriptor with this number.
     Absent,
+}
+
+/// The caller's complete ring namespace: its table id (the fd-core raw
+/// table words) and a resolver for its descriptors. A resolver answer of
+/// `None` means the table is contended or unpublished.
+pub struct NativeNamespace<'a> {
+    pub table: [u64; 3],
+    pub resolve: &'a mut dyn FnMut(i32) -> Option<NativeDescriptor>,
 }
 
 /// A host-file call the native venue knows, decoded from canonical
 /// arguments. Pointers are still untrusted user addresses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostFileCall {
-    Write { fd: i32, buf: u64, count: u64 },
-    Writev { fd: i32, iov: u64, iovcnt: u64 },
-    Fstat { fd: i32, statbuf: u64 },
+    Write {
+        fd: i32,
+        buf: u64,
+        count: u64,
+    },
+    Writev {
+        fd: i32,
+        iov: u64,
+        iovcnt: u64,
+    },
+    Fstat {
+        fd: i32,
+        statbuf: u64,
+    },
+    Openat {
+        dirfd: i32,
+        path: u64,
+        flags: u64,
+        mode: u64,
+    },
+    Faccessat {
+        dirfd: i32,
+        path: u64,
+        mode: u64,
+        flags: u64,
+    },
+    Newfstatat {
+        dirfd: i32,
+        path: u64,
+        statbuf: u64,
+        flags: u64,
+    },
+    Statx {
+        dirfd: i32,
+        path: u64,
+        flags: u64,
+        mask: u64,
+        buf: u64,
+    },
+    Read {
+        fd: i32,
+        buf: u64,
+        count: u64,
+    },
+    Pread {
+        fd: i32,
+        buf: u64,
+        count: u64,
+        offset: u64,
+    },
+    Lseek {
+        fd: i32,
+        offset: u64,
+        whence: u64,
+    },
+    Getdents64 {
+        fd: i32,
+        dirp: u64,
+        count: u64,
+    },
+    Ioctl {
+        fd: i32,
+        request: u64,
+    },
 }
 
 impl HostFileCall {
@@ -70,40 +157,91 @@ impl HostFileCall {
     pub fn decode(canonical: CanonicalNr, args: &[u64; 6]) -> Option<Self> {
         use crate::crossing::nr;
         let fd = args[0] as i32;
-        Some(if canonical == nr::WRITE {
-            Self::Write {
+        Some(match canonical {
+            c if c == nr::WRITE => Self::Write {
                 fd,
                 buf: args[1],
                 count: args[2],
-            }
-        } else if canonical == nr::WRITEV {
-            Self::Writev {
+            },
+            c if c == nr::WRITEV => Self::Writev {
                 fd,
                 iov: args[1],
                 iovcnt: args[2],
-            }
-        } else if canonical == nr::FSTAT {
-            Self::Fstat {
+            },
+            c if c == nr::FSTAT => Self::Fstat {
                 fd,
                 statbuf: args[1],
-            }
-        } else {
-            return None;
+            },
+            c if c == nr::OPENAT => Self::Openat {
+                dirfd: fd,
+                path: args[1],
+                flags: args[2],
+                mode: args[3],
+            },
+            c if c == nr::FACCESSAT => Self::Faccessat {
+                dirfd: fd,
+                path: args[1],
+                mode: args[2],
+                flags: 0,
+            },
+            c if c == nr::FACCESSAT2 => Self::Faccessat {
+                dirfd: fd,
+                path: args[1],
+                mode: args[2],
+                flags: args[3],
+            },
+            c if c == nr::NEWFSTATAT => Self::Newfstatat {
+                dirfd: fd,
+                path: args[1],
+                statbuf: args[2],
+                flags: args[3],
+            },
+            c if c == nr::STATX => Self::Statx {
+                dirfd: fd,
+                path: args[1],
+                flags: args[2],
+                mask: args[3],
+                buf: args[4],
+            },
+            c if c == nr::READ => Self::Read {
+                fd,
+                buf: args[1],
+                count: args[2],
+            },
+            c if c == nr::PREAD64 => Self::Pread {
+                fd,
+                buf: args[1],
+                count: args[2],
+                offset: args[3],
+            },
+            c if c == nr::LSEEK => Self::Lseek {
+                fd,
+                offset: args[1],
+                whence: args[2],
+            },
+            c if c == nr::GETDENTS64 => Self::Getdents64 {
+                fd,
+                dirp: args[1],
+                count: args[2],
+            },
+            c if c == nr::IOCTL => Self::Ioctl {
+                fd,
+                request: args[1],
+            },
+            _ => return None,
         })
-    }
-
-    pub const fn fd(self) -> i32 {
-        match self {
-            Self::Write { fd, .. } | Self::Writev { fd, .. } | Self::Fstat { fd, .. } => fd,
-        }
     }
 }
 
-/// User memory as the staging step needs it. Output is copied back after
-/// the reply through the owner's user-write path, which resolves COW and
-/// reports a genuinely unwritable buffer as EFAULT, as Linux does.
+/// User memory as the staging step needs it. Before a request with output
+/// crosses, its whole output range must already be writable, so the reply's
+/// copy-out cannot need a page the ring would have to supply mid-completion:
+/// staging asks for fault supply first and retries the exact call, and a
+/// refused supply is EFAULT, as Linux reports a bad buffer.
 pub trait HostFileUser {
     fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool;
+    /// Contiguous bytes from `dst` that user mode can write now.
+    fn writable(&mut self, dst: u64, len: usize) -> usize;
 }
 
 /// User output the ring copies back after the carrier replies.
@@ -116,7 +254,8 @@ pub struct HostFileOutput {
 /// The ring's routing decision for one decoded call.
 #[derive(Debug, Eq, PartialEq)]
 pub enum HostFileStage {
-    /// An in-zone object: the call stays with its ring owner and never
+    /// An in-zone object this venue does not serve: the call stays with its
+    /// ring owner (counted ENOSYS until that owner serves it) and never
     /// builds a host request.
     InRing,
     /// Answered in ring without crossing.
@@ -128,6 +267,9 @@ pub enum HostFileStage {
     Request {
         record: Box<[u8]>,
         output: Option<HostFileOutput>,
+        /// The carrier resolves a path, so the caller's credentials must
+        /// be the authority it uses.
+        resolves_path: bool,
     },
 }
 
@@ -135,115 +277,463 @@ fn errno(errno: LinuxErrno) -> HostFileStage {
     HostFileStage::Returned(SyscallResult::from_errno(errno))
 }
 
-fn request(header: HostFileHeader, input: &[u8], output: Option<HostFileOutput>) -> HostFileStage {
-    let output_cap = output.map_or(0, |output| output.len);
-    let Some(len) = record_len(input.len(), output_cap) else {
-        return errno(carrick_syscall_abi::LINUX_EINVAL);
-    };
-    let mut record = vec![0u8; len].into_boxed_slice();
-    if host_file::encode(&mut record, header, input, output_cap).is_err() {
-        return errno(carrick_syscall_abi::LINUX_EINVAL);
-    }
-    HostFileStage::Request { record, output }
+/// Linux terminal requests (the `'T'` ioctl group): on a pipe or eventfd
+/// they are `ENOTTY`.
+fn is_terminal_request(request: u64) -> bool {
+    (request & 0xff00) == 0x5400
 }
 
-/// Route and stage one decoded call against what its descriptor names.
+enum Path {
+    Bytes(Vec<u8>),
+    Stage(HostFileStage),
+}
+
+/// Copy a NUL-terminated user path without reading past its terminator's
+/// page. The result excludes the NUL.
+fn copy_path(user: &mut dyn HostFileUser, address: u64) -> Path {
+    let mut bytes = Vec::new();
+    let mut cursor = address;
+    loop {
+        let room = (PAGE_BYTES - cursor % PAGE_BYTES) as usize;
+        let take = room.min(LINUX_PATH_MAX - bytes.len());
+        let mut chunk = vec![0u8; take];
+        if !user.copy_in(&mut chunk, cursor) {
+            // Retry the exact call after supply; a refused supply is EFAULT.
+            return Path::Stage(HostFileStage::Fault {
+                address: cursor,
+                access: Access::Read,
+            });
+        }
+        if let Some(end) = chunk.iter().position(|byte| *byte == 0) {
+            bytes.extend_from_slice(&chunk[..end]);
+            return Path::Bytes(bytes);
+        }
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() >= LINUX_PATH_MAX {
+            return Path::Stage(errno(carrick_syscall_abi::LINUX_ENAMETOOLONG));
+        }
+        cursor = match cursor.checked_add(take as u64) {
+            Some(next) => next,
+            None => return Path::Stage(errno(carrick_syscall_abi::LINUX_EFAULT)),
+        };
+    }
+}
+
+struct Staging<'n, 'u> {
+    namespace: &'n mut NativeNamespace<'u>,
+}
+
+impl Staging<'_, '_> {
+    fn request(
+        &self,
+        op: HostFileOp,
+        fd: i32,
+        flags: u32,
+        args: [u64; 4],
+        input: &[u8],
+        output: Option<HostFileOutput>,
+    ) -> HostFileStage {
+        let output_cap = output.map_or(0, |output| output.len);
+        let Some(len) = record_len(input.len(), output_cap) else {
+            return errno(carrick_syscall_abi::LINUX_EINVAL);
+        };
+        let mut record = vec![0u8; len].into_boxed_slice();
+        let header = HostFileHeader {
+            op,
+            table: self.namespace.table,
+            fd,
+            flags,
+            args,
+        };
+        if host_file::encode(&mut record, header, input, output_cap).is_err() {
+            return errno(carrick_syscall_abi::LINUX_EINVAL);
+        }
+        HostFileStage::Request {
+            record,
+            output,
+            resolves_path: op.resolves_path(),
+        }
+    }
+
+    fn descriptor(&mut self, fd: i32) -> Option<NativeDescriptor> {
+        (self.namespace.resolve)(fd)
+    }
+
+    /// Route a path call's `dirfd`. A relative path through a descriptor
+    /// other than `AT_FDCWD` needs that directory as the base, which a
+    /// later slice serves; until then it is a counted ENOSYS, never a guess.
+    fn path_base(&mut self, dirfd: i32, path: &[u8]) -> Option<Option<HostFileStage>> {
+        if dirfd == LINUX_AT_FDCWD || path.first() == Some(&b'/') {
+            return Some(None);
+        }
+        Some(Some(match self.descriptor(dirfd)? {
+            NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENOTDIR),
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { .. } => errno(carrick_syscall_abi::LINUX_ENOSYS),
+        }))
+    }
+
+    /// Stage `fstat`/`statx` of a descriptor (`AT_EMPTY_PATH` or `fstat`).
+    fn descriptor_stat(
+        &mut self,
+        op: HostFileOp,
+        fd: i32,
+        flags: u32,
+        args: [u64; 4],
+        output: HostFileOutput,
+    ) -> Option<HostFileStage> {
+        Some(match self.descriptor(fd)? {
+            NativeDescriptor::InZone(_) => HostFileStage::InRing,
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { .. } => {
+                self.request(op, fd, flags, args, &[], Some(output))
+            }
+        })
+    }
+
+    fn write(
+        &mut self,
+        fd: i32,
+        user: &mut dyn HostFileUser,
+        gather: impl FnOnce(&mut dyn HostFileUser) -> Result<Vec<u8>, HostFileStage>,
+    ) -> Option<HostFileStage> {
+        Some(match self.descriptor(fd)? {
+            NativeDescriptor::InZone(_) => HostFileStage::InRing,
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { access } if !access.writable() => {
+                errno(carrick_syscall_abi::LINUX_EBADF)
+            }
+            NativeDescriptor::HostBacked { .. } => match gather(user) {
+                Ok(input) if input.is_empty() => HostFileStage::Returned(SyscallResult::new(0)),
+                Ok(input) => self.request(HostFileOp::Write, fd, 0, [0; 4], &input, None),
+                Err(stage) => stage,
+            },
+        })
+    }
+}
+
+fn chunk(count: u64) -> usize {
+    (count as usize).min(HOST_FILE_CHUNK_BYTES)
+}
+
+/// Gather `writev` vectors into one bounded chunk, in order.
+fn gather_vectors(
+    user: &mut dyn HostFileUser,
+    iov: u64,
+    iovcnt: u64,
+) -> Result<Vec<u8>, HostFileStage> {
+    if iovcnt > LINUX_UIO_MAXIOV {
+        return Err(errno(carrick_syscall_abi::LINUX_EINVAL));
+    }
+    let mut vectors = vec![0u8; iovcnt as usize * IOVEC_BYTES];
+    if !vectors.is_empty() && !user.copy_in(&mut vectors, iov) {
+        return Err(HostFileStage::Fault {
+            address: iov,
+            access: Access::Read,
+        });
+    }
+    // Linux rejects a negative total before any transfer.
+    let mut total: u64 = 0;
+    let mut segments = Vec::with_capacity(iovcnt as usize);
+    for vector in vectors.chunks_exact(IOVEC_BYTES) {
+        let base = u64::from_le_bytes(vector[0..8].try_into().unwrap_or([0; 8]));
+        let len = u64::from_le_bytes(vector[8..16].try_into().unwrap_or([0; 8]));
+        total = match total.checked_add(len) {
+            Some(total) if total <= i64::MAX as u64 => total,
+            _ => return Err(errno(carrick_syscall_abi::LINUX_EINVAL)),
+        };
+        segments.push((base, len));
+    }
+    let mut input = Vec::with_capacity(chunk(total));
+    for (base, len) in segments {
+        let room = HOST_FILE_CHUNK_BYTES - input.len();
+        if room == 0 {
+            break;
+        }
+        let take = (len as usize).min(room);
+        let start = input.len();
+        input.resize(start + take, 0);
+        if !user.copy_in(&mut input[start..], base) {
+            // Supply first and retry the exact call; a refused supply
+            // completes as EFAULT.
+            return Err(HostFileStage::Fault {
+                address: base,
+                access: Access::Read,
+            });
+        }
+    }
+    Ok(input)
+}
+
+/// Route and stage one decoded call. `None` keeps the call on its existing
+/// route (a contended or unpublished namespace, or a call this venue does
+/// not own).
 pub fn stage(
     call: HostFileCall,
-    descriptor: NativeDescriptor,
+    namespace: &mut NativeNamespace<'_>,
     user: &mut dyn HostFileUser,
-) -> HostFileStage {
-    let (table, access) = match descriptor {
-        NativeDescriptor::InZone => return HostFileStage::InRing,
-        NativeDescriptor::Absent => return errno(carrick_syscall_abi::LINUX_EBADF),
-        NativeDescriptor::HostBacked { table, access } => (table, access),
-    };
-    let header = |op| HostFileHeader {
-        op,
-        table,
-        fd: call.fd(),
-        flags: 0,
-        args: [0; 4],
-    };
-    match call {
-        HostFileCall::Write { buf, count, .. } => {
-            if !access.writable() {
-                return errno(carrick_syscall_abi::LINUX_EBADF);
-            }
-            if count == 0 {
-                return HostFileStage::Returned(SyscallResult::new(0));
-            }
-            let len = (count as usize).min(HOST_FILE_CHUNK_BYTES);
-            let mut input = vec![0u8; len];
-            if !user.copy_in(&mut input, buf) {
-                return HostFileStage::Fault {
-                    address: buf,
-                    access: Access::Read,
-                };
-            }
-            request(header(HostFileOp::Write), &input, None)
+) -> Option<HostFileStage> {
+    let staged = stage_call(call, namespace, user)?;
+    if let HostFileStage::Request {
+        output: Some(output),
+        ..
+    } = &staged
+    {
+        let writable = user.writable(output.address, output.len);
+        if writable < output.len {
+            return Some(HostFileStage::Fault {
+                address: output.address.saturating_add(writable as u64),
+                access: Access::Write,
+            });
         }
-        HostFileCall::Writev { iov, iovcnt, .. } => {
-            if !access.writable() {
-                return errno(carrick_syscall_abi::LINUX_EBADF);
-            }
-            if iovcnt > LINUX_UIO_MAXIOV {
-                return errno(carrick_syscall_abi::LINUX_EINVAL);
-            }
-            let mut vectors = vec![0u8; iovcnt as usize * IOVEC_BYTES];
-            if !vectors.is_empty() && !user.copy_in(&mut vectors, iov) {
-                return HostFileStage::Fault {
-                    address: iov,
-                    access: Access::Read,
-                };
-            }
-            // Linux rejects a negative total before any transfer.
-            let mut total: u64 = 0;
-            let mut segments = Vec::with_capacity(iovcnt as usize);
-            for vector in vectors.chunks_exact(IOVEC_BYTES) {
-                let base = u64::from_le_bytes(vector[0..8].try_into().unwrap_or([0; 8]));
-                let len = u64::from_le_bytes(vector[8..16].try_into().unwrap_or([0; 8]));
-                if len > i64::MAX as u64 {
-                    return errno(carrick_syscall_abi::LINUX_EINVAL);
-                }
-                total = match total.checked_add(len) {
-                    Some(total) if total <= i64::MAX as u64 => total,
-                    _ => return errno(carrick_syscall_abi::LINUX_EINVAL),
-                };
-                segments.push((base, len));
-            }
-            if total == 0 {
-                return HostFileStage::Returned(SyscallResult::new(0));
-            }
-            let mut input = Vec::with_capacity((total as usize).min(HOST_FILE_CHUNK_BYTES));
-            for (base, len) in segments {
-                let room = HOST_FILE_CHUNK_BYTES - input.len();
-                if room == 0 {
-                    break;
-                }
-                let take = (len as usize).min(room);
-                let start = input.len();
-                input.resize(start + take, 0);
-                if !user.copy_in(&mut input[start..], base) {
-                    // Supply first and retry the exact call; a refused supply
-                    // completes as EFAULT.
-                    return HostFileStage::Fault {
-                        address: base,
+    }
+    Some(staged)
+}
+
+fn stage_call(
+    call: HostFileCall,
+    namespace: &mut NativeNamespace<'_>,
+    user: &mut dyn HostFileUser,
+) -> Option<HostFileStage> {
+    let mut staging = Staging { namespace };
+    Some(match call {
+        HostFileCall::Write { fd, buf, count } => {
+            return staging.write(fd, user, |user| {
+                let mut input = vec![0u8; chunk(count)];
+                if !input.is_empty() && !user.copy_in(&mut input, buf) {
+                    return Err(HostFileStage::Fault {
+                        address: buf,
                         access: Access::Read,
-                    };
+                    });
                 }
-            }
-            request(header(HostFileOp::Write), &input, None)
+                Ok(input)
+            });
         }
-        HostFileCall::Fstat { statbuf, .. } => request(
-            header(HostFileOp::Fstat),
-            &[],
-            Some(HostFileOutput {
+        HostFileCall::Writev { fd, iov, iovcnt } => {
+            return staging.write(fd, user, |user| gather_vectors(user, iov, iovcnt));
+        }
+        HostFileCall::Fstat { fd, statbuf } => staging.descriptor_stat(
+            HostFileOp::Fstat,
+            fd,
+            0,
+            [0; 4],
+            HostFileOutput {
                 address: statbuf,
                 len: LINUX_STAT_BYTES,
-            }),
-        ),
-    }
+            },
+        )?,
+        HostFileCall::Openat {
+            dirfd,
+            path,
+            flags,
+            mode,
+        } => {
+            let path = match copy_path(user, path) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            if path.is_empty() {
+                return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
+            }
+            if let Some(answer) = staging.path_base(dirfd, &path)? {
+                return Some(answer);
+            }
+            staging.request(
+                HostFileOp::Openat,
+                LINUX_AT_FDCWD,
+                0,
+                [flags, mode, 0, 0],
+                &path,
+                None,
+            )
+        }
+        HostFileCall::Faccessat {
+            dirfd,
+            path,
+            mode,
+            flags,
+        } => {
+            let path = match copy_path(user, path) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            if path.is_empty() {
+                // An AT_EMPTY_PATH descriptor check needs the descriptor's
+                // inode, which a later slice serves.
+                return Some(errno(if flags as u32 & LINUX_AT_EMPTY_PATH != 0 {
+                    carrick_syscall_abi::LINUX_ENOSYS
+                } else {
+                    carrick_syscall_abi::LINUX_ENOENT
+                }));
+            }
+            if let Some(answer) = staging.path_base(dirfd, &path)? {
+                return Some(answer);
+            }
+            staging.request(
+                HostFileOp::Faccessat,
+                LINUX_AT_FDCWD,
+                flags as u32,
+                [mode, 0, 0, 0],
+                &path,
+                None,
+            )
+        }
+        HostFileCall::Newfstatat {
+            dirfd,
+            path,
+            statbuf,
+            flags,
+        } => {
+            let path = match copy_path(user, path) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            let output = HostFileOutput {
+                address: statbuf,
+                len: LINUX_STAT_BYTES,
+            };
+            if path.is_empty() {
+                if flags as u32 & LINUX_AT_EMPTY_PATH == 0 {
+                    return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
+                }
+                if dirfd != LINUX_AT_FDCWD {
+                    return staging.descriptor_stat(HostFileOp::Fstat, dirfd, 0, [0; 4], output);
+                }
+            }
+            if let Some(answer) = staging.path_base(dirfd, &path)? {
+                return Some(answer);
+            }
+            let path: &[u8] = if path.is_empty() { b"." } else { &path };
+            staging.request(
+                HostFileOp::Newfstatat,
+                LINUX_AT_FDCWD,
+                flags as u32,
+                [0; 4],
+                path,
+                Some(output),
+            )
+        }
+        HostFileCall::Statx {
+            dirfd,
+            path,
+            flags,
+            mask,
+            buf,
+        } => {
+            let path = match copy_path(user, path) {
+                Path::Bytes(path) => path,
+                Path::Stage(stage) => return Some(stage),
+            };
+            let output = HostFileOutput {
+                address: buf,
+                len: LINUX_STATX_BYTES,
+            };
+            if path.is_empty() {
+                if flags as u32 & LINUX_AT_EMPTY_PATH == 0 {
+                    return Some(errno(carrick_syscall_abi::LINUX_ENOENT));
+                }
+                if dirfd != LINUX_AT_FDCWD {
+                    return staging.descriptor_stat(
+                        HostFileOp::Statx,
+                        dirfd,
+                        flags as u32,
+                        [mask, 0, 0, 0],
+                        output,
+                    );
+                }
+            }
+            if let Some(answer) = staging.path_base(dirfd, &path)? {
+                return Some(answer);
+            }
+            let path: &[u8] = if path.is_empty() { b"." } else { &path };
+            staging.request(
+                HostFileOp::Statx,
+                LINUX_AT_FDCWD,
+                flags as u32,
+                [mask, 0, 0, 0],
+                path,
+                Some(output),
+            )
+        }
+        HostFileCall::Read { fd, buf, count } => match staging.descriptor(fd)? {
+            NativeDescriptor::InZone(_) => HostFileStage::InRing,
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { access } if !access.readable() => {
+                errno(carrick_syscall_abi::LINUX_EBADF)
+            }
+            NativeDescriptor::HostBacked { .. } => staging.request(
+                HostFileOp::Read,
+                fd,
+                0,
+                [0; 4],
+                &[],
+                Some(HostFileOutput {
+                    address: buf,
+                    len: chunk(count),
+                }),
+            ),
+        },
+        HostFileCall::Pread {
+            fd,
+            buf,
+            count,
+            offset,
+        } => match staging.descriptor(fd)? {
+            NativeDescriptor::InZone(InZoneKind::Pipe) => errno(carrick_syscall_abi::LINUX_ESPIPE),
+            NativeDescriptor::InZone(_) => HostFileStage::InRing,
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { access } if !access.readable() => {
+                errno(carrick_syscall_abi::LINUX_EBADF)
+            }
+            NativeDescriptor::HostBacked { .. } if (offset as i64) < 0 => {
+                errno(carrick_syscall_abi::LINUX_EINVAL)
+            }
+            NativeDescriptor::HostBacked { .. } => staging.request(
+                HostFileOp::Pread,
+                fd,
+                0,
+                [offset, 0, 0, 0],
+                &[],
+                Some(HostFileOutput {
+                    address: buf,
+                    len: chunk(count),
+                }),
+            ),
+        },
+        HostFileCall::Lseek { fd, offset, whence } => match staging.descriptor(fd)? {
+            NativeDescriptor::InZone(InZoneKind::Pipe) => errno(carrick_syscall_abi::LINUX_ESPIPE),
+            NativeDescriptor::InZone(_) => HostFileStage::InRing,
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { .. } => {
+                staging.request(HostFileOp::Lseek, fd, 0, [offset, whence, 0, 0], &[], None)
+            }
+        },
+        HostFileCall::Getdents64 { fd, dirp, count } => match staging.descriptor(fd)? {
+            NativeDescriptor::InZone(_) => errno(carrick_syscall_abi::LINUX_ENOTDIR),
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            NativeDescriptor::HostBacked { .. } => staging.request(
+                HostFileOp::Getdents64,
+                fd,
+                0,
+                [0; 4],
+                &[],
+                Some(HostFileOutput {
+                    address: dirp,
+                    len: chunk(count),
+                }),
+            ),
+        },
+        HostFileCall::Ioctl { fd, request } => match staging.descriptor(fd)? {
+            NativeDescriptor::InZone(InZoneKind::Pipe | InZoneKind::EventFd)
+                if is_terminal_request(request) =>
+            {
+                errno(carrick_syscall_abi::LINUX_ENOTTY)
+            }
+            NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
+            // Other requests, and host-backed terminals, keep their route.
+            _ => return None,
+        },
+    })
 }
 
 /// Map the carrier's reply to the syscall result, copying any output back
@@ -260,10 +750,10 @@ pub fn complete(
         return SyscallResult::new(reply.result);
     }
     if let Some(output) = output {
-        if reply.output.len() != output.len {
+        if reply.output.len() > output.len {
             return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO);
         }
-        if !copy_out(output.address, reply.output) {
+        if !reply.output.is_empty() && !copy_out(output.address, reply.output) {
             return SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT);
         }
     }
@@ -271,206 +761,4 @@ pub fn complete(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use carrick_core_abi::host_file::HostFileRequestView;
-
-    struct Memory {
-        base: u64,
-        bytes: Vec<u8>,
-    }
-    impl HostFileUser for Memory {
-        fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
-            let Some(start) = src.checked_sub(self.base) else {
-                return false;
-            };
-            let start = start as usize;
-            match self.bytes.get(start..start + dst.len()) {
-                Some(bytes) => {
-                    dst.copy_from_slice(bytes);
-                    true
-                }
-                None => false,
-            }
-        }
-    }
-
-    fn memory(bytes: &[u8]) -> Memory {
-        Memory {
-            base: 0x1000,
-            bytes: bytes.to_vec(),
-        }
-    }
-
-    const STDOUT: NativeDescriptor = NativeDescriptor::HostBacked {
-        table: [9, 1, 2],
-        access: DescriptionAccess::ReadWrite,
-    };
-
-    #[test]
-    fn in_zone_pipe_write_never_builds_a_host_request() {
-        let mut user = memory(b"hello");
-        for call in [
-            HostFileCall::Write {
-                fd: 4,
-                buf: 0x1000,
-                count: 5,
-            },
-            HostFileCall::Writev {
-                fd: 4,
-                iov: 0x1000,
-                iovcnt: 1,
-            },
-            HostFileCall::Fstat {
-                fd: 4,
-                statbuf: 0x1000,
-            },
-        ] {
-            assert_eq!(
-                stage(call, NativeDescriptor::InZone, &mut user),
-                HostFileStage::InRing,
-                "{call:?} on an in-zone object must stay in ring"
-            );
-        }
-    }
-
-    #[test]
-    fn host_backed_write_stages_the_callers_bytes_and_table() {
-        let mut user = memory(b"hello");
-        let HostFileStage::Request { mut record, output } = stage(
-            HostFileCall::Write {
-                fd: 1,
-                buf: 0x1000,
-                count: 5,
-            },
-            STDOUT,
-            &mut user,
-        ) else {
-            panic!("a host-backed write crosses");
-        };
-        assert_eq!(output, None);
-        let view = HostFileRequestView::parse(&mut record).unwrap();
-        assert_eq!(view.header().op, HostFileOp::Write);
-        assert_eq!(view.header().table, [9, 1, 2]);
-        assert_eq!(view.header().fd, 1);
-        assert_eq!(view.input(), b"hello");
-    }
-
-    #[test]
-    fn writev_gathers_vectors_and_absent_or_readonly_fds_stay_in_ring() {
-        // Two iovecs at 0x1000 pointing at "ab" (0x1020) and "cde" (0x1022).
-        let mut bytes = vec![0u8; 0x30];
-        bytes[0..8].copy_from_slice(&0x1020u64.to_le_bytes());
-        bytes[8..16].copy_from_slice(&2u64.to_le_bytes());
-        bytes[16..24].copy_from_slice(&0x1022u64.to_le_bytes());
-        bytes[24..32].copy_from_slice(&3u64.to_le_bytes());
-        bytes[0x20..0x25].copy_from_slice(b"abcde");
-        let mut user = memory(&bytes);
-        let call = HostFileCall::Writev {
-            fd: 1,
-            iov: 0x1000,
-            iovcnt: 2,
-        };
-        let HostFileStage::Request { mut record, .. } = stage(call, STDOUT, &mut user) else {
-            panic!("a host-backed writev crosses");
-        };
-        assert_eq!(
-            HostFileRequestView::parse(&mut record).unwrap().input(),
-            b"abcde"
-        );
-        assert_eq!(
-            stage(call, NativeDescriptor::Absent, &mut user),
-            errno(carrick_syscall_abi::LINUX_EBADF)
-        );
-        assert_eq!(
-            stage(
-                call,
-                NativeDescriptor::HostBacked {
-                    table: [9, 1, 2],
-                    access: DescriptionAccess::ReadOnly
-                },
-                &mut user
-            ),
-            errno(carrick_syscall_abi::LINUX_EBADF)
-        );
-        assert_eq!(
-            stage(
-                HostFileCall::Writev {
-                    fd: 1,
-                    iov: 0x1000,
-                    iovcnt: LINUX_UIO_MAXIOV + 1
-                },
-                STDOUT,
-                &mut user
-            ),
-            errno(carrick_syscall_abi::LINUX_EINVAL)
-        );
-    }
-
-    #[test]
-    fn unreadable_input_requests_fault_supply_first() {
-        let mut user = memory(b"");
-        assert_eq!(
-            stage(
-                HostFileCall::Write {
-                    fd: 1,
-                    buf: 0x9000,
-                    count: 1
-                },
-                STDOUT,
-                &mut user
-            ),
-            HostFileStage::Fault {
-                address: 0x9000,
-                access: Access::Read
-            }
-        );
-    }
-
-    #[test]
-    fn completion_copies_output_only_on_success() {
-        let mut user = memory(&[0u8; LINUX_STAT_BYTES]);
-        let HostFileStage::Request {
-            mut record,
-            output: Some(output),
-        } = stage(
-            HostFileCall::Fstat {
-                fd: 1,
-                statbuf: 0x1000,
-            },
-            STDOUT,
-            &mut user,
-        )
-        else {
-            panic!("fstat of a host-backed descriptor crosses with output");
-        };
-        let stat = [7u8; LINUX_STAT_BYTES];
-        HostFileRequestView::parse(&mut record)
-            .unwrap()
-            .reply(0, &stat)
-            .unwrap();
-        let mut copied = Vec::new();
-        let result = complete(&record, Some(output), &mut |address, bytes| {
-            copied.push((address, bytes.to_vec()));
-            true
-        });
-        assert_eq!(result, SyscallResult::new(0));
-        assert_eq!(copied, vec![(0x1000, stat.to_vec())]);
-        // No reply (refused or cancelled service) never copies anything.
-        let HostFileStage::Request { record, output } = stage(
-            HostFileCall::Fstat {
-                fd: 1,
-                statbuf: 0x1000,
-            },
-            STDOUT,
-            &mut user,
-        ) else {
-            panic!("fstat crosses");
-        };
-        let result = complete(&record, output, &mut |_, _| panic!("no output"));
-        assert_eq!(
-            result,
-            SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO)
-        );
-    }
-}
+mod tests;

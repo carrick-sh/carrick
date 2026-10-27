@@ -212,7 +212,7 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             .and_then(std::sync::Weak::upgrade)
             .ok_or(carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)?;
         run.dispatcher
-            .serve_native_host_file(record)
+            .serve_native_host_file(self.files.native_fs_authority().as_ref(), record)
             .map_err(|_| carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)
     }
 }

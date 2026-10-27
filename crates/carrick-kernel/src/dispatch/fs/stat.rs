@@ -48,8 +48,18 @@ impl<'a> FsView<'a> {
             }
             return Err(LINUX_EBADF);
         };
-        if open_file
-            .description
+        let recorded_path = self.lookup_recorded_fd_open_path(fd);
+        self.description_stat_record(&open_file.description, recorded_path)
+    }
+
+    /// The stat record of one open description. `recorded_path` is the path
+    /// a named FIFO was opened by, when the caller's table recorded one.
+    pub(in crate::dispatch) fn description_stat_record(
+        &self,
+        description: &std::sync::Arc<crate::kernel::FileDescription>,
+        recorded_path: Option<String>,
+    ) -> Result<StatRecord, LinuxErrno> {
+        if description
             .concrete_backing::<crate::dispatch::ioring::IoUringBacking>()
             .is_some()
         {
@@ -60,8 +70,8 @@ impl<'a> FsView<'a> {
         // being recalled: fstat reads the host metadata, and every in-zone
         // write must be in it. Write-back errors stay sticky on the
         // description, as at recall.
-        let _ = crate::el1_delegation::sync_to_host(&open_file.description);
-        let Some((is_named_pipe, fs_id, source)) = open_file.description.inspect_kind(|open| {
+        let _ = crate::el1_delegation::sync_to_host(description);
+        let Some((is_named_pipe, fs_id, source)) = description.inspect_kind(|open| {
             (
                 matches!(open, OpenDescription::HostPipe { pty: None, .. }),
                 open.fs_identity(),
@@ -81,7 +91,7 @@ impl<'a> FsView<'a> {
         // `HostPipe` but carry no recorded path, so they keep the synthetic
         // record. Recover the real FIFO stat from the fd's recorded path.
         if is_named_pipe
-            && let Some(path) = self.lookup_recorded_fd_open_path(fd)
+            && let Some(path) = recorded_path
             && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, false)
             && real.kind == RootFsEntryKind::Fifo
         {
@@ -258,6 +268,18 @@ impl<'a> FsView<'a> {
     pub(super) fn path_stat_record(
         &self,
         context: &crate::kernel::KernelContext,
+        dirfd: u64,
+        path: &str,
+        flags: u64,
+    ) -> Result<StatRecord, LinuxErrno> {
+        self.path_stat_record_for(Some(context), dirfd, path, flags)
+    }
+
+    /// `context` is `None` for a native (ring-owned) caller, whose
+    /// caller-relative synthetic `/proc` answers are unrouted (ENOSYS).
+    pub(in crate::dispatch) fn path_stat_record_for(
+        &self,
+        context: Option<&crate::kernel::KernelContext>,
         dirfd: u64,
         path: &str,
         flags: u64,
@@ -658,13 +680,13 @@ impl<'a> FsView<'a> {
             }
 
             let at_flags = carrick_abi::LinuxAtFlags::from_bits_retain(flags);
-            let mut lookup = match this.lookup_path(dirfd, &path, at_flags, LookupIntent::Statx { context: cx.kernel }) {
+            let mut lookup = match this.lookup_path(dirfd, &path, at_flags, LookupIntent::Statx { context: Some(cx.kernel) }) {
                 Ok(lookup) => lookup,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
             // As for newfstatat: write back an in-zone file, then look again.
             if crate::el1_delegation::sync_path(this.fs, lookup.resolved_path()) {
-                lookup = match this.lookup_path(dirfd, &path, at_flags, LookupIntent::Statx { context: cx.kernel }) {
+                lookup = match this.lookup_path(dirfd, &path, at_flags, LookupIntent::Statx { context: Some(cx.kernel) }) {
                     Ok(lookup) => lookup,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };

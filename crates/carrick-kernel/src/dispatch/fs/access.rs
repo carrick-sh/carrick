@@ -27,7 +27,7 @@ impl<'a> FsView<'a> {
             }
             if dirfd == LINUX_AT_FDCWD {
                 let cwd = self.captured_fs_context().cwd();
-                return Ok(self.access_resolved_path(context, &cwd, mode, flags));
+                return Ok(self.access_resolved_path(Some(context), &cwd, mode, flags));
             }
             return Ok(self.fd_access(context, dirfd as i32, mode));
         }
@@ -58,7 +58,7 @@ impl<'a> FsView<'a> {
         } else {
             path
         };
-        Ok(self.access_resolved_path(context, &path, mode, flags))
+        Ok(self.access_resolved_path(Some(context), &path, mode, flags))
     }
 
     /// Trusted-dirfd sibling of [`Self::fast_root_f_ok_absolute`]: a root
@@ -157,17 +157,28 @@ impl<'a> FsView<'a> {
         }
     }
 
-    fn access_resolved_path(
+    /// `context` is `None` for a native (ring-owned) caller: a synthetic
+    /// `/proc` or `/sys` path is then unrouted (ENOSYS), never answered
+    /// for some other process.
+    pub(in crate::dispatch) fn access_resolved_path(
         &self,
-        context: &crate::kernel::KernelContext,
+        context: Option<&crate::kernel::KernelContext>,
         path: &str,
         mode: u64,
         flags: u64,
     ) -> DispatchOutcome {
         // Synthetic /proc /sys paths bypass the rootfs/overlay
         // layered view: they have their own permission model.
-        if let Some(outcome) = self.synthetic_access(context, path, mode) {
-            return outcome;
+        match context {
+            Some(context) => {
+                if let Some(outcome) = self.synthetic_access(context, path, mode) {
+                    return outcome;
+                }
+            }
+            None if crate::vfs::may_be_synthetic_virtual_path(path) => {
+                return DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS);
+            }
+            None => {}
         }
         if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
             let metadata = if let Some(m) = self.fs.vfs_mounts.resolve(path) {
@@ -276,7 +287,7 @@ impl<'a> FsView<'a> {
     /// DAC for `open(2)` on `--fs host`. `access` is the O_ACCMODE bits;
     /// `want_create` is set for O_CREAT. Returns `Some(errno)` to deny.
     /// Root bypasses (so we short-circuit when euid==0).
-    pub(super) fn dac_open_check(
+    pub(in crate::dispatch) fn dac_open_check(
         &self,
         path: &str,
         access: u64,
