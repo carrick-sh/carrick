@@ -1013,6 +1013,24 @@ fn arm_native_service_exit(
                 Some(carrick_personality_linux::native_host_file::HostFileStage::Returned(
                     result,
                 )) => NativeServiceStage::Return(result.raw()),
+                Some(carrick_personality_linux::native_host_file::HostFileStage::InRingReply {
+                    output,
+                    bytes,
+                }) => {
+                    // Staging proved the destination writable; the ring
+                    // copies its own answer.
+                    let mut copy = file::ValidatedCopy {
+                        task,
+                        validator: &file::HardwareValidator,
+                    };
+                    NativeServiceStage::Return(
+                        if file::UserCopy::copy_out(&mut copy, output.address, &bytes) {
+                            0
+                        } else {
+                            carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+                        },
+                    )
+                }
                 Some(carrick_personality_linux::native_host_file::HostFileStage::Fault {
                     address,
                     access,

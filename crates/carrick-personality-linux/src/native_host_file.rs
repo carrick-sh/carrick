@@ -21,9 +21,9 @@ use carrick_guest_arch::Access;
 use carrick_syscall_abi::{CanonicalNr, LinuxErrno};
 
 /// Size of the aarch64 Linux `struct stat` (`asm-generic/stat.h`).
-pub const LINUX_STAT_BYTES: usize = 128;
+pub const LINUX_STAT_BYTES: usize = core::mem::size_of::<carrick_syscall_abi::LinuxStat>();
 /// Size of Linux `struct statx`.
-pub const LINUX_STATX_BYTES: usize = 256;
+pub const LINUX_STATX_BYTES: usize = core::mem::size_of::<carrick_syscall_abi::LinuxStatx>();
 /// Linux `UIO_MAXIOV`.
 pub const LINUX_UIO_MAXIOV: u64 = 1024;
 /// Linux `PATH_MAX`, including the terminating NUL.
@@ -260,6 +260,13 @@ pub enum HostFileStage {
     InRing,
     /// Answered in ring without crossing.
     Returned(SyscallResult),
+    /// Answered in ring with user output: the ring copies `bytes` to
+    /// `output` itself and returns 0. Staging has already proved the
+    /// destination writable.
+    InRingReply {
+        output: HostFileOutput,
+        bytes: Box<[u8]>,
+    },
     /// A user page must be supplied before staging can continue; the ring
     /// retries the exact call afterwards.
     Fault { address: u64, access: Access },
@@ -271,6 +278,26 @@ pub enum HostFileStage {
         /// be the authority it uses.
         resolves_path: bool,
     },
+}
+
+/// `fstat`/`statx` of an in-zone object, answered in ring with the record
+/// the dispatcher reports for the same kind of object: both encode one
+/// shared [`carrick_syscall_abi::LinuxStatFields`].
+fn in_zone_stat(op: HostFileOp, kind: InZoneKind, output: HostFileOutput) -> HostFileStage {
+    let fields = match kind {
+        InZoneKind::Pipe => carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE,
+        InZoneKind::EventFd => carrick_syscall_abi::LinuxStatFields::CARRICK_EVENTFD,
+        InZoneKind::Epoll => carrick_syscall_abi::LinuxStatFields::CARRICK_EPOLL,
+    };
+    let bytes: Box<[u8]> = match op {
+        HostFileOp::Statx => {
+            zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStatx::from_fields(&fields))
+                .into()
+        }
+        _ => zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStat::from_fields(&fields))
+            .into(),
+    };
+    HostFileStage::InRingReply { output, bytes }
 }
 
 fn errno(errno: LinuxErrno) -> HostFileStage {
@@ -383,7 +410,7 @@ impl Staging<'_, '_> {
         output: HostFileOutput,
     ) -> Option<HostFileStage> {
         Some(match self.descriptor(fd)? {
-            NativeDescriptor::InZone(_) => HostFileStage::InRing,
+            NativeDescriptor::InZone(kind) => in_zone_stat(op, kind, output),
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { .. } => {
                 self.request(op, fd, flags, args, &[], Some(output))
@@ -477,7 +504,8 @@ pub fn stage(
     if let HostFileStage::Request {
         output: Some(output),
         ..
-    } = &staged
+    }
+    | HostFileStage::InRingReply { output, .. } = &staged
     {
         let writable = user.writable(output.address, output.len);
         if writable < output.len {

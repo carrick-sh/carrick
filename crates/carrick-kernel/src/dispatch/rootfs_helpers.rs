@@ -25,21 +25,6 @@ const MAX_EXEC_STRING_BYTES: usize = 32 * crate::linux_abi::LINUX_PAGE_SIZE as u
 /// Linux `NLMSG_ALIGNTO` — netlink messages and attributes are 4-byte aligned.
 pub(crate) const NLMSG_ALIGNTO: usize = 4;
 
-/// Decode the major number from a raw Linux `dev_t` (the glibc `gnu_dev_major`
-/// encoding documented in makedev(3)): the major occupies bits 8..20 and 32..64,
-/// the minor bits 0..8 and 20..64 (interleaved so a 32-bit dev_t stays
-/// compatible). `stat`/`mknod` carry the raw `dev_t` verbatim; only `statx`
-/// reports the split fields, so the decode lives here. Clean-room from the man
-/// page, not glibc source.
-pub(super) fn linux_dev_major(dev: u64) -> u32 {
-    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32
-}
-
-/// Decode the minor number from a raw Linux `dev_t` (see `linux_dev_major`).
-pub(super) fn linux_dev_minor(dev: u64) -> u32 {
-    ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32
-}
-
 pub(super) fn linux_mode(metadata: &RootFsMetadata) -> u32 {
     linux_mode_fields(metadata.kind, metadata.mode)
 }
@@ -151,11 +136,7 @@ pub(super) fn synthetic_readonly_access_with_errno(
 }
 
 pub(super) fn blocks_512(size: usize) -> i64 {
-    if size == 0 {
-        0
-    } else {
-        size.div_ceil(512) as i64
-    }
+    carrick_abi::linux_blocks_512(size as u64) as i64
 }
 
 #[inline]

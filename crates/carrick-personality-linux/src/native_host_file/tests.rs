@@ -98,10 +98,6 @@ fn in_zone_objects_never_build_a_host_request() {
             iov: BASE,
             iovcnt: 1,
         },
-        HostFileCall::Fstat {
-            fd: 0,
-            statbuf: BASE,
-        },
         HostFileCall::Read {
             fd: 4,
             buf: BASE,
@@ -158,6 +154,97 @@ fn in_zone_objects_never_build_a_host_request() {
             &mut user
         ),
         returned(carrick_syscall_abi::LINUX_ENOTDIR)
+    );
+}
+
+/// Linux answers `fstat` on a pipe, an eventfd or an epoll instance from the
+/// object itself: the ring returns the record the dispatcher reports for
+/// that kind (one shared `LinuxStatFields`), never a host request.
+#[test]
+fn in_zone_fstat_is_answered_in_ring_with_the_shared_record() {
+    let mut user = memory(b"");
+    let stat = |fields: &carrick_syscall_abi::LinuxStatFields| -> Box<[u8]> {
+        zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStat::from_fields(fields)).into()
+    };
+    let output = HostFileOutput {
+        address: BASE,
+        len: LINUX_STAT_BYTES,
+    };
+    let pipe = run(
+        HostFileCall::Fstat {
+            fd: 0,
+            statbuf: BASE,
+        },
+        &mut user,
+    );
+    assert_eq!(
+        pipe,
+        Some(HostFileStage::InRingReply {
+            output,
+            bytes: stat(&carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE),
+        })
+    );
+    let Some(HostFileStage::InRingReply { bytes, .. }) = pipe else {
+        unreachable!()
+    };
+    let mode = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    assert_eq!(
+        mode & 0o170000,
+        carrick_syscall_abi::LINUX_S_IFIFO,
+        "S_IFIFO"
+    );
+    assert_eq!(
+        run(
+            HostFileCall::Fstat {
+                fd: 4,
+                statbuf: BASE
+            },
+            &mut user
+        ),
+        Some(HostFileStage::InRingReply {
+            output,
+            bytes: stat(&carrick_syscall_abi::LinuxStatFields::CARRICK_EVENTFD),
+        })
+    );
+    // statx(fd, "", AT_EMPTY_PATH) on a pipe: the statx encoding of the
+    // same record.
+    let mut empty = memory(b"\0");
+    assert_eq!(
+        run(
+            HostFileCall::Statx {
+                dirfd: 0,
+                path: BASE,
+                flags: u64::from(LINUX_AT_EMPTY_PATH),
+                mask: 0x7ff,
+                buf: BASE + 0x100,
+            },
+            &mut empty
+        ),
+        Some(HostFileStage::InRingReply {
+            output: HostFileOutput {
+                address: BASE + 0x100,
+                len: LINUX_STATX_BYTES,
+            },
+            bytes: zerocopy::IntoBytes::as_bytes(&carrick_syscall_abi::LinuxStatx::from_fields(
+                &carrick_syscall_abi::LinuxStatFields::CARRICK_PIPE
+            ))
+            .into(),
+        })
+    );
+    // An unwritable buffer still asks for write supply first.
+    user.writable = false;
+    assert_eq!(
+        run(
+            HostFileCall::Fstat {
+                fd: 0,
+                statbuf: BASE
+            },
+            &mut user
+        ),
+        Some(HostFileStage::Fault {
+            address: BASE,
+            access: Access::Write
+        })
     );
 }
 

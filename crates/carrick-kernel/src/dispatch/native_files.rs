@@ -781,6 +781,35 @@ mod tests {
         assert_eq!(fixture.owner.retained_host_resources(), before - 1);
     }
 
+    /// The ring answers `fstat`/`statx` of its in-zone pipes itself; those
+    /// bytes are exactly what the dispatcher reports for its own pipe ends,
+    /// because both encode one shared `LinuxStatFields`. The shared inode is
+    /// the one the dispatcher has always derived from the pipe's label.
+    #[test]
+    fn in_zone_pipe_stat_matches_the_dispatchers_pipe_record() {
+        let dispatcher = SyscallDispatcher::new();
+        let pipe = super::super::fd_table::InMemoryPipeTestFixture::new(1, 4096);
+        let fields = carrick_abi::LinuxStatFields::CARRICK_PIPE;
+        assert_eq!(
+            fields.ino,
+            super::super::inode_for_path(std::path::Path::new("pipe:[carrick]")),
+        );
+        for end in [&pipe.read, &pipe.write] {
+            let record = dispatcher
+                .fs_view()
+                .description_stat_record(end, None)
+                .unwrap();
+            assert_eq!(
+                super::super::format_stat::linux_stat(&record).as_bytes(),
+                carrick_abi::LinuxStat::from_fields(&fields).as_bytes(),
+            );
+            assert_eq!(
+                super::super::format_stat::linux_statx(&record).as_bytes(),
+                carrick_abi::LinuxStatx::from_fields(&fields).as_bytes(),
+            );
+        }
+    }
+
     /// One path: the venue's read, pread, lseek and getdents run the
     /// dispatcher's own description cores, so a native process sees exactly
     /// what the dispatcher's own syscalls return for the same file.
@@ -809,7 +838,7 @@ mod tests {
         // The dispatcher's own syscalls on its own task, same rootfs.
         const BASE: u64 = 0x4_0000;
         let reporter = crate::compat::CompatReporter::default();
-        let mut own = |fixture: &mut Fixture, nr: u64, args: [u64; 6], path: &[u8]| {
+        let own = |fixture: &mut Fixture, nr: u64, args: [u64; 6], path: &[u8]| {
             let mut memory = super::super::outcome::LinearMemory::new(BASE, vec![0u8; 0x2000]);
             memory.bytes[..path.len()].copy_from_slice(path);
             let context = fixture.dispatcher.capture_one_task_context().unwrap();
