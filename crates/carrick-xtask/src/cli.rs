@@ -34,6 +34,8 @@ pub enum Commands {
     LintSource,
     #[command(about = "Compile all recipe lanes once and run their test binaries")]
     TestBatch(crate::test_batch::TestBatchArgs),
+    #[command(about = "Build loom binaries separately, then stream tests under a deadline")]
+    LoomRun(crate::loom_run::LoomRunArgs),
     #[command(about = "Package a guest carrier image for an arbitrary composition root")]
     PackageGuestImage(crate::guest_image::PackageGuestImageArgs),
 
@@ -223,6 +225,8 @@ pub struct RepoInfo {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("loom-run: {message}")]
+    LoomRun { message: String, code: i32 },
     #[error("lint-source: {0} check(s) failed")]
     LintSource(usize),
     #[error("claims: {0}")]
@@ -442,6 +446,16 @@ where
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::claims::run(&root, args, writer)?;
             Ok(())
+        }
+        Commands::LoomRun(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::loom_run::run(&root, args).map_err(|e| CliError::LoomRun {
+                code: e
+                    .downcast_ref::<crate::loom_run::FailureStatus>()
+                    .and_then(|s| s.0.code())
+                    .unwrap_or(1),
+                message: e.to_string(),
+            })
         }
         Commands::TestBatch(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));

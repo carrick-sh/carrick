@@ -27,6 +27,7 @@ pub mod impact;
 pub mod lease_supervisor;
 pub mod ledger_merge;
 mod lock_file;
+pub mod loom_run;
 pub mod probe_coverage;
 pub mod probe_emitters;
 pub mod probe_inventory;
