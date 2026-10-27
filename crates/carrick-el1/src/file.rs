@@ -27,6 +27,12 @@ pub unsafe fn copy_to_user_guarded(
     src: *const u8,
     len: usize,
 ) -> bool {
+    // access_ok: a user range into the EL1 kernel window is EFAULT before
+    // any fixup is armed, so the vector can fail a guard fault loud (#369).
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    if carrick_el1_abi::user_range_overlaps_el1_kernel(dest as u64, len) {
+        return false;
+    }
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let fixup_ptr = &cur_task.linux.fixup_pc as *const _ as *const u64;
@@ -94,6 +100,11 @@ pub unsafe fn copy_from_user_guarded(
     src: *const u8,
     len: usize,
 ) -> bool {
+    // access_ok: see `copy_to_user_guarded`.
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    if carrick_el1_abi::user_range_overlaps_el1_kernel(src as u64, len) {
+        return false;
+    }
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let fixup_ptr = &cur_task.linux.fixup_pc as *const _ as *const u64;

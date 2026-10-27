@@ -3550,11 +3550,11 @@ fn metadata_allocator_control(subtest: u64) -> i64 {
 /// Drive EL1 past the end of this CPU's stack (control op 2, #369). The
 /// unmapped guard below the stack stops it with a host-reported
 /// `El1StackOverflow`; reaching the print below means nothing did.
-fn stack_guard_mode() -> i32 {
+fn stack_guard_mode(op: u64) -> i32 {
     let rc = unsafe {
         raw6(
             carrick_el1_control_abi::SYS_CARRICK_EL1_CONTROL,
-            2,
+            op,
             64,
             0,
             0,
@@ -3564,6 +3564,30 @@ fn stack_guard_mode() -> i32 {
     };
     println!("stack-guard returned rc={rc}: no guard stopped the overflow");
     1
+}
+
+/// Control op 4 (#369): EL1 copies one byte to a user pointer inside an
+/// EL1 stack guard. The guarded copy must refuse it (rc 0, EFAULT for a
+/// syscall) rather than fault on the guard.
+fn guard_user_pointer_mode() -> i32 {
+    let rc = unsafe {
+        raw6(
+            carrick_el1_control_abi::SYS_CARRICK_EL1_CONTROL,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    if rc == 0 {
+        println!("guard-user-pointer refused");
+        0
+    } else {
+        println!("guard-user-pointer rc={rc}");
+        1
+    }
 }
 
 fn metadata_allocator_drain() -> i64 {
@@ -3867,7 +3891,9 @@ fn main() {
         "metadata-allocator" => {
             metadata_allocator_mode(args.get(2).map(String::as_str).unwrap_or(""))
         }
-        "stack-guard" => stack_guard_mode(),
+        "stack-guard" => stack_guard_mode(2),
+        "stack-guard-armed" => stack_guard_mode(3),
+        "guard-user-pointer" => guard_user_pointer_mode(),
         "exec-child" => {
             println!("exec-child ok");
             0
