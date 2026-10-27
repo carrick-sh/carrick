@@ -1134,7 +1134,10 @@ pub(super) mod tests {
                     .release_stage2_reference(
                         (ipa, 16384),
                         Some(owner.record_identity),
-                        crate::trap::Stage1ReferenceOwner::EditorAuthority(receipt.authority()),
+                        crate::trap::Stage1ReferenceOwner::EditorAuthority {
+                            authority: receipt.authority(),
+                            stage1: (ipa, 16384),
+                        },
                         Stage1UnpublicationReceipt::EditorRange(&receipt),
                     )
                     .expect("editor receipt covers retired owner")

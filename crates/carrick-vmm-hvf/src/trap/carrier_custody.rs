@@ -2869,7 +2869,10 @@ mod carrier_vm_custody_tests {
             frames.release_stage2_reference(
                 lease,
                 Some(identity),
-                crate::trap::Stage1ReferenceOwner::EditorAuthority(wrong.authority()),
+                crate::trap::Stage1ReferenceOwner::EditorAuthority {
+                    authority: wrong.authority(),
+                    stage1: lease,
+                },
                 Stage1UnpublicationReceipt::EditorRange(&wrong),
             ),
             Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease))
@@ -2881,9 +2884,10 @@ mod carrier_vm_custody_tests {
             frames.release_stage2_reference(
                 lease,
                 Some(identity),
-                crate::trap::Stage1ReferenceOwner::EditorAuthority(
-                    exact.authority().wrapping_add(1),
-                ),
+                crate::trap::Stage1ReferenceOwner::EditorAuthority {
+                    authority: exact.authority().wrapping_add(1),
+                    stage1: lease,
+                },
                 Stage1UnpublicationReceipt::EditorRange(&exact),
             ),
             Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease)),
@@ -2895,7 +2899,10 @@ mod carrier_vm_custody_tests {
                 .release_stage2_reference(
                     lease,
                     Some(identity),
-                    crate::trap::Stage1ReferenceOwner::EditorAuthority(exact.authority()),
+                    crate::trap::Stage1ReferenceOwner::EditorAuthority {
+                        authority: exact.authority(),
+                        stage1: lease,
+                    },
                     Stage1UnpublicationReceipt::EditorRange(&exact),
                 )
                 .unwrap()
@@ -2905,7 +2912,10 @@ mod carrier_vm_custody_tests {
             .release_stage2_reference(
                 lease,
                 Some(identity),
-                crate::trap::Stage1ReferenceOwner::EditorAuthority(exact.authority()),
+                crate::trap::Stage1ReferenceOwner::EditorAuthority {
+                    authority: exact.authority(),
+                    stage1: lease,
+                },
                 Stage1UnpublicationReceipt::EditorRange(&exact),
             )
             .unwrap()
@@ -5123,7 +5133,10 @@ mod carrier_vm_custody_tests {
             frames.release_stage2_reference(
                 lease,
                 Some(identity),
-                crate::trap::Stage1ReferenceOwner::EditorAuthority(receipt.authority()),
+                crate::trap::Stage1ReferenceOwner::EditorAuthority {
+                    authority: receipt.authority(),
+                    stage1: lease,
+                },
                 Stage1UnpublicationReceipt::EditorRange(&receipt),
             ),
             Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease)),

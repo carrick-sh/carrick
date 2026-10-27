@@ -6422,6 +6422,22 @@ impl HvfVmState {
             inventory,
             reservation,
         } = prepared;
+        // The stage-1 receipt must name every extent the inventory plan
+        // retires. Check it before the first mutation below (receipt
+        // supersession, alias-registry unregistration, Kernel apply), so a
+        // receipt that does not cover the plan is a typed refusal with every
+        // ledger intact rather than a fault discovered after the apply.
+        if let Some(retirement) = inventory.as_ref() {
+            let stage1 = stage1.ok_or(TrapError::RetirementRefused {
+                operation: "alias retirement",
+                missing: "its transaction-bound stage-1 receipt",
+            })?;
+            Self::authenticate_lease_retirement_receipt(
+                retirement,
+                self.page_tables_authority().authority_id(),
+                stage1,
+            )?;
+        }
         let registered = rows == AliasRetirementRows::Registered;
         if registered {
             self.supersede_cow_receipts("process-alias-unmap", va, len as u64);
@@ -6535,6 +6551,12 @@ impl HvfVmState {
                     .map_err(|error| TrapError::Hypervisor(error.to_string()))
             },
         );
+        let apply_result = match apply_result {
+            // A refusal is decided before the Kernel apply and leaves the
+            // inventory, the frame registry and the Kernel unchanged.
+            Err(error @ TrapError::RetirementRefused { .. }) => return Err(error),
+            other => other,
+        };
         if let Err(error) = &apply_result {
             // Name the retirement, not just the id that failed. This abort used
             // to print one MappingId and nothing else, which cannot distinguish

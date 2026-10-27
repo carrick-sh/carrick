@@ -557,7 +557,15 @@ fn table_capacity_retirement_error(
 /// different owner's physical reference.
 #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) enum Stage1ReferenceOwner {
-    EditorAuthority(u64),
+    /// A data extent published by one Editor authority. `stage1` is the
+    /// extent's stage-1 output window `(ipa, length)`: the address domain an
+    /// Editor leaf receipt records. It is deliberately distinct from the
+    /// physical stage-2 lease which backs the extent, which may be wider or
+    /// live at a different IPA (a global-frame owner behind an alias).
+    EditorAuthority {
+        authority: u64,
+        stage1: (u64, u64),
+    },
     Mm(u64),
     TableArena(u64),
 }
@@ -565,9 +573,10 @@ pub(crate) enum Stage1ReferenceOwner {
 impl Stage1ReferenceOwner {
     fn is_named_by(self, lease: (u64, u64), receipt: Stage1UnpublicationReceipt<'_>) -> bool {
         match (self, receipt) {
-            (Self::EditorAuthority(owner), Stage1UnpublicationReceipt::EditorRange(receipt)) => {
-                receipt.authority() == owner && receipt.names(lease.0, lease.1 as usize)
-            }
+            (
+                Self::EditorAuthority { authority, stage1 },
+                Stage1UnpublicationReceipt::EditorRange(receipt),
+            ) => receipt.authority() == authority && receipt.names(stage1.0, stage1.1 as usize),
             (Self::Mm(owner), Stage1UnpublicationReceipt::Inventory(receipt)) => {
                 owner != 0 && receipt.mm() == owner
             }
@@ -2241,6 +2250,86 @@ impl HvfVmState {
         Ok(())
     }
 
+    /// Whether `receipt` names the stage-1 output of every extent a lease
+    /// retirement removes, as unpublished by `stage1_authority`. This depends
+    /// only on the plan and the receipt, so the alias-retirement caller runs
+    /// it before its first mutation (receipt supersession, alias-registry
+    /// unregistration) as well as under the ledger locks before the apply.
+    pub(crate) fn authenticate_lease_retirement_receipt(
+        retirement: &InventoryLeaseRetirement,
+        stage1_authority: u64,
+        receipt: Stage1UnpublicationReceipt<'_>,
+    ) -> Result<(), TrapError> {
+        for &(key, extent) in &retirement.mappings {
+            let owner = Stage1ReferenceOwner::EditorAuthority {
+                authority: stage1_authority,
+                stage1: key,
+            };
+            if !owner.is_named_by((extent.stage2_base, extent.stage2_length), receipt) {
+                return Err(TrapError::RetirementRefused {
+                    operation: "alias-retirement stage-2 reference",
+                    missing: "a stage-1 receipt naming the alias translation",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Authenticate a whole alias-lease retirement against the ledgers and
+    /// its stage-1 receipt before anything irreversible happens.
+    ///
+    /// `commit_inventory_lease_retirement_in` runs after the Kernel apply, so
+    /// a refusal discovered there can only be a carrier fault. Every input
+    /// that can refuse — an extent that moved, a reference that is missing,
+    /// or a receipt that does not name the extent's stage-1 output — is
+    /// checked here first, under the same inventory and registry locks, and
+    /// returns a typed refusal that leaves both ledgers and the Kernel
+    /// untouched.
+    fn validate_inventory_lease_retirement_in(
+        inventory: &HvpatchFrameInventory,
+        registry: &InventoryFrameRegistry,
+        retirement: &InventoryLeaseRetirement,
+        stage1_authority: u64,
+        receipt: Stage1UnpublicationReceipt<'_>,
+    ) -> Result<(), TrapError> {
+        Self::authenticate_lease_retirement_receipt(retirement, stage1_authority, receipt)?;
+        let refused = |missing: &'static str| TrapError::RetirementRefused {
+            operation: "alias-retirement stage-2 reference",
+            missing,
+        };
+        let mut frames = std::collections::BTreeMap::<carrick_hal::FrameId, usize>::new();
+        let mut extents =
+            std::collections::BTreeMap::<(carrick_hal::FrameId, u64, u64), usize>::new();
+        let mut leases = std::collections::BTreeMap::<(u64, u64), usize>::new();
+        for &(key, expected) in &retirement.mappings {
+            let actual = inventory
+                .extents
+                .get(&key)
+                .ok_or_else(|| refused("the exact published alias extent"))?;
+            if actual.mapping != expected.mapping || actual.frame != expected.frame {
+                return Err(refused("the exact published alias identity"));
+            }
+            let lease = (actual.stage2_base, actual.stage2_length);
+            *frames.entry(actual.frame).or_default() += 1;
+            *extents.entry((actual.frame, key.0, key.1)).or_default() += 1;
+            *leases.entry(lease).or_default() += 1;
+        }
+        let covers = |held: Option<&usize>, needed: usize| held.is_some_and(|&held| held >= needed);
+        if !frames
+            .iter()
+            .all(|(frame, &needed)| covers(registry.references.get(frame), needed))
+            || !extents
+                .iter()
+                .all(|(key, &needed)| covers(registry.extent_references.get(key), needed))
+            || !leases
+                .iter()
+                .all(|(lease, &needed)| covers(registry.stage2_references.get(lease), needed))
+        {
+            return Err(refused("the backend references the alias extents hold"));
+        }
+        Ok(())
+    }
+
     fn commit_inventory_lease_retirement_in(
         inventory: &mut HvpatchFrameInventory,
         registry: &mut InventoryFrameRegistry,
@@ -2275,7 +2364,10 @@ impl HvfVmState {
                 .release_stage2_reference(
                     lease,
                     identity_for(lease),
-                    Stage1ReferenceOwner::EditorAuthority(stage1_authority),
+                    Stage1ReferenceOwner::EditorAuthority {
+                        authority: stage1_authority,
+                        stage1: key,
+                    },
                     receipt,
                 )
                 .map_err(|error| {
@@ -2328,8 +2420,11 @@ impl HvfVmState {
     /// Kernel unmap and the backend reference gone).
     ///
     /// `apply` is the Kernel publication; on its failure the backend ledger
-    /// is unchanged. Once it succeeded the backend must follow, so a backend
-    /// ledger refusal then is a carrier fault. `reservation` must have room
+    /// is unchanged. Every refusable input (extent identity, held references,
+    /// the receipt naming each extent's stage-1 output) is validated before
+    /// `apply` and refused as [`TrapError::RetirementRefused`]. Once the apply
+    /// succeeded the backend must follow, so a ledger failure then is a
+    /// carrier fault. `reservation` must have room
     /// for [`InventoryLeaseRetirement::event_count`] events.
     pub(crate) fn apply_inventory_lease_retirement<R>(
         custody: &CarrierVmCustody,
@@ -2344,6 +2439,13 @@ impl HvfVmState {
         let frames = std::sync::Arc::clone(&inventory.frames);
         let mut registry = frames.lock();
         Self::stage_conditional_lease_retirement(&registry, &mut reservation, retirement)?;
+        Self::validate_inventory_lease_retirement_in(
+            &inventory,
+            &registry,
+            retirement,
+            stage1_authority,
+            receipt,
+        )?;
         let applied = apply(reservation.commit(()))?;
         let mut proofs = Self::commit_inventory_lease_retirement_in(
             &mut inventory,
@@ -2693,7 +2795,10 @@ impl HvfVmState {
             .release_stage2_reference(
                 old_lease,
                 identity,
-                Stage1ReferenceOwner::EditorAuthority(split.stage1_authority),
+                Stage1ReferenceOwner::EditorAuthority {
+                    authority: split.stage1_authority,
+                    stage1: old_lease,
+                },
                 receipt,
             )
             .map_err(|error| {

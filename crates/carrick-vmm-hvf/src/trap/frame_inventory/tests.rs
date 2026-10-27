@@ -260,6 +260,149 @@ fn whole_mm_receipt_cannot_release_another_mms_data_extent() {
     assert!(!frames.stage2_references.contains_key(&lease));
 }
 
+/// One alias extent whose stage-1 output window (`alias`) is backed by a
+/// different, wider physical stage-2 lease (`physical`).
+fn alias_retirement_fixture(
+    alias: (u64, u64),
+    physical: (u64, u64),
+) -> (HvpatchFrameInventory, InventoryLeaseRetirement) {
+    let frame = carrick_hal::FrameId::from_kernel_allocation(id(0xa301));
+    let mapping = carrick_hal::MappingId::from_kernel_allocation(id(0xa302));
+    let extent = InventoryExtent {
+        frame,
+        mapping,
+        backing: InventoryBackingIdentity::Private(47),
+        stage2_base: physical.0,
+        stage2_length: physical.1,
+        stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
+    };
+    let mut inventory = HvpatchFrameInventory::default();
+    inventory.extents.insert(alias, extent);
+    {
+        let mut frames = inventory.frames.lock();
+        frames.references.insert(frame, 1);
+        frames
+            .extent_references
+            .insert((frame, alias.0, alias.1), 1);
+        frames.stage2_references.insert(physical, 1);
+    }
+    let retirement = InventoryLeaseRetirement {
+        mappings: vec![(alias, extent)],
+        frames: std::collections::BTreeSet::from([frame]),
+        stage2_leases: std::collections::BTreeSet::from([physical]),
+        stage2_population_complete: std::collections::BTreeMap::from([(physical, true)]),
+        declined: Vec::new(),
+    };
+    (inventory, retirement)
+}
+
+/// The fork-COW `ReceiptMismatch` carrier fatal: an Editor leaf receipt
+/// records stage-1 OUTPUTS, which for an alias extent is the extent's own
+/// window, not the physical lease behind it. Release must authenticate the
+/// receipt against the extent's stage-1 window.
+#[test]
+fn alias_retirement_receipt_names_the_extent_stage1_output_not_its_lease() {
+    let alias = (0xa095_0000_4000, 0x1000);
+    let physical = (0xa095_4000_0000, 0x10_0000);
+    let (mut inventory, retirement) = alias_retirement_fixture(alias, physical);
+    let receipt = test_leaf_retirement_receipt(alias.0);
+    assert!(!receipt.names(physical.0, physical.1 as usize));
+    let frames = std::sync::Arc::clone(&inventory.frames);
+    let result = HvfVmState::commit_inventory_lease_retirement_in(
+        &mut inventory,
+        &mut frames.lock(),
+        &retirement,
+        receipt.authority(),
+        Stage1UnpublicationReceipt::EditorRange(&receipt),
+        |_| None,
+    );
+    assert!(
+        result.is_ok(),
+        "exact alias retirement was refused: {result:?}"
+    );
+    assert!(inventory.extents.is_empty());
+    assert!(!frames.lock().stage2_references.contains_key(&physical));
+}
+
+/// A receipt that does not name the retired extent is refused, typed,
+/// before the Kernel apply runs: the inventory extent and every backend
+/// reference stay with their owner instead of becoming a carrier fatal after
+/// an irreversible apply.
+#[test]
+fn mismatched_alias_retirement_receipt_is_refused_before_the_kernel_apply() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let alias = (0xa096_0000_4000, 0x1000);
+    let physical = (0xa096_4000_0000, 0x10_0000);
+    let (inventory, retirement) = alias_retirement_fixture(alias, physical);
+    let frames = std::sync::Arc::clone(&inventory.frames);
+    let exact = test_leaf_retirement_receipt(alias.0);
+    let wrong = test_leaf_retirement_receipt(alias.0 + 0x4000);
+    let custody = legacy_test_carrier_vm_custody();
+    let reservation = || {
+        let mut reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+            carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0xa6; 32]),
+            carrick_hal::FrameInventoryBatch::prepare(
+                carrick_hal::KernelTransactionId::from_kernel_allocation(id(0xa906)),
+                carrick_hal::FrameEventCapacity::for_event_count(retirement.event_count()).unwrap(),
+            )
+            .unwrap(),
+            Vec::new(),
+            Vec::new(),
+        );
+        HvfVmState::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
+        reservation
+    };
+    let inventory = parking_lot::Mutex::new(inventory);
+    let applied = std::cell::Cell::new(false);
+
+    for (authority, receipt) in [
+        (wrong.authority(), &wrong),
+        (exact.authority().wrapping_add(1), &exact),
+    ] {
+        let result = HvfVmState::apply_inventory_lease_retirement(
+            custody,
+            &inventory,
+            &retirement,
+            authority,
+            Stage1UnpublicationReceipt::EditorRange(receipt),
+            reservation(),
+            |_| {
+                applied.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(result, Err(TrapError::RetirementRefused { .. })),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            !applied.get(),
+            "a refused retirement must not reach the Kernel"
+        );
+        assert_eq!(
+            inventory.lock().extents.get(&alias),
+            Some(&retirement.mappings[0].1)
+        );
+        assert_eq!(frames.lock().stage2_references.get(&physical), Some(&1));
+        assert_eq!(
+            frames
+                .lock()
+                .references
+                .get(&retirement.mappings[0].1.frame),
+            Some(&1)
+        );
+    }
+    assert!(
+        HvfVmState::authenticate_lease_retirement_receipt(
+            &retirement,
+            exact.authority(),
+            Stage1UnpublicationReceipt::EditorRange(&exact),
+        )
+        .is_ok()
+    );
+}
+
 /// Model the inventory after one 4 KiB semantic discard in each 16 KiB
 /// compound, with a fork peer still retaining the complete compound. This
 /// exercises inventory/physical retirement, not the guest DONTNEED adapter.
