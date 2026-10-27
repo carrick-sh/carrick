@@ -711,7 +711,10 @@ struct InstalledExecBacking {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct InstalledExecRegion {
     region: HvfMappedRegion,
+    /// Exact admitted record while the exec publication transaction is open.
     record: Option<CarrierStage2RecordIdentity>,
+    /// Consume-once publication authority retained until commit or rollback.
+    publication: Option<Stage2PublicationAuthority>,
     root: Option<crate::frame_pool::PooledRootSlotHandle>,
     structural_epoch: Option<StructuralEpoch>,
 }
@@ -964,9 +967,9 @@ impl PreparedExecBacking {
                 perms: install.perms,
                 logical_owner: Some(logical_owner),
             };
-            let record = match installed
+            let (record, publication) = match installed
                 .custody
-                .publish_stage2_record_using(spec, |identity| map(install, identity))
+                .publish_unpublished_stage2_record_using(spec, |identity| map(install, identity))
             {
                 Ok(record) => record,
                 Err(error) => {
@@ -986,6 +989,7 @@ impl PreparedExecBacking {
                 installed.regions.push(InstalledExecRegion {
                     region,
                     record: Some(record),
+                    publication: Some(publication),
                     root,
                     structural_epoch,
                 });
@@ -998,6 +1002,7 @@ impl PreparedExecBacking {
                 installed.regions.push(InstalledExecRegion {
                     region,
                     record: Some(record),
+                    publication: Some(publication),
                     root,
                     structural_epoch,
                 });
@@ -1009,6 +1014,7 @@ impl PreparedExecBacking {
             installed.regions.push(InstalledExecRegion {
                 region,
                 record: Some(record),
+                publication: Some(publication),
                 root,
                 structural_epoch,
             });
@@ -1185,6 +1191,9 @@ impl InstalledExecBacking {
                 });
             }
             self.regions[index].record = None;
+            if let Some(publication) = self.regions[index].publication.take() {
+                publication.commit();
+            }
         }
         Ok(PublishedExecBacking {
             plan: self.plan,
@@ -1204,9 +1213,37 @@ impl InstalledExecBacking {
             let Some(identity) = self.regions[index].record else {
                 continue;
             };
+            let Some(publication) = self.regions[index].publication.take() else {
+                return Err(ExecBackingRollbackError {
+                    error: TrapError::Hypervisor(
+                        "exec successor stage-2 record lacks its publication receipt".to_owned(),
+                    ),
+                    installed: Box::new(self),
+                });
+            };
+            let requested = self.custody.request_never_published_stage2_record_retirement(
+                identity,
+                publication.rollback(),
+            );
+            if requested != CarrierStage2RetireOutcome::DeferredActivePins {
+                return Err(ExecBackingRollbackError {
+                    error: TrapError::Hypervisor(format!(
+                        "request exec successor stage-2 retirement: {requested:?}"
+                    )),
+                    installed: Box::new(self),
+                });
+            }
+            let Some(stage1) = self.custody.claim_stage2_retirement(identity) else {
+                return Err(ExecBackingRollbackError {
+                    error: TrapError::Hypervisor(
+                        "claim exec successor stage-2 retirement proof".to_owned(),
+                    ),
+                    installed: Box::new(self),
+                });
+            };
             let outcome = self
                 .custody
-                .retire_stage2_record_using(identity, &mut unmap);
+                .retire_stage2_record_using(identity, &stage1, &mut unmap);
             match outcome {
                 CarrierStage2RetireOutcome::RetiredUnmapped
                 | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
@@ -1215,6 +1252,7 @@ impl InstalledExecBacking {
                         identity,
                         &mut release_retired_stage2_ipa,
                     ) {
+                        drop(stage1);
                         return Err(ExecBackingRollbackError {
                             error,
                             installed: Box::new(self),
@@ -1223,6 +1261,7 @@ impl InstalledExecBacking {
                     self.regions[index].record = None;
                 }
                 other => {
+                    drop(stage1);
                     return Err(ExecBackingRollbackError {
                         error: TrapError::Hypervisor(format!(
                             "rollback exec successor stage-2 record: {other:?}"

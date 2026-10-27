@@ -1258,7 +1258,7 @@ impl PreAdmissionGuard {
         if mm.raw() == 0 || tables.spaces.find(mm.raw()).is_some() {
             return None;
         }
-        let editor = exclude_el1_editor_in(tables, mm)?;
+        let editor = exclude_el1_editor_in(tables.clone(), mm)?;
         Some(Self {
             tables,
             mm,
@@ -1488,6 +1488,7 @@ pub fn publish_address_space_for_test(
             spaces,
             occupancy,
             zone: None,
+            backing: None,
         },
         mm,
         &fence,

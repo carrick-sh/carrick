@@ -2233,7 +2233,10 @@ fn publish_installed_structural_owner(
     let retained = std::sync::Arc::new(StructuralBackingCustodyEntry {
         mapping: std::sync::Arc::new(backing),
         record_identity: parking_lot::Mutex::new(identity),
+        rollback: parking_lot::Mutex::new(None),
         owner_retired: std::sync::atomic::AtomicBool::new(false),
+        physical_ipa: snapshot.ipa,
+        physical_size: snapshot.len,
     });
     let owner = std::sync::Arc::new(StructuralBackingOwner {
         custody: std::sync::Arc::downgrade(custody),

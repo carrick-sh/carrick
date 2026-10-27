@@ -63,7 +63,9 @@ fn check_process_exit_frames(disassembly: &str) {
         ("::ThreadLifecyclePage::initialize_at::", 0x100, false),
         ("::dispatch::dispatch_syscall::", 0x600, true),
         ("::aarch64_process::admit_entry_runtime::", 0x1200, true),
-        ("::exit_with_status::", 0x600, true),
+        // Merged EL1 host-read/exec-successor integration retains 0x20 more
+        // stack in this exit chain than main; measured 0x620 on cloudmac.
+        ("::exit_with_status::", 0x620, true),
         ("::finish_exit::", 0x800, true),
         ("::aarch64_process::resume_selected::", 0xa00, true),
         (
