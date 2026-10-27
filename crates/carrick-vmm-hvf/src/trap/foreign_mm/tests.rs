@@ -1689,13 +1689,15 @@ fn guest_owned_foreign_cow_unauthenticated_publication_is_contained() {
     let _external = ExternalAliasStateRestore::capture();
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = CarrierForeignMmTransport::new();
-    let installed = install_mm(
+    let mut installed = install_mm(
         &transport,
         730,
         0x9a01_6000_0000,
         0x9b01_6000_0000,
         *b"keep",
     );
+    let owners_before: std::collections::BTreeSet<(u64, u64)> =
+        global_frame_host_owners().lock().keys().copied().collect();
     let (_authority, lease, invalidator) = prepare_foreign_cow(&installed);
     installed
         .state
@@ -1735,6 +1737,16 @@ fn guest_owned_foreign_cow_unauthenticated_publication_is_contained() {
             .contains_key(&old_key),
         "the old extent stays with its owner"
     );
+    // The contained write kept the grant's new owner live; hand it to the
+    // fixture's owner cleanup so later tests see a clean registry.
+    let leaked: Vec<(u64, u64)> = global_frame_host_owners()
+        .lock()
+        .keys()
+        .copied()
+        .filter(|key| !owners_before.contains(key))
+        .collect();
+    assert!(!leaked.is_empty(), "the committed grant owner stays live");
+    installed.owners.0.extend(leaked);
 }
 
 #[test]
