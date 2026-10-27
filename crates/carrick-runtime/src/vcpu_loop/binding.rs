@@ -6658,6 +6658,7 @@ where
             native_exec_admission
         {
             let native_exec_capability = native_exec_installer.capability();
+            native_exec_capability.bind_run(Arc::downgrade(&kernel));
             let native_exec_registration = match authority.install_native_exec_service(
                 native_exec_capability.id(),
                 native_exec_capability

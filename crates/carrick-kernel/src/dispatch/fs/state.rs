@@ -559,36 +559,8 @@ pub(in crate::dispatch) struct RuntimeIo {
     pub stdout: Arc<Mutex<Vec<u8>>>,
     pub stderr: Arc<Mutex<Vec<u8>>>,
     /// Where bare fd 1/2 writes go. `Captured` (the default) appends to
-    /// `stdout`/`stderr` above. Shared with this run's [`NativeStdio`].
-    route: Arc<Mutex<StdioRoute>>,
-}
-
-/// The run's stdio route as a ring-owned (native) process reaches it through
-/// the carrier: the same buffers and the same live route object as the
-/// dispatcher that captured it, so a native write and a host write of an
-/// inherited stdio stream land in one place.
-#[derive(::core::clone::Clone)]
-pub struct NativeStdio {
-    stdout: Arc<Mutex<Vec<u8>>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
-    route: Arc<Mutex<StdioRoute>>,
-}
-
-impl ::core::fmt::Debug for NativeStdio {
-    fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        formatter
-            .debug_struct("NativeStdio")
-            .finish_non_exhaustive()
-    }
-}
-
-impl NativeStdio {
-    /// Write bare stdio bytes through the run's route, exactly as the host
-    /// write of an implicit stdio descriptor does.
-    pub(in crate::dispatch) fn write(&self, fd: i32, bytes: &[u8]) -> DispatchOutcome {
-        let route = self.route.lock().clone();
-        super::write_stdio_route(&self.stdout, &self.stderr, route, fd, bytes)
-    }
+    /// `stdout`/`stderr` above.
+    route: Mutex<StdioRoute>,
 }
 
 impl RuntimeIo {
@@ -596,15 +568,7 @@ impl RuntimeIo {
         Self {
             stdout: Arc::new(Mutex::new(Vec::new())),
             stderr: Arc::new(Mutex::new(Vec::new())),
-            route: Arc::new(Mutex::new(StdioRoute::Captured)),
-        }
-    }
-
-    pub(in crate::dispatch) fn native_stdio(&self) -> NativeStdio {
-        NativeStdio {
-            stdout: Arc::clone(&self.stdout),
-            stderr: Arc::clone(&self.stderr),
-            route: Arc::clone(&self.route),
+            route: Mutex::new(StdioRoute::Captured),
         }
     }
 
@@ -646,7 +610,7 @@ impl RuntimeIo {
             stdout: Arc::clone(&self.stdout),
             stderr: Arc::clone(&self.stderr),
             // Same route object: a piped tree shares ONE caller writer.
-            route: Arc::new(Mutex::new(self.route())),
+            route: Mutex::new(self.route()),
         }
     }
 }

@@ -1643,7 +1643,37 @@ impl<'a> FsView<'a> {
                 &bytes[..bytes.len().min(64)]
             );
         }
-        write_stdio_route(&self.io.stdout, &self.io.stderr, self.io.route(), fd, bytes)
+        match self.io.route() {
+            StdioRoute::Captured => {
+                match fd {
+                    1 => self.io.stdout.lock().extend_from_slice(bytes),
+                    2 => self.io.stderr.lock().extend_from_slice(bytes),
+                    _ => return DispatchOutcome::errno(LINUX_EBADF),
+                }
+                DispatchOutcome::returned_len_or_errno(bytes.len())
+            }
+            // BLOCKING-IO-OK: the inherited stdout/stderr (the user's
+            // tty/pipe); blocking here is the correct backpressure.
+            StdioRoute::Inherit => match fd {
+                1 | 2 => Self::write_all_stdio(fd, bytes),
+                _ => DispatchOutcome::errno(LINUX_EBADF),
+            },
+            // BLOCKING-IO-OK: the embedder's writer runs on this vCPU thread;
+            // a blocking writer blocks this guest write, like a full pipe.
+            StdioRoute::Piped { stdout, stderr } => {
+                let writer = match fd {
+                    1 => stdout,
+                    2 => stderr,
+                    _ => return DispatchOutcome::errno(LINUX_EBADF),
+                };
+                match writer.write_all(bytes) {
+                    Ok(()) => DispatchOutcome::returned_len_or_errno(bytes.len()),
+                    Err(error) => DispatchOutcome::errno(crate::host_to_linux_errno(
+                        error.raw_os_error().unwrap_or(libc::EIO),
+                    )),
+                }
+            }
+        }
     }
 
     pub(super) fn stdio_readiness(&self, fd: i32) -> Option<state::StdioReadiness> {
@@ -1659,7 +1689,7 @@ impl<'a> FsView<'a> {
     /// line) and the tail of wide `ls` output. Polling for writability on EAGAIN
     /// restores Linux blocking-tty semantics (a tty write completes fully) without
     /// mutating the shared O_NONBLOCK flag the guest may rely on for reads.
-    pub(super) fn write_all_stdio(fd: i32, bytes: &[u8]) -> DispatchOutcome {
+    fn write_all_stdio(fd: i32, bytes: &[u8]) -> DispatchOutcome {
         let mut off = 0usize;
         while off < bytes.len() {
             // BLOCKING-IO-OK: a write to the inherited controlling tty/pipe
@@ -3043,46 +3073,3 @@ mod tests;
 #[cfg(test)]
 #[path = "fs/rw_close_budget_tests.rs"]
 mod rw_close_budget_tests;
-
-/// Deliver a bare-stdio write (fd 1/2 with no `OpenDescription`) to one route
-/// snapshot. The single implementation behind the dispatcher's implicit stdio
-/// and a native process's inherited stdio ([`state::NativeStdio`]).
-pub(super) fn write_stdio_route(
-    stdout: &Mutex<Vec<u8>>,
-    stderr: &Mutex<Vec<u8>>,
-    route: StdioRoute,
-    fd: i32,
-    bytes: &[u8],
-) -> DispatchOutcome {
-    match route {
-        StdioRoute::Captured => {
-            match fd {
-                1 => stdout.lock().extend_from_slice(bytes),
-                2 => stderr.lock().extend_from_slice(bytes),
-                _ => return DispatchOutcome::errno(LINUX_EBADF),
-            }
-            DispatchOutcome::returned_len_or_errno(bytes.len())
-        }
-        // BLOCKING-IO-OK: the inherited stdout/stderr (the user's
-        // tty/pipe); blocking here is the correct backpressure.
-        StdioRoute::Inherit => match fd {
-            1 | 2 => FsView::write_all_stdio(fd, bytes),
-            _ => DispatchOutcome::errno(LINUX_EBADF),
-        },
-        // BLOCKING-IO-OK: the embedder's writer runs on this vCPU thread;
-        // a blocking writer blocks this guest write, like a full pipe.
-        StdioRoute::Piped { stdout, stderr } => {
-            let writer = match fd {
-                1 => stdout,
-                2 => stderr,
-                _ => return DispatchOutcome::errno(LINUX_EBADF),
-            };
-            match writer.write_all(bytes) {
-                Ok(()) => DispatchOutcome::returned_len_or_errno(bytes.len()),
-                Err(error) => DispatchOutcome::errno(crate::host_to_linux_errno(
-                    error.raw_os_error().unwrap_or(libc::EIO),
-                )),
-            }
-        }
-    }
-}

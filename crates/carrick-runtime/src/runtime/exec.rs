@@ -47,9 +47,11 @@ pub(crate) struct NativeExecCapability {
     id: carrick_core_abi::service::ExecCapabilityId,
     files: carrick_kernel::dispatch::exec_files::ExecFiles,
     loader: ExecLoaderCapabilities,
-    /// The native host-file venue's authority over this tree's host-backed
-    /// descriptors (#894).
-    host_files: carrick_kernel::dispatch::native_files::NativeHostFiles,
+    /// The run whose dispatcher serves this tree's host-file crossings
+    /// (#894). Bound once at service installation; weak, because the run
+    /// owns this capability.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    run: std::sync::OnceLock<std::sync::Weak<crate::vcpu_loop::KernelState>>,
 }
 
 impl core::fmt::Debug for NativeExecCapability {
@@ -64,6 +66,13 @@ impl core::fmt::Debug for NativeExecCapability {
 impl NativeExecCapability {
     pub(crate) fn id(&self) -> carrick_core_abi::service::ExecCapabilityId {
         self.id
+    }
+
+    /// Bind the run that serves this tree's host-file crossings. The first
+    /// binding wins; the run is exact for the capability's whole life.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn bind_run(&self, run: std::sync::Weak<crate::vcpu_loop::KernelState>) {
+        let _ = self.run.set(run);
     }
 }
 
@@ -197,8 +206,13 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
     ) -> Result<(), carrick_vmm_hvf::metadata_grant::NativeHostFileRefused> {
         // The request identity was authenticated by the service cell; the
         // record names the caller's own ring table, pinned at service time.
-        self.host_files
-            .serve(record)
+        let run = self
+            .run
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)?;
+        run.dispatcher
+            .serve_native_host_file(record)
             .map_err(|_| carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)
     }
 }
@@ -217,7 +231,8 @@ pub(crate) fn capture_native_exec_capability(
         id,
         files: dispatcher.capture_exec_files(&context)?,
         loader: ExecLoaderCapabilities::capture(dispatcher),
-        host_files: dispatcher.native_host_files()?,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        run: std::sync::OnceLock::new(),
     })
 }
 
