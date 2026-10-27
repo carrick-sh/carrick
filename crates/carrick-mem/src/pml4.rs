@@ -227,6 +227,41 @@ pub fn pml4_tables(maps: &[Pml4MapSpec], base: u64, capacity: usize) -> Result<V
     Ok(bytes)
 }
 
+/// `maps` with each `(va, len)` hole left unmapped: every map overlapping a
+/// hole is split around it, keeping each piece's VA-to-GPA offset. The CPL0
+/// kernel stack guards are such holes (#369); a guard must stay unmapped in
+/// the alias the CPU runs its stack on, whatever map would cover it.
+pub fn punch_holes(maps: &[Pml4MapSpec], holes: &[(u64, u64)]) -> Vec<Pml4MapSpec> {
+    let mut pieces: Vec<Pml4MapSpec> = maps.to_vec();
+    for &(hole, hole_len) in holes {
+        let hole_end = hole.saturating_add(hole_len);
+        let mut next = Vec::with_capacity(pieces.len() + 1);
+        for map in pieces {
+            let end = map.va.saturating_add(map.len);
+            if hole_end <= map.va || end <= hole {
+                next.push(map);
+                continue;
+            }
+            if map.va < hole {
+                next.push(Pml4MapSpec {
+                    len: hole - map.va,
+                    ..map
+                });
+            }
+            if hole_end < end {
+                next.push(Pml4MapSpec {
+                    va: hole_end,
+                    gpa: map.gpa + (hole_end - map.va),
+                    len: end - hole_end,
+                    ..map
+                });
+            }
+        }
+        pieces = next;
+    }
+    pieces
+}
+
 /// Descend PML4→PDPT for `va`, creating any missing intermediate table, and
 /// return the byte offset of the PD table whose entries can be 2 MiB leaves.
 fn pd_offset_creating(
@@ -954,6 +989,89 @@ fn discover_next_free_table(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #369: the CPL0 page tables leave every kernel stack guard unmapped
+    /// in the direct window while the stacks around it stay mapped, so an
+    /// overflow off one CPU's stack faults instead of writing the memory
+    /// below it.
+    #[test]
+    fn cpl0_kernel_stack_guards_leave_unmapped_gaps_between_slots() {
+        let direct = carrick_el1_abi::X86_CPL0_DIRECT_VA;
+        let start = 0xc0_0000_u64;
+        let end = 0x100_0000_u64;
+        let map = Pml4MapSpec {
+            va: direct + start,
+            gpa: start,
+            len: end - start,
+            user: false,
+            write: true,
+            exec: false,
+        };
+        let guards: Vec<(u64, u64)> = carrick_el1_abi::x86_cpl0_kernel_stack_guards().collect();
+        let bytes = pml4_tables(&punch_holes(&[map], &guards), BASE, 64 * 0x1000).expect("tables");
+        let present = |va: u64| {
+            let walk = walk_descriptors(&bytes, BASE, va);
+            walk.iter()
+                .any(|descriptor| descriptor & PML4_PS != 0 && descriptor & PML4_P != 0)
+                || walk[3] & PML4_P != 0
+        };
+        let gpa_of = |va: u64| {
+            let walk = walk_descriptors(&bytes, BASE, va);
+            if walk[2] & PML4_PS != 0 {
+                (walk[2] & PML4_ADDR_MASK & !0x1f_ffff) + (va & 0x1f_ffff)
+            } else {
+                (walk[3] & PML4_ADDR_MASK) + (va & 0xfff)
+            }
+        };
+        for slot in 0..carrick_el1_abi::X86_CPL0_KERNEL_STACK_SLOTS as usize {
+            let guard = direct + carrick_el1_abi::x86_cpl0_kernel_stack_guard_gpa(slot);
+            let top = direct + carrick_el1_abi::x86_cpl0_kernel_stack_end_gpa(slot);
+            let size = carrick_el1_abi::X86_CPL0_KERNEL_STACK_GUARD_SIZE;
+            for va in (guard..guard + size).step_by(0x1000) {
+                assert!(!present(va), "slot {slot}: guard {va:#x} is mapped");
+            }
+            // The usable stack above the guard and whatever lies below it
+            // keep their identity translation.
+            for va in [guard - 0x1000, guard + size, top - 0x1000] {
+                assert!(present(va), "slot {slot}: {va:#x} lost its translation");
+                assert_eq!(gpa_of(va), va - direct);
+            }
+            assert_eq!(
+                top - (guard + size),
+                carrick_el1_abi::X86_CPL0_KERNEL_STACK_SIZE
+            );
+        }
+    }
+
+    #[test]
+    fn punched_holes_keep_each_piece_offset_and_permissions() {
+        let map = Pml4MapSpec {
+            va: 0xffff_ffff_9000_0000,
+            gpa: 0x10_0000,
+            len: 0x10_000,
+            user: false,
+            write: true,
+            exec: false,
+        };
+        let pieces = punch_holes(&[map], &[(map.va + 0x2000, 0x1000), (map.va, 0x1000)]);
+        assert_eq!(
+            pieces,
+            vec![
+                Pml4MapSpec {
+                    va: map.va + 0x1000,
+                    gpa: 0x10_1000,
+                    len: 0x1000,
+                    ..map
+                },
+                Pml4MapSpec {
+                    va: map.va + 0x3000,
+                    gpa: 0x10_3000,
+                    len: 0xd000,
+                    ..map
+                },
+            ]
+        );
+    }
 
     /// GPA of the table region root (arbitrary but kernel-region-shaped, like
     /// the aarch64 `LINUX_PAGE_TABLES_BASE` role).

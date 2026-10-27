@@ -1867,15 +1867,22 @@ impl Cpl0Carrier {
                 0
             })
             .ok_or_else(|| fail("fixture private copy table capacity"))?;
-        let tables = pml4_tables(&maps, LAYOUT.pml4_base, table_capacity)
-            .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
+        // Every CPU's kernel stack guard stays unmapped in the direct window
+        // the stacks run on (#369), whatever bootstrap map would cover it.
+        let guards: Vec<(u64, u64)> = carrick_el1_abi::x86_cpl0_kernel_stack_guards().collect();
+        let tables = pml4_tables(
+            &carrick_mem::pml4::punch_holes(&maps, &guards),
+            LAYOUT.pml4_base,
+            table_capacity,
+        )
+        .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
         ram.write_gpa(LAYOUT.pml4_base, &tables)
             .map_err(|e| fail(e.to_string()))?;
         if interrupts {
             let last = maps.last_mut().ok_or_else(|| fail("progress data map"))?;
             *last = crate::carrier_interrupts::data_map(1);
             let second = pml4_tables(
-                &maps,
+                &carrick_mem::pml4::punch_holes(&maps, &guards),
                 crate::carrier_interrupts::SECOND_ROOT,
                 table_capacity,
             )
@@ -1903,6 +1910,9 @@ impl Cpl0Carrier {
                 carrick_x86::fault_slot_gpa(carrick_x86::fault_stack_base(LAYOUT), index)?;
             ram.write_gpa(tss + 4, &(DIRECT_VA + fault_stack + 4096).to_le_bytes())
                 .map_err(|e| fail(e.to_string()))?;
+            // The one-page IST1 (#DF) stacks sit back to back with no guard
+            // (#369 guards the kernel stacks): the #DF handler's frame is
+            // fixed and small, so it cannot reach the next CPU's page.
             let ist_top = DIRECT_VA + IST_STACK_BASE + (index + 1) * 4096;
             ram.write_gpa(tss + 36, &ist_top.to_le_bytes())
                 .map_err(|e| fail(e.to_string()))?;
@@ -2057,7 +2067,8 @@ impl Cpl0Carrier {
                     .ok_or_else(|| fail("CPU binding backing"))?
                     .cast::<CpuBinding>();
                 binding.write(CpuBinding {
-                    kernel_stack: DIRECT_VA + 0xe1_0000 + index as u64 * 0x1_0000 - 16,
+                    kernel_stack: DIRECT_VA + carrick_el1_abi::x86_cpl0_kernel_stack_end_gpa(index)
+                        - carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE,
                     user_stack: 0,
                     self_address: METADATA_VA + BINDING_OFFSET + offset,
                     task_address: METADATA_VA + TASK_OFFSET + offset,
