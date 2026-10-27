@@ -89,6 +89,35 @@ impl HostBackingCustody {
         Some(HostBackingLease(record))
     }
 
+    /// Mint a source no other retention shares, even for the same open
+    /// description: its identity names exactly one native private mapping's
+    /// custody, so its release can never drop a later mapping's source.
+    pub(super) fn retain_exclusive_source(
+        self: &Arc<Self>,
+        source: PrivateFileBacking,
+        label: String,
+    ) -> Option<HostBackingLease> {
+        let handle = NonZeroU64::new(
+            NEXT_HANDLE
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .ok()?,
+        )?;
+        let record = Arc::new(Record {
+            key: SourceKey::of(&source),
+            label,
+            source,
+            custody: Arc::clone(self),
+            handle,
+        });
+        self.state
+            .lock()
+            .records
+            .insert(handle.get(), Arc::downgrade(&record));
+        Some(HostBackingLease(record))
+    }
+
     pub(super) fn label(&self, identity: HostBackingIdentity) -> Option<String> {
         if identity.generation() != NonZeroU64::MIN {
             return None;

@@ -1207,6 +1207,22 @@ impl<
         self.write(id, node);
         Ok(())
     }
+    /// Queue a byte source no node holds for retirement, so its custodian
+    /// releases it through [`Self::take_retired_host_backing`]. A source a
+    /// mapping never consumed (a refused or cancelled private file mmap)
+    /// enters the same retirement stream as one whose last node unmapped.
+    /// A source some node still holds, or one already queued, is unchanged.
+    pub fn retire_unused_source(&mut self, backing: HostBackingIdentity) -> Result<(), Refusal> {
+        let id = self.source_reserve(backing)?;
+        let mut node = self.read(id);
+        if node.first == 0 && node.data == 0 {
+            node.data = 1;
+            node.gap = u64::from(self.source_retired());
+            self.set_source_retired(id);
+            self.write(id, node);
+        }
+        Ok(())
+    }
     /// Pop exact physical retirements, including those produced by the guest
     /// venue. A revived token is skipped; no reservation population is walked.
     pub fn take_retired_host_backing(
@@ -4656,6 +4672,44 @@ mod tests {
         );
         assert_eq!(child.take_retired_host_backing().unwrap(), None);
         assert_eq!(parent.take_retired_host_backing().unwrap(), None);
+    }
+
+    /// A source no node consumed (a refused or cancelled private file mmap)
+    /// and one whose last node unmapped leave through the same retirement
+    /// stream, and a thousand such cycles keep the source index empty.
+    #[test]
+    fn unconsumed_and_unmapped_sources_retire_and_keep_the_index_steady() {
+        use core::num::NonZeroU64;
+        let table = table();
+        let mm = ReservationMm::new(43).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut root = table.lock(0, mm).unwrap();
+        let source = |token: u64| {
+            HostBackingIdentity::new(NonZeroU64::new(token).unwrap(), NonZeroU64::MIN, 0)
+        };
+        for cycle in 0..1000u64 {
+            let unconsumed = source(2 * cycle + 1);
+            let unmapped = source(2 * cycle + 2);
+            root.retire_unused_source(unconsumed).unwrap();
+            root.source_reserve(unmapped).unwrap();
+            root.source_add(unmapped, 4096).unwrap();
+            // A held source is never queued.
+            root.retire_unused_source(unmapped).unwrap();
+            root.source_sub(unmapped, 4096).unwrap();
+            let mut retired = alloc::vec::Vec::new();
+            while let Some(identity) = root.take_retired_host_backing().unwrap() {
+                retired.push(identity);
+            }
+            retired.sort();
+            assert_eq!(
+                retired,
+                [
+                    (unconsumed.handle(), unconsumed.generation()),
+                    (unmapped.handle(), unmapped.generation()),
+                ]
+            );
+            assert_eq!(root.source_tree(), 0, "every retired source left the index");
+        }
     }
 
     #[test]

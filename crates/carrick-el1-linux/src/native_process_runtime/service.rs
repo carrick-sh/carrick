@@ -308,6 +308,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// mode, checked by the staging step, is the authority Linux applies.
     ///
     /// A path operation resolves with the process tree's retained authority,
+    /// Keep a carrier-retained private-mapping source for this record:
+    /// `key` names the exact `mmap` retry that consumes it; `None` owes it
+    /// back unconsumed.
+    fn stash_map_source(
+        &self,
+        key: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+        source: carrick_core_abi::HostBackingIdentity,
+    ) -> Result<(), NativeProcessError> {
+        let mut graph = self.runtime.graph.lock();
+        graph
+            .owner
+            .task_mut(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native_mut()
+            .resources_mut()
+            .map_stash
+            .entry(self.record)
+            .or_default()
+            .retain(key, source);
+        Ok(())
+    }
+
     /// which the carrier accepts only as the admitted superuser identity; it
     /// is served only while the caller's ring credentials are still exactly
     /// that identity, else a counted ENOSYS (the exec rule, never an access
@@ -1636,22 +1658,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             result,
                         ) {
                             (Err(result), _) => Ok(NativeResume::Returned(result)),
-                            (Ok(_), ServiceResult::Cancelled) => Ok(NativeResume::Returned(
-                                SyscallResult::new(carrick_syscall_abi::LINUX_EINTR.guest_retval()),
-                            )),
-                            (Ok(source), _) => {
-                                self.runtime.graph.lock().map_sources.insert(
-                                    self.record,
-                                    (
-                                        key,
-                                        carrick_core_abi::HostBackingIdentity::new(
-                                            source.handle,
-                                            source.generation,
-                                            0,
-                                        ),
-                                    ),
+                            (Ok(source), result) => {
+                                let source = carrick_core_abi::HostBackingIdentity::new(
+                                    source.handle,
+                                    source.generation,
+                                    0,
                                 );
-                                Ok(NativeResume::RetrySyscall)
+                                let cancelled = matches!(result, ServiceResult::Cancelled);
+                                // A cancelled call never maps: its source is
+                                // owed back to the carrier, retired by this
+                                // record's next delegated mmap.
+                                self.stash_map_source((!cancelled).then_some(key), source)?;
+                                Ok(if cancelled {
+                                    NativeResume::Returned(SyscallResult::new(
+                                        carrick_syscall_abi::LINUX_EINTR.guest_retval(),
+                                    ))
+                                } else {
+                                    NativeResume::RetrySyscall
+                                })
                             }
                         };
                     }

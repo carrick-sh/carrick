@@ -1168,6 +1168,28 @@ mod tests {
         assert_eq!(&bytes[..11], b"-libc-bytes", "file bytes at offset 4");
         assert!(bytes[11..].iter().all(|byte| *byte == 0), "zero page tail");
 
+        // A second mapping of the same description gets its own source, so
+        // retiring one mapping's source never drops the other's.
+        let mut again = record(
+            fixture.table,
+            HostFileOp::MapPrivate,
+            fd,
+            [0; 4],
+            &[],
+            carrick_core_abi::host_file::MapSourceReply::BYTES,
+        );
+        let second = fixture
+            .dispatcher
+            .serve_native_host_file_in(&fixture.owner, None, &mut again)
+            .unwrap()
+            .retained_source
+            .expect("a second mapping retains a source");
+        assert_ne!(
+            second.identity().handle(),
+            identity.handle(),
+            "each private mapping owns an exclusive source"
+        );
+
         // A directory has no mmap operation; stdio is not a mapping source.
         let mut dir = record(
             fixture.table,

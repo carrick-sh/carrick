@@ -822,7 +822,103 @@ pub enum DelegatedAnonymous {
 /// forwards. The Linux entry owner publishes the completion/refusal counter.
 /// Serve a delegated anonymous-memory syscall in ring. `file` is a retained
 /// private file byte source for this exact `mmap` (see
-/// [`decide_reservation_syscall`]); `None` everywhere else.
+/// [`decide_reservation_syscall`]); `None` everywhere else. A source the
+/// call did not consume is retired for the carrier to release.
+pub fn serve_delegated_mapping<
+    E: AnonymousDescriptorEditor,
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    frame: &mut TrapFrame,
+    counters: &carrick_el1_abi::Counters,
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    editor: &mut E,
+    file: Option<carrick_el1_abi::HostBackingIdentity>,
+) -> DelegatedAnonymous {
+    let slot = frame.slot as u32;
+    let served = serve_delegated_anonymous(frame, counters, current, spaces, table, editor, file);
+    // A retained source this call did not consume (an errno, a refusal or a
+    // forward) is retired now; one a committed node holds is unchanged.
+    if let Some(file) = file {
+        retire_native_sources(current, spaces, table, slot, &[file]);
+    }
+    served
+}
+
+/// Retire byte sources the calling MM's reservation owner holds no node
+/// for, so the carrier releases them with its next private-mapping request.
+/// A busy or absent root keeps them until the MM is torn down, where its
+/// whole custody is released.
+pub fn retire_native_sources<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    slot: u32,
+    sources: &[carrick_el1_abi::HostBackingIdentity],
+) {
+    let Some((mm, index)) = native_reservation_root(current, spaces, table) else {
+        return;
+    };
+    let Ok(mut model) = table.lock_in(spaces, index.index(), mm, slot) else {
+        return;
+    };
+    for source in sources {
+        let _ = model.retire_unused_source(*source);
+    }
+}
+
+/// Pop up to `out.len()` byte sources the calling MM's reservation owner
+/// retired (last node unmapped, or never consumed), for the carrier to
+/// release. Returns how many were written.
+pub fn take_native_source_releases<
+    G: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+>(
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+    slot: u32,
+    out: &mut [(NonZeroU64, NonZeroU64)],
+) -> usize {
+    let Some((mm, index)) = native_reservation_root(current, spaces, table) else {
+        return 0;
+    };
+    let Ok(mut model) = table.lock_in(spaces, index.index(), mm, slot) else {
+        return 0;
+    };
+    let mut taken = 0;
+    for slot in out.iter_mut() {
+        match model.take_retired_host_backing() {
+            Ok(Some(identity)) => {
+                *slot = identity;
+                taken += 1;
+            }
+            _ => break,
+        }
+    }
+    taken
+}
+
+fn native_reservation_root<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    current: &CurrentTask,
+    spaces: SpaceAccess<'_, C>,
+    table: &carrick_core::mm::reservation::SharedReservations<LinuxReservationPolicy, G>,
+) -> Option<(
+    carrick_el1_abi::ReservationMm,
+    carrick_sched_core::spaces::SpaceIndex,
+)> {
+    let mm_key = current.mm.key.load(Ordering::Acquire);
+    let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
+    let index = spaces.find(mm_key)?;
+    table.admitted(index.index(), mm).then_some((mm, index))
+}
+
+#[inline(never)]
 pub fn serve_delegated_anonymous<
     E: AnonymousDescriptorEditor,
     G: ReservationGeometry,
@@ -1704,7 +1800,7 @@ mod tests {
             frame.x[..6].copy_from_slice(&args);
             let served_before = counters.served[nr as usize].load(Ordering::Relaxed);
             let forwarded_before = counters.forwarded[nr as usize].load(Ordering::Relaxed);
-            let route = serve_delegated_anonymous(
+            let route = serve_delegated_mapping(
                 &mut frame,
                 counters,
                 &mm.task,
@@ -1918,6 +2014,74 @@ mod tests {
                 Some(source),
             );
             assert_eq!(route, DelegatedAnonymous::Forward);
+        }
+
+        /// Each private file mapping's source leaves custody exactly once:
+        /// when its last node unmaps, or at once when the call did not
+        /// consume it (here an EINVAL for an unaligned offset). A thousand
+        /// map/unmap and refused-map cycles leave nothing retained.
+        #[test]
+        fn retained_sources_are_released_after_unmap_or_refusal() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let access =
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces);
+            let drain = || {
+                let mut out = [(core::num::NonZeroU64::MIN, core::num::NonZeroU64::MIN); 8];
+                let taken =
+                    take_native_source_releases(&delegated.task, access, &table, 0, &mut out);
+                out[..taken]
+                    .iter()
+                    .map(|(handle, _)| handle.get())
+                    .collect::<Vec<_>>()
+            };
+            for cycle in 0..1000u64 {
+                let source = |token: u64| {
+                    carrick_el1_abi::HostBackingIdentity::new(
+                        core::num::NonZeroU64::new(token).unwrap(),
+                        core::num::NonZeroU64::MIN,
+                        0,
+                    )
+                };
+                let (mapped, refused) = (source(2 * cycle + 1), source(2 * cycle + 2));
+                let (route, address) = syscall_with_file(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MMAP,
+                    [0, 0x2000, PROT_READ, MAP_PRIVATE, 3, 0],
+                    Some(mapped),
+                );
+                assert_eq!(route, DelegatedAnonymous::Served, "cycle {cycle}");
+                assert!(address > 0, "cycle {cycle}: {address}");
+                assert!(drain().is_empty(), "a mapped source stays held");
+                let (route, result) = syscall_with_file(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MMAP,
+                    [0, 0x2000, PROT_READ, MAP_PRIVATE, 3, 0x123],
+                    Some(refused),
+                );
+                assert_eq!((route, result), (DelegatedAnonymous::Served, -22));
+                assert_eq!(drain(), [refused.handle().get()], "never consumed");
+                let (route, result) = syscall(
+                    &delegated,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut editor,
+                    SYS_MUNMAP,
+                    [address as u64, 0x2000, 0, 0, 0, 0],
+                );
+                assert_eq!((route, result), (DelegatedAnonymous::Served, 0));
+                assert_eq!(drain(), [mapped.handle().get()], "last node unmapped");
+            }
         }
 
         /// The glibc loader's exact sequence for libc.so.6 (Docker oracle

@@ -882,6 +882,7 @@ fn native_host_file_stage<V: file::MemoryValidator>(
     validator: &V,
     table: [u64; 3],
     mut descriptor: impl FnMut(i32) -> Option<NativeDescriptor>,
+    releases: &mut dyn FnMut(&mut [carrick_core_abi::host_file::MapSourceReply]) -> usize,
 ) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
     use carrick_personality_linux::native_host_file::{HostFileCall, NativeNamespace, stage};
     if (frame.esr >> 26) & 0x3f != 0x15 {
@@ -898,8 +899,37 @@ fn native_host_file_stage<V: file::MemoryValidator>(
     let mut namespace = NativeNamespace {
         table,
         resolve: &mut descriptor,
+        releases,
     };
     stage(call, &mut namespace, &mut user)
+}
+
+/// The byte sources the caller's reservation owner retired, for the
+/// carrier to release with this private-mapping request.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn native_source_releases<C: Copy + Send + Sync + zerocopy::FromZeros>(
+    task: &CurrentTask,
+    access: carrick_sched_core::spaces::notification::SpaceAccess<'_, C>,
+    slot: u32,
+    out: &mut [carrick_core_abi::host_file::MapSourceReply],
+) -> usize {
+    let mut taken = [(core::num::NonZeroU64::MIN, core::num::NonZeroU64::MIN);
+        carrick_core_abi::host_file::MAX_MAP_RELEASES];
+    let limit = out.len().min(taken.len());
+    let count = memory::take_native_source_releases(
+        task,
+        access,
+        memory::reservations::shared_guest(),
+        slot,
+        &mut taken[..limit],
+    );
+    for (dst, (handle, generation)) in out.iter_mut().zip(&taken[..count]) {
+        *dst = carrick_core_abi::host_file::MapSourceReply {
+            handle: *handle,
+            generation: *generation,
+        };
+    }
+    count
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -1012,9 +1042,16 @@ fn arm_native_service_exit(
             None if action != Action::Forward => NativeServiceStage::Operation,
             None => match ipc::guest_venue(frame.slot as u32).and_then(|venue| {
                 let table = ipc::native_table(&venue, task)?;
-                native_host_file_stage(frame, task, &file::HardwareValidator, table, |fd| {
-                    ipc::native_descriptor(&venue, table, fd)
-                })
+                let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
+                let lock_slot = frame.slot as u32;
+                native_host_file_stage(
+                    frame,
+                    task,
+                    &file::HardwareValidator,
+                    table,
+                    |fd| ipc::native_descriptor(&venue, table, fd),
+                    &mut |out| native_source_releases(task, access, lock_slot, out),
+                )
             }) {
                 Some(carrick_personality_linux::native_host_file::HostFileStage::Request {
                     record,
@@ -2311,21 +2348,36 @@ impl<
         let access = carrick_el1::substrate::sched::object_wait::space_access(zone.tables, slot);
         // A private file mmap the host-file venue already retained a byte
         // source for: this is its exact retry.
-        let file = self.frame.arm_frame_ref().and_then(|frame| {
-            let args = [
-                frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
-            ];
-            (frame.x[8] == carrick_personality_linux::native_host_file::LINUX_NR_MMAP.raw())
-                .then_some(())
-                .and_then(|()| {
-                    self.process.as_deref_mut().and_then(|process| {
-                        process.take_map_source(
-                            carrick_personality_linux::native_host_file::NativeMapKey::of(&args),
-                        )
-                    })
-                })
-        });
-        match memory::serve_delegated_anonymous(
+        let take = self
+            .frame
+            .arm_frame_ref()
+            .filter(|frame| {
+                frame.x[8] == carrick_personality_linux::native_host_file::LINUX_NR_MMAP.raw()
+            })
+            .map(|frame| {
+                carrick_personality_linux::native_host_file::NativeMapKey::of(&[
+                    frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+                ])
+            })
+            .and_then(|key| {
+                self.process
+                    .as_deref_mut()
+                    .map(|process| process.take_map_source(key))
+            })
+            .unwrap_or_default();
+        if !take.orphans.is_empty() {
+            // Sources this thread was given but will not map go back to
+            // the carrier through its MM's retirement stream.
+            memory::retire_native_sources(
+                task,
+                access,
+                memory::reservations::shared_guest(),
+                slot.index() as u32,
+                &take.orphans,
+            );
+        }
+        let file = take.matched;
+        match memory::serve_delegated_mapping(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
                 None => {
@@ -3373,10 +3425,17 @@ mod tests {
         // The same write to an in-zone pipe never builds a host request.
         let mut asked = None;
         assert_eq!(
-            native_host_file_stage(&frame, &task, &Resident, table, |fd| {
-                asked = Some(fd);
-                Some(NativeDescriptor::InZone(InZoneKind::Pipe))
-            }),
+            native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                |fd| {
+                    asked = Some(fd);
+                    Some(NativeDescriptor::InZone(InZoneKind::Pipe))
+                },
+                &mut |_| 0
+            ),
             Some(HostFileStage::InRing)
         );
         assert_eq!(asked, Some(1), "the caller's own fd is resolved");
@@ -3387,11 +3446,18 @@ mod tests {
             output,
             resolves_path,
             map,
-        }) = native_host_file_stage(&frame, &task, &Resident, table, |_| {
-            Some(NativeDescriptor::HostBacked {
-                access: DescriptionAccess::ReadWrite,
-            })
-        })
+        }) = native_host_file_stage(
+            &frame,
+            &task,
+            &Resident,
+            table,
+            |_| {
+                Some(NativeDescriptor::HostBacked {
+                    access: DescriptionAccess::ReadWrite,
+                })
+            },
+            &mut |_| panic!("a write releases no mapping sources"),
+        )
         else {
             panic!("a host-backed stdout write crosses");
         };
@@ -3405,14 +3471,19 @@ mod tests {
         // A contended namespace keeps the call's old route, and a non-SVC
         // exit is never a host-file call.
         assert_eq!(
-            native_host_file_stage(&frame, &task, &Resident, table, |_| None),
+            native_host_file_stage(&frame, &task, &Resident, table, |_| None, &mut |_| 0),
             None
         );
         frame.esr = 0x24 << 26;
         assert_eq!(
-            native_host_file_stage(&frame, &task, &Resident, table, |_| {
-                panic!("a fault never resolves descriptors")
-            }),
+            native_host_file_stage(
+                &frame,
+                &task,
+                &Resident,
+                table,
+                |_| { panic!("a fault never resolves descriptors") },
+                &mut |_| 0
+            ),
             None
         );
     }
