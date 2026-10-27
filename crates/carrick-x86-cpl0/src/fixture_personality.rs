@@ -1161,7 +1161,7 @@ impl Personality for FixturePersonality {
                         CompletionRoute::Suspended => {
                             return ControlFlow::Suspend(OwnedContinuation::new(0));
                         }
-                        CompletionRoute::InvalidCompletion => {
+                        CompletionRoute::InvalidCompletion | CompletionRoute::NativeService => {
                             fatal_error(frame);
                         }
                         CompletionRoute::Forward | CompletionRoute::HostCustody => {
