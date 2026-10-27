@@ -2397,6 +2397,17 @@ impl<
             memory::DelegatedAnonymous::Served => {
                 DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
+            // A private file mapping whose retained source the root still
+            // would not take has no other venue: staging another source would
+            // only repeat this answer. Counted ENOSYS, served in ring.
+            memory::DelegatedAnonymous::Forward if file.is_some() => {
+                let nr = carrick_personality_linux::native_host_file::LINUX_NR_MMAP.raw() as usize;
+                self.counters.refused[nr].fetch_add(1, Ordering::Relaxed);
+                self.counters.served[nr].fetch_add(1, Ordering::Relaxed);
+                DelegatedStep::Served(SyscallResult::new(
+                    carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+                ))
+            }
             memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
         }
     }
