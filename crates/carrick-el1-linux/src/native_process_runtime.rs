@@ -107,22 +107,11 @@ fn request_signal_reschedule<'a, C: ProcessContext, S: NativeProcessService<'a, 
     }
 }
 
-/// What a channel publication does when EL1 cannot place a woken waiter.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum UnplaceableWake {
-    /// Hand the wake to the carrier (terminal wakes only admit this).
-    Cross,
-    /// Leave the waiter parked: a later publication on the same channel
-    /// (the releasing child's exit) wakes it through the carrier.
-    LeaveParked,
-}
-
 fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>(
     zone: &'a ZoneTables<C>,
     slot: SlotId,
     service: &mut S,
     channel: &Arc<WaitChannel>,
-    unplaceable: UnplaceableWake,
     #[cfg(test)] probe: Option<&(dyn Fn(u32) + Sync)>,
 ) -> Result<(), NativeProcessError> {
     let address = WaitChannel::address(channel);
@@ -151,9 +140,6 @@ fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>
     );
     drop(guard);
     if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
-        if unplaceable == UnplaceableWake::LeaveParked {
-            return Ok(());
-        }
         return service.wake_unplaceable_wait(ProcessWaitChannel {
             mm: carrick_el1_abi::EntryMmKey::from_raw(channel.mm),
             address: core::num::NonZeroU64::new(address).ok_or(NativeProcessError::Quarantined)?,
@@ -2128,7 +2114,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 publishing_slot,
                 service,
                 &channel,
-                UnplaceableWake::Cross,
                 #[cfg(test)]
                 None,
             )?;
@@ -2143,7 +2128,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 publishing_slot,
                 service,
                 &channel,
-                UnplaceableWake::Cross,
                 #[cfg(test)]
                 None,
             )?;
@@ -4166,13 +4150,31 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// (its arguments are staged; the child no longer needs the parent's
     /// image). Exit releases it inside the exit notification.
     ///
-    /// The wake is placed by this EL1 slot while the child still runs where
-    /// it was born, beside its parked parent. Exec completes later in a
-    /// resume context from which a host-loaded parent cannot be placed, and
-    /// the carrier admits unplaceable process-channel wakes only from a
-    /// terminal child. If EL1 cannot place the parent here, it stays parked
-    /// and the child's exit wakes it.
+    /// Only native-owned parents suspend (see `fork`), so this EL1 slot can
+    /// place the parked parent like every other process-channel wake.
     pub(super) fn release_vfork_parent(&mut self) -> Result<(), NativeProcessError> {
+        let parent = self
+            .runtime
+            .graph
+            .lock()
+            .vfork_parents
+            .get(&self.key)
+            .copied();
+        let result = self.publish_vfork_release();
+        if result.is_err()
+            && let Some(parent) = parent
+        {
+            // A refused publication leaves the parent parked: keep its row
+            // so the child's exit still releases it.
+            self.runtime
+                .graph
+                .lock()
+                .vfork_parents
+                .insert(self.key, parent);
+        }
+        result
+    }
+    fn publish_vfork_release(&mut self) -> Result<(), NativeProcessError> {
         let channel = {
             let mut graph = self.runtime.graph.lock();
             let Some(parent) = graph.vfork_parents.remove(&self.key) else {
@@ -4190,7 +4192,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source.slot,
                 self.service,
                 &channel,
-                UnplaceableWake::LeaveParked,
                 #[cfg(test)]
                 self.publication_wait_probe,
             ),
@@ -4896,7 +4897,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.source.slot,
             self.service,
             channel,
-            UnplaceableWake::Cross,
             #[cfg(test)]
             self.publication_wait_probe,
         )
@@ -6597,8 +6597,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 mm: handle,
             })
             .map_err(|_| NativeProcessError::Quarantined)?;
-        if let Some(registry) = *self.runtime.registry.lock() {
-            registry
+        // A vfork child may exec or exit as soon as it is registered and
+        // runnable: its release row exists before either, and a refused
+        // publication removes it again.
+        let vfork = child_tid.parent == ProcessForkParent::SuspendedUntilExecOrExit;
+        if vfork {
+            self.runtime
+                .graph
+                .lock()
+                .vfork_parents
+                .insert(child_key, self.key);
+        }
+        let unrow = |runtime: &NativeProcessRuntime<'a, M, C>| {
+            if vfork {
+                runtime.graph.lock().vfork_parents.remove(&child_key);
+            }
+        };
+        if let Some(registry) = *self.runtime.registry.lock()
+            && registry
                 .register_child(
                     self.runtime,
                     NativeChildRegistration {
@@ -6610,18 +6626,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         record: self.source.zone.record_ref(record),
                     },
                 )
-                .map_err(|_| NativeProcessError::Quarantined)?;
-        }
-        // A vfork child may exec or exit on another CPU as soon as it is
-        // runnable: its release row exists before the child can run.
-        if child_tid.parent == ProcessForkParent::SuspendedUntilExecOrExit {
-            self.runtime
-                .graph
-                .lock()
-                .vfork_parents
-                .insert(child_key, self.key);
+                .is_err()
+        {
+            unrow(self.runtime);
+            return Err(NativeProcessError::Quarantined);
         }
         if !self.source.zone.mark_native_owned(record) {
+            unrow(self.runtime);
             return Err(NativeProcessError::Quarantined);
         }
         self.source.zone.requeue_preempted(self.source.slot, record);
@@ -6657,7 +6668,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn take_handoff_receipt(&mut self) -> Option<EntryHandoffReceipt<C>> {
         self.handoff.take()
     }
-    fn fork(&mut self, child_tid: ProcessForkChildTid) -> LifecycleOutcome {
+    fn fork(&mut self, mut child_tid: ProcessForkChildTid) -> LifecycleOutcome {
+        // A suspended parent is woken by the child's in-ring release, which
+        // an EL1 waker can place only for a native-owned record. A
+        // host-loaded caller (the root's host thread) is not placeable from
+        // the child's slot, and the carrier admits such wakes only from a
+        // terminal child, so its suspension could outlive the child's exec.
+        // The child is a copy-on-write fork, so suspension only orders
+        // execution: such a caller returns the pid at once instead.
+        if child_tid.parent == ProcessForkParent::SuspendedUntilExecOrExit
+            && !self.source.zone.record(self.record.id).is_native_owned()
+        {
+            child_tid.parent = ProcessForkParent::Runs;
+        }
         match self.fork_owned(child_tid) {
             Ok(pid) if child_tid.parent == ProcessForkParent::SuspendedUntilExecOrExit => {
                 match self.vfork_suspend(pid) {
@@ -12773,15 +12796,16 @@ mod tests {
         );
     }
 
-    /// vfork(2) from a native-owned root: the clone is served (never
-    /// forwarded), the child runs on clone's stack in its own copy-on-write
-    /// MM, and the parent stays parked until the child releases it, by exec
-    /// commit or by exit. Only then does the parent's clone return the pid,
-    /// and wait4 still reaps the child's exact status.
+    /// vfork(2): the clone is served (never forwarded) and the child runs on
+    /// clone's stack in its own copy-on-write MM. A native-owned parent
+    /// stays parked until the child releases it, by exec admission or by
+    /// exit; only then does its clone return the pid, and wait4 still reaps
+    /// the child's exact status. A host-loaded parent, which the child's
+    /// release could not place, returns the pid at once instead of parking.
     #[test]
     fn vfork_parent_stays_suspended_until_child_execs_or_exits() {
         const CHILD_STACK: u64 = 0x7ffe_f000;
-        for exec_first in [false, true] {
+        for (exec_first, host_loaded) in [(false, false), (true, false), (false, true)] {
             let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
             // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
             let zone = unsafe {
@@ -12793,6 +12817,11 @@ mod tests {
             let control = Box::new(ThreadControlSlot::new());
             let child_page = Box::new(ThreadLifecyclePage::new());
             let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+                ThreadControlSlot::new()
+            }));
+            // The native-owned vfork parent (a fork child) gets its own page.
+            let parent_page = Box::new(ThreadLifecyclePage::new());
+            let parent_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
                 ThreadControlSlot::new()
             }));
             let task = CurrentTask::new();
@@ -12860,23 +12889,75 @@ mod tests {
                 child_copy_error: None,
                 on_signal_clock: None,
             };
-            let parent = TaskKey {
+            let root = TaskKey {
                 id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
                 serial: TaskSerial::from_raw_u64(11).unwrap(),
             };
-            let channel = runtime
-                .graph
-                .lock()
-                .owner
-                .task(parent)
-                .unwrap()
-                .native()
-                .resources()
-                .channel
-                .clone()
-                .unwrap();
+            let resources = |key: TaskKey| {
+                let graph = runtime.graph.lock();
+                let r = graph.owner.task(key).unwrap().native().resources();
+                (r.address, r.record, r.channel.clone().unwrap())
+            };
+            if host_loaded {
+                // The fixture root is the host-loaded record of its executor,
+                // never native-owned: no EL1 waker on the child's slot can
+                // place it, so its vfork returns the pid at once.
+                assert!(!zone.record(resources(root).1.id).is_native_owned());
+                let mut entry = runtime
+                    .enter(source, &task, words(address), &mut service)
+                    .unwrap();
+                let LifecycleOutcome::Returned { result, .. } =
+                    entry.fork(ProcessForkChildTid::vfork(UserVa::new(CHILD_STACK)))
+                else {
+                    panic!("a host-loaded vfork parent must not park on an unplaceable release")
+                };
+                assert!(result.raw() > 0);
+                assert_eq!(entry.take_run_failure(), None);
+                drop(entry);
+                let graph = runtime.graph.lock();
+                assert!(graph.vfork_parents.is_empty());
+                assert!(!graph.pending.contains_key(&root));
+                let child = graph
+                    .owner
+                    .namespace_child_key(root, result.raw() as u32)
+                    .unwrap()
+                    .unwrap();
+                let record = graph.owner.task(child).unwrap().native().resources().record;
+                // SAFETY: the queued child record is only read here.
+                let ctx = unsafe { *zone.record(record.id).ctx_mut() };
+                assert_eq!(ctx.frame[18], CHILD_STACK, "child runs on clone's stack");
+                continue;
+            }
+            // The root forks the native-owned process that will vfork, then
+            // waits for it.
             let mut entry = runtime
                 .enter(source, &task, words(address), &mut service)
+                .unwrap();
+            let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+            else {
+                panic!("fork")
+            };
+            let parent = runtime
+                .namespace_child_key(root, result.raw() as u32)
+                .unwrap();
+            assert!(matches!(
+                entry.wait4(
+                    ProcessWaitPid::from_syscall_argument(u64::MAX),
+                    UserVa::new(0x8000),
+                    LinuxWaitOptions::empty(),
+                    UserVa::new(0)
+                ),
+                LifecycleOutcome::Transferred { .. }
+            ));
+            assert!(entry.take_handoff_receipt().is_some());
+            drop(entry);
+            activate(&runtime, source, &task, parent);
+            service.page = &parent_page;
+            service.controls = &*parent_controls;
+            let (parent_address, parent_record, channel) = resources(parent);
+            assert!(zone.record(parent_record.id).is_native_owned());
+            let mut entry = runtime
+                .enter(source, &task, words(parent_address), &mut service)
                 .unwrap();
             // The parent parks instead of returning the child's pid.
             let outcome = entry.fork(ProcessForkChildTid::vfork(UserVa::new(CHILD_STACK)));
@@ -12898,40 +12979,23 @@ mod tests {
                 let (&child, &owner) = graph.vfork_parents.iter().next().expect("release row");
                 assert_eq!(owner, parent);
                 assert_eq!(graph.vfork_parents.len(), 1);
-                assert!(
-                    graph
-                        .pending
-                        .parked_by(&parent, ContinuationOwner::of(&control, 41))
-                );
                 let row = graph.owner.task(child).unwrap();
-                let resources = row.native().resources();
-                assert_ne!(
-                    resources.address.mm, address.mm,
-                    "the child owns its own MM"
-                );
-                // SAFETY: the unpublished child record is only read here.
-                let ctx = unsafe { *zone.record(resources.record.id).ctx_mut() };
+                let r = row.native().resources();
+                assert_ne!(r.address.mm, parent_address.mm, "the child owns its own MM");
+                // SAFETY: the queued child record is only read here.
+                let ctx = unsafe { *zone.record(r.record.id).ctx_mut() };
                 assert_eq!(ctx.frame[18], CHILD_STACK, "child runs on clone's stack");
                 assert_eq!(ctx.frame[10], 0, "the child's clone returns zero");
                 (child, row.metadata().namespace_pid)
             };
             let before = channel.generation.generation();
             activate(&runtime, source, &task, child);
-            let child_address = runtime
-                .graph
-                .lock()
-                .owner
-                .task(child)
-                .unwrap()
-                .native()
-                .resources()
-                .address;
+            let (child_address, _, _) = resources(child);
             let mut entry = runtime
                 .enter(source, &task, words(child_address), &mut service)
                 .unwrap();
             if exec_first {
-                // Exec admission releases the parent while the child keeps
-                // running.
+                // Exec admission releases the parent while the child runs on.
                 entry.release_vfork_parent().unwrap();
                 assert_eq!(channel.generation.generation().raw(), before.raw() + 1);
                 assert!(runtime.graph.lock().vfork_parents.is_empty());
@@ -12948,7 +13012,7 @@ mod tests {
             assert!(channel.generation.generation().raw() > before.raw());
             activate(&runtime, source, &task, parent);
             let mut entry = runtime
-                .enter(source, &task, words(address), &mut service)
+                .enter(source, &task, words(parent_address), &mut service)
                 .unwrap();
             let Some(LifecycleOutcome::Returned { result, .. }) = entry.resume_pending_wait()
             else {
