@@ -686,6 +686,20 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         Ok(())
     }
 
+    fn host_work_pending(&self) -> Result<bool, TrapError> {
+        let slot = self.live()?.mailbox.slot().raw() as usize;
+        Ok(carrick_el1_abi::peek_pending_host_work(slot))
+    }
+
+    fn kicked_by_cancellation(&self) -> bool {
+        // The exit record stays valid until the next `hv_vcpu_run`: an `hvc`
+        // kick decode leaves `EXCEPTION` there, a cross-thread
+        // `hv_vcpus_exit` leaves `CANCELED`.
+        self.live().is_ok_and(|live| {
+            live.inner.get_exit_info().reason == applevisor::prelude::ExitReason::CANCELED
+        })
+    }
+
     fn force_clock_host_boundary(&mut self) -> Result<bool, TrapError> {
         if self.is_staged() {
             return Ok(false);

@@ -3281,6 +3281,19 @@ pub fn mark_pending_host_work(slot: usize) {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Whether host work is published to the vCPU at `slot`, without consuming
+/// the doorbell.
+pub fn peek_pending_host_work(slot: usize) -> bool {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
+        return false;
+    }
+    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
+    // SAFETY: the record lives in the EL1 region; only atomics are touched.
+    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
+    current_task.linux.has_pending_host_work()
+}
+
 /// Consume the host-work doorbell of the vCPU at `slot`. The token must be
 /// passed to the boundary that settles the work it announces.
 pub fn take_host_work_doorbell(slot: usize) -> Option<HostWorkDoorbell> {

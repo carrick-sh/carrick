@@ -265,6 +265,22 @@ pub trait Aarch64Vcpu {
         Ok(())
     }
 
+    /// Whether host work is published to this vCPU's EL1 slot, without
+    /// consuming it: the doorbell a host kick (`el1_zone::kick_slot`) raises
+    /// before it forces the vCPU out. A scheduler-only kick (a reschedule)
+    /// raises none. A backend with no EL1 slot keeps this `false` default.
+    fn host_work_pending(&self) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
+    /// Whether the `Kicked` exit [`Self::run`] just returned was a raw
+    /// cross-thread cancellation (HVF `CANCELED`), not Carrick's EL1 code
+    /// asking for the host at an EL0 boundary (the `hvc` kick decode). The
+    /// conservative `false` default never re-enters a requested boundary.
+    fn kicked_by_cancellation(&self) -> bool {
+        false
+    }
+
     // ── GPR / sysreg access ──
     fn get_reg(&self, r: Reg) -> Result<u64, TrapError>;
     fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError>;

@@ -40,7 +40,9 @@
  *         `pt-pause-drain-wait` = (coordinator, sibling, wait_us);
  *         `vcpu-kick` = (id u64, valid, rc); `vcpu-canceled` = (id, pc, el,
  *         resumed_mid_el1); `kick-rearm-irq` = (pc, site 1 vector / 2 EL1
- *         image / 3 clock stub, el0_pstate, elr_el1); `owed-kick-settle` =
+ *         image / 3 clock stub / 4 idle-entry EL0 (#890: owed to the EL1
+ *         scheduler's IRQ boundary, never settled by the host), el0_pstate,
+ *         elr_el1); `owed-kick-settle` =
  *         (pc, pstate, el0_state).
  *       * Carrick's ustack frames do not symbolize after the carrier exits;
  *         the stall clause prints from the probe so they do while it lives.
