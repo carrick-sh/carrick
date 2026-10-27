@@ -40,11 +40,23 @@ enum LeaderWait {
     /// A non-IPC queue domain holding a token that collides with a live
     /// IPC operation of this task: never routed to IPC settlement.
     ForeignDomain,
+    /// Futex-parked, then woken by the close and trapping on a fault before
+    /// its exit checkpoint ran.
+    FaultWhileClosing,
 }
 
 #[test]
 fn native_fatal_worker_wakes_futex_parked_leader_before_exit_drain() {
     fatal_worker_retires_parked_leader(LeaderWait::Futex);
+}
+
+/// #856: a member that traps into a service after its process began closing
+/// (a sibling's fatal signal or exit_group won the race) finds the service
+/// claim refused. Linux ends that thread with its group; the carrier must
+/// not fail the run with `native process busy`.
+#[test]
+fn native_member_trapping_while_its_process_closes_takes_the_exit() {
+    fatal_worker_retires_parked_leader(LeaderWait::FaultWhileClosing);
 }
 
 /// A member woken out of a one-description pipe poll by a sibling's fatal
@@ -89,7 +101,7 @@ fn fatal_worker_retires_parked_leader(wait: LeaderWait) {
     )
     .with_words(words);
     service.crossing.terminal_task = Some(&fixture.task);
-    let ipc = (wait != LeaderWait::Futex).then(|| {
+    let ipc = (!matches!(wait, LeaderWait::Futex | LeaderWait::FaultWhileClosing)).then(|| {
         use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
         let owner = std::sync::Arc::new(carrick_kernel::el1_ipc::HostIpc::new(1 << 20).unwrap());
         let table = carrick_kernel::el1_ipc::HostTable::create(owner.clone(), 64, 8).unwrap();
@@ -410,15 +422,77 @@ fn fatal_worker_retires_parked_leader(wait: LeaderWait) {
         assert!(fixture.zone.record(leader).has_object_operation());
         return;
     }
-    let (selected, resumed) = select(&mut service);
-    assert_eq!(selected, leader);
-    assert!(
-        matches!(
-            resumed,
-            super::super::native_process_runtime::NativeResume::Left(None)
-        ),
-        "cancelled native leader must retire before EL0"
-    );
+    if wait == LeaderWait::FaultWhileClosing {
+        let record = fixture.zone.switch_in_full(fixture.slot).unwrap().record;
+        assert_eq!(record, leader);
+        let identity = fixture.zone.record(record).identity();
+        fixture
+            .zone
+            .install_space(fixture.slot, identity.mm)
+            .unwrap();
+        fixture.task.set(
+            El1TaskId::from_linux_tid(identity.tid as i32),
+            carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+            identity.file_table,
+        );
+        fixture.task.mm.key.store(identity.mm, Ordering::Release);
+        fixture
+            .task
+            .mm
+            .thread_generation
+            .store(identity.serial, Ordering::Release);
+        fixture
+            .task
+            .publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+        let saved = unsafe { *fixture.zone.record(record).ctx_mut() };
+        let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        let (result, receipt) = with_process_entry(
+            source,
+            &fixture.task,
+            &saved.native,
+            saved.address_context().unwrap().root.address().raw(),
+            page,
+            control,
+            &mut service,
+            |entry| {
+                let result = entry.begin_service(
+                    carrick_core_abi::service::ServiceOperation::Fault(
+                        carrick_guest_arch::FaultInfo {
+                            address: UserVa::new(0x6000_0000),
+                            access: carrick_guest_arch::Access::Write,
+                            present: false,
+                        },
+                    ),
+                    None,
+                );
+                (result, entry.take_handoff_receipt().is_some())
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                result,
+                Ok(super::super::native_process_runtime::NativeResume::Left(
+                    None
+                ))
+            ),
+            "a member trapping into a closing process must take its exit, not fail \
+             the carrier: {:?}",
+            result.as_ref().err()
+        );
+        assert!(receipt, "the exit hands off its lane");
+    } else {
+        let (selected, resumed) = select(&mut service);
+        assert_eq!(selected, leader);
+        assert!(
+            matches!(
+                resumed,
+                super::super::native_process_runtime::NativeResume::Left(None)
+            ),
+            "cancelled native leader must retire before EL0"
+        );
+    }
     let (selected, resumed) = select(&mut service);
     assert_eq!(selected, worker);
     assert!(

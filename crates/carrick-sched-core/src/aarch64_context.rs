@@ -150,6 +150,16 @@ impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
     fn syscall_return(&self) -> u64 {
         Aarch64ParkedContext::syscall_return(self)
     }
+    fn replay_syscall_entry(&mut self) -> bool {
+        // `svc #0` is one A64 instruction before the saved return.
+        match self.native.pc.checked_sub(4) {
+            Some(pc) if pc != 0 => {
+                self.native.pc = pc;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl carrick_guest_arch::ThreadContext for Aarch64ParkedContext {

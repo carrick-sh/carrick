@@ -2170,6 +2170,15 @@ impl<
             return DelegatedStep::NotDelegated;
         };
         let access = carrick_el1::substrate::sched::object_wait::space_access(zone.tables, slot);
+        // A native member has no host venue for a contended edit: sample its
+        // producers before the attempt so a release in between is not lost.
+        let observe = |cause| {
+            self.process
+                .as_deref()
+                .and_then(|process| process.observe_memory_edit(cause))
+        };
+        let reservations = observe(carrick_core_abi::PortalWaitCause::Reservations);
+        let editor = observe(carrick_core_abi::PortalWaitCause::Editor);
         match memory::serve_delegated_anonymous(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
@@ -2184,12 +2193,34 @@ impl<
             memory::reservations::shared_guest(),
             &mut memory::HardwareAnonymousEditor,
         ) {
+            memory::DelegatedAnonymous::Contended(cause) => DelegatedStep::Contended(match cause {
+                carrick_core_abi::PortalWaitCause::Reservations => reservations,
+                carrick_core_abi::PortalWaitCause::Editor => editor,
+                _ => None,
+            }),
             memory::DelegatedAnonymous::PreparedConflict => DelegatedStep::PreparedConflict,
             memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
             memory::DelegatedAnonymous::Served => {
                 DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
             memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
+        }
+    }
+    fn park_contended(
+        &mut self,
+        wait: carrick_core_abi::PortalOwnerWait,
+    ) -> carrick_personality_linux::pending_anonymous::ContendedPark {
+        use carrick_personality_linux::lifecycle::MemoryEditWait;
+        use carrick_personality_linux::pending_anonymous::ContendedPark;
+        let Some(process) = self.process.as_deref_mut() else {
+            return ContendedPark::Unsupported;
+        };
+        match process.wait_memory_edit(wait) {
+            Some(MemoryEditWait::Parked(outcome)) => ContendedPark::Parked(
+                carrick_personality_linux::lifecycle::lifecycle_effect(&outcome),
+            ),
+            Some(MemoryEditWait::Ready) => ContendedPark::Retry,
+            None => ContendedPark::Unsupported,
         }
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> {

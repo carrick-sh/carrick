@@ -838,6 +838,12 @@ pub trait ProcessContext: Copy + Send + Sync + zerocopy::FromZeros {
         self
     }
     fn syscall_return(&self) -> u64;
+    /// Point the saved user return back at the system-call instruction that
+    /// entered, arguments unchanged, so the call runs again when the thread
+    /// resumes. `false`: this ISA's owner does not replay entries.
+    fn replay_syscall_entry(&mut self) -> bool {
+        false
+    }
 }
 
 /// Architectural register selection for thread-local storage / thread context on x86_64.
