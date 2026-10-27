@@ -281,16 +281,13 @@ fn read_host_pipe_into_owner(
 /// fd hands off to the runtime's lockless kqueue wait via WaitOnFds while a
 /// non-blocking guest fd gets EAGAIN. Never blocks under the dispatcher lock.
 /// `nonblocking` is the guest's intended mode (status_flags / O_NONBLOCK).
-pub(crate) fn read_host_pipe_into(
-    context: &crate::kernel::KernelContext,
+/// The destination is not owner memory, so no task admits the copyout.
+fn read_host_pipe_into_unowned(
     memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
     buf: &mut [u8],
     target: HostPipeReadTarget<'_>,
 ) -> Result<DispatchOutcome, super::outcome::DispatchError> {
-    if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
-        return read_host_pipe_into_owner(context, memory, guest_addr, buf, target);
-    }
     let HostPipeReadTarget {
         host_fd,
         host_fd_owner,
@@ -553,6 +550,24 @@ pub(crate) fn read_host_pipe(
         let mut buf = vec![0u8; length];
         return read_host_pipe_into_owner(context, memory, guest_addr, &mut buf, target);
     }
+    read_host_pipe_unowned(memory, guest_addr, length, target)
+}
+
+/// [`read_host_pipe`] into a destination that is not owner memory (such as a
+/// carrier record buffer): no task admits this copyout.
+pub(crate) fn read_host_pipe_unowned(
+    memory: &mut impl CurrentMmMemory,
+    guest_addr: u64,
+    length: usize,
+    target: HostPipeReadTarget<'_>,
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
+    if length == 0 {
+        return Ok(DispatchOutcome::Returned { value: 0 });
+    }
+    let length = length.min(MAX_RW_COUNT);
+    if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+        return Err(super::fs::carrier_buffer_is_not_owner_memory());
+    }
     if let Some(host_ptr) = memory.host_ptr_for_write(guest_addr, length) {
         let range = [carrick_guest_mem::HostWriteRange {
             guest: carrick_guest_mem::GuestVa::new(guest_addr),
@@ -569,10 +584,10 @@ pub(crate) fn read_host_pipe(
         read_host_pipe_raw(host_ptr, length, target)
     } else if length <= SMALL_HOST_READ_BUF {
         let mut buf = [0u8; SMALL_HOST_READ_BUF];
-        read_host_pipe_into(context, memory, guest_addr, &mut buf[..length], target)
+        read_host_pipe_into_unowned(memory, guest_addr, &mut buf[..length], target)
     } else {
         let mut buf = vec![0u8; length];
-        read_host_pipe_into(context, memory, guest_addr, &mut buf, target)
+        read_host_pipe_into_unowned(memory, guest_addr, &mut buf, target)
     }
 }
 

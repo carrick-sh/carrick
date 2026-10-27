@@ -215,6 +215,39 @@ pub(crate) fn is_structural_namespace_mutation(canonical_nr: u64) -> bool {
     )
 }
 
+/// Who one description-level I/O core serves. The guest syscall handler and
+/// the native host-file venue run the same core against an open description;
+/// only this caller differs.
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+pub(in crate::dispatch) enum IoCaller<'a> {
+    /// A guest task's syscall. Its kernel context admits owner-memory
+    /// copyouts and names the task's `/proc/self`.
+    Task(&'a crate::kernel::KernelContext),
+    /// The native host-file venue. The destination is the carrier-owned
+    /// record buffer (never owner memory), and the caller has no host task
+    /// and therefore no `/proc/self` here.
+    CarrierBuffer,
+}
+
+impl<'a> IoCaller<'a> {
+    pub(in crate::dispatch) fn task(self) -> Option<&'a crate::kernel::KernelContext> {
+        match self {
+            Self::Task(kernel) => Some(kernel),
+            Self::CarrierBuffer => None,
+        }
+    }
+
+    pub(in crate::dispatch) fn visible_self(self) -> Option<u32> {
+        self.task().and_then(proc_synthetic::proc_visible_self)
+    }
+}
+
+/// An owner-memory copy reached without a task: a carrier buffer never is
+/// owner memory, so this names a broken caller, not a guest condition.
+pub(in crate::dispatch) fn carrier_buffer_is_not_owner_memory() -> super::DispatchError {
+    super::DispatchError::MemoryPreparation("a carrier record buffer is never owner memory".into())
+}
+
 mod access;
 mod attr;
 mod close_dup;

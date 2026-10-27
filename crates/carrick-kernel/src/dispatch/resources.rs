@@ -78,6 +78,10 @@ struct CapturedResourcesStack {
     inline: [Option<CapturedResources>; 4],
     len: usize,
     heap: Vec<CapturedResources>,
+    /// The filesystem authority of the native process a carrier host-file
+    /// service runs for ([`with_native_fs_scope`]); consulted only when no
+    /// task's resources are captured.
+    native_fs: Option<NativeFsAuthority>,
 }
 
 impl CapturedResourcesStack {
@@ -86,6 +90,7 @@ impl CapturedResourcesStack {
             inline: [None, None, None, None],
             len: 0,
             heap: Vec::new(),
+            native_fs: None,
         }
     }
 
@@ -145,7 +150,6 @@ thread_local! {
         const { Cell::new(std::ptr::null()) };
     static RETIRING_FILE_TABLES: RefCell<Vec<Arc<crate::kernel::FileTable>>> =
         const { RefCell::new(Vec::new()) };
-    static NATIVE_FS_SCOPE: RefCell<Option<NativeFsAuthority>> = const { RefCell::new(None) };
 }
 
 /// Filesystem authority of a ring-owned (native) process for one carrier
@@ -192,10 +196,10 @@ pub(super) fn with_native_fs_scope<R>(
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
-            NATIVE_FS_SCOPE.with(|scope| scope.borrow_mut().take());
+            CAPTURED_RESOURCES.with(|stack| stack.borrow_mut().native_fs.take());
         }
     }
-    NATIVE_FS_SCOPE.with(|scope| *scope.borrow_mut() = Some(authority.clone()));
+    CAPTURED_RESOURCES.with(|stack| stack.borrow_mut().native_fs = Some(authority.clone()));
     let _restore = Restore;
     Some(operation())
 }
@@ -206,7 +210,7 @@ pub fn executor_boundary_is_clear() -> bool {
     ACTIVE_CONTEXT.with(|active| active.get().is_null())
         && CAPTURED_RESOURCES.with(|stack| stack.borrow().is_empty())
         && RETIRING_FILE_TABLES.with(|stack| stack.borrow().is_empty())
-        && NATIVE_FS_SCOPE.with(|scope| scope.borrow().is_none())
+        && CAPTURED_RESOURCES.with(|stack| stack.borrow().native_fs.is_none())
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -500,9 +504,10 @@ pub(super) fn credentials() -> Option<Arc<crate::kernel::Credentials>> {
     CAPTURED_RESOURCES
         .with(|stack| stack.borrow().last().map(CapturedResources::credentials))
         .or_else(|| {
-            NATIVE_FS_SCOPE.with(|scope| {
-                scope
+            CAPTURED_RESOURCES.with(|stack| {
+                stack
                     .borrow()
+                    .native_fs
                     .as_ref()
                     .map(|authority| Arc::clone(&authority.credentials))
             })
@@ -513,9 +518,10 @@ pub(super) fn fs_context() -> Option<Arc<crate::kernel::FsContext>> {
     CAPTURED_RESOURCES
         .with(|stack| stack.borrow().last().map(CapturedResources::fs_context))
         .or_else(|| {
-            NATIVE_FS_SCOPE.with(|scope| {
-                scope
+            CAPTURED_RESOURCES.with(|stack| {
+                stack
                     .borrow()
+                    .native_fs
                     .as_ref()
                     .map(|authority| Arc::clone(&authority.fs_context))
             })

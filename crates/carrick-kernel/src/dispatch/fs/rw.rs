@@ -609,6 +609,48 @@ fn writev_pipe_fault_boundary(
         * crate::dispatch::fs::pipe::PIPE_BUF
 }
 
+/// A guest task's `read(2)` state that only a task has: its kernel context,
+/// thread registry and reporter, the slot it read through and that slot's
+/// lease, and its host-wait runner.
+pub(in crate::dispatch) struct TaskRead<'t> {
+    kernel: &'t crate::kernel::KernelContext,
+    registry: Option<&'t crate::thread::ThreadRegistry>,
+    reporter: &'t crate::compat::CompatReporter,
+    files: &'t Arc<crate::kernel::FileTable>,
+    slot_authority: crate::kernel::objects::FileSlotAuthority,
+    read_lease: Option<crate::kernel::objects::FileDescriptionFdLease>,
+    fd: Fd,
+    tid: crate::thread::ThreadId,
+    host_wait: Option<&'t (dyn HostWaitRunner + 't)>,
+}
+
+/// Sequential `read(2)` of a host file description: the host advances the
+/// shared offset. `kernel` admits an owner-memory copyout; without it the
+/// destination must be a carrier buffer.
+#[allow(clippy::too_many_arguments)]
+fn read_host_file_sequential<M: CurrentMmMemory>(
+    open: &mut OpenDescription,
+    kernel: Option<&crate::kernel::KernelContext>,
+    memory: &mut M,
+    address: u64,
+    length: usize,
+    nonblocking: bool,
+    authority: crate::dispatch::io_pipe::HostPipeAuthority,
+    host_wait: Option<&dyn HostWaitRunner>,
+) -> Result<DispatchOutcome, DispatchError> {
+    let Some(host_io) = HostFileIo::from_write(open) else {
+        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+    };
+    let host_fd_raw = host_io.raw();
+    host_io.record_sequential_io();
+    let target = HostPipeReadTarget::new(host_fd_raw, None, nonblocking, authority)
+        .with_host_wait(host_wait);
+    match kernel {
+        Some(kernel) => read_host_pipe(kernel, memory, address, length, target),
+        None => crate::dispatch::io_pipe::read_host_pipe_unowned(memory, address, length, target),
+    }
+}
+
 impl<'a> FsView<'a> {
     fn suspend_write_copy_in(
         &self,
@@ -982,6 +1024,996 @@ impl<'a> FsView<'a> {
         };
         punch_result?;
         Ok(out)
+    }
+
+    /// `read(2)` on one open description, shared by the syscall handler and
+    /// the native host-file venue. `task` carries a guest task's syscall
+    /// state; `None` is the venue's carrier record buffer, which reads only
+    /// the regular files and directories the venue opens.
+    pub(in crate::dispatch) fn read_description<M: CurrentMmMemory>(
+        &self,
+        memory: &mut M,
+        description: &Arc<crate::kernel::FileDescription>,
+        address: u64,
+        length: usize,
+        nonblocking: bool,
+        task: Option<TaskRead<'_>>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        // read() on a regular file opened write-only (O_WRONLY) → EBADF
+        // (open09/creat01 read a creat()'d write-only fd). Only regular-file
+        // descriptions carry O_ACCMODE semantics; pipes/sockets/eventfds and
+        // the like have their own readability rules handled per-branch.
+        if matches!(
+            &*open,
+            OpenDescription::File { .. }
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::InMemoryFile { .. }
+                | OpenDescription::HostFile { .. }
+        ) && description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+        {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        }
+        // These sources can be reread at an exact offset. Prepare and
+        // commit each bounded owner destination before advancing the
+        // shared description: the generic path below stages the whole
+        // read and cannot preserve a partial owner copyout.
+        let destination = [LinuxIovec {
+            iov_base: address,
+            iov_len: length as u64,
+        }];
+        if let OpenDescription::File {
+            contents, offset, ..
+        } = &mut *open
+        {
+            if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                let Some(kernel) = task.as_ref().map(|task| task.kernel) else {
+                    return Err(super::carrier_buffer_is_not_owner_memory());
+                };
+                let (copied, refusal) = read_from_repeatable_owner_at(
+                    kernel,
+                    memory,
+                    address,
+                    length,
+                    offset,
+                    |at, bytes| contents.read_at(at as u64, bytes),
+                )?;
+                return Ok(match refusal {
+                    Some(outcome) => outcome,
+                    None => DispatchOutcome::returned_len_or_errno(copied),
+                });
+            }
+            let copied = read_from_file_contents_at(memory, contents, *offset, &destination)?;
+            *offset += copied;
+            return Ok(DispatchOutcome::returned_len_or_errno(copied));
+        }
+        if let OpenDescription::InMemoryFile {
+            contents, offset, ..
+        } = &mut *open
+        {
+            let data = contents.read();
+            if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                let Some(kernel) = task.as_ref().map(|task| task.kernel) else {
+                    return Err(super::carrier_buffer_is_not_owner_memory());
+                };
+                let (copied, refusal) = read_from_repeatable_owner_at(
+                    kernel,
+                    memory,
+                    address,
+                    length,
+                    offset,
+                    |at, bytes| {
+                        let source = data.read_range(at, bytes.len());
+                        bytes[..source.len()].copy_from_slice(&source);
+                        Ok(source.len())
+                    },
+                )?;
+                return Ok(match refusal {
+                    Some(outcome) => outcome,
+                    None => DispatchOutcome::returned_len_or_errno(copied),
+                });
+            }
+            let copied = read_from_sparse_buffer_at(memory, &data, *offset, &destination)?;
+            *offset += copied;
+            return Ok(DispatchOutcome::returned_len_or_errno(copied));
+        }
+        // The native venue's carrier buffer reads only the regular files
+        // and directories that venue opens; every other kind is a task's.
+        let Some(task) = task else {
+            return match &mut *open {
+                OpenDescription::HostFile { .. } => read_host_file_sequential(
+                    &mut open,
+                    None,
+                    memory,
+                    address,
+                    length,
+                    nonblocking,
+                    WaitFdAuthority::internal(InternalWaitKind::HostReadiness).into(),
+                    None,
+                ),
+                OpenDescription::Directory { .. } => Ok(DispatchOutcome::errno(LINUX_EISDIR)),
+                OpenDescription::Closed { .. } => Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                _ => Err(DispatchError::MemoryPreparation(
+                    "a carrier buffer read reached a task-only description".into(),
+                )),
+            };
+        };
+        let (read_len, bytes) = match &mut *open {
+            OpenDescription::Closed { .. } => {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. } => unreachable!(),
+            OpenDescription::SyntheticFile {
+                path,
+                contents,
+                offset,
+                ..
+            } => {
+                // `/proc/<pid>/mem` for the guest's own process is a synthetic
+                // file whose reads translate the file offset as a GUEST VIRTUAL
+                // ADDRESS and return that process's memory there (debuggers +
+                // LTP read their own mappings this way). An unmapped VA is EIO,
+                // like Linux. Every OTHER synthetic file serves its precomputed
+                // byte blob.
+                //
+                // `memory` is the CALLER's address space, so the predicate
+                // must reject a peer's pid — otherwise this arm answers
+                // `/proc/<peer>/mem` with the reader's own bytes. The open
+                // side refuses a peer first; this is the second gate on the
+                // same invariant, kept because the two are reached
+                // independently (an fd can outlive the check that made it).
+                let self_pid =
+                    crate::vfs::proc::self_linux_pid(self.synthetic_proc_identity(task.kernel));
+                if crate::vfs::proc::is_proc_self_mem_path(path, self_pid) {
+                    let va = *offset as u64;
+                    // Secret memory (memfd_secret mappings) is invisible
+                    // to the kernel's view of the process: a read that
+                    // touches a live secretmem mapping fails EIO
+                    // (memfdsecret probe `procmem_hidden`).
+                    if length > 0 && self.range_touches_secretmem(va, length as u64) {
+                        drop(open);
+                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+                    }
+                    match memory.read_bytes(va, length) {
+                        Ok(bytes) => {
+                            let read_len = bytes.len();
+                            *offset += read_len;
+                            (read_len, bytes)
+                        }
+                        Err(_) => {
+                            drop(open);
+                            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
+                        }
+                    }
+                } else if crate::vfs::proc::is_proc_self_pagemap_path(path, self_pid) {
+                    let present = (1u64 << 63).to_le_bytes();
+                    let mut bytes = vec![0u8; length];
+                    for (i, byte) in bytes.iter_mut().enumerate() {
+                        *byte = present[(*offset + i) % present.len()];
+                    }
+                    *offset += bytes.len();
+                    (bytes.len(), bytes)
+                } else {
+                    let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
+                    let read_len = remaining.len().min(length);
+                    let bytes = remaining[..read_len].to_vec();
+                    *offset += read_len;
+                    (read_len, bytes)
+                }
+            }
+            OpenDescription::SyntheticDevice { kind, .. } => {
+                let (read_len, bytes) = match kind {
+                    carrick_vfs::SyntheticDeviceKind::Null => (0, Vec::new()),
+                    carrick_vfs::SyntheticDeviceKind::Zero
+                    | carrick_vfs::SyntheticDeviceKind::Full => (length, vec![0u8; length]),
+                    carrick_vfs::SyntheticDeviceKind::Random
+                    | carrick_vfs::SyntheticDeviceKind::Urandom => {
+                        (length, random_device_bytes(length))
+                    }
+                };
+                (read_len, bytes)
+            }
+            OpenDescription::ProcExecutable {
+                executable, offset, ..
+            } => {
+                let bytes = retained_executable_bytes(executable, *offset, length)?;
+                let read_len = bytes.len();
+                *offset += read_len;
+                (read_len, bytes)
+            }
+            OpenDescription::VirtualConsole { .. } => (0, Vec::new()),
+            OpenDescription::EventFd { state, .. } => {
+                let state = Arc::clone(state);
+                let nonblocking =
+                    LinuxOpenFlags::from_bits_truncate(description.common().status_flags())
+                        .contains(LinuxOpenFlags::NONBLOCK);
+                drop(open);
+                return Ok(read_eventfd(
+                    memory,
+                    address,
+                    length,
+                    &state,
+                    nonblocking,
+                    WaitFdAuthority::logical(task.slot_authority),
+                ));
+            }
+            OpenDescription::TimerFd { state, .. } => {
+                let state = Arc::clone(state);
+                let nonblocking = description.common().status_flags() & LINUX_TFD_NONBLOCK != 0;
+                drop(open);
+                // Authenticate the slot captured before classification and
+                // retain its exact description while the table read guard
+                // prevents a close/reuse from racing this admission.
+                let Some(lease) = task.files.retain_slot_lease(task.slot_authority) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                return Ok(
+                    match super::super::begin_timerfd_read(
+                        memory,
+                        address,
+                        length,
+                        state,
+                        lease,
+                        nonblocking,
+                    ) {
+                        super::super::TimerFdReadStep::Done(outcome) => outcome,
+                        super::super::TimerFdReadStep::Wait(read) => {
+                            DispatchOutcome::BlockingTimerFdRead(read)
+                        }
+                    },
+                );
+            }
+            OpenDescription::Inotify { state, .. } => {
+                let state = Arc::clone(state);
+                let nonblocking = description.common().status_flags() & LINUX_O_NONBLOCK != 0;
+                drop(open);
+                // Drain queued inotify_event records into the guest buffer.
+                // used non-blocking + epoll; a true blocking wait on the
+                // backing readiness poll fd parks via would_block_outcome.
+                return Ok(match state.read_records(length) {
+                    Ok(bytes) if bytes.is_empty() => super::would_block_outcome(
+                        state.poll_fd(),
+                        libc::POLLIN,
+                        nonblocking,
+                        None,
+                        WaitFdAuthority::logical(task.slot_authority),
+                    ),
+                    Ok(bytes) => {
+                        if memory.write_bytes(address, &bytes).is_err() {
+                            DispatchOutcome::errno(LINUX_EFAULT)
+                        } else {
+                            DispatchOutcome::returned_len_or_errno(bytes.len())
+                        }
+                    }
+                    Err(errno) => DispatchOutcome::errno(errno),
+                });
+            }
+            OpenDescription::Fanotify { group, .. } => {
+                let group = Arc::clone(group);
+                // Linux mirrors FAN_NONBLOCK into status_flags at init, and F_SETFL
+                // mutates status_flags; status_flags is authoritative for nonblocking.
+                let _ = group.init_nonblocking();
+                let nonblocking = description.common().status_flags() & LINUX_O_NONBLOCK != 0;
+                drop(open);
+                return notify::read_fanotify(
+                    self,
+                    notify::ReadFanotifyRequest {
+                        context: task.kernel,
+                        registry: task.registry,
+                        reporter: task.reporter,
+                        memory,
+                        address,
+                        length,
+                        group: &group,
+                        nonblocking,
+                        guest_fd: task.fd.0,
+                    },
+                );
+            }
+            OpenDescription::PipeReader { pipe, .. } => {
+                let pipe = Arc::clone(pipe);
+                let flags = description.common().status_flags();
+                drop(open);
+                let Some(lease) = task.read_lease else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                let wait_authority = WaitFdAuthority::logical(task.slot_authority);
+                let outcome = read_pipe(
+                    memory,
+                    address,
+                    length,
+                    &pipe,
+                    flags,
+                    task.fd.0,
+                    wait_authority,
+                );
+                return Ok(match outcome {
+                    DispatchOutcome::WaitOnFds {
+                        fds,
+                        timeout,
+                        sig_mask,
+                        completion,
+                    } => DispatchOutcome::WaitOnFds {
+                        fds: fds.with_description_lease(lease),
+                        timeout,
+                        sig_mask,
+                        completion,
+                    },
+                    outcome => outcome,
+                });
+            }
+            OpenDescription::HostPipe {
+                host_fd,
+                is_read_end,
+                pty,
+                bidirectional,
+                ..
+            } => {
+                // pty ends and O_RDWR FIFOs are bidirectional; only real
+                // one-way pipe ends are gated by is_read_end.
+                if !*is_read_end && pty.is_none() && !*bidirectional {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                let host_fd_raw = host_fd.raw();
+                let host_fd_owner = host_fd.clone();
+                let pty_role = *pty;
+                drop(open);
+                let staged = self.take_staged_splice_pipe_bytes(task.fd.0, length)?;
+                if !staged.is_empty() {
+                    if memory.write_bytes(address, &staged).is_err() {
+                        self.restore_splice_pipe_bytes(task.fd.0, &staged);
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    return Ok(DispatchOutcome::returned_len_or_errno(staged.len()));
+                }
+                let outcome = read_host_pipe(
+                    task.kernel,
+                    memory,
+                    address,
+                    length,
+                    HostPipeReadTarget::new(
+                        host_fd_raw,
+                        Some(host_fd_owner),
+                        nonblocking,
+                        task.slot_authority,
+                    )
+                    .with_host_wait(task.host_wait),
+                )?;
+                // Darwin reports EOF when the last pty slave closes;
+                // Linux's master read contract is EIO after any rescued
+                // tail has drained. Keep ordinary pipes and slave EOFs
+                // untouched.
+                return Ok(match (pty_role, outcome) {
+                    (
+                        Some(crate::vfs::PtyRole {
+                            is_master: true, ..
+                        }),
+                        DispatchOutcome::Returned { value: 0 },
+                    ) => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
+                    (_, outcome) => outcome,
+                });
+            }
+            OpenDescription::Directory { .. } => {
+                return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+            }
+            OpenDescription::SignalFd { mask, .. } => {
+                let mask = *mask;
+                drop(open);
+                // Drain pending signals matching the fd's mask into
+                // signalfd_siginfo records (empty → EAGAIN, like inotify).
+                return Ok(self.read_signalfd(
+                    task.kernel,
+                    memory,
+                    address,
+                    length,
+                    mask,
+                    task.tid,
+                ));
+            }
+            OpenDescription::PerfEvent { state, .. } => {
+                let state = Arc::clone(state);
+                drop(open);
+                // Report the counter in the attr.read_format layout; a
+                // short buffer is ENOSPC. Reads never drain the value.
+                return Ok(self.read_perf_event(memory, address, length, &state));
+            }
+            // read() on an fs context (the kernel's fsconfig error-log
+            // channel) is unimplemented — EINVAL, documented in
+            // `dispatch/mount_api.rs`.
+            OpenDescription::FsContext { .. } => {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            OpenDescription::PipeWriter { .. } => {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. } => {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            OpenDescription::HostSocket { host_fd, type_, .. } => {
+                let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
+                let flows = description.common().socket_flows();
+                let host_fd_raw = host_fd.raw();
+                let host_fd_owner = host_fd.clone();
+                drop(open);
+                let res = read_host_pipe(
+                    task.kernel,
+                    memory,
+                    address,
+                    length,
+                    HostPipeReadTarget::new(
+                        host_fd_raw,
+                        Some(host_fd_owner),
+                        nonblocking,
+                        task.slot_authority,
+                    )
+                    .with_socket_flow(flows.as_ref().map(|f| &f.inbound), is_stream)
+                    .with_host_wait(task.host_wait),
+                )?;
+                return Ok(res);
+            }
+            OpenDescription::InMemorySocket { socket, .. } => {
+                let socket = Arc::clone(socket);
+                drop(open);
+                let mut buf = vec![0u8; length];
+                match socket.recv_stream(&mut buf, 0) {
+                    Ok((read_len, _)) => {
+                        if read_len > 0 {
+                            if memory.write_bytes(address, &buf[..read_len]).is_err() {
+                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                            }
+                            return Ok(DispatchOutcome::returned_len_or_errno(read_len));
+                        } else {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                    }
+                    Err(LINUX_EAGAIN) => {
+                        if nonblocking {
+                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                        }
+                        return Ok(crate::dispatch::net::wait_in_memory_slot(
+                            &self.captured_file_table(),
+                            task.fd.0,
+                            libc::POLLIN,
+                            socket.get_rcvtimeo(),
+                        ));
+                    }
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            }
+            // Netlink: drain whatever a prior dump request queued. A bare
+            // read(2) is rare on netlink sockets (recvmsg is the norm), but
+            // model it as draining the synthetic response so it doesn't
+            // wedge a caller.
+            OpenDescription::Netlink { recv_queue, .. } => {
+                return Ok(net::drain_netlink_queue(
+                    memory, address, length, recv_queue,
+                ));
+            }
+            OpenDescription::Packet { socket, .. } => {
+                let socket = Arc::clone(socket);
+                drop(open);
+                return Ok(socket.recvfrom(memory, address, length, 0, 0, 0));
+            }
+            // Real host file: libc::read advances the kernel offset
+            // (shared across fork). read_host_pipe is just a
+            // memory-into-guest read(2) wrapper.
+            OpenDescription::HostFile { .. } => {
+                return read_host_file_sequential(
+                    &mut open,
+                    Some(task.kernel),
+                    memory,
+                    address,
+                    length,
+                    nonblocking,
+                    task.slot_authority.into(),
+                    task.host_wait,
+                );
+            }
+        };
+        let outcome = DispatchOutcome::returned_len_or_errno(read_len);
+        drop(open);
+        memory.write_bytes(address, &bytes)?;
+        Ok(outcome)
+    }
+
+    /// `pread64(2)` on one open description, shared by the syscall handler
+    /// and the native host-file venue. `slot_authority` names the caller's
+    /// wait authority for a host file read (asked only for one).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::dispatch) fn pread_description<M: CurrentMmMemory>(
+        &self,
+        caller: super::IoCaller<'_>,
+        memory: &mut M,
+        description: &Arc<crate::kernel::FileDescription>,
+        buffer: u64,
+        length: usize,
+        offset: usize,
+        slot_authority: &dyn Fn() -> Option<WaitFdAuthority>,
+        host_wait: Option<&dyn HostWaitRunner>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let Some(open) = crate::kernel::FileDescription::read_for_io(description) else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        // pread reads the fd, so a regular file descriptor not open for reading
+        // (O_WRONLY) is EBADF (pread02 "not open for reading" case), exactly
+        // as the kernel rejects it before touching the data. Non-seekable
+        // descriptions (pipes, sockets, FIFOs) return ESPIPE on positional read.
+        if matches!(&*open, OpenDescription::HostFile { .. })
+            && description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+        {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        }
+        // Real host file: positional read via libc::pread (doesn't
+        // disturb the shared kernel offset).
+        if let Some(host_io) = HostFileIo::from_read(&open) {
+            let host_fd_raw = host_io.raw();
+            let length = length.min(crate::dispatch::MAX_RW_COUNT);
+            let target = HostPipeReadTarget::new(
+                host_fd_raw,
+                None,
+                false,
+                slot_authority().ok_or(LINUX_EBADF)?,
+            )
+            .with_host_wait(host_wait);
+            let outcome = match caller.task() {
+                Some(kernel) => {
+                    read_host_pipe_at(kernel, memory, buffer, length, offset as i64, target)?
+                }
+                None => crate::dispatch::io_pipe::read_host_pipe_unowned(
+                    memory,
+                    buffer,
+                    length,
+                    target.with_offset(offset as i64),
+                )?,
+            };
+            drop(open);
+            return Ok(outcome);
+        }
+        if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+            let Some(kernel) = caller.task() else {
+                return Err(super::carrier_buffer_is_not_owner_memory());
+            };
+            let result = match &*open {
+                OpenDescription::File { contents, .. } => Some(read_from_repeatable_owner_at(
+                    kernel,
+                    memory,
+                    buffer,
+                    length,
+                    &mut { offset },
+                    |at, bytes| contents.read_at(at as u64, bytes),
+                )?),
+                OpenDescription::InMemoryFile { contents, .. } => {
+                    let data = contents.read();
+                    Some(read_from_repeatable_owner_at(
+                        kernel,
+                        memory,
+                        buffer,
+                        length,
+                        &mut { offset },
+                        |at, bytes| {
+                            let source = data.read_range(at, bytes.len());
+                            bytes[..source.len()].copy_from_slice(&source);
+                            Ok(source.len())
+                        },
+                    )?)
+                }
+                _ => None,
+            };
+            if let Some((copied, refusal)) = result {
+                return Ok(match refusal {
+                    Some(outcome) => outcome,
+                    None => DispatchOutcome::returned_len_or_errno(copied),
+                });
+            }
+        }
+        let bytes = match &*open {
+            OpenDescription::Closed { .. } => {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            OpenDescription::File { contents, .. } => {
+                let mut buf = vec![0u8; length];
+                match contents.read_at(offset as u64, &mut buf) {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        buf
+                    }
+                    Err(errno) => {
+                        drop(open);
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                }
+            }
+            OpenDescription::SyntheticFile { contents, .. } => contents
+                .get(offset..)
+                .unwrap_or_default()
+                .iter()
+                .take(length)
+                .copied()
+                .collect(),
+            OpenDescription::ProcExecutable { executable, .. } => {
+                retained_executable_bytes(executable, offset, length)?
+            }
+            OpenDescription::InMemoryFile { contents, .. } => {
+                contents.read().read_range(offset, length)
+            }
+            OpenDescription::SyntheticDevice { kind, .. } => match kind {
+                carrick_vfs::SyntheticDeviceKind::Null => Vec::new(),
+                carrick_vfs::SyntheticDeviceKind::Zero | carrick_vfs::SyntheticDeviceKind::Full => {
+                    vec![0u8; length]
+                }
+                carrick_vfs::SyntheticDeviceKind::Random
+                | carrick_vfs::SyntheticDeviceKind::Urandom => random_device_bytes(length),
+            },
+            OpenDescription::HostFile { .. } => {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            OpenDescription::Directory { .. } => {
+                return Ok(DispatchOutcome::errno(LINUX_EISDIR));
+            }
+            OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. }
+            | OpenDescription::Fanotify { .. }
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::SignalFd { .. }
+            | OpenDescription::PerfEvent { .. }
+            | OpenDescription::FsContext { .. }
+            | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
+            | OpenDescription::VirtualConsole { .. }
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::Packet { .. } => {
+                // Positional read on a non-seekable fd (pipe/socket/anon) is
+                // ESPIPE on Linux; a directory is EISDIR (above). pread02.
+                return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
+            }
+        };
+        drop(open);
+        let read_len = bytes.len();
+        if read_len > 0 {
+            memory.write_bytes(buffer, &bytes)?;
+        }
+        Ok(DispatchOutcome::returned_len_or_errno(read_len))
+    }
+
+    /// `lseek(2)` on one open description, shared by the syscall handler and
+    /// the native host-file venue. `None` when the description is no longer
+    /// open for I/O (the caller answers EBADF, or ESPIPE for live stdio).
+    /// `visible_self` is the caller's own `/proc/self` pid, if it has one.
+    pub(in crate::dispatch) fn lseek_description(
+        &self,
+        description: &Arc<crate::kernel::FileDescription>,
+        offset: i64,
+        whence: u64,
+        visible_self: Option<u32>,
+    ) -> Result<Option<DispatchOutcome>, DispatchError> {
+        let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
+            return Ok(None);
+        };
+        if matches!(&*open, OpenDescription::HostFile { .. }) {
+            let Some(host_io) = HostFileIo::from_read(&open) else {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EBADF)));
+            };
+            let outcome = self.lseek_host_file(&host_io, offset, whence);
+            return Ok(Some(outcome));
+        }
+
+        // A CHARACTER device (/dev/null, /dev/zero, /dev/full, /dev/random,
+        // /dev/urandom) is backed by a host fd but lands here as a HostPipe
+        // (the open path keeps devices as streams). Such devices ARE
+        // seekable on Linux — lseek returns 0/the offset, never ESPIPE — and
+        // Python's io.open("/dev/null","r+") requires seekable(). Delegate to
+        // the host lseek when the backing fd is a char device; genuine
+        // pipes/fifos (S_IFIFO) fall through to the ESPIPE branch below.
+        if let OpenDescription::HostPipe { host_fd, .. } = &*open {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
+                && (st.st_mode & libc::S_IFMT) == libc::S_IFCHR
+            {
+                let host_whence = match whence {
+                    LINUX_SEEK_SET => libc::SEEK_SET,
+                    LINUX_SEEK_CUR => libc::SEEK_CUR,
+                    LINUX_SEEK_END => libc::SEEK_END,
+                    _ => return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL))),
+                };
+                let r = match (unsafe {
+                    libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence)
+                })
+                .host_syscall_errno()
+                {
+                    Ok(r) => r,
+                    Err(errno) => return Ok(Some(DispatchOutcome::errno(errno))),
+                };
+                return Ok(Some(DispatchOutcome::returned_offset_or_errno(r)));
+            }
+        }
+
+        // A directory lists lazily; a SEEK_END that needs the entry
+        // count must take the listing first.
+        if whence == LINUX_SEEK_END
+            && let OpenDescription::Directory {
+                listing,
+                path,
+                trusted_host_dir,
+                ..
+            } = &mut *open
+            && matches!(listing, DirListing::Pending)
+        {
+            let is_self_fd = is_proc_self_fd_dir(path, visible_self);
+            let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
+            if is_self_fd || is_self_fdinfo {
+                *listing = DirListing::Fixed(self.proc_self_fd_entries(path, is_self_fdinfo));
+            } else {
+                *listing = DirListing::Loaded(
+                    self.list_directory_entries(path, trusted_host_dir.as_ref()),
+                );
+            }
+        }
+
+        let (current, end) = match &mut *open {
+            OpenDescription::Closed { .. } => {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EBADF)));
+            }
+            OpenDescription::File {
+                contents,
+                offset: file_offset,
+                ..
+            } => {
+                if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                    match contents {
+                        FileContents::HostBacked { fd } => {
+                            use std::os::fd::AsRawFd;
+                            if offset < 0 {
+                                return Ok(Some(DispatchOutcome::errno(LINUX_ENXIO)));
+                            }
+                            let kind = if whence == LINUX_SEEK_DATA {
+                                carrick_portable::SparseSeek::Data
+                            } else {
+                                carrick_portable::SparseSeek::Hole
+                            };
+                            let r = match carrick_portable::lseek_sparse(
+                                fd.as_raw_fd(),
+                                offset as libc::off_t,
+                                kind,
+                            )
+                            .host_syscall_errno()
+                            {
+                                Ok(r) => r,
+                                Err(errno) => return Ok(Some(DispatchOutcome::errno(errno))),
+                            };
+                            *file_offset = r as usize;
+                            return Ok(Some(DispatchOutcome::returned_offset_or_errno(r)));
+                        }
+                        FileContents::Dense(_) | FileContents::RootFsBacked(_) => {
+                            if offset < 0 {
+                                return Ok(Some(DispatchOutcome::errno(LINUX_ENXIO)));
+                            }
+                            let file_size = match contents.len() {
+                                Ok(l) => l as usize,
+                                Err(errno) => return Ok(Some(DispatchOutcome::errno(errno))),
+                            };
+                            if (offset as usize) >= file_size {
+                                return Ok(Some(DispatchOutcome::errno(LINUX_ENXIO)));
+                            }
+                            let next = if whence == LINUX_SEEK_DATA {
+                                offset
+                            } else {
+                                file_size as i64
+                            };
+                            *file_offset = next as usize;
+                            return Ok(Some(DispatchOutcome::returned_offset_or_errno(next)));
+                        }
+                    }
+                }
+                let file_size = match contents.len() {
+                    Ok(l) => l as i64,
+                    Err(errno) => return Ok(Some(DispatchOutcome::errno(errno))),
+                };
+                (*file_offset as i64, file_size)
+            }
+            OpenDescription::SyntheticFile {
+                contents,
+                offset: file_offset,
+                ..
+            } => {
+                if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                    if offset < 0 {
+                        return Ok(Some(DispatchOutcome::errno(LINUX_ENXIO)));
+                    }
+                    let file_size = contents.len();
+                    if (offset as usize) >= file_size {
+                        return Ok(Some(DispatchOutcome::errno(LINUX_ENXIO)));
+                    }
+                    let next = if whence == LINUX_SEEK_DATA {
+                        offset
+                    } else {
+                        file_size as i64
+                    };
+                    *file_offset = next as usize;
+                    return Ok(Some(DispatchOutcome::returned_offset_or_errno(next)));
+                }
+                (*file_offset as i64, contents.len() as i64)
+            }
+            OpenDescription::ProcExecutable {
+                executable,
+                offset: file_offset,
+                ..
+            } => {
+                let file_size = executable.source().len().map_err(|error| {
+                    error
+                        .raw_os_error()
+                        .map(crate::host_to_linux_errno)
+                        .unwrap_or(crate::linux_abi::LINUX_EIO)
+                })?;
+                if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                    if offset < 0 || offset as usize >= file_size {
+                        return Ok(Some(DispatchOutcome::errno(LINUX_ENXIO)));
+                    }
+                    let next = if whence == LINUX_SEEK_DATA {
+                        offset
+                    } else {
+                        file_size as i64
+                    };
+                    *file_offset = next as usize;
+                    return Ok(Some(DispatchOutcome::returned_offset_or_errno(next)));
+                }
+                (*file_offset as i64, file_size as i64)
+            }
+            OpenDescription::InMemoryFile {
+                contents,
+                offset: file_offset,
+                ..
+            } => {
+                if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                    if offset < 0 {
+                        return Ok(Some(DispatchOutcome::errno(LINUX_ENXIO)));
+                    }
+                    let offset_usize = offset as usize;
+                    let next = match whence {
+                        LINUX_SEEK_DATA => contents.read().seek_data(offset_usize),
+                        LINUX_SEEK_HOLE => contents.read().seek_hole(offset_usize),
+                        _ => unreachable!(),
+                    };
+                    let Some(next) = next else {
+                        return Ok(Some(DispatchOutcome::errno(LINUX_ENXIO)));
+                    };
+                    *file_offset = next;
+                    return Ok(Some(DispatchOutcome::returned_offset_or_errno(next as i64)));
+                }
+                (*file_offset as i64, contents.read().len() as i64)
+            }
+            OpenDescription::Directory {
+                listing, offset, ..
+            } => {
+                if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
+                    return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL)));
+                }
+                (
+                    *offset as i64,
+                    listing.entries().map_or(0, |entries| entries.len()) as i64,
+                )
+            }
+            OpenDescription::SyntheticDevice { .. } => {
+                return match whence {
+                    LINUX_SEEK_SET | LINUX_SEEK_CUR | LINUX_SEEK_END => {
+                        if offset < 0 {
+                            Ok(Some(DispatchOutcome::errno(LINUX_EINVAL)))
+                        } else {
+                            Ok(Some(DispatchOutcome::Returned { value: 0 }))
+                        }
+                    }
+                    _ => Ok(Some(DispatchOutcome::errno(LINUX_EINVAL))),
+                };
+            }
+            // Linux returns ESPIPE for lseek on a pipe / socket / tty
+            // (the kernel's POSIX answer for "unseekable stream") and
+            // EINVAL only for nonsensical arg combinations. Returning
+            // EINVAL here made dpkg-query's ftell() retry-loop spin
+            // forever because POSIX says "EINVAL is recoverable" while
+            // ESPIPE means "give up, it's a stream".
+            OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::SignalFd { .. }
+            // A perf event fd is an unseekable stream (verified ESPIPE
+            // against the Docker oracle).
+            | OpenDescription::PerfEvent { .. }
+            | OpenDescription::FsContext { .. }
+            | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
+            | OpenDescription::VirtualConsole { .. }
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::Packet { .. } => {
+                return Ok(Some(DispatchOutcome::errno(LINUX_ESPIPE)));
+            }
+            // HostFile is handled by the early libc::lseek above.
+            OpenDescription::HostFile { .. } => {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL)));
+            }
+            OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. }
+            | OpenDescription::Fanotify { .. } => {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL)));
+            }
+        };
+        let next = match whence {
+            LINUX_SEEK_SET => offset,
+            LINUX_SEEK_CUR => current.saturating_add(offset),
+            LINUX_SEEK_END => end.saturating_add(offset),
+            _ => {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL)));
+            }
+        };
+        if next < 0 {
+            return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL)));
+        }
+
+        match &mut *open {
+            OpenDescription::Closed { .. } => {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EBADF)));
+            }
+            OpenDescription::File { offset, .. }
+            | OpenDescription::Directory { offset, .. }
+            | OpenDescription::SyntheticFile { offset, .. }
+            | OpenDescription::ProcExecutable { offset, .. }
+            | OpenDescription::InMemoryFile { offset, .. } => *offset = next as usize,
+            OpenDescription::HostFile { .. } => {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL)));
+            }
+            OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. }
+            | OpenDescription::Fanotify { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::SignalFd { .. }
+            | OpenDescription::SyntheticDevice { .. }
+            | OpenDescription::VirtualConsole { .. }
+            | OpenDescription::PerfEvent { .. }
+            | OpenDescription::FsContext { .. }
+            | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::Packet { .. } => {}
+        }
+        // A rewind drops a read-time snapshot so the next getdents64
+        // lists a FRESH view (Linux re-reads the directory after
+        // rewinddir). A synthetic mount's fixed listing replays.
+        if next == 0
+            && let OpenDescription::Directory { listing, path, .. } = &mut *open
+            && (matches!(listing, DirListing::Loaded(_))
+                || is_proc_self_fd_dir(path, visible_self)
+                || is_proc_self_fdinfo_dir(path, visible_self))
+        {
+            *listing = DirListing::Pending;
+        }
+        drop(open);
+        Ok(Some(DispatchOutcome::returned_offset_or_errno(next)))
     }
 
     pub(in crate::dispatch) fn lseek_host_file(
@@ -1656,326 +2688,14 @@ impl<'a> FsView<'a> {
                 }
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
-                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-                }
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            if matches!(&*open, OpenDescription::HostFile { .. }) {
-                let Some(host_io) = HostFileIo::from_read(&open) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                };
-                let outcome = this.lseek_host_file(&host_io, offset, whence);
-                return Ok(outcome);
-            }
-
-            // A CHARACTER device (/dev/null, /dev/zero, /dev/full, /dev/random,
-            // /dev/urandom) is backed by a host fd but lands here as a HostPipe
-            // (the open path keeps devices as streams). Such devices ARE
-            // seekable on Linux — lseek returns 0/the offset, never ESPIPE — and
-            // Python's io.open("/dev/null","r+") requires seekable(). Delegate to
-            // the host lseek when the backing fd is a char device; genuine
-            // pipes/fifos (S_IFIFO) fall through to the ESPIPE branch below.
-            if let OpenDescription::HostPipe { host_fd, .. } = &*open {
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
-                    && (st.st_mode & libc::S_IFMT) == libc::S_IFCHR
-                {
-                    let host_whence = match whence {
-                        LINUX_SEEK_SET => libc::SEEK_SET,
-                        LINUX_SEEK_CUR => libc::SEEK_CUR,
-                        LINUX_SEEK_END => libc::SEEK_END,
-                        _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-                    };
-                    let r = match (unsafe {
-                        libc::lseek(host_fd.raw(), offset as libc::off_t, host_whence)
-                    })
-                    .host_syscall_errno()
-                    {
-                        Ok(r) => r,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                    return Ok(DispatchOutcome::returned_offset_or_errno(r));
-                }
-            }
-
-            // A directory lists lazily; a SEEK_END that needs the entry
-            // count must take the listing first.
-            if whence == LINUX_SEEK_END
-                && let OpenDescription::Directory {
-                    listing,
-                    path,
-                    trusted_host_dir,
-                    ..
-                } = &mut *open
-                && matches!(listing, DirListing::Pending)
-            {
-                let visible_self = proc_visible_self(cx.kernel);
-                let is_self_fd = is_proc_self_fd_dir(path, visible_self);
-                let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
-                if is_self_fd || is_self_fdinfo {
-                    *listing = DirListing::Fixed(this.proc_self_fd_entries(path, is_self_fdinfo));
-                } else {
-                    *listing = DirListing::Loaded(
-                        this.list_directory_entries(path, trusted_host_dir.as_ref()),
-                    );
-                }
-            }
-
-            let (current, end) = match &mut *open {
-                OpenDescription::Closed { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                OpenDescription::File {
-                    contents,
-                    offset: file_offset,
-                    ..
-                } => {
-                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
-                        match contents {
-                            FileContents::HostBacked { fd } => {
-                                use std::os::fd::AsRawFd;
-                                if offset < 0 {
-                                    return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                                }
-                                let kind = if whence == LINUX_SEEK_DATA {
-                                    carrick_portable::SparseSeek::Data
-                                } else {
-                                    carrick_portable::SparseSeek::Hole
-                                };
-                                let r = match carrick_portable::lseek_sparse(
-                                    fd.as_raw_fd(),
-                                    offset as libc::off_t,
-                                    kind,
-                                )
-                                .host_syscall_errno()
-                                {
-                                    Ok(r) => r,
-                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                                };
-                                *file_offset = r as usize;
-                                return Ok(DispatchOutcome::returned_offset_or_errno(r));
-                            }
-                            FileContents::Dense(_) | FileContents::RootFsBacked(_) => {
-                                if offset < 0 {
-                                    return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                                }
-                                let file_size = match contents.len() {
-                                    Ok(l) => l as usize,
-                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                                };
-                                if (offset as usize) >= file_size {
-                                    return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                                }
-                                let next = if whence == LINUX_SEEK_DATA {
-                                    offset
-                                } else {
-                                    file_size as i64
-                                };
-                                *file_offset = next as usize;
-                                return Ok(DispatchOutcome::returned_offset_or_errno(next));
-                            }
-                        }
-                    }
-                    let file_size = match contents.len() {
-                        Ok(l) => l as i64,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                    (*file_offset as i64, file_size)
-                }
-                OpenDescription::SyntheticFile {
-                    contents,
-                    offset: file_offset,
-                    ..
-                } => {
-                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
-                        if offset < 0 {
-                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                        }
-                        let file_size = contents.len();
-                        if (offset as usize) >= file_size {
-                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                        }
-                        let next = if whence == LINUX_SEEK_DATA {
-                            offset
-                        } else {
-                            file_size as i64
-                        };
-                        *file_offset = next as usize;
-                        return Ok(DispatchOutcome::returned_offset_or_errno(next));
-                    }
-                    (*file_offset as i64, contents.len() as i64)
-                }
-                OpenDescription::ProcExecutable {
-                    executable,
-                    offset: file_offset,
-                    ..
-                } => {
-                    let file_size = executable.source().len().map_err(|error| {
-                        error
-                            .raw_os_error()
-                            .map(crate::host_to_linux_errno)
-                            .unwrap_or(crate::linux_abi::LINUX_EIO)
-                    })?;
-                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
-                        if offset < 0 || offset as usize >= file_size {
-                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                        }
-                        let next = if whence == LINUX_SEEK_DATA {
-                            offset
-                        } else {
-                            file_size as i64
-                        };
-                        *file_offset = next as usize;
-                        return Ok(DispatchOutcome::returned_offset_or_errno(next));
-                    }
-                    (*file_offset as i64, file_size as i64)
-                }
-                OpenDescription::InMemoryFile {
-                    contents,
-                    offset: file_offset,
-                    ..
-                } => {
-                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
-                        if offset < 0 {
-                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                        }
-                        let offset_usize = offset as usize;
-                        let next = match whence {
-                            LINUX_SEEK_DATA => contents.read().seek_data(offset_usize),
-                            LINUX_SEEK_HOLE => contents.read().seek_hole(offset_usize),
-                            _ => unreachable!(),
-                        };
-                        let Some(next) = next else {
-                            return Ok(DispatchOutcome::errno(LINUX_ENXIO));
-                        };
-                        *file_offset = next;
-                        return Ok(DispatchOutcome::returned_offset_or_errno(next as i64));
-                    }
-                    (*file_offset as i64, contents.read().len() as i64)
-                }
-                OpenDescription::Directory {
-                    listing, offset, ..
-                } => {
-                    if whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE {
-                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
-                    (
-                        *offset as i64,
-                        listing.entries().map_or(0, |entries| entries.len()) as i64,
-                    )
-                }
-                OpenDescription::SyntheticDevice { .. } => {
-                    return match whence {
-                        LINUX_SEEK_SET | LINUX_SEEK_CUR | LINUX_SEEK_END => {
-                            if offset < 0 {
-                                Ok(DispatchOutcome::errno(LINUX_EINVAL))
-                            } else {
-                                Ok(DispatchOutcome::Returned { value: 0 })
-                            }
-                        }
-                        _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
-                    };
-                }
-                // Linux returns ESPIPE for lseek on a pipe / socket / tty
-                // (the kernel's POSIX answer for "unseekable stream") and
-                // EINVAL only for nonsensical arg combinations. Returning
-                // EINVAL here made dpkg-query's ftell() retry-loop spin
-                // forever because POSIX says "EINVAL is recoverable" while
-                // ESPIPE means "give up, it's a stream".
-                OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
-                | OpenDescription::HostPipe { .. }
-                | OpenDescription::HostSocket { .. }
-                | OpenDescription::InMemorySocket { .. }
-                | OpenDescription::SignalFd { .. }
-                // A perf event fd is an unseekable stream (verified ESPIPE
-                // against the Docker oracle).
-                | OpenDescription::PerfEvent { .. }
-                | OpenDescription::FsContext { .. }
-                | OpenDescription::Mqueue { .. }
-                | OpenDescription::BpfMap { .. }
-                | OpenDescription::BpfProg { .. }
-                | OpenDescription::VirtualConsole { .. }
-                | OpenDescription::Netlink { .. }
-                | OpenDescription::Packet { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-                }
-                // HostFile is handled by the early libc::lseek above.
-                OpenDescription::HostFile { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                OpenDescription::EventFd { .. }
-                | OpenDescription::TimerFd { .. }
-                | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. }
-                | OpenDescription::Fanotify { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-            };
-            let next = match whence {
-                LINUX_SEEK_SET => offset,
-                LINUX_SEEK_CUR => current.saturating_add(offset),
-                LINUX_SEEK_END => end.saturating_add(offset),
-                _ => {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-            };
-            if next < 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-
-            match &mut *open {
-                OpenDescription::Closed { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                OpenDescription::File { offset, .. }
-                | OpenDescription::Directory { offset, .. }
-                | OpenDescription::SyntheticFile { offset, .. }
-                | OpenDescription::ProcExecutable { offset, .. }
-                | OpenDescription::InMemoryFile { offset, .. } => *offset = next as usize,
-                OpenDescription::HostFile { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                OpenDescription::EventFd { .. }
-                | OpenDescription::TimerFd { .. }
-                | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. }
-                | OpenDescription::Fanotify { .. }
-                | OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
-                | OpenDescription::HostPipe { .. }
-                | OpenDescription::HostSocket { .. }
-                | OpenDescription::InMemorySocket { .. }
-                | OpenDescription::SignalFd { .. }
-                | OpenDescription::SyntheticDevice { .. }
-                | OpenDescription::VirtualConsole { .. }
-                | OpenDescription::PerfEvent { .. }
-                | OpenDescription::FsContext { .. }
-                | OpenDescription::Mqueue { .. }
-                | OpenDescription::BpfMap { .. }
-                | OpenDescription::BpfProg { .. }
-                | OpenDescription::Netlink { .. }
-                | OpenDescription::Packet { .. } => {}
-            }
-            // A rewind drops a read-time snapshot so the next getdents64
-            // lists a FRESH view (Linux re-reads the directory after
-            // rewinddir). A synthetic mount's fixed listing replays.
             let visible_self = proc_visible_self(cx.kernel);
-            if next == 0
-                && let OpenDescription::Directory { listing, path, .. } = &mut *open
-                && (matches!(listing, DirListing::Loaded(_))
-                    || is_proc_self_fd_dir(path, visible_self)
-                    || is_proc_self_fdinfo_dir(path, visible_self))
-            {
-                *listing = DirListing::Pending;
+            match this.lseek_description(&open_file.description, offset, whence, visible_self)? {
+                Some(outcome) => Ok(outcome),
+                None if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) => {
+                    Ok(DispatchOutcome::errno(LINUX_ESPIPE))
+                }
+                None => Ok(DispatchOutcome::errno(LINUX_EBADF)),
             }
-            drop(open);
-            let outcome = DispatchOutcome::returned_offset_or_errno(next);
-            Ok(outcome)
 
         }
 
@@ -2115,463 +2835,24 @@ impl<'a> FsView<'a> {
                 };
                 Some(lease)
             } else { None };
-            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            // read() on a regular file opened write-only (O_WRONLY) → EBADF
-            // (open09/creat01 read a creat()'d write-only fd). Only regular-file
-            // descriptions carry O_ACCMODE semantics; pipes/sockets/eventfds and
-            // the like have their own readability rules handled per-branch.
-            if matches!(
-                &*open,
-                OpenDescription::File { .. }
-                    | OpenDescription::SyntheticFile { .. }
-                    | OpenDescription::InMemoryFile { .. }
-                    | OpenDescription::HostFile { .. }
-            ) && open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
-            // These sources can be reread at an exact offset. Prepare and
-            // commit each bounded owner destination before advancing the
-            // shared description: the generic path below stages the whole
-            // read and cannot preserve a partial owner copyout.
-            let destination = [LinuxIovec {
-                iov_base: address,
-                iov_len: count,
-            }];
-            if let OpenDescription::File {
-                contents, offset, ..
-            } = &mut *open
-            {
-                if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
-                    let (copied, refusal) = read_from_repeatable_owner_at(
-                        cx.kernel,
-                        memory,
-                        address,
-                        length,
-                        offset,
-                        |at, bytes| contents.read_at(at as u64, bytes),
-                    )?;
-                    return Ok(match refusal {
-                        Some(outcome) => outcome,
-                        None => DispatchOutcome::returned_len_or_errno(copied),
-                    });
-                }
-                let copied = read_from_file_contents_at(memory, contents, *offset, &destination)?;
-                *offset += copied;
-                return Ok(DispatchOutcome::returned_len_or_errno(copied));
-            }
-            if let OpenDescription::InMemoryFile {
-                contents, offset, ..
-            } = &mut *open
-            {
-                let data = contents.read();
-                if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
-                    let (copied, refusal) = read_from_repeatable_owner_at(
-                        cx.kernel,
-                        memory,
-                        address,
-                        length,
-                        offset,
-                        |at, bytes| {
-                            let source = data.read_range(at, bytes.len());
-                            bytes[..source.len()].copy_from_slice(&source);
-                            Ok(source.len())
-                        },
-                    )?;
-                    return Ok(match refusal {
-                        Some(outcome) => outcome,
-                        None => DispatchOutcome::returned_len_or_errno(copied),
-                    });
-                }
-                let copied = read_from_sparse_buffer_at(memory, &data, *offset, &destination)?;
-                *offset += copied;
-                return Ok(DispatchOutcome::returned_len_or_errno(copied));
-            }
-            let (read_len, bytes) = match &mut *open {
-                OpenDescription::Closed { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. } => unreachable!(),
-                OpenDescription::SyntheticFile {
-                    path,
-                    contents,
-                    offset,
-                    ..
-                } => {
-                    // `/proc/<pid>/mem` for the guest's own process is a synthetic
-                    // file whose reads translate the file offset as a GUEST VIRTUAL
-                    // ADDRESS and return that process's memory there (debuggers +
-                    // LTP read their own mappings this way). An unmapped VA is EIO,
-                    // like Linux. Every OTHER synthetic file serves its precomputed
-                    // byte blob.
-                    //
-                    // `memory` is the CALLER's address space, so the predicate
-                    // must reject a peer's pid — otherwise this arm answers
-                    // `/proc/<peer>/mem` with the reader's own bytes. The open
-                    // side refuses a peer first; this is the second gate on the
-                    // same invariant, kept because the two are reached
-                    // independently (an fd can outlive the check that made it).
-                    let self_pid = crate::vfs::proc::self_linux_pid(
-                        this.synthetic_proc_identity(cx.kernel),
-                    );
-                    if crate::vfs::proc::is_proc_self_mem_path(path, self_pid) {
-                        let va = *offset as u64;
-                        // Secret memory (memfd_secret mappings) is invisible
-                        // to the kernel's view of the process: a read that
-                        // touches a live secretmem mapping fails EIO
-                        // (memfdsecret probe `procmem_hidden`).
-                        if length > 0 && this.range_touches_secretmem(va, length as u64) {
-                            drop(open);
-                            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
-                        }
-                        match memory.read_bytes(va, length) {
-                            Ok(bytes) => {
-                                let read_len = bytes.len();
-                                *offset += read_len;
-                                (read_len, bytes)
-                            }
-                            Err(_) => {
-                                drop(open);
-                                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EIO));
-                            }
-                        }
-                    } else if crate::vfs::proc::is_proc_self_pagemap_path(path, self_pid) {
-                        let present = (1u64 << 63).to_le_bytes();
-                        let mut bytes = vec![0u8; length];
-                        for (i, byte) in bytes.iter_mut().enumerate() {
-                            *byte = present[(*offset + i) % present.len()];
-                        }
-                        *offset += bytes.len();
-                        (bytes.len(), bytes)
-                    } else {
-                        let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
-                        let read_len = remaining.len().min(length);
-                        let bytes = remaining[..read_len].to_vec();
-                        *offset += read_len;
-                        (read_len, bytes)
-                    }
-                }
-                OpenDescription::SyntheticDevice { kind, .. } => {
-                    let (read_len, bytes) = match kind {
-                        carrick_vfs::SyntheticDeviceKind::Null => (0, Vec::new()),
-                        carrick_vfs::SyntheticDeviceKind::Zero
-                        | carrick_vfs::SyntheticDeviceKind::Full => {
-                            (length, vec![0u8; length])
-                        }
-                        carrick_vfs::SyntheticDeviceKind::Random
-                        | carrick_vfs::SyntheticDeviceKind::Urandom => {
-                            (length, random_device_bytes(length))
-                        }
-                    };
-                    (read_len, bytes)
-                }
-                OpenDescription::ProcExecutable {
-                    executable, offset, ..
-                } => {
-                    let bytes = retained_executable_bytes(executable, *offset, length)?;
-                    let read_len = bytes.len();
-                    *offset += read_len;
-                    (read_len, bytes)
-                }
-                OpenDescription::VirtualConsole { .. } => (0, Vec::new()),
-                OpenDescription::EventFd {
-                    state,
-                    ..
-                } => {
-                    let state = Arc::clone(state);
-                    let nonblocking = LinuxOpenFlags::from_bits_truncate(
-                        open_file.description.common().status_flags(),
-                    )
-                    .contains(LinuxOpenFlags::NONBLOCK);
-                    drop(open);
-                    return Ok(read_eventfd(
-                        memory,
-                        address,
-                        length,
-                        &state,
-                            nonblocking,
-                        WaitFdAuthority::logical(slot_authority),
-                    ));
-                }
-                OpenDescription::TimerFd { state, .. } => {
-                    let state = Arc::clone(state);
-                    let nonblocking =
-                        open_file.description.common().status_flags() & LINUX_TFD_NONBLOCK != 0;
-                    drop(open);
-                    // Authenticate the slot captured before classification and
-                    // retain its exact description while the table read guard
-                    // prevents a close/reuse from racing this admission.
-                    let Some(lease) = files.retain_slot_lease(slot_authority) else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    return Ok(match super::super::begin_timerfd_read(
-                        memory,
-                        address,
-                        length,
-                        state,
-                        lease,
-                        nonblocking,
-                    ) {
-                        super::super::TimerFdReadStep::Done(outcome) => outcome,
-                        super::super::TimerFdReadStep::Wait(read) => {
-                            DispatchOutcome::BlockingTimerFdRead(read)
-                        }
-                    });
-                }
-                OpenDescription::Inotify { state, .. } => {
-                    let state = Arc::clone(state);
-                    let nonblocking =
-                        open_file.description.common().status_flags() & LINUX_O_NONBLOCK != 0;
-                    drop(open);
-                    // Drain queued inotify_event records into the guest buffer.
-                    // used non-blocking + epoll; a true blocking wait on the
-                    // backing readiness poll fd parks via would_block_outcome.
-                    return Ok(match state.read_records(length) {
-                        Ok(bytes) if bytes.is_empty() => super::would_block_outcome(
-                            state.poll_fd(),
-                            libc::POLLIN,
-                            nonblocking,
-                            None,
-                            WaitFdAuthority::logical(slot_authority),
-                        ),
-                        Ok(bytes) => {
-                            if memory.write_bytes(address, &bytes).is_err() {
-                                DispatchOutcome::errno(LINUX_EFAULT)
-                            } else {
-                                DispatchOutcome::returned_len_or_errno(bytes.len())
-                            }
-                        }
-                        Err(errno) => DispatchOutcome::errno(errno),
-                    });
-                }
-                OpenDescription::Fanotify { group, .. } => {
-                    let group = Arc::clone(group);
-                    // Linux mirrors FAN_NONBLOCK into status_flags at init, and F_SETFL
-                    // mutates status_flags; status_flags is authoritative for nonblocking.
-                    let _ = group.init_nonblocking();
-                    let nonblocking =
-                        open_file.description.common().status_flags() & LINUX_O_NONBLOCK != 0;
-                    drop(open);
-                    return notify::read_fanotify(
-                        this,
-                        notify::ReadFanotifyRequest {
-                            context: cx.kernel,
-                            registry: cx.thread.as_ref().map(|thread| thread.registry),
-                            reporter: cx.reporter,
-                            memory,
-                            address,
-                            length,
-                            group: &group,
-                            nonblocking,
-                            guest_fd: fd.0,
-                        },
-                    );
-                }
-                OpenDescription::PipeReader { pipe, .. } => {
-                    let pipe = Arc::clone(pipe);
-                    let flags = open_file.description.common().status_flags();
-                    drop(open);
-                    let Some(lease) = _read_lease else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    let wait_authority = WaitFdAuthority::logical(slot_authority);
-                    let outcome = read_pipe(
-                        memory,
-                        address,
-                        length,
-                        &pipe,
-                        flags,
-                        fd.0,
-                        wait_authority,
-                    );
-                    return Ok(match outcome {
-                        DispatchOutcome::WaitOnFds { fds, timeout, sig_mask, completion } =>
-                            DispatchOutcome::WaitOnFds {
-                                fds: fds.with_description_lease(lease),
-                                timeout, sig_mask, completion,
-                            },
-                        outcome => outcome,
-                    });
-                }
-                OpenDescription::HostPipe {
-                    host_fd,
-                    is_read_end,
-                    pty,
-                    bidirectional,
-                    ..
-                } => {
-                    // pty ends and O_RDWR FIFOs are bidirectional; only real
-                    // one-way pipe ends are gated by is_read_end.
-                    if !*is_read_end && pty.is_none() && !*bidirectional {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    let host_fd_raw = host_fd.raw();
-                    let host_fd_owner = host_fd.clone();
-                    let pty_role = *pty;
-                    drop(open);
-                    let staged = this.take_staged_splice_pipe_bytes(fd.0, length)?;
-                    if !staged.is_empty() {
-                        if memory.write_bytes(address, &staged).is_err() {
-                            this.restore_splice_pipe_bytes(fd.0, &staged);
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
-                        return Ok(DispatchOutcome::returned_len_or_errno(staged.len()));
-                    }
-                    let outcome = read_host_pipe(
-                    cx.kernel,
-                        memory,
-                        address,
-                        length,
-                        HostPipeReadTarget::new(
-                            host_fd_raw,
-                            Some(host_fd_owner),
-                            nonblocking,
-                            slot_authority,
-                        )
-                        .with_host_wait(host_wait_ref),
-                    )?;
-                    // Darwin reports EOF when the last pty slave closes;
-                    // Linux's master read contract is EIO after any rescued
-                    // tail has drained. Keep ordinary pipes and slave EOFs
-                    // untouched.
-                    return Ok(match (pty_role, outcome) {
-                        (
-                            Some(crate::vfs::PtyRole {
-                                is_master: true, ..
-                            }),
-                            DispatchOutcome::Returned { value: 0 },
-                        ) => DispatchOutcome::errno(crate::linux_abi::LINUX_EIO),
-                        (_, outcome) => outcome,
-                    });
-                }
-                OpenDescription::Directory { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EISDIR));
-                }
-                OpenDescription::SignalFd { mask, .. } => {
-                    let mask = *mask;
-                    drop(open);
-                    // Drain pending signals matching the fd's mask into
-                    // signalfd_siginfo records (empty → EAGAIN, like inotify).
-                    return Ok(this.read_signalfd(cx.kernel, memory, address, length, mask, tid));
-                }
-                OpenDescription::PerfEvent { state, .. } => {
-                    let state = Arc::clone(state);
-                    drop(open);
-                    // Report the counter in the attr.read_format layout; a
-                    // short buffer is ENOSPC. Reads never drain the value.
-                    return Ok(this.read_perf_event(memory, address, length, &state));
-                }
-                // read() on an fs context (the kernel's fsconfig error-log
-                // channel) is unimplemented — EINVAL, documented in
-                // `dispatch/mount_api.rs`.
-                OpenDescription::FsContext { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                OpenDescription::PipeWriter { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. }
-                | OpenDescription::Mqueue { .. }
-                | OpenDescription::BpfMap { .. }
-                | OpenDescription::BpfProg { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                OpenDescription::HostSocket { host_fd, type_, .. } => {
-                    let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
-                    let flows = open_file.description.common().socket_flows();
-                    let host_fd_raw = host_fd.raw();
-                    let host_fd_owner = host_fd.clone();
-                    drop(open);
-                    let res = read_host_pipe(
-                    cx.kernel,
-                        memory,
-                        address,
-                        length,
-                        HostPipeReadTarget::new(
-                            host_fd_raw,
-                            Some(host_fd_owner),
-                            nonblocking,
-                            slot_authority,
-                        )
-                        .with_socket_flow(flows.as_ref().map(|f| &f.inbound), is_stream)
-                        .with_host_wait(host_wait_ref),
-                    )?;
-                    return Ok(res);
-                }
-                OpenDescription::InMemorySocket { socket, .. } => {
-                    let socket = Arc::clone(socket);
-                    drop(open);
-                    let mut buf = vec![0u8; length];
-                    match socket.recv_stream(&mut buf, 0) {
-                        Ok((read_len, _)) => {
-                            if read_len > 0 {
-                                if memory.write_bytes(address, &buf[..read_len]).is_err() {
-                                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                                }
-                                return Ok(DispatchOutcome::returned_len_or_errno(read_len));
-                            } else {
-                                return Ok(DispatchOutcome::Returned { value: 0 });
-                            }
-                        }
-                        Err(LINUX_EAGAIN) => {
-                            if nonblocking {
-                                return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-                            }
-                            return Ok(crate::dispatch::net::wait_in_memory_slot(
-                                &this.captured_file_table(),
-                                fd.0, libc::POLLIN,
-                                socket.get_rcvtimeo(),
-                            ));
-                        }
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    }
-                }
-                // Netlink: drain whatever a prior dump request queued. A bare
-                // read(2) is rare on netlink sockets (recvmsg is the norm), but
-                // model it as draining the synthetic response so it doesn't
-                // wedge a caller.
-                OpenDescription::Netlink { recv_queue, .. } => {
-                    return Ok(net::drain_netlink_queue(
-                        memory, address, length, recv_queue,
-                    ));
-                }
-                OpenDescription::Packet { socket, .. } => {
-                    let socket = Arc::clone(socket);
-                    drop(open);
-                    return Ok(socket.recvfrom(memory, address, length, 0, 0, 0));
-                }
-                // Real host file: libc::read advances the kernel offset
-                // (shared across fork). read_host_pipe is just a
-                // memory-into-guest read(2) wrapper.
-                OpenDescription::HostFile { .. } => {
-                    let Some(host_io) = HostFileIo::from_write(&mut open) else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    let host_fd_raw = host_io.raw();
-                    host_io.record_sequential_io();
-                    let outcome = read_host_pipe(
-                    cx.kernel,
-                        memory,
-                        address,
-                        length,
-                        HostPipeReadTarget::new(
-                            host_fd_raw,
-                            None,
-                            nonblocking,
-                            slot_authority,
-                        )
-                        .with_host_wait(host_wait_ref),
-                    );
-                    return outcome;
-                }
-            };
-            let outcome = DispatchOutcome::returned_len_or_errno(read_len);
-            drop(open);
-            memory.write_bytes(address, &bytes)?;
-            Ok(outcome)
+            this.read_description(
+                memory,
+                &open_file.description,
+                address,
+                length,
+                nonblocking,
+                Some(TaskRead {
+                    kernel: cx.kernel,
+                    registry: cx.thread.as_ref().map(|thread| thread.registry),
+                    reporter: cx.reporter,
+                    files: &files,
+                    slot_authority,
+                    read_lease: _read_lease,
+                    fd,
+                    tid,
+                    host_wait: host_wait_ref,
+                }),
+            )
 
         }
 
@@ -2984,152 +3265,17 @@ impl<'a> FsView<'a> {
                     crate::dispatch::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
                 )?;
             }
-            let Some(open) = crate::kernel::FileDescription::read_for_io(&open_file.description) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            // pread reads the fd, so a regular file descriptor not open for reading
-            // (O_WRONLY) is EBADF (pread02 "not open for reading" case), exactly
-            // as the kernel rejects it before touching the data. Non-seekable
-            // descriptions (pipes, sockets, FIFOs) return ESPIPE on positional read.
-            if matches!(&*open, OpenDescription::HostFile { .. })
-                && open_file.description.common().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
-            // Real host file: positional read via libc::pread (doesn't
-            // disturb the shared kernel offset).
-            if let Some(host_io) = HostFileIo::from_read(&open) {
-                let host_fd_raw = host_io.raw();
-                let length = length.min(crate::dispatch::MAX_RW_COUNT);
-                let outcome = read_host_pipe_at(
-                    cx.kernel,
-                    memory,
-                    buffer,
-                    length,
-                    offset as i64,
-                    HostPipeReadTarget::new(
-                        host_fd_raw,
-                        None,
-                        false,
-                        WaitFdAuthority::logical(
-                            this.captured_slot_authority(fd.0).ok_or(LINUX_EBADF)?,
-                        ),
-                    )
-                    .with_host_wait(host_wait_ref),
-                )?;
-                drop(open);
-                return Ok(outcome);
-            }
-            if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
-                let result = match &*open {
-                    OpenDescription::File { contents, .. } => Some(
-                        read_from_repeatable_owner_at(cx.kernel, memory, buffer, length, &mut { offset }, |at, bytes| {
-                            contents.read_at(at as u64, bytes)
-                        })?,
-                    ),
-                    OpenDescription::InMemoryFile { contents, .. } => {
-                        let data = contents.read();
-                        Some(read_from_repeatable_owner_at(
-                        cx.kernel,
-                            memory,
-                            buffer,
-                            length,
-                            &mut { offset },
-                            |at, bytes| {
-                                let source = data.read_range(at, bytes.len());
-                                bytes[..source.len()].copy_from_slice(&source);
-                                Ok(source.len())
-                            },
-                        )?)
-                    }
-                    _ => None,
-                };
-                if let Some((copied, refusal)) = result {
-                    return Ok(match refusal {
-                        Some(outcome) => outcome,
-                        None => DispatchOutcome::returned_len_or_errno(copied),
-                    });
-                }
-            }
-            let bytes = match &*open {
-                OpenDescription::Closed { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                OpenDescription::File { contents, .. } => {
-                    let mut buf = vec![0u8; length];
-                    match contents.read_at(offset as u64, &mut buf) {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            buf
-                        }
-                        Err(errno) => {
-                            drop(open);
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                    }
-                }
-                OpenDescription::SyntheticFile { contents, .. } => contents
-                    .get(offset..)
-                    .unwrap_or_default()
-                    .iter()
-                    .take(length)
-                    .copied()
-                    .collect(),
-                OpenDescription::ProcExecutable { executable, .. } => {
-                    retained_executable_bytes(executable, offset, length)?
-                }
-                OpenDescription::InMemoryFile { contents, .. } => contents
-                    .read()
-                    .read_range(offset, length),
-                OpenDescription::SyntheticDevice { kind, .. } => {
-                    match kind {
-                        carrick_vfs::SyntheticDeviceKind::Null => Vec::new(),
-                        carrick_vfs::SyntheticDeviceKind::Zero
-                        | carrick_vfs::SyntheticDeviceKind::Full => vec![0u8; length],
-                        carrick_vfs::SyntheticDeviceKind::Random
-                        | carrick_vfs::SyntheticDeviceKind::Urandom => {
-                            random_device_bytes(length)
-                        }
-                    }
-                }
-                OpenDescription::HostFile { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                OpenDescription::Directory { .. } => {
-                    return Ok(DispatchOutcome::errno(LINUX_EISDIR));
-                }
-                OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
-                | OpenDescription::HostPipe { .. }
-                | OpenDescription::EventFd { .. }
-                | OpenDescription::TimerFd { .. }
-                | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. }
-                | OpenDescription::Fanotify { .. }
-                | OpenDescription::HostSocket { .. }
-                | OpenDescription::SignalFd { .. }
-                | OpenDescription::PerfEvent { .. }
-                | OpenDescription::FsContext { .. }
-                | OpenDescription::Mqueue { .. }
-                | OpenDescription::BpfMap { .. }
-                | OpenDescription::BpfProg { .. }
-                | OpenDescription::VirtualConsole { .. }
-                | OpenDescription::Netlink { .. }
-                | OpenDescription::InMemorySocket { .. }
-                | OpenDescription::Packet { .. } => {
-                    // Positional read on a non-seekable fd (pipe/socket/anon) is
-                    // ESPIPE on Linux; a directory is EISDIR (above). pread02.
-                    return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-                }
-            };
-            drop(open);
-            let read_len = bytes.len();
-            if read_len > 0 {
-                memory.write_bytes(buffer, &bytes)?;
-            }
-            let outcome = DispatchOutcome::returned_len_or_errno(read_len);
-            Ok(outcome)
+            let slot_authority = || this.captured_slot_authority(fd.0).map(WaitFdAuthority::logical);
+            this.pread_description(
+                super::IoCaller::Task(cx.kernel),
+                memory,
+                &open_file.description,
+                buffer,
+                length,
+                offset,
+                &slot_authority,
+                host_wait_ref,
+            )
 
         }
 

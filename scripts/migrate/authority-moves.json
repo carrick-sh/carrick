@@ -30,6 +30,26 @@
       "from": "carrick_kernel::kernel::objects::FileTable::for_fork_copy",
       "to": "carrick_kernel::kernel::objects::FileTable::copy_private",
       "issue": 784
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::stat::FsView<'a>::fd_stat_record",
+      "to": "carrick_kernel::dispatch::fs::stat::FsView<'a>::description_stat_record",
+      "issue": 894
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::rw::FsView<'a>::lseek",
+      "to": "carrick_kernel::dispatch::fs::rw::FsView<'a>::lseek_description",
+      "issue": 894
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::rw::FsView<'a>::read",
+      "to": "carrick_kernel::dispatch::fs::rw::FsView<'a>::read_description",
+      "issue": 894
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::rw::FsView<'a>::pread64",
+      "to": "carrick_kernel::dispatch::fs::rw::FsView<'a>::pread_description",
+      "issue": 894
     }
   ],
   "terminal_custody": []

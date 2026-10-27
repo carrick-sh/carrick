@@ -34,7 +34,13 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
 }
 
 /// The retained service does not serve this exact host-file request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct NativeHostFileRefused;
 
 /// Opaque fallibly prepared image. Exact carrier custody retains this result
