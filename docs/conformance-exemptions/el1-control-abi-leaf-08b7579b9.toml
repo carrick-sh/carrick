@@ -1,0 +1,23 @@
+schema = "carrick.conformance-exemption.v1"
+base = "cb8187f11ffed6b245c2c0f3f2be9e951d63da54"
+head = "08b7579b93e725218efa1904a1539ea42bfad9a8"
+contracts = [
+  "kernel.el1.futex-handoff",
+  "kernel.el1.guest-scheduler",
+  "kernel.el1.guest-run-queue",
+  "kernel.mm.address-space-occupancy",
+  "kernel.el1.fault-entry",
+  "kernel.el1.metadata-allocation",
+  "kernel.el1.gic",
+  "kernel.el1.stage1-publication",
+  "process.native.terminal-child",
+  "kernel.el1.open-lifetime",
+  "kernel.x86.file-region",
+  "kernel.el1.signal-delivery-owner",
+]
+paths = [
+  "crates/carrick-el1-abi/src/lib.rs",
+  "crates/carrick-el1-control-abi/src/lib.rs",
+  "fixtures/embed-el1-sched/src/main.rs",
+]
+rationale = "The exact diff moves the two control-syscall constants (SYS_CARRICK_EL1_CONTROL = 0xCA88_0001, METADATA_GRANT_PENDING = u64::MAX - 1) from carrick-el1-abi into the dependency-free leaf carrick-el1-control-abi, which carrick-el1-abi re-exports and const-asserts; carrick-el1-abi/src/lib.rs only replaces the two definitions with that re-export and two value assertions. The fixture's only source change is the three import paths that name those constants. Values, syscall arguments, return handling and every guest operation are unchanged; the fixture binary computes the same syscalls. The change only shrinks the signed fixture's dependency closure (#891)."
