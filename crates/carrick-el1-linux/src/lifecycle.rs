@@ -216,9 +216,7 @@ impl<
         Some(outcome)
     }
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
-        let mut outcome = self.process_venue()?.exit_group(status);
-        self.run_ready_after_native_transfer(&mut outcome);
-        Some(outcome)
+        Some(self.process_venue()?.exit_group(status))
     }
     fn process_exit_binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
         let binding = LifecycleNative::binding(self)?;
