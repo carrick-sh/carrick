@@ -1357,6 +1357,9 @@ fn classify_run_outcome(
         // "filesystem backend error: failed to run ELF from dispatcher: …" --
         // the same mislabelling `Configuration` is passed through for.
         Err(e @ RuntimeError::KernelAborted { .. }) => Err(e),
+        // A ring stack overflow is a typed terminal report naming the CPU and
+        // its stack (#369); stringifying it would leave callers matching text.
+        Err(e @ RuntimeError::Trap(carrick_hal::TrapError::El1StackOverflow(_))) => Err(e),
         Err(e) => Err(RuntimeError::FsBackend(anyhow::anyhow!("{label}: {e}"))),
     }
 }
@@ -1621,6 +1624,30 @@ mod tests {
             RuntimeError::Dispatch(carrick_kernel::dispatch::DispatchError::InterceptorPanicked {
                 container_id,
             }) if container_id == expected
+        ));
+    }
+
+    #[test]
+    fn run_outcome_preserves_typed_el1_stack_overflows() {
+        let usable = carrick_el1_abi::stack_slot_usable_base(2);
+        let report = carrick_el1_abi::El1StackOverflow::classify(
+            0x9600_0047,
+            usable - 0x10,
+            usable - 0x10,
+            0,
+            Some(carrick_guest_arch::CpuId::new(2)),
+        )
+        .expect("a guard fault");
+        let error = classify_run_outcome(
+            Err(RuntimeError::Trap(
+                carrick_hal::TrapError::El1StackOverflow(report),
+            )),
+            "test launch",
+        )
+        .expect_err("a ring stack overflow fails the run");
+        assert!(matches!(
+            error,
+            RuntimeError::Trap(carrick_hal::TrapError::El1StackOverflow(found)) if found == report
         ));
     }
 
