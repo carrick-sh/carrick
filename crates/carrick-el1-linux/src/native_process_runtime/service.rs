@@ -994,7 +994,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     fn kill_refused_exec(&mut self) -> NativeResume {
         if self
-            .exit_with_signal(carrick_signal_core::policy::Signal::KILL.number() as u8)
+            .exit_with_signal(carrick_signal_core::policy::Signal::KILL)
             .is_ok()
         {
             return NativeResume::Left(None);

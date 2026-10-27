@@ -2668,7 +2668,11 @@ fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
             )
             .unwrap();
         let outcome = match signal {
-            Some(signal) => terminator.exit_with_signal(signal).unwrap(),
+            Some(signal) => terminator
+                .exit_with_signal(
+                    carrick_signal_core::policy::Signal::from_number(signal.into()).unwrap(),
+                )
+                .unwrap(),
             None => terminator.exit_group(23),
         };
         assert!(matches!(outcome, LifecycleOutcome::Transferred { .. }));
