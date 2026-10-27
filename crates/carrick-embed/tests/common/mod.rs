@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use carrick_abi::{NsGid, NsUid};
-use carrick_embed::{ContainerBuilder, ContainerResult, EmbedError, InMemoryFileVfs};
+use carrick_embed::{Carrier, ContainerBuilder, ContainerResult, EmbedError, InMemoryFileVfs};
 use carrick_image::PullPolicy;
 
 /// The canonical smoke image: the arm64 probe lane's image
@@ -25,6 +25,53 @@ pub fn native_exec_three_rounds(name: &str, mut run: impl FnMut()) {
         run();
         println!("native-exec-round case={name} round={round} passed");
     }
+}
+
+/// One fork/exit/fork/exec/wait composition on a native fork child: the
+/// el1-sched fixture's `reused-slot-exec` mode forks a child that exits,
+/// forks again into the retired slot and has that child `execve` a raw
+/// no-libc successor, then waits for both. Shared by
+/// `el1_fork_exec::native_child_exec_after_reusing_a_retired_slot` and the
+/// `smoke_signed` target. The caller holds `guest_lock` and a watchdog and
+/// passes the builder for [`SMOKE_IMAGE`]: implicit
+/// (`ContainerBuilder::from_image`) or on an explicit carrier.
+pub fn reused_slot_native_child_exec(builder: ContainerBuilder) {
+    // Signed smoke for the fork/exit/exec composition. Numeric slot reuse is
+    // deterministic only in the VM-free
+    // `first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation`
+    // witness because the live allocator hashes the successor MM.
+    // The successor is a raw no-libc image. A ring-owned native process has
+    // no host task context, so libc/std startup (std's stdio ppoll) and the
+    // CLI terminal are out of reach; its reply returns over in-zone pipes.
+    const SUCCESSOR: &str = "carrick-linux-aarch64-read-then-write-via-stdio";
+    let fixture_dir = repo_root().join("target/embed-fixtures");
+    let successor_dir =
+        repo_root().join("fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release");
+    assert!(
+        successor_dir.join(SUCCESSOR).is_file(),
+        "missing {SUCCESSOR}; run scripts/build-linux-fixtures.sh first"
+    );
+    let result = run_or_fail(
+        builder
+            .pull_policy(PullPolicy::Missing)
+            .mount_readonly(fixture_dir.to_string_lossy(), "/opt/carrick")
+            .mount_readonly(successor_dir.to_string_lossy(), "/p")
+            .command([
+                "/opt/carrick/el1-sched-aarch64".to_owned(),
+                "reused-slot-exec".to_owned(),
+                format!("/p/{SUCCESSOR}"),
+            ])
+            .run_blocking(),
+    );
+    assert!(
+        result.success(),
+        "exit {} signal {:?} stdout {:?} stderr {:?}",
+        result.exit_code,
+        result.signal,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
+    assert_eq!(result.stdout_utf8(), "reused-slot-exec ok\n");
 }
 
 static GUEST_LOCK: Mutex<()> = Mutex::new(());
@@ -151,6 +198,45 @@ pub fn copyout_vfs() -> InMemoryFileVfs {
     )
     .expect("install executable copyout fixture");
     vfs
+}
+
+/// Where the static el1-sched fixture (`fixtures/embed-el1-sched`) is mounted.
+pub const EL1_SCHED_FIXTURE: &str = "/opt/carrick/el1-sched";
+
+/// The static el1-sched fixture, mounted executable at `/opt/carrick`.
+pub fn el1_sched_vfs() -> InMemoryFileVfs {
+    let fixture = repo_root().join("target/embed-fixtures/el1-sched-aarch64");
+    let bytes = std::fs::read(&fixture).unwrap_or_else(|error| {
+        panic!(
+            "read {}: {error}; scripts/test-signed.sh must build the fixture first \
+             (scripts/build-embed-el1-sched.sh)",
+            fixture.display()
+        )
+    });
+    let vfs = InMemoryFileVfs::new();
+    vfs.add_file_with_metadata(EL1_SCHED_FIXTURE, bytes, 0o755, NsUid::ROOT, NsGid::ROOT, 0)
+        .expect("install executable el1-sched fixture");
+    vfs
+}
+
+/// An explicit carrier (one VM serving every container built from it), or a
+/// loud failure: HV_DENIED is never a skip, and a prior carrier still retiring
+/// is waited for, bounded.
+pub fn carrier_or_fail() -> Carrier {
+    for _ in 0..50 {
+        match Carrier::new() {
+            Ok(carrier) => return carrier,
+            Err(EmbedError::Entitlement) => panic!(
+                "HV_DENIED (0xfae94007): run through scripts/test-signed.sh; \
+                 a bare cargo test cannot boot a guest"
+            ),
+            Err(EmbedError::CarrierAlreadyActive) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => panic!("carrier initialization failed: {error}"),
+        }
+    }
+    panic!("carrier initialization timed out waiting for a prior carrier to retire");
 }
 
 /// Unwrap a container run, turning `EmbedError::Entitlement` into a loud,

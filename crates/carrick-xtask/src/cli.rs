@@ -49,6 +49,10 @@ pub enum Commands {
     CiReceipt(crate::ci_receipt::ReceiptArgs),
     #[command(about = "Authorize, execute and publish the on-demand signed Actions gate")]
     SignedGate(crate::signed_gate::SignedGateArgs),
+    #[command(
+        about = "Signed first-boot smoke (carrick-embed smoke_signed) with an exact-HEAD receipt"
+    )]
+    SmokeSigned(crate::smoke_signed::SmokeSignedArgs),
     #[command(about = "Classify CI diff paths and derive referenced doc/agent dependencies")]
     CiChanges(crate::ci_changes::CiChangesArgs),
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
@@ -280,6 +284,8 @@ pub enum CliError {
     Fixtures(#[from] crate::fixtures::FixturesError),
     #[error("host lease error: {0}")]
     HostLease(#[from] crate::host_lease::HostLeaseError),
+    #[error("smoke-signed: {0}")]
+    SmokeSigned(#[from] crate::smoke_signed::SmokeSignedError),
     #[error("accept error: {0}")]
     Accept(#[from] crate::accept::AcceptError),
     #[error("remote accept error: {0}")]
@@ -473,6 +479,14 @@ where
         Commands::SignedGate(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::signed_gate::run(&root, args)?;
+            Ok(())
+        }
+        Commands::SmokeSigned(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            let receipt = crate::smoke_signed::run(&root, args)?;
+            if !receipt.passed {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Commands::CiReceipt(args) => {

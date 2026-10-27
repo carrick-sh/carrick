@@ -1054,6 +1054,13 @@ pub fn inspect_artifact(root: &Path) -> Result<ArtifactIdentity, String> {
     if !bin_path.exists() {
         return Err(format!("release binary '{}' not found", bin_path.display()));
     }
+    inspect_executable(&bin_path)
+}
+
+/// SHA-256, CDHash, LC_UUID, hypervisor entitlement and `__dof_carrick`
+/// presence of one signed Mach-O executable.
+pub fn inspect_executable(bin_path: &Path) -> Result<ArtifactIdentity, String> {
+    let bin_path = bin_path.to_path_buf();
 
     let bytes = fs::read(&bin_path)
         .map_err(|e| format!("failed to read binary '{}': {e}", bin_path.display()))?;

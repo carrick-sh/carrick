@@ -38,6 +38,7 @@ pub mod remote_lock;
 pub mod safe_copy;
 pub mod signed_gate;
 pub mod signed_receipt;
+pub mod smoke_signed;
 mod target_prune;
 pub mod terminal_custody;
 pub mod test_batch;
