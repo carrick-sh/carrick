@@ -1081,6 +1081,36 @@ fn el1_sched_exit_group_with_parked_threads() {
     }
 }
 
+/// #900: a run that ends while a forked native child still computes at EL0
+/// (no syscall, so it never leaves the guest by itself) completes: carrier
+/// teardown and the executor pool's shutdown kick reach the vCPU running the
+/// child, and every executor joins. A kick swallowed at that boundary hangs
+/// the run until the watchdog fires.
+#[test]
+fn el1_run_ends_with_a_spinning_native_child() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    for _ in 0..3 {
+        let measured = run_fixture(
+            &carrier,
+            &["orphan-spinner", "100"],
+            Duration::from_secs(60),
+        );
+        println!(
+            "el1-sched orphan-spinner exit={} wall_ms={}",
+            measured.result.exit_code,
+            measured.wall.as_millis()
+        );
+        assert_eq!(measured.result.exit_code, 0, "{}", describe(&measured));
+        assert!(
+            String::from_utf8_lossy(&measured.result.stdout).contains("orphan-spinner child="),
+            "{}",
+            describe(&measured)
+        );
+    }
+}
+
 /// `execve` from a non-leader thread while siblings are parked in futex waits
 /// replaces the image: the successor runs and exits normally.
 #[test]
