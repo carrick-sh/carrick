@@ -204,9 +204,12 @@ pub fn decide_anonymous_syscall<
         SYS_BRK => model.brk(frame.x[0]),
         SYS_MMAP => {
             let flags = frame.x[3];
-            let supported = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE;
+            // `MAP_STACK` is a placement hint with no effect on the mapping
+            // (man 2 mmap); the root serves it as private anonymous memory.
+            let supported =
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_STACK;
             if flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) != MAP_ANONYMOUS | MAP_PRIVATE
-                || flags & (MAP_GROWSDOWN | MAP_STACK | MAP_HUGETLB) != 0
+                || flags & (MAP_GROWSDOWN | MAP_HUGETLB) != 0
                 || flags & !supported != 0
             {
                 return ReservationDisposition::Forward;
@@ -1735,6 +1738,54 @@ mod tests {
             );
             assert_eq!(route, DelegatedAnonymous::Forward);
             assert!(editor.calls.is_empty());
+        }
+
+        /// Rust std maps its sigaltstack `MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK`
+        /// before `main`. Linux treats `MAP_STACK` as a hint with no effect on
+        /// the mapping, so the root serves it. A native process has no host
+        /// fallback: forwarding the hint became ENOSYS, std aborted, and the
+        /// exec successor died with SIGSEGV. `MAP_GROWSDOWN` changes the
+        /// mapping and keeps the host decoder.
+        #[test]
+        fn mmap_stack_hint_is_served_like_private_anonymous() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let delegated = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let (route, address) = syscall(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [
+                    0,
+                    0x4000,
+                    PROT_READ | PROT_WRITE,
+                    ANON | MAP_STACK,
+                    u64::MAX,
+                    0,
+                ],
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            assert!(address > 0 && (address as u64).is_multiple_of(PAGE_SIZE));
+            let (route, _) = syscall(
+                &delegated,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [
+                    0,
+                    0x4000,
+                    PROT_READ | PROT_WRITE,
+                    ANON | MAP_GROWSDOWN,
+                    u64::MAX,
+                    0,
+                ],
+            );
+            assert_eq!(route, DelegatedAnonymous::Forward);
         }
 
         #[test]
