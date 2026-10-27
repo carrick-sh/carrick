@@ -203,6 +203,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
+ "carrick-sched-core",
  "libc",
  "parking_lot",
  "tracing",
@@ -222,6 +223,7 @@ dependencies = [
 name = "carrick-core"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.11.1",
  "carrick-core-abi",
  "carrick-guest-arch",
  "carrick-mmu-core",
@@ -246,13 +248,10 @@ dependencies = [
  "carrick-core",
  "carrick-core-abi",
  "carrick-el1-abi",
- "carrick-fatal",
  "carrick-guest-arch",
- "carrick-inotify-core",
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
- "carrick-signal-core",
  "carrick-syscall-abi",
  "libc",
  "zerocopy",
@@ -270,6 +269,7 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-pipe-core",
  "carrick-sched-core",
+ "carrick-signal-core",
  "carrick-syscall-abi",
 ]
 
@@ -278,6 +278,28 @@ name = "carrick-el1-image"
 version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
+]
+
+[[package]]
+name = "carrick-el1-linux"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-el1",
+ "carrick-el1-abi",
+ "carrick-fatal",
+ "carrick-fd-core",
+ "carrick-guest-arch",
+ "carrick-inotify-core",
+ "carrick-mmu-core",
+ "carrick-personality-linux",
+ "carrick-sched-core",
+ "carrick-signal-core",
+ "carrick-syscall-abi",
+ "libc",
+ "zerocopy",
 ]
 
 [[package]]
@@ -291,6 +313,7 @@ dependencies = [
 name = "carrick-fd-core"
 version = "0.1.0"
 dependencies = [
+ "carrick-core-abi",
  "carrick-sched-core",
 ]
 
@@ -306,6 +329,7 @@ dependencies = [
 name = "carrick-guest-arch"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "zerocopy",
 ]
 
@@ -315,6 +339,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
  "carrick-fatal",
+ "carrick-guest-arch",
  "libc",
  "parking_lot",
  "serde",
@@ -336,7 +361,9 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
+ "carrick-personality-linux",
  "carrick-sched-core",
+ "carrick-signal-core",
  "carrick-signal-linux",
  "carrick-timer-core",
  "libc",
@@ -392,9 +419,12 @@ dependencies = [
  "camino",
  "carrick-abi",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-fatal",
+ "carrick-fd-core",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
@@ -406,8 +436,10 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-observability",
  "carrick-personality-linux",
+ "carrick-pipe-core",
  "carrick-portable",
  "carrick-sched-core",
+ "carrick-signal-core",
  "carrick-signal-linux",
  "carrick-spec",
  "carrick-thread",
@@ -449,6 +481,8 @@ dependencies = [
  "carrick-fatal",
  "carrick-guest-mem",
  "carrick-mmu-core",
+ "carrick-personality-linux",
+ "carrick-syscall-abi",
  "goblin",
  "libc",
  "parking_lot",
@@ -463,6 +497,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-guest-arch",
  "hashbrown 0.15.5",
+ "zerocopy",
 ]
 
 [[package]]
@@ -489,7 +524,6 @@ dependencies = [
  "carrick-core",
  "carrick-core-abi",
  "carrick-guest-arch",
- "carrick-sched-core",
 ]
 
 [[package]]
@@ -530,9 +564,12 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-fatal",
+ "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
@@ -554,6 +591,7 @@ dependencies = [
  "carrick-vmm-hvf",
  "carrick-vmm-kvm",
  "carrick-x86",
+ "carrick-x86-cpl0-host",
  "clap",
  "fd-lock",
  "flate2",
@@ -676,6 +714,7 @@ dependencies = [
  "carrick-abi",
  "carrick-core",
  "carrick-core-abi",
+ "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-arch",
@@ -715,6 +754,7 @@ dependencies = [
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-guest-mem",
@@ -728,6 +768,7 @@ dependencies = [
  "carrick-thread",
  "carrick-timer-core",
  "carrick-x86",
+ "carrick-x86-cpl0-host",
  "getrandom 0.3.4",
  "kvm-bindings",
  "kvm-ioctls",
@@ -755,6 +796,28 @@ dependencies = [
  "carrick-sched-core",
  "libc",
  "zerocopy",
+]
+
+[[package]]
+name = "carrick-x86-cpl0-host"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-el1",
+ "carrick-el1-abi",
+ "carrick-el1-linux",
+ "carrick-fatal",
+ "carrick-guest-arch",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-mem",
+ "carrick-mmu-core",
+ "carrick-sched-core",
+ "carrick-x86",
+ "libc",
+ "static_assertions",
 ]
 
 [[package]]
@@ -789,7 +852,7 @@ checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
- "rand_core 0.10.1",
+ "rand_core",
 ]
 
 [[package]]
@@ -1221,11 +1284,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -1235,11 +1296,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
- "rand_core 0.10.1",
+ "rand_core",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1297,7 +1360,7 @@ dependencies = [
  "ipnet",
  "jni",
  "once_cell",
- "rand 0.10.3",
+ "rand",
  "ring",
  "thiserror",
  "tinyvec",
@@ -2012,15 +2075,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ppv-lite86"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
-dependencies = [
- "zerocopy",
-]
-
-[[package]]
 name = "pretty-hex"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2089,14 +2143,15 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "lru-slab",
- "rand 0.9.4",
+ "rand",
+ "rand_pcg",
  "ring",
  "rustc-hash",
  "rustls",
@@ -2145,42 +2200,13 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.9.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
-dependencies = [
- "rand_chacha",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.2",
- "rand_core 0.10.1",
-]
-
-[[package]]
-name = "rand_chacha"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand_core"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
-dependencies = [
- "getrandom 0.3.4",
+ "rand_core",
 ]
 
 [[package]]
@@ -2188,6 +2214,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core",
+]
 
 [[package]]
 name = "redox_syscall"
@@ -2312,9 +2347,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",
@@ -2336,9 +2371,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2569,6 +2604,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strsim"
