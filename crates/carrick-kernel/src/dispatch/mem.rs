@@ -534,6 +534,25 @@ pub struct MemState {
 pub(crate) use carrick_mem::memory::MemoryLayout;
 
 impl MemState {
+    /// Retain `reference` as a private-mapping byte source in this run's
+    /// custody, for a native process's private file `mmap` (#894). The same
+    /// custody and lease a host-owned private file mapping takes; the lease
+    /// reads the file as the mapping's pages fault in.
+    pub(in crate::dispatch) fn retain_native_private_source(
+        &self,
+        reference: Arc<crate::kernel::objects::MappedFileReference>,
+        label: String,
+    ) -> Option<(
+        Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
+        carrick_el1_abi::HostBackingIdentity,
+    )> {
+        let lease = self
+            .host_backing_custody
+            .retain_labeled_source(backing::PrivateFileBacking::Description(reference), label)?;
+        let identity = lease.identity(0);
+        Some((Arc::new(lease), identity))
+    }
+
     /// Apply `mprotect(start..end, prot)` to every Linux-visible row the host
     /// lane keeps, then re-merge `dynamic_maps` rows that the split left as
     /// identical neighbours (Linux merges adjacent VMAs once their flags

@@ -25,12 +25,14 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
     /// Serve one ring-staged host-file record
     /// ([`carrick_core_abi::host_file`]) with the process tree's retained
     /// authority, writing its reply in place. `Err` refuses the exact request
-    /// (the ring answers counted ENOSYS); no reply may have been written.
+    /// (the ring answers counted ENOSYS); no reply may have been written. A
+    /// private-mapping record returns the retained byte source, which the
+    /// carrier registers for the caller's MM before acknowledging.
     fn serve_host_file(
         &self,
         request: ServiceRequest,
         record: &mut [u8],
-    ) -> Result<(), NativeHostFileRefused>;
+    ) -> Result<Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>, NativeHostFileRefused>;
 }
 
 /// The retained service does not serve this exact host-file request.
@@ -169,7 +171,10 @@ mod native_exec_service_registration_tests {
             &self,
             _request: ServiceRequest,
             _record: &mut [u8],
-        ) -> Result<(), NativeHostFileRefused> {
+        ) -> Result<
+            Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+            NativeHostFileRefused,
+        > {
             Err(NativeHostFileRefused)
         }
     }
@@ -354,9 +359,42 @@ impl NativeService {
             None => return Err(stale()),
         };
         match served {
-            Ok(()) => self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale())),
+            Ok(None) => {
+                self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))
+            }
+            Ok(Some(source)) => {
+                // The reply names this source: it must be the caller's exact
+                // MM's before the ring can map it, or nothing is supplied.
+                if !self.register_native_source(source) {
+                    return Err(stale());
+                }
+                self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale()))
+            }
             Err(NativeHostFileRefused) => self.refuse_host_file(),
         }
+    }
+
+    /// Register a retained private-mapping byte source for the requesting
+    /// native child's exact MM, where `supply_backing` resolves its faults.
+    fn register_native_source(
+        &self,
+        source: Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
+    ) -> bool {
+        let handle = self.request().identity.birth.mm;
+        let mut stock = self.custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()) != Some(handle)
+            || stock.owner.is_quarantined(handle.mm())
+        {
+            return false;
+        }
+        let Some(root) = stock.owner.child_root(handle.mm()) else {
+            return false;
+        };
+        let Some(physical) = stock.owner.child_physical_mut(handle.mm(), root) else {
+            return false;
+        };
+        physical.sources.inherit(source);
+        true
     }
 
     fn refuse_host_file(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {

@@ -203,7 +203,10 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
         &self,
         _request: carrick_core_abi::service::ServiceRequest,
         record: &mut [u8],
-    ) -> Result<(), carrick_vmm_hvf::metadata_grant::NativeHostFileRefused> {
+    ) -> Result<
+        Option<std::sync::Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
+        carrick_vmm_hvf::metadata_grant::NativeHostFileRefused,
+    > {
         // The request identity was authenticated by the service cell; the
         // record names the caller's own ring table, pinned at service time.
         let run = self
@@ -213,6 +216,7 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             .ok_or(carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)?;
         run.dispatcher
             .serve_native_host_file(self.files.native_fs_authority().as_ref(), record)
+            .map(|served| served.retained_source)
             .map_err(|_| carrick_vmm_hvf::metadata_grant::NativeHostFileRefused)
     }
 }

@@ -241,6 +241,14 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn copy_out_owned(&mut self, _dst: UserVa, _bytes: &[u8]) -> Option<bool> {
         None
     }
+    /// The private file byte source the native host-file venue retained for
+    /// exactly this thread's retried `mmap` with `key`, consumed once.
+    fn take_map_source(
+        &mut self,
+        _key: crate::native_host_file::NativeMapKey,
+    ) -> Option<carrick_core_abi::HostBackingIdentity> {
+        None
+    }
     fn binding(&self) -> ExecutionBinding;
     fn pid_exists(&self, _pid: u32) -> Option<bool> {
         None

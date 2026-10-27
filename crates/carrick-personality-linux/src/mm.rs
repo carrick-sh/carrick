@@ -183,6 +183,15 @@ impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
     ) -> Result<Decision, Refusal> {
         reservation::mmap(root, placement, len, protection)
     }
+    fn mmap_private_file<M: carrick_core_abi::ReservationPolicyAccess>(
+        root: &mut M,
+        placement: Placement,
+        len: GuestLen,
+        protection: ReservationProtection,
+        backing: HostBackingIdentity,
+    ) -> Result<Decision, Refusal> {
+        reservation::mmap_private_file(root, placement, len, protection, backing)
+    }
     fn mremap<M: carrick_core_abi::ReservationPolicyAccess>(
         root: &mut M,
         source: ReservationRange,

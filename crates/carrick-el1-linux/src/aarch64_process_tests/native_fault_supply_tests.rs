@@ -931,6 +931,7 @@ fn composed_native_supply(
         access,
         fixture.region.table(),
         &mut FixtureMapping { words, residency },
+        None,
     );
     if let Some(pin) = transfer_pin {
         assert_eq!(
@@ -952,6 +953,7 @@ fn composed_native_supply(
                 access,
                 fixture.region.table(),
                 &mut FixtureMapping { words, residency },
+                None,
             ),
             carrick_el1::memory::DelegatedAnonymous::Served
         );

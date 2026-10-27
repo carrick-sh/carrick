@@ -2272,6 +2272,16 @@ impl<
     ) -> Result<Decision, Refusal> {
         Policy::mmap(self, placement, GuestLen::new(len), prot)
     }
+    /// Map `len` bytes privately from a retained host byte source.
+    pub fn mmap_private_file(
+        &mut self,
+        placement: Placement,
+        len: u64,
+        prot: ReservationProtection,
+        backing: HostBackingIdentity,
+    ) -> Result<Decision, Refusal> {
+        Policy::mmap_private_file(self, placement, GuestLen::new(len), prot, backing)
+    }
     pub fn munmap(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
         self.proposal(ReservationProposal {
             range,
@@ -3449,6 +3459,10 @@ impl<
         if id == 0 {
             return Err(Refusal::Stale);
         }
+        // Completion counts the new node's bytes against its byte source, so
+        // the source must be registered first: a no-op for a source a moved
+        // mapping already holds, a new entry for a fresh private file map.
+        self.source_reserve(backing)?;
         self.write(
             id,
             NodeData {

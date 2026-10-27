@@ -438,6 +438,15 @@ pub trait ReservationPolicy {
         len: GuestLen,
         protection: ReservationProtection,
     ) -> Result<Decision, Refusal>;
+    /// A private file mapping whose bytes come from `backing` (a retained
+    /// host byte source at the mapping's file offset), supplied on fault.
+    fn mmap_private_file<M: ReservationPolicyAccess>(
+        root: &mut M,
+        placement: Placement,
+        len: GuestLen,
+        protection: ReservationProtection,
+        backing: HostBackingIdentity,
+    ) -> Result<Decision, Refusal>;
     fn mremap<M: ReservationPolicyAccess>(
         root: &mut M,
         source: ReservationRange,

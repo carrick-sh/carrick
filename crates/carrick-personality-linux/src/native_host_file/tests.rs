@@ -79,6 +79,7 @@ fn request(stage: Option<HostFileStage>) -> (Box<[u8]>, Option<HostFileOutput>, 
             record,
             output,
             resolves_path,
+            ..
         }) => (record, output, resolves_path),
         other => panic!("expected a host request, got {other:?}"),
     }
@@ -501,5 +502,63 @@ fn unwritable_output_requests_write_supply_before_crossing() {
             address: BASE + 4096,
             access: Access::Write
         })
+    );
+}
+
+#[test]
+fn private_file_mmap_stages_a_byte_source_request_with_its_exact_key() {
+    let mut user = memory(b"");
+    let key = NativeMapKey {
+        address: 0,
+        length: 8192,
+        prot: 1,
+        flags: LINUX_MAP_PRIVATE,
+        fd: 3,
+        offset: 4096,
+    };
+    let Some(HostFileStage::Request {
+        mut record,
+        output,
+        resolves_path,
+        map,
+    }) = run(HostFileCall::MapPrivate(key), &mut user)
+    else {
+        panic!("a host file mapping crosses for its byte source");
+    };
+    assert_eq!((output, resolves_path, map), (None, false, Some(key)));
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::MapPrivate);
+    assert_eq!(view.header().args[0], 4096);
+    // A pipe has no mmap; an unaligned offset or empty length is EINVAL.
+    assert_eq!(
+        run(
+            HostFileCall::MapPrivate(NativeMapKey { fd: 0, ..key }),
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_ENODEV)
+    );
+    assert_eq!(
+        run(
+            HostFileCall::MapPrivate(NativeMapKey { offset: 1, ..key }),
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_EINVAL)
+    );
+    // Decoding claims only private file mappings.
+    let args = |flags| [0, 4096, 1, flags, 3, 0];
+    assert!(matches!(
+        HostFileCall::decode(LINUX_NR_MMAP, &args(LINUX_MAP_PRIVATE)),
+        Some(HostFileCall::MapPrivate(_))
+    ));
+    assert_eq!(
+        HostFileCall::decode(LINUX_NR_MMAP, &args(LINUX_MAP_SHARED)),
+        None
+    );
+    assert_eq!(
+        HostFileCall::decode(
+            LINUX_NR_MMAP,
+            &args(LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS)
+        ),
+        None
     );
 }

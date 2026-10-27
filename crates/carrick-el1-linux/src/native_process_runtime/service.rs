@@ -61,6 +61,7 @@ enum CarrierContinuation {
 struct PendingHostFile {
     record: Box<[u8]>,
     output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+    map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
 }
 
 /// Ring-owned input of a typed service, retained until completion ACK.
@@ -316,6 +317,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         record: Box<[u8]>,
         output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
         resolves_path: bool,
+        map: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
     ) -> Result<NativeResume, NativeProcessError> {
         if resolves_path && !self.caller_has_admitted_credentials()? {
             return Ok(NativeResume::Returned(SyscallResult::new(
@@ -338,7 +340,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             },
             None,
             None,
-            ServicePayload::HostFile(PendingHostFile { record, output }),
+            ServicePayload::HostFile(PendingHostFile {
+                record,
+                output,
+                map,
+            }),
             false,
         )
     }
@@ -1619,6 +1625,36 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .host_file
                         .as_ref()
                         .ok_or(NativeProcessError::Stale)?;
+                    if let Some(key) = pending_file.map {
+                        // A private file mapping: the carrier retained the
+                        // byte source; the ring's reservation owner maps it
+                        // on this exact call's immediate retry.
+                        return match (
+                            carrick_personality_linux::native_host_file::map_source(
+                                &pending_file.record,
+                            ),
+                            result,
+                        ) {
+                            (Err(result), _) => Ok(NativeResume::Returned(result)),
+                            (Ok(_), ServiceResult::Cancelled) => Ok(NativeResume::Returned(
+                                SyscallResult::new(carrick_syscall_abi::LINUX_EINTR.guest_retval()),
+                            )),
+                            (Ok(source), _) => {
+                                self.runtime.graph.lock().map_sources.insert(
+                                    self.record,
+                                    (
+                                        key,
+                                        carrick_core_abi::HostBackingIdentity::new(
+                                            source.handle,
+                                            source.generation,
+                                            0,
+                                        ),
+                                    ),
+                                );
+                                Ok(NativeResume::RetrySyscall)
+                            }
+                        };
+                    }
                     let mut copy_out = |address: u64, bytes: &[u8]| {
                         self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)
                             .is_ok()

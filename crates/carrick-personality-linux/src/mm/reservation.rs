@@ -87,6 +87,45 @@ pub(super) fn mmap<M: ReservationPolicyAccess>(
     })
 }
 
+/// Linux `MAP_PRIVATE` of a file: the placement and charges of a private
+/// mapping, with its bytes supplied from `backing` on first touch (the same
+/// byte-source node an inherited private file mapping carries).
+pub(super) fn mmap_private_file<M: ReservationPolicyAccess>(
+    root: &mut M,
+    placement: Placement,
+    len: GuestLen,
+    prot: ReservationProtection,
+    backing: HostBackingIdentity,
+) -> Result<Decision, Refusal> {
+    let len = len.raw();
+    if root.has_pending_edit() || root.fork_pending() {
+        return Err(Refusal::Busy);
+    }
+    if backing.advance(len).is_none() {
+        return Err(Refusal::Invalid);
+    }
+    let range = place(root, placement, GuestLen::new(len))?;
+    let address = range.start();
+    let decision = root.propose(ReservationProposal {
+        range,
+        protection: prot,
+        operation: ReservationOperation::Prepare,
+        result: UserVa::new(address),
+        policy_value: UserVa::new(LinuxReservationLayout::from(root.layout()).brk),
+        require_coverage: false,
+        source: None,
+        flags: ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+    })?;
+    if let Decision::Work(request) = decision
+        && let Err(refusal) = root.write_pending_backing(backing)
+    {
+        // Never leave a proposal pending behind a refused source.
+        root.refuse(request)?;
+        return Err(refusal);
+    }
+    Ok(decision)
+}
+
 pub(super) fn mremap<M: ReservationPolicyAccess>(
     root: &mut M,
     source: ReservationRange,
