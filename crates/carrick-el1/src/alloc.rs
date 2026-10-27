@@ -682,21 +682,8 @@ pub fn run_stack_guard_witness(depth: u64) -> u64 {
     u64::from(core::hint::black_box(&record)[1023]).wrapping_add(below)
 }
 
-// Landing for the armed-fixup witness: if the vector ever took the armed
-// fixup for a guard fault, EL1 would resume here and trap through `hvc #3`
-// from outside the current-EL handler (a generic EL1 fault, not a typed
-// stack overflow), which the signed witness reports as red.
-#[cfg(all(
-    feature = "allocator-test-control",
-    target_os = "none",
-    target_arch = "aarch64"
-))]
-core::arch::global_asm!(
-    ".global carrick_el1_guard_witness_landing",
-    "carrick_el1_guard_witness_landing:",
-    "hvc #3",
-    "b carrick_el1_guard_witness_landing",
-);
+// The armed-fixup witnesses' landing stub lives in the reviewed
+// `isa::aarch64` boundary (`carrick_el1_guard_witness_landing`).
 
 /// Test-control witness (#369): overflow the EL1 stack while a user-copy
 /// fixup is armed. The guard fault must still fail loud as a stack

@@ -660,3 +660,19 @@ pub unsafe fn set_signal_stack(sp: carrick_guest_arch::UserVa) {
         core::arch::asm!("msr sp_el0, {}", in(reg) sp.raw(), options(nomem, nostack));
     }
 }
+
+// Landing for the armed-fixup witness: if the vector ever took the armed
+// fixup for a guard fault, EL1 would resume here and trap through `hvc #3`
+// from outside the current-EL handler (a generic EL1 fault, not a typed
+// stack overflow), which the signed witness reports as red.
+#[cfg(all(
+    feature = "allocator-test-control",
+    target_os = "none",
+    target_arch = "aarch64"
+))]
+core::arch::global_asm!(
+    ".global carrick_el1_guard_witness_landing",
+    "carrick_el1_guard_witness_landing:",
+    "hvc #3",
+    "b carrick_el1_guard_witness_landing",
+);
