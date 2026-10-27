@@ -27,6 +27,14 @@ env:
   CARGO_INCREMENTAL: "0"
   # Only cache-warm publishes the three bounded hosted compiler caches.
   SCCACHE_CACHE_SIZE: "3G"
+  # Hosted jobs share one unbounded compiler cache in Cloudflare R2 (#858);
+  # scripts/ci/compiler-cache-env.sh selects it per job. These credentials are
+  # a read-only token: only cache-warm swaps in the writer token. Forks and
+  # Dependabot see empty secrets and fall back to the bounded GitHub cache.
+  CARRICK_SCCACHE_R2_BUCKET: carrick-sccache
+  CARRICK_SCCACHE_R2_ENDPOINT: https://687f8b8c824af34922f7bb4d1776f1a7.r2.cloudflarestorage.com
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
   # Harden registry transport against intermittent network errors without retrying tests.
   CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
   CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
@@ -48,8 +56,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -59,6 +71,9 @@ jobs:
             sccache-linux-x64-
       - name: Build lean xtask
         run: just ci-prebuild-xtask
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
       - uses: actions/upload-artifact@v4
         with:
           name: xtask-linux-x64
@@ -87,6 +102,9 @@ jobs:
     env:
       # Reserve quota for the two retained target caches and package/sysroot caches.
       SCCACHE_CACHE_SIZE: ${{ matrix.cache-size }}
+      # The only R2 writer; PR and queue jobs keep the read-only token.
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_WRITER_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_WRITER_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -97,8 +115,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh ${{ matrix.family }} read-write
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -194,6 +216,7 @@ jobs:
       - name: Compiler cache statistics after critical replay
         run: just build-cache
       - name: Save shared compiler cache
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -231,8 +254,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -272,8 +299,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -292,6 +323,9 @@ jobs:
           echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Compile the all-features xtask test union once
         run: just ci-build-xtask-tests
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
       - uses: actions/upload-artifact@v4
         with:
           name: xtask-tests-linux-x64
@@ -398,8 +432,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -454,8 +492,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -540,8 +582,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -605,8 +651,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -713,8 +763,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -766,8 +820,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -830,8 +888,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh darwin-hosted read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -882,8 +944,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh darwin-hosted read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -926,8 +992,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh darwin-hosted read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -975,8 +1045,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh darwin-hosted read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -1019,8 +1093,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh darwin-hosted read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -1063,8 +1141,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh darwin-hosted read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -1107,8 +1189,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -1190,8 +1276,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-arm64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -1239,8 +1329,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -1352,8 +1446,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
@@ -1456,8 +1554,12 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
       - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
