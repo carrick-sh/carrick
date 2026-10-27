@@ -504,7 +504,8 @@ pub enum ProcessForkParent {
     /// fork(2): the parent returns the child's pid at once.
     Runs,
     /// vfork(2) (`CLONE_VM|CLONE_VFORK|SIGCHLD`): the parent returns the
-    /// child's pid only after the child's exec commits or the child exits.
+    /// child's pid only after the child's exec is admitted or the child
+    /// exits. A venue that cannot guarantee that release may return at once.
     SuspendedUntilExecOrExit,
 }
 
@@ -532,7 +533,8 @@ impl ProcessForkChildTid {
 
     /// vfork(2) served with a copy-on-write child: Linux's `clone(2)` lets
     /// the child run on `stack` (glibc passes the caller's own sp), and the
-    /// parent stays suspended until the child execs or exits.
+    /// parent is suspended as [`ProcessForkParent::SuspendedUntilExecOrExit`]
+    /// describes.
     pub const fn vfork(stack: UserVa) -> Self {
         Self {
             stack: if stack.raw() == 0 { None } else { Some(stack) },
