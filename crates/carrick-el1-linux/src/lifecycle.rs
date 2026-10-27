@@ -158,8 +158,10 @@ impl<
         Ok(())
     }
     fn process_fork(&mut self, child_tid: ProcessForkChildTid) -> Option<LifecycleOutcome> {
-        let outcome = super::native_fork_refusal::observe_process_venue(self.process_venue())?
+        let mut outcome = super::native_fork_refusal::observe_process_venue(self.process_venue())?
             .fork(child_tid);
+        // A suspended vfork parent parked: run its child (queued here) next.
+        self.run_ready_after_native_transfer(&mut outcome);
         if matches!(&outcome, LifecycleOutcome::Returned { result, .. } if result.raw() > 0) {
             let task_index = self.frame.task_index();
             if let (Some(slot), Some(zone)) = (self.frame.slot(), self.zone.as_mut())

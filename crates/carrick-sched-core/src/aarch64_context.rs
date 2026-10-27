@@ -141,6 +141,9 @@ impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
     fn fork_child(self, address: AddressContext<RootGpa>) -> Self {
         Aarch64ParkedContext::fork_child(self, address)
     }
+    fn set_user_stack(&mut self, stack: u64) {
+        self.native.sp_el0 = stack;
+    }
     fn set_syscall_return(&mut self, value: u64) {
         Aarch64ParkedContext::set_syscall_return(self, value);
     }

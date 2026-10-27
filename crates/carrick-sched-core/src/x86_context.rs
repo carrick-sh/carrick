@@ -131,6 +131,9 @@ impl carrick_guest_arch::ProcessContext for ParkedContextWords {
     fn fork_child(self, address: AddressContext<RootGpa>) -> Self {
         ParkedContextWords::fork_child(self, address)
     }
+    fn set_user_stack(&mut self, stack: u64) {
+        self.frame[18] = stack; // RSP in IRET's five-word tail.
+    }
     fn set_syscall_return(&mut self, value: u64) {
         ParkedContextWords::set_syscall_return(self, value);
     }

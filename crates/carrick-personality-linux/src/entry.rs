@@ -33,6 +33,12 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
             0,
         ];
         crate::lifecycle::SYS_CLONE as u64
+    } else if native == 58 {
+        // vfork (glibc x86_64 issues it directly) has no canonical syscall
+        // either: normalize it to clone(CLONE_VM|CLONE_VFORK|SIGCHLD, 0),
+        // the same shape ARM libcs pass, preserving its native nr.
+        args = [crate::lifecycle::VFORK_CLONE_FLAGS, 0, 0, 0, 0, 0];
+        crate::lifecycle::SYS_CLONE as u64
     } else {
         carrick_syscall_abi::syscall_x86_64::canonical_x86_64(carrick_syscall_abi::NativeNr(native))
             .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw)

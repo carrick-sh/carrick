@@ -769,7 +769,12 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         // This bounded CPL0 fixture has no child-MM copy aperture. Keep its
         // former ENOSYS for TID-bearing clones until that owner can publish
         // the child-only write and wake, instead of reporting false success.
-        if child_tid.set || child_tid.clear {
+        // Nor can it suspend a vfork parent or place a child stack.
+        if child_tid.set
+            || child_tid.clear
+            || child_tid.stack.is_some()
+            || child_tid.parent != carrick_personality_linux::lifecycle::ProcessForkParent::Runs
+        {
             return None;
         }
         if !crate::process::process_mode()

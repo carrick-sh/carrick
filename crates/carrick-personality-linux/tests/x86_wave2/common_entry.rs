@@ -794,7 +794,8 @@ fn common_linux_entry_calls_native_process_custody() {
             Some(ProcessForkChildTid {
                 address: UserVa::new(0x7000),
                 set,
-                clear
+                clear,
+                ..ProcessForkChildTid::NONE
             }),
         );
     }
@@ -870,6 +871,37 @@ fn common_linux_entry_calls_native_process_custody() {
         );
         assert_eq!(process.visits.len(), 12);
     }
+    // vfork(2): x86's native vfork (58) and a raw clone with exactly
+    // CLONE_VM|CLONE_VFORK|SIGCHLD reach the process venue as one
+    // suspended-parent fork, never the thread path. A clone stack is the
+    // child's stack (arm64 glibc passes its own sp).
+    for (native, args, stack) in [
+        (58, [0; 6], None),
+        (56, [0x4111, 0, 0, 0, 0, 0], None),
+        (56, [0x4111, 0x5000, 0, 0, 0, 0], Some(UserVa::new(0x5000))),
+    ] {
+        let call = carrick_personality_linux::entry::decode_x86_64(native, args, 0x7fff0000);
+        assert_eq!(
+            served_result(serve_full(
+                &call,
+                &world,
+                &mut anonymous,
+                Some(&mut process),
+                None,
+            )),
+            Some(42),
+            "vfork shape {native} {args:x?} must be served by the process venue",
+        );
+        assert_eq!(
+            process.fork_tids.last().copied(),
+            Some(ProcessForkChildTid {
+                stack,
+                parent: carrick_personality_linux::lifecycle::ProcessForkParent::SuspendedUntilExecOrExit,
+                ..ProcessForkChildTid::NONE
+            }),
+        );
+    }
+    assert_eq!(process.visits.len(), 15);
 }
 
 #[test]
