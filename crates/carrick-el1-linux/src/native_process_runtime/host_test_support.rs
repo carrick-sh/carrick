@@ -2782,6 +2782,53 @@ fn sigkill_wins_over_an_in_progress_native_exec_drain() {
     exec_drain_is_upgraded_by_terminal_sibling(Some(9));
 }
 
+/// Review P0 on #905: ring set*id changes a native caller's credentials
+/// without the host. The carrier's exec service checks access with the
+/// origin's host credentials, so a caller whose ring credentials changed is
+/// refused (counted ENOSYS) before any exec service is issued, never served
+/// under the origin's identity. A child inherits its parent's ring
+/// credentials at fork, so a root setuid before fork reaches the same check.
+#[cfg(test)]
+#[test]
+fn native_child_exec_after_ring_setuid_is_refused_before_service() {
+    use carrick_personality_linux::identity::ProcessIdentityVenue as _;
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    let (_, child_address, child_words) = capacity.select().unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let mut child = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            child_address,
+            &child_words,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        child.resume_checkpoint(),
+        Ok(NativeResume::NoPending)
+    ));
+    assert!(child.caller_has_admitted_credentials().unwrap());
+    child.set_uid(1000).unwrap();
+    assert!(!child.caller_has_admitted_credentials().unwrap());
+    assert!(matches!(
+        child.begin_exec_service(test_exec_payload(b"/bin/static")),
+        Ok(NativeResume::Returned(result))
+            if result.raw() == carrick_syscall_abi::LINUX_ENOSYS.guest_retval()
+    ));
+    assert!(
+        child.take_handoff_receipt().is_none(),
+        "no exec service was issued under the wrong credentials"
+    );
+}
+
 #[cfg(test)]
 #[test]
 fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
