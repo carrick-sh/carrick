@@ -347,6 +347,14 @@ pub const ZONE_IDLE_FAR: u8 = 84;
 /// The runtime terminates only this MM with SIGKILL.
 pub const STAGE2_AUTHORITY_INVARIANT: u8 = 85;
 
+/// A task backend whose retirement was refused entered the process
+/// quarantine. `a` is the number now held, `b` the budget.
+pub const RETIREMENT_QUARANTINED: u8 = 94;
+
+pub fn rec_retirement_quarantined(held: u64, capacity: u64) {
+    rec(RETIREMENT_QUARANTINED, low32(held), low32(capacity), 0);
+}
+
 pub fn rec_stage2_authority_invariant(
     mm: u64,
     tid: i32,
@@ -1932,6 +1940,10 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
                 a as u32, c as u32
             )
         }
+        RETIREMENT_QUARANTINED => format!(
+            "RETIREMENT_QUARANTINED held={} capacity={}",
+            a as u32, b as u32
+        ),
         STAGE2_AUTHORITY_INVARIANT_EDITOR => format!(
             "STAGE2_AUTHORITY_INVARIANT_EDITOR mm={} current_revision={} editor_held={}",
             a as u32,

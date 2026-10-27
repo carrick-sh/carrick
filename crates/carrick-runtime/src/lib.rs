@@ -103,6 +103,24 @@ pub mod el1_census;
 
 /// Append the shared reservation owner's live root lock words to a terminal
 /// event census while the EL1 region remains mapped.
+/// Retained task backends against the process retirement-quarantine budget.
+pub fn write_retirement_quarantine_census(out: &mut impl core::fmt::Write) -> core::fmt::Result {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        vcpu_loop::continuation::quantum::write_retirement_quarantine_census(out)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let quarantine = &carrick_core::mm::retirement::RETIREMENT_QUARANTINE;
+        writeln!(
+            out,
+            "retirement quarantine: held={} capacity={}",
+            quarantine.held(),
+            quarantine.capacity()
+        )
+    }
+}
+
 pub fn write_reservation_root_census(out: &mut impl core::fmt::Write) -> core::fmt::Result {
     if let Some(roots) = carrick_el1::memory::reservations::shared_host() {
         roots.write_lock_census(out)?;

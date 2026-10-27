@@ -417,6 +417,61 @@ impl<V: ResidencyVenue, G: Copy + Eq> ResidencyRetirement<V, G> {
     }
 }
 
+/// Process-wide budget for task backends retained after a typed retirement
+/// refusal. A refused terminal transaction has no safe reclaim point: its
+/// exact custody (and the IPAs it still names) must stay live. Retaining is
+/// counted and bounded here, by the neutral retirement owner; once the
+/// budget is spent the caller must treat the refusal as a carrier fault
+/// rather than accumulate unbounded custody. One process can host several
+/// carriers (in-process embedding), so the bound is per process.
+#[derive(::core::fmt::Debug)]
+pub struct RetirementQuarantine {
+    held: AtomicU64,
+    capacity: u64,
+}
+
+/// The quarantine budget is spent.
+#[derive(Clone, Copy, ::core::fmt::Debug, PartialEq, Eq)]
+pub struct RetirementQuarantineExhausted {
+    pub capacity: u64,
+}
+
+impl RetirementQuarantine {
+    pub const fn new(capacity: u64) -> Self {
+        Self {
+            held: AtomicU64::new(0),
+            capacity,
+        }
+    }
+
+    /// Admit one more retained backend. Returns the number now held.
+    pub fn admit(&self) -> Result<u64, RetirementQuarantineExhausted> {
+        self.held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < self.capacity).then_some(held + 1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| RetirementQuarantineExhausted {
+                capacity: self.capacity,
+            })
+    }
+
+    pub fn held(&self) -> u64 {
+        self.held.load(Ordering::Acquire)
+    }
+
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
+    }
+}
+
+/// Retained-backend capacity of one process.
+pub const RETIREMENT_QUARANTINE_CAPACITY: u64 = 64;
+
+/// The process's retirement quarantine budget.
+pub static RETIREMENT_QUARANTINE: RetirementQuarantine =
+    RetirementQuarantine::new(RETIREMENT_QUARANTINE_CAPACITY);
+
 pub use carrick_core_abi::mm::custody::*;
 
 pub fn record_identity_mismatch(

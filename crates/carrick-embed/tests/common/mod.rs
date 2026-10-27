@@ -316,6 +316,7 @@ impl Watchdog {
                     // Root lock words distinguish a missing producer from an
                     // EL1 critical section that left its image while held.
                     let _ = carrick_runtime::write_reservation_root_census(&mut census);
+                    let _ = carrick_runtime::write_retirement_quarantine_census(&mut census);
                     eprintln!("WATCHDOG zone census:\n{census}");
                 }
                 // The abort's post-mortem names every blocked thread's
