@@ -173,6 +173,10 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   LC_UUID, entitlement, `__dof_carrick`; run the full backend probe set on it;
   prove scoped cleanup. Earlier focused tests/`just ci`/400-of-400 receipts
   don't carry over.
+- **Smoke before you report signed-lane work.** Run `just smoke-signed`
+  (about 30 s warm: bootstrap, root exit, successor bootstrap, pipe, exec)
+  and attach its green `target/smoke-signed/receipt.json` for your exact
+  HEAD; nine of eleven #855 rounds died in this first second (#893).
 - **A signed verdict compares populations, not failure names.** A killed
   binary reports no failures (#344's watchdog cascade started 25 of 89 EL1
   tests and read clean): diff started tests and finished binaries against the

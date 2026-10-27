@@ -23,14 +23,13 @@ mod host_read_gate;
 
 use std::time::Duration;
 
-use carrick_abi::{NsGid, NsUid};
 use carrick_embed::{
-    Carrier, ContainerResult, EmbedError, InMemoryFileVfs, PullPolicy, hvpatch_task_loads_total,
-    read_el1_counters, reset_el1_counters, vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total,
-    vcpu_run_exit_classes, vcpu_run_exits_total,
+    Carrier, ContainerResult, PullPolicy, hvpatch_task_loads_total, read_el1_counters,
+    reset_el1_counters, vcpu_hvc_not_svc_reasons, vcpu_hvc_not_svc_total, vcpu_run_exit_classes,
+    vcpu_run_exits_total,
 };
 
-const FIXTURE: &str = "/opt/carrick/el1-sched";
+use common::{EL1_SCHED_FIXTURE as FIXTURE, carrier_or_fail, el1_sched_vfs};
 
 #[derive(Default)]
 struct HostReadTask(std::sync::Mutex<Option<carrick_kernel::kernel::objects::TaskRef>>);
@@ -206,39 +205,6 @@ fn measured_sample_backing_is_fixed_across_short_and_long_runs() {
         assert!(short_samples.is_empty());
         assert!(long_samples.is_empty());
     }
-}
-
-fn carrier_or_fail() -> Carrier {
-    for _ in 0..50 {
-        match Carrier::new() {
-            Ok(carrier) => return carrier,
-            Err(EmbedError::Entitlement) => panic!(
-                "HV_DENIED (0xfae94007): run through scripts/test-signed.sh; \
-                 a bare cargo test cannot boot a guest"
-            ),
-            Err(EmbedError::CarrierAlreadyActive) => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => panic!("carrier initialization failed: {error}"),
-        }
-    }
-    panic!("carrier initialization timed out waiting for a prior carrier to retire");
-}
-
-/// The static el1-sched fixture, mounted executable at `/opt/carrick`.
-fn el1_sched_vfs() -> InMemoryFileVfs {
-    let fixture = common::repo_root().join("target/embed-fixtures/el1-sched-aarch64");
-    let bytes = std::fs::read(&fixture).unwrap_or_else(|error| {
-        panic!(
-            "read {}: {error}; scripts/test-signed.sh must build the fixture first \
-             (scripts/build-embed-el1-sched.sh)",
-            fixture.display()
-        )
-    });
-    let vfs = InMemoryFileVfs::new();
-    vfs.add_file_with_metadata(FIXTURE, bytes, 0o755, NsUid::ROOT, NsGid::ROOT, 0)
-        .expect("install executable el1-sched fixture");
-    vfs
 }
 
 /// The carrier process's own CPU time (user + system) in nanoseconds. The

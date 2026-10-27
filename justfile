@@ -510,7 +510,7 @@ test-xtask *ARGS:
 
 [private]
 _test-xtask *ARGS:
-    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test smoke_signed --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
 
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:
@@ -1079,6 +1079,20 @@ gate-containers: build
 # NOT part of `just ci`.
 test-embed *ARGS: build
     env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-embed {{ARGS}}
+
+# Signed first-boot smoke (#893), about 30 s on a warm build: builds only the
+# carrick-embed `smoke_signed` target, signs it and runs bootstrap -> clean root
+# exit -> two successor bootstraps in one carrier, blocking pipe round trips
+# and a root exec through scripts/test-signed.sh (negative control and run-id
+# cleanup included); known-red cases (fork + wait, #740 follow-ups) run as
+# informational. Writes target/smoke-signed/<run-id>/receipt.json (and
+# target/smoke-signed/receipt.json) binding HEAD, clean tree, artifact
+# SHA-256/CDHash/LC_UUID, per-case results, durations and cleanup counts; the
+# exit status is the verdict. Refuses a dirty tracked tree (`--allow-dirty`
+# runs but never qualifies). Attach a green receipt for your exact HEAD before
+# reporting signed-lane work. Needs the fixture bundle for HEAD's inputs.
+smoke-signed *ARGS:
+    {{_xtask}} smoke-signed {{ARGS}}
 
 # Guest-running tests of carrick-vmm-hvf from SIGNED cargo test executables.
 test-hvf *ARGS:
