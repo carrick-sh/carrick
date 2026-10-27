@@ -156,6 +156,7 @@ fn prepare_native_exec_image(
 struct NativePreparedExecImage {
     _request: carrick_core_abi::service::ServiceIdentity,
     plan: carrick_vmm_hvf::trap::GuestMappingPlan,
+    successor: carrick_kernel::dispatch::NativeSuccessorImage,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -171,8 +172,12 @@ impl core::fmt::Debug for NativePreparedExecImage {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_vmm_hvf::metadata_grant::NativeExecPreparation for NativePreparedExecImage {
-    fn into_mapping_plan(self: Box<Self>) -> carrick_vmm_hvf::trap::GuestMappingPlan {
-        self.plan
+    fn into_parts(self: Box<Self>) -> carrick_vmm_hvf::metadata_grant::NativeExecParts {
+        carrick_vmm_hvf::metadata_grant::NativeExecParts {
+            plan: self.plan,
+            lazy_regions: self.successor.lazy_regions,
+            sources: self.successor.sources,
+        }
     }
 }
 
@@ -182,6 +187,7 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
         &self,
         request: carrick_core_abi::service::ServiceRequest,
         payload: &[u8],
+        successor: carrick_el1_abi::ReservationMm,
     ) -> Result<
         Box<dyn carrick_vmm_hvf::metadata_grant::NativeExecPreparation>,
         carrick_core_abi::service::ServiceFailureCode,
@@ -190,12 +196,24 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             carrick_core_abi::service::ServiceFailureCode::new(errno.get() as u32)
                 .unwrap_or(carrick_core_abi::service::ServiceFailureCode::MINIMUM)
         };
+        let run = self
+            .run
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| fail(crate::linux_abi::LINUX_ENOSYS))?;
         let loaded = prepare_native_exec_image(self, payload).map_err(fail)?;
         let plan = carrick_vmm_hvf::trap::GuestMappingPlan::from_address_space(&loaded.image)
             .map_err(|_| fail(crate::linux_abi::LINUX_ENOMEM))?;
+        // The successor's ELF images become its own root's lazy nodes; the
+        // carrier maps only what the root records as opaque.
+        let successor = run
+            .dispatcher
+            .prepare_native_successor(&loaded.image, successor)
+            .map_err(fail)?;
         Ok(Box::new(NativePreparedExecImage {
             _request: request.identity,
             plan,
+            successor,
         }))
     }
 

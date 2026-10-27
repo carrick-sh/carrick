@@ -16,10 +16,13 @@ const UNROUTED_EXEC: ServiceFailureCode = match ServiceFailureCode::new(38) {
 /// Carrier-retained file/loader service. It owns no task lookup; the service
 /// cell has already authenticated `request` against the stopped ring member.
 pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
+    /// Prepare the image of `successor`, whose published reservation root is
+    /// still unadmitted: the service imports the image's rows into it.
     fn prepare(
         &self,
         request: ServiceRequest,
         payload: &[u8],
+        successor: carrick_el1_abi::ReservationMm,
     ) -> Result<Box<dyn NativeExecPreparation>, ServiceFailureCode>;
 
     /// Serve one ring-staged host-file record
@@ -48,7 +51,15 @@ pub struct NativeHostFileRefused;
 /// Opaque fallibly prepared image. Exact carrier custody retains this result
 /// until the ring consumes successor adoption or terminal cleanup drops it.
 pub trait NativeExecPreparation: core::fmt::Debug + Send + 'static {
-    fn into_mapping_plan(self: Box<Self>) -> crate::trap::GuestMappingPlan;
+    fn into_parts(self: Box<Self>) -> NativeExecParts;
+}
+
+/// A prepared successor image: the carrier maps `plan` except its lazy
+/// regions, which the successor's ring owner supplies from `sources`.
+pub struct NativeExecParts {
+    pub plan: crate::trap::GuestMappingPlan,
+    pub lazy_regions: Vec<(u64, u64)>,
+    pub sources: Vec<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
 }
 
 /// Exact carrier registration for a retained exec service.
@@ -163,6 +174,7 @@ mod native_exec_service_registration_tests {
             &self,
             _request: ServiceRequest,
             _payload: &[u8],
+            _successor: carrick_el1_abi::ReservationMm,
         ) -> Result<Box<dyn NativeExecPreparation>, ServiceFailureCode> {
             Err(ServiceFailureCode::MINIMUM)
         }
@@ -517,11 +529,11 @@ impl NativeService {
             Ok(service) => service,
             Err(unrouted) => return self.finish_exec_failure(unrouted),
         };
-        match service.prepare(request, payload) {
+        match service.prepare(request, payload, successor_mm) {
             Ok(prepared) => {
                 let prepared = match crate::trap::prepare_native_exec_successor(
                     Arc::clone(&self.custody),
-                    prepared.into_mapping_plan(),
+                    prepared.into_parts(),
                 ) {
                     Ok(prepared) => prepared,
                     Err(_) => {

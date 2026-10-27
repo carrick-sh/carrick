@@ -1027,7 +1027,7 @@ fn native_exec_successor_arena_has_no_terminal() {
         arena_end - 0x1000,
     ];
     let host = tables(&prepare_global_exec_plan(&plan, None).unwrap());
-    let native_plan = prepare_native_exec_global_plan(&plan).unwrap();
+    let native_plan = prepare_native_exec_global_plan(&plan, &[]).unwrap();
     let native = tables(&native_plan);
     for va in probes {
         assert_eq!(

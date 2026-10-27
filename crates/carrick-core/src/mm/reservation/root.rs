@@ -1916,6 +1916,20 @@ impl<
         self.gap(root, &mut cursor, len, arena.end())
             .or_else(|| (arena.end().saturating_sub(cursor) >= len).then_some(cursor))
     }
+    /// Whether root-editable nodes cover every byte of `range`.
+    fn editable_cover(&mut self, range: ReservationRange) -> bool {
+        let mut cursor = range.start();
+        while let Some(n) = self.next(cursor) {
+            if n.start > cursor || !Policy::root_editable(&n) {
+                return false;
+            }
+            cursor = n.end;
+            if cursor >= range.end() {
+                return true;
+            }
+        }
+        false
+    }
     fn in_layout(&self, range: ReservationRange) -> bool {
         let layout = self.state().layout;
         [layout.heap, layout.arena]
@@ -1952,7 +1966,18 @@ impl<
         {
             return Err(Refusal::PreparedConflict);
         }
-        if !self.in_layout(range) {
+        // The layout bounds where the root places mappings. Outside it, the
+        // root still owns an edit of nodes it holds whole: an imported image
+        // (an exec successor's executable, say) is protected or unmapped by
+        // its owner. Anything else there belongs to the host.
+        let edits_held_nodes = matches!(
+            operation,
+            ReservationOperation::Protect
+                | ReservationOperation::Retire
+                | ReservationOperation::Decommit
+        );
+        let root_owned = self.in_layout(range) || (edits_held_nodes && self.editable_cover(range));
+        if !root_owned {
             return Err(Refusal::ForeignMapping);
         }
         // A retired resident extent's frames are unreusable until the
@@ -5324,6 +5349,72 @@ mod tests {
             table.release(node, parent.banks);
         }
         assert_eq!(count_free(&parent), initial_free);
+    }
+
+    /// An exec successor's image lies outside the placement layout (a PIE
+    /// at 0x88_0000_0000). The root edits the image nodes it holds there
+    /// (RELRO `mprotect`, `munmap`), but a range it does not cover, or a
+    /// new placement there, still belongs to the host.
+    #[test]
+    fn imported_image_nodes_outside_the_layout_are_root_edited() {
+        use core::num::NonZeroU64;
+        let table = table();
+        let mm = ReservationMm::new(5).unwrap();
+        table.publish(1, mm, layout()).unwrap();
+        let mut g = table.lock(1, mm).unwrap();
+        let image = range(0x2000_0000, 0x2000_4000);
+        let source = HostBackingIdentity::new(NonZeroU64::new(3).unwrap(), NonZeroU64::MIN, 0);
+        g.import_with_backing(
+            image,
+            ReservationProtection::READ_WRITE,
+            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+            source,
+        )
+        .unwrap();
+        g.import_with(
+            range(0x2000_8000, 0x2000_9000),
+            ReservationProtection::READ,
+            ReservationNodeFlags::PRIVATE,
+        )
+        .unwrap();
+        g.finish_import().unwrap();
+        let relro = range(0x2000_1000, 0x2000_2000);
+        let decision = g.mprotect(relro, ReservationProtection::READ).unwrap();
+        assert!(
+            matches!(decision, Decision::Work(_)),
+            "RELRO is the root's edit"
+        );
+        complete(&mut g, decision);
+        assert_eq!(
+            g.mapping(0x2000_1000).map(|m| m.protection),
+            Some(ReservationProtection::READ)
+        );
+        // A hole, an opaque row, or a range running past the image: host.
+        for (edit, why) in [
+            (range(0x2000_4000, 0x2000_5000), "hole"),
+            (range(0x2000_8000, 0x2000_9000), "opaque row"),
+            (range(0x2000_3000, 0x2000_5000), "past the image"),
+        ] {
+            assert_eq!(
+                g.mprotect(edit, ReservationProtection::READ),
+                Err(Refusal::ForeignMapping),
+                "{why}"
+            );
+        }
+        // Placement there is never the root's.
+        assert_eq!(
+            g.mmap(
+                Placement::Fixed(0x2000_4000),
+                0x1000,
+                ReservationProtection::READ_WRITE
+            ),
+            Err(Refusal::ForeignMapping)
+        );
+        let decision = g.munmap(range(0x2000_0000, 0x2000_1000)).unwrap();
+        assert!(
+            matches!(decision, Decision::Work(_)),
+            "unmap is the root's edit"
+        );
     }
 
     #[test]

@@ -681,6 +681,7 @@ pub use fs::MountRetirement;
 pub(crate) use fs::{LegacyAioContextId, SplicePushback};
 #[macro_use]
 pub mod mem;
+pub use mem::NativeSuccessorImage;
 pub use mem::boot_private_file_backings;
 #[macro_use]
 pub(crate) mod net;
