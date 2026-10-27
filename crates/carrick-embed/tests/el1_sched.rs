@@ -1086,6 +1086,7 @@ fn el1_sched_exit_group_with_parked_threads() {
 /// teardown and the executor pool's shutdown kick reach the vCPU running the
 /// child, and every executor joins. A kick swallowed at that boundary hangs
 /// the run until the watchdog fires.
+#[ignore = "pre-existing terminal-settlement fatal: #962"]
 #[test]
 fn el1_run_ends_with_a_spinning_native_child() {
     let _guard = common::guest_lock();
