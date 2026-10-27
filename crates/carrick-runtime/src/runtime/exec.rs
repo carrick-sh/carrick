@@ -937,6 +937,87 @@ mod tests {
         );
     }
 
+    /// A minimal ET_DYN AArch64 image, as the dynamic loader is.
+    fn synthetic_aarch64_interpreter() -> Vec<u8> {
+        let mut elf = synthetic_aarch64_exec();
+        const ET_DYN: u16 = 3;
+        elf[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x1000_u64.to_le_bytes());
+        let ph = 64;
+        elf[ph + 16..ph + 24].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[ph + 24..ph + 32].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf
+    }
+
+    /// A minimal ET_EXEC AArch64 image whose PT_INTERP names `interpreter`.
+    fn synthetic_dynamic_aarch64_exec(interpreter: &str) -> Vec<u8> {
+        const PT_INTERP: u32 = 3;
+        let mut elf = synthetic_aarch64_exec();
+        // Two program headers: PT_LOAD (already at 64) and PT_INTERP at 120.
+        elf[56..58].copy_from_slice(&2_u16.to_le_bytes());
+        let interp_offset = 0x200_u64;
+        let mut name = interpreter.as_bytes().to_vec();
+        name.push(0);
+        elf[interp_offset as usize..interp_offset as usize + name.len()].copy_from_slice(&name);
+        let ph = 64 + 56;
+        elf[ph..ph + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&4_u32.to_le_bytes());
+        elf[ph + 8..ph + 16].copy_from_slice(&interp_offset.to_le_bytes());
+        elf[ph + 16..ph + 24].copy_from_slice(&(0x400000 + interp_offset).to_le_bytes());
+        elf[ph + 24..ph + 32].copy_from_slice(&(0x400000 + interp_offset).to_le_bytes());
+        elf[ph + 32..ph + 40].copy_from_slice(&(name.len() as u64).to_le_bytes());
+        elf[ph + 40..ph + 48].copy_from_slice(&(name.len() as u64).to_le_bytes());
+        elf[ph + 48..ph + 56].copy_from_slice(&1_u64.to_le_bytes());
+        elf
+    }
+
+    /// #937: a native fork child's exec of a dynamically linked binary in a
+    /// usrmerge rootfs (`/lib -> usr/lib`) must resolve its PT_INTERP through
+    /// the layered rootfs, exactly as the host-owned exec does.
+    #[test]
+    fn native_child_exec_prepares_a_dynamic_binary_through_a_usrmerge_rootfs() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let lower = tempfile::tempdir().unwrap();
+        let root = lower.path();
+        std::fs::create_dir_all(root.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", root.join("lib")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+        let interpreter = root.join("usr/lib/ld-linux-aarch64.so.1");
+        std::fs::write(&interpreter, synthetic_aarch64_interpreter()).unwrap();
+        std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = root.join("usr/bin/true");
+        std::fs::write(
+            &binary,
+            synthetic_dynamic_aarch64_exec("/lib/ld-linux-aarch64.so.1"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(root).unwrap();
+        let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+        // The host-owned exec resolves the interpreter (control).
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let files = dispatcher.capture_exec_files(&context).unwrap();
+        let loader = ExecLoaderCapabilities::capture(&dispatcher);
+        drop(context);
+        for spelling in ["/usr/bin/true", "/bin/true"] {
+            load_execve_image(&loader, &files, spelling, vec![], vec![], false)
+                .unwrap_or_else(|errno| panic!("host-owned exec of {spelling}: errno {errno:?}"));
+        }
+
+        let capability = capture_native_exec_capability(&dispatcher).unwrap();
+        for spelling in ["/usr/bin/true", "/bin/true"] {
+            let payload =
+                native_exec_payload(carrick_core_abi::service::ExecCall::Execve, spelling);
+            let loaded = prepare_native_exec_image(&capability, &payload)
+                .unwrap_or_else(|errno| panic!("native exec of {spelling}: errno {errno:?}"));
+            assert_ne!(loaded.image.entry(), 0x400000, "entered the interpreter");
+        }
+        drop(dispatcher);
+    }
+
     #[test]
     fn native_exec_capability_outlives_context_without_host_task_lookup() {
         let dispatcher = SyscallDispatcher::new();
