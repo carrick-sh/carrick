@@ -851,8 +851,8 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         banks: Option<&dyn storage::NodeBanks>,
         capacity: u32,
     ) -> Result<u32, Refusal> {
-        // One bounded attempt: contention/capacity must unwind to admission,
-        // not spin on another MM while retaining this MM's authority.
+        // One attempt: a lost race returns `Busy` for the caller to retry
+        // (`pool_node`); capacity unwinds to admission as MetadataRequired.
 
         let head = self.free.load(Ordering::Acquire);
         let index = head as u32;
@@ -2064,13 +2064,17 @@ impl<
         Ok(Decision::Work(request))
     }
     /// One node from the shared pool. A lost free-list race means another
-    /// allocation completed: a host guard retries it (lock-free progress,
-    /// no wait on any event), EL1 answers `Busy` and forwards. Only an
-    /// empty pool ends a host pop (`MetadataRequired`).
+    /// allocation or return completed, so every holder retries it: that is
+    /// lock-free progress with no wait on any event or other MM's lock. A
+    /// lost race is never an answer: an MM with no host venue (a native
+    /// process) cannot forward it, and turning it into a refusal made a
+    /// guest-visible ENOSYS, or a killed exec, depend on which other MM
+    /// allocated at the same instant (#955). Only an empty pool ends a pop
+    /// (`MetadataRequired`).
     fn pool_node(&self) -> Result<u32, Refusal> {
         loop {
             match self.table.allocate(self.banks, self.node_capacity) {
-                Err(Refusal::Busy) if self.host_holder => core::hint::spin_loop(),
+                Err(Refusal::Busy) => core::hint::spin_loop(),
                 result => return result,
             }
         }
@@ -3640,10 +3644,10 @@ mod tests {
     }
 
     /// A lost free-list race (another allocation won the CAS) is not an
-    /// answer a host guard may give: it retries the pop. EL1 declines with
-    /// its one attempt and forwards.
+    /// answer any holder gives: host and EL1 guards both retry the pop
+    /// (#955: an EL1 refusal became a native process's ENOSYS).
     #[test]
-    fn a_host_pool_pop_retries_a_lost_race_and_el1_declines() {
+    fn every_pool_pop_retries_a_lost_race() {
         let table = table();
         let mm = ReservationMm::new(61).unwrap();
         table.publish(0, mm, layout()).unwrap();
@@ -3661,11 +3665,7 @@ mod tests {
         drop(host);
         LOSE_POPS.with(|lose| lose.set(1));
         let guest = table.lock_el1(0, mm, 4).unwrap();
-        assert_eq!(
-            guest.pool_node(),
-            Err(Refusal::Busy),
-            "EL1 takes one attempt"
-        );
+        assert!(guest.pool_node().is_ok(), "EL1 retries past a lost race");
         LOSE_POPS.with(|lose| lose.set(0));
     }
 
