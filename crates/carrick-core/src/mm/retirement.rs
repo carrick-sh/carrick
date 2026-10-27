@@ -431,7 +431,13 @@ pub struct RetirementQuarantine {
 }
 
 /// The quarantine budget is spent.
-#[derive(Clone, Copy, ::core::fmt::Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct RetirementQuarantineExhausted {
     pub capacity: u64,
 }
@@ -467,10 +473,6 @@ impl RetirementQuarantine {
 
 /// Retained-backend capacity of one process.
 pub const RETIREMENT_QUARANTINE_CAPACITY: u64 = 64;
-
-/// The process's retirement quarantine budget.
-pub static RETIREMENT_QUARANTINE: RetirementQuarantine =
-    RetirementQuarantine::new(RETIREMENT_QUARANTINE_CAPACITY);
 
 pub use carrick_core_abi::mm::custody::*;
 

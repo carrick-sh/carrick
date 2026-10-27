@@ -26,47 +26,6 @@ use carrick_kernel::kernel::continuation::next_nonzero;
 
 static NEXT_RUNNER_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Backends whose physical retirement was refused, retained for the process
-/// lifetime. Held here (not forgotten) so the census can count them; there is
-/// deliberately no lookup or reuse path that could recycle their identities.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-static QUARANTINED_BACKENDS: Mutex<Vec<Box<dyn std::any::Any + Send>>> = Mutex::new(Vec::new());
-
-/// Retain a backend whose physical retirement was refused. The task is
-/// failed closed, but dropping this authority would turn a typed lifecycle
-/// refusal into a carrier abort and could make its IPA reusable without a
-/// matching retirement receipt. Admission is counted and bounded by
-/// `carrick_core::mm::retirement::RETIREMENT_QUARANTINE`; when the budget is
-/// spent the backend is handed back and the caller's ordinary drop (a carrier
-/// fault) follows.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn quarantine_refused_retirement_backend(
-    backend: Box<dyn std::any::Any + Send>,
-) -> Result<u64, Box<dyn std::any::Any + Send>> {
-    match carrick_core::mm::retirement::RETIREMENT_QUARANTINE.admit() {
-        Ok(held) => {
-            QUARANTINED_BACKENDS.lock().push(backend);
-            carrick_kernel::event_ring::rec_retirement_quarantined(
-                held,
-                carrick_core::mm::retirement::RETIREMENT_QUARANTINE.capacity(),
-            );
-            Ok(held)
-        }
-        Err(_) => Err(backend),
-    }
-}
-
-/// One census line: retained backends against the process budget.
-pub fn write_retirement_quarantine_census(out: &mut impl core::fmt::Write) -> core::fmt::Result {
-    let quarantine = &carrick_core::mm::retirement::RETIREMENT_QUARANTINE;
-    writeln!(
-        out,
-        "retirement quarantine: held={} capacity={}",
-        quarantine.held(),
-        quarantine.capacity()
-    )
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuantumExit {
     Runnable,
@@ -564,6 +523,7 @@ impl HvpatchTaskBinding {
         &self,
         _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
         _stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
+        _quarantine: &carrick_kernel::kernel::core::RetirementQuarantineStore,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, crate::trap::TrapError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -606,7 +566,7 @@ impl HvpatchTaskBinding {
                     // its drop until the end of this settlement. Retain it in
                     // the carrier quarantine instead: the exact authority and
                     // its non-reusable IPAs stay live without aborting peers.
-                    match quarantine_refused_retirement_backend(backend) {
+                    match _quarantine.retain(backend) {
                         Ok(_) => Err(error),
                         Err(backend) => {
                             eprintln!(
@@ -1056,21 +1016,35 @@ mod tests {
             }
         }
 
+        // #855 review P2-6: the quarantine is the carrier kernel's, counted
+        // and bounded by the neutral retirement owner, and visible in the
+        // census; past its budget the backend is handed back, not hoarded.
+        let store = carrick_kernel::kernel::core::RetirementQuarantineStore::new();
         let dropped = Arc::new(AtomicBool::new(false));
-        let before = carrick_core::mm::retirement::RETIREMENT_QUARANTINE.held();
-        let held = quarantine_refused_retirement_backend(Box::new(DropProbe(Arc::clone(&dropped))))
+        let held = store
+            .retain(Box::new(DropProbe(Arc::clone(&dropped))))
             .unwrap_or_else(|_| panic!("the quarantine budget admits a refused backend"));
         assert!(
             !dropped.load(Ordering::Acquire),
-            "typed retirement refusal must retain backend custody for the process lifetime"
+            "typed retirement refusal must retain backend custody for the carrier lifetime"
         );
-        assert_eq!(held, before + 1, "every retained backend is counted");
+        assert_eq!(held, 1, "every retained backend is counted");
         let mut census = String::new();
-        write_retirement_quarantine_census(&mut census).unwrap();
+        store.write_census(&mut census).unwrap();
+        assert!(census.contains("held=1 capacity="), "{census}");
+        for _ in 1..store.capacity() {
+            assert!(store.retain(Box::new(())).is_ok());
+        }
+        let refused = Arc::new(AtomicBool::new(false));
+        let returned = store
+            .retain(Box::new(DropProbe(Arc::clone(&refused))))
+            .expect_err("the budget is bounded");
+        drop(returned);
         assert!(
-            census.contains(&format!("held={held} capacity=")),
-            "{census}"
+            refused.load(Ordering::Acquire),
+            "an over-budget backend is handed back"
         );
+        assert_eq!(store.held(), store.capacity());
     }
     use carrick_kernel::kernel::continuation::test_support::bootstrap;
     #[test]

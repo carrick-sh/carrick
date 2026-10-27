@@ -595,6 +595,10 @@ pub struct DebugSchedulerRow {
     /// queue). None: a shard lock was contended, or an older producer.
     #[serde(default)]
     pub zone_held: Option<Vec<DebugZoneHeldRow>>,
+    /// Task backends this carrier retains after refused retirements, and
+    /// the budget. None: an older producer.
+    #[serde(default)]
+    pub retirement_quarantine: Option<(u64, u64)>,
 }
 
 /// One zone-held runnable row and who is expected to run it. A row whose

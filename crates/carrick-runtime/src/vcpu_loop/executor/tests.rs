@@ -313,6 +313,7 @@ impl PersistentTaskBinding for FakeBinding {
         &self,
         root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
         _stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
+        _quarantine: &carrick_kernel::kernel::core::RetirementQuarantineStore,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         if self.retire_requires_materialized.load(Ordering::SeqCst)
             && !self.terminal_residency_retired.load(Ordering::SeqCst)

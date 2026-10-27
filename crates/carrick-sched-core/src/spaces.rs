@@ -285,6 +285,23 @@ impl ExcludedEditor<'_> {
     }
 }
 
+impl ExcludedEditor<'static> {
+    /// Bootstrap proof for an MM before any EL1 region exists, taken in no
+    /// directory at all. `None` for key 0.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have established that no guest EL1 editor of any MM
+    /// can exist: no EL1 region (and so no zone directory) is installed.
+    /// The kernel's bootstrap exclusion is the one intended caller.
+    pub unsafe fn bootstrap_unpublished(key: u64) -> Option<Self> {
+        (key != 0).then_some(Self {
+            key,
+            _spaces: core::marker::PhantomData,
+        })
+    }
+}
+
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'a, C> {
     /// Exact MM identity whose Editor word admitted this mutation.
     pub fn key(&self) -> u64 {

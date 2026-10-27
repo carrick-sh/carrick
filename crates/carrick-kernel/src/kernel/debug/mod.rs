@@ -544,6 +544,7 @@ mod tests {
                     residencies: None,
                     host_queued: None,
                     zone_held: None,
+                    retirement_quarantine: None,
                 })
                 .into_iter()
                 .collect()

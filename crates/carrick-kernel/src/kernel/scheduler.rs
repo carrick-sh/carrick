@@ -1119,6 +1119,7 @@ pub struct SchedulerSummary {
     /// Zone-held runnable rows and their expected owners; None when a shard
     /// or the adoption table was contended.
     pub zone_held: Option<Vec<crate::kernel::debug::dto::DebugZoneHeldRow>>,
+    pub retirement_quarantine: (u64, u64),
 }
 
 /// What a queue insertion did with one exact row. A bare `bool` said only
@@ -5468,6 +5469,10 @@ impl Scheduler {
             residencies,
             host_queued: self.queue.inner.host_queued.load(Ordering::Acquire),
             zone_held: self.queue.inner.zone_held_census(),
+            retirement_quarantine: (
+                self.kernel().retirement_quarantine().held(),
+                self.kernel().retirement_quarantine().capacity(),
+            ),
         }
     }
 

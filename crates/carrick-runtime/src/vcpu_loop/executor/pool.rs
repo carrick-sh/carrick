@@ -723,6 +723,7 @@ impl carrick_kernel::kernel::debug::KernelDebugAuxProvider for HvpatchKernelDebu
             residencies: summary.residencies,
             host_queued: Some(summary.host_queued),
             zone_held: summary.zone_held,
+            retirement_quarantine: Some(summary.retirement_quarantine),
         }]
     }
 

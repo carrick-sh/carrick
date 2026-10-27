@@ -1240,7 +1240,11 @@ where
                 }
             };
             let cleanup = if let Some(stage1_unpublished) = stage1_unpublished {
-                binding.retire_detached_address_space(root_ticket, stage1_unpublished)
+                binding.retire_detached_address_space(
+                    root_ticket,
+                    stage1_unpublished,
+                    scheduler.kernel().retirement_quarantine(),
+                )
             } else {
                 binding.retire_detached_shared_mm_edge().map(|()| None)
             };

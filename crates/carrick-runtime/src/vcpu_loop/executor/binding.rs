@@ -100,6 +100,7 @@ pub trait PersistentTaskBinding {
         &self,
         _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
         _stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
+        _quarantine: &carrick_kernel::kernel::core::RetirementQuarantineStore,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         Err(TrapError::Hypervisor(
             "task binding has no detached address-space cleanup authority".to_owned(),
@@ -220,11 +221,13 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
         &self,
         root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
         stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
+        quarantine: &carrick_kernel::kernel::core::RetirementQuarantineStore,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_address_space(
             self,
             root_ticket,
             stage1_unpublished,
+            quarantine,
         )
     }
 

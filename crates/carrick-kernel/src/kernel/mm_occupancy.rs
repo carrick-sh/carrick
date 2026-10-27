@@ -868,22 +868,18 @@ pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
     )
 }
 
-/// The one directory bootstrap exclusions are taken in. It never holds a
-/// published entry, so its proof is "no guest editor of this MM can exist":
-/// true only while no EL1 region is installed.
-static BOOTSTRAP_EDITOR_DIRECTORY: AddressSpaces = AddressSpaces::new();
-
 /// With no EL1 region installed, no guest editor exists or can be admitted.
-/// Mint the exact-MM unpublished proof from the process's bootstrap
-/// directory (a `'static` borrow, not a private value that could be minted
-/// anywhere), and refuse it once an EL1 region exists: the bootstrap token
-/// cannot be taken after EL1 is installed. The guard carries no gate.
+/// Mint the exact-MM bootstrap proof through sched-core's explicitly unsafe
+/// constructor (not a private directory any caller could build), and refuse
+/// it once an EL1 region exists: the bootstrap token cannot be taken after
+/// EL1 is installed. The guard carries no gate.
 fn bootstrap_el1_editor_exclusion(mm: MmId) -> Option<El1EditorExclusion> {
     if carrick_el1_abi::zone_tables().is_some() {
         return None;
     }
-    let spaces = &BOOTSTRAP_EDITOR_DIRECTORY;
-    let excluded = spaces.unpublished(mm.raw())?;
+    // SAFETY: no EL1 region is installed (checked above and again below), so
+    // no guest editor of any MM exists or can be admitted.
+    let excluded = unsafe { carrick_sched_core::ExcludedEditor::bootstrap_unpublished(mm.raw()) }?;
     let held = carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
     // An EL1 region installed while the proof was minted retires it.
     if carrick_el1_abi::zone_tables().is_some() {

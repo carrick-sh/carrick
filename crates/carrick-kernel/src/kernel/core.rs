@@ -561,10 +561,84 @@ impl std::fmt::Debug for ContainerRootPublicationBarriers {
     }
 }
 
+/// Task backends whose physical retirement was refused, retained for this
+/// carrier's lifetime. A refused terminal transaction has no safe reclaim
+/// point: its exact custody and the IPAs it still names must stay live.
+/// Admission is counted and bounded by the neutral retirement owner
+/// (`carrick_core::mm::retirement::RetirementQuarantine`); the retained
+/// values are never looked up or reused. Per kernel (one per carrier), so
+/// in-process embedding with several carriers keeps separate budgets.
+pub struct RetirementQuarantineStore {
+    budget: carrick_core::mm::retirement::RetirementQuarantine,
+    retained: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+}
+
+impl std::fmt::Debug for RetirementQuarantineStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetirementQuarantineStore")
+            .field("held", &self.held())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+impl Default for RetirementQuarantineStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RetirementQuarantineStore {
+    pub fn new() -> Self {
+        Self {
+            budget: carrick_core::mm::retirement::RetirementQuarantine::new(
+                carrick_core::mm::retirement::RETIREMENT_QUARANTINE_CAPACITY,
+            ),
+            retained: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Retain `backend` if the budget admits it (returning the number now
+    /// held, and recording it in the event ring); otherwise hand it back so
+    /// the caller's ordinary drop, a carrier fault, follows.
+    pub fn retain(
+        &self,
+        backend: Box<dyn std::any::Any + Send>,
+    ) -> Result<u64, Box<dyn std::any::Any + Send>> {
+        match self.budget.admit() {
+            Ok(held) => {
+                self.retained.lock().push(backend);
+                crate::event_ring::rec_retirement_quarantined(held, self.budget.capacity());
+                Ok(held)
+            }
+            Err(_) => Err(backend),
+        }
+    }
+
+    pub fn held(&self) -> u64 {
+        self.budget.held()
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.budget.capacity()
+    }
+
+    /// One census line: retained backends against the budget.
+    pub fn write_census(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        writeln!(
+            out,
+            "retirement quarantine: held={} capacity={}",
+            self.held(),
+            self.capacity()
+        )
+    }
+}
+
 /// One backend-neutral Linux kernel instance.
 #[derive(Debug)]
 pub struct Kernel {
     population_origin: KernelPopulationOrigin,
+    retirement_quarantine: RetirementQuarantineStore,
     #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
     schedule_hooks: super::schedule::Hooks,
     ipc: Mutex<Option<Arc<crate::el1_ipc::HostIpc>>>,
@@ -1380,6 +1454,11 @@ impl std::fmt::Debug for TaskExitSubscribers {
 }
 
 impl Kernel {
+    /// This carrier's retirement quarantine.
+    pub fn retirement_quarantine(&self) -> &RetirementQuarantineStore {
+        &self.retirement_quarantine
+    }
+
     #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
     pub fn schedule_hooks(&self) -> &super::schedule::Hooks {
         &self.schedule_hooks
@@ -1591,6 +1670,7 @@ impl Kernel {
             hvpatch_child_token_issuer,
             hvpatch_child_token_verifier,
             observations: Mutex::new(observations),
+            retirement_quarantine: RetirementQuarantineStore::new(),
             exit_subscribers: TaskExitSubscribers::default(),
             pending_file_closes: Mutex::new(None),
             reservation_gate: ReservationGate::default(),
