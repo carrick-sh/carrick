@@ -82,7 +82,7 @@ pub use carrier_process::{
 pub use core::ReservationChangeSubscription;
 pub use core::{
     Kernel, KernelContext, KernelError, KernelTaskBinding, RegistryInvariantError, RootBootstrap,
-    TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason,
+    TaskExitSubscriber, TaskRevision, VforkParentWait, VforkReleaseReason, WeakKernelTaskBinding,
 };
 pub use debug::{
     ClientError as KernelDebugClientError, DebugEndpoint,
