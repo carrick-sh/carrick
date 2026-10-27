@@ -35,17 +35,19 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
             .unwrap()
             .success()
     );
-    let run = |recipe: &str| {
+    // Only the stall recipe should reach its deadline; the others get room
+    // for a loaded host.
+    let spawn = |recipe: &str, timeout: &str| {
         let log = dir.path().join(format!("{recipe}.log"));
         let output = fs::File::create(&log).unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        let child = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .args([
                 "--root",
                 dir.path().to_str().unwrap(),
                 "loom-run",
                 recipe,
                 "--timeout-secs",
-                "1",
+                timeout,
             ])
             .env("CARGO_TARGET_DIR", dir.path().join("target"))
             .env_remove("RUST_TEST_THREADS")
@@ -53,7 +55,12 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
             .stderr(Stdio::from(output))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        (child, log)
+    };
+    let run = |recipe: &str| {
+        let timeout = if recipe == "stall" { "1" } else { "30" };
+        let (mut child, log) = spawn(recipe, timeout);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -112,6 +119,36 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
         "{log}"
     );
     assert!(!log.contains("unfinished expected_panic"), "{log}");
+    assert_process_gone(&dir.path().join("sleeping.pid"));
+    assert_process_gone(&dir.path().join("descendant.pid"));
+
+    // Cancelling the runner (Ctrl-C, or a lease supervisor) must take the
+    // binary in its own process group down with it.
+    for file in ["sleeping.pid", "descendant.pid"] {
+        fs::remove_file(dir.path().join(file)).unwrap();
+    }
+    let (mut child, log) = spawn("stall", "600");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !dir.path().join("descendant.pid").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = i32::try_from(child.id()).unwrap();
+    // SAFETY: the runner is this test's own child.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGTERM),
+        "{}",
+        fs::read_to_string(&log).unwrap()
+    );
     assert_process_gone(&dir.path().join("sleeping.pid"));
     assert_process_gone(&dir.path().join("descendant.pid"));
 }
