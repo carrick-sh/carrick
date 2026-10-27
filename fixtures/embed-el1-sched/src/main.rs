@@ -834,6 +834,30 @@ fn compute_pair(rounds: u32) -> i32 {
     0
 }
 
+/// `orphan-spinner MS`: fork a child that computes forever without a
+/// syscall, so it stays at EL0 on whichever vCPU runs it (a native record
+/// EL1 runs, possibly on an idle executor's vCPU), then exit the root after
+/// `MS` ms with the child still spinning. The run ends with a background
+/// native thread at EL0: carrier teardown and the executor pool's shutdown
+/// kick must still reach that vCPU and every executor must join (#900).
+fn orphan_spinner(ms: u64) -> i32 {
+    // SAFETY: the fixture is single-threaded here; the child only computes.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        println!("orphan-spinner fork failed");
+        return 2;
+    }
+    if pid == 0 {
+        let mut x: u64 = 1;
+        loop {
+            x = core::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1));
+        }
+    }
+    sleep_ms(ms);
+    println!("orphan-spinner child={pid} ms={ms}");
+    0
+}
+
 static IDLE_WORDS: [AtomicU32; 4] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
@@ -3701,6 +3725,7 @@ fn main() {
         "timed-wait" => timed_wait(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),
         "compute-pair" => compute_pair(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(16)),
         "idle-carrier" => idle_carrier(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(500)),
+        "orphan-spinner" => orphan_spinner(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100)),
         "wfi-signal" => wfi_signal(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100)),
         "pstate" => pstate_mode(),
         "ipc-mixed" => ipc::mixed(args.get(2).map(String::as_str).unwrap_or("pipe")),
