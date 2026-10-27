@@ -4686,6 +4686,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.slot(slot).resched_owed.swap(0, Ordering::AcqRel) != 0
     }
 
+    /// Whether `slot`'s vCPU owes the in-guest scheduler a reschedule SGI,
+    /// without consuming it: an owed reschedule ([`Self::take_resched`]), or
+    /// threads queued there with no slice timer armed. This is exactly what
+    /// the backend run loop raises as the reschedule SGI before it runs the
+    /// vCPU again.
+    pub fn reschedule_owed(&self, slot: SlotId) -> bool {
+        let s = self.slot(slot);
+        s.resched_owed.load(Ordering::Acquire) != 0 || (s.queued() != 0 && s.timer_cval() == 0)
+    }
+
     fn begin_host_transfer(&self, record: RecordRef, from: Claim) -> Option<HostTransfer<'_, C>> {
         let rec = self.record(record.id);
         if rec.incarnation() != record.incarnation

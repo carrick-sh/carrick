@@ -403,12 +403,23 @@ impl WorkerKick {
     /// down. A guest that halts in-zone (a parent in `wait4` whose child the
     /// run already failed) never exits on its own, so the join would wait
     /// forever; `need_resched` covers a kick that lands before guest entry.
+    ///
+    /// A worker waiting in the guest's scheduler gets durable host work on
+    /// its zone slot before the kick, exactly as a scheduler wake does
+    /// (`wake_from_guest_idle`): the vCPU may be running a native thread at
+    /// EL0 there, and only published host work makes the guest scheduler
+    /// leave for the executor (#900). The hardware kick follows either way.
     pub(crate) fn interrupt_for_shutdown(&self) {
         self.shutdown_interrupted.store(true, Ordering::Release);
         self.need_resched.store(true, Ordering::Release);
+        let guest_idle = self.guest_idle.lock();
+        if let Some(GuestIdleTarget::Zone(slot)) = *guest_idle {
+            carrick_kernel::el1_zone::kick_slot(slot);
+        }
         if let Some(hardware) = self.hardware.lock().as_ref() {
             hardware.handle.kick();
         }
+        drop(guest_idle);
     }
 
     pub(crate) fn is_shutdown_interrupted(&self) -> bool {

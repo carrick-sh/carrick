@@ -688,7 +688,25 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
 
     fn host_work_pending(&self) -> Result<bool, TrapError> {
         Ok(<Self as Aarch64Vcpu>::mailbox_slot(self)
+            .and_then(carrick_el1_abi::SlotId::from_index)
             .is_some_and(carrick_el1_abi::peek_pending_host_work))
+    }
+
+    fn resched_pending(&self) -> Result<bool, TrapError> {
+        // The same slot and predicate `run_to_exit` raises the reschedule
+        // SGI from before every run, read without consuming it.
+        Ok(self
+            .leased_mailbox_slot()
+            .and_then(carrick_el1_abi::SlotId::from_index)
+            .zip(carrick_el1_abi::zone_tables())
+            .is_some_and(|(slot, zone)| zone.reschedule_owed(slot)))
+    }
+
+    fn owes_el0_kicks_to_guest_scheduler(&self) -> bool {
+        // Only the in-kernel GIC keeps the owed kick and reschedule SGIs
+        // pending across run returns and takes them at EL0; the
+        // `CARRICK_HVF_GIC=0` hatch surfaces the kick as before.
+        crate::gic::interrupt_model() == crate::gic::InterruptModel::Gic
     }
 
     fn kicked_by_cancellation(&self) -> bool {

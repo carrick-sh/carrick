@@ -8785,3 +8785,42 @@ fn native_service_waits_do_not_exhaust_the_default_executor_pool() {
     assert_eq!(report.joined(), workers);
     native.lock().acknowledge_and_retire();
 }
+
+/// #900: the pool's shutdown kick reaches a worker waiting in the guest's
+/// scheduler as durable host work on its zone slot, not a bare hardware
+/// kick. The guest scheduler may be running a native thread at EL0 on that
+/// vCPU; a bare kick carries nothing that makes it leave for the executor,
+/// and the pool's join would then wait forever.
+#[test]
+fn serial_host_shutdown_kick_publishes_host_work_to_a_guest_idle_worker() {
+    struct Region(Box<carrick_test_support::TestEl1Region>);
+    impl Drop for Region {
+        fn drop(&mut self) {
+            assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
+                self.0.as_ptr() as usize
+            ));
+        }
+    }
+    let region = Region(carrick_test_support::TestEl1Region::zeroed());
+    carrick_el1_abi::record_el1_region_host_ptr(region.0.as_ptr() as usize);
+    let slot = carrick_el1_abi::SlotId::from_index(2).unwrap();
+    let idle_kick = WorkerKick::new(Arc::new(ReceiptLog::default()));
+    let busy_kick = WorkerKick::new(Arc::new(ReceiptLog::default()));
+    let busy_slot = carrick_el1_abi::SlotId::from_index(3).unwrap();
+
+    let idle_wait = idle_kick.enter_guest_idle(super::GuestIdleTarget::Zone(slot));
+    idle_kick.interrupt_for_shutdown();
+    busy_kick.interrupt_for_shutdown();
+    drop(idle_wait);
+
+    assert!(idle_kick.is_shutdown_interrupted());
+    assert!(
+        carrick_el1_abi::peek_pending_host_work(slot),
+        "the shutdown kick reached a guest-idle worker without host work"
+    );
+    assert!(
+        !carrick_el1_abi::peek_pending_host_work(busy_slot),
+        "a worker not waiting in the guest gets no zone host work"
+    );
+    drop(region);
+}

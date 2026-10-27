@@ -166,14 +166,21 @@ pub fn run_idle_entry<C: Aarch64Vcpu + ?Sized>(
 /// `host_work_boundary` for host work, the preemption decision for a
 /// reschedule) and the vCPU resumes the thread or leaves through the idle
 /// exit with the record handed back. False when the kick was EL1's own
-/// requested boundary or this backend has no IRQ vehicle; the exit then
-/// surfaces as before.
+/// requested boundary or this backend cannot owe kicks to the guest
+/// scheduler; the exit then surfaces as before.
 ///
-/// The two kick kinds are kept distinct. A host kick (`el1_zone::kick_slot`)
-/// published host work first, so the kick SGI is made pending (EL1 takes it
-/// as host work). A reschedule (`el1_zone::resched_slot`) published only the
-/// slot's owed reschedule, which the backend's run loop raises as the
-/// reschedule SGI before the vCPU runs on; it is not turned into host work.
+/// What the kicker published decides what is owed:
+/// - host work (`el1_zone::kick_slot`): the kick SGI is made pending; EL1
+///   takes it as host work;
+/// - only an owed reschedule (`el1_zone::resched_slot`): the backend's run
+///   loop raises the reschedule SGI before the vCPU runs on, and it is not
+///   turned into host work;
+/// - neither (a bare hardware kick, such as one that predates its kicker's
+///   host-work publication, or any future raw kicker): the kick is published
+///   as owed host work and the kick SGI made pending, exactly as an
+///   absorbed EL1 kick is ([`OwedKick::absorb`]). A raw kick therefore always
+///   reaches the host; it is never swallowed.
+///
 /// Either SGI is taken at the first EL0 instruction once `I` is clear. The
 /// guest never observes `I` (`carrick_hal::el0_visible_pstate`) and EL1's
 /// served returns to EL0 clear it anyway, so it is not restored.
@@ -181,7 +188,7 @@ fn owe_idle_el0_kick<C: Aarch64Vcpu + ?Sized>(vcpu: &mut C) -> Result<bool, Trap
     // EL1's own `hvc` kick at an EL0 boundary decodes to `Kicked` too. That
     // is a boundary EL1 asked for: re-entering it would loop, so only a raw
     // cross-thread cancellation is owed.
-    if !vcpu.kicked_by_cancellation() || !vcpu.injects_kick_irq() {
+    if !vcpu.kicked_by_cancellation() || !vcpu.owes_el0_kicks_to_guest_scheduler() {
         return Ok(false);
     }
     let pstate = vcpu.get_reg(Reg::Pstate)?;
@@ -194,7 +201,11 @@ fn owe_idle_el0_kick<C: Aarch64Vcpu + ?Sized>(vcpu: &mut C) -> Result<bool, Trap
         pstate,
         vcpu.get_reg(Reg::ElrEl1).unwrap_or(u64::MAX),
     );
-    if vcpu.host_work_pending()? {
+    let host_work = vcpu.host_work_pending()?;
+    if host_work || !vcpu.resched_pending()? {
+        if !host_work {
+            vcpu.publish_owed_kick()?;
+        }
         vcpu.set_pending_irq(true)?;
     }
     if pstate & PSTATE_I != 0 {
@@ -653,6 +664,11 @@ mod tests {
             el1_requested: bool,
             /// The last exit was a cross-thread cancellation.
             cancelled: bool,
+            /// The backend delivers owed kicks as interrupts taken at EL0
+            /// (HVF with its in-kernel GIC); `false` models the hatch.
+            guest_scheduler_irqs: bool,
+            /// Owed kicks published to the slot's host-work doorbell.
+            published_owed_kicks: u32,
         }
 
         impl IdleModel {
@@ -671,6 +687,8 @@ mod tests {
                     lost_kick: false,
                     el1_requested: false,
                     cancelled: false,
+                    guest_scheduler_irqs: true,
+                    published_owed_kicks: 0,
                 }
             }
         }
@@ -681,6 +699,17 @@ mod tests {
             }
             fn kicked_by_cancellation(&self) -> bool {
                 self.cancelled
+            }
+            fn resched_pending(&self) -> Result<bool, TrapError> {
+                Ok(self.resched_owed)
+            }
+            fn owes_el0_kicks_to_guest_scheduler(&self) -> bool {
+                self.guest_scheduler_irqs
+            }
+            fn publish_owed_kick(&mut self) -> Result<(), TrapError> {
+                self.published_owed_kicks += 1;
+                self.host_work = true;
+                Ok(())
             }
             fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
                 Ok(match r {
@@ -823,9 +852,41 @@ mod tests {
                 );
                 assert_eq!(vcpu.settled, Some(Settled::Preempted));
                 assert_eq!(vcpu.kick_sgis_armed, 0, "a reschedule invented host work");
+                assert_eq!(vcpu.published_owed_kicks, 0);
                 assert!(!vcpu.host_work);
                 assert!(!vcpu.lost_kick);
             }
+        }
+
+        /// A bare cancellation that published neither host work nor a
+        /// reschedule (the pool's shutdown kick, or any future raw kicker)
+        /// must not be swallowed: re-entering with nothing pending leaves the
+        /// native thread computing, or EL1 in WFI, and the kicker waits
+        /// forever. It is owed as host work and reaches the host.
+        #[test]
+        fn bare_kick_at_el0_is_owed_as_host_work_not_swallowed() {
+            for native_pstate in [EL0_UNMASKED, EL0_DAIF_MASKED] {
+                let mut vcpu = IdleModel::new(native_pstate, false, false);
+                let exit = run_idle_entry(&mut vcpu).expect("idle entry");
+                assert!(
+                    !vcpu.lost_kick,
+                    "pstate {native_pstate:#x}: a bare kick was swallowed and EL0 ran on"
+                );
+                assert!(matches!(exit, Aarch64Exit::Halt), "{exit:?}");
+                assert_eq!(vcpu.settled, Some(Settled::HostWorkBoundary));
+                assert_eq!(vcpu.published_owed_kicks, 1);
+            }
+        }
+
+        /// A backend that cannot owe kicks to the guest scheduler (HVF's
+        /// `CARRICK_HVF_GIC=0` hatch) keeps surfacing the kick.
+        #[test]
+        fn kick_without_guest_scheduler_irqs_still_surfaces() {
+            let mut vcpu = IdleModel::new(EL0_UNMASKED, true, false);
+            vcpu.guest_scheduler_irqs = false;
+            let exit = run_idle_entry(&mut vcpu).expect("idle entry");
+            assert!(matches!(exit, Aarch64Exit::Kicked));
+            assert_eq!(vcpu.kick_sgis_armed, 0);
         }
 
         /// EL1's own `hvc` kick at an EL0 boundary also decodes to `Kicked`.
