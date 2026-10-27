@@ -166,8 +166,8 @@ jobs:
       # input identity offline, so populate the cache from every fixture
       # lockfile first; this is the job's only network step for fixtures.
       # rust-cache above saves only when the whole job succeeds, so keep the
-      # downloaded registry in its own cache, saved as soon as the fetch
-      # succeeds. A warm cache makes the fetch network-free (#899).
+      # downloaded registry in its own cache, saved after the host-only gate
+      # whatever its verdict. A warm cache makes both network-free (#899).
       - name: Locate cargo home
         id: cargo-home
         run: echo "dir=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_OUTPUT"
@@ -180,21 +180,11 @@ jobs:
             ${{ steps.cargo-home.outputs.dir }}/registry/index
             ${{ steps.cargo-home.outputs.dir }}/registry/cache
             ${{ steps.cargo-home.outputs.dir }}/git/db
-          key: hvf-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: hvf-cargo-registry-
+          key: hvf-cargo-registry-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: hvf-cargo-registry-v2-
 
       - name: Fetch fixture lockfile dependencies
         run: just xtask fixtures fetch
-
-      - name: Save cargo registry
-        if: ${{ steps.registry.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ${{ steps.cargo-home.outputs.dir }}/registry/index
-            ${{ steps.cargo-home.outputs.dir }}/registry/cache
-            ${{ steps.cargo-home.outputs.dir }}/git/db
-          key: hvf-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       # Run the host-only source gate before the signed release steps and
       # prune its build tree immediately afterward.
@@ -212,6 +202,19 @@ jobs:
 
       - name: Host-only source gate
         run: RUST_TEST_THREADS=1 just lease gate just ci
+
+      # Save after the gate too: `just ci` downloads the workspace's own
+      # crates, which the fixture fetch alone does not. `!cancelled()` keeps
+      # the save independent of the gate's verdict, which is red on main.
+      - name: Save cargo registry
+        if: ${{ !cancelled() && steps.registry.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ steps.cargo-home.outputs.dir }}/registry/index
+            ${{ steps.cargo-home.outputs.dir }}/registry/cache
+            ${{ steps.cargo-home.outputs.dir }}/git/db
+          key: hvf-cargo-registry-v2-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Prune host-only gate build artifacts
         # Must run even when `Host-only source gate` fails (`!cancelled()`), so
