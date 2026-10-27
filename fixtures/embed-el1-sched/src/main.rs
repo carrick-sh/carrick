@@ -504,10 +504,12 @@ fn reused_slot_exec(argv0: &str) -> i32 {
         }
     }
     status = 0x5a5a;
-    if unsafe { libc::waitpid(second, &mut status, 0) } != second
-        || !libc::WIFEXITED(status)
-        || libc::WEXITSTATUS(status) != 0
-    {
+    let waited = unsafe { libc::waitpid(second, &mut status, 0) };
+    if waited != second || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        println!(
+            "reused-slot-exec second wait failed child={second} waited={waited} errno={errno} status={status:#x}"
+        );
         return 6;
     }
     0
