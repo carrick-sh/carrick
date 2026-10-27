@@ -16,7 +16,8 @@
 //!   and a pair is handing off.
 //! - `exec`: `execve` from a non-leader thread while siblings are parked.
 //! - `exec-child`: the image `exec` runs.
-//! - `reused-slot-exec`: reap one fork child, then exec from a second child.
+//! - `reused-slot-exec <successor>`: reap one fork child, then exec
+//!   `successor` from a second child over in-zone stdio pipes.
 //! - `exec-successor-memory`: execs this static image, then the successor
 //!   faults the far end of a sparse anonymous mapping and resolves fork COW.
 //! - `epoll-pingpong <iters>`: two threads hand a turn back and forth through
@@ -469,7 +470,13 @@ fn exec_successor_memory(argv0: &str) -> i32 {
     3
 }
 
-fn reused_slot_exec(argv0: &str) -> i32 {
+/// Reap one fork child, then exec `successor` from a second child whose
+/// stdin/stdout are pipes this process owns. The successor makes no host
+/// crossing: a ring-owned native process has no host task context, so its
+/// result returns through in-zone pipes and its exit status, never through
+/// the CLI terminal.
+fn reused_slot_exec(successor: &str) -> i32 {
+    const REQUEST: &[u8] = b"slot-reuse";
     let first = unsafe { libc::fork() };
     if first < 0 {
         return 2;
@@ -488,21 +495,45 @@ fn reused_slot_exec(argv0: &str) -> i32 {
         return 3;
     }
 
+    let (mut to_child, mut from_child) = ([0; 2], [0; 2]);
+    if unsafe { libc::pipe2(to_child.as_mut_ptr(), libc::O_CLOEXEC) } != 0
+        || unsafe { libc::pipe2(from_child.as_mut_ptr(), libc::O_CLOEXEC) } != 0
+    {
+        println!("reused-slot-exec pipe failed");
+        return 7;
+    }
+    let path = std::ffi::CString::new(successor).expect("successor");
+    let argv = [path.as_ptr(), std::ptr::null()];
+    let envp = [std::ptr::null::<libc::c_char>()];
     let second = unsafe { libc::fork() };
     if second < 0 {
         return 4;
     }
     if second == 0 {
-        let path = std::ffi::CString::new(argv0).expect("argv0");
-        let arg0 = std::ffi::CString::new("el1-sched").expect("arg0");
-        let arg1 = std::ffi::CString::new("reused-slot-exec-child").expect("arg1");
-        let argv = [arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
-        let envp = [std::ptr::null::<libc::c_char>()];
         unsafe {
+            if libc::dup2(to_child[0], 0) != 0 || libc::dup2(from_child[1], 1) != 1 {
+                libc::_exit(8);
+            }
             libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(5);
         }
     }
+    unsafe {
+        libc::close(to_child[0]);
+        libc::close(from_child[1]);
+    }
+    let wrote = unsafe { libc::write(to_child[1], REQUEST.as_ptr().cast(), REQUEST.len()) };
+    unsafe { libc::close(to_child[1]) };
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        let n = unsafe { libc::read(from_child[0], buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+        reply.extend_from_slice(&buf[..n as usize]);
+    }
+    unsafe { libc::close(from_child[0]) };
     status = 0x5a5a;
     let waited = unsafe { libc::waitpid(second, &mut status, 0) };
     if waited != second || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
@@ -512,6 +543,14 @@ fn reused_slot_exec(argv0: &str) -> i32 {
         );
         return 6;
     }
+    if wrote != REQUEST.len() as isize || reply != [b"got:".as_slice(), REQUEST].concat() {
+        println!(
+            "reused-slot-exec successor reply wrote={wrote} reply={:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        return 9;
+    }
+    println!("reused-slot-exec ok");
     0
 }
 
@@ -3788,11 +3827,13 @@ fn main() {
             println!("exec-child ok");
             0
         }
-        "reused-slot-exec" => reused_slot_exec(&args[0]),
-        "reused-slot-exec-child" => {
-            println!("reused-slot-exec ok");
-            0
-        }
+        "reused-slot-exec" => match args.get(2) {
+            Some(successor) => reused_slot_exec(successor),
+            None => {
+                println!("reused-slot-exec needs a successor path");
+                2
+            }
+        },
         other => {
             println!("unknown mode {other}");
             2
