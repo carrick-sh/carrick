@@ -59,6 +59,17 @@ refused before hashing. There is no hand-maintained crate list; the closure is
 re-derived from `cargo metadata` on every check, so a new path dependency is
 an input as soon as a fixture depends on it.
 
+Because every reached checkout crate is an input, a fixture may reach only
+**dependency-free leaf crates** listed in `FIXTURE_LEAF_CRATES`
+(`crates/carrick-xtask/src/fixtures/inputs.rs`), such as
+`carrick-el1-control-abi`. `carrick-xtask fixtures leaf-closure`, run by
+`just lint-domains`, fails on any other path package or on a leaf that grows a
+dependency. Before #891 `embed-el1-sched` reached 13 kernel crates through
+`carrick-el1-abi`, and about 29% of `main` commits invalidated the bundle.
+`carrick-xtask fixtures identity [--manifest <bundle manifest>]` prints the
+checkout's current input identity (compiler inputs from the manifest, or
+none), for checking that a change leaves the bundle valid.
+
 The source inventory is the union of two derivations:
 
 - **Cargo graph closure**, re-derived on every check (below). It is resolved

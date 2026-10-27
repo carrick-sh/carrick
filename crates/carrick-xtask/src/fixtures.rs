@@ -19,7 +19,9 @@ mod inputs;
 pub mod linker;
 use environment::BuildEnvironment;
 pub use environment::BuildPolicy;
-pub use inputs::{current_build_code, fetch_dependencies, fetch_plan, source_hashes};
+pub use inputs::{
+    check_leaf_closures, current_build_code, fetch_dependencies, fetch_plan, source_hashes,
+};
 
 const SCHEMA: &str = "carrick.fixtures.v3";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
@@ -89,6 +91,16 @@ pub enum FixturesAction {
     /// Print the build scripts and proc-macros in the fixture graphs in the
     /// reviewed-list format, for review before updating the committed list.
     BuildCode,
+    /// Fail unless every signed fixture's path-dependency closure holds only
+    /// allowlisted, dependency-free leaf crates (run by `just lint-domains`).
+    LeafClosure,
+    /// Print the checkout's fixture input identity. Compiler-recorded inputs
+    /// come from `--manifest` (a bundle manifest); without it they are empty,
+    /// which yields the Cargo-graph and build-input identity alone.
+    Identity {
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
     /// Check a bundle or, by default, every installed signed-tier fixture.
     Verify {
         #[arg(long, conflicts_with = "bundle")]
@@ -1136,6 +1148,30 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                 writer,
                 "{}",
                 build_code::render(&current_build_code(root)?)?
+            )?;
+        }
+        FixturesAction::LeafClosure => {
+            for (fixture, packages) in check_leaf_closures(root)? {
+                let names: Vec<_> = packages.iter().map(|p| p.name.as_str()).collect();
+                writeln!(
+                    writer,
+                    "fixtures: leaf closure ok {fixture}: [{}]",
+                    names.join(", ")
+                )?;
+            }
+        }
+        FixturesAction::Identity { manifest } => {
+            let compiler_inputs = match manifest {
+                Some(path) => read_bundle_manifest(&path)?.compiler_inputs,
+                None => Vec::new(),
+            };
+            let sources = source_hashes(root, &compiler_inputs)?;
+            writeln!(
+                writer,
+                "fixtures: input_identity {} ({} sources, {} compiler inputs)",
+                input_identity(&sources, &compiler_inputs, &BuildPolicy::default())?,
+                sources.len(),
+                compiler_inputs.len()
             )?;
         }
         FixturesAction::Verify {

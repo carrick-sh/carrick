@@ -16,6 +16,12 @@ pub(super) const FIXTURES: &[&str] = &[
     "fixtures/embed-copyout",
     "fixtures/embed-el1-sched",
 ];
+/// Checkout crates a signed fixture may depend on. Every path package in a
+/// fixture's closure is a bundle input, so one kernel crate there makes every
+/// kernel-only commit invalidate the signed bundle (#891). A leaf here must
+/// have no dependencies of its own; growing one is a lint failure, not an
+/// allowlist edit.
+pub(super) const FIXTURE_LEAF_CRATES: &[&str] = &["carrick-el1-control-abi"];
 /// Inputs outside the Cargo graph. Workspace manifests, lockfiles and Cargo
 /// configuration are derived from each fixture's resolved graph below.
 const BUILD_INPUTS: &[&str] = &[
@@ -141,19 +147,78 @@ pub fn fetch_dependencies(root: &Path) -> Result<usize> {
 }
 
 fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
-    let (inputs, found) = resolve_graph(root)?;
-    build_code::check(root, &found)?;
-    Ok(inputs)
+    let graph = resolve_graph(root)?;
+    build_code::check(root, &graph.build_code)?;
+    Ok(graph.inputs)
 }
 
 /// Build scripts and proc-macros in the fixture graphs, as reviewed entries.
 pub fn current_build_code(root: &Path) -> Result<BTreeSet<ReviewedEntry>> {
-    Ok(resolve_graph(root)?.1)
+    Ok(resolve_graph(root)?.build_code)
 }
 
-fn resolve_graph(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<ReviewedEntry>)> {
+/// A checkout (path) package other than the fixture itself, reached through
+/// built (normal or build) edges of a fixture's resolved graph.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PathPackage {
+    pub name: String,
+    /// Built dependencies (registry or path) the package itself declares.
+    pub dependencies: Vec<String>,
+}
+
+struct Graph {
+    inputs: BTreeSet<String>,
+    build_code: BTreeSet<ReviewedEntry>,
+    /// Fixture directory -> checkout packages in its built closure.
+    path_packages: BTreeMap<&'static str, BTreeSet<PathPackage>>,
+}
+
+/// Every signed fixture's path-dependency closure may hold only allowlisted,
+/// dependency-free leaf crates. Returns the checked closures for reporting.
+pub fn check_leaf_closures(root: &Path) -> Result<BTreeMap<&'static str, BTreeSet<PathPackage>>> {
+    let graph = resolve_graph(root)?;
+    let violations = leaf_violations(&graph.path_packages, FIXTURE_LEAF_CRATES);
+    if !violations.is_empty() {
+        return Err(fail(format!(
+            "signed fixture path-dependency closure holds non-leaf crates; every \
+             checkout crate a fixture reaches is a bundle input (docs/signed-fixtures.md, \
+             #891). Depend on a dependency-free leaf crate instead:\n  {}",
+            violations.join("\n  ")
+        )));
+    }
+    Ok(graph.path_packages)
+}
+
+/// Pure leaf rule: each path package is allowlisted and has no built
+/// dependencies of its own.
+pub(super) fn leaf_violations(
+    closures: &BTreeMap<&'static str, BTreeSet<PathPackage>>,
+    allowlist: &[&str],
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (fixture, packages) in closures {
+        for package in packages {
+            if !allowlist.contains(&package.name.as_str()) {
+                violations.push(format!(
+                    "{fixture}: `{}` is not an allowlisted fixture leaf crate",
+                    package.name
+                ));
+            } else if !package.dependencies.is_empty() {
+                violations.push(format!(
+                    "{fixture}: leaf crate `{}` has dependencies: {}",
+                    package.name,
+                    package.dependencies.join(", ")
+                ));
+            }
+        }
+    }
+    violations
+}
+
+fn resolve_graph(root: &Path) -> Result<Graph> {
     let root = root.canonicalize()?;
     let mut found = BTreeSet::new();
+    let mut path_packages = BTreeMap::new();
     let environment = BuildEnvironment::new(&root)?;
     let mut inputs: BTreeSet<_> = BUILD_INPUTS
         .iter()
@@ -214,8 +279,9 @@ fn resolve_graph(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<ReviewedEntr
                 .ok_or_else(|| fail("missing fixture Cargo resolve root"))?;
             let packages: BTreeMap<_, _> = metadata.packages.iter().map(|p| (&p.id, p)).collect();
             let nodes: BTreeMap<_, _> = resolve.nodes.iter().map(|n| (&n.id, n)).collect();
-            let mut pending = vec![root_id];
+            let mut pending = vec![root_id.clone()];
             let mut seen = BTreeSet::new();
+            let closure: &mut BTreeSet<PathPackage> = path_packages.entry(*fixture).or_default();
             while let Some(id) = pending.pop() {
                 if !seen.insert(id.clone()) {
                     continue;
@@ -226,6 +292,7 @@ fn resolve_graph(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<ReviewedEntr
                 let node = nodes
                     .get(&id)
                     .ok_or_else(|| fail("missing resolved fixture dependency node"))?;
+                let mut built_dependencies = Vec::new();
                 for dependency in &node.deps {
                     let mut built = false;
                     for kind in &dependency.dep_kinds {
@@ -243,6 +310,11 @@ fn resolve_graph(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<ReviewedEntr
                         return Err(fail("missing Cargo dependency kind"));
                     }
                     if built {
+                        built_dependencies.push(
+                            packages
+                                .get(&dependency.pkg)
+                                .map_or_else(|| dependency.pkg.clone(), |p| p.name.clone()),
+                        );
                         pending.push(dependency.pkg.clone());
                     }
                 }
@@ -266,6 +338,13 @@ fn resolve_graph(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<ReviewedEntr
                 if package.source.is_some() {
                     continue;
                 }
+                if id != root_id {
+                    built_dependencies.sort();
+                    closure.insert(PathPackage {
+                        name: package.name.clone(),
+                        dependencies: built_dependencies,
+                    });
+                }
                 let directory = package
                     .manifest_path
                     .parent()
@@ -288,7 +367,11 @@ fn resolve_graph(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<ReviewedEntr
             }
         }
     }
-    Ok((inputs, found))
+    Ok(Graph {
+        inputs,
+        build_code: found,
+        path_packages,
+    })
 }
 
 /// Reject a recorded compiler input that could name anything but a tracked
@@ -342,4 +425,72 @@ pub fn source_hashes(
     }
     linker::check_inventory(root, &sources, BUILD_SCRIPTS)?;
     Ok(sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn closure(
+        fixture: &'static str,
+        packages: &[(&str, &[&str])],
+    ) -> BTreeMap<&'static str, BTreeSet<PathPackage>> {
+        BTreeMap::from([(
+            fixture,
+            packages
+                .iter()
+                .map(|(name, deps)| PathPackage {
+                    name: (*name).to_owned(),
+                    dependencies: deps.iter().map(|d| (*d).to_owned()).collect(),
+                })
+                .collect(),
+        )])
+    }
+
+    #[test]
+    fn fixture_leaf_closure_admits_dependency_free_allowlisted_leaf() {
+        let closures = closure(
+            "fixtures/embed-el1-sched",
+            &[("carrick-el1-control-abi", &[])],
+        );
+        assert!(leaf_violations(&closures, FIXTURE_LEAF_CRATES).is_empty());
+        let empty = closure("fixtures/embed-copyout", &[]);
+        assert!(leaf_violations(&empty, FIXTURE_LEAF_CRATES).is_empty());
+    }
+
+    /// Red witness: the pre-#891 `embed-el1-sched` closure reached the kernel
+    /// cores through `carrick-el1-abi`.
+    #[test]
+    fn fixture_leaf_closure_rejects_kernel_crate_closure() {
+        let closures = closure(
+            "fixtures/embed-el1-sched",
+            &[
+                (
+                    "carrick-el1-abi",
+                    &["carrick-sched-core", "carrick-el1-control-abi"],
+                ),
+                ("carrick-sched-core", &[]),
+                ("carrick-el1-control-abi", &[]),
+            ],
+        );
+        let violations = leaf_violations(&closures, FIXTURE_LEAF_CRATES);
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations[0].contains("`carrick-el1-abi` is not an allowlisted"));
+        assert!(violations[1].contains("`carrick-sched-core` is not an allowlisted"));
+    }
+
+    #[test]
+    fn fixture_leaf_closure_rejects_leaf_that_grew_dependencies() {
+        let closures = closure(
+            "fixtures/embed-el1-sched",
+            &[("carrick-el1-control-abi", &["zerocopy"])],
+        );
+        let violations = leaf_violations(&closures, FIXTURE_LEAF_CRATES);
+        assert_eq!(
+            violations,
+            [
+                "fixtures/embed-el1-sched: leaf crate `carrick-el1-control-abi` has dependencies: zerocopy"
+            ]
+        );
+    }
 }

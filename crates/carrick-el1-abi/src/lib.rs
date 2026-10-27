@@ -439,12 +439,13 @@ pub const METADATA_GRANT_ERR_OVERLAP: u64 = 4;
 /// Metadata grant hypercall outcome: extent alignment violation.
 pub const METADATA_GRANT_ERR_ALIGNMENT: u64 = 5;
 
-/// Test/control return used only to ask the caller to cross an EL0 host-work
-/// boundary and retry after an asynchronous metadata request completes.
-pub const METADATA_GRANT_PENDING: u64 = u64::MAX - 1;
-
-/// Unaliased Carrick-private test and diagnostic control syscall number (outside Linux 0..500 space).
-pub const SYS_CARRICK_EL1_CONTROL: u64 = 0xCA88_0001;
+// The guest-facing control syscall constants live in the dependency-free
+// leaf crate that signed fixtures build against (#891); this crate re-exports
+// them so host and EL1 code keep one spelling. The assertions pin the ABI
+// values every published fixture executable has baked in.
+pub use carrick_el1_control_abi::{METADATA_GRANT_PENDING, SYS_CARRICK_EL1_CONTROL};
+const _: () = assert!(METADATA_GRANT_PENDING == u64::MAX - 1);
+const _: () = assert!(SYS_CARRICK_EL1_CONTROL == 0xCA88_0001);
 
 /// Byte offset of the EL1 kernel heap within the region.
 pub const EL1_HEAP_OFFSET: u64 = EL1_BOOTSTRAP_METADATA_OFFSET + EL1_BOOTSTRAP_METADATA_SIZE;
