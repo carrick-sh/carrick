@@ -7,6 +7,12 @@ use carrick_core_abi::service::{
 use carrick_sched_core::object_wait::ObjectWaitKey;
 use core::ops::Deref;
 
+/// Counted ENOSYS for an exec request whose capability names no live service.
+const UNROUTED_EXEC: ServiceFailureCode = match ServiceFailureCode::new(38) {
+    Some(code) => code,
+    None => ServiceFailureCode::MINIMUM,
+};
+
 /// Carrier-retained file/loader service. It owns no task lookup; the service
 /// cell has already authenticated `request` against the stopped ring member.
 pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
@@ -75,6 +81,17 @@ impl NativeExecServiceDirectory {
             .map(|(_, service)| Arc::clone(service))
     }
 
+    /// The service a guest exec request names, or the counted ENOSYS a
+    /// request receives when no live service holds that capability (for
+    /// example a fork child of a root whose image the host replaced). A
+    /// guest-selected capability is never carrier custody to fail on.
+    pub(crate) fn resolve(
+        &self,
+        capability: ExecCapabilityId,
+    ) -> Result<Arc<dyn NativeExecHostService>, ServiceFailureCode> {
+        self.service(capability).ok_or(UNROUTED_EXEC)
+    }
+
     fn remove(&self, capability: ExecCapabilityId) -> Result<(), NativeExecRegistrationError> {
         let mut services = self.services.lock();
         let index = services
@@ -127,6 +144,37 @@ mod native_exec_service_registration_tests {
         ) -> Result<Box<dyn NativeExecPreparation>, ServiceFailureCode> {
             Err(ServiceFailureCode::MINIMUM)
         }
+    }
+
+    /// #936: a native child of a post-exec root names the root's original
+    /// exec capability, which the host exec retired. The request must be a
+    /// counted ENOSYS (as on main), never a carrier custody fatal.
+    #[test]
+    fn retired_or_unknown_exec_capability_is_a_counted_enosys() {
+        let directory = Arc::new(NativeExecServiceDirectory::default());
+        let capability = carrick_core_abi::service::ExecCapabilityId::new(
+            core::num::NonZeroU64::new(7).unwrap(),
+        );
+        assert_eq!(
+            directory
+                .resolve(capability)
+                .err()
+                .map(ServiceFailureCode::raw),
+            Some(38)
+        );
+        let service: Arc<dyn NativeExecHostService> = Arc::new(RetainedService {
+            _retained: Arc::new(()),
+        });
+        let registration = directory.install(capability, service).unwrap();
+        assert!(directory.resolve(capability).is_ok());
+        registration.retire().unwrap();
+        assert_eq!(
+            directory
+                .resolve(capability)
+                .err()
+                .map(ServiceFailureCode::raw),
+            Some(38)
+        );
     }
 
     #[test]
@@ -278,10 +326,10 @@ impl NativeService {
             }
             _ => return Err(stale()),
         };
-        let service = self
-            .custody
-            .native_exec_service(capability)
-            .ok_or_else(|| stale())?;
+        let service = match self.custody.native_exec_services.resolve(capability) {
+            Ok(service) => service,
+            Err(unrouted) => return self.finish_exec_failure(unrouted),
+        };
         match service.prepare(request, payload) {
             Ok(prepared) => {
                 let prepared = match crate::trap::prepare_native_exec_successor(
