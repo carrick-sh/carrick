@@ -2327,7 +2327,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     ///
     /// Returns the exit that ended the wait: `Halt` is the idle exit (host
     /// work, or a queued thread that needs the executor); anything else means
-    /// EL1 ran a thread here and it left at EL0, which the executor adopts.
+    /// EL1 ran a thread here and it left at EL0, which the executor adopts
+    /// through its native service. A kick never ends the wait: one at EL0
+    /// (a native thread EL1 runs here) is owed to the EL1 scheduler's IRQ
+    /// boundary (`owed_kick::run_idle_entry`, #890).
     pub fn run_idle_entry_on_vcpu(
         vcpu: &mut V::Vcpu,
         carrier_root: carrick_mem::memory::CarrierMaintenanceRoot,
@@ -2348,22 +2351,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         vcpu.set_reg(Reg::X(16), frame_va)?;
         vcpu.set_reg(Reg::Pc, carrick_mem::memory::el1_idle_entry_va())?;
         vcpu.set_reg(Reg::Pstate, AARCH64_PSTATE_EL1H_DAIF_MASKED)?;
-        loop {
-            match vcpu.run()? {
-                // A kick at an EL1 instruction outside the image (the vector
-                // page) surfaces here. The hook may already hold a thread
-                // EL1 switched in, so it is never abandoned: re-enter, and
-                // the hook leaves through the host on the kick's pending
-                // host work.
-                Aarch64Exit::Kicked if Self::vcpu_at_el1(vcpu) => continue,
-                exit => return Ok(exit),
-            }
-        }
-    }
-
-    fn vcpu_at_el1(vcpu: &mut V::Vcpu) -> bool {
-        vcpu.get_reg(Reg::Pstate)
-            .is_ok_and(|pstate| (pstate >> 2) & 0b11 != 0)
+        crate::owed_kick::run_idle_entry(vcpu)
     }
 
     fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {

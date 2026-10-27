@@ -51,6 +51,9 @@ pub enum AbsorbedKickSite {
     El1Vector = 1,
     El1Image = 2,
     El0ClockStub = 3,
+    /// EL0 of a native thread EL1 runs on an idle-entry vCPU, owed to the
+    /// EL1 scheduler's IRQ boundary (`run_idle_entry`).
+    IdleEntryEl0 = 4,
 }
 
 /// The kick currently owed to the EL0 boundary, if any, for one `next_syscall`.
@@ -132,6 +135,77 @@ impl OwedKick {
         let el0_pstate = vcpu.get_reg(el0_state)?;
         vcpu.set_reg(el0_state, el0_pstate | PSTATE_I)
     }
+}
+
+/// Run an idle-entry vCPU (no host task loaded, see
+/// `Aarch64EngineCore::run_idle_entry_on_vcpu`) until an exit its executor
+/// must take.
+pub fn run_idle_entry<C: Aarch64Vcpu + ?Sized>(
+    vcpu: &mut C,
+) -> Result<crate::vmm::Aarch64Exit, TrapError> {
+    use crate::vmm::Aarch64Exit;
+    loop {
+        match vcpu.run()? {
+            // A kick at an EL1 instruction outside the image (the vector
+            // page) surfaces here. The hook may already hold a thread EL1
+            // switched in, so it is never abandoned: re-enter, and the hook
+            // leaves through the host on the kick's pending host work.
+            Aarch64Exit::Kicked if vcpu_at_el1(vcpu) => continue,
+            // At EL0: EL1 switched a native-owned record in and runs it here.
+            // No host task is loaded to take the kick (#890), so it is owed
+            // to the EL1 scheduler's EL0 IRQ boundary instead.
+            Aarch64Exit::Kicked if owe_idle_el0_kick(vcpu)? => continue,
+            exit => return Ok(exit),
+        }
+    }
+}
+
+/// A kick cancelled an idle-entry vCPU while EL1 ran a native thread at EL0.
+/// Re-enter with the kick owed to the scheduler's EL0 IRQ boundary: the
+/// native owner settles the record there (`Sched::finish_interrupt` ->
+/// `host_work_boundary` for host work, the preemption decision for a
+/// reschedule) and the vCPU resumes the thread or leaves through the idle
+/// exit with the record handed back. False when the kick was EL1's own
+/// requested boundary or this backend has no IRQ vehicle; the exit then
+/// surfaces as before.
+///
+/// The two kick kinds are kept distinct. A host kick (`el1_zone::kick_slot`)
+/// published host work first, so the kick SGI is made pending (EL1 takes it
+/// as host work). A reschedule (`el1_zone::resched_slot`) published only the
+/// slot's owed reschedule, which the backend's run loop raises as the
+/// reschedule SGI before the vCPU runs on; it is not turned into host work.
+/// Either SGI is taken at the first EL0 instruction once `I` is clear. The
+/// guest never observes `I` (`carrick_hal::el0_visible_pstate`) and EL1's
+/// served returns to EL0 clear it anyway, so it is not restored.
+fn owe_idle_el0_kick<C: Aarch64Vcpu + ?Sized>(vcpu: &mut C) -> Result<bool, TrapError> {
+    // EL1's own `hvc` kick at an EL0 boundary decodes to `Kicked` too. That
+    // is a boundary EL1 asked for: re-entering it would loop, so only a raw
+    // cross-thread cancellation is owed.
+    if !vcpu.kicked_by_cancellation() || !vcpu.injects_kick_irq() {
+        return Ok(false);
+    }
+    let pstate = vcpu.get_reg(Reg::Pstate)?;
+    if !carrick_hal::aarch64::ExecLevel::from_pstate(pstate).is_guest() {
+        return Ok(false);
+    }
+    carrick_observability::probes::kick_rearm_irq(
+        vcpu.get_reg(Reg::Pc).unwrap_or(0),
+        AbsorbedKickSite::IdleEntryEl0 as u32,
+        pstate,
+        vcpu.get_reg(Reg::ElrEl1).unwrap_or(u64::MAX),
+    );
+    if vcpu.host_work_pending()? {
+        vcpu.set_pending_irq(true)?;
+    }
+    if pstate & PSTATE_I != 0 {
+        vcpu.set_reg(Reg::Pstate, pstate & !PSTATE_I)?;
+    }
+    Ok(true)
+}
+
+fn vcpu_at_el1<C: Aarch64Vcpu + ?Sized>(vcpu: &C) -> bool {
+    vcpu.get_reg(Reg::Pstate)
+        .is_ok_and(|pstate| !carrick_hal::aarch64::ExecLevel::from_pstate(pstate).is_guest())
 }
 
 /// Where the interrupted EL0 PSTATE lives right now: the live PSTATE when the
@@ -518,5 +592,253 @@ mod tests {
         owed.settle(&mut vcpu).expect("settle");
         assert!(!vcpu.pending_irq, "settle left the SGI pending");
         assert_eq!(vcpu.spsr_el1, EL0_DAIF_MASKED);
+    }
+
+    /// Contract `kernel.vcpu.kick-el0-boundary`, idle-entry half (#890).
+    ///
+    /// An executor with no host task waits in the EL1 scheduler (the idle
+    /// entry). EL1 may switch a native-owned record in and run it at EL0 on
+    /// that vCPU. A kick that cancels the vCPU there is not an exit the
+    /// executor can take: no host task is loaded to receive it. It must reach
+    /// the EL1 scheduler's EL0 IRQ boundary, where the native owner settles
+    /// the record (`Sched::finish_interrupt` -> `host_work_boundary` for host
+    /// work, the preemption decision for a reschedule), and the vCPU then
+    /// leaves through the idle exit with the record handed back.
+    ///
+    /// `IdleModel` models the Hypervisor.framework + in-kernel GIC facts this
+    /// depends on: a pending SGI is taken at EL0 only with PSTATE.I clear and
+    /// survives run returns; the HVF run loop arms the reschedule SGI owed by
+    /// a host placement (`ZoneTables::take_resched`) and unmasks EL0 IRQs
+    /// before it runs the vCPU. The EL1 side of the boundary is the
+    /// scheduler's own VM-free suite (`carrick-el1-linux` `sched::tests`).
+    mod idle_entry {
+        use super::*;
+
+        /// The idle entry's EL1h, DAIF-masked start state.
+        const EL1H: u64 = 0x3c5;
+        /// A native thread EL1 switched in: EL0t with IRQs unmasked, as every
+        /// EL1-served return to EL0 leaves it under the GIC.
+        const EL0_UNMASKED: u64 = 0x340;
+        const NATIVE_PC: u64 = 0x0029_e564;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Settled {
+            /// The native owner settled the record at the IRQ boundary for
+            /// host work and the vCPU left through the idle exit.
+            HostWorkBoundary,
+            /// The reschedule preempted the record into its run queue and the
+            /// vCPU left for the executor.
+            Preempted,
+        }
+
+        struct IdleModel {
+            pc: u64,
+            pstate: u64,
+            /// The EL0 PSTATE the switched-in native thread runs with.
+            native_pstate: u64,
+            /// EL1 switched the native record in on the first run.
+            switched_in: bool,
+            /// The slot's pending-host-work doorbell (`kick_slot`).
+            host_work: bool,
+            /// A host placement owes the slot a reschedule SGI.
+            resched_owed: bool,
+            kick_sgi: bool,
+            resched_sgi: bool,
+            kick_sgis_armed: u32,
+            settled: Option<Settled>,
+            /// EL0 ran on with nothing pending: the kick was lost.
+            lost_kick: bool,
+            /// The first `Kicked` is EL1's own `hvc` boundary request rather
+            /// than a cross-thread cancellation.
+            el1_requested: bool,
+            /// The last exit was a cross-thread cancellation.
+            cancelled: bool,
+        }
+
+        impl IdleModel {
+            fn new(native_pstate: u64, host_work: bool, resched_owed: bool) -> Self {
+                Self {
+                    pc: 0,
+                    pstate: EL1H,
+                    native_pstate,
+                    switched_in: false,
+                    host_work,
+                    resched_owed,
+                    kick_sgi: false,
+                    resched_sgi: false,
+                    kick_sgis_armed: 0,
+                    settled: None,
+                    lost_kick: false,
+                    el1_requested: false,
+                    cancelled: false,
+                }
+            }
+        }
+
+        impl Aarch64Vcpu for IdleModel {
+            fn host_work_pending(&self) -> Result<bool, TrapError> {
+                Ok(self.host_work)
+            }
+            fn kicked_by_cancellation(&self) -> bool {
+                self.cancelled
+            }
+            fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
+                Ok(match r {
+                    Reg::Pc => self.pc,
+                    Reg::Pstate => self.pstate,
+                    _ => 0,
+                })
+            }
+            fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError> {
+                match r {
+                    Reg::Pc => self.pc = v,
+                    Reg::Pstate => self.pstate = v,
+                    _ => {}
+                }
+                Ok(())
+            }
+            fn get_sys_reg(&self, _r: SysReg) -> Result<u64, TrapError> {
+                Ok(0)
+            }
+            fn set_sys_reg(&mut self, _r: SysReg, _v: u64) -> Result<(), TrapError> {
+                Ok(())
+            }
+            fn get_vreg(&self, _n: u32) -> Result<u128, TrapError> {
+                Ok(0)
+            }
+            fn set_vreg(&mut self, _n: u32, _v: u128) -> Result<(), TrapError> {
+                Ok(())
+            }
+            fn get_fpcr(&self) -> Result<u64, TrapError> {
+                Ok(0)
+            }
+            fn set_fpcr(&mut self, _v: u64) -> Result<(), TrapError> {
+                Ok(())
+            }
+            fn get_fpsr(&self) -> Result<u64, TrapError> {
+                Ok(0)
+            }
+            fn set_fpsr(&mut self, _v: u64) -> Result<(), TrapError> {
+                Ok(())
+            }
+            fn get_esr_el1(&self) -> Result<u64, TrapError> {
+                Ok(0)
+            }
+            fn get_far_el1(&self) -> Result<u64, TrapError> {
+                Ok(0)
+            }
+            fn snapshot(&self) -> Result<Aarch64VcpuSnapshot, TrapError> {
+                Err(TrapError::Hypervisor("unused model snapshot".into()))
+            }
+            fn restore(&mut self, _snap: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
+                Ok(())
+            }
+            fn set_pending_irq(&mut self, pending: bool) -> Result<(), TrapError> {
+                if pending {
+                    self.kick_sgis_armed += 1;
+                }
+                self.kick_sgi = pending;
+                Ok(())
+            }
+            fn injects_kick_irq(&self) -> bool {
+                true
+            }
+            fn kick(&self) -> Result<(), TrapError> {
+                Ok(())
+            }
+            fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
+                self.cancelled = false;
+                if !self.switched_in {
+                    // EL1's idle loop switches the native record in and
+                    // erets to it; the cross-thread kick cancels the vCPU at
+                    // its first EL0 instruction.
+                    self.switched_in = true;
+                    self.pstate = self.native_pstate;
+                    self.pc = NATIVE_PC;
+                    self.cancelled = !self.el1_requested;
+                    return Ok(Aarch64Exit::Kicked);
+                }
+                // The HVF run loop's pre-run reschedule check.
+                if std::mem::take(&mut self.resched_owed) {
+                    self.resched_sgi = true;
+                    self.pstate &= !PSTATE_I;
+                }
+                let at_el0 = carrick_hal::aarch64::ExecLevel::from_pstate(self.pstate).is_guest();
+                if at_el0 && self.pstate & PSTATE_I == 0 && (self.kick_sgi || self.resched_sgi) {
+                    // Taken at EL0: the EL0 IRQ hook enters the scheduler.
+                    // A kick SGI is host work (`Sched::take_irqs`).
+                    if std::mem::take(&mut self.kick_sgi) {
+                        self.host_work = true;
+                    }
+                    let resched = std::mem::take(&mut self.resched_sgi);
+                    self.settled = Some(if self.host_work {
+                        Settled::HostWorkBoundary
+                    } else {
+                        assert!(resched);
+                        Settled::Preempted
+                    });
+                    // `hvc #5`: the idle exit, no thread loaded.
+                    self.pstate = EL1H;
+                    return Ok(Aarch64Exit::Halt);
+                }
+                self.lost_kick = true;
+                Ok(Aarch64Exit::Halt)
+            }
+        }
+
+        /// A host kick (`kick_slot`: host work published, then
+        /// `hv_vcpus_exit`) landing on the native thread at EL0 is settled
+        /// at the native owner's IRQ boundary, never surfaced as an exit the
+        /// threadless executor would have to fail on. Both EL0 IRQ states.
+        #[test]
+        fn host_kick_at_el0_settles_at_the_native_irq_boundary() {
+            for native_pstate in [EL0_UNMASKED, EL0_DAIF_MASKED] {
+                let mut vcpu = IdleModel::new(native_pstate, true, false);
+                let exit = run_idle_entry(&mut vcpu).expect("idle entry");
+                assert!(
+                    matches!(exit, Aarch64Exit::Halt),
+                    "pstate {native_pstate:#x}: an EL0 kick under the idle entry surfaced \
+                     as {exit:?} to an executor with no host task loaded"
+                );
+                assert_eq!(vcpu.settled, Some(Settled::HostWorkBoundary));
+                assert!(!vcpu.lost_kick);
+                assert!(
+                    !vcpu.kick_sgi,
+                    "the kick SGI stayed pending after it was taken"
+                );
+            }
+        }
+
+        /// A reschedule kick (`resched_slot`: a host placement, no host
+        /// work) reaches the scheduler's preemption decision through the
+        /// reschedule SGI. It must not be turned into host work.
+        #[test]
+        fn resched_kick_at_el0_reaches_the_preemption_decision() {
+            for native_pstate in [EL0_UNMASKED, EL0_DAIF_MASKED] {
+                let mut vcpu = IdleModel::new(native_pstate, false, true);
+                let exit = run_idle_entry(&mut vcpu).expect("idle entry");
+                assert!(
+                    matches!(exit, Aarch64Exit::Halt),
+                    "pstate {native_pstate:#x}: a reschedule kick at EL0 surfaced as {exit:?}"
+                );
+                assert_eq!(vcpu.settled, Some(Settled::Preempted));
+                assert_eq!(vcpu.kick_sgis_armed, 0, "a reschedule invented host work");
+                assert!(!vcpu.host_work);
+                assert!(!vcpu.lost_kick);
+            }
+        }
+
+        /// EL1's own `hvc` kick at an EL0 boundary also decodes to `Kicked`.
+        /// It is a boundary EL1 asked for, not a cancellation: it surfaces
+        /// (re-entering it would loop on the same pending host work).
+        #[test]
+        fn el1_requested_el0_boundary_still_surfaces() {
+            let mut vcpu = IdleModel::new(EL0_UNMASKED, true, false);
+            vcpu.el1_requested = true;
+            let exit = run_idle_entry(&mut vcpu).expect("idle entry");
+            assert!(matches!(exit, Aarch64Exit::Kicked));
+            assert_eq!(vcpu.kick_sgis_armed, 0);
+            assert_eq!(vcpu.settled, None);
+        }
     }
 }
