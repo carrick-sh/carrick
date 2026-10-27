@@ -312,7 +312,10 @@ _lint-domains-source:
     ./scripts/check-fixture-lockfiles.sh
     # Every checkout crate a signed fixture reaches is a bundle input; only
     # dependency-free leaf crates may be reached, so kernel-only commits keep
-    # the published fixture bundle valid (#891).
+    # the published fixture bundle valid (#891). The closure resolves offline,
+    # so populate every fixture lock (including conformance-probes, which the
+    # lockfile gate above does not fetch) on fresh runners first.
+    {{_xtask}} fixtures fetch
     {{_xtask}} fixtures leaf-closure
     {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
