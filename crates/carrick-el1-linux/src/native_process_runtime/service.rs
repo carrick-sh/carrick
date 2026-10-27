@@ -309,11 +309,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ///
     /// A path operation resolves with the process tree's retained authority,
     /// Keep a carrier-retained private-mapping source for this record:
-    /// `key` names the exact `mmap` retry that consumes it; `None` owes it
-    /// back unconsumed.
+    /// `key` names the exact `mmap` retry that consumes it.
     fn stash_map_source(
         &self,
-        key: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+        key: carrick_personality_linux::native_host_file::NativeMapKey,
         source: carrick_core_abi::HostBackingIdentity,
     ) -> Result<(), NativeProcessError> {
         let mut graph = self.runtime.graph.lock();
@@ -1658,24 +1657,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             result,
                         ) {
                             (Err(result), _) => Ok(NativeResume::Returned(result)),
-                            (Ok(source), result) => {
-                                let source = carrick_core_abi::HostBackingIdentity::new(
-                                    source.handle,
-                                    source.generation,
-                                    0,
-                                );
-                                let cancelled = matches!(result, ServiceResult::Cancelled);
-                                // A cancelled call never maps: its source is
-                                // owed back to the carrier, retired by this
-                                // record's next delegated mmap.
-                                self.stash_map_source((!cancelled).then_some(key), source)?;
-                                Ok(if cancelled {
-                                    NativeResume::Returned(SyscallResult::new(
-                                        carrick_syscall_abi::LINUX_EINTR.guest_retval(),
-                                    ))
-                                } else {
-                                    NativeResume::RetrySyscall
-                                })
+                            (Ok(source), _) => {
+                                // Linux never interrupts mmap: a cancelled
+                                // service that already retained the source
+                                // still maps it on the restarted call, after
+                                // whatever cancelled it is delivered.
+                                self.stash_map_source(
+                                    key,
+                                    carrick_core_abi::HostBackingIdentity::new(
+                                        source.handle,
+                                        source.generation,
+                                        0,
+                                    ),
+                                )?;
+                                Ok(NativeResume::RetrySyscall)
                             }
                         };
                     }
@@ -1703,9 +1698,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     )))
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Cancelled) => {
-                    Ok(NativeResume::Returned(SyscallResult::new(
-                        carrick_syscall_abi::LINUX_EINTR.guest_retval(),
-                    )))
+                    // No effect happened. The venue's operations on regular
+                    // files, directories and paths are not interruptible in
+                    // Linux (no EINTR): the call restarts once whatever
+                    // cancelled the service has been delivered.
+                    Ok(NativeResume::RetrySyscall)
                 }
                 (ServiceOperation::Exception(_), ServiceResult::Supplied) => {
                     Err(NativeProcessError::Quarantined)

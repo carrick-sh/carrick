@@ -718,8 +718,9 @@ impl<C: ProcessContext> Drop for InterruptedChildWait<C> {
 }
 
 /// One record's retained private-mapping byte sources: the one its next
-/// exact `mmap` retry consumes, and any it will not (a cancelled or replaced
-/// reply), which that retry retires so the carrier releases them.
+/// exact `mmap` retry consumes, and any it will not (a reply replaced before
+/// its retry, or one whose retry changed its arguments), which that retry
+/// retires so the carrier releases them.
 #[derive(Default)]
 struct MapStash {
     live: Option<(
@@ -742,16 +743,11 @@ impl MapStash {
 
     fn retain(
         &mut self,
-        key: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+        key: carrick_personality_linux::native_host_file::NativeMapKey,
         source: carrick_core_abi::HostBackingIdentity,
     ) {
-        match key {
-            Some(key) => {
-                if let Some((_, replaced)) = self.live.replace((key, source)) {
-                    self.orphan(replaced);
-                }
-            }
-            None => self.orphan(source),
+        if let Some((_, replaced)) = self.live.replace((key, source)) {
+            self.orphan(replaced);
         }
     }
 }
