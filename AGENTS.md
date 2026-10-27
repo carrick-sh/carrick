@@ -661,6 +661,14 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
 - **Fix in the shared layers** (shared kernel, `carrick-abi`, `carrick-hal`,
   neutral cores) so every backend benefits; no per-backend one-offs. Move
   code, never copy it.
+- **One lane for x86 and aarch64** (owner, 2026-10-27). Routing, authority,
+  lifecycle and service logic live in ISA-neutral crates (`carrick-el1-linux`,
+  `carrick-personality-linux`, `carrick-kernel`, `carrick-runtime`, neutral
+  cores). Per-arch code holds only true ISA mechanics: register frames, trap
+  and IRQ entry, page-table formats. Separate by ISA only when the ISA
+  requires it, and say why in the commit. Review flags neutral logic placed
+  in `carrick-aarch64`, `carrick-vmm-hvf` or the x86 carrier crates; one ISA
+  left behind is a `seam` issue, never a silent gap.
 - **Seams:** a seam is a carrick issue labelled `seam`, in neutral
   vocabulary. Additive personality-API seams (new types and traits, no
   guest-visible behaviour change, Linux dispatch/mm/fork/signal untouched)
