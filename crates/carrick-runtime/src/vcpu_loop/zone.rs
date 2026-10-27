@@ -65,6 +65,16 @@ fn editor_is_held(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool
         .is_some_and(|index| zone.spaces.active_editor(index).is_some())
 }
 
+/// A host page-table pause or editor exclusion (an `MmMutationGuard` munmap,
+/// an exit or exec retirement) holds the gate raised. Its release publishes
+/// the Gate notification, so it is a producer even though no guest Editor
+/// word is set and the Editor revision has not advanced yet.
+fn host_gate_is_raised(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool {
+    zone.spaces
+        .find(mm.raw())
+        .is_some_and(|index| zone.spaces.host_gate_raised(index))
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -75,21 +85,28 @@ fn editor_is_held(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool
 enum EditorRefusalDisposition {
     Reselect,
     Park,
+    /// No guest Editor is held, but a host exclusion holds the gate raised
+    /// (it is unpublishing stage-1 and retiring stage-2 before its release
+    /// advances the Editor revision). Park on the gate release.
+    ParkOnHostGate,
     Invariant,
 }
 
 /// Classify one refused SELECT receipt. A changed revision is consumed by one
 /// reselect; observing the same revision again can only park behind its held
-/// editor or terminate the inconsistent MM.
+/// editor or raised host gate, or terminate the inconsistent MM.
 fn editor_refusal_disposition(
     selected_revision: u64,
     current_revision: u64,
     editor_held: bool,
+    host_gate_raised: bool,
 ) -> EditorRefusalDisposition {
     if current_revision != selected_revision {
         EditorRefusalDisposition::Reselect
     } else if editor_held {
         EditorRefusalDisposition::Park
+    } else if host_gate_raised {
+        EditorRefusalDisposition::ParkOnHostGate
     } else {
         EditorRefusalDisposition::Invariant
     }
@@ -102,16 +119,21 @@ mod editor_refusal_tests {
     #[test]
     fn a_revision_change_buys_exactly_one_reselect() {
         assert_eq!(
-            editor_refusal_disposition(7, 8, false),
+            editor_refusal_disposition(7, 8, false, false),
             EditorRefusalDisposition::Reselect
         );
         assert_eq!(
-            editor_refusal_disposition(8, 8, true),
+            editor_refusal_disposition(8, 8, true, false),
             EditorRefusalDisposition::Park,
             "the new SELECT receipt parks only behind its live editor producer"
         );
         assert_eq!(
-            editor_refusal_disposition(8, 8, false),
+            editor_refusal_disposition(8, 8, false, true),
+            EditorRefusalDisposition::ParkOnHostGate,
+            "a raised host exclusion is the producer of the pending revision"
+        );
+        assert_eq!(
+            editor_refusal_disposition(8, 8, false, false),
             EditorRefusalDisposition::Invariant,
             "the same revision cannot authorize another synchronous reselect"
         );
@@ -957,6 +979,8 @@ where
         >| {
             carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
         };
+        let mut enrollment = enrollment;
+        let mut parked_on_host_gate = false;
         let cause = enrollment.cause();
         if cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
             && space_is_closed(zone, wait_mm)
@@ -969,12 +993,27 @@ where
         {
             let current_revision = enrollment.current_revision();
             let editor_held = editor_is_held(zone, wait_mm);
-            match editor_refusal_disposition(enrollment.revision(), current_revision, editor_held) {
+            let host_gate_raised = host_gate_is_raised(zone, wait_mm);
+            match editor_refusal_disposition(
+                enrollment.revision(),
+                current_revision,
+                editor_held,
+                host_gate_raised,
+            ) {
                 EditorRefusalDisposition::Reselect => {
                     zone.free_record(record);
                     return Ok(OwnerMemoryPark::Recheck(action));
                 }
                 EditorRefusalDisposition::Park => {}
+                EditorRefusalDisposition::ParkOnHostGate => {
+                    // Sample the Gate revision first; the park below rechecks
+                    // that the gate is still raised after enrolling, and a
+                    // release in between changes the sampled revision.
+                    enrollment = enrollment.rebind_current(
+                        carrick_sched_core::spaces::notification::SpaceWaitCause::Gate,
+                    );
+                    parked_on_host_gate = true;
+                }
                 EditorRefusalDisposition::Invariant => {
                     zone.free_record(record);
                     return Ok(OwnerMemoryPark::Stage2AuthorityInvariant {
@@ -987,6 +1026,7 @@ where
             }
         }
         match enrollment.park_host_rechecked(record, token, &complete, || match cause {
+            _ if parked_on_host_gate => host_gate_is_raised(zone, wait_mm),
             carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations => {
                 reservation_root_is_held(zone, wait_mm)
             }

@@ -4547,6 +4547,26 @@ pub(crate) mod tests {
         );
     }
 
+    /// #855 review P1-1: a host exclusion (an `MmMutationGuard` munmap, an
+    /// exit or exec retirement) raises the gate, unpublishes stage-1 and
+    /// retires stage-2; the Editor revision advances only when it releases.
+    /// A copy that pins in that window holds the current revision with no
+    /// guest Editor. It must park on the gate release and reselect, never be
+    /// classified as a stage-2 authority invariant and SIGKILLed.
+    #[test]
+    fn serial_host_copy_pinning_under_host_exclusion_parks_then_reselects() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::FSTAT,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            OwnerWaitSelection::HostExclusionInFlight,
+        );
+    }
+
     #[test]
     fn serial_host_mm_exit_close_races_a_parked_sibling_copy_without_invariant_kill() {
         exercise_owner_wait_schedule_at(
@@ -4621,6 +4641,7 @@ pub(crate) mod tests {
         Normal,
         Stale,
         ReleasedEditorAdmission,
+        HostExclusionInFlight,
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4634,7 +4655,9 @@ pub(crate) mod tests {
         close_mm_while_parked: bool,
         selection: OwnerWaitSelection,
     ) {
-        let stale_selection_without_editor = selection == OwnerWaitSelection::Stale;
+        let host_exclusion_in_flight = selection == OwnerWaitSelection::HostExclusionInFlight;
+        let stale_selection_without_editor =
+            selection == OwnerWaitSelection::Stale || host_exclusion_in_flight;
         let released_editor_admission = selection == OwnerWaitSelection::ReleasedEditorAdmission;
         #[derive(Debug)]
         struct RetirementRequestedBacking {
@@ -5338,6 +5361,58 @@ pub(crate) mod tests {
                                 carrick_kernel::kernel::objects::BlockedReason::HostWait,
                             )
                             .unwrap();
+                    } else if host_exclusion_in_flight {
+                        // The production exclusion an `MmMutationGuard` takes
+                        // for munmap: gate raised, no guest Editor word.
+                        let exclusion = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                            root.shared().mm().id(),
+                        )
+                        .expect("published MM admits a host exclusion");
+                        let index = zone.spaces.find(mm.raw()).unwrap();
+                        assert!(zone.spaces.host_gate_raised(index));
+                        assert!(zone.spaces.active_editor(index).is_none());
+                        let completed = job
+                            .drive_service_outcome(
+                                &mut engine,
+                                &mut control,
+                                frame,
+                                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                                Some(resume),
+                            )
+                            .unwrap();
+                        assert!(
+                            kernel
+                                .fatal_signal
+                                .recorded_for(job.state.fatal_image_generation)
+                                .is_none(),
+                            "a copy pinning under a host exclusion must not become STAGE2INV"
+                        );
+                        let executor::ExecutorExit::BlockedContinuation {
+                            continuation,
+                            vfork_activation: None,
+                        } = completed
+                        else {
+                            panic!("the copy must park on the raised gate: {completed:?}");
+                        };
+                        let mut wait_registration =
+                            wait_service.prepare_registration(&continuation);
+                        wait_service.enroll(&mut wait_registration).unwrap();
+                        running
+                            .restore_lease(submission.take_execution_lease().unwrap())
+                            .unwrap();
+                        scheduler
+                            .settle_blocked_continuation(running, *continuation, wait_registration)
+                            .unwrap();
+                        assert_eq!(scheduler.queued_len(), 0, "parked until the gate releases");
+                        drop(exclusion);
+                        carrick_kernel::el1_zone::hand_back_completions();
+                        assert_eq!(
+                            scheduler.queued_len(),
+                            1,
+                            "the gate release must wake the copy to reselect"
+                        );
+                        scheduler.close();
+                        return;
                     } else if stale_selection_without_editor {
                         let invariant_event = (
                             wait.handle().mm().raw() as u32 as i32,

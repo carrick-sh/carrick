@@ -660,6 +660,14 @@ impl AddressSpaces {
         self.entry(index).gate.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// Whether a host page-table pause or editor exclusion currently holds
+    /// the gate raised. Every such raise ends in a gate release that
+    /// publishes the space's Gate notification, so a waiter that finds the
+    /// gate raised has a live producer to park on.
+    pub fn host_gate_raised(&self, index: SpaceIndex) -> bool {
+        self.gate(index) & !(GATE_CLOSED | GATE_INITIAL_BIND) != 0
+    }
+
     /// The gate word (tests and diagnostics).
     pub fn gate(&self, index: SpaceIndex) -> u64 {
         self.entry(index).gate.load(Ordering::SeqCst)

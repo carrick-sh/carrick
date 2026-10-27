@@ -106,6 +106,16 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
         self.source.observe(self.cause).revision()
     }
 
+    /// Re-enroll on another notification cause of the same exact MM source,
+    /// at that cause's current revision. The revision is sampled here, so a
+    /// caller must check its producer predicate only afterwards: a producer
+    /// that completes in between advances the sampled revision and the park
+    /// is refused as changed.
+    pub fn rebind_current(self, cause: SpaceWaitCause) -> Self {
+        let revision = self.source.observe(cause).revision();
+        Self::new(self.source, cause, revision)
+    }
+
     /// Authenticate a ring-owned continuation against its retained birth MM.
     pub fn for_owner(
         zone: &'a ZoneTables<C>,
