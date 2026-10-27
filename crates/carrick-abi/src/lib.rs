@@ -146,15 +146,6 @@ pub use syscall_x86_64::SyscallRemap;
 pub mod bpf;
 pub mod keyring;
 
-pub const LINUX_S_IFMT: u32 = 0o170000;
-pub const LINUX_S_IFDIR: u32 = 0o040000;
-pub const LINUX_S_IFREG: u32 = 0o100000;
-pub const LINUX_S_IFLNK: u32 = 0o120000;
-pub const LINUX_S_IFIFO: u32 = 0o010000;
-pub const LINUX_S_IFCHR: u32 = 0o020000;
-pub const LINUX_S_IFBLK: u32 = 0o060000;
-pub const LINUX_S_IFSOCK: u32 = 0o140000;
-
 /// What `sched_rr_get_interval(2)` reports for a SCHED_OTHER task.
 ///
 /// A `LinuxTimespec` rather than a bare nanosecond integer: a scheduling
@@ -201,7 +192,6 @@ pub const LINUX_AT_HWCAP2: u64 = 26;
 pub const LINUX_AT_EXECFN: u64 = 31;
 /// Base address of the kernel-provided vDSO ELF (carrick's fast clock page).
 pub const LINUX_AT_SYSINFO_EHDR: u64 = 33;
-pub const LINUX_PAGE_SIZE: u64 = 4096;
 
 bitflags! {
     /// AArch64 Linux `AT_HWCAP` feature bits published to the guest.
@@ -527,42 +517,6 @@ impl WaitSigMask {
 
 pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64Header>();
 
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
-pub struct LinuxStat {
-    pub st_dev: u64,
-    pub st_ino: u64,
-    pub st_mode: u32,
-    pub st_nlink: u32,
-    pub st_uid: u32,
-    pub st_gid: u32,
-    pub st_rdev: u64,
-    pub __pad1: u64,
-    pub st_size: i64,
-    pub st_blksize: i32,
-    pub __pad2: i32,
-    pub st_blocks: i64,
-    pub st_atime: i64,
-    pub st_atime_nsec: u64,
-    pub st_mtime: i64,
-    pub st_mtime_nsec: u64,
-    pub st_ctime: i64,
-    pub st_ctime_nsec: u64,
-    pub __unused4: u32,
-    pub __unused5: u32,
-}
-
 /// Linux x86_64 `struct stat` written by legacy syscalls `stat(2)`,
 /// `fstat(2)`, and `lstat(2)`.
 ///
@@ -630,82 +584,6 @@ pub struct LinuxStatfs {
     pub f_frsize: i64,
     pub f_flags: i64,
     pub f_spare: [i64; 4],
-}
-
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
-pub struct LinuxStatxTimestamp {
-    pub tv_sec: i64,
-    pub tv_nsec: u32,
-    pub __reserved: i32,
-}
-
-impl LinuxStatxTimestamp {
-    pub const fn zero() -> Self {
-        Self {
-            tv_sec: 0,
-            tv_nsec: 0,
-            __reserved: 0,
-        }
-    }
-}
-
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
-pub struct LinuxStatx {
-    pub stx_mask: u32,
-    pub stx_blksize: u32,
-    pub stx_attributes: u64,
-    pub stx_nlink: u32,
-    pub stx_uid: u32,
-    pub stx_gid: u32,
-    pub stx_mode: u16,
-    pub __spare0: [u16; 1],
-    pub stx_ino: u64,
-    pub stx_size: u64,
-    pub stx_blocks: u64,
-    pub stx_attributes_mask: u64,
-    pub stx_atime: LinuxStatxTimestamp,
-    pub stx_btime: LinuxStatxTimestamp,
-    pub stx_ctime: LinuxStatxTimestamp,
-    pub stx_mtime: LinuxStatxTimestamp,
-    pub stx_rdev_major: u32,
-    pub stx_rdev_minor: u32,
-    pub stx_dev_major: u32,
-    pub stx_dev_minor: u32,
-    pub stx_mnt_id: u64,
-    pub stx_dio_mem_align: u32,
-    pub stx_dio_offset_align: u32,
-    pub stx_subvol: u64,
-    pub stx_atomic_write_unit_min: u32,
-    pub stx_atomic_write_unit_max: u32,
-    pub stx_atomic_write_segments_max: u32,
-    pub stx_dio_read_offset_align: u32,
-    pub stx_atomic_write_unit_max_opt: u32,
-    pub __spare2: [u32; 1],
-    pub __spare3: [u64; 8],
 }
 
 #[repr(C, packed)]
@@ -4078,24 +3956,6 @@ pub const LINUX_P_ALL: u64 = 0;
 pub const LINUX_P_PID: u64 = 1;
 pub const LINUX_P_PGID: u64 = 2;
 pub const LINUX_P_PIDFD: u64 = 3;
-pub const LINUX_STATX_TYPE: u32 = 0x0001;
-pub const LINUX_STATX_MODE: u32 = 0x0002;
-pub const LINUX_STATX_NLINK: u32 = 0x0004;
-pub const LINUX_STATX_UID: u32 = 0x0008;
-pub const LINUX_STATX_GID: u32 = 0x0010;
-pub const LINUX_STATX_ATIME: u32 = 0x0020;
-pub const LINUX_STATX_MTIME: u32 = 0x0040;
-pub const LINUX_STATX_CTIME: u32 = 0x0080;
-pub const LINUX_STATX_INO: u32 = 0x0100;
-pub const LINUX_STATX_SIZE: u32 = 0x0200;
-pub const LINUX_STATX_BLOCKS: u32 = 0x0400;
-pub const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
-pub const LINUX_STATX_BTIME: u32 = 0x0800;
-pub const LINUX_STATX_MNT_ID: u32 = 0x1000;
-pub const LINUX_STATX_DIOALIGN: u32 = 0x2000;
-pub const LINUX_STATX_MNT_ID_UNIQUE: u32 = 0x4000;
-pub const LINUX_STATX_ALL: u32 = 0x0fff;
-pub const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
 
 pub const LINUX_MFD_CLOEXEC: u64 = 0x0001;
 pub const LINUX_MFD_ALLOW_SEALING: u64 = 0x0002;

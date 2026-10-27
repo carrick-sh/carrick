@@ -3677,6 +3677,42 @@ impl StatRecord {
         }
     }
 
+    /// A record of shared Linux stat facts (an in-zone object every venue
+    /// reports identically), on carrick's overlay device.
+    pub(super) fn from_linux_fields(fields: carrick_abi::LinuxStatFields) -> Self {
+        Self {
+            ino: fields.ino,
+            mode: fields.mode,
+            nlink: fields.nlink,
+            uid: carrick_abi::NsUid::new(fields.uid),
+            gid: carrick_abi::NsGid::new(fields.gid),
+            rdev: fields.rdev,
+            size: fields.size,
+            blocks: fields.blocks,
+            atime: fields.atime,
+            mtime: fields.mtime,
+            ctime: fields.ctime,
+            fs_identity: carrick_vfs::FsIdentity::Overlay,
+        }
+    }
+
+    /// The facts the Linux stat encodings report for this record.
+    pub(super) fn linux_fields(&self) -> carrick_abi::LinuxStatFields {
+        carrick_abi::LinuxStatFields {
+            ino: self.ino,
+            mode: self.mode,
+            nlink: self.nlink,
+            uid: self.uid.raw(),
+            gid: self.gid.raw(),
+            rdev: self.rdev,
+            size: self.size,
+            blocks: self.blocks,
+            atime: self.atime,
+            mtime: self.mtime,
+            ctime: self.ctime,
+        }
+    }
+
     pub(super) fn with_fs_identity(mut self, fs_identity: carrick_vfs::FsIdentity) -> Self {
         self.fs_identity = fs_identity;
         self
@@ -3936,15 +3972,15 @@ impl OpenDescription {
                 record.rdev = 4 << 8;
                 OpenStatSource::Record(record)
             }
-            OpenDescription::EventFd { .. } => {
-                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[eventfd]", 0, 0o600))
-            }
+            OpenDescription::EventFd { .. } => OpenStatSource::Record(
+                StatRecord::from_linux_fields(carrick_abi::LinuxStatFields::CARRICK_EVENTFD),
+            ),
             OpenDescription::TimerFd { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[timerfd]", 0, 0o600))
             }
-            OpenDescription::Epoll { .. } => {
-                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[eventpoll]", 0, 0o600))
-            }
+            OpenDescription::Epoll { .. } => OpenStatSource::Record(StatRecord::from_linux_fields(
+                carrick_abi::LinuxStatFields::CARRICK_EPOLL,
+            )),
             OpenDescription::Pidfd { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[pidfd]", 0, 0o600))
             }
@@ -3973,10 +4009,8 @@ impl OpenDescription {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:bpf-prog", 0, 0o600))
             }
             OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
-                OpenStatSource::Record(StatRecord::synthetic(
-                    "pipe:[carrick]",
-                    0,
-                    LINUX_S_IFIFO | 0o600,
+                OpenStatSource::Record(StatRecord::from_linux_fields(
+                    carrick_abi::LinuxStatFields::CARRICK_PIPE,
                 ))
             }
             OpenDescription::HostPipe {

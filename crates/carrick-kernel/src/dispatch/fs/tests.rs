@@ -2165,7 +2165,7 @@ fn stat_following_final_symlink_cycle_returns_eloop() {
                 LINUX_AT_FDCWD,
                 0x4000,
                 0,
-                LINUX_STATX_BASIC_STATS as u64,
+                carrick_abi::LINUX_STATX_BASIC_STATS as u64,
                 0x4200,
                 0,
             ],
