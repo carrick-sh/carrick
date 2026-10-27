@@ -1,0 +1,418 @@
+use super::*;
+use carrick_core_abi::host_file::HostFileRequestView;
+
+/// User memory at a fixed base; anything outside it faults.
+struct Memory {
+    base: u64,
+    bytes: Vec<u8>,
+    writable: bool,
+}
+impl HostFileUser for Memory {
+    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+        let Some(start) = src.checked_sub(self.base) else {
+            return false;
+        };
+        let start = start as usize;
+        match self.bytes.get(start..start + dst.len()) {
+            Some(bytes) => {
+                dst.copy_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+    fn writable(&mut self, dst: u64, len: usize) -> usize {
+        if !self.writable {
+            return 0;
+        }
+        let end = self.base + self.bytes.len() as u64;
+        (end.saturating_sub(dst) as usize).min(len)
+    }
+}
+
+const BASE: u64 = 0x10000;
+const TABLE: [u64; 3] = [9, 1, 2];
+
+/// Resident memory is whole pages, like real user mappings: a path copy may
+/// read up to its terminator's page end.
+fn memory(bytes: &[u8]) -> Memory {
+    let mut bytes = bytes.to_vec();
+    bytes.resize(bytes.len().div_ceil(4096).max(1) * 4096, 0);
+    Memory {
+        base: BASE,
+        bytes,
+        writable: true,
+    }
+}
+
+/// Descriptors: 0 pipe, 1 host stdout, 3 host file (read-only), 4 eventfd.
+fn caller(fd: i32) -> Option<NativeDescriptor> {
+    Some(match fd {
+        0 => NativeDescriptor::InZone(InZoneKind::Pipe),
+        1 => NativeDescriptor::HostBacked {
+            access: DescriptionAccess::ReadWrite,
+        },
+        3 => NativeDescriptor::HostBacked {
+            access: DescriptionAccess::ReadOnly,
+        },
+        4 => NativeDescriptor::InZone(InZoneKind::EventFd),
+        _ => NativeDescriptor::Absent,
+    })
+}
+
+fn run(call: HostFileCall, user: &mut Memory) -> Option<HostFileStage> {
+    let mut resolve = caller;
+    let mut namespace = NativeNamespace {
+        table: TABLE,
+        resolve: &mut resolve,
+    };
+    stage(call, &mut namespace, user)
+}
+
+fn returned(errno: LinuxErrno) -> Option<HostFileStage> {
+    Some(HostFileStage::Returned(SyscallResult::from_errno(errno)))
+}
+
+fn request(stage: Option<HostFileStage>) -> (Box<[u8]>, Option<HostFileOutput>, bool) {
+    match stage {
+        Some(HostFileStage::Request {
+            record,
+            output,
+            resolves_path,
+        }) => (record, output, resolves_path),
+        other => panic!("expected a host request, got {other:?}"),
+    }
+}
+
+#[test]
+fn in_zone_objects_never_build_a_host_request() {
+    let mut user = memory(b"hello\0");
+    for call in [
+        HostFileCall::Write {
+            fd: 0,
+            buf: BASE,
+            count: 5,
+        },
+        HostFileCall::Writev {
+            fd: 0,
+            iov: BASE,
+            iovcnt: 1,
+        },
+        HostFileCall::Fstat {
+            fd: 0,
+            statbuf: BASE,
+        },
+        HostFileCall::Read {
+            fd: 4,
+            buf: BASE,
+            count: 8,
+        },
+    ] {
+        assert_eq!(
+            run(call, &mut user),
+            Some(HostFileStage::InRing),
+            "{call:?} on an in-zone object must stay in ring"
+        );
+    }
+    // Linux answers these for a pipe without any host involvement.
+    assert_eq!(
+        run(
+            HostFileCall::Lseek {
+                fd: 0,
+                offset: 0,
+                whence: 1
+            },
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_ESPIPE)
+    );
+    assert_eq!(
+        run(
+            HostFileCall::Pread {
+                fd: 0,
+                buf: BASE,
+                count: 1,
+                offset: 0
+            },
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_ESPIPE)
+    );
+    assert_eq!(
+        run(
+            HostFileCall::Ioctl {
+                fd: 0,
+                request: 0x5401
+            },
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_ENOTTY)
+    );
+    assert_eq!(
+        run(
+            HostFileCall::Getdents64 {
+                fd: 0,
+                dirp: BASE,
+                count: 64
+            },
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_ENOTDIR)
+    );
+}
+
+#[test]
+fn host_backed_write_stages_the_callers_bytes_and_table() {
+    let mut user = memory(b"hello");
+    let (mut record, output, resolves_path) = request(run(
+        HostFileCall::Write {
+            fd: 1,
+            buf: BASE,
+            count: 5,
+        },
+        &mut user,
+    ));
+    assert_eq!(output, None);
+    assert!(!resolves_path, "a descriptor write needs no path authority");
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Write);
+    assert_eq!(view.header().table, TABLE);
+    assert_eq!(view.header().fd, 1);
+    assert_eq!(view.input(), b"hello");
+}
+
+#[test]
+fn writev_gathers_vectors_and_bad_descriptors_stay_in_ring() {
+    // Two iovecs at BASE pointing at "ab" and "cde".
+    let mut bytes = vec![0u8; 0x30];
+    bytes[0..8].copy_from_slice(&(BASE + 0x20).to_le_bytes());
+    bytes[8..16].copy_from_slice(&2u64.to_le_bytes());
+    bytes[16..24].copy_from_slice(&(BASE + 0x22).to_le_bytes());
+    bytes[24..32].copy_from_slice(&3u64.to_le_bytes());
+    bytes[0x20..0x25].copy_from_slice(b"abcde");
+    let mut user = memory(&bytes);
+    let call = |fd| HostFileCall::Writev {
+        fd,
+        iov: BASE,
+        iovcnt: 2,
+    };
+    let (mut record, ..) = request(run(call(1), &mut user));
+    assert_eq!(
+        HostFileRequestView::parse(&mut record).unwrap().input(),
+        b"abcde"
+    );
+    assert_eq!(
+        run(call(9), &mut user),
+        returned(carrick_syscall_abi::LINUX_EBADF)
+    );
+    assert_eq!(
+        run(call(3), &mut user),
+        returned(carrick_syscall_abi::LINUX_EBADF),
+        "a read-only description refuses writes"
+    );
+    assert_eq!(
+        run(
+            HostFileCall::Writev {
+                fd: 1,
+                iov: BASE,
+                iovcnt: LINUX_UIO_MAXIOV + 1
+            },
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_EINVAL)
+    );
+}
+
+#[test]
+fn path_calls_stage_the_path_and_need_path_authority() {
+    let mut user = memory(b"/etc/ld.so.cache\0");
+    let (mut record, output, resolves_path) = request(run(
+        HostFileCall::Openat {
+            dirfd: LINUX_AT_FDCWD,
+            path: BASE,
+            flags: 0o2_000_000,
+            mode: 0,
+        },
+        &mut user,
+    ));
+    assert!(resolves_path, "openat resolves with the caller's authority");
+    assert_eq!(output, None);
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Openat);
+    assert_eq!(
+        view.header().table,
+        TABLE,
+        "the new fd lands in the caller's table"
+    );
+    assert_eq!(view.header().args[0], 0o2_000_000);
+    assert_eq!(view.input(), b"/etc/ld.so.cache");
+
+    // A relative path through an in-zone or absent dirfd is answered in ring;
+    // through a host directory it is a later slice (counted ENOSYS).
+    let mut relative = memory(b"libc.so.6\0");
+    let openat = |dirfd| HostFileCall::Openat {
+        dirfd,
+        path: BASE,
+        flags: 0,
+        mode: 0,
+    };
+    assert_eq!(
+        run(openat(0), &mut relative),
+        returned(carrick_syscall_abi::LINUX_ENOTDIR)
+    );
+    assert_eq!(
+        run(openat(9), &mut relative),
+        returned(carrick_syscall_abi::LINUX_EBADF)
+    );
+    assert_eq!(
+        run(openat(3), &mut relative),
+        returned(carrick_syscall_abi::LINUX_ENOSYS)
+    );
+    let mut empty = memory(b"\0");
+    assert_eq!(
+        run(openat(LINUX_AT_FDCWD), &mut empty),
+        returned(carrick_syscall_abi::LINUX_ENOENT)
+    );
+}
+
+#[test]
+fn empty_path_stat_names_the_descriptor() {
+    let mut user = memory(b"\0");
+    let (mut record, output, resolves_path) = request(run(
+        HostFileCall::Newfstatat {
+            dirfd: 3,
+            path: BASE,
+            statbuf: BASE + 0x100,
+            flags: u64::from(LINUX_AT_EMPTY_PATH),
+        },
+        &mut user,
+    ));
+    assert!(!resolves_path);
+    assert_eq!(
+        output,
+        Some(HostFileOutput {
+            address: BASE + 0x100,
+            len: LINUX_STAT_BYTES
+        })
+    );
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Fstat);
+    assert_eq!(view.header().fd, 3);
+    // Without AT_EMPTY_PATH an empty path is ENOENT, never a descriptor stat.
+    assert_eq!(
+        run(
+            HostFileCall::Newfstatat {
+                dirfd: 3,
+                path: BASE,
+                statbuf: BASE,
+                flags: 0
+            },
+            &mut user
+        ),
+        returned(carrick_syscall_abi::LINUX_ENOENT)
+    );
+}
+
+#[test]
+fn unreadable_input_requests_fault_supply_first_and_long_paths_fail() {
+    let mut user = memory(b"");
+    assert_eq!(
+        run(
+            HostFileCall::Write {
+                fd: 1,
+                buf: 0x9000,
+                count: 1
+            },
+            &mut user
+        ),
+        Some(HostFileStage::Fault {
+            address: 0x9000,
+            access: Access::Read
+        })
+    );
+    let mut long = memory(&vec![b'a'; LINUX_PATH_MAX + 8]);
+    assert_eq!(
+        run(
+            HostFileCall::Faccessat {
+                dirfd: LINUX_AT_FDCWD,
+                path: BASE,
+                mode: 0,
+                flags: 0
+            },
+            &mut long
+        ),
+        returned(carrick_syscall_abi::LINUX_ENAMETOOLONG)
+    );
+}
+
+#[test]
+fn completion_copies_output_only_on_success() {
+    let mut user = memory(&[0u8; 4]);
+    let (mut record, output, _) = request(run(
+        HostFileCall::Read {
+            fd: 3,
+            buf: BASE,
+            count: 4,
+        },
+        &mut user,
+    ));
+    HostFileRequestView::parse(&mut record)
+        .unwrap()
+        .reply(3, b"abc")
+        .unwrap();
+    let mut copied = Vec::new();
+    let result = complete(&record, output, &mut |address, bytes| {
+        copied.push((address, bytes.to_vec()));
+        true
+    });
+    assert_eq!(result, SyscallResult::new(3));
+    assert_eq!(copied, vec![(BASE, b"abc".to_vec())]);
+    // No reply (refused or cancelled service) never copies anything.
+    let (record, output, _) = request(run(
+        HostFileCall::Read {
+            fd: 3,
+            buf: BASE,
+            count: 4,
+        },
+        &mut user,
+    ));
+    assert_eq!(
+        complete(&record, output, &mut |_, _| panic!("no output")),
+        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO)
+    );
+}
+
+#[test]
+fn unwritable_output_requests_write_supply_before_crossing() {
+    let mut user = memory(b"");
+    user.writable = false;
+    assert_eq!(
+        run(
+            HostFileCall::Fstat {
+                fd: 1,
+                statbuf: BASE + 8
+            },
+            &mut user
+        ),
+        Some(HostFileStage::Fault {
+            address: BASE + 8,
+            access: Access::Write
+        })
+    );
+    // A buffer whose tail runs past the resident range faults at the tail.
+    let mut user = memory(b"");
+    assert_eq!(
+        run(
+            HostFileCall::Read {
+                fd: 3,
+                buf: BASE + 4096 - 2,
+                count: 8
+            },
+            &mut user
+        ),
+        Some(HostFileStage::Fault {
+            address: BASE + 4096,
+            access: Access::Write
+        })
+    );
+}

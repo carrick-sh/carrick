@@ -814,6 +814,28 @@ enum NativeExecStage {
     Failed(carrick_syscall_abi::LinuxErrno),
 }
 
+/// The EL0 data-abort syndrome a staging copy would have taken: a read or a
+/// write translation fault, or a write permission fault on a present page
+/// (COW), so the ordinary owner fault selector resolves it exactly.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn native_stage_fault_syndrome(fault: carrick_guest_arch::FaultInfo) -> u64 {
+    const DATA_ABORT_EL0: u64 = 0x24 << 26;
+    const WRITE: u64 = 1 << 6;
+    match fault.access {
+        carrick_guest_arch::Access::Write
+            if file::MemoryValidator::readable_bytes(
+                &file::HardwareValidator,
+                fault.address.raw(),
+                1,
+            ) == 1 =>
+        {
+            DATA_ABORT_EL0 | WRITE | 0x0f
+        }
+        carrick_guest_arch::Access::Write => DATA_ABORT_EL0 | WRITE | 0x07,
+        _ => DATA_ABORT_EL0 | 0x04,
+    }
+}
+
 /// One staged native service request, before its owner publishes it.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 enum NativeServiceStage {
@@ -821,6 +843,7 @@ enum NativeServiceStage {
     HostFile(
         alloc::boxed::Box<[u8]>,
         Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+        bool,
     ),
     Fault(carrick_guest_arch::FaultInfo),
     Return(i64),
@@ -837,6 +860,9 @@ impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::Host
     fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
         file::UserCopy::copy_in(&mut self.0, dst, src)
     }
+    fn writable(&mut self, dst: u64, len: usize) -> usize {
+        self.0.validator.writable_bytes(dst, len)
+    }
 }
 
 /// Route a native SVC through the host-file venue. `None` keeps the call on
@@ -847,12 +873,10 @@ fn native_host_file_stage<V: file::MemoryValidator>(
     frame: &TrapFrame,
     task: &CurrentTask,
     validator: &V,
-    descriptor: impl FnOnce(
-        i32,
-    )
-        -> Option<carrick_personality_linux::native_host_file::NativeDescriptor>,
+    table: [u64; 3],
+    mut descriptor: impl FnMut(i32) -> Option<NativeDescriptor>,
 ) -> Option<carrick_personality_linux::native_host_file::HostFileStage> {
-    use carrick_personality_linux::native_host_file::{HostFileCall, stage};
+    use carrick_personality_linux::native_host_file::{HostFileCall, NativeNamespace, stage};
     if (frame.esr >> 26) & 0x3f != 0x15 {
         return None;
     }
@@ -863,10 +887,16 @@ fn native_host_file_stage<V: file::MemoryValidator>(
             frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
         ],
     )?;
-    let descriptor = descriptor(call.fd())?;
     let mut user = HostFileCopy(file::ValidatedCopy { task, validator });
-    Some(stage(call, descriptor, &mut user))
+    let mut namespace = NativeNamespace {
+        table,
+        resolve: &mut descriptor,
+    };
+    stage(call, &mut namespace, &mut user)
 }
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+use carrick_personality_linux::native_host_file::NativeDescriptor;
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 struct ExecStageCopy<'a, V: file::MemoryValidator> {
@@ -969,14 +999,17 @@ fn arm_native_service_exit(
                 NativeServiceStage::Return(errno.guest_retval())
             }
             Some(NativeExecStage::Fault(fault)) => NativeServiceStage::Fault(fault),
-            None => match native_host_file_stage(frame, task, &file::HardwareValidator, |fd| {
-                ipc::guest_venue(frame.slot as u32)
-                    .and_then(|venue| ipc::native_descriptor(&venue, task, fd))
+            None => match ipc::guest_venue(frame.slot as u32).and_then(|venue| {
+                let table = ipc::native_table(&venue, task)?;
+                native_host_file_stage(frame, task, &file::HardwareValidator, table, |fd| {
+                    ipc::native_descriptor(&venue, table, fd)
+                })
             }) {
                 Some(carrick_personality_linux::native_host_file::HostFileStage::Request {
                     record,
                     output,
-                }) => NativeServiceStage::HostFile(record, output),
+                    resolves_path,
+                }) => NativeServiceStage::HostFile(record, output, resolves_path),
                 Some(carrick_personality_linux::native_host_file::HostFileStage::Returned(
                     result,
                 )) => NativeServiceStage::Return(result.raw()),
@@ -986,7 +1019,13 @@ fn arm_native_service_exit(
                 }) => NativeServiceStage::Fault(carrick_guest_arch::FaultInfo {
                     address: carrick_guest_arch::UserVa::new(address),
                     access,
-                    present: false,
+                    // A write to a readable page is a permission (COW) fault.
+                    present: access == carrick_guest_arch::Access::Write
+                        && file::MemoryValidator::readable_bytes(
+                            &file::HardwareValidator,
+                            address,
+                            1,
+                        ) == 1,
                 }),
                 Some(carrick_personality_linux::native_host_file::HostFileStage::InRing) => {
                     // An in-zone object the ring does not serve yet never
@@ -1003,8 +1042,8 @@ fn arm_native_service_exit(
         };
         match staged {
             NativeServiceStage::Exec(payload) => break (None, Some(payload), None, false),
-            NativeServiceStage::HostFile(record, output) => {
-                break (None, None, Some((record, output)), false);
+            NativeServiceStage::HostFile(record, output, resolves_path) => {
+                break (None, None, Some((record, output, resolves_path)), false);
             }
             NativeServiceStage::Return(result) => {
                 frame.x[0] = result as u64;
@@ -1015,7 +1054,7 @@ fn arm_native_service_exit(
                 // an EL0 abort. Feed that exact read through the ordinary
                 // owner fault selector, retaining the syscall frame for retry.
                 let mut synthetic = *frame;
-                synthetic.esr = (0x24 << 26) | 0x04;
+                synthetic.esr = native_stage_fault_syndrome(fault);
                 synthetic.far = fault.address.raw();
                 let mut fault_wait = None;
                 match super::cow_resolver::dispatch_fault(&mut synthetic, counters, &mut fault_wait)
@@ -1079,11 +1118,11 @@ fn arm_native_service_exit(
                     return Err(super::native_process_runtime::NativeProcessError::Quarantined);
                 }
                 process.begin_exec_service(payload)?
-            } else if let Some((record, output)) = host_file {
+            } else if let Some((record, output, resolves_path)) = host_file {
                 if service_wait.is_some() {
                     return Err(super::native_process_runtime::NativeProcessError::Quarantined);
                 }
-                process.begin_host_file_service(record, output)?
+                process.begin_host_file_service(record, output, resolves_path)?
             } else if retry_exec_stage {
                 process.begin_exec_stage_fault_service(
                     match operation {
@@ -3250,7 +3289,7 @@ mod tests {
     #[test]
     fn native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout() {
         use carrick_personality_linux::native_host_file::{
-            DescriptionAccess, HostFileStage, NativeDescriptor,
+            DescriptionAccess, HostFileStage, InZoneKind,
         };
         struct Resident;
         impl file::MemoryValidator for Resident {
@@ -3271,43 +3310,47 @@ mod tests {
         frame.x[0] = 1;
         frame.x[1] = bytes.as_ptr().addr() as u64;
         frame.x[2] = bytes.len() as u64;
+        let table = [3, 4, 5];
 
         // The same write to an in-zone pipe never builds a host request.
         let mut asked = None;
         assert_eq!(
-            native_host_file_stage(&frame, &task, &Resident, |fd| {
+            native_host_file_stage(&frame, &task, &Resident, table, |fd| {
                 asked = Some(fd);
-                Some(NativeDescriptor::InZone)
+                Some(NativeDescriptor::InZone(InZoneKind::Pipe))
             }),
             Some(HostFileStage::InRing)
         );
         assert_eq!(asked, Some(1), "the caller's own fd is resolved");
 
         // Host stdout crosses with the caller's bytes and table.
-        let Some(HostFileStage::Request { mut record, output }) =
-            native_host_file_stage(&frame, &task, &Resident, |_| {
-                Some(NativeDescriptor::HostBacked {
-                    table: [3, 4, 5],
-                    access: DescriptionAccess::ReadWrite,
-                })
+        let Some(HostFileStage::Request {
+            mut record,
+            output,
+            resolves_path,
+        }) = native_host_file_stage(&frame, &task, &Resident, table, |_| {
+            Some(NativeDescriptor::HostBacked {
+                access: DescriptionAccess::ReadWrite,
             })
+        })
         else {
             panic!("a host-backed stdout write crosses");
         };
         assert_eq!(output, None);
+        assert!(!resolves_path);
         let view = carrick_core_abi::host_file::HostFileRequestView::parse(&mut record).unwrap();
         assert_eq!(view.input(), bytes);
-        assert_eq!(view.header().table, [3, 4, 5]);
+        assert_eq!(view.header().table, table);
 
-        // An unpublished or contended namespace keeps the call's old route,
-        // and a non-SVC exit is never a host-file call.
+        // A contended namespace keeps the call's old route, and a non-SVC
+        // exit is never a host-file call.
         assert_eq!(
-            native_host_file_stage(&frame, &task, &Resident, |_| None),
+            native_host_file_stage(&frame, &task, &Resident, table, |_| None),
             None
         );
         frame.esr = 0x24 << 26;
         assert_eq!(
-            native_host_file_stage(&frame, &task, &Resident, |_| {
+            native_host_file_stage(&frame, &task, &Resident, table, |_| {
                 panic!("a fault never resolves descriptors")
             }),
             None

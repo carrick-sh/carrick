@@ -984,7 +984,7 @@ impl<'a> FsView<'a> {
         Ok(out)
     }
 
-    fn lseek_host_file(
+    pub(in crate::dispatch) fn lseek_host_file(
         &self,
         host_io: &HostFileIo<'_>,
         offset: i64,

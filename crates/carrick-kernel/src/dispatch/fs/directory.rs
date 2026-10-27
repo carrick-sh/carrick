@@ -5,7 +5,7 @@ use carrick_guest_mem::CurrentMmMemory;
 use std::path::Path;
 
 /// Encode the next repeatable portion without publishing a directory cursor.
-pub(super) fn directory_record_batch(
+pub(in crate::dispatch) fn directory_record_batch(
     entries: &[RootFsDirEntry],
     offset: usize,
     address: u64,
@@ -128,6 +128,64 @@ struct RenameAtRequest {
 }
 
 impl<'a> FsView<'a> {
+    /// Materialize `listing` for a getdents read and return its entries,
+    /// with `.` and `..` first. The one listing owner for the dispatcher's
+    /// `getdents64` and the native host-file venue's.
+    pub(in crate::dispatch) fn directory_entries<'l>(
+        &self,
+        listing: &'l mut DirListing,
+        path: &str,
+        trusted_host_dir: Option<&TrustedHostDir>,
+        offset: usize,
+        visible_self: Option<u32>,
+    ) -> &'l mut Vec<RootFsDirEntry> {
+        // The listing is taken LAZILY on the first read (Linux lists at
+        // getdents time, and a walk anchor that never reads pays
+        // nothing): streamed off a trusted host dirfd when nothing
+        // interferes, the exact layered merge otherwise.
+        let is_self_fd = is_proc_self_fd_dir(path, visible_self);
+        let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
+        if (is_self_fd || is_self_fdinfo) && (offset == 0 || matches!(listing, DirListing::Pending))
+        {
+            *listing = DirListing::Fixed(self.proc_self_fd_entries(path, is_self_fdinfo));
+        } else if matches!(listing, DirListing::Pending) {
+            *listing = DirListing::Loaded(self.list_directory_entries(path, trusted_host_dir));
+        }
+        let entries = match listing {
+            DirListing::Loaded(entries) | DirListing::Fixed(entries) => entries,
+            DirListing::Pending => unreachable!("listing materialized above"),
+        };
+
+        // Real Linux getdents64 always returns `.` (self) and `..` (parent)
+        // first. Synthesize them on the READ path only — NOT in
+        // layered_directory_entries, which also backs the rmdir/unlinkat
+        // emptiness check (two synthetic dot entries there made every empty
+        // dir look non-empty → ENOTEMPTY broke `rm -rf`). Idempotent: prepend
+        // once if absent.
+        if entries.first().map(|e| e.name.as_str()) != Some(".") {
+            let parent = std::path::Path::new(path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string());
+            let dir_path = path.to_string();
+            let dot_entry = |name: &str, p: String| RootFsDirEntry {
+                name: name.to_string(),
+                metadata: RootFsMetadata {
+                    path: std::path::PathBuf::from(p),
+                    kind: RootFsEntryKind::Directory,
+                    mode: 0o755,
+                    size: 0,
+                },
+                // "."/".." are skipped by scandir; ino unused → hash fallback.
+                ino: 0,
+            };
+            entries.insert(0, dot_entry("..", parent));
+            entries.insert(0, dot_entry(".", dir_path));
+        }
+
+        entries
+    }
+
     pub(super) fn read_directory<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<'_, M>,
@@ -150,52 +208,14 @@ impl<'a> FsView<'a> {
         else {
             return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
         };
-        // The listing is taken LAZILY on the first read (Linux lists at
-        // getdents time, and a walk anchor that never reads pays
-        // nothing): streamed off a trusted host dirfd when nothing
-        // interferes, the exact layered merge otherwise.
         let visible_self = proc_visible_self(cx.kernel);
-        let is_self_fd = is_proc_self_fd_dir(path, visible_self);
-        let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
-        if (is_self_fd || is_self_fdinfo)
-            && (*offset == 0 || matches!(listing, DirListing::Pending))
-        {
-            *listing = DirListing::Fixed(self.proc_self_fd_entries(path, is_self_fdinfo));
-        } else if matches!(listing, DirListing::Pending) {
-            *listing =
-                DirListing::Loaded(self.list_directory_entries(path, trusted_host_dir.as_ref()));
-        }
-        let entries = match listing {
-            DirListing::Loaded(entries) | DirListing::Fixed(entries) => entries,
-            DirListing::Pending => unreachable!("listing materialized above"),
-        };
-
-        // Real Linux getdents64 always returns `.` (self) and `..` (parent)
-        // first. Synthesize them on the READ path only — NOT in
-        // layered_directory_entries, which also backs the rmdir/unlinkat
-        // emptiness check (two synthetic dot entries there made every empty
-        // dir look non-empty → ENOTEMPTY broke `rm -rf`). Idempotent: prepend
-        // once if absent.
-        if entries.first().map(|e| e.name.as_str()) != Some(".") {
-            let parent = std::path::Path::new(path.as_str())
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "/".to_string());
-            let dir_path = path.clone();
-            let dot_entry = |name: &str, p: String| RootFsDirEntry {
-                name: name.to_string(),
-                metadata: RootFsMetadata {
-                    path: std::path::PathBuf::from(p),
-                    kind: RootFsEntryKind::Directory,
-                    mode: 0o755,
-                    size: 0,
-                },
-                // "."/".." are skipped by scandir; ino unused → hash fallback.
-                ino: 0,
-            };
-            entries.insert(0, dot_entry("..", parent));
-            entries.insert(0, dot_entry(".", dir_path));
-        }
+        let entries = self.directory_entries(
+            listing,
+            path,
+            trusted_host_dir.as_ref(),
+            *offset,
+            visible_self,
+        );
 
         let mut copied = 0;
         while *offset < entries.len() && copied < length {

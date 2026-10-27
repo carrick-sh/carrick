@@ -21,6 +21,24 @@ pub enum HostFileOp {
     Write = 1,
     /// `fstat` of a host-backed descriptor; the output is a Linux `struct stat`.
     Fstat = 2,
+    /// `openat` of the staged path (`args[0]` open flags, `args[1]` mode); a
+    /// non-negative result is the new descriptor in the caller's table.
+    Openat = 3,
+    /// `faccessat2` of the staged path (`args[0]` mode, `flags` AT flags).
+    Faccessat = 4,
+    /// `newfstatat` of the staged path (`flags` AT flags); output `struct stat`.
+    Newfstatat = 5,
+    /// `statx` of the staged path, or of the descriptor for an empty path
+    /// (`flags` AT flags, `args[0]` mask); output `struct statx`.
+    Statx = 6,
+    /// `read` of at most the output capacity at the description offset.
+    Read = 7,
+    /// `pread64` of at most the output capacity at `args[0]`.
+    Pread = 8,
+    /// `lseek` (`args[0]` offset as `i64`, `args[1]` whence).
+    Lseek = 9,
+    /// `getdents64` of at most the output capacity.
+    Getdents64 = 10,
 }
 
 impl HostFileOp {
@@ -28,8 +46,25 @@ impl HostFileOp {
         Some(match raw {
             1 => Self::Write,
             2 => Self::Fstat,
+            3 => Self::Openat,
+            4 => Self::Faccessat,
+            5 => Self::Newfstatat,
+            6 => Self::Statx,
+            7 => Self::Read,
+            8 => Self::Pread,
+            9 => Self::Lseek,
+            10 => Self::Getdents64,
             _ => return None,
         })
+    }
+
+    /// Whether the operation resolves a path, and therefore needs the
+    /// caller's filesystem authority (credentials, cwd, root).
+    pub const fn resolves_path(self) -> bool {
+        matches!(
+            self,
+            Self::Openat | Self::Faccessat | Self::Newfstatat | Self::Statx
+        )
     }
 }
 

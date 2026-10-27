@@ -265,17 +265,30 @@ impl IpcTables for GuestTables {
 
 const EL1_WAIT: ShortLockSpin = ShortLockSpin;
 
-/// What `fd` names in `task`'s complete ring namespace, for the native
-/// host-file venue. In-zone objects stay with their ring owner; only a
-/// host-backed description crosses. `None` when the namespace is not
-/// published or the table is contended: the call keeps its existing route.
+/// `task`'s complete ring descriptor table, as the fd-core raw table words
+/// the native host-file venue names it by. `None` when no complete namespace
+/// is published.
+pub fn native_table(venue: &IpcVenue<'_>, task: &CurrentTask) -> Option<[u64; 3]> {
+    let raw = venue.tables.table_of(task)?;
+    Some([raw.authority, raw.index, raw.generation])
+}
+
+/// What `fd` names in `table`, for the native host-file venue. In-zone
+/// objects stay with their ring owner; only a host-backed description
+/// crosses. `None` when the table is contended: the call keeps its route.
 pub fn native_descriptor(
     venue: &IpcVenue<'_>,
-    task: &CurrentTask,
+    table: [u64; 3],
     fd: i32,
 ) -> Option<carrick_personality_linux::native_host_file::NativeDescriptor> {
-    use carrick_personality_linux::native_host_file::{DescriptionAccess, NativeDescriptor};
-    let raw = venue.tables.table_of(task)?;
+    use carrick_personality_linux::native_host_file::{
+        DescriptionAccess, InZoneKind, NativeDescriptor,
+    };
+    let raw = RawTableId {
+        authority: table[0],
+        index: table[1],
+        generation: table[2],
+    };
     match venue
         .region
         .fd(EL1_WAIT)
@@ -283,7 +296,6 @@ pub fn native_descriptor(
     {
         Ok(description) => Some(match IpcBacking::decode(description.backing)? {
             IpcBacking::Host(_) => NativeDescriptor::HostBacked {
-                table: [raw.authority, raw.index, raw.generation],
                 access: match description.access {
                     AccessMode::ReadOnly => DescriptionAccess::ReadOnly,
                     AccessMode::WriteOnly => DescriptionAccess::WriteOnly,
@@ -291,9 +303,9 @@ pub fn native_descriptor(
                     AccessMode::Path => DescriptionAccess::Path,
                 },
             },
-            IpcBacking::Pipe { .. } | IpcBacking::EventFd { .. } | IpcBacking::Epoll { .. } => {
-                NativeDescriptor::InZone
-            }
+            IpcBacking::Pipe { .. } => NativeDescriptor::InZone(InZoneKind::Pipe),
+            IpcBacking::EventFd { .. } => NativeDescriptor::InZone(InZoneKind::EventFd),
+            IpcBacking::Epoll { .. } => NativeDescriptor::InZone(InZoneKind::Epoll),
         }),
         Err(FdError::BadFd) => Some(NativeDescriptor::Absent),
         Err(_) => None,

@@ -305,11 +305,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// Stage one typed host-file crossing for the carrier venue. Fd-based
     /// calls carry no credential decision: the open description's access
     /// mode, checked by the staging step, is the authority Linux applies.
+    ///
+    /// A path operation resolves with the process tree's retained authority,
+    /// which the carrier accepts only as the admitted superuser identity; it
+    /// is served only while the caller's ring credentials are still exactly
+    /// that identity, else a counted ENOSYS (the exec rule, never an access
+    /// decision under the wrong credentials).
     pub fn begin_host_file_service(
         &mut self,
         record: Box<[u8]>,
         output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+        resolves_path: bool,
     ) -> Result<NativeResume, NativeProcessError> {
+        if resolves_path && !self.caller_has_admitted_credentials()? {
+            return Ok(NativeResume::Returned(SyscallResult::new(
+                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+            )));
+        }
         let capability = self
             .runtime
             .exec_capability()
@@ -1608,7 +1620,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .as_ref()
                         .ok_or(NativeProcessError::Stale)?;
                     let mut copy_out = |address: u64, bytes: &[u8]| {
-                        self.copy_signal_frame(carrick_guest_arch::UserVa::new(address), bytes)
+                        self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)
                             .is_ok()
                     };
                     Ok(NativeResume::Returned(

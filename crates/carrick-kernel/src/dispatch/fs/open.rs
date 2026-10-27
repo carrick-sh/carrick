@@ -603,101 +603,23 @@ impl<'a> FsView<'a> {
             Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::NotFoundCreate)
         );
         let description = match dispatch_result {
-            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::File {
-                metadata,
-                contents,
-                writable,
-            }) => {
-                let inode = carrick_vfs::InodeIdentity::new(
-                    0,
-                    super::inode_for_path(std::path::Path::new(&path)),
-                );
-                OpenDescription::File {
-                    path,
-                    metadata,
-                    contents: FileContents::dense(contents),
-                    offset: 0,
-                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC).with_inode(inode),
-                    writable,
+            Ok(
+                existing @ (carrick_vfs::vfs::rootfs::OpenDispatchResult::File { .. }
+                | carrick_vfs::vfs::rootfs::OpenDispatchResult::RootFsBackedFile {
+                    ..
                 }
-            }
-            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::RootFsBackedFile {
-                metadata,
-                contents,
-                object,
-                writable,
-            }) => {
-                let source = object.map(|object| {
-                    crate::dispatch::executable_authority::ExecSource::shared_object(
-                        object,
-                        path.clone(),
-                    )
-                });
-                let inode = carrick_vfs::InodeIdentity::new(
-                    0,
-                    super::inode_for_path(std::path::Path::new(&path)),
-                );
-                OpenDescription::File {
-                    path,
-                    metadata,
-                    contents: FileContents::shared_backed(
-                        contents.base,
-                        contents.dirty,
-                        contents.len,
-                    ),
-                    offset: 0,
-                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC)
-                        .with_inode(inode)
-                        .with_exec_source(source),
-                    writable,
-                }
-            }
-            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile {
-                host_fd,
-                metadata,
-                writable,
-            }) => {
-                debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
-                let (host_fd_ref, inode) = HostFdRef::adopt_with_identity(
-                    host_fd,
-                    carrick_guest_mem::PrivateFileSource::Mutable,
-                );
-                if want_trunc && let Some(inode) = inode {
-                    self.fs.reset_host_sparse_extents_for_inode(inode, 0);
-                    self.fs.rootfs_vfs.invalidate_host_inode(inode);
-                }
-                let mut base = OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC);
-                if let Some(inode) = inode {
-                    base = base.with_inode(inode);
-                }
-                OpenDescription::HostFile {
-                    host_fd: host_fd_ref,
-                    metadata,
-                    base,
-                    writable,
-                }
-            }
-            Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::Directory { metadata }) => {
-                // A directory can never be the target of a write-intent open
-                // (O_WRONLY/O_RDWR) nor of an O_CREAT open — Linux returns
-                // EISDIR in both cases (a directory is never "created" by
-                // open(), and its dentry rejects write access). O_RDONLY
-                // without O_CREAT still yields a readable directory fd.
-                if writable_request || want_create {
-                    return Ok(DispatchOutcome::errno(LINUX_EISDIR));
-                }
-                OpenDescription::Directory {
-                    path,
-                    metadata,
-                    listing: DirListing::Pending,
-                    offset: 0,
-                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                    // The trusted lane (`try_open_trusted_dir`) already
-                    // declined this open (mount/inotify/backend), so the
-                    // description keeps the historical untrusted model.
-                    trusted_host_dir: None,
-                }
-            }
+                | carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile { .. }
+                | carrick_vfs::vfs::rootfs::OpenDispatchResult::Directory { .. }),
+            ) => match self.description_for_existing(
+                existing,
+                path,
+                flags,
+                want_trunc,
+                writable_request || want_create,
+            ) {
+                Ok(description) => description,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            },
             Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
                 // O_CREAT path: validate the parent directory exists,
                 // create the empty overlay entry, return a writable
@@ -2187,6 +2109,120 @@ impl<'a> FsView<'a> {
             }
         }
         Ok(false)
+    }
+
+    /// The open description for an existing rootfs object `open_for_dispatch`
+    /// returned: the single constructor shared by the dispatcher's open and
+    /// the native host-file venue's open. `write_intent` is a write-access or
+    /// `O_CREAT` request, which a directory refuses with EISDIR.
+    pub(in crate::dispatch) fn description_for_existing(
+        &self,
+        existing: carrick_vfs::vfs::rootfs::OpenDispatchResult,
+        path: String,
+        flags: u64,
+        want_trunc: bool,
+        write_intent: bool,
+    ) -> Result<OpenDescription, LinuxErrno> {
+        Ok(match existing {
+            carrick_vfs::vfs::rootfs::OpenDispatchResult::File {
+                metadata,
+                contents,
+                writable,
+            } => {
+                let inode = carrick_vfs::InodeIdentity::new(
+                    0,
+                    super::inode_for_path(std::path::Path::new(&path)),
+                );
+                OpenDescription::File {
+                    path,
+                    metadata,
+                    contents: FileContents::dense(contents),
+                    offset: 0,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC).with_inode(inode),
+                    writable,
+                }
+            }
+            carrick_vfs::vfs::rootfs::OpenDispatchResult::RootFsBackedFile {
+                metadata,
+                contents,
+                object,
+                writable,
+            } => {
+                let source = object.map(|object| {
+                    crate::dispatch::executable_authority::ExecSource::shared_object(
+                        object,
+                        path.clone(),
+                    )
+                });
+                let inode = carrick_vfs::InodeIdentity::new(
+                    0,
+                    super::inode_for_path(std::path::Path::new(&path)),
+                );
+                OpenDescription::File {
+                    path,
+                    metadata,
+                    contents: FileContents::shared_backed(
+                        contents.base,
+                        contents.dirty,
+                        contents.len,
+                    ),
+                    offset: 0,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC)
+                        .with_inode(inode)
+                        .with_exec_source(source),
+                    writable,
+                }
+            }
+            carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile {
+                host_fd,
+                metadata,
+                writable,
+            } => {
+                debug_assert!(crate::dispatch::net::host_fd_is_nonblocking(host_fd));
+                let (host_fd_ref, inode) = HostFdRef::adopt_with_identity(
+                    host_fd,
+                    carrick_guest_mem::PrivateFileSource::Mutable,
+                );
+                if want_trunc && let Some(inode) = inode {
+                    self.fs.reset_host_sparse_extents_for_inode(inode, 0);
+                    self.fs.rootfs_vfs.invalidate_host_inode(inode);
+                }
+                let mut base = OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC);
+                if let Some(inode) = inode {
+                    base = base.with_inode(inode);
+                }
+                OpenDescription::HostFile {
+                    host_fd: host_fd_ref,
+                    metadata,
+                    base,
+                    writable,
+                }
+            }
+            carrick_vfs::vfs::rootfs::OpenDispatchResult::Directory { metadata } => {
+                // A directory can never be the target of a write-intent open
+                // (O_WRONLY/O_RDWR) nor of an O_CREAT open — Linux returns
+                // EISDIR in both cases (a directory is never "created" by
+                // open(), and its dentry rejects write access). O_RDONLY
+                // without O_CREAT still yields a readable directory fd.
+                if write_intent {
+                    return Err(LINUX_EISDIR);
+                }
+                OpenDescription::Directory {
+                    path,
+                    metadata,
+                    listing: DirListing::Pending,
+                    offset: 0,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                    // The trusted lane (`try_open_trusted_dir`) already
+                    // declined this open (mount/inotify/backend), so the
+                    // description keeps the historical untrusted model.
+                    trusted_host_dir: None,
+                }
+            }
+            carrick_vfs::vfs::rootfs::OpenDispatchResult::NotFoundCreate => {
+                return Err(LINUX_ENOENT);
+            }
+        })
     }
 
     define_syscall! {
