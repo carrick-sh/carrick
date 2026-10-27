@@ -64,13 +64,18 @@ impl NativeExecCapability {
     }
 }
 
-/// Native exec serves ring-owned fork children, which cannot chdir, chroot
-/// or change credentials themselves: their authority is the origin task's at
-/// fork. The retained capability holds that authority only while the origin's
-/// credential and filesystem objects are unchanged, and it holds no per-child
-/// cwd, descriptor table or executable. So the service resolves exactly an
-/// `execve` of an absolute path outside the self-relative `/proc` and
-/// `/dev/fd` views, under unchanged origin authority, and refuses the rest.
+/// Native exec serves ring-owned fork children. Their chdir/chroot are host
+/// crossings the carrier refuses, so their filesystem context is the origin
+/// task's (any origin chdir/chroot publishes a new revision and fails this
+/// check closed). Their credentials live in the ring and can change there
+/// (set*id is served in ring); the native owner refuses exec unless the
+/// caller's ring credentials are still the admitted superuser identity, and
+/// this service requires the origin's host credentials to be that same
+/// identity, so the access check uses exactly the caller's authority. The
+/// capability holds no per-child cwd, descriptor table or executable, so the
+/// service resolves only an `execve` of an absolute path outside the
+/// caller-relative `/proc` and `/dev/fd` views (also refused when reached
+/// through a symlink), and refuses the rest.
 fn native_child_exec_is_exact(
     capability: &NativeExecCapability,
     call: carrick_core_abi::service::ExecCall,
@@ -92,6 +97,7 @@ fn native_child_exec_is_exact(
         && path.starts_with('/')
         && !self_relative
         && capability.files.origin_authority_unchanged()
+        && capability.files.origin_is_superuser()
 }
 
 fn prepare_native_exec_image(
@@ -126,7 +132,7 @@ fn prepare_native_exec_image(
     let env = view.envp().map(<[u8]>::to_vec).collect();
     load_execve_image(
         &capability.loader,
-        &capability.files,
+        &capability.files.for_native_child(),
         &path,
         argv,
         env,
@@ -865,6 +871,22 @@ mod tests {
         dispatcher.set_cwd(directory.path().to_str().unwrap());
         assert_eq!(refused(ExecCall::Execve, &absolute), enosys);
         drop(dispatcher);
+
+        // A native child's ring credentials start as the admitted superuser
+        // identity. An origin captured under any other identity cannot be
+        // paired with them, so even an absolute exec is refused.
+        let unprivileged = SyscallDispatcher::new();
+        unprivileged.set_credentials(carrick_abi::NsUid(1000), carrick_abi::NsGid(1000));
+        let capability = capture_native_exec_capability(&unprivileged).unwrap();
+        assert_eq!(
+            prepare_native_exec_image(
+                &capability,
+                &native_exec_payload(ExecCall::Execve, &absolute)
+            )
+            .map(|_| ()),
+            enosys
+        );
+        drop(unprivileged);
     }
 
     #[test]

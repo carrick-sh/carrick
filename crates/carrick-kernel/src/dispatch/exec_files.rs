@@ -66,6 +66,10 @@ struct ExecFileContext {
     pub executable: Option<ExecSource>,
     pub descriptors: Arc<dyn ExecFdSources>,
     origin: Option<ExecOrigin>,
+    /// A ring-owned native child is not the origin task: `/proc/self`,
+    /// `/proc/thread-self` and `/dev/fd` must never select the origin's
+    /// executable or descriptors for it, including through a symlink.
+    deny_caller_views: bool,
 }
 
 /// The live task this capability was captured from, and the exact
@@ -139,6 +143,26 @@ impl ExecFiles {
                 && Arc::ptr_eq(&fs_context, &origin.fs_context)
                 && fs_context.revision() == origin.fs_revision
         })
+    }
+
+    /// Whether every origin credential is the ring's admitted superuser
+    /// identity (all ids 0). A native child's ring credentials start there
+    /// and the native owner refuses exec once they differ, so this pairs the
+    /// host access view with the caller's ring identity exactly.
+    pub fn origin_is_superuser(&self) -> bool {
+        self.context.origin.as_ref().is_some_and(|origin| {
+            let c = &origin.credentials;
+            [c.ruid, c.euid, c.suid, c.fsuid].iter().all(|id| id.0 == 0)
+                && [c.rgid, c.egid, c.sgid, c.fsgid].iter().all(|id| id.0 == 0)
+        })
+    }
+
+    /// The access view for a ring-owned native child of the origin task:
+    /// identical filesystem authority, but no caller-relative magic views.
+    pub fn for_native_child(&self) -> Self {
+        let mut child = self.clone();
+        child.context.deny_caller_views = true;
+        child
     }
 
     pub fn resolve_path(&self, path: &str) -> String {
@@ -220,6 +244,9 @@ impl ExecFiles {
             self.context.proc_caller,
             host_open,
             |candidate| {
+                if self.context.deny_caller_views && is_caller_view(candidate) {
+                    return Some(Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOSYS)));
+                }
                 // Only the captured thread's directory may select its retained
                 // executable or descriptors; another thread is not this caller.
                 let thread_path = self.context.proc_caller.and_then(|caller| {
@@ -404,6 +431,7 @@ impl SyscallDispatcher {
                     .current_executable()
                     .map(|current| current.source().clone()),
                 descriptors: Arc::new(HostExecFdSources(context.resources().files())),
+                deny_caller_views: false,
                 origin: Some(ExecOrigin {
                     binding: binding.downgrade(),
                     tid: context.thread().key().tid,
@@ -551,4 +579,20 @@ pub(super) fn resolve_exec_path(path: &str, cwd: &str) -> String {
     } else {
         super::normalize_abs_path(&format!("{}/{}", cwd.trim_end_matches('/'), path))
     }
+}
+
+/// `/proc`, `/dev/fd` and the standard-stream aliases name the calling task.
+fn is_caller_view(path: &str) -> bool {
+    [
+        "/proc",
+        "/dev/fd",
+        "/dev/stdin",
+        "/dev/stdout",
+        "/dev/stderr",
+    ]
+    .iter()
+    .any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
 }

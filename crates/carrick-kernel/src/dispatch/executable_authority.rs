@@ -1319,6 +1319,67 @@ mod tests {
                 || matches!(a.acquire("/absent"), Err(ExecSourceError::Linux(errno)) if errno.get() == 2)
         );
     }
+    /// Review P0 on #905: a native child must never reach the origin task's
+    /// executable or descriptors through a caller-relative view, even when
+    /// an ordinary absolute symlink names it.
+    #[test]
+    fn native_child_exec_view_refuses_symlinks_into_caller_views() {
+        use carrick_vfs::rootfs::{LayerSource, RootFs};
+        use tar::{Builder, EntryType, Header};
+        let mut archive = Vec::new();
+        {
+            let mut builder = Builder::new(&mut archive);
+            let bytes = b"origin";
+            let mut header = Header::new_gnu();
+            header.set_path("image").unwrap();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append(&header, &bytes[..]).unwrap();
+            for (link, target) in [
+                ("self-exe", "/proc/self/exe"),
+                ("stdin-link", "/dev/fd/0"),
+                ("procdir", "/proc"),
+            ] {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(EntryType::Symlink);
+                header.set_path(link).unwrap();
+                header.set_link_name(target).unwrap();
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_cksum();
+                builder.append(&header, &[][..]).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let rootfs = RootFs::from_layers([LayerSource::Tar(archive)]).unwrap();
+        let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let source = dispatcher.acquire_exec_source(&context, "/image").unwrap();
+        dispatcher.set_executable_identity_with_source("/image", vec![], vec![], source);
+        let files = dispatcher.capture_exec_files(&context).unwrap();
+        assert_eq!(
+            files.acquire("/self-exe").unwrap().read_head(6).unwrap(),
+            b"origin",
+            "the origin task's own view still resolves its executable"
+        );
+        let child = files.for_native_child();
+        for path in ["/self-exe", "/procdir/self/exe", "/proc/self/exe"] {
+            assert!(
+                matches!(child.acquire(path), Err(ExecSourceError::Linux(errno)) if errno.get() == 38),
+                "{path} must not select the origin's executable"
+            );
+        }
+        // Whatever the rootfs makes of /dev/fd, the child never receives the
+        // origin's descriptor.
+        assert!(child.acquire("/stdin-link").is_err());
+        assert_eq!(
+            child.acquire("/image").unwrap().read_head(6).unwrap(),
+            b"origin"
+        );
+        drop(context);
+    }
+
     #[test]
     fn exec_capabilities_resolve_nonleader_thread_self_after_task_release() {
         let dispatcher = SyscallDispatcher::new();
