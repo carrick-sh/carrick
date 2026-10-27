@@ -517,6 +517,13 @@ pub enum TrapError {
         far_el1: u64,
         spsr_el1: u64,
     },
+    /// An EL1 ring stack overflow (#369): the current-EL synchronous vector
+    /// reported, without storing into it, a fault on the unmapped guard below
+    /// an EL1 stack (or a fault taken with no stack left). It names the CPU
+    /// and the stack, where an unguarded stack once corrupted its neighbour
+    /// silently (#338).
+    #[error("{0}")]
+    El1StackOverflow(carrick_el1_abi::El1StackOverflow),
     /// An ISA-neutral synchronous guest fault, carrying the **already-resolved**
     /// Linux signal triple (NOT a raw architectural syndrome). The runtime's
     /// fault arm delivers `signum`/`si_code` to the guest with `si_addr =

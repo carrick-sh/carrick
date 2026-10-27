@@ -28,12 +28,7 @@ pub use crate::substrate::sched::hw::{IrqGuard, disable_irq_save, restore_irq};
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(always)]
 fn current_el1_slot() -> Option<usize> {
-    let sp = crate::substrate::sched::hw::read_current_sp();
-    let offset = sp.checked_sub(carrick_el1_abi::EL1_STACKS_BASE)?;
-    if offset >= carrick_el1_abi::EL1_STACK_SLOTS * carrick_el1_abi::EL1_STACK_SIZE {
-        return None;
-    }
-    Some((offset / carrick_el1_abi::EL1_STACK_SIZE) as usize)
+    carrick_el1_abi::el1_stack_slot(crate::substrate::sched::hw::read_current_sp())
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

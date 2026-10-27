@@ -8525,6 +8525,25 @@ impl HvfInner {
                     };
                     carrick_fatal!("el1", "{report}");
                 }
+                // A report from the current-EL synchronous vector whose
+                // original fault hit an EL1 stack guard (#369) is a ring stack
+                // overflow on a named CPU, not generic EL1 corruption. The
+                // vector restored SP before the `hvc`, so SP_EL1 is the
+                // faulting SP.
+                if carrick_mem::memory::el1_cur_el_sync_handler_range().contains(&pc)
+                    && let Some(overflow) = carrick_el1_abi::El1StackOverflow::classify(
+                        esr_el1,
+                        far_el1,
+                        vcpu.get_sys_reg(SysReg::SP_EL1).unwrap_or(0),
+                        elr_el1,
+                        mailbox
+                            .leased_slot()
+                            .map(|slot| carrick_guest_arch::CpuId::new(u32::from(slot.raw()))),
+                    )
+                {
+                    eprintln!("FAIL-LOUD pid={}: {overflow}", unsafe { libc::getpid() });
+                    return Err(TrapError::El1StackOverflow(overflow));
+                }
                 if is_stage1_cow_write_fault(esr_el1) {
                     vcpu.set_reg(Reg::PC, elr_el1).map_err(hvf_error)?;
                     vcpu.set_reg(Reg::CPSR, spsr_el1).map_err(hvf_error)?;
