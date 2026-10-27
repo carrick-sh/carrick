@@ -295,6 +295,11 @@ impl ReservationNodeFlags {
     pub const FILE: Self = Self(1 << 7);
     /// Shared anonymous provenance without private anonymous edit authority.
     pub const SHARED_ANONYMOUS: Self = Self(1 << 8);
+    /// An executable image the root's own import supplies outside heap and
+    /// arena (a native exec successor's program or interpreter). Only an
+    /// unadmitted root's import sets it; no admitted edit, host attribute or
+    /// guest decision can, so it is the root's typed ownership of that span.
+    pub const IMAGE: Self = Self(1 << 9);
     pub const ANONYMOUS_PRIVATE: Self = Self(Self::ANONYMOUS.0 | Self::PRIVATE.0);
     /// Attributes the host sets with `set_flags` (`mlock`, `madvise`).
     pub const ATTRIBUTES: Self = Self(
@@ -307,10 +312,15 @@ impl ReservationNodeFlags {
     /// Attributes a private anonymous VMA keeps across EL1 edits: they ride
     /// `mprotect` splits and `mremap` moves, and never make the node
     /// host-owned. `GROWSDOWN` is not one of them (a stack is host-owned).
-    pub const CARRIED: Self =
-        Self(Self::LOCKED.0 | Self::DONTFORK.0 | Self::WIPEONFORK.0 | Self::DONTDUMP.0);
-    const ALL: u32 =
-        Self::ANONYMOUS_PRIVATE.0 | Self::ATTRIBUTES.0 | Self::FILE.0 | Self::SHARED_ANONYMOUS.0;
+    /// `IMAGE` rides them too: a split of an image node stays the root's.
+    pub const CARRIED: Self = Self(
+        Self::LOCKED.0 | Self::DONTFORK.0 | Self::WIPEONFORK.0 | Self::DONTDUMP.0 | Self::IMAGE.0,
+    );
+    const ALL: u32 = Self::ANONYMOUS_PRIVATE.0
+        | Self::ATTRIBUTES.0
+        | Self::FILE.0
+        | Self::SHARED_ANONYMOUS.0
+        | Self::IMAGE.0;
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL == 0 {

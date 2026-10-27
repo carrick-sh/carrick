@@ -340,6 +340,11 @@ mod flag_tests {
             assert!(ReservationNodeFlags::ATTRIBUTES.contains(flag));
             assert!(!ReservationNodeFlags::PRIVATE.union(flag).root_editable());
         }
-        assert_eq!(ReservationNodeFlags::from_bits(1 << 9), None);
+        // The import-only image mark rides edits but is no host attribute.
+        let image = ReservationNodeFlags::IMAGE;
+        assert!(ReservationNodeFlags::CARRIED.contains(image));
+        assert!(!ReservationNodeFlags::ATTRIBUTES.contains(image));
+        assert!(anon.union(image).root_editable());
+        assert_eq!(ReservationNodeFlags::from_bits(1 << 10), None);
     }
 }
