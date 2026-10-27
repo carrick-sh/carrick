@@ -484,13 +484,6 @@ impl CarrierVmCustody {
         self.native_exec_services.install(capability, service)
     }
 
-    pub(crate) fn native_exec_service(
-        &self,
-        capability: carrick_core_abi::service::ExecCapabilityId,
-    ) -> Option<std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>> {
-        self.native_exec_services.service(capability)
-    }
-
     pub(crate) fn reserve_native_exec_receipt(
         &self,
     ) -> Result<carrick_core_abi::service::ExecAdoptionReceipt, ()> {
