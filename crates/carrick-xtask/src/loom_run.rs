@@ -214,6 +214,9 @@ impl Tests {
             return;
         };
         if let Some((name, result)) = test.split_once(" ... ") {
+            // Pretty results decorate expected-panic tests; --list uses the
+            // undecorated name. Keep both records on the same inventory entry.
+            let name = name.strip_suffix(" - should panic").unwrap_or(name);
             if let Some(state) = self.states.get_mut(name) {
                 if ["ok", "FAILED", "ignored"]
                     .iter()
@@ -225,7 +228,9 @@ impl Tests {
                 }
             }
         } else if let Some((name, _)) = test.split_once(" has been running for over ")
-            && let Some(state) = self.states.get_mut(name)
+            && let Some(state) = self
+                .states
+                .get_mut(name.strip_suffix(" - should panic").unwrap_or(name))
             && matches!(state, Progress::Pending)
         {
             *state = Progress::Over60(now);
@@ -441,5 +446,28 @@ mod tests {
         }
         assert!(matches!(tests.states["slow"], Progress::Over60(_)));
         assert!(matches!(tests.states["pending"], Progress::Pending));
+    }
+
+    #[test]
+    fn expected_panic_decoration_keeps_starts_and_results_on_the_listed_test() {
+        let now = Instant::now();
+        let mut tests = Tests::default();
+        for name in ["expected_panic", "failed_expected", "slow_expected"] {
+            tests.states.insert(name.into(), Progress::Pending);
+        }
+        tests.observe(b"test expected_panic - should panic ... ", now);
+        assert!(matches!(
+            tests.states["expected_panic"],
+            Progress::Started(_)
+        ));
+        tests.observe(b"ok\ntest failed_expected - should panic ... FAILED\n", now);
+        tests.observe(
+            b"test slow_expected - should panic has been running for over 60 seconds\n",
+            now,
+        );
+        for name in ["expected_panic", "failed_expected"] {
+            assert!(matches!(tests.states[name], Progress::Finished));
+        }
+        assert!(matches!(tests.states["slow_expected"], Progress::Over60(_)));
     }
 }

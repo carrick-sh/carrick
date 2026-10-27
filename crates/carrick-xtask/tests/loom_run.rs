@@ -13,6 +13,9 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
         dir.path().join("src/lib.rs"),
         r#"
         #[test] fn passing() { assert!(cfg!(feature = "loom")); }
+        #[test]
+        #[should_panic(expected = "expected panic witness")]
+        fn expected_panic() { panic!("expected panic witness"); }
         #[test] fn sleeping() {
             std::fs::write("sleeping.pid", std::process::id().to_string()).unwrap();
             let child = std::process::Command::new("sleep").arg("3600").spawn().unwrap();
@@ -104,6 +107,11 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
         "{log}"
     );
     assert!(!log.contains("unfinished passing"), "{log}");
+    assert!(
+        log.contains("test expected_panic - should panic ... ok"),
+        "{log}"
+    );
+    assert!(!log.contains("unfinished expected_panic"), "{log}");
     assert_process_gone(&dir.path().join("sleeping.pid"));
     assert_process_gone(&dir.path().join("descendant.pid"));
 }
