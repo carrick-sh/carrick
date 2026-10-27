@@ -253,6 +253,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         payload: Box<[u8]>,
     ) -> Result<NativeResume, NativeProcessError> {
+        // The carrier's exec service checks access with the origin's host
+        // credentials, which it only accepts as the admitted superuser
+        // identity. Ring set*id changes the caller's credentials without the
+        // host knowing, so exec is served only while they are still exactly
+        // that identity; otherwise it is a counted ENOSYS, never an access
+        // decision under the wrong credentials.
+        if !self.caller_has_admitted_credentials()? {
+            return Ok(NativeResume::Returned(SyscallResult::new(
+                carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
+            )));
+        }
         let capability = self
             .runtime
             .exec_capability()
@@ -272,6 +283,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Some(payload),
             false,
         )
+    }
+    /// Whether the calling thread's ring credentials are still exactly the
+    /// identity a native process is admitted with.
+    pub(super) fn caller_has_admitted_credentials(&self) -> Result<bool, NativeProcessError> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?;
+        let credentials = task
+            .credentials_for(self.calling_tid)
+            .map_err(|_| NativeProcessError::Stale)?;
+        Ok(*credentials == carrick_personality_linux::identity::TaskCredentials::ROOT)
     }
     /// Park the exact ring operation on the producer observed before its
     /// failed admission. No physical service notice is published.
