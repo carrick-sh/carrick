@@ -47,12 +47,31 @@ the current Rust stack.
 
 This is a contract for the registered entry-chain compositions, not a complete
 whole-program call-graph proof. Data-dependent reservation-tree traversals,
-all indirect-call target discovery, arbitrary new compositions, asynchronous
-current-EL exceptions and the x86 image still require the broader #369 work.
+all indirect-call target discovery, arbitrary new compositions and asynchronous
+current-EL exceptions stay unproven here (the guard below the stack turns
+a miss into a named fault), and the x86 CPL0 images are #956.
 The individual-frame ceiling also rejects oversized functions outside the
 registered chains. Changing a composition or recursive bound requires reviewing
-the envelope; silently increasing a budget is not a baseline update. Guard
-pages remain separate work in #369; this change does not move or enlarge stacks.
+the envelope; silently increasing a budget is not a baseline update.
+
+## Guard pages (#369)
+
+Each 16 KiB EL1 stack sits directly above a 16 KiB guard that no stage-1
+root maps. The slots have a 32 KiB stride in an 8 MiB arena; the extra
+4 MiB came from the zone reservation's unused tail. The usable stack, and
+so every budget above, is unchanged. An overflow takes a translation fault
+on the guard. The current-EL synchronous handler tests SP before its
+first store, so it cannot push into the guard. A guard FAR never reaches
+an armed exception fixup, and the host reports `TrapError::El1StackOverflow`,
+naming the executing CPU and the slot. The signed witness is
+`carrick-embed/tests/el1_stack_guard.rs`.
+
+The guard is what makes these budgets fail safe; the budgets are what keep
+the guard from firing. The per-function ceiling (3/16 of the stack) is
+asserted to be no wider than the guard, so no frame can step over it
+without touching it. The parser also counts the residual `sub sp` that
+LLVM emits after a probe loop, which #704's audit found was being dropped.
+CPL0 stacks have a 4 KiB guard. Their frame budget is #956.
 
 The root failure was ARM signal encoding's by-value `LinuxSignalContext`,
 `LinuxUcontext`, `SignalFrame`, and aggregate return buffers. The signal setup
