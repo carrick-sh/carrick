@@ -32995,14 +32995,14 @@
     {
       "family": "k1_create_install",
       "operation": "write_for_io",
-      "owner": "carrick_kernel::dispatch::fs::rw::FsView<'a>::lseek",
+      "owner": "carrick_kernel::dispatch::fs::rw::FsView<'a>::lseek_description",
       "lane": "shared",
       "ceiling": 1
     },
     {
       "family": "k1_create_install",
       "operation": "write_for_io",
-      "owner": "carrick_kernel::dispatch::fs::rw::FsView<'a>::read",
+      "owner": "carrick_kernel::dispatch::fs::rw::FsView<'a>::read_description",
       "lane": "shared",
       "ceiling": 1
     },
@@ -33275,7 +33275,7 @@
     {
       "family": "k1_inspect_misc",
       "operation": "concrete_backing",
-      "owner": "carrick_kernel::dispatch::fs::stat::FsView<'a>::fd_stat_record",
+      "owner": "carrick_kernel::dispatch::fs::stat::FsView<'a>::description_stat_record",
       "lane": "shared",
       "ceiling": 1
     },
@@ -33828,7 +33828,7 @@
     {
       "family": "k1_inspect_misc",
       "operation": "read_for_io",
-      "owner": "carrick_kernel::dispatch::fs::rw::FsView<'a>::pread64",
+      "owner": "carrick_kernel::dispatch::fs::rw::FsView<'a>::pread_description",
       "lane": "shared",
       "ceiling": 1
     },

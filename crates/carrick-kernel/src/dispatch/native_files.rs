@@ -17,7 +17,6 @@ use carrick_core_abi::host_file::{HostFileHeader, HostFileOp, HostFileRequestVie
 use carrick_el1_abi::ipc::fd;
 use zerocopy::IntoBytes;
 
-use super::fd_table::{DirListing, HostFileIo, OpenDescription};
 use super::resources::NativeFsAuthority;
 use super::{DispatchOutcome, SyscallDispatcher};
 use crate::el1_ipc::{HostIpc, HostResource, InstallHostDescriptionError, PinnedHostResourceError};
@@ -43,6 +42,22 @@ pub struct NativeOpenFile {
     description: Arc<crate::kernel::FileDescription>,
 }
 
+impl NativeOpenFile {
+    /// The native descriptor is a functional reference to the description,
+    /// exactly as a host fd slot is: close effects and mapping rules follow.
+    fn new(description: Arc<crate::kernel::FileDescription>) -> Self {
+        description.retain_fd_ref();
+        Self { description }
+    }
+}
+
+impl Drop for NativeOpenFile {
+    fn drop(&mut self) {
+        // The ring released the last descriptor naming this description.
+        self.description.release_fd_ref();
+    }
+}
+
 enum Served {
     Reply(i64, Vec<u8>),
     Refused,
@@ -63,14 +78,6 @@ fn outcome_result(outcome: DispatchOutcome) -> i64 {
         DispatchOutcome::Errno { errno } => errno.guest_retval(),
         _ => carrick_abi::LINUX_EIO.guest_retval(),
     }
-}
-
-fn host_errno() -> carrick_abi::LinuxErrno {
-    crate::host_to_linux_errno(
-        std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO),
-    )
 }
 
 /// Open flags the slice serves: a read-only open of an existing object.
@@ -199,12 +206,19 @@ impl SyscallDispatcher {
                     Err(errno) => Served::errno(errno),
                 }
             }
-            HostFileOp::Read => native_read(description, None, capacity),
-            HostFileOp::Pread => native_read(description, Some(header.args[0]), capacity),
-            HostFileOp::Lseek => {
-                self.native_lseek(description, header.args[0] as i64, header.args[1])
+            HostFileOp::Read | HostFileOp::Pread | HostFileOp::Getdents64 => {
+                self.native_read_into_record(header, description, capacity)
             }
-            HostFileOp::Getdents64 => self.native_getdents(description, capacity),
+            HostFileOp::Lseek => match self.fs_view().lseek_description(
+                description,
+                header.args[0] as i64,
+                header.args[1],
+                None,
+            ) {
+                Ok(Some(outcome)) => served_outcome(outcome, Vec::new()),
+                Ok(None) => Served::errno(carrick_abi::LINUX_EBADF),
+                Err(_) => Served::Refused,
+            },
             // Opened read-only by this slice.
             HostFileOp::Write => Served::errno(carrick_abi::LINUX_EBADF),
             HostFileOp::Openat | HostFileOp::Faccessat | HostFileOp::Newfstatat => Served::Refused,
@@ -351,8 +365,8 @@ impl SyscallDispatcher {
             Ok(description) => description,
             Err(errno) => return Served::errno(errno),
         };
-        let file = super::fd_table::OpenFile::from_open_description_with_status_flags(
-            Arc::new(parking_lot::RwLock::new(description)),
+        let file = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+            std::sync::Arc::new(parking_lot::RwLock::new(description)),
             flags & !carrick_abi::LINUX_O_CLOEXEC,
             super::linux_fd_flags_from_open_flags(flags),
         );
@@ -373,9 +387,7 @@ impl SyscallDispatcher {
         };
         match owner.install_host_description(
             table,
-            Box::new(NativeOpenFile {
-                description: Arc::clone(&file.description),
-            }),
+            Box::new(NativeOpenFile::new(Arc::clone(&file.description))),
             fd::AccessMode::ReadOnly,
             status,
             open_flags.contains(LinuxOpenFlags::CLOEXEC),
@@ -392,192 +404,86 @@ impl SyscallDispatcher {
         }
     }
 
-    fn native_lseek(
+    /// `read`, `pread64` or `getdents64` on a venue-opened description: the
+    /// dispatcher's own description cores, writing into the record's output
+    /// area through a carrier buffer.
+    fn native_read_into_record(
         &self,
-        description: &Arc<crate::kernel::FileDescription>,
-        offset: i64,
-        whence: u64,
-    ) -> Served {
-        let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
-            return Served::errno(carrick_abi::LINUX_EBADF);
-        };
-        if matches!(&*open, OpenDescription::HostFile { .. }) {
-            let Some(host_io) = HostFileIo::from_read(&open) else {
-                return Served::errno(carrick_abi::LINUX_EBADF);
-            };
-            return Served::value(outcome_result(
-                self.fs_view().lseek_host_file(&host_io, offset, whence),
-            ));
-        }
-        if !matches!(
-            whence,
-            carrick_abi::LINUX_SEEK_SET | carrick_abi::LINUX_SEEK_CUR | carrick_abi::LINUX_SEEK_END
-        ) {
-            // SEEK_DATA/SEEK_HOLE on carrick's in-memory contents: later slice.
-            return if whence <= 4 {
-                Served::Refused
-            } else {
-                Served::errno(carrick_abi::LINUX_EINVAL)
-            };
-        }
-        let (current, end) = match &mut *open {
-            OpenDescription::File {
-                contents, offset, ..
-            } => match contents.len() {
-                Ok(len) => (*offset as i64, len as i64),
-                Err(errno) => return Served::errno(errno),
-            },
-            OpenDescription::Directory {
-                listing,
-                path,
-                trusted_host_dir,
-                offset,
-                ..
-            } => {
-                let current = *offset as i64;
-                let end = if whence == carrick_abi::LINUX_SEEK_END {
-                    self.fs_view()
-                        .directory_entries(
-                            listing,
-                            path,
-                            trusted_host_dir.as_ref(),
-                            current as usize,
-                            None,
-                        )
-                        .len() as i64
-                } else {
-                    0
-                };
-                (current, end)
-            }
-            _ => return Served::Refused,
-        };
-        let next = match whence {
-            carrick_abi::LINUX_SEEK_SET => offset,
-            carrick_abi::LINUX_SEEK_CUR => current.saturating_add(offset),
-            _ => end.saturating_add(offset),
-        };
-        if next < 0 {
-            return Served::errno(carrick_abi::LINUX_EINVAL);
-        }
-        match &mut *open {
-            OpenDescription::File { offset, .. } => *offset = next as usize,
-            OpenDescription::Directory {
-                offset, listing, ..
-            } => {
-                *offset = next as usize;
-                // A rewind lists a fresh view, as Linux re-reads after rewinddir.
-                if next == 0 && matches!(listing, DirListing::Loaded(_)) {
-                    *listing = DirListing::Pending;
-                }
-            }
-            _ => {}
-        }
-        Served::value(next)
-    }
-
-    fn native_getdents(
-        &self,
+        header: HostFileHeader,
         description: &Arc<crate::kernel::FileDescription>,
         capacity: usize,
     ) -> Served {
-        let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
-            return Served::errno(carrick_abi::LINUX_EBADF);
-        };
-        let OpenDescription::Directory {
-            listing,
-            offset,
-            path,
-            trusted_host_dir,
-            ..
-        } = &mut *open
-        else {
-            return Served::errno(carrick_abi::LINUX_ENOTDIR);
-        };
-        let entries = self.fs_view().directory_entries(
-            listing,
-            path,
-            trusted_host_dir.as_ref(),
-            *offset,
-            None,
-        );
-        let mut out = Vec::new();
-        let mut next = *offset;
-        while next < entries.len() && out.len() < capacity {
-            // The ring copies the whole reply at once, so batches start on a
-            // notional page boundary of the reply buffer.
-            let at = out.len() as u64;
-            match super::fs::directory::directory_record_batch(
-                entries,
-                next,
-                at,
-                capacity - out.len(),
-            ) {
-                Ok((bytes, after)) if !bytes.is_empty() => {
-                    out.extend_from_slice(&bytes);
-                    next = after;
-                }
-                Ok(_) => break,
-                Err(_) if !out.is_empty() => break,
-                Err(_) => return Served::errno(carrick_abi::LINUX_EINVAL),
+        let mut buffer = super::outcome::LinearMemory::new(CARRIER_BUFFER_BASE, vec![0; capacity]);
+        let fs = self.fs_view();
+        let outcome = match header.op {
+            HostFileOp::Read => {
+                let nonblocking =
+                    LinuxOpenFlags::from_bits_truncate(description.common().status_flags())
+                        .contains(LinuxOpenFlags::NONBLOCK);
+                fs.read_description(
+                    &mut buffer,
+                    description,
+                    CARRIER_BUFFER_BASE,
+                    capacity,
+                    nonblocking,
+                    None,
+                )
             }
+            HostFileOp::Pread => fs.pread_description(
+                super::fs::IoCaller::CarrierBuffer,
+                &mut buffer,
+                description,
+                CARRIER_BUFFER_BASE,
+                capacity,
+                header.args[0] as usize,
+                &|| {
+                    Some(super::WaitFdAuthority::internal(
+                        super::InternalWaitKind::HostReadiness,
+                    ))
+                },
+                None,
+            ),
+            HostFileOp::Getdents64 => {
+                let Some(lease) = description.retain_fd_lease() else {
+                    return Served::errno(carrick_abi::LINUX_EBADF);
+                };
+                fs.read_directory(
+                    super::fs::IoCaller::CarrierBuffer,
+                    &mut buffer,
+                    crate::kernel::FileSlot::new(Arc::clone(description), 0),
+                    lease,
+                    carrick_guest_mem::GuestVa::new(CARRIER_BUFFER_BASE),
+                    capacity,
+                )
+            }
+            _ => return Served::Refused,
+        };
+        match outcome {
+            Ok(outcome) => served_outcome(outcome, buffer.bytes),
+            Err(_) => Served::Refused,
         }
-        *offset = next;
-        let len = out.len() as i64;
-        Served::Reply(len, out)
     }
 }
 
-/// Read up to `capacity` bytes at `position` (pread) or the description
-/// offset (read) of a carrier-opened regular file.
-fn native_read(
-    description: &Arc<crate::kernel::FileDescription>,
-    position: Option<u64>,
-    capacity: usize,
-) -> Served {
-    let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
-        return Served::errno(carrick_abi::LINUX_EBADF);
-    };
-    let mut buffer = vec![0u8; capacity];
-    let read = match &mut *open {
-        OpenDescription::File {
-            contents, offset, ..
-        } => {
-            let at = position.unwrap_or(*offset as u64);
-            match contents.read_at(at, &mut buffer) {
-                Ok(read) => {
-                    if position.is_none() {
-                        *offset += read;
-                    }
-                    read
-                }
-                Err(errno) => return Served::errno(errno),
+/// Where a carrier buffer sits in the description cores' notional address
+/// space: page aligned, so their page-granular batching starts on a page.
+const CARRIER_BUFFER_BASE: u64 = 0x1_0000;
+
+/// A description core's outcome as a reply: a byte count returns that prefix
+/// of `bytes` as output; an errno or offset returns no output; anything else
+/// (a wait) cannot arise for a venue-opened file and is refused exactly.
+fn served_outcome(outcome: DispatchOutcome, mut bytes: Vec<u8>) -> Served {
+    match outcome {
+        DispatchOutcome::Returned { value } => {
+            match usize::try_from(value) {
+                Ok(len) if len <= bytes.len() => bytes.truncate(len),
+                _ => bytes.clear(),
             }
+            Served::Reply(value, bytes)
         }
-        OpenDescription::HostFile { host_fd, .. } => {
-            // SAFETY: the description owns `host_fd` for this guard's life;
-            // the buffer is valid for `capacity` bytes.
-            let result = unsafe {
-                match position {
-                    Some(at) => libc::pread(
-                        host_fd.raw(),
-                        buffer.as_mut_ptr().cast(),
-                        capacity,
-                        at as libc::off_t,
-                    ),
-                    None => libc::read(host_fd.raw(), buffer.as_mut_ptr().cast(), capacity),
-                }
-            };
-            if result < 0 {
-                return Served::errno(host_errno());
-            }
-            result as usize
-        }
-        OpenDescription::Directory { .. } => return Served::errno(carrick_abi::LINUX_EISDIR),
-        _ => return Served::Refused,
-    };
-    buffer.truncate(read);
-    Served::Reply(read as i64, buffer)
+        DispatchOutcome::Errno { errno } => Served::errno(errno),
+        _ => Served::Refused,
+    }
 }
 
 fn native_stat_bytes(op: HostFileOp, record: &super::StatRecord) -> Vec<u8> {
@@ -873,6 +779,125 @@ mod tests {
             .unwrap();
         fixture.owner.release(released.backing).unwrap();
         assert_eq!(fixture.owner.retained_host_resources(), before - 1);
+    }
+
+    /// One path: the venue's read, pread, lseek and getdents run the
+    /// dispatcher's own description cores, so a native process sees exactly
+    /// what the dispatcher's own syscalls return for the same file.
+    #[test]
+    fn native_reads_equal_the_dispatchers_own_syscalls() {
+        let mut fixture = rootfs_fixture();
+        let authority = authority_of(&fixture.dispatcher);
+        let venue_open = |fixture: &Fixture, path: &[u8], flags: u64| {
+            fixture
+                .result(
+                    Some(&authority),
+                    record(
+                        fixture.table,
+                        HostFileOp::Openat,
+                        FDCWD,
+                        [flags, 0, 0, 0],
+                        path,
+                        0,
+                    ),
+                )
+                .0 as i32
+        };
+        let venue = |fixture: &Fixture, op: HostFileOp, fd: i32, args: [u64; 4], cap: usize| {
+            fixture.result(None, record(fixture.table, op, fd, args, &[], cap))
+        };
+        // The dispatcher's own syscalls on its own task, same rootfs.
+        const BASE: u64 = 0x4_0000;
+        let reporter = crate::compat::CompatReporter::default();
+        let mut own = |fixture: &mut Fixture, nr: u64, args: [u64; 6], path: &[u8]| {
+            let mut memory = super::super::outcome::LinearMemory::new(BASE, vec![0u8; 0x2000]);
+            memory.bytes[..path.len()].copy_from_slice(path);
+            let context = fixture.dispatcher.capture_one_task_context().unwrap();
+            let outcome = fixture
+                .dispatcher
+                .dispatch(
+                    &context,
+                    crate::dispatch::SyscallRequest::new(nr, crate::compat::SyscallArgs(args)),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            let value = match outcome {
+                DispatchOutcome::Returned { value } => value,
+                DispatchOutcome::Errno { errno } => errno.guest_retval(),
+                other => panic!("unexpected outcome {other:?}"),
+            };
+            // Byte results land at BASE + 0x1000 (the `buf` below).
+            let len = usize::try_from(value).unwrap_or(0).min(0x1000);
+            (value, memory.bytes[0x1000..0x1000 + len].to_vec())
+        };
+        let (own_fd, _) = own(
+            &mut fixture,
+            56,
+            [FDCWD as u64, BASE, 0, 0, 0, 0],
+            b"/lib/libc.so.6\0",
+        );
+        assert!(own_fd >= 0, "dispatcher openat: {own_fd}");
+        let fd = venue_open(&fixture, b"/lib/libc.so.6", 0);
+        assert!(fd >= 0, "venue openat: {fd}");
+        let buf = BASE + 0x1000;
+        let steps: [(HostFileOp, u64, [u64; 4], [u64; 6]); 5] = [
+            (
+                HostFileOp::Read,
+                63,
+                [0; 4],
+                [own_fd as u64, buf, 4, 0, 0, 0],
+            ),
+            (
+                HostFileOp::Pread,
+                67,
+                [1, 0, 0, 0],
+                [own_fd as u64, buf, 3, 1, 0, 0],
+            ),
+            (
+                HostFileOp::Lseek,
+                62,
+                [2, 0, 0, 0],
+                [own_fd as u64, 2, 0, 0, 0, 0],
+            ),
+            (
+                HostFileOp::Read,
+                63,
+                [0; 4],
+                [own_fd as u64, buf, 64, 0, 0, 0],
+            ),
+            (
+                HostFileOp::Read,
+                63,
+                [0; 4],
+                [own_fd as u64, buf, 64, 0, 0, 0],
+            ),
+        ];
+        for (op, nr, venue_args, own_args) in steps {
+            let cap = match op {
+                HostFileOp::Lseek => 0,
+                _ => own_args[2] as usize,
+            };
+            let native = venue(&fixture, op, fd, venue_args, cap);
+            let mut dispatcher = own(&mut fixture, nr, own_args, b"");
+            if op == HostFileOp::Lseek {
+                dispatcher.1.clear();
+            }
+            assert_eq!(native, dispatcher, "{op:?}");
+        }
+
+        // getdents64 on a directory: identical record bytes.
+        let dir = venue_open(&fixture, b"/usr/lib", carrick_abi::LINUX_O_DIRECTORY);
+        let (own_dir, _) = own(
+            &mut fixture,
+            56,
+            [FDCWD as u64, BASE, carrick_abi::LINUX_O_DIRECTORY, 0, 0, 0],
+            b"/usr/lib\0",
+        );
+        let native = venue(&fixture, HostFileOp::Getdents64, dir, [0; 4], 512);
+        let dispatcher = own(&mut fixture, 61, [own_dir as u64, buf, 512, 0, 0, 0], b"");
+        assert!(native.0 > 0, "a listing: {native:?}");
+        assert_eq!(native, dispatcher, "getdents64");
     }
 
     /// Witness for the authority binding: a relative path resolves against

@@ -101,7 +101,7 @@ impl SyscallDispatcher {
         // A ready physical dependency still owns writer exclusion. Release
         // that custody before PREPARE acquires a fresh destination permit.
         drop(wait);
-        let mut cx = SyscallCtx {
+        let cx = SyscallCtx {
             host_wait: route.host_wait,
             kernel,
             request,
@@ -112,8 +112,14 @@ impl SyscallDispatcher {
             mm_executor: route.mm_executor,
         };
         resources::with_captured_resources(kernel, || {
-            self.fs_view()
-                .read_directory(&mut cx, target, lease, address, length)
+            self.fs_view().read_directory(
+                super::IoCaller::Task(cx.kernel),
+                &mut *cx.memory,
+                target,
+                lease,
+                address,
+                length,
+            )
         })
     }
 }
@@ -186,9 +192,12 @@ impl<'a> FsView<'a> {
         entries
     }
 
-    pub(super) fn read_directory<M: CurrentMmMemory>(
+    /// `getdents64(2)` on one open directory description: the syscall
+    /// handler and the native host-file venue share it.
+    pub(in crate::dispatch) fn read_directory<M: CurrentMmMemory>(
         &self,
-        cx: &mut SyscallCtx<'_, M>,
+        caller: super::IoCaller<'_>,
+        memory: &mut M,
         target: OpenFile,
         lease: crate::kernel::objects::FileDescriptionFdLease,
         address: GuestVa,
@@ -208,7 +217,7 @@ impl<'a> FsView<'a> {
         else {
             return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
         };
-        let visible_self = proc_visible_self(cx.kernel);
+        let visible_self = caller.visible_self();
         let entries = self.directory_entries(
             listing,
             path,
@@ -232,34 +241,37 @@ impl<'a> FsView<'a> {
                 Err(_) if copied > 0 => break,
                 Err(error) => return Err(error),
             };
-            let result =
-                if cx.memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
-                    let Some(range) =
-                        carrick_guest_mem::GuestWriteRange::new(GuestVa::new(at), bytes.len())
-                    else {
-                        return Ok(if copied > 0 {
-                            DispatchOutcome::returned_len_or_errno(copied)
-                        } else {
-                            DispatchOutcome::errno(LINUX_EFAULT)
-                        });
-                    };
-                    match cx.memory.prepare_write(&[range]) {
-                        Ok(prepared) => {
-                            let effect = match super::super::copyout::admit_effect(cx.kernel) {
-                                Ok(effect) => effect,
-                                Err(cancelled) => return Ok(cancelled.into_outcome()),
-                            };
-                            prepared.commit(&[&bytes]);
-                            Ok(Some(effect))
-                        }
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    cx.memory
-                        .write_bytes(at, &bytes)
-                        .map(|()| None)
-                        .map_err(carrick_guest_mem::MemoryPrepareError::Fault)
+            let result = if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
+            {
+                let Some(range) =
+                    carrick_guest_mem::GuestWriteRange::new(GuestVa::new(at), bytes.len())
+                else {
+                    return Ok(if copied > 0 {
+                        DispatchOutcome::returned_len_or_errno(copied)
+                    } else {
+                        DispatchOutcome::errno(LINUX_EFAULT)
+                    });
                 };
+                let Some(kernel) = caller.task() else {
+                    return Err(super::carrier_buffer_is_not_owner_memory());
+                };
+                match memory.prepare_write(&[range]) {
+                    Ok(prepared) => {
+                        let effect = match super::super::copyout::admit_effect(kernel) {
+                            Ok(effect) => effect,
+                            Err(cancelled) => return Ok(cancelled.into_outcome()),
+                        };
+                        prepared.commit(&[&bytes]);
+                        Ok(Some(effect))
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                memory
+                    .write_bytes(at, &bytes)
+                    .map(|()| None)
+                    .map_err(carrick_guest_mem::MemoryPrepareError::Fault)
+            };
             let effect = match result {
                 Ok(effect) => effect,
                 Err(error) => {
@@ -296,12 +308,15 @@ impl<'a> FsView<'a> {
                         MemoryPrepareError::Supply(request) => MemoryReadWait::Supply(request),
                         other => return Ok(crate::el1_delegation::owner_prepare_refusal(other)),
                     };
+                    let Some(kernel) = caller.task() else {
+                        return Err(super::carrier_buffer_is_not_owner_memory());
+                    };
                     drop(open);
                     return Ok(DispatchOutcome::DirectoryReadSuspended(Box::new(
                         OwnedDirectoryRead {
                             target,
                             _lease: lease,
-                            thread: cx.kernel.thread().key(),
+                            thread: kernel.thread().key(),
                             address,
                             length,
                             wait,
@@ -822,7 +837,14 @@ impl<'a> FsView<'a> {
             let length = usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
             let Some(target) = this.open_file(fd.0) else { return Ok(DispatchOutcome::errno(LINUX_EBADF)); };
             let Some(lease) = target.description.retain_fd_lease() else { return Ok(DispatchOutcome::errno(LINUX_EBADF)); };
-            this.read_directory(cx, target, lease, GuestVa::new(dirp.0), length)
+            this.read_directory(
+                super::IoCaller::Task(cx.kernel),
+                &mut *cx.memory,
+                target,
+                lease,
+                GuestVa::new(dirp.0),
+                length,
+            )
         }
 
         fn readlinkat(this, cx, dirfd: u64, pathname: GuestPtr, buf: GuestPtr, bufsiz: u64) {

@@ -30,7 +30,13 @@ impl std::fmt::Debug for Binding {
 /// The host resource behind an implicit stdio descriptor: the run's own
 /// host stream `fd` (0..2) as inherited by `file_table`'s namespace. The
 /// carrier serves it through the run's stdio route.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ImplicitHostStdio {
     pub file_table: FileTableId,
     pub fd: fd::Fd,
