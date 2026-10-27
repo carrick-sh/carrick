@@ -543,10 +543,10 @@ impl UserTransferCustody {
             Err(reason @ (CarrierStage2PinError::NotFound | CarrierStage2PinError::NotMapped)) => {
                 self.trace_host_read_retention(
                     selected.ipa,
-                    match reason {
-                        CarrierStage2PinError::NotFound => 3,
-                        CarrierStage2PinError::NotMapped => 4,
-                        _ => unreachable!(),
+                    if reason == CarrierStage2PinError::NotFound {
+                        3
+                    } else {
+                        4
                     },
                     Some(identity),
                     publication_authority,
