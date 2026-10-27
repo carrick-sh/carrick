@@ -2010,3 +2010,23 @@ contracts = ["process.exec.files"]
 [[surfaces]]
 path = "crates/carrick-host/src/host_mapping.rs"
 contracts = ["process.exec.backing"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/native_files.rs"
+contracts = ["kernel.native.host-file-venue"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/host_file.rs"
+contracts = ["kernel.native.host-file-venue"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/native_host_file.rs"
+contracts = ["kernel.native.host-file-venue"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/native_host_file/tests.rs"
+contracts = ["kernel.native.host-file-venue"]
+
+[[surfaces]]
+path = "crates/carrick-syscall-abi/src/stat.rs"
+contracts = ["kernel.native.host-file-venue"]

@@ -1,0 +1,29 @@
+schema_version = 1
+id = "kernel.native.host-file-venue"
+title = "Native processes cross to the host only for host files, through the dispatcher's own path"
+guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev"]
+semantic_authority = ["man 2 read", "man 2 pread", "man 2 lseek", "man 2 getdents64", "man 2 fstat", "man 2 statx", "man 2 openat", "man 2 pipe", "owner decision on #231, #894 and #937"]
+fixture = "unit:native_reads_equal_the_dispatchers_own_syscalls"
+scale_points = [1]
+structural_budgets = []
+rationale = """
+A ring-owned (native) process has no host task. Its calls on in-zone objects
+(pipes, eventfds, epoll) never build a host request: they stay with the ring,
+which answers fstat/statx of those objects itself from the same shared stat
+record the dispatcher reports. Calls on host-backed descriptions cross once
+to the carrier, which runs the dispatcher's own description cores (read,
+pread64, lseek, getdents64, stat) against the caller's pinned description, so
+a native process sees exactly what the dispatcher's own syscalls return.
+Paths resolve with the caller's own credentials and filesystem context, never
+the serving task's. The VM-free witnesses compare venue results with the
+dispatcher's syscalls byte for byte and prove the in-zone routing.
+"""
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls; carrick-kernel::dispatch::native_files::tests::in_zone_pipe_stat_matches_the_dispatchers_pipe_record; carrick-kernel::dispatch::native_files::tests::native_open_read_and_fstat_serve_the_loader_through_one_vfs; carrick-kernel::dispatch::native_files::tests::native_relative_open_resolves_with_the_callers_cwd; carrick-personality-linux::native_host_file::tests::in_zone_objects_never_build_a_host_request; carrick-personality-linux::native_host_file::tests::in_zone_fstat_is_answered_in_ring_with_the_shared_record; carrick-el1-linux::dispatch::tests::native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout"
+
+[bindings.unresolved]
+embed_structural = "The director owns the signed carrier binding and exact-artifact verification for this venue."
+observation = "No versioned WorkObservation counts venue crossings yet; the routing witnesses prove zero host requests for in-zone objects."
+embed = "The signed native pipeline witness (`sh -c 'ls / | head -2'`) waits on the exec successor's image import (#894 ruling 1)."
+docker = "Semantics come from the syscall specifications; the dispatcher's own syscalls are the in-tree oracle for byte equality."
