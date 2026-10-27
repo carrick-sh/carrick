@@ -554,7 +554,6 @@ const AARCH64_UBFX_X16_X16_26_6_OPCODE: u32 = 0xd35a_7e10;
 const AARCH64_CMP_X16_SVC64_OPCODE: u32 = 0xf100_561f;
 const AARCH64_CMP_X16_DATA_ABORT_OPCODE: u32 = 0xf100_921f;
 const AARCH64_MRS_FAR_EL1_X17_OPCODE: u32 = 0xd538_6011;
-const AARCH64_MRS_FAR_EL1_X16_OPCODE: u32 = 0xd538_6010;
 const AARCH64_MSR_FAR_EL1_X17_OPCODE: u32 = 0xd518_6011;
 const AARCH64_MRS_ELR_EL1_X16_OPCODE: u32 = 0xd538_4030;
 const AARCH64_MRS_SPSR_EL1_X16_OPCODE: u32 = 0xd538_4010;
@@ -4444,8 +4443,8 @@ fn write_x16_address(bytes: &mut [u8], cursor: &mut usize, base: u64) {
 
 /// Emit the EL1 exception-fixup handler for current-EL SPx synchronous exceptions (slot 0x200).
 /// When ELR_EL1 is inside the EL1 image and `fixup_pc` is armed in CurrentTask, redirects
-/// ELR_EL1 to `fixup_pc` and erets. Otherwise, traps loud via `hvc #3`. A fault whose SP or
-/// FAR lies in an EL1 stack guard (#369) traps loud without storing anything.
+/// ELR_EL1 to `fixup_pc` and erets. Otherwise, traps loud via `hvc #3`. A fault taken with SP
+/// in (or within the scratch of) an EL1 stack guard (#369) traps loud without storing anything.
 fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
     let put = |bytes: &mut [u8], off: usize, op: u32| {
         bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
@@ -4480,41 +4479,9 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
     emit(bytes, &mut cursor, enc_sub_xd_sp_xm(0, 0)); // sub x0, sp, x0 (x0 restored)
     emit(bytes, &mut cursor, enc_sub_sp_sp_xm(0)); // sub sp, sp, x0 (sp = new sp)
     emit(bytes, &mut cursor, 0xA900_47F0); // stp x16, x17, [sp]
-    // 1b. A fault whose address is an EL1 stack guard is a stack overflow,
-    //     never a user access an armed fixup may absorb: fail loud.
-    emit(bytes, &mut cursor, AARCH64_MRS_FAR_EL1_X16_OPCODE); // mrs x16, far_el1
-    let guard_base = carrick_el1_abi::EL1_STACKS_BASE;
-    emit(
-        bytes,
-        &mut cursor,
-        enc_movz_xn(17, ((guard_base >> 16) & 0xFFFF) as u16, 1),
-    );
-    emit(
-        bytes,
-        &mut cursor,
-        enc_movk_xn(17, ((guard_base >> 32) & 0xFFFF) as u16, 2),
-    );
-    emit(bytes, &mut cursor, 0xCB11_0210); // sub x16, x16, x17
-    emit(
-        bytes,
-        &mut cursor,
-        enc_movz_xn(
-            17,
-            ((carrick_el1_abi::EL1_STACKS_SIZE >> 16) & 0xFFFF) as u16,
-            1,
-        ),
-    );
-    emit(bytes, &mut cursor, 0xEB11_021F); // cmp x16, x17
-    let bhs_not_guard = cursor;
-    emit(bytes, &mut cursor, 0); // b.hs not_guard
-    let tbz_far_guard = cursor;
-    emit(bytes, &mut cursor, 0); // tbz x16, #USABLE_BIT, fail_loud
-    let not_guard = cursor;
-    put(
-        bytes,
-        bhs_not_guard,
-        enc_bhs(bhs_not_guard as u64, not_guard as u64),
-    );
+    // A fault whose FAR is in a guard is not refused here: with a fixup
+    // armed it is a user access to kernel memory (EFAULT, as Linux), and
+    // without one it fails loud below, where the host classifies it.
     // 2. Read faulting PC
     emit(bytes, &mut cursor, AARCH64_MRS_ELR_EL1_X16_OPCODE); // mrs x16, elr_el1
 
@@ -4644,16 +4611,6 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
         bytes,
         cbz_fail,
         enc_cbz_xn(16, cbz_fail as u64, fail_loud as u64),
-    );
-    put(
-        bytes,
-        tbz_far_guard,
-        enc_tbz(
-            16,
-            carrick_el1_abi::EL1_STACK_USABLE_BIT,
-            tbz_far_guard as u64,
-            fail_loud as u64,
-        ),
     );
 
     assert!(
@@ -4982,6 +4939,16 @@ const _: () = assert!(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE <= EL1_VECTO
 /// last 0x100 bytes before the EL1 hook. The clock transport ends below it.
 const EL1_CUR_EL_SYNC_HANDLER_OFFSET: usize = EL1_VECTOR_HOOK_OFFSET - EL1_CUR_EL_SYNC_HANDLER_SIZE;
 const EL1_CUR_EL_SYNC_HANDLER_SIZE: usize = 0x100;
+// The handler and hooks encode these with `sub/add sp, #32`, `sub #0x120` and
+// movz/movk of bits 16..47: keep the encodings tied to their ABI constants.
+const _: () = {
+    assert!(carrick_el1_abi::EL1_FAULT_VECTOR_SCRATCH == 32);
+    assert!(carrick_el1_abi::TRAP_FRAME_ALLOCATION == 0x120);
+    assert!(carrick_el1_abi::EL1_STACKS_BASE & 0xFFFF == 0);
+    assert!(carrick_el1_abi::EL1_STACKS_BASE < 1 << 48);
+    assert!(carrick_el1_abi::EL1_STACKS_SIZE & 0xFFFF == 0);
+    assert!(carrick_el1_abi::EL1_STACKS_SIZE < 1 << 32);
+};
 /// Guest-virtual range of the current-EL synchronous handler in the EL1
 /// vector page: an `hvc #3` taken from it reports an EL1 exception the
 /// vector refused to fix up (the host classifies stack-guard hits, #369).
@@ -9515,7 +9482,6 @@ mod el1_shim_tests {
             VECTOR_PAGE_REGIONS
                 .iter()
                 .find(|(_, base, len)| (*base..base + len).contains(&offset))
-                .map(|(name, _, _)| *name)
         };
         for (name, page) in every_vector_image() {
             for offset in (16 * AARCH64_VECTOR_SLOT_SIZE..page.len()).step_by(4) {
@@ -9523,15 +9489,10 @@ mod el1_shim_tests {
                 if word == AARCH64_NOP_OPCODE || word == 0 {
                     continue;
                 }
-                let region = region_of(offset).unwrap_or_else(|| {
-                    panic!("{name}: word {word:#010x} at {offset:#x} is in no declared region")
-                });
-                if (EL1_CUR_EL_SYNC_HANDLER_OFFSET
-                    ..EL1_CUR_EL_SYNC_HANDLER_OFFSET + EL1_CUR_EL_SYNC_HANDLER_SIZE)
-                    .contains(&offset)
-                {
-                    assert_eq!(region, "current-EL synchronous");
-                }
+                assert!(
+                    region_of(offset).is_some(),
+                    "{name}: word {word:#010x} at {offset:#x} is in no declared region"
+                );
             }
         }
     }
@@ -9594,26 +9555,12 @@ mod el1_shim_tests {
             }
         }
 
-        // A fault on a guard address never reaches an armed fixup: after the
-        // scratch store, FAR in the arena with the usable bit clear branches
-        // to the fail-loud tail (`ldp`, `add sp`, `hvc #3`).
-        let far = (0..EL1_CUR_EL_SYNC_HANDLER_SIZE / 4)
-            .position(|index| at(index) == AARCH64_MRS_FAR_EL1_X16_OPCODE)
-            .expect("handler reads FAR_EL1");
-        assert!(far > 6, "FAR is checked after the scratch store");
-        let far_tbz = (far..EL1_CUR_EL_SYNC_HANDLER_SIZE / 4)
-            .find(|index| at(*index) & 0x7F00_001F == 0x3600_0010)
-            .expect("tbz x16 on the FAR offset");
-        assert_eq!(
-            (at(far_tbz) >> 19) & 31,
-            carrick_el1_abi::EL1_STACK_USABLE_BIT
+        // A guard FAR is not refused before the fixup lookup: an armed
+        // fixup turns a user pointer into a guard into EFAULT (#954 review).
+        assert!(
+            (0..EL1_CUR_EL_SYNC_HANDLER_SIZE / 4).all(|index| at(index) != 0xd538_6010), // mrs x16, far_el1
+            "the handler must not consult FAR"
         );
-        let far_offset = (((at(far_tbz) >> 5) & 0x3FFF) as i32) << 18 >> 16;
-        let fail_loud = (EL1_CUR_EL_SYNC_HANDLER_OFFSET as i64
-            + far_tbz as i64 * 4
-            + far_offset as i64) as usize;
-        let tail: Vec<u32> = (0..3).map(|i| rd_u32(&page, fail_loud + i * 4)).collect();
-        assert_eq!(tail, [0xA940_47F0, 0x9100_83FF, HVC3]);
 
         let handler = |page: &[u8]| {
             page[EL1_CUR_EL_SYNC_HANDLER_OFFSET

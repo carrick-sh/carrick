@@ -61,8 +61,9 @@ root maps. The slots have a 32 KiB stride in an 8 MiB arena; the extra
 4 MiB came from the zone reservation's unused tail. The usable stack, and
 so every budget above, is unchanged. An overflow takes a translation fault
 on the guard. The current-EL synchronous handler tests SP before its
-first store, so it cannot push into the guard. A guard FAR never reaches
-an armed exception fixup, and the host reports `TrapError::El1StackOverflow`,
+first store, so it cannot push into the guard. A user pointer into a guard
+still takes an armed exception fixup (EFAULT, as for any kernel address);
+an unfixed guard fault traps, and the host reports `TrapError::El1StackOverflow`,
 naming the executing CPU and the slot. The signed witness is
 `carrick-embed/tests/el1_stack_guard.rs`.
 
