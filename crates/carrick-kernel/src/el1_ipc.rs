@@ -190,9 +190,24 @@ pub struct IpcGrowth {
     pub description_records: usize,
 }
 
+/// One retained host object behind an `IpcBacking::Host` token. Shared so a
+/// carrier service can use it without holding the resource table lock.
+pub type HostResource = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
 struct HostResources {
     next: u64,
-    live: BTreeMap<u64, Box<dyn Send + Sync>>,
+    live: BTreeMap<u64, HostResource>,
+}
+
+/// Why a native host-file service could not reach a host resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PinnedHostResourceError {
+    /// No open descriptor with this number in the table.
+    BadFd,
+    /// The descriptor names an in-zone object, which the ring owns.
+    InZone,
+    /// The table or description is contended or inconsistent.
+    Unavailable,
 }
 
 #[derive(Debug)]
@@ -971,13 +986,54 @@ impl HostIpc {
     }
     pub fn retain_host_resource(
         &self,
-        resource: Box<dyn Send + Sync>,
+        resource: Box<dyn std::any::Any + Send + Sync>,
     ) -> Result<HostResourceToken, AdmissionError> {
         let mut resources = self.resources.lock();
         let token = HostResourceToken::new(resources.next).ok_or(AdmissionError::NoMemory)?;
         resources.next += 1;
-        resources.live.insert(token.get(), resource);
+        resources
+            .live
+            .insert(token.get(), HostResource::from(resource));
         Ok(token)
+    }
+
+    /// Pin the exact open description `fd` names in ring table `table` and
+    /// hand its host resource to `serve`. The pin lasts for the whole service,
+    /// so a concurrent close cannot retire the resource underneath it; a
+    /// final release found at unpin is performed here, after `serve`.
+    pub fn with_pinned_host_resource<R>(
+        &self,
+        table: fd::TableId,
+        number: fd::Fd,
+        serve: impl FnOnce(&HostResource) -> R,
+    ) -> Result<R, PinnedHostResourceError> {
+        let region = self.region();
+        let authority = region.fd(HostLockWait);
+        let (pin, description) = authority.pin(table, number).map_err(|error| match error {
+            fd::Error::BadFd => PinnedHostResourceError::BadFd,
+            _ => PinnedHostResourceError::Unavailable,
+        })?;
+        let resource = match carrick_el1_abi::ipc::IpcBacking::decode(description.backing) {
+            Some(carrick_el1_abi::ipc::IpcBacking::Host(token)) => self
+                .resources
+                .lock()
+                .live
+                .get(&token.get())
+                .cloned()
+                .ok_or(PinnedHostResourceError::Unavailable),
+            Some(_) => Err(PinnedHostResourceError::InZone),
+            None => Err(PinnedHostResourceError::Unavailable),
+        };
+        let result = resource.map(|resource| serve(&resource));
+        match authority.unpin(pin) {
+            Ok(Some(last)) => {
+                self.release(last.backing)
+                    .map_err(|_| PinnedHostResourceError::Unavailable)?;
+            }
+            Ok(None) => {}
+            Err(_) => return Err(PinnedHostResourceError::Unavailable),
+        }
+        result
     }
     #[cfg(feature = "test-support")]
     pub fn retained_host_resources(&self) -> usize {

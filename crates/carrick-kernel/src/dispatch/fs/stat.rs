@@ -13,29 +13,6 @@ impl<'a> FsView<'a> {
     /// synthetic st_ino matches `stat("/dev/pts/N")` — the equality `ttyname(3)`
     /// checks between `fstat(fd)` and the `/proc/self/fd/N` readlink target.
     /// Shared by `write_fd_stat` (fstat) and `write_fd_statx` (statx).
-    pub(super) fn stdio_synthetic_label_mode(&self, fd: i32) -> (String, u32) {
-        let label = if crate::host_tty::host_isatty(fd)
-            && let Some(n) = self.pty_table().lock().controlling()
-        {
-            format!("/dev/pts/{n}")
-        } else {
-            match fd {
-                0 => "/dev/stdin",
-                1 => "/dev/stdout",
-                _ => "/dev/stderr",
-            }
-            .to_string()
-        };
-        let mut host_st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: fd is a stdio fd; &host_st is a valid stat out-param.
-        let mode = if unsafe { libc::fstat(fd, &mut host_st) } == 0 {
-            (host_st.st_mode as u32 & LINUX_S_IFMT) | 0o620
-        } else {
-            LINUX_S_IFCHR | 0o620
-        };
-        (label, mode)
-    }
-
     pub(super) fn write_fd_stat(
         &self,
         context: &crate::kernel::KernelContext,
@@ -67,9 +44,7 @@ impl<'a> FsView<'a> {
             // A stdio fd the guest explicitly closed (and did not reopen) is
             // genuinely closed: report EBADF, not our still-open host stream.
             if is_stdio_fd(fd) && !self.stdio_is_closed(fd) {
-                let (label, mode) = self.stdio_synthetic_label_mode(fd);
-                return Ok(StatRecord::synthetic(&label, 0, mode)
-                    .with_fs_identity(carrick_vfs::FsIdentity::Pipe));
+                return Ok(implicit_stdio_stat_record(self.pty_table(), fd));
             }
             return Err(LINUX_EBADF);
         };
@@ -969,4 +944,44 @@ mod tests {
             .expect("pipe readlink target");
         assert_eq!(pipe_link, format!("pipe:[{}]", pipe_read.ino));
     }
+}
+
+/// Label and mode of the run's own host stdio stream `fd`: its controlling
+/// pty's name when it is the terminal, else `/dev/std*`, with the host
+/// stream's file type.
+fn implicit_stdio_label_mode(
+    pty_table: &parking_lot::Mutex<crate::vfs::PtyTable>,
+    fd: i32,
+) -> (String, u32) {
+    let label = if crate::host_tty::host_isatty(fd)
+        && let Some(n) = pty_table.lock().controlling()
+    {
+        format!("/dev/pts/{n}")
+    } else {
+        match fd {
+            0 => "/dev/stdin",
+            1 => "/dev/stdout",
+            _ => "/dev/stderr",
+        }
+        .to_string()
+    };
+    let mut host_st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is a stdio fd; &host_st is a valid stat out-param.
+    let mode = if unsafe { libc::fstat(fd, &mut host_st) } == 0 {
+        (host_st.st_mode as u32 & LINUX_S_IFMT) | 0o620
+    } else {
+        LINUX_S_IFCHR | 0o620
+    };
+    (label, mode)
+}
+
+/// The stat record of an implicit (never reopened) stdio descriptor. One
+/// answer for the dispatcher's own fd table and for a native process's
+/// inherited implicit stdio.
+pub(in crate::dispatch) fn implicit_stdio_stat_record(
+    pty_table: &parking_lot::Mutex<crate::vfs::PtyTable>,
+    fd: i32,
+) -> StatRecord {
+    let (label, mode) = implicit_stdio_label_mode(pty_table, fd);
+    StatRecord::synthetic(&label, 0, mode).with_fs_identity(carrick_vfs::FsIdentity::Pipe)
 }

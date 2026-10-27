@@ -18,7 +18,7 @@ use super::ids::{
 use carrick_fatal::carrick_fatal;
 
 mod ipc;
-pub use ipc::FileTableStdioGuard;
+pub use ipc::{FileTableStdioGuard, ImplicitHostStdio};
 pub mod credentials;
 mod file_cursor;
 pub use file_cursor::{FileCursorReservation, FileCursorWait};

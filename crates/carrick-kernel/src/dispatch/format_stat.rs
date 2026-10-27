@@ -37,12 +37,24 @@ pub(super) fn write_stat_record(
     statbuf: u64,
     record: &StatRecord,
 ) -> DispatchOutcome {
+    copyout_record(
+        context,
+        memory,
+        statbuf,
+        &linux_stat(record),
+        DispatchOutcome::Returned { value: 0 },
+    )
+}
+
+/// The Linux `struct stat` for one record: the single encoding shared by the
+/// dispatcher's copyout and the native host-file venue's reply.
+pub(super) fn linux_stat(record: &StatRecord) -> LinuxStat {
     let size = record.size_usize();
     let blocks = record
         .blocks
         .map(|b| b as i64)
         .unwrap_or_else(|| blocks_512(size));
-    let stat = LinuxStat {
+    LinuxStat {
         st_dev: 1,
         st_ino: record.ino,
         st_mode: record.mode,
@@ -63,15 +75,7 @@ pub(super) fn write_stat_record(
         st_ctime_nsec: record.ctime.1 as u64,
         __unused4: 0,
         __unused5: 0,
-    };
-
-    copyout_record(
-        context,
-        memory,
-        statbuf,
-        &stat,
-        DispatchOutcome::Returned { value: 0 },
-    )
+    }
 }
 
 pub(super) fn write_x8664_stat_record(

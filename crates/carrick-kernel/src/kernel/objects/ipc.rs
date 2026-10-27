@@ -27,6 +27,15 @@ impl std::fmt::Debug for Binding {
     }
 }
 
+/// The host resource behind an implicit stdio descriptor: the run's own
+/// host stream `fd` (0..2) as inherited by `file_table`'s namespace. The
+/// carrier serves it through the run's stdio route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImplicitHostStdio {
+    pub file_table: FileTableId,
+    pub fd: fd::Fd,
+}
+
 impl Binding {
     fn new(
         owner: Arc<HostIpc>,
@@ -64,7 +73,10 @@ impl Binding {
         for number in 0..3 {
             let token = binding
                 .owner
-                .retain_host_resource(Box::new((file_table, fd::Fd(number))))?;
+                .retain_host_resource(Box::new(ImplicitHostStdio {
+                    file_table,
+                    fd: fd::Fd(number),
+                }))?;
             let backing = IpcBacking::Host(token).encode();
             let description = match binding.owner.admit_description(fd::Description::new(
                 backing,

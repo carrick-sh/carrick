@@ -21,7 +21,21 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
         request: ServiceRequest,
         payload: &[u8],
     ) -> Result<Box<dyn NativeExecPreparation>, ServiceFailureCode>;
+
+    /// Serve one ring-staged host-file record
+    /// ([`carrick_core_abi::host_file`]) with the process tree's retained
+    /// authority, writing its reply in place. `Err` refuses the exact request
+    /// (the ring answers counted ENOSYS); no reply may have been written.
+    fn serve_host_file(
+        &self,
+        request: ServiceRequest,
+        record: &mut [u8],
+    ) -> Result<(), NativeHostFileRefused>;
 }
+
+/// The retained service does not serve this exact host-file request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeHostFileRefused;
 
 /// Opaque fallibly prepared image. Exact carrier custody retains this result
 /// until the ring consumes successor adoption or terminal cleanup drops it.
@@ -144,6 +158,14 @@ mod native_exec_service_registration_tests {
         ) -> Result<Box<dyn NativeExecPreparation>, ServiceFailureCode> {
             Err(ServiceFailureCode::MINIMUM)
         }
+
+        fn serve_host_file(
+            &self,
+            _request: ServiceRequest,
+            _record: &mut [u8],
+        ) -> Result<(), NativeHostFileRefused> {
+            Err(NativeHostFileRefused)
+        }
     }
 
     /// #936: a native child of a post-exec root names the root's original
@@ -229,6 +251,12 @@ impl RetainedExecPayload {
         // a dynamic aperture allocation additionally retains its host mapping.
         unsafe { core::slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
     }
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `bytes`; additionally the parked ring continuation does not
+        // touch a host-file record until it consumes this ticket's ACK, and this
+        // unique ticket is the only carrier view of it.
+        unsafe { core::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.len) }
+    }
 }
 impl Deref for ServicePin {
     type Target = ServiceCell;
@@ -300,6 +328,41 @@ impl NativeService {
     /// The single contiguous ring-owned input for a typed exec request.
     pub fn exec_payload(&self) -> Option<&[u8]> {
         self.exec_payload.as_ref().map(RetainedExecPayload::bytes)
+    }
+
+    /// Serve the ring-staged host-file record through the retained file
+    /// capability the request names. The reply is written before the ticket
+    /// completes; a refusal leaves no reply and answers counted ENOSYS.
+    pub fn serve_host_file(mut self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let request = self.request();
+        let carrick_core_abi::service::ServiceOperation::HostFile { capability, .. } =
+            request.operation
+        else {
+            return self.refuse();
+        };
+        let Some(service) = self.custody.native_exec_service(capability) else {
+            return self.refuse_host_file();
+        };
+        let served = match self.exec_payload.as_mut() {
+            Some(record) => service.serve_host_file(request, record.bytes_mut()),
+            None => return Err(stale()),
+        };
+        match served {
+            Ok(()) => self.finish_exec_ticket(|ticket| ticket.complete(true).map_err(|_| stale())),
+            Err(NativeHostFileRefused) => self.refuse_host_file(),
+        }
+    }
+
+    fn refuse_host_file(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let request = self.request();
+        carrick_observability::probes::hvpatch_native_crossing_refused(
+            request.identity.birth.mm.mm().raw(),
+            request.identity.birth.mm.incarnation().get(),
+            request.identity.birth.record.id.raw(),
+            request.identity.sequence.get(),
+            0,
+        );
+        self.finish_exec_ticket(|ticket| ticket.complete(false).map_err(|_| stale()))
     }
 
     /// Resolve and run the retained exec service selected by the authenticated
@@ -995,7 +1058,17 @@ pub(super) fn take(
                             custody,
                             region,
                             ticket.request().identity.birth.mm,
-                            payload,
+                            payload.address().raw(),
+                            payload.length().raw(),
+                        )?)
+                    }
+                    carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } => {
+                        Some(retain_exec_payload(
+                            custody,
+                            region,
+                            ticket.request().identity.birth.mm,
+                            payload.address().raw(),
+                            payload.length().raw(),
                         )?)
                     }
                     _ => None,
@@ -1023,10 +1096,10 @@ fn retain_exec_payload(
     custody: &Arc<crate::trap::CarrierVmCustody>,
     region: RetainedAbiRegion<'_>,
     handle: carrick_core_abi::El1MmHandle,
-    payload: carrick_core_abi::service::ExecPayloadDescriptor,
+    address: u64,
+    length: u64,
 ) -> Result<RetainedExecPayload, TrapError> {
-    let address = payload.address().raw();
-    let len = usize::try_from(payload.length().raw()).map_err(|_| stale())?;
+    let len = usize::try_from(length).map_err(|_| stale())?;
     let end = address.checked_add(len as u64).ok_or_else(|| stale())?;
 
     // Authentication is against the request's retained MM incarnation, not
