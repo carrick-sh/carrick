@@ -340,7 +340,7 @@ impl NativeService {
         else {
             return self.refuse();
         };
-        let Some(service) = self.custody.native_exec_service(capability) else {
+        let Ok(service) = self.custody.native_exec_services.resolve(capability) else {
             return self.refuse_host_file();
         };
         let served = match self.exec_payload.as_mut() {
