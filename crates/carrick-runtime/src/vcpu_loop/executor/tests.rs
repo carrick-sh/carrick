@@ -963,7 +963,9 @@ impl PersistentExecutor for FakeExecutor {
     fn wait_in_guest(&mut self) -> Result<super::GuestIdleExit, TrapError> {
         if let Some(entry) = self.idle_entry.take() {
             entry();
-            return Ok(super::GuestIdleExit::Idle);
+            return Ok(super::GuestIdleExit::Idle(super::SettledIdleSlot::admit(
+                self.idle_slot,
+            )?));
         }
         let Some(native) = &self.factory.native_services else {
             return Ok(super::GuestIdleExit::Unsupported);
@@ -978,7 +980,9 @@ impl PersistentExecutor for FakeExecutor {
                 .unwrap();
             // The real ring owner has parked and transferred the ticket to
             // the external fixture. The idle quantum now releases this worker.
-            Ok(super::GuestIdleExit::Idle)
+            Ok(super::GuestIdleExit::Idle(super::SettledIdleSlot::admit(
+                self.idle_slot,
+            )?))
         } else {
             Ok(super::GuestIdleExit::Unsupported)
         }

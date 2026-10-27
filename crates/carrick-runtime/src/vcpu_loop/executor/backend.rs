@@ -611,13 +611,132 @@ pub(crate) trait PersistentExecutor: 'static {
 #[derive(Debug)]
 pub(crate) enum GuestIdleExit {
     /// The vCPU left for the host: host work (a control request, a kick), or
-    /// a queued thread that needs this executor.
-    Idle,
+    /// a queued thread that needs this executor. The proof says the slot
+    /// holds no switched record, so the executor may park or load on it.
+    Idle(SettledIdleSlot),
     /// A parked native continuation; physical backing custody survives the lane.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Service(Box<carrick_vmm_hvf::metadata_grant::NativeService>),
     /// No guest scheduler on this backend or carrier.
     Unsupported,
+}
+
+/// Proof that a guest idle exit left this executor's zone slot with no
+/// switched record current (#890). The shared executor leaves the slot
+/// (`leave_driven_zone_slot`) or loads a task on it after an idle exit, and
+/// both are refused while EL1 still has a record switched in there (#885).
+/// Every backend's idle lane therefore builds [`GuestIdleExit::Idle`]
+/// through [`Self::admit`]; how a backend settles a kick that lands on a
+/// switched record before it gets here is its own contract (ARM:
+/// `carrick_aarch64::owed_kick::run_idle_entry`).
+#[derive(Debug)]
+pub(crate) struct SettledIdleSlot(());
+
+/// An idle exit refused because its zone slot still held a switched record.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RetainedSwitchedRecord {
+    slot: carrick_el1_abi::SlotId,
+    record: carrick_el1_abi::RecordId,
+}
+
+impl From<RetainedSwitchedRecord> for TrapError {
+    fn from(refused: RetainedSwitchedRecord) -> Self {
+        TrapError::Hypervisor(format!(
+            "guest idle exit retained a switched record: slot={:?} record={:?}",
+            refused.slot, refused.record
+        ))
+    }
+}
+
+impl SettledIdleSlot {
+    /// Admit the idle exit of the executor leasing `slot` (`None`: it leases
+    /// no zone slot) against the live zone tables.
+    pub(crate) fn admit(
+        slot: Option<carrick_el1_abi::SlotId>,
+    ) -> Result<Self, RetainedSwitchedRecord> {
+        Self::admit_in(carrick_kernel::el1_zone::zone(), slot)
+    }
+
+    fn admit_in(
+        zone: Option<&carrick_el1_abi::ZoneTables>,
+        slot: Option<carrick_el1_abi::SlotId>,
+    ) -> Result<Self, RetainedSwitchedRecord> {
+        match zone.zip(slot) {
+            Some((zone, slot)) => match zone.slot(slot).current() {
+                Some(record) => Err(RetainedSwitchedRecord { slot, record }),
+                None => Ok(Self(())),
+            },
+            None => Ok(Self(())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod settled_idle_tests {
+    use super::{RetainedSwitchedRecord, SettledIdleSlot};
+    use carrick_el1_abi::{SlotId, ThreadIdentity, ZoneTables};
+
+    fn zone() -> Box<ZoneTables> {
+        let layout = std::alloc::Layout::new::<ZoneTables>();
+        // SAFETY: all-zero is the valid empty zone.
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        }
+    }
+
+    /// A backend idle exit that hands the executor a slot on which EL1 still
+    /// has a native record switched in is refused by the shared contract,
+    /// whichever backend produced it. The executor would otherwise park
+    /// into the #885 refused-leave fatal (#890).
+    #[test]
+    fn idle_exit_with_a_retained_switched_record_is_refused() {
+        let zone = zone();
+        let slot = SlotId::from_index(1).unwrap();
+        zone.drive(slot, 2);
+        zone.publish_slot(slot, 0, None, 0);
+        // The record's address space is published and open, so EL1 may
+        // install it on the threadless slot (a native-owned record).
+        zone.spaces.set_idle_ttbr(0x30000);
+        let space = zone.spaces.publish_closed(4, 0x10000, 0x10000).unwrap();
+        zone.spaces.open(space);
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 11,
+                serial: 1011,
+                mm: 4,
+                file_table: 5,
+                generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        assert!(zone.mark_native_owned(record));
+        zone.requeue_preempted(slot, record);
+        assert_eq!(zone.switch_in_full(slot).map(|s| s.record), Some(record));
+        assert_eq!(zone.slot(slot).current(), Some(record));
+        assert_eq!(
+            SettledIdleSlot::admit_in(Some(&zone), Some(slot)).unwrap_err(),
+            RetainedSwitchedRecord { slot, record },
+            "an idle exit with a switched record was admitted"
+        );
+    }
+
+    /// An empty slot, an executor with no zone slot, and a carrier with no
+    /// zone are settled.
+    #[test]
+    fn idle_exit_with_an_empty_slot_is_admitted() {
+        let zone = zone();
+        let slot = SlotId::from_index(1).unwrap();
+        zone.drive(slot, 2);
+        zone.publish_slot(slot, 0, None, 0);
+        assert!(SettledIdleSlot::admit_in(Some(&zone), Some(slot)).is_ok());
+        assert!(SettledIdleSlot::admit_in(Some(&zone), None).is_ok());
+        assert!(SettledIdleSlot::admit_in(None, Some(slot)).is_ok());
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1466,7 +1585,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             return Ok(GuestIdleExit::Service(Box::new(service)));
         }
         match exit? {
-            carrick_aarch64::Aarch64Exit::Halt => Ok(GuestIdleExit::Idle),
+            carrick_aarch64::Aarch64Exit::Halt => {
+                Ok(GuestIdleExit::Idle(SettledIdleSlot::admit(Some(slot))?))
+            }
             other => {
                 let held = zone.slot(slot).current().map(|record| {
                     let rec = zone.record(record);

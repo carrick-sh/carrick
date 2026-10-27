@@ -1647,7 +1647,7 @@ fn next_runnable<F: PersistentExecutor>(
             backend.disarm_guest_idle();
             drop(idle_wait);
             match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
-                GuestIdleExit::Idle => return Ok(None),
+                GuestIdleExit::Idle(_settled) => return Ok(None),
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 GuestIdleExit::Service(service) => {
                     backend::finish_native_service(*service, scheduler.kernel())
@@ -1758,7 +1758,7 @@ fn next_runnable<F: PersistentExecutor>(
     let waited = backend.wait_in_guest();
     drop(idle_wait);
     match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
-        GuestIdleExit::Idle => Ok(None),
+        GuestIdleExit::Idle(_settled) => Ok(None),
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         GuestIdleExit::Service(service) => {
             backend::finish_native_service(*service, scheduler.kernel())

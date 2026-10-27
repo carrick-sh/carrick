@@ -51,7 +51,7 @@ use carrick_kernel::kernel::{KernelContext, KernelTaskBinding, Scheduler, Submis
 use super::{
     ExactHardwareKick, ExecutorCpuReceipt, ExecutorExit, ExecutorSaveError,
     ExecutorSubmissionContext, GuestIdleExit, PersistentExecutor, PersistentExecutorFactory,
-    RunnableTask, SavedRunnable,
+    RunnableTask, SavedRunnable, SettledIdleSlot,
 };
 use super::{PersistentTaskBinding, TaskBindingDirectory, TaskBindingResolver, TaskLoadIdentity};
 
@@ -1207,7 +1207,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                         status, exits,
                     ))?;
                 }
-                Ok(GuestIdleExit::Idle)
+                Ok(GuestIdleExit::Idle(SettledIdleSlot::admit(
+                    self.zone_slot(),
+                )?))
             }
             CarrierRunExit::SyscallTrap => {
                 let lane_exited = self
@@ -1227,10 +1229,18 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     .ok_or_else(|| TrapError::Hypervisor("KVM total exit count overflow".into()))?;
                 let task = self.physical.idle_peer_task()?;
                 self.service_syscall_trap(task, exited, None)?;
-                Ok(GuestIdleExit::Idle)
+                Ok(GuestIdleExit::Idle(SettledIdleSlot::admit(
+                    self.zone_slot(),
+                )?))
             }
             CarrierRunExit::Halt => Ok(GuestIdleExit::Unsupported),
-            CarrierRunExit::Kick => Ok(GuestIdleExit::Idle),
+            // The production CPL0 lane exposes no zone slot to the host yet,
+            // so this admission has nothing to check; routing a kick that
+            // stops a native record on the idle peer to the CPL0 scheduler
+            // boundary, and exposing the peer's slot, is seam #925.
+            CarrierRunExit::Kick => Ok(GuestIdleExit::Idle(SettledIdleSlot::admit(
+                self.zone_slot(),
+            )?)),
             other => Err(TrapError::Hypervisor(format!(
                 "idle CPL0 peer needs a host task handback: {other:?}"
             ))),
