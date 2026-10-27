@@ -9,9 +9,16 @@
 # the bucket has no size cap, so the warm union no longer evicts itself.
 # FAMILY scopes keys (sccache hashes the absolute paths of each runner image).
 #
-# Without credentials (fork and Dependabot pull requests) or on self-hosted
-# runners, the job keeps the bounded GitHub Actions cache: the workflow's
-# actions/cache steps run when this prints backend=gha.
+# Self-hosted runners keep a persistent cache on their own disk (#938). A
+# runner always builds in the same checkout path, so its entries match from
+# job to job; hosted entries never would, and the runner holds no R2
+# credentials. The GitHub cache never hit there: its version includes the
+# runner's temp path. Each job gets its own server socket, because runners
+# sharing one user would otherwise share sccache's default TCP server.
+#
+# Without credentials (fork and Dependabot pull requests), a GitHub-hosted job
+# keeps the bounded GitHub Actions cache: the workflow's actions/cache steps
+# run when this prints backend=gha.
 #
 # sccache refuses to start when the bucket cannot be read, so a wrong or
 # revoked token fails the build instead of silently compiling uncached.
@@ -37,14 +44,26 @@ case "$mode" in
         ;;
 esac
 
+if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
+    : "${RUNNER_NAME:?self-hosted runner has no RUNNER_NAME}" "${HOME:?}"
+    dir="${CARRICK_SCCACHE_LOCAL_ROOT:-$HOME/.cache/carrick-sccache}/$RUNNER_NAME"
+    mkdir -p "$dir"
+    {
+        echo "SCCACHE_DIR=$dir"
+        echo "SCCACHE_CACHE_SIZE=15G"
+        echo "SCCACHE_SERVER_UDS=$RUNNER_TEMP/sccache.sock"
+    } >> "$GITHUB_ENV"
+    echo "backend=local" >> "$GITHUB_OUTPUT"
+    echo "compiler cache: family=$family backend=local ($dir, runner is ${RUNNER_ENVIRONMENT:-unknown})"
+    exit 0
+fi
+
 # The GitHub cache path stays identical so fallback keys keep matching.
 echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
 
 backend=gha
 reason="no R2 credentials"
-if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
-    reason="runner is ${RUNNER_ENVIRONMENT:-unknown}, not github-hosted"
-elif [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+if [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
     : "${CARRICK_SCCACHE_R2_BUCKET:?R2 credentials are set but no bucket is named}"
     : "${CARRICK_SCCACHE_R2_ENDPOINT:?R2 credentials are set but no endpoint is named}"
     {
