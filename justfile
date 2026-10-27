@@ -140,7 +140,7 @@ xtask *ARGS:
     fi
     exec {{_admit}} {{_xtask}} {{ARGS}}
 
-# Physical-host lease (site SSH broker when configured, otherwise local flock).
+# Local machine/VM host lease (flock).
 # Cancels on runner death or TERM/INT/HUP; cleanup failure releases with error.
 # One five-second cleanup deadline; owner SIGKILL releases immediately.
 # Darwin cannot contain detached descendants closing every scope fd; see docs/host-lease-containment-follow-up.md.

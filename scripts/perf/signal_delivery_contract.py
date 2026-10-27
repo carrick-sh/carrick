@@ -166,8 +166,6 @@ def gate_identity():
             require(len(data) < 4096 and time.monotonic() < deadline, "invalid lease reply")
     identity = json.loads(data)
     require(identity["mode"] == "gate", "shared/Docker lease is not an enclosing gate")
-    # This runner is for the local macOS acceptance lane, not a remote broker.
-    require(identity.get("broker") is None, "remote broker lane unsupported by this driver")
     lock = Path(os.environ.get("CARRICK_HOST_LEASE_PATH", "/tmp/carrick-host-lease.lock")).stat()
     require((identity["dev"], identity["ino"]) == (lock.st_dev, lock.st_ino), "wrong lease lock")
     scope = identity.get("scope")

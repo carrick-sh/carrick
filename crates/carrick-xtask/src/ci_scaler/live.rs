@@ -1091,7 +1091,6 @@ fn reconcile_all(
     dir: &Path,
     path: &Path,
     approval: (u64, &Admission),
-    lease_ready: bool,
 ) -> Result<Pass, ScalerError> {
     let active: Vec<Record> = ledger
         .rows
@@ -1103,7 +1102,7 @@ fn reconcile_all(
     let mut first_error = None;
     for row in active {
         let lane = row.lane;
-        match reconcile_one(pve, gh, ledger, dir, path, approval, row, lease_ready) {
+        match reconcile_one(pve, gh, ledger, dir, path, approval, row) {
             Ok(true) => finished += 1,
             Ok(false) => {}
             Err(error @ ScalerError::CpuCeiling { .. }) if lane == CloneLane::Kvm => {
@@ -1129,7 +1128,6 @@ fn reconcile_one(
     path: &Path,
     approval: (u64, &Admission),
     mut row: Record,
-    lease_ready: bool,
 ) -> Result<bool, ScalerError> {
     let lane_pve = pve.for_lane(row.lane)?;
     let pve = &lane_pve;
@@ -1190,7 +1188,7 @@ fn reconcile_one(
                 None,
                 false,
             )?;
-            if lease_ready && pending_owned_job(&row, &job, &run, approval.1) {
+            if pending_owned_job(&row, &job, &run, approval.1) {
                 println!(
                     "vm={} resuming completed clone in place; error history retained",
                     row.vm.get()
@@ -1232,9 +1230,7 @@ fn reconcile_one(
         // one-use runner has written its exit status: nothing is live.
         assignment = Assignment::Completed;
     }
-    if reap_decision(&row, now()?, assignment) == Reap::Destroy
-        || (!lease_ready && assignment == Assignment::Unassigned)
-    {
+    if reap_decision(&row, now()?, assignment) == Reap::Destroy {
         return cleanup(pve, gh, ledger, &mut row, dir, path, assignment);
     }
     Ok(false)
@@ -1606,61 +1602,6 @@ fn revet_assignments(
 /// Controller poll period; admission retries back off separately.
 const POLL: Duration = Duration::from_secs(30);
 
-struct CloneLease {
-    path: Option<PathBuf>,
-    held: Option<crate::host_lease::HostLease>,
-}
-
-impl CloneLease {
-    fn acquire(&mut self) -> Result<(), ScalerError> {
-        if let Some(path) = self.path.as_deref()
-            && self.held.is_none()
-        {
-            self.held = Some(crate::host_lease::HostLease::acquire_broker_path(
-                path,
-                crate::host_lease::HostLeaseMode::Gate,
-                crate::host_lease::HOST_LEASE_WAIT_LIMIT,
-                |delay| {
-                    std::thread::sleep(delay);
-                    Ok(false)
-                },
-            )?);
-        }
-        Ok(())
-    }
-
-    fn try_recover(&mut self, ledger: &Ledger) -> Result<bool, ScalerError> {
-        if ledger.rows.iter().all(|row| row.state == State::Destroyed) {
-            return Ok(true);
-        }
-        let Some(path) = self.path.as_deref() else {
-            return Ok(true);
-        };
-        if self.held.is_some() {
-            return Ok(true);
-        }
-        match crate::host_lease::HostLease::acquire_broker_path(
-            path,
-            crate::host_lease::HostLeaseMode::Gate,
-            Duration::ZERO,
-            |_| Ok(false),
-        ) {
-            Ok(lease) => {
-                self.held = Some(lease);
-                Ok(true)
-            }
-            Err(crate::host_lease::HostLeaseError::Timeout { .. }) => Ok(false),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn release_if_idle(&mut self, ledger: &Ledger) {
-        if ledger.rows.iter().all(|row| row.state == State::Destroyed) {
-            self.held = None;
-        }
-    }
-}
-
 fn verify_protected_vms(
     site: site::Site,
     mut permissions: impl FnMut(u16) -> Result<Value, ScalerError>,
@@ -1790,10 +1731,6 @@ pub(super) fn controller(
     let gh = Github;
     let path = dir.join("ledger.json");
     let mut ledger = Ledger::load(&path)?;
-    let mut clone_lease = CloneLease {
-        path: pve.site.host_lease.map(PathBuf::from),
-        held: None,
-    };
     let mut reconcile = Instant::now() - Duration::from_secs(60);
     let mut frozen = true;
     let mut backoff = Backoff::default();
@@ -1821,22 +1758,8 @@ pub(super) fn controller(
     };
     loop {
         ledger.refresh()?;
-        let lease_ready = clone_lease.try_recover(&ledger)?;
-        if !lease_ready {
-            eprintln!(
-                "host lease contended during active-ledger recovery; refusing admission and reconciling surviving clones"
-            );
-        }
-        if !lease_ready || reconcile.elapsed() >= Duration::from_secs(60) {
-            let pass = reconcile_all(
-                &pve,
-                &gh,
-                &mut ledger,
-                dir,
-                &path,
-                (group, admission),
-                lease_ready,
-            )?;
+        if reconcile.elapsed() >= Duration::from_secs(60) {
+            let pass = reconcile_all(&pve, &gh, &mut ledger, dir, &path, (group, admission))?;
             if pass.finished > 0 && one_job {
                 ledger.refresh()?;
                 return one_job_result(ledger.rows.last());
@@ -1846,13 +1769,10 @@ pub(super) fn controller(
                     eprintln!("reconcile failed: {error}; admission frozen for active ledger");
                     true
                 }
-                None => !lease_ready,
+                None => false,
             };
-            if lease_ready {
-                reconcile = Instant::now();
-            }
+            reconcile = Instant::now();
         }
-        clone_lease.release_if_idle(&ledger);
         let demand = if matches!(admission, Admission::Standing) {
             gh.coalesced_demand(&mut ledger, &path, &LABELS)
         } else {
@@ -1878,15 +1798,14 @@ pub(super) fn controller(
                     dir,
                     &path,
                     (group, admission, demand),
-                    (limit, &mut clone_lease),
+                    limit,
                 )
             }) {
                 Ok(()) => backoff.reset(),
                 Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
                 Err(error) => {
-                    // Transient GitHub/PVE/lease contention failures never end the controller.
+                    // Transient GitHub/PVE failures never end the controller.
                     eprintln!("admission pass failed: {error}; backing off");
-                    clone_lease.release_if_idle(&ledger);
                     frozen = true;
                     backoff.grow();
                     admit_after = Instant::now() + backoff.delay();
@@ -1927,30 +1846,20 @@ fn reserve_admitted_clone(
     path: &Path,
     job: JobKey,
     capacity: (Concurrency, CloneLane),
-    clone_lease: &mut CloneLease,
     admit: impl FnOnce() -> Result<bool, ScalerError>,
     inventory: impl FnOnce() -> Result<Vec<PoolMember>, ScalerError>,
 ) -> Result<Option<Record>, ScalerError> {
-    let result = (|| -> Result<Option<Record>, ScalerError> {
-        if !admit()? {
-            return Ok(None);
-        }
-        let inventory = inventory()?;
-        ledger.refresh()?;
-        if ledger.served(job) {
-            return Ok(None);
-        }
-        if capacity.1 == CloneLane::Kvm {
-            clone_lease.acquire()?;
-        }
-        let row = ledger.reserve_lane(job, &inventory, now()?, capacity.0, capacity.1)?;
-        ledger.save(path)?;
-        Ok(Some(row))
-    })();
-    if !matches!(result, Ok(Some(_))) {
-        clone_lease.release_if_idle(ledger);
+    if !admit()? {
+        return Ok(None);
     }
-    result
+    let inventory = inventory()?;
+    ledger.refresh()?;
+    if ledger.served(job) {
+        return Ok(None);
+    }
+    let row = ledger.reserve_lane(job, &inventory, now()?, capacity.0, capacity.1)?;
+    ledger.save(path)?;
+    Ok(Some(row))
 }
 
 fn admit_one(
@@ -1960,9 +1869,8 @@ fn admit_one(
     dir: &Path,
     path: &Path,
     demand: (u64, &Admission, Vec<JobKey>),
-    capacity: (Concurrency, &mut CloneLease),
+    limit: Concurrency,
 ) -> Result<(), ScalerError> {
-    let (limit, clone_lease) = capacity;
     let (group, original_admission, kvm_demand) = demand;
     let agents = pve.site.node == site::CONTABO.node
         && matches!(original_admission, Admission::Standing)
@@ -2016,7 +1924,6 @@ fn admit_one(
         path,
         job,
         (limit, lane),
-        clone_lease,
         || {
             gh.vet(admission, job)?;
             match resource_admission(pve) {
@@ -2033,7 +1940,6 @@ fn admit_one(
     if let Err(error) = provision(pve, gh, ledger, &mut row, dir, path, (group, admission)) {
         row.failure = Some(error.to_string());
         update(ledger, &row, path)?;
-        clone_lease.release_if_idle(ledger);
         return Err(error);
     }
     Ok(())
@@ -2048,42 +1954,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     #[test]
-    fn clone_lease_spans_active_ledger_and_releases_only_when_idle() {
+    fn admit_early_returns_never_reserve() {
         let temp = tempfile::tempdir().unwrap();
-        let lock = temp.path().join("host.lock");
-        let mut lease = CloneLease {
-            path: Some(lock.clone()),
-            held: None,
-        };
-        assert!(
-            lease.acquire().is_err(),
-            "missing broker lock file must fail closed without O_CREAT"
-        );
-        std::fs::File::create(&lock).unwrap();
-        lease.acquire().unwrap();
-        let independent = std::fs::File::open(&lock).unwrap();
-        assert!(matches!(
-            independent.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
-        let mut ledger = Ledger::default();
-        ledger.rows.push(row());
-        lease.release_if_idle(&ledger);
-        lease.acquire().unwrap(); // Existing admission never reacquires/upgrades.
-        assert!(matches!(
-            independent.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
-        ledger.rows[0].state = State::Destroyed;
-        lease.release_if_idle(&ledger);
-        independent.try_lock().unwrap();
-    }
-
-    #[test]
-    fn admit_early_returns_never_hold_or_leak_clone_lease() {
-        let temp = tempfile::tempdir().unwrap();
-        let lock = temp.path().join("host.lock");
-        std::fs::File::create(&lock).unwrap();
         let path = temp.path().join("ledger.json");
         let job = JobKey {
             run: RunId(10),
@@ -2091,169 +1963,45 @@ mod tests {
             job: JobId(20),
         };
 
-        // 1. Early return when resource_admission is false: neither waits on
-        // a contended lock nor retains an existing idle lease across POLL.
+        // 1. Early return when resource_admission is false: inventory is
+        // never queried and nothing is reserved.
         let mut ledger = Ledger::default();
-        let external = std::fs::File::open(&lock).unwrap();
-        external.try_lock().unwrap();
-        let mut lease = CloneLease {
-            path: Some(lock.clone()),
-            held: None,
-        };
         let reserved = reserve_admitted_clone(
             &mut ledger,
             &path,
             job,
             (Concurrency::ONE, CloneLane::Kvm),
-            &mut lease,
             || Ok(false),
             || panic!("inventory must not be queried when resource_admission is false"),
         )
         .unwrap();
         assert!(reserved.is_none());
-        assert!(lease.held.is_none());
-        drop(external);
 
-        lease.acquire().unwrap();
-        let reserved = reserve_admitted_clone(
-            &mut ledger,
-            &path,
-            job,
-            (Concurrency::ONE, CloneLane::Kvm),
-            &mut lease,
-            || Ok(false),
-            || Ok(Vec::new()),
-        )
-        .unwrap();
-        assert!(reserved.is_none());
-        assert!(
-            lease.held.is_none(),
-            "resource_admission=false retained clone lease on idle ledger"
-        );
-        let probe = std::fs::File::open(&lock).unwrap();
-        probe.try_lock().unwrap();
-        drop(probe);
-
-        // 2. Early return when ledger.served(job) is true: neither waits on
-        // a contended lock nor retains an existing idle lease across POLL.
+        // 2. Early return when ledger.served(job) is true.
         ledger.refused.push(job);
-        let external = std::fs::File::open(&lock).unwrap();
-        external.try_lock().unwrap();
         let reserved = reserve_admitted_clone(
             &mut ledger,
             &path,
             job,
             (Concurrency::ONE, CloneLane::Kvm),
-            &mut lease,
             || Ok(true),
             || Ok(Vec::new()),
         )
         .unwrap();
         assert!(reserved.is_none());
-        assert!(lease.held.is_none());
-        drop(external);
 
-        lease.acquire().unwrap();
-        let reserved = reserve_admitted_clone(
-            &mut ledger,
-            &path,
-            job,
-            (Concurrency::ONE, CloneLane::Kvm),
-            &mut lease,
-            || Ok(true),
-            || Ok(Vec::new()),
-        )
-        .unwrap();
-        assert!(reserved.is_none());
-        assert!(
-            lease.held.is_none(),
-            "ledger.served(job)=true retained clone lease on idle ledger"
-        );
-        let probe = std::fs::File::open(&lock).unwrap();
-        probe.try_lock().unwrap();
-        drop(probe);
-
-        // 3. Admitted reservation acquires immediately before ledger.reserve.
+        // 3. Admitted, unserved demand is reserved.
         ledger.refused.clear();
         let reserved = reserve_admitted_clone(
             &mut ledger,
             &path,
             job,
             (Concurrency::ONE, CloneLane::Kvm),
-            &mut lease,
             || Ok(true),
             || Ok(Vec::new()),
         )
         .unwrap();
         assert!(reserved.is_some());
-        assert!(lease.held.is_some());
-        let probe = std::fs::File::open(&lock).unwrap();
-        assert!(matches!(
-            probe.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
-    }
-
-    #[test]
-    fn recovery_try_recover_is_zero_wait_when_contended_and_acquires_when_free() {
-        let temp = tempfile::tempdir().unwrap();
-        let lock = temp.path().join("host.lock");
-        std::fs::File::create(&lock).unwrap();
-        let mut ledger = Ledger::default();
-        ledger.rows.push(row());
-        let mut lease = CloneLease {
-            path: Some(lock.clone()),
-            held: None,
-        };
-
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (released_tx, released_rx) = std::sync::mpsc::channel();
-
-        let lock_path = lock.clone();
-        let contender = std::thread::spawn(move || {
-            let file = std::fs::File::open(&lock_path).unwrap();
-            file.try_lock().unwrap();
-            let file = crate::lock_file::OwnedFileLock::from_locked(file);
-            locked_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            drop(file);
-            released_tx.send(()).unwrap();
-        });
-
-        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(
-            !lease.try_recover(&ledger).unwrap(),
-            "contended recovery must return false without waiting"
-        );
-        assert!(lease.held.is_none());
-        let (recovered, held) = crate::lock_file::tests::with_unrelated_fork_exec(
-            || {
-                // Keep an inherited fd alive across the contender's release:
-                // closing a raw File alone cannot release the shared flock.
-                release_tx.send(()).unwrap();
-                released_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                contender.join().unwrap();
-                let recovered = lease.try_recover(&ledger).unwrap();
-                let held = lease.held.is_some();
-                drop(lease);
-                (recovered, held)
-            },
-            || {
-                let mut lease = CloneLease {
-                    path: Some(lock.clone()),
-                    held: None,
-                };
-                assert!(lease.try_recover(&ledger).unwrap());
-                assert!(lease.held.is_some());
-            },
-        );
-        // Assert after the helper has allowed exec and reaped its child.
-        assert!(
-            recovered,
-            "free recovery must succeed before unrelated exec"
-        );
-        assert!(held);
     }
 
     #[test]

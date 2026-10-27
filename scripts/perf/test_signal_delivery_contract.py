@@ -175,8 +175,7 @@ class LeaseTests(unittest.TestCase):
         for mutation, accepted in [({}, True), ({"mode": "carrick"}, False),
                                    ({"mode": "docker"}, False), ({"ino": 8}, False),
                                    ({"scope": None}, False),
-                                   ({"scope": {"dev": 3, "ino": 99}}, False),
-                                   ({"broker": {"host": "remote"}}, False)]:
+                                   ({"scope": {"dev": 3, "ino": 99}}, False)]:
             reply = dict(identity, **mutation)
             with self.subTest(reply=reply), patch("signal_delivery_contract.socket.socket") as sock, patch("signal_delivery_contract.Path.stat", return_value=SimpleNamespace(st_dev=1, st_ino=2)), patch("signal_delivery_contract.os.fstat", return_value=SimpleNamespace(st_dev=3, st_ino=4, st_mode=driver.stat.S_IFIFO)), patch("signal_delivery_contract.fcntl.fcntl", return_value=driver.os.O_WRONLY):
                 sock.return_value.__enter__.return_value.recv.side_effect = [json.dumps(reply).encode(), b""]
