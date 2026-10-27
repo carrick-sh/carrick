@@ -574,13 +574,42 @@ fn compiler_cache_env_selects_r2_only_for_credentialed_hosted_runners() {
     assert_eq!(out, "backend=gha\n");
     assert_eq!(env, format!("SCCACHE_DIR={}\n", dir.display()));
 
-    // Self-hosted runners hash different absolute paths: never R2.
-    let (_, env, out, _) = run(
+    // Self-hosted runners hash different absolute paths: never R2. They keep
+    // a persistent per-runner cache and a per-job server socket (#938).
+    let local = tempfile::tempdir().unwrap();
+    let root = local.path().display().to_string();
+    let (code, env, out, temp_cache) = run(
         &["darwin-hosted", "read-only"],
-        &[creds[0], creds[1], ("RUNNER_ENVIRONMENT", "self-hosted")],
+        &[
+            creds[0],
+            creds[1],
+            ("RUNNER_ENVIRONMENT", "self-hosted"),
+            ("RUNNER_NAME", "carrick-m4-ci-2"),
+            ("HOME", "/nonexistent"),
+            ("CARRICK_SCCACHE_LOCAL_ROOT", &root),
+        ],
     );
-    assert_eq!(out, "backend=gha\n");
-    assert!(!env.contains("SCCACHE_BUCKET"));
+    assert_eq!(code, Some(0));
+    assert_eq!(out, "backend=local\n");
+    let dir = local.path().join("carrick-m4-ci-2");
+    assert!(dir.is_dir());
+    let socket = temp_cache.with_file_name("sccache.sock");
+    assert_eq!(
+        env,
+        format!(
+            "SCCACHE_DIR={}\nSCCACHE_CACHE_SIZE=15G\nSCCACHE_SERVER_UDS={}\n",
+            dir.display(),
+            socket.display()
+        )
+    );
+
+    // Without a runner name the directory would be shared; refuse instead.
+    let (code, env, out, _) = run(
+        &["darwin-hosted", "read-only"],
+        &[("RUNNER_ENVIRONMENT", "self-hosted"), ("HOME", &root)],
+    );
+    assert_ne!(code, Some(0));
+    assert!(env.is_empty() && out.is_empty());
 
     let (code, env, out, _) = run(&["linux-arm64", "read-only"], &hosted_creds);
     assert_eq!(code, Some(0));

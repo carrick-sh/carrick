@@ -32,9 +32,16 @@ selects it per job: pull-request and merge-queue jobs read, and only the
 trusted `cache-warm` job writes, with a writer token held as a secret of the
 `sccache-writer` environment, which admits only `main`. The reader secrets are
 job-level env on the GitHub-hosted jobs that compile; jobs that never compile
-and jobs on the self-hosted Mac do not receive them. Jobs without the R2
-secrets (fork and Dependabot pull requests) and self-hosted runners fall back
-to the bounded GitHub Actions cache (#858).
+and jobs on the self-hosted Mac do not receive them. GitHub-hosted jobs
+without the R2 secrets (fork and Dependabot pull requests) fall back to the
+bounded GitHub Actions cache (#858).
+Self-hosted runners (the `carrick-macos-ci` PR runners) keep a persistent
+15G cache per runner in `~/.cache/carrick-sccache/<runner name>`, outside the
+job workspace (#938). Each runner builds in one fixed checkout path, so its own
+entries keep matching, which hosted R2 entries never would. Each job starts its
+own sccache server on a socket in `$RUNNER_TEMP`, so jobs on two runners that
+share one user don't share a server. Only same-repository pull requests run
+there; merge-queue and `main` jobs use hosted macOS.
 No linker, Rust flags, entitlement, DOF processing, or signing steps change:
 macOS still uses Apple ld64 and the existing post-link signing path.
 
