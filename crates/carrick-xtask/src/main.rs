@@ -9,6 +9,9 @@ fn main() {
     }
     if let Err(err) = carrick_xtask::cli::run(args) {
         eprintln!("carrick-xtask: {err}");
-        std::process::exit(1);
+        std::process::exit(match err {
+            carrick_xtask::cli::CliError::LoomRun { code, .. } => code,
+            _ => 1,
+        });
     }
 }
