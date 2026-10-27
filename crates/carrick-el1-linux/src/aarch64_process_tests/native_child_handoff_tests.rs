@@ -815,13 +815,13 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             NativeThreadGroupOwner::Root
         );
         assert!(
-            arm_owner_must_serve(
+            !arm_owner_must_serve(
                 221,
                 0x6000_0010,
                 || arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
                 carrick_el1_abi::Lifecycle::live(fixture.page),
             ),
-            "strict ring-first exec belongs to the admitted root's native owner"
+            "the root continues through host exec after two native forks"
         );
     }
     fixture.zone.publish_slot(fixture.slot, 0, None, 0);

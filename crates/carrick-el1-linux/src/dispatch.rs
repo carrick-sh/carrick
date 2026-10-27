@@ -492,9 +492,13 @@ pub(super) fn arm_process_call_claimed(
 ) -> bool {
     use super::native_process_runtime::NativeThreadGroupOwner;
 
-    matches!(nr, 221 | 281 | 435)
+    // Only a ring-owned fork child's execve is the native owner's. A root or
+    // host-loaded task execs through the host with its own live cwd,
+    // credentials, executable and descriptor table; execveat stays unclaimed.
+    nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
         || match nr {
+            221 => owner() == NativeThreadGroupOwner::ForkChild,
             260 | 93 | 94 | 95 | 58 | 139 => owner() != NativeThreadGroupOwner::Unowned,
             _ => false,
         }
@@ -890,10 +894,19 @@ fn arm_native_service_exit(
     if !zone.record(record).is_native_owned() {
         return None;
     }
+    let (page, control) = task.lifecycle_refs()?;
+    // Only a fork child's execve is staged for the native exec service; a
+    // root's exec keeps the host route and its live cwd, credentials,
+    // executable and descriptor table (execveat is never claimed).
+    if (frame.esr >> 26) & 0x3f == 0x15
+        && matches!(frame.x[8], 221 | 281)
+        && !arm_process_call_claimed(frame.x[8], 0, || arm_thread_group_owner(zone, task, page))
+    {
+        return None;
+    }
     if refuse_traced_native_exec(frame, task, counters) {
         return Some(arm_signal_user_return(frame));
     }
-    let (page, control) = task.lifecycle_refs()?;
     let mut service_wait = wait;
     let (operation, exec_payload, retry_exec_stage) = loop {
         match native_exec_stage(frame, task) {
@@ -3211,18 +3224,29 @@ mod tests {
             arm_process_call_claimed(95, 0, || NativeThreadGroupOwner::ForkChild),
             "native child waitid"
         );
-        for ordinal in [221, 281] {
+        // Only a ring-owned fork child's execve is the owner's: a root or
+        // host-loaded task execs through the host with its live authority.
+        assert!(
+            arm_process_call_claimed(221, 0, || NativeThreadGroupOwner::ForkChild),
+            "native child execve"
+        );
+        for owner in [
+            NativeThreadGroupOwner::Root,
+            NativeThreadGroupOwner::Unowned,
+        ] {
             assert!(
-                arm_process_call_claimed(ordinal, 0, || NativeThreadGroupOwner::Root),
-                "native root exec ordinal={ordinal}"
+                !arm_process_call_claimed(221, 0, || owner),
+                "{owner:?} execve"
             );
+        }
+        for owner in [
+            NativeThreadGroupOwner::Root,
+            NativeThreadGroupOwner::ForkChild,
+            NativeThreadGroupOwner::Unowned,
+        ] {
             assert!(
-                arm_process_call_claimed(ordinal, 0, || NativeThreadGroupOwner::ForkChild),
-                "native child exec ordinal={ordinal}"
-            );
-            assert!(
-                arm_process_call_claimed(ordinal, 0, || NativeThreadGroupOwner::Unowned),
-                "first native root exec ordinal={ordinal}"
+                !arm_process_call_claimed(281, 0, || owner),
+                "{owner:?} execveat"
             );
         }
         assert!(!arm_process_call_claimed(62, 0, || panic!(
