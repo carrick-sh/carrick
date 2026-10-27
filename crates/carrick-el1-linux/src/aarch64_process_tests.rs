@@ -6609,27 +6609,20 @@ fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
         arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
         NativeThreadGroupOwner::Root
     );
+    for ordinal in [221, 281] {
+        assert!(
+            !arm_owner_must_serve(
+                ordinal,
+                0,
+                || arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
+                1,
+            ),
+            "the admitted root execs through the host with its live authority ({ordinal})"
+        );
+    }
     assert!(
-        arm_owner_must_serve(
-            221,
-            0,
-            || arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
-            1,
-        ),
-        "the admitted root owns execve after its first fork"
-    );
-    assert!(
-        arm_owner_must_serve(
-            281,
-            0,
-            || arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
-            1,
-        ),
-        "the admitted root owns execveat after its first fork"
-    );
-    assert!(
-        arm_owner_must_serve(221, 0, || NativeThreadGroupOwner::Unowned, 1),
-        "the first native root exec establishes its process owner"
+        !arm_owner_must_serve(221, 0, || NativeThreadGroupOwner::Unowned, 1),
+        "an unowned task's execve keeps the host route"
     );
     let mut exec_frame = carrick_el1_abi::TrapFrame::default();
     exec_frame.x[0] = 0x1234;

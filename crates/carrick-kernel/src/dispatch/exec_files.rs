@@ -65,6 +65,19 @@ struct ExecFileContext {
     pub fsgid: NsGid,
     pub executable: Option<ExecSource>,
     pub descriptors: Arc<dyn ExecFdSources>,
+    origin: Option<ExecOrigin>,
+}
+
+/// The live task this capability was captured from, and the exact
+/// credential and filesystem-context objects it observed then.
+#[derive(Clone)]
+struct ExecOrigin {
+    binding: crate::kernel::KernelTaskBinding,
+    tid: crate::kernel::LinuxTid,
+    credentials: Arc<crate::kernel::Credentials>,
+    fs_context: Arc<crate::kernel::FsContext>,
+    /// chdir and chroot edit the context in place and publish a revision.
+    fs_revision: u64,
 }
 
 #[derive(Clone)]
@@ -107,6 +120,22 @@ impl ExecFiles {
         inherited.context.fsuid = fsuid;
         inherited.context.fsgid = fsgid;
         inherited
+    }
+
+    /// Whether the captured credentials and filesystem context are still the
+    /// origin task's live objects. Any set*id, chdir or chroot replaces them,
+    /// so `true` means a descendant that cannot change them itself (a
+    /// ring-owned native child) still holds exactly this authority.
+    pub fn origin_authority_unchanged(&self) -> bool {
+        let Some(origin) = &self.context.origin else {
+            return false;
+        };
+        origin.binding.capture(origin.tid).is_ok_and(|live| {
+            let fs_context = live.resources().fs_context();
+            Arc::ptr_eq(&live.resources().credentials(), &origin.credentials)
+                && Arc::ptr_eq(&fs_context, &origin.fs_context)
+                && fs_context.revision() == origin.fs_revision
+        })
     }
 
     pub fn resolve_path(&self, path: &str) -> String {
@@ -372,6 +401,13 @@ impl SyscallDispatcher {
                     .current_executable()
                     .map(|current| current.source().clone()),
                 descriptors: Arc::new(HostExecFdSources(context.resources().files())),
+                origin: Some(ExecOrigin {
+                    binding: binding.clone(),
+                    tid: context.thread().key().tid,
+                    credentials: Arc::clone(&credentials),
+                    fs_revision: context.resources().fs_context().revision(),
+                    fs_context: context.resources().fs_context(),
+                }),
             },
         ))
     }

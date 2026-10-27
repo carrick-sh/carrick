@@ -3816,7 +3816,7 @@ impl FsContext {
         ))
     }
 
-    pub(super) fn revision(&self) -> u64 {
+    pub(crate) fn revision(&self) -> u64 {
         self.revision.load()
     }
 }
