@@ -3283,8 +3283,9 @@ pub fn mark_pending_host_work(slot: usize) {
 
 /// Whether host work is published to the vCPU at `slot`, without consuming
 /// the doorbell.
-pub fn peek_pending_host_work(slot: usize) -> bool {
+pub fn peek_pending_host_work(slot: SlotId) -> bool {
     let ptr = get_el1_region_host_ptr();
+    let slot = usize::from(slot.raw());
     if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
         return false;
     }

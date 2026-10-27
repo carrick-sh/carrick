@@ -273,6 +273,25 @@ pub trait Aarch64Vcpu {
         Ok(false)
     }
 
+    /// Whether this vCPU's slot owes the in-guest scheduler a reschedule
+    /// SGI, without consuming it (`ZoneTables::reschedule_owed`): what the
+    /// backend's run loop raises before the vCPU runs again. The `false`
+    /// default makes every unexplained kick owed host work, which always
+    /// reaches the host.
+    fn resched_pending(&self) -> Result<bool, TrapError> {
+        Ok(false)
+    }
+
+    /// Whether a kick that cancels this vCPU at EL0 under the idle entry can
+    /// be owed to the in-guest scheduler's EL0 IRQ boundary: the backend
+    /// delivers the owed kick and reschedule as interrupts that survive run
+    /// returns and are taken at EL0 (HVF with its in-kernel GIC). A backend
+    /// answering `false` (the default, and HVF's `CARRICK_HVF_GIC=0` hatch)
+    /// keeps surfacing the kick to its executor.
+    fn owes_el0_kicks_to_guest_scheduler(&self) -> bool {
+        false
+    }
+
     /// Whether the `Kicked` exit [`Self::run`] just returned was a raw
     /// cross-thread cancellation (HVF `CANCELED`), not Carrick's EL1 code
     /// asking for the host at an EL0 boundary (the `hvc` kick decode). The
