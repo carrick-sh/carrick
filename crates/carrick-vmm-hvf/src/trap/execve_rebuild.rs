@@ -436,7 +436,7 @@ pub(crate) fn prepare_native_exec_successor(
     custody: std::sync::Arc<CarrierVmCustody>,
     plan: GuestMappingPlan,
 ) -> Result<PreparedNativeExecSuccessor, TrapError> {
-    let global = prepare_global_exec_plan(&plan, None)?;
+    let global = prepare_native_exec_global_plan(&plan)?;
     let root_raw = global.plan.stage1_page_tables_base.ok_or_else(|| {
         TrapError::Hypervisor("native exec successor has no stage-1 root".to_owned())
     })?;
@@ -1279,6 +1279,29 @@ pub(crate) fn prepare_global_exec_plan(
     prepare_global_exec_plan_with_root_backing(plan, mm_root_slot, false)
 }
 
+/// Who serves the successor's anonymous `mmap` arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecAnonymousArena {
+    /// The host process materializes the sparse arena. Its leaves keep their
+    /// identity output as PROT_NONE until the host's own `mmap` replaces it.
+    HostSparse,
+    /// The ring's reservation root owns the arena. No host path will ever
+    /// replace an identity output, so the arena has no terminal at all: a
+    /// fresh mapping is a lazy reservation and first touch builds its
+    /// hierarchy from host table grants, exactly like a fork child's
+    /// pristine span.
+    RingOwned,
+}
+
+/// The global plan for a ring-owned exec successor, whose anonymous memory
+/// belongs to its reservation root rather than to a host process.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prepare_native_exec_global_plan(
+    plan: &GuestMappingPlan,
+) -> Result<GlobalExecPlan, TrapError> {
+    prepare_global_exec_plan_for_arena(plan, None, false, ExecAnonymousArena::RingOwned)
+}
+
 /// [`prepare_global_exec_plan`] naming whether the replacement stage-1 root
 /// slot is served by the carrier's pre-mapped root-slot pool, in which case
 /// the table's lease spans the whole slot.
@@ -1286,6 +1309,20 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
     plan: &GuestMappingPlan,
     mm_root_slot: Option<(u64, u64)>,
     pool_backed_root: bool,
+) -> Result<GlobalExecPlan, TrapError> {
+    prepare_global_exec_plan_for_arena(
+        plan,
+        mm_root_slot,
+        pool_backed_root,
+        ExecAnonymousArena::HostSparse,
+    )
+}
+
+fn prepare_global_exec_plan_for_arena(
+    plan: &GuestMappingPlan,
+    mm_root_slot: Option<(u64, u64)>,
+    pool_backed_root: bool,
+    arena: ExecAnonymousArena,
 ) -> Result<GlobalExecPlan, TrapError> {
     let old_root = plan.stage1_page_tables_base.ok_or_else(|| {
         TrapError::Hypervisor("hvpatch exec image has no stage-1 tables".to_owned())
@@ -1414,6 +1451,20 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
         .map_err(|error| {
             TrapError::Hypervisor(format!("reserve sparse HVPatch mmap arena: {error:?}"))
         })?;
+    if arena == ExecAnonymousArena::RingOwned {
+        // The unpublished image is this builder's sole copy; no walker can
+        // reach it, so the pristine arena may lose its terminals outright.
+        page_tables.declare_offline_private_image();
+        page_tables
+            .clear_offline_fork_range(
+                crate::memory::LINUX_MMAP_BASE,
+                crate::memory::mmap_arena_size() as usize,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("clear ring-owned HVPatch mmap arena: {error:?}"))
+            })?;
+        page_tables.declare_live_hardware_image();
+    }
     reapply_global_exec_page_spans(&mut page_tables, &global.ro_spans, &global.rw_spans)?;
     for mapping in &global.mappings {
         let expected = (!is_sparse_hvpatch_mmap_mapping(mapping)).then_some(mapping.ipa_start);
