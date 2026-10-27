@@ -8,6 +8,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -91,6 +92,7 @@ pub fn run(root: &Path, args: LoomRunArgs) -> Result<()> {
             .status()?;
         return checked(status);
     }
+    forward_termination_signals()?;
     let lanes = crate::test_shards::records(root, &args.recipe, &args.args)?
         .into_iter()
         .map(lane)
@@ -264,6 +266,35 @@ impl Tests {
     }
 }
 
+/// Process group of the test binary now running, for [`forward_and_exit`].
+static RUNNING_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// The binary runs in its own process group, so a signal aimed at this
+/// runner (Ctrl-C, or a lease supervisor cancelling `just ci`) would leave it
+/// running. Kill its group, then die of the same signal.
+extern "C" fn forward_and_exit(signal: libc::c_int) {
+    let pgid = RUNNING_GROUP.load(Ordering::SeqCst);
+    // SAFETY: kill, signal and raise are async-signal-safe.
+    unsafe {
+        if pgid > 0 {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+fn forward_termination_signals() -> std::io::Result<()> {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        let handler = forward_and_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // SAFETY: the handler only performs async-signal-safe calls.
+        if unsafe { libc::signal(signal, handler) } == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 struct Group(Child);
 impl Group {
     fn kill(&mut self) -> std::io::Result<()> {
@@ -281,6 +312,7 @@ impl Group {
 impl Drop for Group {
     fn drop(&mut self) {
         let _ = self.kill();
+        RUNNING_GROUP.store(0, Ordering::SeqCst);
         // SIGKILL normally reaps immediately, but an uninterruptible host wait
         // must not turn the watchdog itself into an unlimited wait.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -352,6 +384,19 @@ fn supervise(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    // SIGKILL cannot be forwarded: on Linux let the kernel kill the binary
+    // when this runner dies. The supervising loop runs on the main thread,
+    // which is the thread the death signal follows.
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl is async-signal-safe and affects only the child.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     if list {
         command.arg("--list");
     }
@@ -366,6 +411,10 @@ fn supervise(
         }
     }
     let mut group = Group(command.spawn()?);
+    RUNNING_GROUP.store(
+        i32::try_from(group.0.id()).map_err(std::io::Error::other)?,
+        Ordering::SeqCst,
+    );
     let mut stdout = group.0.stdout.take().ok_or("missing test stdout")?;
     let mut stderr = group.0.stderr.take().ok_or("missing test stderr")?;
     nonblocking(&stdout)?;
