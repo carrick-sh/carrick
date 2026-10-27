@@ -681,3 +681,63 @@ pub fn run_stack_guard_witness(depth: u64) -> u64 {
     };
     u64::from(core::hint::black_box(&record)[1023]).wrapping_add(below)
 }
+
+// Landing for the armed-fixup witness: if the vector ever took the armed
+// fixup for a guard fault, EL1 would resume here and trap through `hvc #3`
+// from outside the current-EL handler (a generic EL1 fault, not a typed
+// stack overflow), which the signed witness reports as red.
+#[cfg(all(
+    feature = "allocator-test-control",
+    target_os = "none",
+    target_arch = "aarch64"
+))]
+core::arch::global_asm!(
+    ".global carrick_el1_guard_witness_landing",
+    "carrick_el1_guard_witness_landing:",
+    "hvc #3",
+    "b carrick_el1_guard_witness_landing",
+);
+
+/// Test-control witness (#369): overflow the EL1 stack while a user-copy
+/// fixup is armed. The guard fault must still fail loud as a stack
+/// overflow; an armed fixup may only absorb user accesses.
+#[cfg(feature = "allocator-test-control")]
+pub fn run_armed_stack_guard_witness(
+    task: Option<&carrick_el1_abi::CurrentTask>,
+    depth: u64,
+) -> u64 {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    if let Some(task) = task {
+        unsafe extern "C" {
+            fn carrick_el1_guard_witness_landing();
+        }
+        task.linux.fixup_pc.store(
+            carrick_el1_guard_witness_landing as *const () as usize as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let result = run_stack_guard_witness(depth);
+    if let Some(task) = task {
+        task.linux
+            .fixup_pc
+            .store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+/// Test-control witness (#369): a user pointer into an EL1 stack guard is
+/// EFAULT from the guarded copy (Carrick's access_ok), never a guard fault.
+/// Returns 0 when the copy refused the range.
+#[cfg(feature = "allocator-test-control")]
+pub fn run_guard_user_pointer_witness(task: Option<&carrick_el1_abi::CurrentTask>) -> u64 {
+    let Some(task) = task else {
+        return 2;
+    };
+    let byte = 0x5a_u8;
+    let guard = carrick_el1_abi::stack_slot_guard_base(0) + 0x100;
+    // SAFETY: the destination is deliberately a kernel guard address; the
+    // guarded copy must refuse it before touching it.
+    let copied =
+        unsafe { crate::substrate::file::copy_to_user_guarded(task, guard as *mut u8, &byte, 1) };
+    u64::from(copied)
+}

@@ -244,6 +244,29 @@ pub const fn is_el1_stack_guard(va: u64) -> bool {
     el1_stack_guard_slot(va).is_some()
 }
 
+/// Carrick's `access_ok` for an ARM user pointer: whether `[va, va + len)`
+/// touches the EL1 kernel window (the EL1 region, the dynamic metadata
+/// aperture and the IPC window, contiguous and EL1-only). The window lies
+/// below the user ceiling, so a range check alone accepts it. Every
+/// fixup-guarded user copy refuses such a range with EFAULT before it arms
+/// a fixup, so a fault in a stack guard under an armed fixup can only be the
+/// kernel's own overflow and the vector fails it loud (#369).
+#[inline(always)]
+pub const fn user_range_overlaps_el1_kernel(va: u64, len: usize) -> bool {
+    let end = match va.checked_add(len as u64) {
+        Some(end) => end,
+        None => return true,
+    };
+    len != 0 && va < EL1_KERNEL_WINDOW_END && end > EL1_REGION_BASE
+}
+
+/// One past the EL1 kernel window [`user_range_overlaps_el1_kernel`] refuses.
+pub const EL1_KERNEL_WINDOW_END: u64 = EL1_IPC_BASE + EL1_IPC_SIZE;
+const _: () = {
+    assert!(EL1_REGION_BASE + EL1_REGION_SIZE == EL1_DYNAMIC_METADATA_BASE);
+    assert!(EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE == EL1_IPC_BASE);
+};
+
 /// Every stack guard as `(base, len)`, lowest first.
 pub fn el1_stack_guards() -> impl Iterator<Item = (u64, u64)> {
     (0..EL1_STACK_SLOTS as usize).map(|slot| (stack_slot_guard_base(slot), EL1_STACK_GUARD_SIZE))
@@ -5954,6 +5977,23 @@ mod el1_stack_layout_tests {
         assert_eq!(el1_stack_slot(EL1_STACKS_BASE + EL1_STACKS_SIZE), None);
         assert!(!is_el1_stack_guard(EL1_STACKS_BASE - 1));
         assert!(!is_el1_stack_guard(EL1_STACKS_BASE + EL1_STACKS_SIZE));
+    }
+
+    /// Every stack guard, and the rest of the EL1 kernel window, is refused
+    /// as a user range; ordinary user addresses and empty ranges are not.
+    #[test]
+    fn el1_kernel_window_is_refused_as_a_user_range() {
+        for (base, len) in el1_stack_guards() {
+            assert!(user_range_overlaps_el1_kernel(base, 1));
+            assert!(user_range_overlaps_el1_kernel(base + len - 1, 1));
+        }
+        assert!(user_range_overlaps_el1_kernel(EL1_REGION_BASE - 1, 2));
+        assert!(user_range_overlaps_el1_kernel(EL1_KERNEL_WINDOW_END - 1, 1));
+        assert!(user_range_overlaps_el1_kernel(u64::MAX, 2));
+        assert!(!user_range_overlaps_el1_kernel(EL1_REGION_BASE - 1, 1));
+        assert!(!user_range_overlaps_el1_kernel(EL1_KERNEL_WINDOW_END, 4096));
+        assert!(!user_range_overlaps_el1_kernel(0x40_0000, 4096));
+        assert!(!user_range_overlaps_el1_kernel(EL1_STACKS_BASE, 0));
     }
 
     /// The stack arena's level-3 tables cover exactly the 2 MiB blocks the

@@ -367,3 +367,65 @@ impl Drop for Watchdog {
         }
     }
 }
+
+/// Run the el1-sched fixture in `mode` on a fresh carrier for the #369
+/// stack-guard witnesses, bounded by a watchdog.
+pub fn run_stack_guard_fixture(
+    mode: &str,
+) -> Result<carrick_embed::ContainerResult, carrick_embed::EmbedError> {
+    let carrier = carrier_or_fail();
+    let watchdog = Watchdog::start(std::time::Duration::from_secs(120));
+    let outcome = carrier
+        .container(SMOKE_IMAGE)
+        .pull_policy(carrick_embed::PullPolicy::Missing)
+        .command(vec![EL1_SCHED_FIXTURE.to_owned(), mode.to_owned()])
+        .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+        .run_blocking();
+    drop(watchdog);
+    outcome
+}
+
+/// The typed EL1 stack overflow report a failed run carries (#369).
+pub fn expect_el1_stack_overflow(
+    outcome: Result<carrick_embed::ContainerResult, carrick_embed::EmbedError>,
+) -> carrick_el1_abi::El1StackOverflow {
+    let error = match outcome {
+        Ok(result) => panic!(
+            "an EL1 stack overflow must fail the run with a typed report; the guest \
+             finished instead: exit={} signal={:?} stdout={:?} stderr={:?}",
+            result.exit_code,
+            result.signal,
+            result.stdout_utf8(),
+            result.stderr_utf8()
+        ),
+        Err(EmbedError::Entitlement) => panic!(
+            "HV_DENIED (0xfae94007): run through scripts/test-signed.sh; \
+             a bare cargo test cannot boot a guest"
+        ),
+        Err(error) => error,
+    };
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = source {
+        if let Some(carrick_hal::TrapError::El1StackOverflow(overflow)) =
+            current.downcast_ref::<carrick_hal::TrapError>()
+        {
+            let report = *overflow;
+            assert_eq!(
+                report.kind,
+                carrick_el1_abi::El1StackOverflowKind::GuardFault,
+                "{report}"
+            );
+            // The overflow ran off the executing CPU's own stack into its
+            // own guard.
+            let cpu = report.executing.expect("the leased CPU is named");
+            assert_eq!(cpu.raw(), u32::from(report.stack.raw()), "{report}");
+            assert!(
+                carrick_el1_abi::is_el1_stack_guard(report.far_el1.raw()),
+                "{report}"
+            );
+            return report;
+        }
+        source = current.source();
+    }
+    panic!("expected TrapError::El1StackOverflow in the error chain, got: {error:#?}");
+}

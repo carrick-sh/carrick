@@ -2245,6 +2245,10 @@ impl<
             // The stack guard witness (#369): never returns while the guard
             // below this CPU's EL1 stack is unmapped.
             2 => carrick_el1::alloc::run_stack_guard_witness(frame.x[1].min(64)),
+            // The same overflow with a user-copy fixup armed must still fail
+            // loud; a user pointer into a guard must be EFAULT (#369).
+            3 => carrick_el1::alloc::run_armed_stack_guard_witness(cur_task, frame.x[1].min(64)),
+            4 => carrick_el1::alloc::run_guard_user_pointer_witness(cur_task),
             _ => 1,
         };
         if res == carrick_el1_abi::METADATA_GRANT_PENDING {
