@@ -371,6 +371,9 @@ pub enum MemoryEditWait {
     Parked(LifecycleOutcome),
     /// The cause moved after the sample: attempt the call again now.
     Ready,
+    /// A deliverable signal cancelled the wait. The call made no effect;
+    /// it returns to user mode to run again after the signal checkpoint.
+    Interrupted,
 }
 
 pub use carrick_core::personality::UserCopy;

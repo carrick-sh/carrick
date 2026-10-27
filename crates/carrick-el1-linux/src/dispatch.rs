@@ -2480,8 +2480,23 @@ impl<
                 carrick_personality_linux::lifecycle::lifecycle_effect(&outcome),
             ),
             Some(MemoryEditWait::Ready) => ContendedPark::Retry,
+            Some(MemoryEditWait::Interrupted) => {
+                ContendedPark::Interrupted(carrick_personality_linux::pending_anonymous::PendingAnonymousVenue::replay_at_checkpoint(self))
+            }
             None => ContendedPark::Unsupported,
         }
+    }
+    fn replay_at_checkpoint(&mut self) -> FamilyCompletion {
+        // The call made no effect: point the frame back at its svc so it
+        // runs again once the user-return checkpoint has run.
+        let Some(frame) = self.frame.arm_frame() else {
+            return FamilyCompletion::Forward;
+        };
+        let Some(svc) = frame.elr.checked_sub(4) else {
+            return FamilyCompletion::Forward;
+        };
+        frame.elr = svc;
+        FamilyCompletion::FrameRestored
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> {
         let slot = self.frame.slot()?;

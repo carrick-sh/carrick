@@ -1285,7 +1285,11 @@ fn composed_native_supply(
 #[test]
 fn native_contended_memory_edit_waits_and_replays_the_unchanged_call() {
     use carrick_personality_linux::lifecycle::{MemoryEditWait, ProcessNative};
-    for release_before_enroll in [false, true] {
+    // 0: park until the release; 1: release in the sample gap; 2: a
+    // deliverable signal cancels the wait.
+    for mode in 0..3 {
+        let release_before_enroll = mode == 1;
+        let signalled = mode == 2;
         let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
         fixture.zone.spaces.set_idle_ttbr(0x30000);
         let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -1386,10 +1390,14 @@ fn native_contended_memory_edit_waits_and_replays_the_unchanged_call() {
                 if release_before_enroll {
                     drop(sibling.take());
                 }
+                if signalled {
+                    carrick_personality_linux::signal::ProcessSignals::raise_sigpipe(entry);
+                }
                 let waited = entry.wait_memory_edit(wait).unwrap();
                 assert_eq!(
                     entry.take_handoff_receipt().is_some(),
-                    !release_before_enroll
+                    mode == 0,
+                    "only an uncancelled wait parks"
                 );
                 waited
             },
@@ -1406,6 +1414,15 @@ fn native_contended_memory_edit_waits_and_replays_the_unchanged_call() {
                 "a release in the sample gap retries the call at once"
             );
             assert_eq!(page.claimed_count(), 0);
+            continue;
+        }
+        if signalled {
+            assert!(
+                matches!(waited, MemoryEditWait::Interrupted),
+                "a pending signal leaves through the user-return checkpoint, never a retry"
+            );
+            assert_eq!(page.claimed_count(), 0);
+            assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
             continue;
         }
         assert!(matches!(

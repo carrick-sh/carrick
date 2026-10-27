@@ -6960,7 +6960,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                 progress: carrick_core::Served::Idle,
                 result: SyscallResult::new(0),
             }),
-            Ok(NativeResume::NoPending) => MemoryEditWait::Ready,
+            Ok(NativeResume::NoPending) => {
+                // The wait ended before it parked. A pending exit published
+                // its owner continuation: take the exit now. A deliverable
+                // signal leaves for the user-return checkpoint. Only a moved
+                // producer reselects.
+                if self.runtime.graph.lock().pending.has_exit(&self.key) {
+                    return Some(match self.resume_pending_lifecycle() {
+                        Some(outcome) => MemoryEditWait::Parked(outcome),
+                        None => MemoryEditWait::Interrupted,
+                    });
+                }
+                if self.signal_interrupts_current() {
+                    MemoryEditWait::Interrupted
+                } else {
+                    MemoryEditWait::Ready
+                }
+            }
             Ok(NativeResume::Returned(result)) => MemoryEditWait::Parked(returned(result.raw())),
             Ok(_) => MemoryEditWait::Parked(
                 self.run_failed(NativeProcessError::Quarantined.run_failure_reason()),
