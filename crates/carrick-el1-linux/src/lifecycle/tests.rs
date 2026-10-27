@@ -565,7 +565,7 @@ fn clone_forwards_every_other_flag_set_without_effects() {
     let fork = 0x11; // SIGCHLD
     let cases = [
         fork,
-        CLONE_VM | 0x4000 | fork,                  // vfork
+        CLONE_VM | 0x4000 | fork,                  // vfork, no process venue
         GLIBC_FLAGS | 0x8000,                      // CLONE_PARENT
         GLIBC_FLAGS | fork,                        // an exit signal
         GLIBC_FLAGS & !CLONE_SYSVSEM,              // not a libc set

@@ -829,6 +829,9 @@ pub struct FatalReport {
 pub trait ProcessContext: Copy + Send + Sync + zerocopy::FromZeros {
     fn authenticates(&self, expected: AddressContext<RootGpa>) -> bool;
     fn fork_child(self, address: AddressContext<RootGpa>) -> Self;
+    /// Replace the user stack pointer a process child returns on (clone's
+    /// stack argument); every other register keeps the parent's value.
+    fn set_user_stack(&mut self, stack: u64);
     fn set_syscall_return(&mut self, value: u64);
     fn with_syscall_return(mut self, value: u64) -> Self {
         self.set_syscall_return(value);

@@ -481,6 +481,10 @@ const CLONE_VM: u64 = 0x0000_0100;
 const CLONE_FS: u64 = 0x0000_0200;
 const CLONE_FILES: u64 = 0x0000_0400;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
+const CLONE_VFORK: u64 = 0x0000_4000;
+/// The exact clone flags of vfork(2): `CLONE_VM|CLONE_VFORK|SIGCHLD`.
+pub const VFORK_CLONE_FLAGS: u64 =
+    CLONE_VM | CLONE_VFORK | carrick_signal_core::policy::Signal::CHLD.number() as u64;
 const CLONE_THREAD: u64 = 0x0001_0000;
 const CLONE_SYSVSEM: u64 = 0x0004_0000;
 const CLONE_SETTLS: u64 = 0x0008_0000;
@@ -493,13 +497,28 @@ const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 /// The low byte: the child's exit signal. A thread has none.
 const CSIGNAL: u64 = 0xff;
 
-/// Child-only TID effects of a process fork. The address belongs to the new
-/// MM, so callers must not copy it through the parent's UserCopy aperture.
+/// What the parent of a process fork does until its child leaves the
+/// parent's image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessForkParent {
+    /// fork(2): the parent returns the child's pid at once.
+    Runs,
+    /// vfork(2) (`CLONE_VM|CLONE_VFORK|SIGCHLD`): the parent returns the
+    /// child's pid only after the child's exec commits or the child exits.
+    SuspendedUntilExecOrExit,
+}
+
+/// Child-only effects of a process fork. The TID address and the stack belong
+/// to the new MM, so callers must not copy through the parent's UserCopy
+/// aperture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessForkChildTid {
     pub address: UserVa,
     pub set: bool,
     pub clear: bool,
+    /// The child's user stack pointer; `None` keeps the parent's.
+    pub stack: Option<UserVa>,
+    pub parent: ProcessForkParent,
 }
 
 impl ProcessForkChildTid {
@@ -507,7 +526,20 @@ impl ProcessForkChildTid {
         address: UserVa::new(0),
         set: false,
         clear: false,
+        stack: None,
+        parent: ProcessForkParent::Runs,
     };
+
+    /// vfork(2) served with a copy-on-write child: Linux's `clone(2)` lets
+    /// the child run on `stack` (glibc passes the caller's own sp), and the
+    /// parent stays suspended until the child execs or exits.
+    pub const fn vfork(stack: UserVa) -> Self {
+        Self {
+            stack: if stack.raw() == 0 { None } else { Some(stack) },
+            parent: ProcessForkParent::SuspendedUntilExecOrExit,
+            ..Self::NONE
+        }
+    }
 
     pub const fn flags(self) -> u64 {
         (if self.set { CLONE_CHILD_SETTID } else { 0 })
@@ -618,7 +650,17 @@ pub fn invoke<'a>(
             address: UserVa::new(args[4]),
             set: args[0] & CLONE_CHILD_SETTID != 0,
             clear: args[0] & CLONE_CHILD_CLEARTID != 0,
+            ..ProcessForkChildTid::NONE
         });
+    }
+    // vfork(2) as every libc issues it (glibc/musl `vfork`, dash, x86's
+    // decoded vfork 58): exactly CLONE_VM|CLONE_VFORK|SIGCHLD. Linux ignores
+    // parent_tid, tls and child_tid without their flags; arg1 is the child's
+    // stack (glibc on arm64 passes its own sp, x86 vfork passes zero). The
+    // process venue serves it as a copy-on-write fork whose parent stays
+    // suspended until the child execs or exits; no venue keeps the fallback.
+    if call == LifecycleCall::Clone && args[0] == VFORK_CLONE_FLAGS {
+        return native.process_fork(ProcessForkChildTid::vfork(UserVa::new(args[1])));
     }
     match call {
         LifecycleCall::Fork => return native.process_fork(ProcessForkChildTid::NONE),

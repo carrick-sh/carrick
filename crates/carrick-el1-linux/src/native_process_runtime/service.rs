@@ -273,6 +273,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_guest_arch::GuestLen::new(payload.len() as u64),
         )
         .ok_or(NativeProcessError::Exhausted)?;
+        // The staged payload holds every argument: a vfork parent may run.
+        self.release_vfork_parent()?;
         self.begin_service_inner(
             ServiceOperation::Exec {
                 capability,
