@@ -15,6 +15,8 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
         #[test] fn passing() { assert!(cfg!(feature = "loom")); }
         #[test] fn sleeping() {
             std::fs::write("sleeping.pid", std::process::id().to_string()).unwrap();
+            let child = std::process::Command::new("sleep").arg("3600").spawn().unwrap();
+            std::fs::write("descendant.pid", child.id().to_string()).unwrap();
             loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
         }
         #[test] fn failing() { panic!("ordinary failure witness"); }
@@ -54,6 +56,13 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
                 break status;
             }
             if Instant::now() >= deadline {
+                if let Ok(pid) = fs::read_to_string(dir.path().join("sleeping.pid")) {
+                    let pid: i32 = pid.parse().unwrap();
+                    // SAFETY: the fixture records its dedicated process group.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
                 child.kill().unwrap();
                 child.wait().unwrap();
                 panic!(
@@ -95,18 +104,26 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
         "{log}"
     );
     assert!(!log.contains("unfinished passing"), "{log}");
-    let pid: i32 = fs::read_to_string(dir.path().join("sleeping.pid"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    // SAFETY: signal zero observes the fixture PID without sending a signal.
-    assert_eq!(
-        unsafe { libc::kill(pid, 0) },
-        -1,
-        "test process {pid} survived"
-    );
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH)
-    );
+    assert_process_gone(&dir.path().join("sleeping.pid"));
+    assert_process_gone(&dir.path().join("descendant.pid"));
+}
+
+fn assert_process_gone(file: &std::path::Path) {
+    let pid: i32 = fs::read_to_string(file).unwrap().parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // SAFETY: signal zero observes the fixture PID without sending a signal.
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture process {pid} survived group cancellation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
