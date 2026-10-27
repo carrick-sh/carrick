@@ -1430,34 +1430,49 @@ impl MmAccessState {
         key: (u64, usize),
         remove: impl FnOnce(&std::sync::Arc<StructuralBackingOwner>) -> bool,
     ) -> Option<std::sync::Arc<StructuralBackingOwner>> {
+        // Same scope as `install_structural_owner`: identity, then owners,
+        // with the pending registration updated before either is released,
+        // so an identity adoption never sees the owner and lease sets differ.
+        let identity = self.identity.read();
         let removed = {
             let mut owners = self.structural_owners.write();
-            owners
+            let removed = owners
                 .get(&key)
                 .is_some_and(remove)
                 .then(|| owners.remove(&key))
-                .flatten()
-        };
-        if removed.is_some() {
-            let lease = (key.0, key.1 as u64);
-            if let StructuralStage2ReferenceRegistrations::PreIdentity(pending) =
-                &mut *self.structural_reference_registrations.lock()
-            {
-                pending.leases.remove(&lease);
+                .flatten();
+            if removed.is_some() {
+                let lease = (key.0, key.1 as u64);
+                if let StructuralStage2ReferenceRegistrations::PreIdentity(pending) =
+                    &mut *self.structural_reference_registrations.lock()
+                {
+                    pending.leases.remove(&lease);
+                }
             }
+            removed
+        };
+        drop(identity);
+        if removed.is_some() {
             custody.stage2_publication_authority().changed();
         }
         removed
     }
 
-    fn register_structural_stage2_references(&self) -> Result<(), TrapError> {
-        let identity = self.identity.read();
-        let owners = self.structural_owners.read();
+    /// Register the owner set as structural stage-2 references. Callers hold
+    /// the identity guard and the owner set together, so an identity install
+    /// (which holds the identity for writing while it adopts) sees either the
+    /// owner set before this mutation or after its registration, never one
+    /// without the other.
+    fn register_structural_stage2_references_locked(
+        &self,
+        identity: Option<u64>,
+        owners: &std::collections::BTreeMap<(u64, usize), std::sync::Arc<StructuralBackingOwner>>,
+    ) -> Result<(), TrapError> {
         let leases = owners
             .keys()
             .map(|&(ipa, len)| (ipa, len as u64))
             .collect::<std::collections::BTreeSet<_>>();
-        let Some(mm) = identity.as_ref().map(|(mm, _)| mm.raw_for_probe()) else {
+        let Some(mm) = identity else {
             let mut registrations = self.structural_reference_registrations.lock();
             let StructuralStage2ReferenceRegistrations::PreIdentity(pending) = &mut *registrations
             else {
@@ -1469,9 +1484,7 @@ impl MmAccessState {
             pending.leases.extend(leases);
             return Ok(());
         };
-        let result = self.register_identified_structural_stage2_references(mm, leases);
-        drop(owners);
-        result
+        self.register_identified_structural_stage2_references(mm, leases)
     }
 
     fn adopt_structural_stage2_references(&self, mm: u64) -> Result<(), TrapError> {
@@ -1538,13 +1551,34 @@ impl MmAccessState {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn structural_reference_leases_for_test(
+        &self,
+    ) -> (Option<u64>, std::collections::BTreeSet<(u64, u64)>) {
+        match &*self.structural_reference_registrations.lock() {
+            StructuralStage2ReferenceRegistrations::PreIdentity(pending) => {
+                (None, pending.leases.clone())
+            }
+            StructuralStage2ReferenceRegistrations::Identified(registered) => {
+                (Some(registered.mm), registered.leases.clone())
+            }
+        }
+    }
+
     pub(crate) fn install_structural_owner(
         &self,
         owner: std::sync::Arc<StructuralBackingOwner>,
     ) -> Result<(), TrapError> {
         let key = (owner.physical_ipa, owner.physical_size);
-        self.structural_owners.write().insert(key, owner);
-        self.register_structural_stage2_references()
+        let identity = self.identity.read();
+        let mut owners = self.structural_owners.write();
+        owners.insert(key, owner);
+        #[cfg(test)]
+        structural_install_test_hook::run();
+        self.register_structural_stage2_references_locked(
+            identity.as_ref().map(|(mm, _)| mm.raw_for_probe()),
+            &owners,
+        )
     }
 
     fn release_structural_stage2_reference(
@@ -5711,3 +5745,26 @@ pub mod foreign_cow_test_support {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Test-only pause between a structural owner's insertion and its reference
+/// registration, so a witness can race an identity install into that point.
+#[cfg(test)]
+pub(crate) mod structural_install_test_hook {
+    type Hook = Box<dyn Fn() + Send + Sync>;
+    static HOOK: parking_lot::Mutex<Option<Hook>> = parking_lot::Mutex::new(None);
+
+    pub(crate) fn install(hook: impl Fn() + Send + Sync + 'static) {
+        *HOOK.lock() = Some(Box::new(hook));
+    }
+
+    pub(crate) fn clear() {
+        *HOOK.lock() = None;
+    }
+
+    pub(super) fn run() {
+        let hook = HOOK.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}

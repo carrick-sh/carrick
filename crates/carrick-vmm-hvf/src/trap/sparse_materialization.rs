@@ -2358,6 +2358,93 @@ mod arena_pin_tests {
             .unwrap();
     }
 
+    /// #855 review P2-8: an identity install racing a structural owner's
+    /// installation must see the owner set and its reference registration
+    /// change together. The install used to insert the owner, drop the lock
+    /// and register afterwards; an identity adopting in between found the
+    /// owner without its pending lease and refused publication.
+    #[test]
+    fn identity_install_racing_structural_owner_install_adopts_both() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let (state, custody, first) = rollback_fixture();
+        let second_base = 0x7d00_8000_0000;
+        let size = 2 * 1024 * 1024;
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .unwrap();
+        let mut lease = GlobalFrameStage2Lease::fixed(second_base, size as u64);
+        lease.mark_mapped();
+        let second = StructuralBackingOwner::new_in(
+            &custody,
+            host,
+            lease,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+            next_structural_epoch().unwrap(),
+            second_base,
+            size,
+        )
+        .unwrap();
+        let mm = carrick_hal::ForeignMmId::from_kernel_allocation(
+            std::num::NonZeroU64::new(0x8e8).unwrap(),
+        );
+        let binding = CarrierForeignMmBinding {
+            asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                std::num::NonZeroU16::new(0x8e).unwrap(),
+            ),
+            stage1_root: carrick_guest_mem::Gpa::new(first.physical_ipa),
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let racing = std::sync::Arc::clone(&state);
+        let identity_result = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let result_slot = std::sync::Arc::clone(&identity_result);
+        let completed_inside = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inside = std::sync::Arc::clone(&completed_inside);
+        let installer = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let installer_slot = std::sync::Arc::clone(&installer);
+        crate::trap::foreign_mm::structural_install_test_hook::install(move || {
+            let racing = std::sync::Arc::clone(&racing);
+            let thread_slot = std::sync::Arc::clone(&result_slot);
+            let done_tx = done_tx.clone();
+            *installer_slot.lock() = Some(std::thread::spawn(move || {
+                *thread_slot.lock() = Some(racing.install_identity(mm, binding));
+                let _ = done_tx.send(());
+            }));
+            // Give the identity install every chance to run inside the window.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            inside.store(
+                result_slot.lock().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        });
+        let install = state.install_structural_owner(second.clone());
+        crate::trap::foreign_mm::structural_install_test_hook::clear();
+        let handle = installer
+            .lock()
+            .take()
+            .expect("the hook raced an identity install");
+        handle.join().unwrap();
+        let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(install.is_ok(), "{install:?}");
+        assert!(
+            !completed_inside.load(std::sync::atomic::Ordering::SeqCst),
+            "an identity install must not complete between owner insertion and registration"
+        );
+        let identity = identity_result.lock().take().unwrap();
+        assert!(identity.is_ok(), "{identity:?}");
+        let (registered_mm, leases) = state.structural_reference_leases_for_test();
+        assert_eq!(registered_mm, Some(0x8e8));
+        assert_eq!(
+            leases,
+            std::collections::BTreeSet::from([
+                (first.physical_ipa, first.physical_size as u64),
+                (second_base, size as u64),
+            ])
+        );
+        let _ = (first, second);
+    }
+
     fn rollback_fixture() -> (
         std::sync::Arc<MmAccessState>,
         std::sync::Arc<CarrierVmCustody>,
