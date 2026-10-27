@@ -347,7 +347,7 @@ fn fatal_worker_retires_parked_leader(wait: LeaderWait) {
         page,
         control,
         &mut service,
-        |entry| entry.exit_with_signal(11),
+        |entry| entry.exit_with_signal(carrick_signal_core::policy::Signal::SEGV),
     )
     .unwrap()
     .unwrap();
