@@ -2613,8 +2613,13 @@ mod tests {
         );
         assert_eq!(custody.native_frame_backings.lock().len(), frame_baseline);
         assert_eq!(crate::trap::exec_ipa_lease_count_for_tests(), ipa_baseline);
+        // The cancelled ASID left the live set without a TLB proof; the
+        // allocator decides when its numeric identity is reused (fresh first).
+        assert_eq!(
+            custody.asid_allocator().release_unpublished(prepared_asid),
+            Err(carrick_hal::asid::AsidError::NotLive(prepared_asid.asid()))
+        );
         let replacement = custody.asid_allocator().allocate_unpublished().unwrap();
-        assert_eq!(replacement.generation().raw(), prepared_asid.raw());
         assert!(replacement.generation().generation() > prepared_asid.generation());
         drop(replacement);
         assert_eq!(execution.binding.mm.raw(), 5);
