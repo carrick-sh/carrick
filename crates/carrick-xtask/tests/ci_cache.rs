@@ -433,14 +433,6 @@ fn hosted_jobs_read_the_r2_compiler_cache_and_only_the_warmer_writes() {
     let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
     let env = &workflow["env"];
     assert_eq!(
-        env["AWS_ACCESS_KEY_ID"].as_str(),
-        Some("${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}")
-    );
-    assert_eq!(
-        env["AWS_SECRET_ACCESS_KEY"].as_str(),
-        Some("${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}")
-    );
-    assert_eq!(
         env["CARRICK_SCCACHE_R2_BUCKET"].as_str(),
         Some("carrick-sccache")
     );
@@ -505,9 +497,17 @@ fn hosted_jobs_read_the_r2_compiler_cache_and_only_the_warmer_writes() {
                     Some("${{ secrets.SCCACHE_R2_WRITER_SECRET_ACCESS_KEY }}")
                 );
             } else {
-                assert!(writer.is_none(), "{job}: only cache-warm gets the writer");
+                assert!(
+                    !writer.is_some_and(|w| w.contains("WRITER")),
+                    "{job}: only cache-warm gets the writer"
+                );
                 assert!(body["environment"].is_badvalue(), "{job}");
-                assert!(body["env"]["AWS_SECRET_ACCESS_KEY"].is_badvalue(), "{job}");
+                assert!(
+                    !body["env"]["AWS_SECRET_ACCESS_KEY"]
+                        .as_str()
+                        .is_some_and(|w| w.contains("WRITER")),
+                    "{job}"
+                );
             }
         }
     }
@@ -608,4 +608,108 @@ fn compiler_cache_env_selects_r2_only_for_credentialed_hosted_runners() {
         assert_eq!(code, Some(2), "{args:?}");
         assert!(out.is_empty());
     }
+}
+
+/// Every string in `value` that names an R2 secret.
+fn r2_secret_references(value: &yaml_rust2::Yaml, found: &mut Vec<String>) {
+    match value {
+        yaml_rust2::Yaml::String(text) if text.contains("secrets.SCCACHE_R2_") => {
+            found.push(text.clone());
+        }
+        yaml_rust2::Yaml::Array(items) => {
+            for item in items {
+                r2_secret_references(item, found);
+            }
+        }
+        yaml_rust2::Yaml::Hash(map) => {
+            for (key, item) in map {
+                r2_secret_references(key, found);
+                r2_secret_references(item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn r2_reader_credentials_reach_only_hosted_compiling_jobs() {
+    // #889 follow-up: workflow-level credentials reached every job, including
+    // jobs that never compile and jobs on the persistent self-hosted Mac.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
+    let mut workflow_refs = Vec::new();
+    r2_secret_references(&workflow["env"], &mut workflow_refs);
+    assert!(
+        workflow_refs.is_empty(),
+        "workflow-level: {workflow_refs:?}"
+    );
+    assert!(workflow["env"]["AWS_ACCESS_KEY_ID"].is_badvalue());
+    assert!(workflow["env"]["AWS_SECRET_ACCESS_KEY"].is_badvalue());
+
+    // A self-hosted runner is chosen only for same-repository PRs; the
+    // credential expression must resolve empty exactly then.
+    let hosted_only = |secret: &str| {
+        format!(
+            "${{{{ needs.changes.outputs.macos_runner == '\"macos-15\"' && secrets.{secret} || '' }}}}"
+        )
+    };
+    let mut readers = 0;
+    for (job, body) in workflow["jobs"].as_hash().unwrap() {
+        let job = job.as_str().unwrap();
+        let compiles = body["steps"].as_vec().unwrap().iter().any(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.starts_with("scripts/ci/compiler-cache-env.sh "))
+        });
+        let mut refs = Vec::new();
+        r2_secret_references(body, &mut refs);
+        if job == "cache-warm" {
+            assert!(refs.iter().all(|r| r.contains("_WRITER_")), "{refs:?}");
+            continue;
+        }
+        if !compiles {
+            assert!(refs.is_empty(), "{job} never compiles but sees {refs:?}");
+            continue;
+        }
+        readers += 1;
+        assert_eq!(refs.len(), 2, "{job}: only the job-level pair: {refs:?}");
+        let runner = body["runs-on"].as_str().unwrap();
+        let (id, secret) = if runner.contains("macos_runner") {
+            (
+                hosted_only("SCCACHE_R2_ACCESS_KEY_ID"),
+                hosted_only("SCCACHE_R2_SECRET_ACCESS_KEY"),
+            )
+        } else {
+            assert!(
+                !runner.contains("self-hosted") && !runner.contains("${{"),
+                "{job}: {runner}"
+            );
+            (
+                "${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}".to_owned(),
+                "${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}".to_owned(),
+            )
+        };
+        assert_eq!(
+            body["env"]["AWS_ACCESS_KEY_ID"].as_str(),
+            Some(id.as_str()),
+            "{job}"
+        );
+        assert_eq!(
+            body["env"]["AWS_SECRET_ACCESS_KEY"].as_str(),
+            Some(secret.as_str()),
+            "{job}"
+        );
+    }
+    assert_eq!(readers, 20, "every hosted compiler cache reader");
+    for job in ["linked-issue", "commit-trailers", "actionlint", "ci-ok"] {
+        assert!(workflow["jobs"][job]["env"]["AWS_ACCESS_KEY_ID"].is_badvalue());
+    }
+    // The self-hosted runner choice still lives in one place.
+    assert!(
+        workflow["jobs"]["changes"]["outputs"]["macos_runner"]
+            .as_str()
+            .unwrap()
+            .ends_with("|| '\"macos-15\"' }}")
+    );
 }

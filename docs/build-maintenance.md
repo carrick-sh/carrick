@@ -28,9 +28,11 @@ Cargo recipe regressions with sccache absent from PATH.
 GitHub-hosted CI jobs share one compiler cache in the Cloudflare R2 bucket
 `carrick-sccache` (sccache's S3 backend, one key prefix per runner family;
 objects expire 30 days after upload). `scripts/ci/compiler-cache-env.sh`
-selects it per job: pull-request and merge-queue jobs read with a read-only
-token, and only the trusted `cache-warm` job writes, with a writer token
-held as a secret of the `sccache-writer` environment, which admits only `main`. Jobs without the R2
+selects it per job: pull-request and merge-queue jobs read, and only the
+trusted `cache-warm` job writes, with a writer token held as a secret of the
+`sccache-writer` environment, which admits only `main`. The reader secrets are
+job-level env on the GitHub-hosted jobs that compile; jobs that never compile
+and jobs on the self-hosted Mac do not receive them. Jobs without the R2
 secrets (fork and Dependabot pull requests) and self-hosted runners fall back
 to the bounded GitHub Actions cache (#858).
 No linker, Rust flags, entitlement, DOF processing, or signing steps change:

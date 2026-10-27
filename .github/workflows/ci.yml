@@ -28,13 +28,13 @@ env:
   # Only cache-warm publishes the three bounded hosted compiler caches.
   SCCACHE_CACHE_SIZE: "3G"
   # Hosted jobs share one unbounded compiler cache in Cloudflare R2 (#858);
-  # scripts/ci/compiler-cache-env.sh selects it per job. These credentials are
-  # a read-only token: only cache-warm swaps in the writer token. Forks and
+  # scripts/ci/compiler-cache-env.sh selects it per job. The reader
+  # credentials are job-level env on each GitHub-hosted job that compiles,
+  # never workflow-wide: jobs that do not compile and jobs on the self-hosted
+  # Mac never receive them. Only cache-warm gets the writer pair. Forks and
   # Dependabot see empty secrets and fall back to the bounded GitHub cache.
   CARRICK_SCCACHE_R2_BUCKET: carrick-sccache
   CARRICK_SCCACHE_R2_ENDPOINT: https://687f8b8c824af34922f7bb4d1776f1a7.r2.cloudflarestorage.com
-  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
   # Harden registry transport against intermittent network errors without retrying tests.
   CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
   CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
@@ -46,6 +46,10 @@ jobs:
   xtask-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -233,6 +237,10 @@ jobs:
     # Restoring the 3 GiB shared compiler cache and building xtask can take
     # over five minutes on a slow runner; a cancelled `changes` fails ci-ok.
     timeout-minutes: 12
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     permissions:
       contents: read
       pull-requests: read
@@ -294,6 +302,10 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -426,6 +438,10 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -486,6 +502,10 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -572,6 +592,10 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -646,6 +670,10 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -758,6 +786,10 @@ jobs:
       matrix:
         shard: [a, b]
     timeout-minutes: 60
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -815,6 +847,10 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -878,6 +914,11 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runner) }}
     timeout-minutes: 60
+    env:
+      # R2 reader for the compiler cache; empty when this job lands on the
+      # self-hosted Mac (same-repository PRs), which never receives it.
+      AWS_ACCESS_KEY_ID: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -934,6 +975,10 @@ jobs:
     if: github.event_name == 'merge_group' && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -987,6 +1032,11 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runner) }}
     timeout-minutes: 60
+    env:
+      # R2 reader for the compiler cache; empty when this job lands on the
+      # self-hosted Mac (same-repository PRs), which never receives it.
+      AWS_ACCESS_KEY_ID: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1040,6 +1090,11 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true' && github.event_name != 'merge_group'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runner) }}
     timeout-minutes: 60
+    env:
+      # R2 reader for the compiler cache; empty when this job lands on the
+      # self-hosted Mac (same-repository PRs), which never receives it.
+      AWS_ACCESS_KEY_ID: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1088,6 +1143,11 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true' && github.event_name != 'merge_group'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runner) }}
     timeout-minutes: 60
+    env:
+      # R2 reader for the compiler cache; empty when this job lands on the
+      # self-hosted Mac (same-repository PRs), which never receives it.
+      AWS_ACCESS_KEY_ID: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1136,6 +1196,11 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true' && github.event_name != 'merge_group'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runner) }}
     timeout-minutes: 60
+    env:
+      # R2 reader for the compiler cache; empty when this job lands on the
+      # self-hosted Mac (same-repository PRs), which never receives it.
+      AWS_ACCESS_KEY_ID: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ needs.changes.outputs.macos_runner == '"macos-15"' && secrets.SCCACHE_R2_SECRET_ACCESS_KEY || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1184,6 +1249,10 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1271,6 +1340,10 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1320,6 +1393,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       FBSD_VERSION: 14.3-RELEASE
       FBSD_MAJOR: "14"
       FBSD_SYSROOT: ${{ github.workspace }}/.freebsd-sysroot
@@ -1438,6 +1514,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
       NBSD_VERSION: "10.1"
       NBSD_SYSROOT: ${{ github.workspace }}/.netbsd-sysroot
     steps:
@@ -1548,6 +1627,10 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
