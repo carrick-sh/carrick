@@ -285,7 +285,10 @@ impl Drop for Group {
         // must not turn the watchdog itself into an unlimited wait.
         let deadline = Instant::now() + Duration::from_secs(5);
         while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+            // Observe external child retirement within the remaining budget.
+            std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
 }
