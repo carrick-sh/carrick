@@ -195,6 +195,16 @@ pub fn terminal_descriptor_is_fork_cow(descriptor: u64) -> bool {
     el1_cow(descriptor)
 }
 
+/// The output one stage-1 retirement accounts for at a page, by leaf kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementOutput {
+    /// A valid leaf the retirement unpublishes.
+    Live(u64),
+    /// An invalid leaf already retired in place (EL1's in-ring munmap) whose
+    /// backend retirement is still owed as a deferred return.
+    RetiredInPlace(u64),
+}
+
 /// An invalid terminal whose retained output belongs to a retired lease.
 /// This applies to both EL1-private grants and older untagged host aliases.
 pub fn terminal_descriptor_is_retired(descriptor: u64) -> bool {
@@ -4980,13 +4990,15 @@ impl PageTableManager {
     /// Other invalid leaves are excluded on purpose: a prepared EL1-private
     /// grant, or a fresh sparse-arena leaf, retains an output without any
     /// published backing, and must not mint stage-2 retirement authority.
-    pub fn translate_published_or_retired(&self, va: u64) -> Option<u64> {
-        self.translate(va).or_else(|| {
-            let walk = self.try_debug_walk(va).ok()?;
-            terminal_descriptor_is_retired(terminal_descriptor(walk))
-                .then(|| self.translate_retained_output(va))
-                .flatten()
-        })
+    pub fn retirement_output(&self, va: u64) -> Option<RetirementOutput> {
+        if let Some(output) = self.translate(va) {
+            return Some(RetirementOutput::Live(output));
+        }
+        let walk = self.try_debug_walk(va).ok()?;
+        terminal_descriptor_is_retired(terminal_descriptor(walk))
+            .then(|| self.translate_retained_output(va))
+            .flatten()
+            .map(RetirementOutput::RetiredInPlace)
     }
 
     /// Resolve the output address retained in a block/page whose valid bit may

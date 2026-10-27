@@ -210,8 +210,30 @@ pub struct Stage1LeafRetired {
     image_generation: std::num::NonZeroU64,
     va: u64,
     len: usize,
-    retired: Vec<(u64, u64)>,
+    retired: Vec<(u64, u64, LeafKind)>,
+    /// Whether this receipt was minted by the reconciliation of an owed
+    /// deferred return. Only then may rows retired in place authorize
+    /// stage-2 retirement; anywhere else they are stale outputs.
+    deferred_return: bool,
     _tlbi: TlbiComplete,
+}
+
+/// Which kind of leaf a receipt row was captured from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeafKind {
+    Live,
+    RetiredInPlace,
+}
+
+impl LeafKind {
+    fn of(output: carrick_mmu_core::aarch64::RetirementOutput) -> (u64, Self) {
+        match output {
+            carrick_mmu_core::aarch64::RetirementOutput::Live(ipa) => (ipa, Self::Live),
+            carrick_mmu_core::aarch64::RetirementOutput::RetiredInPlace(ipa) => {
+                (ipa, Self::RetiredInPlace)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -226,7 +248,7 @@ pub struct PendingStage1LeafRetired {
     image_generation: std::num::NonZeroU64,
     va: u64,
     len: usize,
-    retired: Vec<(u64, u64)>,
+    retired: Vec<(u64, u64, LeafKind)>,
 }
 
 impl PendingStage1LeafRetired {
@@ -243,6 +265,7 @@ impl PendingStage1LeafRetired {
             va: self.va,
             len: self.len,
             retired: self.retired,
+            deferred_return: false,
             _tlbi: TlbiComplete,
         })
     }
@@ -254,7 +277,7 @@ struct Stage1LeafRetirementPlan {
     image_generation: std::num::NonZeroU64,
     va: u64,
     len: usize,
-    retired: Vec<(u64, u64)>,
+    retired: Vec<(u64, u64, LeafKind)>,
 }
 
 /// Pre-publication half of a guest descriptor retirement. Its fields are
@@ -266,7 +289,7 @@ pub struct PendingGuestStage1Retirement {
     txn_id: DescriptorTxnId,
     va: u64,
     len: usize,
-    retired: Vec<(u64, u64)>,
+    retired: Vec<(u64, u64, LeafKind)>,
 }
 
 /// Why a verified guest retirement could not be bound to the pre-image that
@@ -300,7 +323,7 @@ impl Stage1LeafRetirementPlan {
     /// accounts for.
     ///
     /// `translate` must resolve leaves retired in place as well as valid
-    /// ones (`PageTableManager::translate_published_or_retired`): EL1 serves
+    /// ones (`PageTableManager::retirement_output`): EL1 serves
     /// a guest `munmap` by retiring the leaf in place and owes the host the
     /// backend retirement (a deferred return). Capturing only valid leaves
     /// produced no receipt for such a range, so the backend retirement it
@@ -313,7 +336,7 @@ impl Stage1LeafRetirementPlan {
         image_generation: std::num::NonZeroU64,
         va: u64,
         len: usize,
-        mut translate: impl FnMut(u64) -> Option<u64>,
+        mut translate: impl FnMut(u64) -> Option<carrick_mmu_core::aarch64::RetirementOutput>,
     ) -> Option<Self> {
         let end = va.checked_add(len as u64)?;
         if len == 0 {
@@ -322,8 +345,9 @@ impl Stage1LeafRetirementPlan {
         let mut retired = Vec::new();
         let mut cursor = va & !0xfff;
         while cursor < end {
-            if let Some(ipa) = translate(cursor) {
-                retired.push((cursor, ipa));
+            if let Some(output) = translate(cursor) {
+                let (ipa, kind) = LeafKind::of(output);
+                retired.push((cursor, ipa, kind));
             }
             cursor = cursor.checked_add(4096)?;
         }
@@ -342,7 +366,7 @@ impl Stage1LeafRetirementPlan {
     ) -> Option<PendingStage1LeafRetired> {
         self.retired
             .iter()
-            .all(|&(va, ipa)| translate(va) != Some(ipa))
+            .all(|&(va, ipa, _)| translate(va) != Some(ipa))
             .then_some(PendingStage1LeafRetired {
                 authority: self.authority,
                 image_generation: self.image_generation,
@@ -366,13 +390,24 @@ impl Stage1LeafRetired {
         (self.va, self.len)
     }
 
+    /// Admit this receipt's rows retired in place: it was minted by the
+    /// reconciliation of the deferred return those rows owe. Crate-private so
+    /// only the engine's deferred-return entry can admit them.
+    pub(crate) fn owing_deferred_return(mut self) -> Self {
+        self.deferred_return = true;
+        self
+    }
+
+    /// Whether a live row (or, for a deferred return, a row retired in
+    /// place) unpublished an output inside `[ipa, ipa+len)`.
     pub fn names(&self, ipa: u64, len: usize) -> bool {
         let Some(end) = ipa.checked_add(len as u64) else {
             return false;
         };
         self.retired
             .iter()
-            .any(|&(_, translated)| ipa <= translated && translated < end)
+            .filter(|&&(_, _, kind)| kind == LeafKind::Live || self.deferred_return)
+            .any(|&(_, translated, _)| ipa <= translated && translated < end)
     }
 }
 
@@ -632,8 +667,9 @@ impl Stage1Authority {
         while page < end {
             // See `Stage1LeafRetirementPlan::capture`: a leaf retired in
             // place still names backing this retirement owes.
-            if let Some(old_ipa) = manager.translate_published_or_retired(page) {
-                retired.push((page, old_ipa));
+            if let Some(output) = manager.retirement_output(page) {
+                let (old_ipa, kind) = LeafKind::of(output);
+                retired.push((page, old_ipa, kind));
             }
             page = page.checked_add(4096)?;
         }
@@ -689,7 +725,7 @@ impl Stage1Authority {
             if plan
                 .retired
                 .iter()
-                .any(|&(page, old_ipa)| manager.translate(page) == Some(old_ipa))
+                .any(|&(page, old_ipa, _)| manager.translate(page) == Some(old_ipa))
             {
                 return Err(GuestRetirementProofError::OldLeafStillPublished);
             }
@@ -701,6 +737,7 @@ impl Stage1Authority {
             va,
             len,
             retired,
+            deferred_return: false,
             _tlbi: TlbiComplete,
         }))
     }
@@ -756,7 +793,7 @@ impl Stage1Authority {
             if manager.translate(cursor) == Some(old) {
                 return None;
             }
-            retired.push((cursor, old));
+            retired.push((cursor, old, LeafKind::Live));
             cursor = cursor.checked_add(4096)?;
         }
         (!retired.is_empty()).then_some(Stage1LeafRetired {
@@ -765,6 +802,7 @@ impl Stage1Authority {
             va,
             len,
             retired,
+            deferred_return: false,
             _tlbi: TlbiComplete,
         })
     }
@@ -798,7 +836,7 @@ impl Stage1Authority {
             if manager.translate_retained_output(cursor) == Some(old) {
                 return None;
             }
-            retired.push((cursor, old));
+            retired.push((cursor, old, LeafKind::Live));
             cursor = cursor.checked_add(4096)?;
         }
         (!retired.is_empty()).then_some(Stage1LeafRetired {
@@ -807,6 +845,7 @@ impl Stage1Authority {
             va: completion.span_va,
             len,
             retired,
+            deferred_return: false,
             _tlbi: TlbiComplete,
         })
     }
@@ -1630,7 +1669,7 @@ impl Stage1Authority {
                         generation,
                         va,
                         len,
-                        |address| editor.translate_published_or_retired(address),
+                        |address| editor.retirement_output(address),
                     )
                 });
                 let result = f(editor)?;
@@ -1968,7 +2007,7 @@ impl Stage1Authority {
                     generation,
                     va,
                     len,
-                    |address| editor.translate_published_or_retired(address),
+                    |address| editor.retirement_output(address),
                 )
             });
             let result = f(editor)?;
@@ -3200,6 +3239,12 @@ pub(crate) mod tests {
             .complete_after(|| Ok::<(), ()>(()))
             .unwrap();
         assert_eq!(receipt.authority(), authority.authority_id());
+        // #855 review P2-2: a row retired in place keeps a possibly stale
+        // output. An ordinary unmap receipt must not let it authorize a
+        // stage-2 retirement; only the deferred-return reconciliation it owes
+        // admits it.
+        assert!(!receipt.names(old_ipa, 4096));
+        let receipt = receipt.owing_deferred_return();
         assert!(receipt.names(old_ipa, 4096));
         assert!(receipt.names(old_ipa + 4096, 4096));
         assert!(!receipt.names(old_ipa + 2 * 4096, 4096));

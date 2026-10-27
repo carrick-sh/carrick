@@ -1045,6 +1045,19 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Reconcile a deferred return EL1 owes for `[address, address+len)`:
+    /// the same retirement as [`Self::unmap_range`], except that leaves EL1
+    /// already retired in place may authorize the backend retirement they
+    /// owe. Only the kernel's deferred-return reconciliation calls this.
+    fn return_deferred_range(
+        &mut self,
+        license: &El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        self.unmap_range(license, address, len)
+    }
+
     /// Retire physical mappings before committing a semantic replacement.
     /// A backend may report `Clean` only if every predecessor translation and
     /// backing remains intact. Untyped unmap errors prove no such guarantee.

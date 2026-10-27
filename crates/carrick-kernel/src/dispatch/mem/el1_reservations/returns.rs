@@ -146,7 +146,9 @@ impl MemView<'_> {
             for range in owed.iter().chain(&stock) {
                 let len = usize::try_from(range.len())
                     .map_err(|_| El1ReturnError::Authority(Refusal::Invalid))?;
-                if let Err(error) = memory.unmap_range(editor_excluded, range.start(), len) {
+                if let Err(error) =
+                    memory.return_deferred_range(editor_excluded, range.start(), len)
+                {
                     // Nothing is acknowledged; the stock is retried too.
                     self.restore_first_touch_stock(stock_spans);
                     return Err(El1ReturnError::Backend {

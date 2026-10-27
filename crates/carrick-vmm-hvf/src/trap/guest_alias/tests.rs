@@ -879,7 +879,10 @@ fn guest_retirement_receipt_names_leaves_el1_already_retired() {
         .complete_guest_retirement_proof(va, len as usize, vec![plan], &[receipt])
         .expect("the retirement binds its old leaves")
         .expect("a deferred return yields a receipt naming EL1's retained outputs");
-    assert!(retired.names(ipa, PAGE as usize));
-    assert!(retired.names(ipa + PAGE, PAGE as usize));
-    assert!(!retired.names(ipa + len, PAGE as usize));
+    // Outside the engine's deferred-return entry
+    // (`GuestMemory::return_deferred_range`), the stale outputs of rows
+    // retired in place authorize nothing (#855 review P2-2).
+    assert_eq!(retired.range(), (va, len as usize));
+    assert!(!retired.names(ipa, PAGE as usize));
+    assert!(!retired.names(ipa + PAGE, PAGE as usize));
 }

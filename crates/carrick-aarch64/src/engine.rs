@@ -414,6 +414,10 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// host-driven EL1 call meanwhile runs below it, never over the
     /// suspended operation's frames.
     suspended_el1_sp: Option<u64>,
+    /// Set only while [`GuestMemory::return_deferred_range`] reconciles a
+    /// deferred return: its retirement receipt may then admit the leaves EL1
+    /// already retired in place (the return they owe).
+    owing_deferred_return: bool,
 
     // ── trap-surface discriminator (the one aarch64-specific scalar) ──
     /// EC of the most recent exit: did we leave EL0 via `svc` (EC=0x15) or the
@@ -797,6 +801,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_fork_image_allocations: 0,
             last_fault_esr: 0,
             suspended_el1_sp: None,
+            owing_deferred_return: false,
             last_exit_class: 0,
             is_forked_child: false,
             process_asid,
@@ -1045,6 +1050,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_syscall_orig_x0,
             last_fault_esr,
             suspended_el1_sp: None,
+            owing_deferred_return: false,
             last_exit_class,
             is_forked_child,
             process_asid,
@@ -1399,6 +1405,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_fork_image_allocations: 0,
             last_fault_esr: 0,
             suspended_el1_sp: None,
+            owing_deferred_return: false,
             last_exit_class: 0,
             is_forked_child: false,
             process_asid: None,
@@ -1526,6 +1533,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             last_fork_image_allocations: 0,
             last_fault_esr: 0,
             suspended_el1_sp: None,
+            owing_deferred_return: false,
             last_exit_class: 0,
             is_forked_child: false,
             process_asid: None,
@@ -4713,6 +4721,18 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             .map_err(MappingRetirementError::into_memory_error)
     }
 
+    fn return_deferred_range(
+        &mut self,
+        license: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        self.owing_deferred_return = true;
+        let result = self.retire_mapping(license, GuestVa::new(address), len);
+        self.owing_deferred_return = false;
+        result.map_err(MappingRetirementError::into_memory_error)
+    }
+
     fn retire_mapping(
         &mut self,
         license: &carrick_guest_mem::El1EditorExcluded,
@@ -4743,6 +4763,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             self.retire_stage1_range(Some(license), address, len, true)?
         } else {
             self.retire_stage1_range(Some(license), address, len, false)?
+        };
+        // Rows EL1 already retired in place authorize stage-2 retirement
+        // only for the deferred return they owe, never for a later munmap.
+        let stage1 = if self.owing_deferred_return {
+            stage1.map(crate::stage1_authority::Stage1LeafRetired::owing_deferred_return)
+        } else {
+            stage1
         };
         self.vm
             .on_unmap(stage1.as_ref(), address, len)

@@ -2598,6 +2598,14 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     ) -> Result<(), MemoryError> {
         self.mem.unmap_range(editor, address, len)
     }
+    fn return_deferred_range(
+        &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        self.mem.return_deferred_range(editor, address, len)
+    }
     fn retire_mapping(
         &mut self,
         editor: &carrick_guest_mem::El1EditorExcluded,
