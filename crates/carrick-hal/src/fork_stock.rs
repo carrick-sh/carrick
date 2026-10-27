@@ -75,6 +75,21 @@ impl ForkHostBackingCustody {
             .insert((identity.handle(), identity.generation()), source);
     }
 
+    /// Drop one source the MM's reservation owner retired. Unknown
+    /// identities are ignored: release is idempotent.
+    pub fn release(&mut self, handle: NonZeroU64, generation: NonZeroU64) -> bool {
+        self.sources.remove(&(handle, generation)).is_some()
+    }
+
+    /// Sources this MM holds.
+    pub fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
     pub fn retain(
         &self,
         identity: carrick_el1_abi::HostBackingIdentity,

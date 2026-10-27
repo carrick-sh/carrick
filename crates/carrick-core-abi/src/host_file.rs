@@ -41,7 +41,8 @@ pub enum HostFileOp {
     Getdents64 = 10,
     /// Retain the descriptor's file as a private-mapping byte source for the
     /// caller's MM; output is the source identity ([`MapSourceReply`]). The
-    /// ring then maps it with its own reservation owner.
+    /// ring then maps it with its own reservation owner. Input is the list of
+    /// sources the caller's owner retired, which the carrier releases first.
     MapPrivate = 11,
 }
 
@@ -82,7 +83,25 @@ impl MapSourceReply {
             generation: core::num::NonZeroU64::new(wire.generation.get())?,
         })
     }
+
+    /// The released sources a [`HostFileOp::MapPrivate`] request carries as
+    /// its input: at most [`MAX_MAP_RELEASES`] whole records, or `None`.
+    pub fn decode_releases(input: &[u8]) -> Option<impl Iterator<Item = Self> + '_> {
+        if !input.len().is_multiple_of(Self::BYTES) || input.len() / Self::BYTES > MAX_MAP_RELEASES
+        {
+            return None;
+        }
+        let all = input
+            .chunks_exact(Self::BYTES)
+            .all(|bytes| Self::decode(bytes).is_some());
+        all.then(|| input.chunks_exact(Self::BYTES).filter_map(Self::decode))
+    }
 }
+
+/// Byte sources one [`HostFileOp::MapPrivate`] request may release: those
+/// the caller's reservation owner retired since its last request (their last
+/// node unmapped, or no node ever consumed them).
+pub const MAX_MAP_RELEASES: usize = 8;
 
 impl HostFileOp {
     const fn decode(raw: u16) -> Option<Self> {

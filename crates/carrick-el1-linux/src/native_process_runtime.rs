@@ -717,6 +717,45 @@ impl<C: ProcessContext> Drop for InterruptedChildWait<C> {
     }
 }
 
+/// One record's retained private-mapping byte sources: the one its next
+/// exact `mmap` retry consumes, and any it will not (a cancelled or replaced
+/// reply), which that retry retires so the carrier releases them.
+#[derive(Default)]
+struct MapStash {
+    live: Option<(
+        carrick_personality_linux::native_host_file::NativeMapKey,
+        carrick_core_abi::HostBackingIdentity,
+    )>,
+    orphans: Vec<carrick_core_abi::HostBackingIdentity>,
+}
+
+impl MapStash {
+    /// Orphans one record can owe at once; older ones stay in the carrier
+    /// until the MM is torn down (its source bound still holds).
+    const MAX_ORPHANS: usize = carrick_core_abi::host_file::MAX_MAP_RELEASES;
+
+    fn orphan(&mut self, source: carrick_core_abi::HostBackingIdentity) {
+        if self.orphans.len() < Self::MAX_ORPHANS {
+            self.orphans.push(source);
+        }
+    }
+
+    fn retain(
+        &mut self,
+        key: Option<carrick_personality_linux::native_host_file::NativeMapKey>,
+        source: carrick_core_abi::HostBackingIdentity,
+    ) {
+        match key {
+            Some(key) => {
+                if let Some((_, replaced)) = self.live.replace((key, source)) {
+                    self.orphan(replaced);
+                }
+            }
+            None => self.orphan(source),
+        }
+    }
+}
+
 pub struct NativeResources<'a, M, C: ProcessContext> {
     _control_custody: carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>,
     zone: &'a ZoneTables<C>,
@@ -727,6 +766,9 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     mm: M,
     address: AddressContext<RootGpa>,
     interrupted_child_waits: BTreeMap<RecordRef, InterruptedChildWait<C>>,
+    /// Private file byte sources the host-file venue retained for one
+    /// record's `mmap`, consumed by that record's next delegated mmap.
+    map_stash: BTreeMap<RecordRef, MapStash>,
     /// Consumed on the child's first return to user mode, after its MM split.
     pending_child_tid: Option<UserVa>,
     signals: NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo>,
@@ -1205,15 +1247,6 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     /// child and naming the parent. The child's exec commit or exit removes
     /// its row before publishing the parent's channel.
     vfork_parents: BTreeMap<TaskKey, TaskKey>,
-    /// A private file byte source retained by the host-file venue for one
-    /// record's exact `mmap`, consumed by that record's immediate retry.
-    map_sources: BTreeMap<
-        RecordRef,
-        (
-            carrick_personality_linux::native_host_file::NativeMapKey,
-            carrick_core_abi::HostBackingIdentity,
-        ),
-    >,
 }
 impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     fn has_member_wait(&self, record: &RecordRef) -> bool {
@@ -1507,10 +1540,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     }
                 }
                 carrick_signal_core::wait::clear_non_interrupting_for(key.task.id().raw());
-                row.native_mut()
-                    .resources_mut()
-                    .interrupted_child_waits
-                    .remove(record);
+                let resources = row.native_mut().resources_mut();
+                resources.interrupted_child_waits.remove(record);
+                // A thread that died between the venue's reply and its retry:
+                // its sources stay in the carrier until the MM is torn down.
+                resources.map_stash.remove(record);
                 row.native_mut().resources_mut().members.retain(|member| {
                     member.record != *record && member.thread.id() != key.task.id()
                 });
@@ -1828,6 +1862,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
         if old_record != reference || old_key != key {
             resources.interrupted_child_waits.remove(&old_record);
+            resources.map_stash.remove(&old_record);
         }
         if old_record != reference
             && let Some(projection) = &resources.members[member_index].signal_projection
@@ -2432,10 +2467,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 }
                 member.expected_host = host_identity;
                 if replaced {
-                    row.native_mut()
-                        .resources_mut()
-                        .interrupted_child_waits
-                        .remove(&old_record);
+                    let resources = row.native_mut().resources_mut();
+                    resources.interrupted_child_waits.remove(&old_record);
+                    resources.map_stash.remove(&old_record);
                 }
             } else {
                 let retained = retain_member_control(control)?;
@@ -3083,6 +3117,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             mm,
             address,
             interrupted_child_waits: BTreeMap::new(),
+            map_stash: BTreeMap::new(),
             pending_child_tid: None,
             signals,
             _thread_claim: thread_claim,
@@ -3160,7 +3195,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 uts,
                 ipc,
                 vfork_parents: BTreeMap::new(),
-                map_sources: BTreeMap::new(),
             }),
             zone: source.zone,
             ipc_channels,
@@ -5330,10 +5364,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             let page = row.native().resources().page;
             if first_close {
-                row.native_mut()
-                    .resources_mut()
-                    .interrupted_child_waits
-                    .clear();
+                let resources = row.native_mut().resources_mut();
+                resources.interrupted_child_waits.clear();
+                resources.map_stash.clear();
                 let admission = match &operation {
                     PendingCloseOperation::Exit { .. } => {
                         PendingCloseAdmission::Exit(carrick_core::terminal::TerminalCustody::<
@@ -6510,6 +6543,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             mm: self.service.prepared_mm(&prepared),
             address,
             interrupted_child_waits: BTreeMap::new(),
+            map_stash: BTreeMap::new(),
             pending_child_tid: child_tid.set.then_some(child_tid.address),
             signals,
             _thread_claim: thread_claim,
@@ -6698,12 +6732,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn take_map_source(
         &mut self,
         key: carrick_personality_linux::native_host_file::NativeMapKey,
-    ) -> Option<carrick_core_abi::HostBackingIdentity> {
+    ) -> carrick_personality_linux::lifecycle::MapSourceTake {
         let mut graph = self.runtime.graph.lock();
-        match graph.map_sources.remove(&self.record) {
-            Some((retained, source)) if retained == key => Some(source),
-            _ => None,
+        let Ok(row) = graph.owner.task_mut(self.key) else {
+            return Default::default();
+        };
+        let Some(stash) = row
+            .native_mut()
+            .resources_mut()
+            .map_stash
+            .remove(&self.record)
+        else {
+            return Default::default();
+        };
+        let mut take = carrick_personality_linux::lifecycle::MapSourceTake {
+            matched: None,
+            orphans: stash.orphans,
+        };
+        match stash.live {
+            Some((retained, source)) if retained == key => take.matched = Some(source),
+            Some((_, source)) => take.orphans.push(source),
+            None => {}
         }
+        take
     }
     fn binding(&self) -> ExecutionBinding {
         self.binding

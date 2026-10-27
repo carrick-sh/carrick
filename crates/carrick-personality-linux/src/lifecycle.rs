@@ -222,6 +222,16 @@ use core::sync::atomic::Ordering;
 pub type RobustSlotReader<'r> =
     dyn FnMut(&ThreadLifecyclePage, EntryRef) -> Option<(u64, u32)> + 'r;
 
+/// What one delegated `mmap` takes from its thread's retained sources.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MapSourceTake {
+    /// The source for exactly this call, when its key matches.
+    pub matched: Option<carrick_core_abi::HostBackingIdentity>,
+    /// Sources this thread holds but no call will map: the reservation
+    /// owner retires them so the carrier releases them.
+    pub orphans: alloc::vec::Vec<carrick_core_abi::HostBackingIdentity>,
+}
+
 /// Native process custody supplied by the execution lane. Registry decisions
 /// remain in the shared scheduler owner; this adapter retains machine context.
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
@@ -242,12 +252,10 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
         None
     }
     /// The private file byte source the native host-file venue retained for
-    /// exactly this thread's retried `mmap` with `key`, consumed once.
-    fn take_map_source(
-        &mut self,
-        _key: crate::native_host_file::NativeMapKey,
-    ) -> Option<carrick_core_abi::HostBackingIdentity> {
-        None
+    /// exactly this thread's retried `mmap` with `key`, consumed once, and
+    /// every source this thread was given but will not map (to retire).
+    fn take_map_source(&mut self, _key: crate::native_host_file::NativeMapKey) -> MapSourceTake {
+        MapSourceTake::default()
     }
     fn binding(&self) -> ExecutionBinding;
     fn pid_exists(&self, _pid: u32) -> Option<bool> {

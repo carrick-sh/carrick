@@ -61,10 +61,28 @@ fn caller(fd: i32) -> Option<NativeDescriptor> {
 }
 
 fn run(call: HostFileCall, user: &mut Memory) -> Option<HostFileStage> {
+    run_releasing(call, user, &[], &mut 0)
+}
+
+/// Stage with `retired` sources pending in the caller's reservation owner;
+/// `popped` counts how many staging took.
+fn run_releasing(
+    call: HostFileCall,
+    user: &mut Memory,
+    retired: &[host_file::MapSourceReply],
+    popped: &mut usize,
+) -> Option<HostFileStage> {
     let mut resolve = caller;
+    let mut releases = |out: &mut [host_file::MapSourceReply]| {
+        let taken = retired.len().min(out.len());
+        out[..taken].copy_from_slice(&retired[..taken]);
+        *popped += taken;
+        taken
+    };
     let mut namespace = NativeNamespace {
         table: TABLE,
         resolve: &mut resolve,
+        releases: &mut releases,
     };
     stage(call, &mut namespace, user)
 }
@@ -529,6 +547,41 @@ fn private_file_mmap_stages_a_byte_source_request_with_its_exact_key() {
     let view = HostFileRequestView::parse(&mut record).unwrap();
     assert_eq!(view.header().op, HostFileOp::MapPrivate);
     assert_eq!(view.header().args[0], 4096);
+    assert!(view.input().is_empty(), "nothing retired, nothing released");
+
+    // The owner's retired sources ride the next mapping request; a refused
+    // call (an in-zone descriptor) pops none of them.
+    let source = |token: u64| host_file::MapSourceReply {
+        handle: core::num::NonZeroU64::new(token).unwrap(),
+        generation: core::num::NonZeroU64::MIN,
+    };
+    let retired = [source(5), source(6)];
+    let mut popped = 0;
+    assert_eq!(
+        run_releasing(
+            HostFileCall::MapPrivate(NativeMapKey { fd: 0, ..key }),
+            &mut user,
+            &retired,
+            &mut popped
+        ),
+        returned(carrick_syscall_abi::LINUX_ENODEV)
+    );
+    assert_eq!(popped, 0, "a call answered in ring releases nothing");
+    let Some(HostFileStage::Request { mut record, .. }) = run_releasing(
+        HostFileCall::MapPrivate(key),
+        &mut user,
+        &retired,
+        &mut popped,
+    ) else {
+        panic!("a host file mapping crosses");
+    };
+    let view = HostFileRequestView::parse(&mut record).unwrap();
+    assert_eq!(
+        host_file::MapSourceReply::decode_releases(view.input())
+            .unwrap()
+            .collect::<Vec<_>>(),
+        retired
+    );
     // A pipe has no mmap; an unaligned offset or empty length is EINVAL.
     assert_eq!(
         run(

@@ -79,6 +79,10 @@ pub enum NativeDescriptor {
 pub struct NativeNamespace<'a> {
     pub table: [u64; 3],
     pub resolve: &'a mut dyn FnMut(i32) -> Option<NativeDescriptor>,
+    /// Pops the byte sources the caller's reservation owner retired into
+    /// the slice and returns how many; called only when a private-mapping
+    /// request is built, which carries them to the carrier for release.
+    pub releases: &'a mut dyn FnMut(&mut [host_file::MapSourceReply]) -> usize,
 }
 
 /// A host-file call the native venue knows, decoded from canonical
@@ -442,6 +446,20 @@ impl Staging<'_, '_> {
             resolves_path: op.resolves_path(),
             map: None,
         }
+    }
+
+    /// The caller's retired byte sources, encoded as a release list.
+    fn releases(&mut self) -> alloc::vec::Vec<u8> {
+        let placeholder = host_file::MapSourceReply {
+            handle: core::num::NonZeroU64::MIN,
+            generation: core::num::NonZeroU64::MIN,
+        };
+        let mut released = [placeholder; host_file::MAX_MAP_RELEASES];
+        let taken = (self.namespace.releases)(&mut released).min(released.len());
+        released[..taken]
+            .iter()
+            .flat_map(|release| release.encode())
+            .collect()
     }
 
     fn descriptor(&mut self, fd: i32) -> Option<NativeDescriptor> {
@@ -835,28 +853,32 @@ fn stage_call(
             {
                 errno(carrick_syscall_abi::LINUX_EINVAL)
             }
-            NativeDescriptor::HostBacked { .. } => match staging.request_with_reply(
-                HostFileOp::MapPrivate,
-                key.fd,
-                0,
-                [key.offset, key.length, 0, 0],
-                &[],
-                None,
-                host_file::MapSourceReply::BYTES,
-            ) {
-                HostFileStage::Request {
-                    record,
-                    output,
-                    resolves_path,
-                    ..
-                } => HostFileStage::Request {
-                    record,
-                    output,
-                    resolves_path,
-                    map: Some(key),
-                },
-                other => other,
-            },
+            NativeDescriptor::HostBacked { .. } => {
+                let releases = staging.releases();
+                let staged = staging.request_with_reply(
+                    HostFileOp::MapPrivate,
+                    key.fd,
+                    0,
+                    [key.offset, key.length, 0, 0],
+                    &releases,
+                    None,
+                    host_file::MapSourceReply::BYTES,
+                );
+                match staged {
+                    HostFileStage::Request {
+                        record,
+                        output,
+                        resolves_path,
+                        ..
+                    } => HostFileStage::Request {
+                        record,
+                        output,
+                        resolves_path,
+                        map: Some(key),
+                    },
+                    other => other,
+                }
+            }
         },
     })
 }

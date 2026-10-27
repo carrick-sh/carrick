@@ -548,7 +548,7 @@ impl MemState {
     )> {
         let lease = self
             .host_backing_custody
-            .retain_labeled_source(backing::PrivateFileBacking::Description(reference), label)?;
+            .retain_exclusive_source(backing::PrivateFileBacking::Description(reference), label)?;
         let identity = lease.identity(0);
         Some((Arc::new(lease), identity))
     }
