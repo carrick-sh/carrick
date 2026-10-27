@@ -996,6 +996,68 @@ fn exec_rebuild_leaves_the_heap_window_unmapped() {
     );
 }
 
+/// A ring-owned exec successor has no host process to replace the sparse
+/// arena's PROT_NONE identity blocks. The ring classifies such a block as
+/// foreign and forwards every `mmap` over it, which a native process cannot
+/// cross. Its arena therefore carries no terminal, as in a fork child's
+/// pristine span; the host successor keeps its retained identity outputs.
+#[test]
+fn native_exec_successor_arena_has_no_terminal() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let tables = |global: &GlobalExecPlan| {
+        let root = global.plan.stage1_page_tables_base.unwrap();
+        let table = global
+            .plan
+            .mappings
+            .iter()
+            .find(|mapping| mapping.ipa_start == root)
+            .expect("rebuilt table mapping");
+        carrick_mmu_core::aarch64::PageTableManager::new(
+            table.image.as_ref().clone(),
+            root,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        )
+    };
+    let plan = root_exec_test_plan();
+    let arena_end = crate::memory::LINUX_MMAP_BASE + crate::memory::mmap_arena_size();
+    let probes = [
+        crate::memory::LINUX_MMAP_BASE,
+        crate::memory::LINUX_MMAP_BASE + 0x1000,
+        crate::memory::LINUX_MMAP_BASE + (1 << 30) + 0x20_0000,
+        arena_end - 0x1000,
+    ];
+    let host = tables(&prepare_global_exec_plan(&plan, None).unwrap());
+    let native_plan = prepare_native_exec_global_plan(&plan).unwrap();
+    let native = tables(&native_plan);
+    for va in probes {
+        assert_eq!(
+            host.translate_retained_output(va),
+            Some(va),
+            "host successor keeps its sparse identity output at {va:#x}"
+        );
+        assert_eq!(host.translate(va), None);
+        assert_eq!(
+            native.translate_retained_output(va),
+            None,
+            "ring-owned arena page {va:#x} retains a terminal: {:x?}",
+            native.debug_walk(va)
+        );
+    }
+    assert_eq!(
+        native.translate(0x20_0000),
+        Some(
+            native_plan
+                .plan
+                .mappings
+                .iter()
+                .find(|mapping| mapping.guest_start == 0x20_0000)
+                .unwrap()
+                .ipa_start
+        ),
+        "the image's own mappings stay mapped"
+    );
+}
+
 /// The rebuilt image's table payload is its occupied table prefix, not the
 /// 1.75 MiB root-slot capacity: every exec copies this payload into the slot,
 /// records it as the slot's populated prefix (zeroed again when the slot is
