@@ -1014,8 +1014,7 @@ fn native_owner_cancel_direct_el0_enters_same_fatal_hook_from_idle() {
         assert_eq!(machine.signal_check_frames.len(), 1);
         assert_eq!(machine.signal_check_frames[0].0, 0xfffc);
         assert_eq!(machine.signal_check_arg0, [saved[0]]);
-        let frame =
-            carrick_el1_abi::EL1_STACKS_BASE + (SLOT + 1) * carrick_el1_abi::EL1_STACK_SIZE - 0x120;
+        let frame = carrick_el1_abi::el1_slot_frame_va(SLOT as usize);
         for (reg, expected) in saved.into_iter().enumerate() {
             assert_eq!(machine.read(frame + (reg as u64) * 8), expected, "x{reg}");
         }

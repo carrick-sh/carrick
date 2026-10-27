@@ -10,10 +10,14 @@
 //! Within this 64 MiB region:
 //! - Image: [`EL1_IMAGE_OFFSET`] plus the typed [`EL1_IMAGE_SIZE`] (1.5 MiB).
 //! - Counters and control tables: [`EL1_COUNTERS_OFFSET`] (1 MiB).
-//! - Per-vCPU stacks: [`EL1_STACKS_OFFSET`] (4 MiB), 256 16 KiB slots.
+//! - Per-vCPU stacks: [`EL1_STACKS_OFFSET`] (8 MiB), 256 slots of
+//!   [`EL1_STACK_STRIDE`] (32 KiB): an unmapped [`EL1_STACK_GUARD_SIZE`]
+//!   (16 KiB) guard below each 16 KiB usable stack ([`EL1_STACK_SIZE`]).
 //! - Current tasks: [`EL1_CURRENT_TASKS_OFFSET`] (1 MiB).
 //! - Bootstrap metadata: [`EL1_BOOTSTRAP_METADATA_OFFSET`] (9 MiB).
-//! - Fixed-table heap: [`EL1_HEAP_OFFSET`] to the end of the region.
+//! - Fixed-table heap: [`EL1_HEAP_OFFSET`] to the end of the region. The
+//!   stack guards (#369) took 4 MiB of it from the zone reservation's unused
+//!   tail ([`EL1_ZONE_SIZE`]).
 //!
 //! A separate kernel-only window at [`EL1_IPC_BASE`] (after the dynamic
 //! metadata aperture) maps the host IPC authority's [`ipc::IpcDirectory`] and
@@ -25,6 +29,8 @@ pub use carrick_guest_arch::ContextGeneration;
 
 use carrick_core_abi::OpenLifetime;
 mod entry_binding_fatal;
+mod stack_overflow;
+pub use stack_overflow::*;
 #[cfg(test)]
 mod image_layout_tests;
 pub use entry_binding_fatal::*;
@@ -109,11 +115,139 @@ pub const EL1_STACKS_OFFSET: u64 = EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE;
 /// Base guest virtual address of the per-vCPU stack arena.
 pub const EL1_STACKS_BASE: u64 = EL1_REGION_BASE + EL1_STACKS_OFFSET;
 
-/// Size of each vCPU's EL1 kernel stack: 16 KiB.
+/// Unmapped guard below each vCPU's usable EL1 stack: 16 KiB.
+///
+/// A ring stack overflow runs into this range, which no stage-1 root maps,
+/// so it takes a translation fault at EL1 instead of writing the CPU slot
+/// below it (#338, #369). It is a whole number of the ring's own 4 KiB
+/// stage-1 granules and equals the 16 KiB host and stage-2 page, so the
+/// usable stacks stay host-page aligned and the stride stays a power of two
+/// (the current-EL vector tests one address bit to reject an SP in a guard
+/// before it stores anything).
+pub const EL1_STACK_GUARD_SIZE: u64 = 0x4000;
+
+/// Usable bytes of each vCPU's EL1 kernel stack: 16 KiB.
 pub const EL1_STACK_SIZE: u64 = 0x4000;
+
+/// Stride between consecutive vCPU stack slots: guard plus usable stack.
+pub const EL1_STACK_STRIDE: u64 = EL1_STACK_GUARD_SIZE + EL1_STACK_SIZE;
+
+/// `log2(EL1_STACK_STRIDE)`: the vector page derives a slot from SP with it.
+pub const EL1_STACK_STRIDE_SHIFT: u32 = EL1_STACK_STRIDE.trailing_zeros();
+
+/// The address bit that is set in every usable stack byte and clear in every
+/// guard byte of the stack arena (the guard is the low half of each stride).
+pub const EL1_STACK_USABLE_BIT: u32 = EL1_STACK_GUARD_SIZE.trailing_zeros();
 
 /// Number of vCPU stack slots supported in the stack arena (matches mailbox slots).
 pub const EL1_STACK_SLOTS: u64 = 256;
+
+/// Total size of the per-vCPU stack arena (8 MiB: 256 slots of 32 KiB).
+pub const EL1_STACKS_SIZE: u64 = EL1_STACK_SLOTS * EL1_STACK_STRIDE;
+
+/// Bytes of the region one stage-1 level-3 table translates (2 MiB).
+pub const EL1_STACK_TABLE_SPAN: u64 = 0x20_0000;
+
+/// First region offset the stack arena's level-3 tables translate: the
+/// arena is not 2 MiB aligned, so its first table also covers the end of
+/// the counters area (mapped exactly as the 2 MiB block did).
+pub const EL1_STACK_TABLES_FIRST_OFFSET: u64 =
+    EL1_STACKS_OFFSET / EL1_STACK_TABLE_SPAN * EL1_STACK_TABLE_SPAN;
+
+/// Level-3 tables that translate the stack arena page by page.
+pub const EL1_STACK_TABLE_PAGES: usize =
+    ((EL1_STACKS_OFFSET + EL1_STACKS_SIZE).div_ceil(EL1_STACK_TABLE_SPAN)
+        - EL1_STACK_TABLES_FIRST_OFFSET / EL1_STACK_TABLE_SPAN) as usize;
+
+/// Byte offset of the level-3 tables through which the carrier maintenance
+/// root translates the stack arena (guards invalid). That root's own pages
+/// are full, and an idle vCPU runs the EL1 scheduler on it, so its stack
+/// guards need tables of their own; they sit in the counters area's free
+/// gap after the COW copy window. Every MM root writes private copies with
+/// the same leaf rule.
+pub const EL1_STACK_GUARD_TABLES_OFFSET: u64 = EL1_COW_COPY_OFFSET + 0x4000;
+
+/// Guest-physical base of [`EL1_STACK_GUARD_TABLES_OFFSET`].
+pub const EL1_STACK_GUARD_TABLES_BASE: u64 = EL1_REGION_BASE + EL1_STACK_GUARD_TABLES_OFFSET;
+
+/// Bytes of the maintenance root's stack-arena level-3 tables.
+pub const EL1_STACK_GUARD_TABLES_SIZE: u64 = EL1_STACK_TABLE_PAGES as u64 * 4096;
+
+const _: () = {
+    assert!(EL1_STACK_GUARD_SIZE >= carrick_mmu_core::aarch64::owner_fork::GRANULE_SIZE);
+    assert!(
+        EL1_STACK_GUARD_SIZE.is_multiple_of(carrick_mmu_core::aarch64::owner_fork::GRANULE_SIZE)
+    );
+    assert!(EL1_STACK_STRIDE.is_power_of_two());
+    // The one-bit guard test in the vector page relies on these three facts.
+    assert!(EL1_STACK_GUARD_SIZE == EL1_STACK_SIZE);
+    assert!(EL1_STACK_STRIDE == 1 << (EL1_STACK_USABLE_BIT + 1));
+    assert!(EL1_STACKS_BASE.is_multiple_of(EL1_STACK_STRIDE));
+    assert!(EL1_REGION_BASE.is_multiple_of(EL1_STACK_TABLE_SPAN));
+    assert!(EL1_COW_COPY_OFFSET + EL1_COW_COPY_SIZE <= EL1_STACK_GUARD_TABLES_OFFSET);
+    assert!(
+        EL1_STACK_GUARD_TABLES_OFFSET + EL1_STACK_GUARD_TABLES_SIZE
+            <= EL1_SERVICE_COPY_TABLE_OFFSET
+    );
+    assert!(EL1_STACK_GUARD_TABLES_OFFSET.is_multiple_of(4096));
+};
+
+/// Lowest address of `slot`'s unmapped guard.
+#[inline(always)]
+pub const fn stack_slot_guard_base(slot: usize) -> u64 {
+    EL1_STACKS_BASE + (slot as u64) * EL1_STACK_STRIDE
+}
+
+/// Lowest usable address of `slot`'s stack (just above its guard).
+#[inline(always)]
+pub const fn stack_slot_usable_base(slot: usize) -> u64 {
+    stack_slot_guard_base(slot) + EL1_STACK_GUARD_SIZE
+}
+
+/// One past the highest byte of `slot`'s stack: its initial SP.
+#[inline(always)]
+pub const fn stack_slot_top(slot: usize) -> u64 {
+    stack_slot_guard_base(slot) + EL1_STACK_STRIDE
+}
+
+/// The slot whose usable stack holds `sp`, or `None` for an address outside
+/// the arena or inside a guard. The one rule for deriving the executing CPU
+/// from its EL1 stack pointer.
+#[inline(always)]
+pub const fn el1_stack_slot(sp: u64) -> Option<usize> {
+    let Some(offset) = sp.checked_sub(EL1_STACKS_BASE) else {
+        return None;
+    };
+    if offset >= EL1_STACKS_SIZE || offset % EL1_STACK_STRIDE < EL1_STACK_GUARD_SIZE {
+        return None;
+    }
+    Some((offset >> EL1_STACK_STRIDE_SHIFT) as usize)
+}
+
+/// The slot whose guard holds `va` (the guard directly below that slot's
+/// usable stack), or `None` when `va` is in no guard.
+#[inline(always)]
+pub const fn el1_stack_guard_slot(va: u64) -> Option<usize> {
+    let Some(offset) = va.checked_sub(EL1_STACKS_BASE) else {
+        return None;
+    };
+    if offset >= EL1_STACKS_SIZE || offset % EL1_STACK_STRIDE >= EL1_STACK_GUARD_SIZE {
+        return None;
+    }
+    Some((offset >> EL1_STACK_STRIDE_SHIFT) as usize)
+}
+
+/// Whether `va` lies in a stack guard. Every stage-1 builder leaves exactly
+/// these pages without a translation.
+#[inline(always)]
+pub const fn is_el1_stack_guard(va: u64) -> bool {
+    el1_stack_guard_slot(va).is_some()
+}
+
+/// Every stack guard as `(base, len)`, lowest first.
+pub fn el1_stack_guards() -> impl Iterator<Item = (u64, u64)> {
+    (0..EL1_STACK_SLOTS as usize).map(|slot| (stack_slot_guard_base(slot), EL1_STACK_GUARD_SIZE))
+}
 
 /// Byte offset of the per-vCPU current-task array within the region.
 pub const EL1_CURRENT_TASKS_OFFSET: u64 = EL1_STACKS_OFFSET + EL1_STACKS_SIZE;
@@ -753,6 +887,9 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         ReservationNodeFlags::ATTRIBUTES.bits() as u64,
         EL1_STACKS_OFFSET,
         EL1_STACK_SIZE,
+        EL1_STACK_GUARD_SIZE,
+        EL1_STACK_STRIDE,
+        EL1_STACK_GUARD_TABLES_OFFSET,
         EL1_CURRENT_TASKS_OFFSET,
         EL1_METADATA_MAILBOX_OFFSET,
         EL1_FRAME_GRANT_MAILBOX_OFFSET,
@@ -2276,9 +2413,6 @@ pub use carrick_mmu_core::aarch64::EL1_IMAGE_SIZE;
 /// Total size of the EL1 kernel counters area (1 MiB).
 pub const EL1_COUNTERS_SIZE: u64 = 0x10_0000;
 
-/// Total size of the EL1 kernel stacks area (4 MiB).
-pub const EL1_STACKS_SIZE: u64 = 0x40_0000;
-
 /// Sentinel value written by `carrick-el1` panic handler into [`Counters`] before spinning.
 pub const PANIC_SENTINEL: u64 = 0xDEAD_CAFE_DEAD_BEEF;
 
@@ -2734,13 +2868,15 @@ pub type ZoneRecord = carrick_sched_core::ZoneRecord<Aarch64ParkedContext>;
 
 /// Byte offset of the in-guest scheduler's tables ([`ZoneTables`]: futex
 /// wait queues, parked-thread records, per-vCPU run queues).
-pub const EL1_ZONE_OFFSET: u64 = 0x350_0000;
+pub const EL1_ZONE_OFFSET: u64 = EL1_REGION_SIZE - EL1_ZONE_SIZE;
 
 /// Base guest virtual address of the zone tables.
 pub const EL1_ZONE_BASE: u64 = EL1_REGION_BASE + EL1_ZONE_OFFSET;
 
-/// Space reserved for the zone tables (11 MiB, to the end of the region).
-pub const EL1_ZONE_SIZE: u64 = 0xB0_0000;
+/// Space reserved for the zone tables (7 MiB, to the end of the region).
+/// `ZoneTables` measures about 6.3 MiB; the reservation was 11 MiB until
+/// the EL1 stack guards (#369) took 4 MiB of its unused tail.
+pub const EL1_ZONE_SIZE: u64 = 0x70_0000;
 
 const _: () = assert!(core::mem::size_of::<ZoneTables>() as u64 <= EL1_ZONE_SIZE);
 const _: () = assert!(EL1_ZONE_OFFSET.is_multiple_of(core::mem::align_of::<ZoneTables>() as u64));
@@ -2751,7 +2887,7 @@ const _: () = assert!(EL1_REGION_SIZE == 64 * 1024 * 1024);
 const _: () = assert!(EL1_IMAGE_OFFSET + EL1_IMAGE_SIZE.raw() <= EL1_COUNTERS_OFFSET);
 const _: () = assert!(EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE <= EL1_STACKS_OFFSET);
 const _: () = assert!(
-    EL1_STACKS_OFFSET + EL1_STACK_SLOTS * EL1_STACK_SIZE <= EL1_STACKS_OFFSET + EL1_STACKS_SIZE
+    EL1_STACKS_OFFSET + EL1_STACK_SLOTS * EL1_STACK_STRIDE <= EL1_STACKS_OFFSET + EL1_STACKS_SIZE
 );
 const _: () = assert!(EL1_STACKS_OFFSET + EL1_STACKS_SIZE <= EL1_CURRENT_TASKS_OFFSET);
 const _: () = assert!(
@@ -3155,11 +3291,24 @@ pub fn clear_current_task_record(slot: usize) {
     current_task.clear();
 }
 
+/// Bytes the EL1 hooks reserve at the top of each slot's stack for the
+/// [`TrapFrame`] (its size rounded up to 16 bytes).
+pub const TRAP_FRAME_ALLOCATION: u64 = 0x120;
+const _: () = assert!(
+    core::mem::size_of::<TrapFrame>() as u64 <= TRAP_FRAME_ALLOCATION
+        && TRAP_FRAME_ALLOCATION.is_multiple_of(16)
+);
+
+/// Scratch the current-EL synchronous vector pushes below the faulting SP
+/// before it decides between an exception fixup and a fatal report. A
+/// faulting SP with less room than this above its slot's guard is reported
+/// as a stack overflow without any store.
+pub const EL1_FAULT_VECTOR_SCRATCH: u64 = 32;
+
 /// The guest virtual address of `slot`'s [`TrapFrame`] on its EL1 stack: the
-/// frame the EL1 hooks save and the idle entry starts from (stack top minus
-/// 0x120, the frame rounded up to 16 bytes).
+/// frame the EL1 hooks save and the idle entry starts from.
 pub const fn el1_slot_frame_va(slot: usize) -> u64 {
-    EL1_STACKS_BASE + EL1_STACK_SIZE * (slot as u64 + 1) - 0x120
+    stack_slot_top(slot) - TRAP_FRAME_ALLOCATION
 }
 
 /// Prepare `slot` for the idle entry (EL1 plan 1d): its task record names no
@@ -4011,7 +4160,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x2192a1701f0ad4d1);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x661ef1c57f329093);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -5702,5 +5851,68 @@ mod x86_table_alias_tests {
         );
         // Below the extent but beyond the mapped direct window.
         assert!(x86_cpl0_table_alias(FrameGpa::new(X86_CPL0_DIRECT_WINDOW_BYTES)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod el1_stack_layout_tests {
+    use super::*;
+
+    /// #369: every slot's usable stack sits directly above its own guard,
+    /// the guard is the whole low half of the slot's stride, and the slot
+    /// rule refuses a guard address instead of naming the slot below.
+    #[test]
+    fn el1_stack_slots_are_separated_by_guards() {
+        assert_eq!(EL1_STACK_SIZE, 0x4000, "the usable stack keeps its 16 KiB");
+        assert_eq!(EL1_STACK_STRIDE, EL1_STACK_GUARD_SIZE + EL1_STACK_SIZE);
+        assert_eq!(EL1_STACKS_SIZE, EL1_STACK_SLOTS * EL1_STACK_STRIDE);
+        assert_eq!(el1_stack_guards().count(), EL1_STACK_SLOTS as usize);
+        for slot in 0..EL1_STACK_SLOTS as usize {
+            let guard = stack_slot_guard_base(slot);
+            let base = stack_slot_usable_base(slot);
+            let top = stack_slot_top(slot);
+            assert_eq!(base - guard, EL1_STACK_GUARD_SIZE);
+            assert_eq!(top - base, EL1_STACK_SIZE);
+            for address in [guard, guard + EL1_STACK_GUARD_SIZE - 1] {
+                assert!(is_el1_stack_guard(address));
+                assert_eq!(el1_stack_guard_slot(address), Some(slot));
+                assert_eq!(el1_stack_slot(address), None, "{address:#x} is a guard");
+                // The vector page's one-bit test agrees.
+                assert_eq!(address >> EL1_STACK_USABLE_BIT & 1, 0);
+            }
+            for address in [base, top - 1] {
+                assert!(!is_el1_stack_guard(address));
+                assert_eq!(el1_stack_guard_slot(address), None);
+                assert_eq!(el1_stack_slot(address), Some(slot));
+                assert_eq!(address >> EL1_STACK_USABLE_BIT & 1, 1);
+            }
+            if slot + 1 < EL1_STACK_SLOTS as usize {
+                assert_eq!(top, stack_slot_guard_base(slot + 1));
+            }
+            assert_eq!(el1_slot_frame_va(slot), top - TRAP_FRAME_ALLOCATION);
+        }
+        assert_eq!(el1_stack_slot(EL1_STACKS_BASE - 1), None);
+        assert_eq!(el1_stack_slot(EL1_STACKS_BASE + EL1_STACKS_SIZE), None);
+        assert!(!is_el1_stack_guard(EL1_STACKS_BASE - 1));
+        assert!(!is_el1_stack_guard(EL1_STACKS_BASE + EL1_STACKS_SIZE));
+    }
+
+    /// The stack arena's level-3 tables cover exactly the 2 MiB blocks the
+    /// arena touches, and the guards took their 4 MiB from the zone
+    /// reservation's unused tail: the zone still holds `ZoneTables`.
+    #[test]
+    fn stack_tables_cover_the_arena_and_the_zone_keeps_its_tables() {
+        let first = EL1_STACK_TABLES_FIRST_OFFSET;
+        let end = first + EL1_STACK_TABLE_PAGES as u64 * EL1_STACK_TABLE_SPAN;
+        assert!(first <= EL1_STACKS_OFFSET);
+        assert!(EL1_STACKS_OFFSET - first < EL1_STACK_TABLE_SPAN);
+        assert!(EL1_STACKS_OFFSET + EL1_STACKS_SIZE <= end);
+        assert!(end - (EL1_STACKS_OFFSET + EL1_STACKS_SIZE) < EL1_STACK_TABLE_SPAN);
+        assert!(core::mem::size_of::<ZoneTables>() as u64 <= EL1_ZONE_SIZE);
+        assert_eq!(EL1_ZONE_OFFSET + EL1_ZONE_SIZE, EL1_REGION_SIZE);
+        assert_eq!(
+            EL1_BOOTSTRAP_METADATA_SIZE, 0x90_0000,
+            "metadata is not shrunk"
+        );
     }
 }

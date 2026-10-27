@@ -12,7 +12,10 @@ pub const STUB_SIZE: u64 = 0x4000;
 /// with no observer, seccomp, trap budget, or pending mandatory boundary.
 pub const CLOCK_GATE_OFFSET: u64 = 16;
 const ACTIVE: u16 = AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE as u16;
-const ENTRY: usize = MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE;
+pub(super) const ENTRY: usize = MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE;
+/// Bytes reserved for the transport from [`ENTRY`]: up to the current-EL
+/// synchronous handler (see `VECTOR_PAGE_REGIONS`).
+pub(super) const SIZE: usize = EL1_CUR_EL_SYNC_HANDLER_OFFSET - ENTRY;
 const TMP16: u64 = mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x16));
 const TMP17: u64 = mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x17));
 const MARKER: u16 = 0xC10C;
@@ -248,7 +251,10 @@ fn emit_handler(mut c: Code<'_>) -> ClockHandlerLayout {
     c.restore_frame();
     c.restore_regs(false);
     c.emit(enc_b(c.pc as u64, MAILBOX_HANDLER_OFFSET as u64));
-    assert!(c.pc <= EL1_VECTOR_HOOK_OFFSET);
+    assert!(
+        c.pc <= ENTRY + SIZE,
+        "clock transport overruns its vector-page region"
+    );
     ClockHandlerLayout {
         start: LINUX_EL1_VECTORS_BASE + ENTRY as u64,
         completion: LINUX_EL1_VECTORS_BASE + completion as u64,
