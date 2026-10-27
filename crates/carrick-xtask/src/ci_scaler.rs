@@ -51,8 +51,6 @@ const PILOT_BRANCH: &str = "work/willow-pilot";
 
 #[derive(Debug, Error)]
 pub enum ScalerError {
-    #[error("host lease: {0}")]
-    HostLease(#[from] crate::host_lease::HostLeaseError),
     #[error("projected clone CPU {projected:.1}% exceeds the 80% admission ceiling")]
     CpuCeiling { projected: f64 },
     #[error("KVM_GET_API_VERSION returned {version}, errno={errno}; expected 12")]

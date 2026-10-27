@@ -92,7 +92,7 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
 | `just accept --profile linux-portable` | Linux host gate + receipt; signed phase rejected. |
 | `just remote-accept --ref COMMIT --phase host` | Worker gate on cloudmac + fetched receipt; also run signed for macOS/ARM changes. |
-| `just lease MODE +CMD` | Run command under host flock lease (carrick shared, gate/docker exclusive). |
+| `just lease MODE +CMD` | Run command under the local machine/VM flock lease (carrick shared, gate/docker exclusive). |
 
 **Toolchain:** pin, edition, members, `deny`ed lints: [`rust-toolchain.toml`](rust-toolchain.toml) and
 [`Cargo.toml`](Cargo.toml). CI uses moving `@stable`, which can flag lints

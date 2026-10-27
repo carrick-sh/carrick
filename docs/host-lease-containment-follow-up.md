@@ -1,5 +1,12 @@
 # Host lease supervision and containment follow-up
 
+Leases cover one machine or VM, never its physical hypervisor (#639, owner
+reversal of #565). Each worker VM, agent clone, KVM CI clone and oracle holds
+only its own local flock. The standing controller holds no physical-host
+lease across clone lifecycle operations. The SSH broker and its config were
+deleted. Checkout admission precedes the local VM lease; nested commands
+reuse that lease without upgrading shared admission.
+
 On macOS the supervisor and an independent guardian share flock custody;
 arbitrary commands, tests and guests own zero
 flock descriptors. Caller exit and supervisor SIGTERM/SIGINT/SIGHUP request
@@ -7,19 +14,10 @@ cancellation. The supervisor cancels and observes supervised work exiting,
 reaps its children, observes lifetime EOF, and only then releases exclusion on success. Cleanup failure releases with a
 reported failed-run error under the bounded policy below. If the supervisor
 fails cleanup, its guardian retains custody while recovering the workload.
-The existing `try_exclusive` performs a zero-wait attempt through the configured
-broker when present, or a local flock otherwise.
+The existing `try_exclusive` performs a zero-wait local flock attempt.
 
 Linux uses a dedicated child subreaper. With child-list support, detached descendants remain owned even
-after `setsid` and closing every inherited descriptor. When a remote SSH broker
-is configured on Linux, `lease-supervisor` spawns the `ssh` custodian in its own
-session (`setsid`) so group-directed signals (`SIGTERM`, `SIGINT`, `SIGHUP`) to
-the supervisor's process group or caller do not kill `ssh` and drop broker
-custody before the five-second workload cancellation and reaping deadline
-completes. The client's keepalive detection window (`ServerAliveInterval=2`,
-`ServerAliveCountMax=3` = 6 s) is strictly shorter than the broker server's
-keepalive window (`ClientAliveInterval 5`, `ClientAliveCountMax 3` = 15 s) minus
-the five-second cleanup limit (`6 s < 15 s - 5 s = 10 s`). Darwin selects members
+after `setsid` and closing every inherited descriptor. Darwin selects members
 by the workload session or the exact kernel scope-pipe identity. Cancellation
 issues SIGKILL without first stopping processes. An EPERM helper keeps running
 while exit observation and cleanup remain active within the single deadline.
@@ -80,9 +78,6 @@ unkillable work has stopped. The supervisor must not wedge the host indefinitely
 Linux subreaper `waitpid(-1)` through `ECHILD` is release authority; procfs child
 lists only help cancel live adopted roots and are optional. Without those lists,
 an undiscoverable live detached child may cause the bounded failed-run state.
-When the subreaper reaps the SSH custodian PID via `waitpid(-1)` (for example after
-broker disconnect), the session records that reaped state and skips signalling
-or waiting on that PID again during teardown.
 The containment follow-up below remains necessary for stronger guarantees.
 
 ## Follow-up design

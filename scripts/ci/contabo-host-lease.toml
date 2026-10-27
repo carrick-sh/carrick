@@ -1,5 +1,0 @@
-# Owner installs on worker VMs and oracle 110, not CI clones (their controller
-# holds the gate until destruction). No credentials are stored in this file.
-broker = "carrick-lease@10.77.0.1"
-identity_file = "/etc/carrick/host-lease.key"
-known_hosts_file = "/etc/carrick/host-lease.known_hosts"

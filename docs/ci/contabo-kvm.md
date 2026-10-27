@@ -203,13 +203,14 @@ exclusive physical-host lock for either KVM or agent clones. Each clone runs
 its build/test work under its local lease. A local `gate` lease excludes
 other local work; it does not promise a quiet physical host or isolate other VMs.
 
-The owner disabled `/etc/carrick/host-lease.toml` on ctb-w1..w4 on
-2026-10-18. With no broker config, `HostLease` selects the VM-local lock.
-The owner also retires that config from VM 110 and the templates, the
-`carrick-lease` broker account, its authorized keys and sshd drop-in. Workers
-must not perform those administrative changes or reinstall the broker.
-The generic broker implementation remains available for separately configured
-hosts; it is not part of Contabo clone custody.
+The physical-host broker and the controller's clone custody have been
+deleted from the code (owner decision 2026-10-27, recorded on #231).
+`HostLease` has one implementation, the VM-local flock, and reads no broker
+configuration: a leftover `/etc/carrick/host-lease.toml` is ignored. The
+owner disabled that file on ctb-w1..w4 on 2026-10-18 and retires it from VM
+110 and the templates, together with the `carrick-lease` broker account, its
+authorized keys and sshd drop-in. Workers must not perform those
+administrative changes.
 
 The [agent dispatch provider](dispatch-worker.md) shares the existing ledger,
 VMID pool, admission checks, assignment re-vetting, deadlines and destruction

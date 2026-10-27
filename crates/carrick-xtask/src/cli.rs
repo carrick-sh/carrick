@@ -114,8 +114,8 @@ pub enum Commands {
 
     #[command(
         name = "host-lease",
-        about = "Run command under machine-global host lease flock (carrick shared, gate/docker exclusive)",
-        long_about = "Run command under machine-global host lease flock. Runner death and supervisor SIGTERM/SIGINT/SIGHUP cancel supervised work before successful release. Cleanup errors or the single five-second cleanup deadline fail the run explicitly and release the lease. On macOS, either supervisor or guardian survives the other's SIGKILL and retains exclusion during cleanup; loss of both releases flock. Linux still has a sole supervisor. On Darwin, detached descendants closing all inherited scope descriptors escape; the final process-start-time check to kill also has a PID reuse window. See docs/host-lease-containment-follow-up.md."
+        about = "Run command under local machine/VM lease flock (carrick shared, gate/docker exclusive)",
+        long_about = "Run command under local machine/VM lease flock. Runner death and supervisor SIGTERM/SIGINT/SIGHUP cancel supervised work before successful release. Cleanup errors or the single five-second cleanup deadline fail the run explicitly and release the lease. On macOS, either supervisor or guardian survives the other's SIGKILL and retains exclusion during cleanup; loss of both releases flock. Linux still has a sole supervisor. On Darwin, detached descendants closing all inherited scope descriptors escape; the final process-start-time check to kill also has a PID reuse window. See docs/host-lease-containment-follow-up.md."
     )]
     HostLease(HostLeaseArgs),
 
@@ -177,15 +177,12 @@ pub enum Commands {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct HostLeaseArgs {
-    #[command(subcommand)]
-    pub action: Option<HostLeaseAction>,
-
     #[arg(
         long,
         value_enum,
         help = "Lock mode: carrick (shared), gate or docker (exclusive)"
     )]
-    pub mode: Option<crate::host_lease::HostLeaseMode>,
+    pub mode: crate::host_lease::HostLeaseMode,
 
     #[arg(long, help = "Refuse yes/stress/stress-ng unless CARRICK_ALLOW_LOAD=1")]
     pub check_load: bool,
@@ -196,12 +193,6 @@ pub struct HostLeaseArgs {
         help = "Command and arguments to run under the host lease"
     )]
     pub command: Vec<OsString>,
-}
-
-#[derive(clap::Subcommand, Debug, Clone)]
-pub enum HostLeaseAction {
-    /// Restricted forced command: lease request over stdin, custody until EOF.
-    Broker(crate::host_lease::broker::BrokerArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -600,16 +591,8 @@ where
             Ok(())
         }
         Commands::HostLease(args) => {
-            if let Some(HostLeaseAction::Broker(args)) = args.action {
-                crate::host_lease::broker::run(args)?;
-                return Ok(());
-            }
-            let mode = args.mode.ok_or_else(|| {
-                CliError::HostLease(crate::host_lease::HostLeaseError::Inherited(
-                    "--mode is required".into(),
-                ))
-            })?;
-            let exit_code = crate::host_lease::run_command(mode, args.check_load, &args.command)?;
+            let exit_code =
+                crate::host_lease::run_command(args.mode, args.check_load, &args.command)?;
             std::process::exit(exit_code);
         }
         Commands::LeaseSupervisor(args) => {

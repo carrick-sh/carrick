@@ -37,9 +37,6 @@ pub(super) enum Network {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Site {
     pub lane: super::CloneLane,
-    /// Physical-host clone admission, held in-process from reservation through
-    /// destruction. Guests do not recursively acquire this exclusive lease.
-    pub host_lease: Option<&'static str>,
     /// `/etc/hostname`, which is also the PVE node name.
     pub node: &'static str,
     /// Name on the node's PVE certificate; resolved to 127.0.0.1.
@@ -62,7 +59,6 @@ pub(super) struct Site {
 
 pub(super) const WILLOW: Site = Site {
     lane: super::CloneLane::Kvm,
-    host_lease: None,
     node: "willow",
     api_host: "willow.atxconsulting.com",
     api_ca: None,
@@ -80,7 +76,6 @@ pub(super) const WILLOW: Site = Site {
 /// directory storage, and the agent-worker VMs/template protected.
 pub(super) const CONTABO: Site = Site {
     lane: super::CloneLane::Kvm,
-    host_lease: None,
     node: "carrick-ctb",
     api_host: "carrick-ctb.turkey-moth.ts.net",
     api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -374,7 +369,6 @@ mod tests {
             WILLOW,
             Site {
                 lane: super::super::CloneLane::Kvm,
-                host_lease: None,
                 node: "willow",
                 api_host: "willow.atxconsulting.com",
                 api_ca: None,
@@ -407,7 +401,6 @@ mod tests {
             CONTABO,
             Site {
                 lane: super::super::CloneLane::Kvm,
-                host_lease: None,
                 node: "carrick-ctb",
                 api_host: "carrick-ctb.turkey-moth.ts.net",
                 api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -466,8 +459,6 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
         ] {
             assert!(env.lines().any(|actual| actual == line), "{line}");
         }
-        assert!(CONTABO.host_lease.is_none());
-        assert!(site.host_lease.is_none());
         assert_eq!(
             site.for_lane(super::super::CloneLane::Kvm).unwrap(),
             CONTABO
