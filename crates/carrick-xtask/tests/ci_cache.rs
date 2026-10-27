@@ -422,3 +422,188 @@ fn warm_tail_replays_consumer_xtask_builds_after_eviction_pressure() {
         );
     }
 }
+
+#[test]
+fn hosted_jobs_read_the_r2_compiler_cache_and_only_the_warmer_writes() {
+    // #858: the bounded GitHub cache thrashed (the linux-x64 warmer hit 29% of
+    // its own unchanged replay at 3 GiB). Hosted jobs read R2 with a read-only
+    // token; only cache-warm writes; forks fall back to the GitHub cache.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
+    let env = &workflow["env"];
+    assert_eq!(
+        env["AWS_ACCESS_KEY_ID"].as_str(),
+        Some("${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}")
+    );
+    assert_eq!(
+        env["AWS_SECRET_ACCESS_KEY"].as_str(),
+        Some("${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}")
+    );
+    assert_eq!(
+        env["CARRICK_SCCACHE_R2_BUCKET"].as_str(),
+        Some("carrick-sccache")
+    );
+    assert!(env["SCCACHE_BUCKET"].is_badvalue(), "selected per job");
+    let mut readers = 0;
+    for (job, body) in workflow["jobs"].as_hash().unwrap() {
+        let job = job.as_str().unwrap();
+        let Some(steps) = body["steps"].as_vec() else {
+            continue;
+        };
+        for (index, step) in steps.iter().enumerate() {
+            let Some(key) = step["with"]["key"]
+                .as_str()
+                .filter(|k| k.starts_with("sccache-"))
+            else {
+                continue;
+            };
+            let family = key
+                .strip_prefix("sccache-")
+                .unwrap()
+                .split("-${{ hashFiles")
+                .next()
+                .unwrap();
+            assert_eq!(
+                step["if"].as_str(),
+                Some("steps.compiler-cache.outputs.backend == 'gha'"),
+                "{job}: GitHub cache steps run only on the fallback backend"
+            );
+            if step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
+            {
+                continue;
+            }
+            readers += 1;
+            let configure = &steps[index - 1];
+            assert_eq!(configure["id"].as_str(), Some("compiler-cache"), "{job}");
+            assert_eq!(
+                configure["env"]["RUNNER_ENVIRONMENT"].as_str(),
+                Some("${{ runner.environment }}"),
+                "{job}"
+            );
+            let mode = if job == "cache-warm" {
+                "read-write"
+            } else {
+                "read-only"
+            };
+            assert_eq!(
+                configure["run"].as_str(),
+                Some(format!("scripts/ci/compiler-cache-env.sh {family} {mode}").as_str()),
+                "{job}"
+            );
+            let writer = body["env"]["AWS_ACCESS_KEY_ID"].as_str();
+            if job == "cache-warm" {
+                assert_eq!(
+                    writer,
+                    Some("${{ secrets.SCCACHE_R2_WRITER_ACCESS_KEY_ID }}")
+                );
+                assert_eq!(
+                    body["env"]["AWS_SECRET_ACCESS_KEY"].as_str(),
+                    Some("${{ secrets.SCCACHE_R2_WRITER_SECRET_ACCESS_KEY }}")
+                );
+            } else {
+                assert!(writer.is_none(), "{job}: only cache-warm gets the writer");
+                assert!(body["env"]["AWS_SECRET_ACCESS_KEY"].is_badvalue(), "{job}");
+            }
+        }
+    }
+    assert_eq!(
+        readers, 21,
+        "every compiler cache consumer selects a backend"
+    );
+}
+
+#[test]
+fn compiler_cache_env_selects_r2_only_for_credentialed_hosted_runners() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let script = root.join("scripts/ci/compiler-cache-env.sh");
+    let secret = "not-a-real-secret-value";
+    let run = |args: &[&str], vars: &[(&str, &str)]| {
+        let temp = tempfile::tempdir().unwrap();
+        let env_file = temp.path().join("env");
+        let out_file = temp.path().join("out");
+        std::fs::write(&env_file, "").unwrap();
+        std::fs::write(&out_file, "").unwrap();
+        let mut command = std::process::Command::new(&script);
+        command
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap())
+            .env("GITHUB_ENV", &env_file)
+            .env("GITHUB_OUTPUT", &out_file)
+            .env("RUNNER_TEMP", temp.path())
+            .env("CARRICK_SCCACHE_R2_BUCKET", "carrick-sccache")
+            .env(
+                "CARRICK_SCCACHE_R2_ENDPOINT",
+                "https://example.r2.cloudflarestorage.com",
+            );
+        for (key, value) in vars {
+            command.env(key, value);
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stdout.contains(secret) && !stderr.contains(secret));
+        (
+            output.status.code(),
+            std::fs::read_to_string(&env_file).unwrap(),
+            std::fs::read_to_string(&out_file).unwrap(),
+            temp.path().join("carrick-sccache"),
+        )
+    };
+    let creds = [
+        ("AWS_ACCESS_KEY_ID", "id"),
+        ("AWS_SECRET_ACCESS_KEY", secret),
+    ];
+    let hosted_creds = [creds[0], creds[1], ("RUNNER_ENVIRONMENT", "github-hosted")];
+
+    // Fork pull requests: empty secrets keep the GitHub cache.
+    let (code, env, out, dir) = run(
+        &["linux-x64", "read-only"],
+        &[
+            ("AWS_ACCESS_KEY_ID", ""),
+            ("AWS_SECRET_ACCESS_KEY", ""),
+            ("RUNNER_ENVIRONMENT", "github-hosted"),
+        ],
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(out, "backend=gha\n");
+    assert_eq!(env, format!("SCCACHE_DIR={}\n", dir.display()));
+
+    // Self-hosted runners hash different absolute paths: never R2.
+    let (_, env, out, _) = run(
+        &["darwin-hosted", "read-only"],
+        &[creds[0], creds[1], ("RUNNER_ENVIRONMENT", "self-hosted")],
+    );
+    assert_eq!(out, "backend=gha\n");
+    assert!(!env.contains("SCCACHE_BUCKET"));
+
+    let (code, env, out, _) = run(&["linux-arm64", "read-only"], &hosted_creds);
+    assert_eq!(code, Some(0));
+    assert_eq!(out, "backend=r2\n");
+    for line in [
+        "SCCACHE_BUCKET=carrick-sccache",
+        "SCCACHE_ENDPOINT=https://example.r2.cloudflarestorage.com",
+        "SCCACHE_REGION=auto",
+        "SCCACHE_S3_USE_SSL=true",
+        "SCCACHE_S3_KEY_PREFIX=sccache/linux-arm64/",
+        "SCCACHE_S3_RW_MODE=READ_ONLY",
+    ] {
+        assert!(env.lines().any(|l| l == line), "{line} in {env}");
+    }
+    assert!(
+        !env.contains(secret),
+        "credentials stay in the job env only"
+    );
+
+    let (_, env, _, _) = run(&["linux-x64", "read-write"], &hosted_creds);
+    assert!(env.lines().any(|l| l == "SCCACHE_S3_RW_MODE=READ_WRITE"));
+
+    for args in [["linux", "read-only"], ["linux-x64", "write"]] {
+        let (code, _, out, _) = run(&args, &hosted_creds);
+        assert_eq!(code, Some(2), "{args:?}");
+        assert!(out.is_empty());
+    }
+}

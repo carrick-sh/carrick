@@ -25,6 +25,13 @@ automatic caching off, without removing ambient compiler wrappers.
 Hosted and trusted-hardware CI install sccache per user after restoring Rust
 caches; setup recipes also work before installation. Hosted CI runs the real
 Cargo recipe regressions with sccache absent from PATH.
+GitHub-hosted CI jobs share one compiler cache in the Cloudflare R2 bucket
+`carrick-sccache` (sccache's S3 backend, one key prefix per runner family;
+objects expire 30 days after upload). `scripts/ci/compiler-cache-env.sh`
+selects it per job: pull-request and merge-queue jobs read with a read-only
+token, and only the trusted `cache-warm` job writes. Jobs without the R2
+secrets (fork and Dependabot pull requests) and self-hosted runners fall back
+to the bounded GitHub Actions cache (#858).
 No linker, Rust flags, entitlement, DOF processing, or signing steps change:
 macOS still uses Apple ld64 and the existing post-link signing path.
 
