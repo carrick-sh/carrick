@@ -2983,6 +2983,70 @@ fn blocking_wait4_reenters_its_owner_after_host_materialization() {
 
 #[cfg(test)]
 #[test]
+fn sibling_entry_cannot_consume_a_parked_wait4() {
+    // The process-keyed wait belongs to the thread that parked it. Another
+    // thread of the same process entering the owner must run its own
+    // syscall, not complete (or swallow) the parked operation.
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let (_, address, saved) = capacity.select().unwrap();
+    let child_pid = fixture.task.visible_pid().unwrap();
+    let mut service = fixture.service();
+    {
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.exit_group(0),
+            LifecycleOutcome::Transferred { .. }
+        ));
+    }
+    let (_, address, saved) = capacity.select().unwrap();
+    let mut parent = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    let waiter = parent.calling_tid();
+    // A sibling thread (another tid in the same process) enters the owner.
+    parent.set_calling_tid(waiter + 1);
+    assert!(!parent.owns_parked_operation());
+    assert!(
+        parent.resume_pending_wait().is_none(),
+        "a sibling's entry must not resume another thread's wait4"
+    );
+    // The parked thread still owns its operation and reaps exactly once.
+    parent.set_calling_tid(waiter);
+    assert!(parent.owns_parked_operation());
+    assert!(matches!(
+        parent.resume_owned_continuation(),
+        Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == i64::from(child_pid)
+    ));
+    assert!(parent.resume_owned_continuation().is_none());
+    drop(parent);
+    assert_eq!(service.copies, vec![LinuxWaitStatus::exited(0)]);
+}
+
+#[cfg(test)]
+#[test]
 fn carrier_work_wake_redrives_parked_wait4_before_returning_to_user() {
     carrier_work_redrives_parked_wait4(false);
 }
