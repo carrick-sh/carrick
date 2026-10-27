@@ -1002,8 +1002,8 @@ fn read_instructions_installed(
 }
 
 struct TestEditorExclusion {
-    _spaces: Box<carrick_sched_core::AddressSpaces>,
-    _held: carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion,
+    _spaces: &'static carrick_sched_core::AddressSpaces,
+    _held: carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion<'static>,
 }
 
 impl std::fmt::Debug for TestEditorExclusion {
@@ -1015,7 +1015,7 @@ impl std::fmt::Debug for TestEditorExclusion {
 
 impl TestEditorExclusion {
     fn unpublished(mm: u64) -> Self {
-        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let spaces: &'static _ = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
         let excluded = spaces
             .unpublished(mm)
             .expect("foreign COW target starts unpublished");

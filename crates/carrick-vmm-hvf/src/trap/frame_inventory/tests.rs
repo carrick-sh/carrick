@@ -113,8 +113,8 @@ fn bind_test_mm_for_host_edits(
     asid: u16,
     stage1_root: u64,
 ) -> (
-    Box<carrick_sched_core::AddressSpaces>,
-    carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion,
+    &'static carrick_sched_core::AddressSpaces,
+    carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion<'static>,
 ) {
     access
         .install_identity(
@@ -129,7 +129,7 @@ fn bind_test_mm_for_host_edits(
             },
         )
         .expect("publish test MM identity");
-    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let spaces: &'static _ = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
     let excluded = spaces
         .unpublished(mm)
         .expect("test MM starts Editor-excluded");

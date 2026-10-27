@@ -1250,3 +1250,29 @@ fn successor_image_import_failure_keeps_old_root_and_success_stays_closed() {
     assert!(region.zone.spaces.find(43_002).is_some());
     drop(old);
 }
+/// #855 review P2-3: the bootstrap Editor exclusion minted when no EL1 region
+/// is installed is taken in the process's one bootstrap directory and can no
+/// longer be taken once an EL1 region exists (a guest editor may then exist).
+#[test]
+fn serial_host_bootstrap_editor_exclusion_is_refused_once_an_el1_region_exists() {
+    carrick_el1_abi::record_el1_region_host_ptr(0);
+    let bootstrap = super::bootstrap_el1_editor_exclusion(mm(0x8e9))
+        .expect("no EL1 region: the bootstrap exclusion is available");
+    assert_eq!(bootstrap.license().mm(), 0x8e9);
+    drop(bootstrap);
+
+    let region = carrick_test_support::TestEl1Region::zeroed();
+    carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+    struct ClearRegion;
+    impl Drop for ClearRegion {
+        fn drop(&mut self) {
+            carrick_el1_abi::record_el1_region_host_ptr(0);
+        }
+    }
+    let _clear = ClearRegion;
+    assert!(carrick_el1_abi::zone_tables().is_some());
+    assert!(
+        super::bootstrap_el1_editor_exclusion(mm(0x8e9)).is_none(),
+        "the bootstrap token must not exist once EL1 is installed"
+    );
+}

@@ -5130,7 +5130,7 @@ pub mod foreign_cow_test_support {
     pub struct ProductionCarrierForeignCowHarness {
         transport: CarrierForeignMmTransport,
         state: std::sync::Arc<MmAccessState>,
-        editor_exclusion: carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion,
+        editor_exclusion: carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion<'static>,
         original_extents: Vec<(u64, u64)>,
         data_va: u64,
         data_len: u64,

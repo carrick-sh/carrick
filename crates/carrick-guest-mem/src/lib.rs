@@ -66,15 +66,21 @@
 
 /// One held exclusion of an MM's EL1 editor. The proof is owned by the guard
 /// which raised the gate and can only be lent to the edit it protects.
+///
+/// The lifetime is the address-space directory the exclusion was taken in:
+/// the proof cannot outlive the directory whose gate (or unpublished entry)
+/// justified it.
 #[derive(Debug)]
-pub struct HeldEl1EditorExclusion {
+pub struct HeldEl1EditorExclusion<'a> {
     license: El1EditorExcluded,
+    _directory: core::marker::PhantomData<&'a carrick_sched_core::AddressSpaces>,
 }
 
-impl HeldEl1EditorExclusion {
+impl<'a> HeldEl1EditorExclusion<'a> {
     #[must_use]
-    pub fn register(excluded: &carrick_sched_core::ExcludedEditor<'_>) -> Self {
+    pub fn register(excluded: &carrick_sched_core::ExcludedEditor<'a>) -> Self {
         Self {
+            _directory: core::marker::PhantomData,
             license: El1EditorExcluded {
                 mm: excluded.key(),
                 stage1_edited: core::sync::atomic::AtomicBool::new(false),
