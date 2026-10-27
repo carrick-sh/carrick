@@ -29,9 +29,22 @@ impl LifecycleVenue for ChildVenue {
     }
 }
 
+/// What the futex-joined leader is parked on when its worker dies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeaderWait {
+    Futex,
+    /// Its own one-description pipe poll: the exit abandons it.
+    PipePoll,
+    /// A pipe poll operation naming another task: refused untouched.
+    ForeignTaskPoll,
+    /// A non-IPC queue domain holding a token that collides with a live
+    /// IPC operation of this task: never routed to IPC settlement.
+    ForeignDomain,
+}
+
 #[test]
 fn native_fatal_worker_wakes_futex_parked_leader_before_exit_drain() {
-    fatal_worker_retires_parked_leader(false);
+    fatal_worker_retires_parked_leader(LeaderWait::Futex);
 }
 
 /// A member woken out of a one-description pipe poll by a sibling's fatal
@@ -41,10 +54,26 @@ fn native_fatal_worker_wakes_futex_parked_leader_before_exit_drain() {
 /// retirement quarantines the run (#856, eight-pair two-process pipe case).
 #[test]
 fn native_fatal_worker_retires_leader_holding_pipe_poll_operation() {
-    fatal_worker_retires_parked_leader(true);
+    fatal_worker_retires_parked_leader(LeaderWait::PipePoll);
 }
 
-fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
+/// Exit settles only the exiting task's own IPC operation: an operation
+/// record of another task stays live, its pin held, and the exit reports
+/// the typed refusal instead of finishing it.
+#[test]
+fn native_exit_refuses_pipe_poll_operation_of_another_task() {
+    fatal_worker_retires_parked_leader(LeaderWait::ForeignTaskPoll);
+}
+
+/// The issuing authority comes from the queue domain the operation parked
+/// on, not from the token's shape: a reservation-pool operation whose token
+/// equals a live IPC operation's never reaches the IPC table.
+#[test]
+fn native_exit_never_routes_a_foreign_domain_operation_to_ipc() {
+    fatal_worker_retires_parked_leader(LeaderWait::ForeignDomain);
+}
+
+fn fatal_worker_retires_parked_leader(wait: LeaderWait) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -60,7 +89,7 @@ fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
     )
     .with_words(words);
     service.crossing.terminal_task = Some(&fixture.task);
-    let ipc = pipe_poll.then(|| {
+    let ipc = (wait != LeaderWait::Futex).then(|| {
         use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
         let owner = std::sync::Arc::new(carrick_kernel::el1_ipc::HostIpc::new(1 << 20).unwrap());
         let table = carrick_kernel::el1_ipc::HostTable::create(owner.clone(), 64, 8).unwrap();
@@ -224,7 +253,8 @@ fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
                 pin: pin.into_raw(),
                 object: object.to_raw(),
                 task: carrick_el1_abi::ipc::IpcTaskKey(
-                    fixture.task.execution.task.load(Ordering::Acquire),
+                    fixture.task.execution.task.load(Ordering::Acquire)
+                        + u64::from(wait == LeaderWait::ForeignTaskPoll) * 1000,
                 ),
                 mm: carrick_el1_abi::ipc::IpcMmKey(fixture.task.mm.key.load(Ordering::Acquire)),
                 buf: IpcUserVa(0x7000),
@@ -234,6 +264,10 @@ fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
             })
             .unwrap();
         let raw = token.into_raw();
+        let pin_raw = region
+            .operation(&carrick_el1_abi::ipc::IpcOpToken::from_raw(raw))
+            .unwrap()
+            .pin;
         let counters = carrick_el1_abi::Counters::new();
         let mut sched = crate::sched::Sched {
             handoff: None,
@@ -247,6 +281,18 @@ fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
         frame.x = [0; 31];
         frame.x[8] = 73;
         frame.elr = 0x4004;
+        let key = if wait == LeaderWait::ForeignDomain {
+            let pool = carrick_sched_core::object_wait::ObjectWaitKey::reservation_pool(
+                core::num::NonZeroU64::MIN,
+            );
+            fixture
+                .zone
+                .bind_object_wait(pool, &carrick_sched_core::ShortLockSpin)
+                .unwrap();
+            pool
+        } else {
+            key
+        };
         let snapshot = sched.observe_object(key).unwrap();
         let parked = sched
             .park_object(
@@ -267,7 +313,7 @@ fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
                 .is_some()
         );
         assert!(fixture.zone.record(leader).has_object_operation());
-        raw
+        (raw, pin_raw)
     });
     if poll_operation.is_none() {
         call(&mut service, &mut frame, &mut cpu);
@@ -333,6 +379,37 @@ fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
             resume_selected(&owner, registry(), source, &fixture.task, record, service),
         )
     };
+    if matches!(
+        wait,
+        LeaderWait::ForeignTaskPoll | LeaderWait::ForeignDomain
+    ) {
+        let Err(refused) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| select(&mut service)))
+        else {
+            panic!("an operation exit cannot settle must refuse the exit");
+        };
+        assert!(
+            refused
+                .downcast_ref::<crate::native_run_failure::NativeRunFailurePanic>()
+                .is_some(),
+            "the refusal is the typed native run failure, not a fatal"
+        );
+        let (owner, _, _) = ipc.as_ref().unwrap();
+        let (raw, pin_raw) = poll_operation.unwrap();
+        let live = owner
+            .region()
+            .operation(&carrick_el1_abi::ipc::IpcOpToken::from_raw(raw))
+            .expect("the refused operation record stays live");
+        assert_eq!(live.kind, carrick_el1_abi::ipc::IpcOpKind::PollWait);
+        assert_eq!(live.pin, pin_raw);
+        assert_eq!(
+            pinned_holds(owner, pin_raw).map(|holds| holds.1),
+            Some(1),
+            "its pin stays held"
+        );
+        assert!(fixture.zone.record(leader).has_object_operation());
+        return;
+    }
     let (selected, resumed) = select(&mut service);
     assert_eq!(selected, leader);
     assert!(
@@ -360,7 +437,12 @@ fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
         carrick_sched_core::Claim::Free
     ));
     assert!(!fixture.zone.spaces.is_open(identity.mm));
-    if let (Some((owner, _, _)), Some(raw)) = (&ipc, poll_operation) {
+    if let (Some((owner, _, _)), Some((raw, pin_raw))) = (&ipc, poll_operation) {
+        assert_eq!(
+            pinned_holds(owner, pin_raw),
+            None,
+            "the abandoned poll's description pin is dropped"
+        );
         assert!(
             owner
                 .region()
@@ -369,4 +451,20 @@ fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
             "the leader's exit must finish its abandoned poll operation"
         );
     }
+}
+
+/// Descriptor references and pins of the description an operation pinned;
+/// `None` once no pin holds it (the pin is stale).
+fn pinned_holds(
+    owner: &carrick_kernel::el1_ipc::HostIpc,
+    pin: carrick_el1_abi::ipc::RawOfdPin,
+) -> Option<(usize, usize)> {
+    let pin = carrick_el1_abi::ipc::OfdPin::from_raw(pin);
+    let holds = owner
+        .region()
+        .fd(carrick_sched_core::ShortLockSpin)
+        .holds(&pin)
+        .ok();
+    let _ = pin.into_raw();
+    holds
 }

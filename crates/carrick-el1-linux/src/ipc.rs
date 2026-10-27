@@ -210,14 +210,45 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
     }
 }
 
-/// Abandon the object operation an exiting native thread still owns.
+/// The live IPC operation a record names must belong to the exiting task
+/// and MM; a token can never settle another task's operation.
+fn native_operation_owned(
+    op: &IpcOperation,
+    task: &CurrentTask,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    if op.task != task_key(task) || op.mm != mm_key(task) {
+        return Err(carrick_el1_abi::ipc::IpcError::Stale);
+    }
+    Ok(())
+}
+
+/// Read-only authentication of the IPC operation a record still owns (its
+/// census index and generation), before its token leaves the record: the
+/// slot is live at exactly that generation and belongs to `task`.
+pub(crate) fn authenticate_native_operation(
+    region: &IpcRegion<'_>,
+    index: u64,
+    generation: u64,
+    task: &CurrentTask,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    use carrick_el1_abi::ipc::IpcError;
+    let token = carrick_sched_core::object_wait::OperationToken::new(index, generation)
+        .and_then(from_sched_token)
+        .ok_or(IpcError::Corrupt)?;
+    let observed = region.operation(&token);
+    // The record keeps ownership: this view settles nothing.
+    let _ = token.into_raw();
+    native_operation_owned(&observed?, task)
+}
+
+/// Abandon the IPC operation an exiting native thread still owns.
 ///
 /// A thread woken out of an IPC wait by its process's exit never re-enters
 /// the adapter that parked it, so that adapter cannot consume the token.
 /// Like Linux, the leaving thread drops its wait: the operation record is
 /// finished exactly once and its description pin goes through the same
-/// physical release (and peer wakes) as a native close. A metadata request
-/// wait has no IPC authority; taking its token is the whole settlement.
+/// physical release (and peer wakes) as a native close. An operation of
+/// another task or MM, or at another generation, is refused untouched.
 pub(crate) fn abandon_native_operation<C: carrick_el1_abi::EntryContext>(
     region: &IpcRegion<'_>,
     token: carrick_sched_core::object_wait::OperationToken,
@@ -226,10 +257,8 @@ pub(crate) fn abandon_native_operation<C: carrick_el1_abi::EntryContext>(
     task: &CurrentTask,
 ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
     use carrick_el1_abi::ipc::IpcError;
-    if token.metadata_generation().is_some() {
-        return Ok(());
-    }
     let token = from_sched_token(token).ok_or(IpcError::Corrupt)?;
+    native_operation_owned(&region.operation(&token)?, task)?;
     let op = region.finish_operation(token)?;
     if op.pin.authority == 0 {
         return Ok(());

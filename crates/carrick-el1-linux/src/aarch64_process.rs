@@ -1196,6 +1196,16 @@ impl<'a> Aarch64NativeProcessService<'a, HvcForkStockCrossing> {
 }
 
 impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
+    /// Take the switched-in exiting record's operation token through the
+    /// scheduler's exact ownership check.
+    fn take_exiting_operation(
+        &self,
+        expected: carrick_sched_core::ThreadIdentity,
+    ) -> Result<carrick_sched_core::object_wait::OperationToken, NativeProcessError> {
+        carrick_core::wait::take_object_operation(self.zone, self.slot, expected)
+            .map_err(|_| NativeProcessError::Stale)?
+            .ok_or(NativeProcessError::Stale)
+    }
     pub fn with_crossing(
         task: &'a CurrentTask,
         slot: SlotId,
@@ -2319,37 +2329,44 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         {
             return Err(NativeProcessError::Stale);
         }
-        // Resolve the issuing authority before the token leaves the record:
-        // only a metadata request wait is not issued by the IPC arena.
-        let region = if carrick_sched_core::object_wait::OperationToken::new(
-            census.operation,
-            census.operation_generation,
-        )
-        .is_some()
-        {
-            Some(
-                self.crossing
+        // The queue domain the operation was parked on names its issuing
+        // authority. Only an authority with an existing settlement may take
+        // the token; every other operation is refused before it leaves the
+        // record (its owner settles it, or the exit reports the refusal).
+        use carrick_sched_core::object_wait::OperationDomain;
+        match owned.object_operation_domain() {
+            Some(OperationDomain::IpcObject) => {
+                let (region, _) = self
+                    .crossing
                     .ipc_binding()
-                    .ok_or(NativeProcessError::Unsupported)?
-                    .0,
-            )
-        } else {
-            None
-        };
-        let token =
-            carrick_core::wait::take_object_operation(self.zone, self.slot, owned.identity())
-                .map_err(|_| NativeProcessError::Stale)?
-                .ok_or(NativeProcessError::Stale)?;
-        match region {
-            Some(region) => super::ipc::abandon_native_operation(
-                &region, token, self.zone, self.slot, self.task,
-            )
-            .map_err(|_| NativeProcessError::Quarantined),
-            // No authority owns a metadata request wait: taking it settles it.
-            None => {
+                    .ok_or(NativeProcessError::Unsupported)?;
+                super::ipc::authenticate_native_operation(
+                    &region,
+                    census.operation,
+                    census.operation_generation,
+                    self.task,
+                )
+                .map_err(|_| NativeProcessError::Stale)?;
+                let token = self.take_exiting_operation(owned.identity())?;
+                super::ipc::abandon_native_operation(
+                    &region, token, self.zone, self.slot, self.task,
+                )
+                .map_err(|_| NativeProcessError::Quarantined)
+            }
+            // No authority owns a carrier metadata request wait (the
+            // allocator adapter consumes it the same way): taking it is
+            // the whole settlement.
+            Some(OperationDomain::Metadata)
+                if carrick_sched_core::object_wait::OperationToken::metadata_request(
+                    census.operation_generation,
+                )
+                .is_some_and(|token| token.index() == census.operation) =>
+            {
+                let token = self.take_exiting_operation(owned.identity())?;
                 debug_assert!(token.metadata_generation().is_some());
                 Ok(())
             }
+            _ => Err(NativeProcessError::Unsupported),
         }
     }
     fn retire_fd_table(&mut self, table: u64) {

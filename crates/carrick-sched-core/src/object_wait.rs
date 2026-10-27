@@ -66,7 +66,7 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 12;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 13;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
@@ -74,6 +74,8 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         OBJECT_HOST_CONTINUATION as u64,
         OWNER_CONTINUATION as u64,
         OWNER_EXCEPTION_ENTRY as u64,
+        OPERATION_DOMAIN_SHIFT as u64,
+        OPERATION_DOMAIN_MASK as u64,
         ADMISSION_PENDING as u64,
         ADMISSION_CUSTODY as u64,
         ADMISSION_POSTED as u64,
@@ -127,6 +129,38 @@ pub struct ObjectWaitKey {
 }
 
 impl ObjectWaitKey {
+    /// The authority domain owning this queue index (`None`: an unassigned
+    /// spare index, which no key constructor produces).
+    pub const fn domain(&self) -> Option<OperationDomain> {
+        let index = self.index as usize;
+        if index < ADDRESS_SPACE_WAIT_BASE {
+            Some(OperationDomain::IpcObject)
+        } else if index == METADATA_WAIT_INDEX {
+            Some(OperationDomain::Metadata)
+        } else if index < RESERVATION_POOL_WAIT_INDEX {
+            Some(OperationDomain::AddressSpace)
+        } else if index == RESERVATION_POOL_WAIT_INDEX {
+            Some(OperationDomain::ReservationPool)
+        } else if index < ORIGINAL_OBJECT_WAIT_QUEUES {
+            None
+        } else if index < DELEGATED_FILE_WAIT_BASE {
+            Some(OperationDomain::SpaceCause)
+        } else if index < NATIVE_SERVICE_WAIT_BASE {
+            Some(OperationDomain::DelegatedFile)
+        } else if index < OBJECT_WAIT_QUEUES {
+            Some(OperationDomain::NativeService)
+        } else {
+            None
+        }
+    }
+
+    const fn domain_bits(&self) -> u32 {
+        match self.domain() {
+            Some(domain) => domain.bits(),
+            None => 0,
+        }
+    }
+
     pub const fn new(index: u32, generation: u64) -> Option<Self> {
         if index == 0 || index as usize >= ORIGINAL_OBJECT_WAIT_QUEUES || generation == 0 {
             None
@@ -631,9 +665,10 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectNotificationTicket<'
         rec.object
             .generation
             .store(key.generation, Ordering::Relaxed);
-        rec.object
-            .expired
-            .store(OBJECT_HOST_CONTINUATION, Ordering::Relaxed);
+        rec.object.expired.store(
+            OBJECT_HOST_CONTINUATION | key.domain_bits(),
+            Ordering::Relaxed,
+        );
         rec.object.next.store(0, Ordering::Relaxed);
         rec.object.prev.store(ADMISSION_CUSTODY, Ordering::Release);
         zone.mark_woken(rec, 0);
@@ -783,6 +818,56 @@ const OBJECT_EXPIRED: u32 = 1;
 const OBJECT_HOST_CONTINUATION: u32 = 2;
 const OWNER_CONTINUATION: u32 = 4;
 const OWNER_EXCEPTION_ENTRY: u32 = 8;
+/// The issuing domain of the pending operation (`OperationDomain`), stamped
+/// with the operation and kept after its registration is unlinked.
+const OPERATION_DOMAIN_SHIFT: u32 = 16;
+const OPERATION_DOMAIN_MASK: u32 = 0xff << OPERATION_DOMAIN_SHIFT;
+
+/// The queue domain whose authority issued a record's pending operation.
+/// Each domain owns a disjoint queue index range, so the domain names the
+/// only authority that may settle the operation's token.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+#[repr(u8)]
+pub enum OperationDomain {
+    /// An IPC object readiness lane (the original queue domain).
+    IpcObject = 1,
+    /// The carrier metadata request queue.
+    Metadata = 2,
+    /// An exact admitted MM incarnation's queue.
+    AddressSpace = 3,
+    /// Carrier reservation-pool progress.
+    ReservationPool = 4,
+    /// An address-space cause queue beyond the original domain.
+    SpaceCause = 5,
+    /// A delegated host file wait.
+    DelegatedFile = 6,
+    /// A native member's service queue.
+    NativeService = 7,
+}
+
+impl OperationDomain {
+    const fn bits(self) -> u32 {
+        (self as u32) << OPERATION_DOMAIN_SHIFT
+    }
+    const fn from_bits(flags: u32) -> Option<Self> {
+        match (flags & OPERATION_DOMAIN_MASK) >> OPERATION_DOMAIN_SHIFT {
+            1 => Some(Self::IpcObject),
+            2 => Some(Self::Metadata),
+            3 => Some(Self::AddressSpace),
+            4 => Some(Self::ReservationPool),
+            5 => Some(Self::SpaceCause),
+            6 => Some(Self::DelegatedFile),
+            7 => Some(Self::NativeService),
+            _ => None,
+        }
+    }
+}
 
 /// The entry whose native context the retained owner parked.
 #[derive(
@@ -1281,14 +1366,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
         }
         rollback.armed = false;
         rec.object.expired.store(
-            match destination {
-                OperationDestination::Guest => 0,
-                OperationDestination::Host => OBJECT_HOST_CONTINUATION,
-                OperationDestination::Owner(OwnerEntry::Syscall) => OWNER_CONTINUATION,
-                OperationDestination::Owner(OwnerEntry::Exception) => {
-                    OWNER_CONTINUATION | OWNER_EXCEPTION_ENTRY
-                }
-            },
+            self.key.domain_bits()
+                | match destination {
+                    OperationDestination::Guest => 0,
+                    OperationDestination::Host => OBJECT_HOST_CONTINUATION,
+                    OperationDestination::Owner(OwnerEntry::Syscall) => OWNER_CONTINUATION,
+                    OperationDestination::Owner(OwnerEntry::Exception) => {
+                        OWNER_CONTINUATION | OWNER_EXCEPTION_ENTRY
+                    }
+                },
             Ordering::Relaxed,
         );
         self.zone.set_deadline(record, deadline);
@@ -1482,6 +1568,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
 
     pub fn has_object_operation(&self) -> bool {
         self.object.operation.load(Ordering::Acquire) != 0
+    }
+
+    /// The domain whose authority issued the pending operation, retained
+    /// after a wake unlinks its registration (`None`: no operation).
+    pub fn object_operation_domain(&self) -> Option<OperationDomain> {
+        if !self.has_object_operation() {
+            return None;
+        }
+        OperationDomain::from_bits(self.object.expired.load(Ordering::Acquire))
     }
 
     /// Whether this record's last object park ended at its deadline rather
@@ -1983,13 +2078,57 @@ mod host_tests {
             zone.record(record).resume_disposition(),
             ResumeDisposition::OwnerContinuation(OwnerEntry::Exception)
         );
+        // The wake unlinked the registration; the issuing domain stays.
+        assert_eq!(zone.record(record).object_wait_census().unwrap().queue, 0);
+        assert_eq!(
+            zone.record(record).object_operation_domain(),
+            Some(OperationDomain::NativeService)
+        );
         // SAFETY: switch_in gave this fixture exclusive OnCpu custody.
         unsafe {
             let completed = zone.record(record).take_object_operation().unwrap();
+            assert_eq!(zone.record(record).object_operation_domain(), None);
             assert_eq!(completed.index(), u64::from(record.raw()));
             assert_eq!(completed.generation(), 19);
             assert!(zone.record(record).take_object_operation().is_none());
         }
+    }
+
+    #[test]
+    fn operation_domain_follows_each_disjoint_queue_range() {
+        assert_eq!(key(1).domain(), Some(OperationDomain::IpcObject));
+        assert_eq!(
+            ObjectWaitKey::metadata_request(3).unwrap().domain(),
+            Some(OperationDomain::Metadata)
+        );
+        assert_eq!(
+            ObjectWaitKey::address_space(0, 1).unwrap().domain(),
+            Some(OperationDomain::AddressSpace)
+        );
+        assert_eq!(
+            ObjectWaitKey::reservation_pool(core::num::NonZeroU64::MIN).domain(),
+            Some(OperationDomain::ReservationPool)
+        );
+        let record = RecordRef {
+            id: RecordId::from_raw(5).unwrap(),
+            incarnation: 1,
+        };
+        assert_eq!(
+            ObjectWaitKey::native_service(record).unwrap().domain(),
+            Some(OperationDomain::NativeService)
+        );
+        let zone = fixture(true);
+        let record = allocate(&zone, 101);
+        {
+            let queue = zone.object_wait(key(1), &SpinForever).unwrap();
+            queue
+                .park(queue.snapshot(), record, OperationToken::new(9, 4).unwrap())
+                .unwrap();
+        }
+        assert_eq!(
+            zone.record(record).object_operation_domain(),
+            Some(OperationDomain::IpcObject)
+        );
     }
 
     #[test]
