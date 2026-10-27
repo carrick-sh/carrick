@@ -3512,7 +3512,7 @@ fn fault_entry_mode() -> i32 {
 fn metadata_allocator_control(subtest: u64) -> i64 {
     unsafe {
         raw6(
-            carrick_el1_abi::SYS_CARRICK_EL1_CONTROL,
+            carrick_el1_control_abi::SYS_CARRICK_EL1_CONTROL,
             1,
             subtest,
             0,
@@ -3530,7 +3530,7 @@ fn metadata_allocator_drain() -> i64 {
     const MAX_BOUNDARIES: usize = 2 * 128 + 2;
     for _ in 0..MAX_BOUNDARIES {
         let drain = metadata_allocator_control(5);
-        if drain != carrick_el1_abi::METADATA_GRANT_PENDING as i64 {
+        if drain != carrick_el1_control_abi::METADATA_GRANT_PENDING as i64 {
             return drain;
         }
     }
@@ -3541,7 +3541,7 @@ fn metadata_allocator_phase(subtest: u64, drain_on_success: bool) -> i64 {
     const MAX_BOUNDARIES: usize = 2 * 128 + 2;
     for _ in 0..MAX_BOUNDARIES {
         let rc = metadata_allocator_control(subtest);
-        if rc != carrick_el1_abi::METADATA_GRANT_PENDING as i64 {
+        if rc != carrick_el1_control_abi::METADATA_GRANT_PENDING as i64 {
             if rc != 0 {
                 return rc;
             }

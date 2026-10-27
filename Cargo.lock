@@ -509,6 +509,7 @@ name = "carrick-el1-abi"
 version = "0.1.0"
 dependencies = [
  "carrick-core-abi",
+ "carrick-el1-control-abi",
  "carrick-fd-core",
  "carrick-guest-arch",
  "carrick-inotify-core",
@@ -519,6 +520,10 @@ dependencies = [
  "carrick-signal-core",
  "carrick-syscall-abi",
 ]
+
+[[package]]
+name = "carrick-el1-control-abi"
+version = "0.1.0"
 
 [[package]]
 name = "carrick-el1-image"

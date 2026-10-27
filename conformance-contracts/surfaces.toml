@@ -628,6 +628,10 @@ path = "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs"
 contracts = ["kernel.el1.gic", "process.exec.backing"]
 
 [[surfaces]]
+path = "crates/carrick-el1-control-abi/src/lib.rs"
+contracts = ["kernel.el1.metadata-allocation"]
+
+[[surfaces]]
 path = "crates/carrick-el1-abi/src/lib.rs"
 contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.stage1-publication", "process.native.terminal-child", "kernel.el1.open-lifetime", "kernel.x86.file-region", "kernel.el1.signal-delivery-owner"]
 

@@ -310,6 +310,10 @@ _lint-domains-source:
     # step lock drift surfaced only at `just fixtures-publish`. No compile, so it
     # costs a lock resolution per fixture.
     ./scripts/check-fixture-lockfiles.sh
+    # Every checkout crate a signed fixture reaches is a bundle input; only
+    # dependency-free leaf crates may be reached, so kernel-only commits keep
+    # the published fixture bundle valid (#891).
+    {{_xtask}} fixtures leaf-closure
     {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
     # Generic scalar rules here; symbol-bound task rules and mandatory owner
@@ -523,7 +527,7 @@ _test-xtask-shards:
 
 [private]
 _test-xtask-domain-unit:
-    {{_cargo}} test --locked -p carrick-xtask --all-features --lib -- terminal_custody copyout_debt
+    {{_cargo}} test --locked -p carrick-xtask --all-features --lib -- terminal_custody copyout_debt fixture_leaf_closure
 
 [private]
 _test-xtask-domain-integration:

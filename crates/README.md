@@ -48,6 +48,7 @@ lists it). Do not read the crate map as a completed neutral/Linux layering.
 | `carrick-core` | Neutral MM, fork, COW, and wait/lifecycle substrate for Carrick (shared owner algorithms; hardware and Linux lowering stay with clients). |
 | `carrick-core-abi` | Neutral owner identities and transport, shared by both ISA images. |
 | `carrick-el1-abi` | Contracts, memory layouts, and definitions shared between the host runtime and the bare-metal in-guest EL1 kernel (`carrick-el1`). |
+| `carrick-el1-control-abi` | `no_std`, dependency-free leaf holding the guest-facing constants of the private EL1 control syscall; re-exported by `carrick-el1-abi`. Signed guest fixtures depend only on leaf crates like this so kernel-only commits keep the fixture bundle's input identity (`carrick-xtask fixtures leaf-closure`, #891). |
 | `carrick-fatal` | Single fatal sink for carrier invariant violations (`carrick_fatal!`) with non-allocating stack formatting and `CARRICK_LAST_FATAL` recording. |
 | `carrick-fd-core` | Allocation-free descriptor and OFD authority as shared atomic records across host and EL1. |
 | `carrick-guest-arch` | The no_std hardware boundary and sealed `Arch` traits for Carrick's in-guest kernel. |

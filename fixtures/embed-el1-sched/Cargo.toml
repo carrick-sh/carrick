@@ -16,7 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-carrick-el1-abi = { path = "../../crates/carrick-el1-abi" }
+# Leaf only: a fixture path dependency is a signed-bundle input (#891).
+carrick-el1-control-abi = { path = "../../crates/carrick-el1-control-abi" }
 
 [profile.release]
 opt-level = 2
