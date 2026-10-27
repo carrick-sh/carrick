@@ -2303,6 +2303,55 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         Ok(())
     }
+    fn abandon_object_operation(
+        &mut self,
+        record: carrick_sched_core::RecordRef,
+    ) -> Result<(), NativeProcessError> {
+        let owned = self.zone.record(record.id);
+        let Some(census) = owned.object_wait_census().filter(|c| c.operation != 0) else {
+            return Ok(());
+        };
+        // The exit's wake detached every registration before queueing the
+        // record; a still-enrolled or recycled record is not this exit's.
+        if owned.incarnation() != record.incarnation
+            || census.queue != 0
+            || self.zone.slot(self.slot).current() != Some(record.id)
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        // Resolve the issuing authority before the token leaves the record:
+        // only a metadata request wait is not issued by the IPC arena.
+        let region = if carrick_sched_core::object_wait::OperationToken::new(
+            census.operation,
+            census.operation_generation,
+        )
+        .is_some()
+        {
+            Some(
+                self.crossing
+                    .ipc_binding()
+                    .ok_or(NativeProcessError::Unsupported)?
+                    .0,
+            )
+        } else {
+            None
+        };
+        let token =
+            carrick_core::wait::take_object_operation(self.zone, self.slot, owned.identity())
+                .map_err(|_| NativeProcessError::Stale)?
+                .ok_or(NativeProcessError::Stale)?;
+        match region {
+            Some(region) => super::ipc::abandon_native_operation(
+                &region, token, self.zone, self.slot, self.task,
+            )
+            .map_err(|_| NativeProcessError::Quarantined),
+            // No authority owns a metadata request wait: taking it settles it.
+            None => {
+                debug_assert!(token.metadata_generation().is_some());
+                Ok(())
+            }
+        }
+    }
     fn retire_fd_table(&mut self, table: u64) {
         if let Some((region, map)) = self.crossing.ipc_binding()
             && let Some(raw) = map.take_owned(table)

@@ -433,6 +433,17 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         Ok(())
     }
     fn retire_fd_table(&mut self, _table: u64) {}
+    /// Abandon the object operation (an IPC wait the exit woke) that the
+    /// exiting, switched-in `record` still owns, through the authority that
+    /// issued it. Retirement must never meet a record owning an operation:
+    /// the scheduler requeues such a record instead of releasing it. A
+    /// service without that authority refuses before taking the token.
+    fn abandon_object_operation(
+        &mut self,
+        _record: carrick_sched_core::RecordRef,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
     /// The root exit crossing terminates every remaining thread of the run,
     /// so a root `exit_group` may complete while siblings are still live.
     /// Their census and pool entries stay with the host, which retires them
@@ -3785,6 +3796,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
         self.run_failure.take()
     }
+    /// A leaving thread abandons the object wait its exit woke (Linux drops
+    /// a dying thread's wait-queue entries) before any retirement: release
+    /// requeues a record that still owns an operation, which would strand
+    /// the leaving record and quarantine the run.
+    fn abandon_leaving_operation(&mut self) -> Result<(), NativeProcessError> {
+        let zone = self.source.zone;
+        if zone.slot(self.source.slot).current() != Some(self.record.id)
+            || !zone.record(self.record.id).has_object_operation()
+        {
+            return Ok(());
+        }
+        self.service.abandon_object_operation(self.record)
+    }
     fn run_failed(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> LifecycleOutcome {
         self.run_failure = Some(reason);
         if let Some(record) = self
@@ -5109,6 +5133,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .record(self.record.id)
                     .consume_owner_continuation();
             }
+            if let Err(error) = self.abandon_leaving_operation() {
+                return Some(self.run_failed(error.run_failure_reason()));
+            }
             if let Some(status) = self.pending_close_status() {
                 return Some(match self.retire_closing_member(status) {
                     Ok(outcome) => outcome,
@@ -5118,6 +5145,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // Wait/IPC handbacks re-enter the saved syscall instruction too.
             // Their owned operation, rather than a readiness scalar or a new
             // dispatch, decides completion below.
+            self.retire_thread_identity(self.calling_tid);
+            let Some(receipt) =
+                carrick_core::entry::retire_current(self.binding, self.source, self.record.id)
+            else {
+                return Some(self.run_failed(NativeProcessError::Quarantined.run_failure_reason()));
+            };
+            self.handoff = Some(receipt);
+            return Some(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            });
         }
         self.resume_pending_wait()
     }
@@ -5850,6 +5888,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         wait_status: LinuxWaitStatus,
         entry: OwnerEntry,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
+        self.abandon_leaving_operation()?;
         let child_pid = self
             .runtime
             .graph

@@ -31,6 +31,20 @@ impl LifecycleVenue for ChildVenue {
 
 #[test]
 fn native_fatal_worker_wakes_futex_parked_leader_before_exit_drain() {
+    fatal_worker_retires_parked_leader(false);
+}
+
+/// A member woken out of a one-description pipe poll by a sibling's fatal
+/// exit still owns its poll operation (endpoint pin and operation record)
+/// when it is selected. Its exit must abandon that wait before retirement;
+/// the scheduler otherwise requeues the leaving record and native
+/// retirement quarantines the run (#856, eight-pair two-process pipe case).
+#[test]
+fn native_fatal_worker_retires_leader_holding_pipe_poll_operation() {
+    fatal_worker_retires_parked_leader(true);
+}
+
+fn fatal_worker_retires_parked_leader(pipe_poll: bool) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -46,6 +60,47 @@ fn native_fatal_worker_wakes_futex_parked_leader_before_exit_drain() {
     )
     .with_words(words);
     service.crossing.terminal_task = Some(&fixture.task);
+    let ipc = pipe_poll.then(|| {
+        use carrick_el1_abi::ipc::{IpcBacking, fd, pipe};
+        let owner = std::sync::Arc::new(carrick_kernel::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let table = carrick_kernel::el1_ipc::HostTable::create(owner.clone(), 64, 8).unwrap();
+        let object = owner.create_pipe(65536).unwrap();
+        let region = owner.region();
+        let fd = region.fd(carrick_kernel::el1_zone::HostLockWait);
+        for (number, end, access) in [
+            (3, pipe::End::Reader, fd::AccessMode::ReadOnly),
+            (4, pipe::End::Writer, fd::AccessMode::WriteOnly),
+        ] {
+            let pin = fd
+                .create_pinned(fd::Description::new(
+                    IpcBacking::Pipe { object, end }.encode(),
+                    access,
+                    fd::StatusFlags::default(),
+                ))
+                .unwrap();
+            fd.install_pin(table.id(), fd::Fd(number), &pin, false)
+                .unwrap();
+            assert_eq!(fd.unpin(pin).unwrap(), None);
+        }
+        let storage = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+        // SAFETY: retained aligned ABI storage contains this zeroed map.
+        let map = unsafe {
+            &*storage
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+                .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+        };
+        map.publish(5, table.id().to_raw()).unwrap();
+        fixture
+            .zone
+            .bind_object_wait(
+                carrick_el1::substrate::ipc::wait_key(object, pipe::WaitFor::Readable).unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+            )
+            .unwrap();
+        service.crossing.ipc = Some((owner.clone(), map));
+        (owner, table, map)
+    });
     let mut frame = carrick_el1_abi::TrapFrame::default();
     let mut cpu = crate::sched::FakeCpu::default();
     frame.x[8] = 220;
@@ -141,7 +196,82 @@ fn native_fatal_worker_wakes_futex_parked_leader_before_exit_drain() {
     frame.x[0] = join.as_ptr() as u64;
     frame.x[1] = 128;
     frame.x[2] = 1;
-    call(&mut service, &mut frame, &mut cpu);
+    let poll_operation = ipc.as_ref().map(|(owner, _, map)| {
+        // The adapter's fresh-call park (`ipc::poll::serve_one`): pin the
+        // inherited reader, find it empty, enroll a PollWait operation on
+        // the pipe's readable queue and switch to the runnable worker.
+        use carrick_el1_abi::ipc::{IpcOpKind, IpcOperation, IpcUserVa, WriteProgress, fd, pipe};
+        let region = owner.region();
+        let table = fd::TableId::from_raw(
+            map.lookup_owned(fixture.task.linux.file_table.load(Ordering::Acquire))
+                .expect("forked leader owns its inherited descriptor table"),
+        );
+        let (pin, description) = region
+            .fd(carrick_sched_core::ShortLockSpin)
+            .pin(table, fd::Fd(3))
+            .unwrap();
+        let Some(carrick_el1_abi::ipc::IpcBacking::Pipe {
+            object,
+            end: pipe::End::Reader,
+        }) = carrick_el1_abi::ipc::IpcBacking::decode(description.backing)
+        else {
+            panic!("fd 3 is the inherited pipe reader");
+        };
+        let key = carrick_el1::substrate::ipc::wait_key(object, pipe::WaitFor::Readable).unwrap();
+        let token = region
+            .begin_operation(IpcOperation {
+                kind: IpcOpKind::PollWait,
+                pin: pin.into_raw(),
+                object: object.to_raw(),
+                task: carrick_el1_abi::ipc::IpcTaskKey(
+                    fixture.task.execution.task.load(Ordering::Acquire),
+                ),
+                mm: carrick_el1_abi::ipc::IpcMmKey(fixture.task.mm.key.load(Ordering::Acquire)),
+                buf: IpcUserVa(0x7000),
+                progress: WriteProgress { len: 3, written: 0 },
+                nr: 73,
+                ..IpcOperation::EMPTY
+            })
+            .unwrap();
+        let raw = token.into_raw();
+        let counters = carrick_el1_abi::Counters::new();
+        let mut sched = crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        };
+        frame.x = [0; 31];
+        frame.x[8] = 73;
+        frame.elr = 0x4004;
+        let snapshot = sched.observe_object(key).unwrap();
+        let parked = sched
+            .park_object(
+                &frame,
+                key,
+                snapshot,
+                carrick_el1::substrate::sched::object_wait::OperationResumePc::new(0x4000).unwrap(),
+                carrick_el1::substrate::ipc::to_sched_token(
+                    carrick_el1_abi::ipc::IpcOpToken::from_raw(raw),
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        assert!(
+            sched
+                .resume_after_object_park(&mut frame, parked, 0)
+                .is_some()
+        );
+        assert!(fixture.zone.record(leader).has_object_operation());
+        raw
+    });
+    if poll_operation.is_none() {
+        call(&mut service, &mut frame, &mut cpu);
+    }
     assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(worker));
     assert!(matches!(
         fixture.zone.record(leader).claim(),
@@ -230,4 +360,13 @@ fn native_fatal_worker_wakes_futex_parked_leader_before_exit_drain() {
         carrick_sched_core::Claim::Free
     ));
     assert!(!fixture.zone.spaces.is_open(identity.mm));
+    if let (Some((owner, _, _)), Some(raw)) = (&ipc, poll_operation) {
+        assert!(
+            owner
+                .region()
+                .operation(&carrick_el1_abi::ipc::IpcOpToken::from_raw(raw))
+                .is_err(),
+            "the leader's exit must finish its abandoned poll operation"
+        );
+    }
 }

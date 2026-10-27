@@ -210,6 +210,40 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
     }
 }
 
+/// Abandon the object operation an exiting native thread still owns.
+///
+/// A thread woken out of an IPC wait by its process's exit never re-enters
+/// the adapter that parked it, so that adapter cannot consume the token.
+/// Like Linux, the leaving thread drops its wait: the operation record is
+/// finished exactly once and its description pin goes through the same
+/// physical release (and peer wakes) as a native close. A metadata request
+/// wait has no IPC authority; taking its token is the whole settlement.
+pub(crate) fn abandon_native_operation<C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    token: carrick_sched_core::object_wait::OperationToken,
+    zone: &carrick_sched_core::ZoneTables<C>,
+    slot: carrick_el1_abi::SlotId,
+    task: &CurrentTask,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    use carrick_el1_abi::ipc::IpcError;
+    if token.metadata_generation().is_some() {
+        return Ok(());
+    }
+    let token = from_sched_token(token).ok_or(IpcError::Corrupt)?;
+    let op = region.finish_operation(token)?;
+    if op.pin.authority == 0 {
+        return Ok(());
+    }
+    match region
+        .fd(EL1_WAIT)
+        .unpin(OfdPin::from_raw(op.pin))
+        .map_err(IpcError::Fd)?
+    {
+        Some(description) => release_native_description(region, description, zone, slot, task),
+        None => Ok(()),
+    }
+}
+
 /// Tables resolved through the host-published [`IpcTableMap`], keyed by the
 /// running task's host file table (which an EL1 switch-in updates): a table
 /// with no entry is not served.
