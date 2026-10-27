@@ -947,6 +947,10 @@ path = "crates/carrick-core/tests/entry_completion.rs"
 contracts = ["core.entry.completion"]
 
 [[surfaces]]
+path = "crates/carrick-el1-abi/src/stack_overflow.rs"
+contracts = ["kernel.el1.fault-entry"]
+
+[[surfaces]]
 path = "crates/carrick-el1-abi/src/entry_binding_fatal.rs"
 contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle"]
 
