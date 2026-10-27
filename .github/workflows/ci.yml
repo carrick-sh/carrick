@@ -99,6 +99,11 @@ jobs:
             cache-size: 512M
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    # The R2 writer token is an environment secret, readable only by jobs
+    # running from main under this environment's deployment-branch rule; a
+    # workflow edited on another branch cannot reach it (repository secrets
+    # ignore this job's `if:`).
+    environment: sccache-writer
     env:
       # Reserve quota for the two retained target caches and package/sysroot caches.
       SCCACHE_CACHE_SIZE: ${{ matrix.cache-size }}

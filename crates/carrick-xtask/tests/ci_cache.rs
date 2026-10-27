@@ -495,6 +495,7 @@ fn hosted_jobs_read_the_r2_compiler_cache_and_only_the_warmer_writes() {
             );
             let writer = body["env"]["AWS_ACCESS_KEY_ID"].as_str();
             if job == "cache-warm" {
+                assert_eq!(body["environment"].as_str(), Some("sccache-writer"));
                 assert_eq!(
                     writer,
                     Some("${{ secrets.SCCACHE_R2_WRITER_ACCESS_KEY_ID }}")
@@ -505,6 +506,7 @@ fn hosted_jobs_read_the_r2_compiler_cache_and_only_the_warmer_writes() {
                 );
             } else {
                 assert!(writer.is_none(), "{job}: only cache-warm gets the writer");
+                assert!(body["environment"].is_badvalue(), "{job}");
                 assert!(body["env"]["AWS_SECRET_ACCESS_KEY"].is_badvalue(), "{job}");
             }
         }
