@@ -3547,6 +3547,25 @@ fn metadata_allocator_control(subtest: u64) -> i64 {
     }
 }
 
+/// Drive EL1 past the end of this CPU's stack (control op 2, #369). The
+/// unmapped guard below the stack stops it with a host-reported
+/// `El1StackOverflow`; reaching the print below means nothing did.
+fn stack_guard_mode() -> i32 {
+    let rc = unsafe {
+        raw6(
+            carrick_el1_control_abi::SYS_CARRICK_EL1_CONTROL,
+            2,
+            64,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    println!("stack-guard returned rc={rc}: no guard stopped the overflow");
+    1
+}
+
 fn metadata_allocator_drain() -> i64 {
     // One global mailbox can require one boundary per grant/return. The
     // allocator admits at most 128 extents, so this bound covers a complete
@@ -3848,6 +3867,7 @@ fn main() {
         "metadata-allocator" => {
             metadata_allocator_mode(args.get(2).map(String::as_str).unwrap_or(""))
         }
+        "stack-guard" => stack_guard_mode(),
         "exec-child" => {
             println!("exec-child ok");
             0

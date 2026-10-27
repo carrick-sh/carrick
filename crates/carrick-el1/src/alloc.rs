@@ -660,3 +660,24 @@ mod tests {
         );
     }
 }
+
+/// Test-control witness for the EL1 stack guards (#369), invoked by the
+/// embed fixture through `SYS_CARRICK_EL1_CONTROL` op 2 in the
+/// test-control image only. Each level keeps a 1 KiB record live across
+/// the next call, so `depth` levels need about `depth` KiB of stack: past
+/// the 16 KiB stack the next frame's first store lands in the unmapped
+/// guard below it, and the host reports `El1StackOverflow`. It returns
+/// only when no guard stopped it, which the fixture reports as a failure.
+#[cfg(feature = "allocator-test-control")]
+#[inline(never)]
+pub fn run_stack_guard_witness(depth: u64) -> u64 {
+    let mut record = [0_u8; 1024];
+    record[0] = depth as u8;
+    core::hint::black_box(&mut record);
+    let below = if depth == 0 {
+        0
+    } else {
+        run_stack_guard_witness(depth - 1)
+    };
+    u64::from(core::hint::black_box(&record)[1023]).wrapping_add(below)
+}

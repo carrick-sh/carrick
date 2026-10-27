@@ -2242,6 +2242,9 @@ impl<
         }
         let res = match frame.x[0] {
             1 => carrick_el1::alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
+            // The stack guard witness (#369): never returns while the guard
+            // below this CPU's EL1 stack is unmapped.
+            2 => carrick_el1::alloc::run_stack_guard_witness(frame.x[1].min(64)),
             _ => 1,
         };
         if res == carrick_el1_abi::METADATA_GRANT_PENDING {
