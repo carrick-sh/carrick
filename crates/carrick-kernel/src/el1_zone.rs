@@ -329,6 +329,24 @@ pub fn hand_back_foreign_timer(slot: SlotId) {
         return;
     };
     while let Some(foreign) = zone.take_foreign_timer(slot) {
+        // A native member has no host thread to re-run its call: a host
+        // claim would strand it (#856). It re-runs in the zone instead.
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        let native = zone.requeue_native_timed_park(
+            carrick_sched_core::ForeignTimer {
+                record: foreign.record,
+                seq: foreign.seq,
+            },
+            slot,
+            &mut effects,
+        );
+        if native.is_some() {
+            for target in effects.sgi_slots() {
+                zone.owe_resched(target);
+                resched_slot(target);
+            }
+            continue;
+        }
         if let HostClaim::Claimed = claim(foreign.record, Some(foreign.seq), Handback::Control) {
             hand_back(&[foreign.record]);
         }
@@ -1494,6 +1512,60 @@ mod tests {
         let raw = carrick_el1_abi::zone_tables().unwrap();
         assert_eq!(raw.carrier_affinity_mask(), Some(u64::MAX >> (64 - count)));
         assert_eq!(raw.carrier_cpu_count(), Some(count));
+    }
+
+    /// #856: a native fork child's poll with a timeout parks on its slot's
+    /// timer. When that slot's executor leaves EL1, a host claim would hand
+    /// the record to a host thread that does not exist, so the child hung
+    /// with `Claim::Host`/`Control` while still owning its poll operation.
+    /// The native member must instead stay queued in the zone and re-run
+    /// its call there.
+    #[test]
+    fn serial_host_native_member_timed_poll_stays_in_the_zone_when_its_slot_leaves() {
+        use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let previous = carrick_el1_abi::get_el1_region_host_ptr();
+        struct Restore(usize, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+                enable(self.1);
+            }
+        }
+        let _restore = Restore(
+            previous,
+            GUEST_SCHEDULER.load(std::sync::atomic::Ordering::Acquire),
+        );
+        carrick_el1_abi::record_el1_region_host_ptr(region.as_mut_ptr() as usize);
+        enable(true);
+        let zone = zone().expect("the region's zone serves this test");
+        let slot = SlotId::new(1);
+        zone.drive(slot, 7);
+        let member = zone.alloc_record(identity(41)).unwrap();
+        assert!(zone.mark_native_owned(member));
+        let key = ObjectWaitKey::new(5, 1).unwrap();
+        zone.bind_object_wait(key, &HostLockWait).unwrap();
+        let seq = zone.next_seq(member);
+        zone.arm_timer(slot, member, seq).unwrap();
+        {
+            let guard = zone.object_wait(key, &HostLockWait).unwrap();
+            guard
+                .park_until(
+                    guard.snapshot(),
+                    member,
+                    OperationToken::new(41, 1).unwrap(),
+                    u64::MAX - 1,
+                )
+                .unwrap();
+        }
+        hand_back_foreign_timer(slot);
+        assert!(
+            matches!(zone.record(member).claim(), Claim::Queued { slot: queued, .. } if queued == slot),
+            "a native member's timed park must stay in the zone, got {:?}",
+            zone.record(member).claim()
+        );
+        assert!(zone.record(member).has_object_operation());
+        assert_eq!(zone.timer_owner(slot), None);
     }
 
     #[test]

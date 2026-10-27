@@ -3257,6 +3257,69 @@ mod host_tests {
         record
     }
 
+    /// #856: a native member's timed object park (a poll with a timeout)
+    /// left on a slot whose executor leaves EL1 has no host thread to re-run
+    /// the call. It stays in the zone, queued with its operation retained,
+    /// and only for the exact park its ticket names.
+    #[test]
+    fn native_foreign_timed_park_stays_in_the_zone() {
+        let zone = fixture(true);
+        let record = allocate(&zone, 320);
+        assert!(zone.mark_native_owned(record));
+        let seq = zone.next_seq(record);
+        zone.arm_timer(SLOT, record, seq).unwrap();
+        {
+            let guard = zone.object_wait(key(1), &SpinForever).unwrap();
+            guard
+                .park_until(
+                    guard.snapshot(),
+                    record,
+                    OperationToken::new(320, 1).unwrap(),
+                    5_000,
+                )
+                .unwrap();
+        }
+        let host = park_foreign_until(&zone, 2, 321, 6_000);
+        let first = zone.take_foreign_timer(SLOT).unwrap();
+        assert_eq!(first.record, zone.record_ref(record));
+        let ticket = |seq| crate::ForeignTimer {
+            record: first.record,
+            seq,
+        };
+        let mut effects = crate::WakeEffects::default();
+        // A stale ticket for an earlier park of the same record is refused.
+        let stale = ticket(first.seq.wrapping_sub(1));
+        assert_eq!(
+            zone.requeue_native_timed_park(stale, SLOT, &mut effects),
+            Some(false)
+        );
+        assert!(matches!(zone.record(record).claim(), Claim::Parked { .. }));
+        assert_eq!(
+            zone.requeue_native_timed_park(ticket(first.seq), SLOT, &mut effects),
+            Some(true)
+        );
+        assert!(matches!(
+            zone.record(record).claim(),
+            Claim::Queued { slot: SLOT, .. }
+        ));
+        assert!(zone.record(record).has_object_operation());
+        assert_eq!(zone.record(record).object_wait_census().unwrap().queue, 0);
+        assert_eq!(zone.record(record).handback(), Some(Handback::Resumed));
+        assert_eq!(
+            zone.requeue_native_timed_park(ticket(first.seq), SLOT, &mut effects),
+            Some(false),
+            "exactly once"
+        );
+        // A host thread's timed park is not the zone's to keep.
+        let second = zone.take_foreign_timer(SLOT).unwrap();
+        assert_eq!(second.record, zone.record_ref(host));
+        assert_eq!(
+            zone.requeue_native_timed_park(second, SLOT, &mut effects),
+            None
+        );
+        assert!(matches!(zone.record(host).claim(), Claim::Parked { .. }));
+    }
+
     #[test]
     fn concurrent_timed_parks_share_the_slot_timer() {
         let zone = fixture(true);
