@@ -289,6 +289,18 @@ impl std::fmt::Display for GuestRetirementProofError {
 impl std::error::Error for GuestRetirementProofError {}
 
 impl Stage1LeafRetirementPlan {
+    /// Record every leaf in `[va, va+len)` whose output this retirement
+    /// accounts for.
+    ///
+    /// `translate` must resolve leaves retired in place as well as valid
+    /// ones (`PageTableManager::translate_published_or_retired`): EL1 serves
+    /// a guest `munmap` by retiring the leaf in place and owes the host the
+    /// backend retirement (a deferred return). Capturing only valid leaves
+    /// produced no receipt for such a range, so the backend retirement it
+    /// authorizes was refused. Prepared or fresh leaves retain an output
+    /// with no published backing and stay excluded. `finish` still checks
+    /// the old outputs with the valid-only walk: the receipt proves no named
+    /// output remains guest-visible.
     fn capture(
         authority: u64,
         image_generation: std::num::NonZeroU64,
@@ -610,7 +622,9 @@ impl Stage1Authority {
         let mut retired = Vec::new();
         let mut page = span.va;
         while page < end {
-            if let Some(old_ipa) = manager.translate(page) {
+            // See `Stage1LeafRetirementPlan::capture`: a leaf retired in
+            // place still names backing this retirement owes.
+            if let Some(old_ipa) = manager.translate_published_or_retired(page) {
                 retired.push((page, old_ipa));
             }
             page = page.checked_add(4096)?;
@@ -1584,7 +1598,7 @@ impl Stage1Authority {
                         generation,
                         va,
                         len,
-                        |address| editor.translate(address),
+                        |address| editor.translate_published_or_retired(address),
                     )
                 });
                 let result = f(editor)?;
@@ -1922,7 +1936,7 @@ impl Stage1Authority {
                     generation,
                     va,
                     len,
-                    |address| editor.translate(address),
+                    |address| editor.translate_published_or_retired(address),
                 )
             });
             let result = f(editor)?;
@@ -3105,6 +3119,58 @@ pub(crate) mod tests {
             authority.with_manager(|manager| manager.translate(va)),
             Some(Some(new_ipa))
         );
+    }
+
+    /// A leaf retired in place (invalid, output retained for lease
+    /// accounting: EL1's deferred return of a guest `munmap`) still owns
+    /// backing the unmap must retire. The receipt of the unmapping edit has
+    /// to name that output; capturing only valid leaves returned no receipt
+    /// at all, and the backend retirement it authorizes was refused.
+    #[test]
+    fn edit_unpublishing_names_a_leaf_retired_in_place() {
+        use carrick_mmu_core::aarch64::{PtOp, UserLeafAccess};
+
+        let va = LINUX_MMAP_BASE;
+        let old_ipa = 0x009b_5000_0000;
+        let authority = test_authority_with_manager(Some(test_manager()));
+        authority
+            .edit(
+                test_edit_license(),
+                || Err::<PageTableManager, PageTableError>(PageTableError::BadAddress),
+                |editor| {
+                    editor
+                        .map_aliased(va, old_ipa, 2 * 4096, UserLeafAccess::READ_WRITE)
+                        .map(|_| ())?;
+                    editor.apply(va, 2 * 4096, PtOp::Retire).map(|_| ())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(va)),
+            Some(None)
+        );
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate_retained_output(va)),
+            Some(Some(old_ipa))
+        );
+
+        let (_, receipt) = authority
+            .edit_unpublishing(
+                test_edit_license(),
+                || Err::<PageTableManager, PageTableError>(PageTableError::BadAddress),
+                va,
+                2 * 4096,
+                |editor| editor.unmap_aliased(va, 2 * 4096).map(|_| ()),
+            )
+            .unwrap();
+        let receipt = receipt
+            .expect("unmapping a leaf retired in place yields a retirement receipt")
+            .complete_after(|| Ok::<(), ()>(()))
+            .unwrap();
+        assert_eq!(receipt.authority(), authority.authority_id());
+        assert!(receipt.names(old_ipa, 4096));
+        assert!(receipt.names(old_ipa + 4096, 4096));
+        assert!(!receipt.names(old_ipa + 2 * 4096, 4096));
     }
 
     #[test]

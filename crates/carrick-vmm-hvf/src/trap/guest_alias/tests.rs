@@ -828,3 +828,58 @@ fn chunks_follow_congruence_and_cover_the_span_exactly() {
         assert_eq!(start / TWO_MIB, (start + count - 1) / TWO_MIB);
     }
 }
+
+/// The deferred-return shape behind the #847 root-exec `brk` ENOMEM: EL1
+/// serves a guest munmap in ring by retiring the leaves in place (invalid,
+/// output retained for lease accounting), and the host later reconciles the
+/// owed return with the production reclaiming retirement. Its receipt must
+/// name EL1's retained outputs; a capture of valid leaves only produced no
+/// receipt, and the alias retirement refused the whole reconciliation.
+#[test]
+fn guest_retirement_receipt_names_leaves_el1_already_retired() {
+    use carrick_mmu_core::aarch64::{PtOp, TerminalRule, terminal_descriptor_is_retired};
+
+    let mm = guest_mm(carrick_mem::memory::stage1_hvpatch_page_tables);
+    let va = 0x5000_0000_4000;
+    let ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x10_0000;
+    let len = 2 * PAGE;
+    publish_raw(&mm, va, ipa, len, true);
+    let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut el1 = El1::new(&mm, log);
+
+    // EL1's in-ring munmap: retire in place and owe the host the return.
+    let retire = mm
+        .tables
+        .with_manager(|manager| manager.terminal_op(va, len, TerminalRule::pt(PtOp::Retire)))
+        .unwrap();
+    let txn = mm
+        .tables
+        .prepare_guest_descriptor_txn(nz(9), retire)
+        .unwrap();
+    el1.publish(&txn).unwrap();
+    for page in [va, va + PAGE] {
+        let (_, leaf) = guest_leaf(&mm, page);
+        assert!(terminal_descriptor_is_retired(leaf), "{page:#x}: {leaf:#x}");
+        assert_eq!(mm.tables.with_manager(|m| m.translate(page)), Some(None));
+    }
+
+    // The host's reconciliation: the reclaiming retirement of the same span.
+    let op = mm
+        .tables
+        .with_manager(|manager| manager.unmap_aliased_op(va, len))
+        .unwrap();
+    let txn = mm.tables.prepare_guest_descriptor_txn(nz(9), op).unwrap();
+    let plan = mm
+        .tables
+        .prepare_guest_retirement_proof(&txn)
+        .expect("reclaiming retirement has a proof plan");
+    let receipt = el1.publish(&txn).unwrap();
+    let retired = mm
+        .tables
+        .complete_guest_retirement_proof(va, len as usize, vec![plan], &[receipt])
+        .expect("the retirement binds its old leaves")
+        .expect("a deferred return yields a receipt naming EL1's retained outputs");
+    assert!(retired.names(ipa, PAGE as usize));
+    assert!(retired.names(ipa + PAGE, PAGE as usize));
+    assert!(!retired.names(ipa + len, PAGE as usize));
+}

@@ -4971,6 +4971,24 @@ impl PageTableManager {
         self.try_translate(va).ok().flatten()
     }
 
+    /// The output a stage-1 retirement must account for at `va`: a valid
+    /// leaf's output, or the output an invalid leaf retains after it was
+    /// retired in place ([`terminal_descriptor_is_retired`]). EL1 serves a
+    /// guest `munmap` that way and owes the host the backend retirement; the
+    /// host's later retirement of that range must still name the output.
+    ///
+    /// Other invalid leaves are excluded on purpose: a prepared EL1-private
+    /// grant, or a fresh sparse-arena leaf, retains an output without any
+    /// published backing, and must not mint stage-2 retirement authority.
+    pub fn translate_published_or_retired(&self, va: u64) -> Option<u64> {
+        self.translate(va).or_else(|| {
+            let walk = self.try_debug_walk(va).ok()?;
+            terminal_descriptor_is_retired(terminal_descriptor(walk))
+                .then(|| self.translate_retained_output(va))
+                .flatten()
+        })
+    }
+
     /// Resolve the output address retained in a block/page whose valid bit may
     /// have been cleared by `munmap`/`PROT_NONE` publication.
     ///
