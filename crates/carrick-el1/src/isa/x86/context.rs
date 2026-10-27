@@ -156,8 +156,10 @@ pub fn current_stack_slot() -> Option<usize> {
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
     }
-    let stack_end = binding.kernel_stack.checked_add(16)?;
-    if sp < stack_end.checked_sub(0x1_0000)? || sp > stack_end {
+    let stack_end = binding
+        .kernel_stack
+        .checked_add(carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE)?;
+    if sp < stack_end.checked_sub(carrick_el1_abi::X86_CPL0_KERNEL_STACK_SIZE)? || sp > stack_end {
         return None;
     }
     Some(binding.cpu_slot as usize)

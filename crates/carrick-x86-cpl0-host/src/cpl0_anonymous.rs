@@ -512,10 +512,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let top = self
             .binding(lease.cpu)
             .kernel_stack
-            .checked_add(16)
+            .checked_add(carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE)
             .ok_or_else(|| fail("physical stack top"))?;
         let base = top
-            .checked_sub(0x10000)
+            .checked_sub(carrick_el1_abi::X86_CPL0_KERNEL_STACK_SIZE)
             .ok_or_else(|| fail("physical stack base"))?;
         let end = address
             .checked_add(size_of::<T>() as u64)

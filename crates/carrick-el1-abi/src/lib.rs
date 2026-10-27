@@ -371,6 +371,65 @@ const _: () = {
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
 /// Bytes of guest-physical space (from GPA 0) the direct window maps.
 pub const X86_CPL0_DIRECT_WINDOW_BYTES: u64 = 0x0200_0000;
+
+/// Guest-physical base of the CPL0 per-CPU kernel stacks, reached through
+/// the direct window. Each CPU's slot is an unmapped guard page below its
+/// usable stack; the carrier never maps the guard in any supervisor alias
+/// the CPU executes on (#369).
+pub const X86_CPL0_KERNEL_STACKS_GPA: u64 = 0xe0_0000;
+/// Stride between CPL0 kernel stack slots: guard plus usable stack.
+pub const X86_CPL0_KERNEL_STACK_STRIDE: u64 = 0x1_0000;
+/// Unmapped guard below each CPL0 kernel stack: one page of the 4 KiB x86
+/// translation granule. The guard is a missing stage-1 leaf, so it does not
+/// depend on the host leaving any stage-2 range unmapped.
+pub const X86_CPL0_KERNEL_STACK_GUARD_SIZE: u64 = carrick_mmu_core::x86::descriptor_txn::PAGE;
+/// Usable bytes of each CPL0 kernel stack.
+pub const X86_CPL0_KERNEL_STACK_SIZE: u64 =
+    X86_CPL0_KERNEL_STACK_STRIDE - X86_CPL0_KERNEL_STACK_GUARD_SIZE;
+/// CPL0 kernel stack slots below the carrier's IST stacks (`0xf0_0000`).
+pub const X86_CPL0_KERNEL_STACK_SLOTS: u64 = 16;
+/// Bytes the CPU binding keeps above the initial RSP (`kernel_stack + 16`
+/// is the stack end).
+pub const X86_CPL0_KERNEL_STACK_TOP_RESERVE: u64 = 16;
+const _: () = {
+    assert!(X86_CPL0_KERNEL_STACK_GUARD_SIZE >= carrick_mmu_core::x86::descriptor_txn::PAGE);
+    assert!(
+        X86_CPL0_KERNEL_STACK_GUARD_SIZE
+            .is_multiple_of(carrick_mmu_core::x86::descriptor_txn::PAGE)
+    );
+    assert!(
+        X86_CPL0_KERNEL_STACK_STRIDE.is_multiple_of(carrick_mmu_core::x86::descriptor_txn::PAGE)
+    );
+    assert!(X86_CPL0_KERNEL_STACK_SIZE >= EL1_STACK_SIZE);
+    // The CPL0 #PF fixup tests CR2 with a mask and 32-bit immediates.
+    assert!(X86_CPL0_KERNEL_STACK_STRIDE.is_power_of_two());
+    assert!(X86_CPL0_KERNEL_STACK_SLOTS * X86_CPL0_KERNEL_STACK_STRIDE < 1 << 31);
+    assert!(
+        X86_CPL0_KERNEL_STACKS_GPA + X86_CPL0_KERNEL_STACK_SLOTS * X86_CPL0_KERNEL_STACK_STRIDE
+            <= 0xf0_0000
+    );
+};
+
+/// Guest-physical base of CPL0 `slot`'s unmapped guard page.
+pub const fn x86_cpl0_kernel_stack_guard_gpa(slot: usize) -> u64 {
+    X86_CPL0_KERNEL_STACKS_GPA + slot as u64 * X86_CPL0_KERNEL_STACK_STRIDE
+}
+
+/// Guest-physical end (one past the highest byte) of CPL0 `slot`'s stack.
+pub const fn x86_cpl0_kernel_stack_end_gpa(slot: usize) -> u64 {
+    x86_cpl0_kernel_stack_guard_gpa(slot) + X86_CPL0_KERNEL_STACK_STRIDE
+}
+
+/// Every CPL0 kernel stack guard as a `(va, len)` range of the supervisor
+/// direct window, the alias the CPU executes its stack on.
+pub fn x86_cpl0_kernel_stack_guards() -> impl Iterator<Item = (u64, u64)> {
+    (0..X86_CPL0_KERNEL_STACK_SLOTS as usize).map(|slot| {
+        (
+            X86_CPL0_DIRECT_VA + x86_cpl0_kernel_stack_guard_gpa(slot),
+            X86_CPL0_KERNEL_STACK_GUARD_SIZE,
+        )
+    })
+}
 pub const X86_CPL0_REGION_BASE: u64 = 0xffff_ffff_c000_0000;
 /// MM-private temporary supervisor copy pair.
 pub const X86_CPL0_COW_COPY_BASE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_BASE;
