@@ -265,7 +265,7 @@ unsafe impl Sync for Root {}
 const fn pack_prot(prot: ReservationProtection) -> u16 {
     prot.bits() as u16
 }
-/// Lossless: validated node flags use nine bits.
+/// Lossless: validated node flags use ten bits.
 const fn pack_flags(flags: ReservationNodeFlags) -> u16 {
     flags.bits() as u16
 }
@@ -1916,11 +1916,21 @@ impl<
         self.gap(root, &mut cursor, len, arena.end())
             .or_else(|| (arena.end().saturating_sub(cursor) >= len).then_some(cursor))
     }
-    /// Whether root-editable nodes cover every byte of `range`.
-    fn editable_cover(&mut self, range: ReservationRange) -> bool {
+    fn in_layout(&self, range: ReservationRange) -> bool {
+        let layout = self.state().layout;
+        [layout.heap, layout.arena]
+            .iter()
+            .any(|r| r.start() <= range.start() && range.end() <= r.end())
+    }
+    /// Whether nodes the root's import marked [`ReservationNodeFlags::IMAGE`]
+    /// cover every byte of `range`: the root's own image outside its layout.
+    fn image_cover(&mut self, range: ReservationRange) -> bool {
         let mut cursor = range.start();
         while let Some(n) = self.next(cursor) {
-            if n.start > cursor || !Policy::root_editable(&n) {
+            if n.start > cursor
+                || !Policy::flags(&n).contains(ReservationNodeFlags::IMAGE)
+                || !Policy::root_editable(&n)
+            {
                 return false;
             }
             cursor = n.end;
@@ -1929,12 +1939,6 @@ impl<
             }
         }
         false
-    }
-    fn in_layout(&self, range: ReservationRange) -> bool {
-        let layout = self.state().layout;
-        [layout.heap, layout.arena]
-            .iter()
-            .any(|r| r.start() <= range.start() && range.end() <= r.end())
     }
     /// Whether one node straddles `address` (so an edit boundary there splits it).
     fn straddles(&mut self, address: u64) -> bool {
@@ -1966,18 +1970,19 @@ impl<
         {
             return Err(Refusal::PreparedConflict);
         }
-        // The layout bounds where the root places mappings. Outside it, the
-        // root still owns an edit of nodes it holds whole: an imported image
-        // (an exec successor's executable, say) is protected or unmapped by
-        // its owner. Anything else there belongs to the host.
-        let edits_held_nodes = matches!(
+        if flags.contains(ReservationNodeFlags::IMAGE) {
+            return Err(Refusal::Invalid);
+        }
+        // The layout bounds placement. Outside it the root edits only the
+        // image its own import adopted (typed by `IMAGE`); any other range
+        // there, however editable its nodes look, belongs to the host.
+        let image_edit = matches!(
             operation,
             ReservationOperation::Protect
                 | ReservationOperation::Retire
                 | ReservationOperation::Decommit
-        );
-        let root_owned = self.in_layout(range) || (edits_held_nodes && self.editable_cover(range));
-        if !root_owned {
+        ) && self.image_cover(range);
+        if !image_edit && !self.in_layout(range) {
             return Err(Refusal::ForeignMapping);
         }
         // A retired resident extent's frames are unreusable until the
@@ -2904,6 +2909,10 @@ impl<
         host_backing: Option<carrick_core_abi::HostBackingIdentity>,
     ) -> Result<(), Refusal> {
         if host_backing.is_some_and(|backing| backing.advance(range.len()).is_none()) {
+            return Err(Refusal::Invalid);
+        }
+        // Image ownership is the import's alone.
+        if flags.contains(ReservationNodeFlags::IMAGE) && self.state().admitted {
             return Err(Refusal::Invalid);
         }
         if self.pending().is_some() || self.state().fork_pending {
@@ -5351,64 +5360,62 @@ mod tests {
         assert_eq!(count_free(&parent), initial_free);
     }
 
-    /// An exec successor's image lies outside the placement layout (a PIE
-    /// at 0x88_0000_0000). The root edits the image nodes it holds there
-    /// (RELRO `mprotect`, `munmap`), but a range it does not cover, or a
-    /// new placement there, still belongs to the host.
+    /// An exec successor's image lies outside heap and arena (a PIE at
+    /// 0x88_0000_0000). The root owns it only where its import marked the
+    /// nodes `IMAGE`: a private file row outside the layout without that
+    /// mark stays the host's, however editable its flags look.
     #[test]
-    fn imported_image_nodes_outside_the_layout_are_root_edited() {
+    fn only_imported_image_nodes_outside_the_layout_are_root_edited() {
         use core::num::NonZeroU64;
         let table = table();
         let mm = ReservationMm::new(5).unwrap();
         table.publish(1, mm, layout()).unwrap();
         let mut g = table.lock(1, mm).unwrap();
+        let file = ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE);
+        let source =
+            |token| HostBackingIdentity::new(NonZeroU64::new(token).unwrap(), NonZeroU64::MIN, 0);
         let image = range(0x2000_0000, 0x2000_4000);
-        let source = HostBackingIdentity::new(NonZeroU64::new(3).unwrap(), NonZeroU64::MIN, 0);
         g.import_with_backing(
             image,
             ReservationProtection::READ_WRITE,
-            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
-            source,
+            file.union(ReservationNodeFlags::IMAGE),
+            source(3),
         )
         .unwrap();
-        g.import_with(
-            range(0x2000_8000, 0x2000_9000),
-            ReservationProtection::READ,
-            ReservationNodeFlags::PRIVATE,
-        )
-        .unwrap();
+        // Same flags and source shape, outside the layout, not an image.
+        let foreign = range(0x3000_0000, 0x3000_1000);
+        g.import_with_backing(foreign, ReservationProtection::READ_WRITE, file, source(4))
+            .unwrap();
         g.finish_import().unwrap();
+        assert_eq!(
+            g.mprotect(foreign, ReservationProtection::READ),
+            Err(Refusal::ForeignMapping),
+            "an unmarked row outside the layout is the host's"
+        );
         let relro = range(0x2000_1000, 0x2000_2000);
         let decision = g.mprotect(relro, ReservationProtection::READ).unwrap();
         assert!(
             matches!(decision, Decision::Work(_)),
-            "RELRO is the root's edit"
+            "the successor's RELRO is its root's edit"
         );
         complete(&mut g, decision);
         assert_eq!(
             g.mapping(0x2000_1000).map(|m| m.protection),
             Some(ReservationProtection::READ)
         );
-        // A hole, an opaque row, or a range running past the image: host.
-        for (edit, why) in [
-            (range(0x2000_4000, 0x2000_5000), "hole"),
-            (range(0x2000_8000, 0x2000_9000), "opaque row"),
-            (range(0x2000_3000, 0x2000_5000), "past the image"),
-        ] {
-            assert_eq!(
-                g.mprotect(edit, ReservationProtection::READ),
-                Err(Refusal::ForeignMapping),
-                "{why}"
-            );
-        }
-        // Placement there is never the root's.
         assert_eq!(
-            g.mmap(
-                Placement::Fixed(0x2000_4000),
-                0x1000,
-                ReservationProtection::READ_WRITE
+            g.mprotect(range(0x2000_3000, 0x2000_5000), ReservationProtection::READ),
+            Err(Refusal::ForeignMapping),
+            "a range running past the image"
+        );
+        // No admitted edit can mint image ownership.
+        assert_eq!(
+            g.import_with(
+                range(0x4000_0000, 0x4000_1000),
+                ReservationProtection::READ,
+                file.union(ReservationNodeFlags::IMAGE)
             ),
-            Err(Refusal::ForeignMapping)
+            Err(Refusal::Stale)
         );
         let decision = g.munmap(range(0x2000_0000, 0x2000_1000)).unwrap();
         assert!(

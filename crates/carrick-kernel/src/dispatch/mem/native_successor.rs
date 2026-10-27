@@ -5,9 +5,10 @@
 //! therefore not pre-built by the carrier: every file-backed page becomes a
 //! private file node whose byte source is the loaded image, and every bss
 //! page a private anonymous node, both supplied by the ring on first touch
-//! exactly like a private file `mmap`. The ring then edits those mappings
-//! itself (RELRO `mprotect`, `munmap`) because the leaves it builds are its
-//! own. The heap backing is likewise left to the root's brk policy. Everything
+//! exactly like a private file `mmap`. Those nodes carry
+//! `ReservationNodeFlags::IMAGE`, the import-only mark of the root's own image
+//! outside heap and arena, and the ring edits them itself (RELRO `mprotect`,
+//! `munmap`) because the leaves it builds are its own. The heap backing is likewise left to the root's brk policy. Everything
 //! else the carrier still builds (stack, vDSO) is recorded as an opaque row,
 //! so no carrier-built user leaf lies outside a node.
 use super::backing::{PrivateFileMapEntry, boot_private_file_backings};
@@ -148,11 +149,13 @@ pub(in crate::dispatch) fn successor_plan(
             let row = SuccessorRow {
                 range: ReservationRange::new(page, next).ok_or(LINUX_ENOMEM)?,
                 protection: protection(true, write, execute).ok_or(LINUX_ENOMEM)?,
+                // `IMAGE`: the root's own image outside heap and arena.
                 flags: if source.is_some() {
                     ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE)
                 } else {
                     ReservationNodeFlags::ANONYMOUS_PRIVATE
-                },
+                }
+                .union(ReservationNodeFlags::IMAGE),
                 source: source.map(|index| {
                     let entry = &sources[index].0;
                     (index, entry.offset + (page - entry.start))
@@ -310,7 +313,9 @@ mod tests {
             .with_linux_initial_stack(vec![b"two".to_vec()], Vec::<Vec<u8>>::new())
             .unwrap();
         let plan = successor_plan(&image, MemoryLayout::hvf_default()).unwrap();
-        let file = ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE);
+        let file = ReservationNodeFlags::PRIVATE
+            .union(ReservationNodeFlags::FILE)
+            .union(ReservationNodeFlags::IMAGE);
         let row_at = |address: u64| {
             plan.rows
                 .iter()
@@ -336,7 +341,11 @@ mod tests {
         let bss = row_at(0x404000);
         assert_eq!(
             (bss.flags, bss.protection.bits(), bss.source),
-            (ReservationNodeFlags::ANONYMOUS_PRIVATE, 0b011, None),
+            (
+                ReservationNodeFlags::ANONYMOUS_PRIVATE.union(ReservationNodeFlags::IMAGE),
+                0b011,
+                None
+            ),
             "bss is lazy private anonymous"
         );
         assert!(
