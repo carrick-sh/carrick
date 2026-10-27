@@ -66,6 +66,8 @@ pub(crate) mod anonymous;
 mod settled;
 pub(crate) use self::anonymous::RootAliasProposal;
 pub mod el1_reservations;
+mod native_successor;
+pub use self::native_successor::NativeSuccessorImage;
 mod host_backing;
 mod host_first_touch;
 pub use host_first_touch::{HostFirstTouchDescriptorReceipt, HostFirstTouchIntent};

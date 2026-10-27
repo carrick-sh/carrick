@@ -8,7 +8,7 @@ pub(crate) use native_service::NativeExecServiceDirectory;
 pub(crate) use native_service::settle_native_cow;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use native_service::{
-    NativeExecHostService, NativeExecPreparation, NativeExecRegistrationError,
+    NativeExecHostService, NativeExecParts, NativeExecPreparation, NativeExecRegistrationError,
     NativeExecServiceRegistration, NativeHostFileRefused, NativeService,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

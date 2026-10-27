@@ -434,9 +434,31 @@ pub(crate) fn exec_ipa_lease_count_for_tests() -> usize {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn prepare_native_exec_successor(
     custody: std::sync::Arc<CarrierVmCustody>,
-    plan: GuestMappingPlan,
+    parts: crate::metadata_grant::NativeExecParts,
 ) -> Result<PreparedNativeExecSuccessor, TrapError> {
-    let global = prepare_native_exec_global_plan(&plan)?;
+    let crate::metadata_grant::NativeExecParts {
+        mut plan,
+        lazy_regions,
+        sources,
+    } = parts;
+    // The successor's ring owner supplies its ELF pages from `sources`; the
+    // carrier builds no leaf and no frame for them.
+    let lazy = |start: u64, end: u64| {
+        lazy_regions
+            .iter()
+            .any(|&(lazy_start, lazy_end)| start < lazy_end && lazy_start < end)
+    };
+    plan.mappings.retain(|mapping| {
+        !lazy(
+            mapping.guest_start,
+            mapping.guest_start + mapping.mapped_size,
+        )
+    });
+    plan.ro_spans
+        .retain(|span| !lazy(span.start, span.start + span.len));
+    plan.rw_spans
+        .retain(|span| !lazy(span.start, span.start + span.len));
+    let global = prepare_native_exec_global_plan(&plan, &lazy_regions)?;
     let root_raw = global.plan.stage1_page_tables_base.ok_or_else(|| {
         TrapError::Hypervisor("native exec successor has no stage-1 root".to_owned())
     })?;
@@ -464,7 +486,10 @@ pub(crate) fn prepare_native_exec_successor(
     let stack_pointer = backing.plan.initial_stack_pointer.ok_or_else(|| {
         TrapError::Hypervisor("native exec successor has no initial stack".to_owned())
     })?;
-    let physical = install_native_exec_physical(backing, root_slot)?;
+    let mut physical = install_native_exec_physical(backing, root_slot)?;
+    for source in sources {
+        physical.sources.inherit(source);
+    }
     Ok(PreparedNativeExecSuccessor {
         physical,
         asid,
@@ -1287,7 +1312,7 @@ pub(crate) fn prepare_global_exec_plan(
     ::core::cmp::PartialEq,
     ::core::cmp::Eq,
 )]
-enum ExecAnonymousArena {
+enum ExecAnonymousArena<'a> {
     /// The host process materializes the sparse arena. Its leaves keep their
     /// identity output as PROT_NONE until the host's own `mmap` replaces it.
     HostSparse,
@@ -1295,8 +1320,9 @@ enum ExecAnonymousArena {
     /// replace an identity output, so the arena has no terminal at all: a
     /// fresh mapping is a lazy reservation and first touch builds its
     /// hierarchy from host table grants, exactly like a fork child's
-    /// pristine span.
-    RingOwned,
+    /// pristine span. `lazy_regions` (the successor's ELF images) likewise
+    /// have no terminal: the root's file and bss nodes supply them.
+    RingOwned { lazy_regions: &'a [(u64, u64)] },
 }
 
 /// The global plan for a ring-owned exec successor, whose anonymous memory
@@ -1304,8 +1330,14 @@ enum ExecAnonymousArena {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn prepare_native_exec_global_plan(
     plan: &GuestMappingPlan,
+    lazy_regions: &[(u64, u64)],
 ) -> Result<GlobalExecPlan, TrapError> {
-    prepare_global_exec_plan_for_arena(plan, None, false, ExecAnonymousArena::RingOwned)
+    prepare_global_exec_plan_for_arena(
+        plan,
+        None,
+        false,
+        ExecAnonymousArena::RingOwned { lazy_regions },
+    )
 }
 
 /// [`prepare_global_exec_plan`] naming whether the replacement stage-1 root
@@ -1328,7 +1360,7 @@ fn prepare_global_exec_plan_for_arena(
     plan: &GuestMappingPlan,
     mm_root_slot: Option<(u64, u64)>,
     pool_backed_root: bool,
-    arena: ExecAnonymousArena,
+    arena: ExecAnonymousArena<'_>,
 ) -> Result<GlobalExecPlan, TrapError> {
     let old_root = plan.stage1_page_tables_base.ok_or_else(|| {
         TrapError::Hypervisor("hvpatch exec image has no stage-1 tables".to_owned())
@@ -1457,9 +1489,10 @@ fn prepare_global_exec_plan_for_arena(
         .map_err(|error| {
             TrapError::Hypervisor(format!("reserve sparse HVPatch mmap arena: {error:?}"))
         })?;
-    if arena == ExecAnonymousArena::RingOwned {
+    if let ExecAnonymousArena::RingOwned { lazy_regions } = arena {
         // The unpublished image is this builder's sole copy; no walker can
-        // reach it, so the pristine arena may lose its terminals outright.
+        // reach it, so the pristine arena may lose its terminals outright,
+        // as do the lazy ELF regions the ring owner supplies itself.
         page_tables.declare_offline_private_image();
         page_tables
             .clear_offline_fork_range(
@@ -1469,6 +1502,15 @@ fn prepare_global_exec_plan_for_arena(
             .map_err(|error| {
                 TrapError::Hypervisor(format!("clear ring-owned HVPatch mmap arena: {error:?}"))
             })?;
+        for &(start, end) in lazy_regions {
+            page_tables
+                .clear_offline_fork_range(start, (end - start) as usize)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "clear ring-supplied HVPatch exec region 0x{start:x}: {error:?}"
+                    ))
+                })?;
+        }
         page_tables.declare_live_hardware_image();
     }
     reapply_global_exec_page_spans(&mut page_tables, &global.ro_spans, &global.rw_spans)?;
