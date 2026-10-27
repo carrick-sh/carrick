@@ -174,6 +174,14 @@ not close the frozen suite or ecosystem denominator.
 
 ## Exec admission custody (`process.exec.custody`)
 
+The ARM slot-reuse witness also drives `prepare_adoption` and
+`finish_exec_successor` with a real admitted notification source. It was red
+at the raw gate-open assertion after slice 3. The production finish path
+must open through its existing release venue, advance the Gate revision once
+and install the successor before the test crossing refuses host settlement.
+This component witness does not claim physical host settlement acceptance.
+
+
 The shared `carrick-sched-core::process::exec::ExecOperationGuard` retains
 admission until an already admitted sibling drain settles. Rollback resumes
 siblings before release; after the no-return cut, dropping the guard terminates
