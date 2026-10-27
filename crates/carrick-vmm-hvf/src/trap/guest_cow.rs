@@ -588,6 +588,12 @@ pub(crate) fn settle_one(
         runtime.identity.linux_pid,
         runtime.identity.linux_tid,
     );
+    // Typed refusal before the Kernel commit; the commit below repeats it.
+    HvfVmState::validate_cow_inventory_split(
+        &state.frame_inventory.ledger.lock(),
+        &split,
+        Stage1UnpublicationReceipt::EditorRange(&stage1),
+    )?;
     runtime
         .authority
         .apply(reservation.commit(()))

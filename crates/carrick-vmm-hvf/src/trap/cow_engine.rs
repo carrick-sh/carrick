@@ -4359,6 +4359,21 @@ impl HvfTaskState {
                         .map(|receipt| ((), Some(receipt)))
                 })
         };
+        // Authenticate the backend split against the repoint's receipt while
+        // the error arm below can still roll the publication back; a refusal
+        // after the Kernel commit could only be a carrier fault.
+        let page_table_result = page_table_result.and_then(|((), receipt)| {
+            let stage1 = receipt.as_ref().ok_or(TrapError::RetirementRefused {
+                operation: "COW inventory split",
+                missing: "the old-leaf retirement receipt",
+            })?;
+            HvfVmState::validate_cow_inventory_split(
+                &self.frame_inventory.ledger.lock(),
+                &split,
+                Stage1UnpublicationReceipt::EditorRange(stage1),
+            )?;
+            Ok(((), receipt))
+        });
         let stage1_leaf = match page_table_result {
             Ok(((), receipt)) => receipt,
             Err(error) => {

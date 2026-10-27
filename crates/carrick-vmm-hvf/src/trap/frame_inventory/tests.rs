@@ -5977,7 +5977,10 @@ fn cow_collision_is_rejected_before_backend_inventory_mutation() {
         |_| Ok(true),
     )
     .expect_err("colliding COW extent must fail closed");
-    assert!(error.to_string().contains("before backend mutation"));
+    assert!(
+        matches!(error, TrapError::RetirementRefused { .. }),
+        "a colliding destination is a typed refusal before backend mutation: {error}"
+    );
     assert_eq!(
         inventory.extents.get(&old_key).unwrap().mapping,
         old_mapping
@@ -6043,7 +6046,9 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
             mapping: carrick_hal::MappingId::from_kernel_allocation(id(92)),
         },
     ];
-    let stage1 = test_leaf_retirement_receipt(old_stage2.0);
+    // The repoint retires the leaf of the split compound, whose stage-1
+    // output lies in the old extent's window (`old_key`), not at its lease.
+    let stage1 = test_leaf_retirement_receipt(new_key.0);
     let split = CowInventorySplit {
         stage1_authority: stage1.authority(),
         replacement_is_existing: false,
@@ -6093,6 +6098,137 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
     assert_eq!(
         inventory.extents.get(&new_key).unwrap().stage2_owner,
         new_owner
+    );
+}
+
+/// A COW split whose old extent's stage-1 window (`old_key`) is disjoint from
+/// its physical lease, as after an alias. The repoint's leaf receipt names
+/// stage-1 outputs, so the release authenticates the window; asking the
+/// receipt to name the lease refused an exact receipt (#855 review P2-4).
+fn cow_split_fixture(
+    old_key: (u64, u64),
+    old_stage2: (u64, u64),
+) -> (
+    HvpatchFrameInventory,
+    CowInventorySplit,
+    carrick_aarch64::stage1_authority::Stage1LeafRetired,
+) {
+    let compound = CowArmedRanges::COMPOUND_SIZE;
+    let old_frame = carrick_hal::FrameId::from_kernel_allocation(id(0xc501));
+    let old = InventoryExtent {
+        frame: old_frame,
+        mapping: carrick_hal::MappingId::from_kernel_allocation(id(0xc502)),
+        backing: InventoryBackingIdentity::Private(0xc5),
+        stage2_base: old_stage2.0,
+        stage2_length: old_stage2.1,
+        stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
+    };
+    let mut inventory = HvpatchFrameInventory::default();
+    inventory.extents.insert(old_key, old);
+    {
+        let mut frames = inventory.frames.lock();
+        frames.references.insert(old_frame, 1);
+        frames
+            .extent_references
+            .insert((old_frame, old_key.0, old_key.1), 1);
+        frames.stage2_references.insert(old_stage2, 1);
+    }
+    let new_key = (0xa2a0_0000_0000, compound);
+    let stage1 = test_leaf_retirement_receipt(old_key.0);
+    let split = CowInventorySplit {
+        stage1_authority: stage1.authority(),
+        replacement_is_existing: false,
+        old_key,
+        old,
+        fragments: Vec::new(),
+        new_key,
+        new_extent: InventoryExtent {
+            frame: carrick_hal::FrameId::from_kernel_allocation(id(0xc503)),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(id(0xc504)),
+            backing: InventoryBackingIdentity::Private(0xc6),
+            stage2_base: new_key.0,
+            stage2_length: new_key.1,
+            stage2_owner: InventoryStage2OwnerIdentity::TEST_UNOWNED,
+        },
+        retirement: CowInventoryRetirementDecision {
+            retire_old_frame: true,
+            backend_frame_references_complete: true,
+        },
+    };
+    (inventory, split, stage1)
+}
+
+#[test]
+fn cow_split_receipt_names_the_old_stage1_window_not_its_lease() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let compound = CowArmedRanges::COMPOUND_SIZE;
+    let (mut inventory, split, stage1) =
+        cow_split_fixture((0x7100_0000, compound), (0xa2b0_0000_0000, compound));
+    assert!(!stage1.names(split.old.stage2_base, split.old.stage2_length as usize));
+    let result = HvfVmState::commit_cow_inventory_split(
+        &mut inventory,
+        &split,
+        (None, Stage1UnpublicationReceipt::EditorRange(&stage1)),
+        |_| Ok(true),
+    );
+    assert!(
+        result.is_ok(),
+        "exact COW split receipt was refused: {result:?}"
+    );
+    assert!(inventory.extents.get(&split.old_key).is_none());
+    assert_eq!(
+        inventory.extents.get(&split.new_key),
+        Some(&split.new_extent)
+    );
+}
+
+/// A receipt that names another window is a typed refusal decided before
+/// any mutation: the old extent and every backend reference survive for the
+/// owner's retry, instead of a half-applied split after the Kernel commit.
+#[test]
+fn mismatched_cow_split_receipt_is_refused_before_any_mutation() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let compound = CowArmedRanges::COMPOUND_SIZE;
+    let (mut inventory, split, _) =
+        cow_split_fixture((0x7200_0000, compound), (0xa2c0_0000_0000, compound));
+    let wrong = test_leaf_retirement_receipt(0x7300_0000);
+    let split = CowInventorySplit {
+        stage1_authority: wrong.authority(),
+        ..split
+    };
+    assert!(matches!(
+        HvfVmState::validate_cow_inventory_split(
+            &inventory,
+            &split,
+            Stage1UnpublicationReceipt::EditorRange(&wrong),
+        ),
+        Err(TrapError::RetirementRefused { .. })
+    ));
+    let result = HvfVmState::commit_cow_inventory_split(
+        &mut inventory,
+        &split,
+        (None, Stage1UnpublicationReceipt::EditorRange(&wrong)),
+        |_| panic!("a refused split must not retire stage-2"),
+    );
+    assert!(
+        matches!(result, Err(TrapError::RetirementRefused { .. })),
+        "{result:?}"
+    );
+    assert_eq!(inventory.extents.get(&split.old_key), Some(&split.old));
+    assert!(inventory.extents.get(&split.new_key).is_none());
+    let frames = inventory.frames.lock();
+    assert_eq!(frames.references.get(&split.old.frame), Some(&1));
+    assert_eq!(
+        frames
+            .extent_references
+            .get(&(split.old.frame, split.old_key.0, split.old_key.1)),
+        Some(&1)
+    );
+    assert_eq!(
+        frames
+            .stage2_references
+            .get(&(split.old.stage2_base, split.old.stage2_length)),
+        Some(&1)
     );
 }
 

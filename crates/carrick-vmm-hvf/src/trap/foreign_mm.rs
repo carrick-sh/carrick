@@ -3798,6 +3798,21 @@ fn perform_foreign_guest_cow(
             },
         )
         .map_err(|_| Error::MutationFailed)?;
+    // Refuse, typed, before EL1 publishes anything: the backend split must
+    // still match the ledger, and the repoint's receipt (which names exactly
+    // `old_ipa..+len`) must fall inside the old extent's stage-1 window that
+    // the backend commit authenticates after the Kernel commit.
+    let old_end = split.old_key.0.saturating_add(split.old_key.1);
+    if HvfVmState::validate_cow_inventory_split_ledger(
+        &lease.state.frame_inventory.ledger.lock(),
+        &split,
+    )
+    .is_err()
+        || old_ipa < split.old_key.0
+        || old_ipa.saturating_add(span.len as u64) > old_end
+    {
+        return Err(Error::MutationFailed);
+    }
     // A clean EL1 refusal left nothing live: returning drops `grant`, which
     // rolls the kernel grant, ledger and owner back. Anything else is unknown.
     let verified = match publisher.publish(&txn) {

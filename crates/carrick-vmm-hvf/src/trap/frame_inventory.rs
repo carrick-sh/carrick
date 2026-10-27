@@ -684,6 +684,7 @@ impl InventoryFrameRegistry {
     }
 }
 
+#[cfg(test)]
 fn editor_receipt_matches_authority(
     authority: u64,
     receipt: Stage1UnpublicationReceipt<'_>,
@@ -2705,6 +2706,77 @@ impl HvfVmState {
         })
     }
 
+    /// Authenticate a COW inventory split against the ledgers and the stage-1
+    /// receipt of its repoint before the Kernel commit is applied.
+    ///
+    /// The receipt names stage-1 outputs, so it must name the old extent's
+    /// stage-1 window (`old_key`), not the physical lease behind it. Every
+    /// refusal is a typed [`TrapError::RetirementRefused`] decided before any
+    /// mutation; callers run this before their irreversible Kernel apply, and
+    /// [`Self::commit_cow_inventory_split`] repeats it before it mutates.
+    pub(crate) fn validate_cow_inventory_split(
+        inventory: &HvpatchFrameInventory,
+        split: &CowInventorySplit,
+        receipt: Stage1UnpublicationReceipt<'_>,
+    ) -> Result<(), TrapError> {
+        let refused = |missing: &'static str| TrapError::RetirementRefused {
+            operation: "COW inventory split",
+            missing,
+        };
+        let old_lease = (split.old.stage2_base, split.old.stage2_length);
+        let owner = Stage1ReferenceOwner::EditorAuthority {
+            authority: split.stage1_authority,
+            stage1: split.old_key,
+        };
+        if !owner.is_named_by(old_lease, receipt) {
+            return Err(refused("a stage-1 receipt naming the old COW extent"));
+        }
+        Self::validate_cow_inventory_split_ledger(inventory, split)
+    }
+
+    /// The receipt-independent half of [`Self::validate_cow_inventory_split`]:
+    /// destination, old extent identity and held backend references. A path
+    /// that has no receipt until its publication runs this before publishing.
+    pub(crate) fn validate_cow_inventory_split_ledger(
+        inventory: &HvpatchFrameInventory,
+        split: &CowInventorySplit,
+    ) -> Result<(), TrapError> {
+        let refused = |missing: &'static str| TrapError::RetirementRefused {
+            operation: "COW inventory split",
+            missing,
+        };
+        let old_lease = (split.old.stage2_base, split.old.stage2_length);
+        if split.replacement_is_existing {
+            if split.new_extent.frame == split.old.frame
+                || inventory.extents.get(&split.new_key) != Some(&split.new_extent)
+            {
+                return Err(refused("the exact existing COW destination"));
+            }
+        } else if inventory.extents.contains_key(&split.new_key) {
+            return Err(refused("a free COW destination extent"));
+        }
+        let current = inventory
+            .extents
+            .get(&split.old_key)
+            .ok_or_else(|| refused("the old COW inventory extent"))?;
+        if current.mapping != split.old.mapping || current.frame != split.old.frame {
+            return Err(refused("the exact old COW extent identity"));
+        }
+        let frames = inventory.frames.lock();
+        let held = |count: Option<&usize>| count.is_some_and(|&count| count > 0);
+        if !held(frames.references.get(&split.old.frame))
+            || !held(frames.extent_references.get(&(
+                split.old.frame,
+                split.old_key.0,
+                split.old_key.1,
+            )))
+            || !held(frames.stage2_references.get(&old_lease))
+        {
+            return Err(refused("the old COW extent's backend references"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn commit_cow_inventory_split(
         inventory: &mut HvpatchFrameInventory,
         split: &CowInventorySplit,
@@ -2715,34 +2787,8 @@ impl HvfVmState {
         retire_stage2: impl FnOnce(Option<Stage1Unpublished>) -> Result<bool, TrapError>,
     ) -> Result<bool, TrapError> {
         let (identity, receipt) = stage1;
-        if !editor_receipt_matches_authority(split.stage1_authority, receipt) {
-            return Err(TrapError::Hypervisor(format!(
-                "COW stage-1 receipt authority does not own split {}",
-                split.stage1_authority
-            )));
-        }
-        if split.replacement_is_existing {
-            if split.new_extent.frame == split.old.frame
-                || inventory.extents.get(&split.new_key) != Some(&split.new_extent)
-            {
-                return Err(TrapError::Hypervisor(
-                    "HVPatch COW reuse destination drifted".to_owned(),
-                ));
-            }
-        } else if let Some(existing) = inventory.extents.get(&split.new_key) {
-            let stage2_references = inventory
-                .frames
-                .lock()
-                .stage2_references
-                .get(&(existing.stage2_base, existing.stage2_length))
-                .copied();
-            return Err(TrapError::Hypervisor(format!(
-                "HVPatch COW new inventory extent collided before backend mutation: \
-                 new_key={:?} existing={existing:?} existing_stage2_references={stage2_references:?} \
-                 old_key={:?} fragments={:?}",
-                split.new_key, split.old_key, split.fragments,
-            )));
-        }
+        // Every refusable input is checked before the first mutation below.
+        Self::validate_cow_inventory_split(inventory, split, receipt)?;
         let removed = inventory.extents.remove(&split.old_key).ok_or_else(|| {
             TrapError::Hypervisor("HVPatch COW old inventory mapping disappeared".to_owned())
         })?;
@@ -2797,7 +2843,7 @@ impl HvfVmState {
                 identity,
                 Stage1ReferenceOwner::EditorAuthority {
                     authority: split.stage1_authority,
-                    stage1: old_lease,
+                    stage1: split.old_key,
                 },
                 receipt,
             )
