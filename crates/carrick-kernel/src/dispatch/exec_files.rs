@@ -72,7 +72,7 @@ struct ExecFileContext {
 /// credential and filesystem-context objects it observed then.
 #[derive(Clone)]
 struct ExecOrigin {
-    binding: crate::kernel::KernelTaskBinding,
+    binding: crate::kernel::WeakKernelTaskBinding,
     tid: crate::kernel::LinuxTid,
     credentials: Arc<crate::kernel::Credentials>,
     fs_context: Arc<crate::kernel::FsContext>,
@@ -130,7 +130,10 @@ impl ExecFiles {
         let Some(origin) = &self.context.origin else {
             return false;
         };
-        origin.binding.capture(origin.tid).is_ok_and(|live| {
+        let Some(binding) = origin.binding.upgrade() else {
+            return false;
+        };
+        binding.capture(origin.tid).is_ok_and(|live| {
             let fs_context = live.resources().fs_context();
             Arc::ptr_eq(&live.resources().credentials(), &origin.credentials)
                 && Arc::ptr_eq(&fs_context, &origin.fs_context)
@@ -402,7 +405,7 @@ impl SyscallDispatcher {
                     .map(|current| current.source().clone()),
                 descriptors: Arc::new(HostExecFdSources(context.resources().files())),
                 origin: Some(ExecOrigin {
-                    binding: binding.clone(),
+                    binding: binding.downgrade(),
                     tid: context.thread().key().tid,
                     credentials: Arc::clone(&credentials),
                     fs_revision: context.resources().fs_context().revision(),
