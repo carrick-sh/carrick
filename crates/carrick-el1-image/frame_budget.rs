@@ -44,6 +44,11 @@ impl Frames {
         let mut current: Option<(String, usize)> = None;
         let mut prologue = true;
         let mut aligned = false;
+        // Between `sub x9, sp, #N` and the end of LLVM's probe loop
+        // (`cmp sp, x9`) or realignment (`and sp, x9`), the loop's
+        // `sub sp, sp, #4096` steps are part of N. A residual
+        // `sub sp, sp, #R` after the loop is a further allocation.
+        let mut in_probe = false;
         for line in disassembly.lines() {
             let line = line.trim();
             if let Some((address, name)) = line.strip_suffix(">:").and_then(|s| s.split_once(" <"))
@@ -55,6 +60,7 @@ impl Frames {
                 current = Some((name.to_owned(), 0));
                 prologue = true;
                 aligned = false;
+                in_probe = false;
                 continue;
             }
             let Some((_, size)) = current.as_mut() else {
@@ -90,16 +96,24 @@ impl Frames {
             if mnemonic == "sub" {
                 if operands.starts_with("x9, sp,") {
                     aligned = true;
+                    in_probe = true;
                     // LLVM rounds down to the 64-byte ThreadCtx alignment.
                     // Charge its maximum padding as well as the target SP.
                     *size += 63;
                 }
-                if operands.starts_with("sp, sp,") && !aligned
-                    || aligned
+                if operands.starts_with("sp, sp,") && !in_probe
+                    || in_probe
                         && (operands.starts_with("x9, sp,") || operands.starts_with("x9, x9,"))
                 {
+                    // A register operand (a dynamic allocation) has no
+                    // immediate and fails the build here.
                     *size += immediate(operands)?;
                 }
+            }
+            if mnemonic == "cmp" && operands == "sp, x9"
+                || mnemonic == "and" && operands.starts_with("sp, x9,")
+            {
+                in_probe = false;
             }
             if mnemonic == "and"
                 && operands.starts_with("sp,")
@@ -509,6 +523,55 @@ mod tests {
         assert_eq!(frames.maximum("large"), 8 * 4096 + 128);
         assert_eq!(frames.maximum("tail"), 0);
         assert_eq!(frames.maximum("leaf"), 16);
+    }
+
+    /// #369 (folded from #704's ring audit): LLVM probes a large frame to
+    /// the page multiple in x9 and subtracts the remainder after the loop.
+    /// That residual is part of the frame; it was dropped, an undercount of
+    /// up to 4 KiB per function.
+    #[test]
+    fn counts_the_residual_after_a_probe_loop() {
+        let input = "1000 <entry>:\n\
+                     1000: stp x29, x30, [sp, #-0x40]!\n\
+                     1004: sub x9, sp, #0x20, lsl #12\n\
+                     1008: sub sp, sp, #0x1, lsl #12\n\
+                     100c: str xzr, [sp]\n\
+                     1010: cmp sp, x9\n\
+                     1014: b.ne 0x1008 <entry+0x8>\n\
+                     1018: sub sp, sp, #0x40\n\
+                     101c: str xzr, [sp]\n\
+                     1020: bl 0x2000 <leaf>\n\
+                     2000 <leaf>:\n\
+                     2000: ret\n";
+        let frames = Frames::parse(input).unwrap();
+        // The pre-index, the loop target, the residual, realignment slack.
+        assert_eq!(frames.maximum("entry"), 0x40 + 0x20000 + 0x40 + 63);
+    }
+
+    /// A realigned frame (`and sp, x9, #mask`) ends at its realignment.
+    #[test]
+    fn a_realigned_frame_counts_its_target_once() {
+        let input = "1000 <entry>:\n\
+                     1000: stp x29, x30, [sp, #-0x10]!\n\
+                     1004: sub x9, sp, #0xc0\n\
+                     1008: and sp, x9, #0xffffffffffffffc0\n\
+                     100c: bl 0x2000 <leaf>\n\
+                     2000 <leaf>:\n\
+                     2000: ret\n";
+        assert_eq!(
+            Frames::parse(input).unwrap().maximum("entry"),
+            0x10 + 0xc0 + 63
+        );
+    }
+
+    /// A dynamic allocation has no bound the gate could charge.
+    #[test]
+    fn a_dynamic_stack_allocation_fails_closed() {
+        let input = "1000 <entry>:\n\
+                     1000: stp x29, x30, [sp, #-0x10]!\n\
+                     1004: sub sp, sp, x8\n\
+                     1008: ret\n";
+        assert!(Frames::parse(input).is_err());
     }
 
     fn small_frames() -> Frames {

@@ -87,6 +87,10 @@ fn check_process_exit_frames(disassembly: &str) {
             true,
         ),
     ];
+    // The per-function ceiling (`Frames::check`: 3/16 of the stack) keeps
+    // every frame narrower than the unmapped guard below each EL1 stack, so
+    // no single frame can step over the guard without touching it (#369).
+    const { assert!(carrick_el1_abi::EL1_STACK_SIZE * 3 / 16 <= carrick_el1_abi::EL1_STACK_GUARD_SIZE) };
     let frames = frame_budget::Frames::parse(disassembly).unwrap_or_else(|error| panic!("{error}"));
     // Charge the actual vector record as well as every retained Rust frame.
     for line in frames
