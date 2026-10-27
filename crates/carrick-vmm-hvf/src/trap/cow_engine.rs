@@ -4136,7 +4136,7 @@ impl HvfTaskState {
                 let stage1_leaf = match (
                     *verified.txn() == txn,
                     verified.cow_repoint().is_some(),
-                    tables.verified_guest_cow_unpublication(&verified),
+                    tables.verified_guest_cow_unpublication(editor_excluded, &verified),
                 ) {
                     (true, true, Some(receipt)) => receipt,
                     _ => carrick_fatal!(

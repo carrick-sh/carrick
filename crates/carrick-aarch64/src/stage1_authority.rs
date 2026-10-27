@@ -709,7 +709,31 @@ impl Stage1Authority {
     /// retirement capability as a host `edit_unpublishing`. The descriptor
     /// receipt authenticates the transaction and completed TLBI; the live
     /// manager check proves none of the named old leaves survived it.
+    ///
+    /// `license` proves the MM's Editor is excluded from the publication
+    /// through this verification, so no other editor can republish an old
+    /// leaf in between: a `None` here is EL1 misbehaving, not a race.
     pub fn verified_guest_cow_unpublication(
+        &self,
+        license: &impl Stage1EditLicense,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+    ) -> Option<Stage1LeafRetired> {
+        self.assert_license(license).ok()?;
+        self.cow_unpublication_of(receipt)
+    }
+
+    /// The same proof for a foreign writer (process_vm_writev, ptrace) that
+    /// publishes into a paused target through a lent vCPU and holds no
+    /// Editor exclusion of that target. A `None` must be contained to the
+    /// target operation, never treated as a carrier invariant.
+    pub fn verified_foreign_guest_cow_unpublication(
+        &self,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+    ) -> Option<Stage1LeafRetired> {
+        self.cow_unpublication_of(receipt)
+    }
+
+    fn cow_unpublication_of(
         &self,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
     ) -> Option<Stage1LeafRetired> {

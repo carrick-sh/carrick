@@ -3830,13 +3830,18 @@ fn perform_foreign_guest_cow(
     let stage1 = match (
         *verified.txn() == txn,
         verified.cow_repoint().is_some(),
-        tables.verified_guest_cow_unpublication(&verified),
+        tables.verified_foreign_guest_cow_unpublication(&verified),
     ) {
         (true, true, Some(receipt)) => receipt,
-        _ => carrick_fatal!(
-            "hvpatch::foreign_cow",
-            "guest foreign COW receipt does not authenticate its transaction and retired leaves"
-        ),
+        _ => {
+            // Contain the unauthenticated publication to this foreign write.
+            // EL1 may have repointed onto the grant, so keep the grant's new
+            // owner (never roll back a frame a leaf may name); the old extent
+            // stays in the ledger and the write is refused.
+            drop(publisher);
+            grant.commit();
+            return Err(Error::MutationFailed);
+        }
     };
     // The borrowed-TTBR0 window is closed: settle the target ASID admission
     // (resident) before the commit, so the target's retirement is not held.

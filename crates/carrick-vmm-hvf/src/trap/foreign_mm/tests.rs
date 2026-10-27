@@ -1156,6 +1156,23 @@ struct ModelCallerEl1 {
     /// executing it: EL1 refusing (or rolling back) an authenticated
     /// submission, leaving nothing live.
     not_applied: Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome>,
+    /// Republish this VA's pre-transaction leaf right after the executor
+    /// applies its transaction: an editor racing the publication, so the
+    /// verified receipt's old leaf is still live at verification.
+    republish_old_leaf: Option<u64>,
+}
+
+/// The live L3 descriptor word for `va` in the fixture table arena rooted at
+/// `root` (`(ipa, host pointer)`), walking the real descriptors.
+fn live_l3_word(root: (u64, usize), va: u64) -> *mut u64 {
+    let mut table = root.0;
+    for level in 0..3 {
+        let index = (va >> (39 - 9 * level)) & 511;
+        let entry = (root.1 + (table - root.0) as usize + index as usize * 8) as *const u64;
+        // SAFETY: the fixture arena is resident and covers every table.
+        table = unsafe { entry.read_volatile() } & 0x0000_ffff_ffff_f000;
+    }
+    (root.1 + (table - root.0) as usize + ((va >> 12) & 511) as usize * 8) as *mut u64
 }
 
 impl ModelCallerEl1 {
@@ -1172,6 +1189,7 @@ impl ModelCallerEl1 {
             submitted: Vec::new(),
             before_apply,
             not_applied: None,
+            republish_old_leaf: None,
         }
     }
 }
@@ -1259,7 +1277,19 @@ impl carrick_guest_mem::CallerEl1Call for ModelCallerEl1 {
                             );
                         }
                     }
-                    execute_descriptor_txn(&words, root, txn, &mut InlineJournal::new()).outcome
+                    let republish = self.republish_old_leaf.map(|va| {
+                        let word = live_l3_word(self.root, va);
+                        // SAFETY: resident fixture descriptor word.
+                        (word, unsafe { word.read_volatile() })
+                    });
+                    let outcome =
+                        execute_descriptor_txn(&words, root, txn, &mut InlineJournal::new())
+                            .outcome;
+                    if let Some((word, old)) = republish {
+                        // SAFETY: resident fixture descriptor word.
+                        unsafe { word.write_volatile(old) };
+                    }
+                    outcome
                 }
             };
             claimed.complete(outcome, || {});
@@ -1647,6 +1677,66 @@ fn guest_owned_foreign_cow_refusal_before_submission_rolls_back_every_stage() {
 /// EL1 authenticates the submission and refuses it before its first store
 /// (or rolls every store back): nothing is live, so the foreign COW is an
 /// ordinary refusal that rolls back grant, ledger and owner, never a fatal.
+/// #855 review P2-5: a foreign writer publishes into a paused target with no
+/// Editor exclusion of it. If EL1's verified repoint does not authenticate
+/// (here an old leaf is republished after the executor applied it), the
+/// failure is contained to this write: the grant's new owner is kept (a
+/// leaf may name it), the old extent stays in the ledger, and the write is
+/// refused instead of aborting the carrier.
+#[test]
+fn guest_owned_foreign_cow_unauthenticated_publication_is_contained() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        730,
+        0x9a01_6000_0000,
+        0x9b01_6000_0000,
+        *b"keep",
+    );
+    let (_authority, lease, invalidator) = prepare_foreign_cow(&installed);
+    installed
+        .state
+        .page_tables_authority()
+        .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let old_key = installed.owners.0[1];
+    let mut caller = ModelCallerEl1::new(&installed, Box::new(|| {}));
+    caller.republish_old_leaf = Some(TEST_VA);
+    let mut lending = LendingInvalidator {
+        residency: ModelAsidResidency::default(),
+        inner: invalidator,
+        caller: Some(caller),
+    };
+    install_test_slots(&installed, lending.caller.as_ref().unwrap());
+    let result = lease.break_cow(
+        &mut lending,
+        &installed.snapshot,
+        GuestVa::new(TEST_VA),
+        4,
+        Instant::now() + Duration::from_secs(1),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(carrick_hal::ForeignMmTransportError::MutationFailed)
+        ),
+        "{result:?}"
+    );
+    assert_eq!(lending.caller.as_ref().unwrap().drains, 1);
+    assert!(
+        installed
+            .state
+            .frame_inventory
+            .ledger
+            .lock()
+            .extents
+            .contains_key(&old_key),
+        "the old extent stays with its owner"
+    );
+}
+
 #[test]
 fn guest_owned_foreign_cow_el1_refusal_rolls_back_every_stage() {
     use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorOutcome, DescriptorRefusal};
