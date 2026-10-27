@@ -73,7 +73,7 @@ fn deadline_names_unfinished_test_reaps_process_and_preserves_results() {
         "{log}"
     );
     let (red, log) = run("red");
-    assert!(!red.success(), "{log}");
+    assert_eq!(red.code(), Some(101), "{log}");
     assert!(log.contains("test failing ... FAILED"), "{log}");
     assert!(!log.contains("STALLED"), "{log}");
     let (red, log) = run("bad-build");
