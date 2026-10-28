@@ -1218,6 +1218,17 @@ impl Kernel {
             .replenish(self, &state, context);
     }
 
+    /// Retire unused standing birth reservations after scheduler admission
+    /// closes. The write view waits out replenishment that admitted a runtime
+    /// submission before close but has not inserted its pool entry yet.
+    /// Claimed/born entries fail the owner's revoke CAS and remain owned.
+    pub(in crate::kernel) fn revoke_unused_thread_birth_capacity(&self) {
+        let state = self.registry().settled().write();
+        for record in state.tasks.values() {
+            record.thread_pool.revoke_unused();
+        }
+    }
+
     /// Release inactive capacity only after every carrier executor has joined.
     /// # Safety
     /// No executor may access or resume any lifecycle record in this kernel.

@@ -2822,6 +2822,13 @@ impl RunQueue {
                 return Err(RunQueueError::ControlPoked);
             }
 
+            // Enrol before observing close readiness. Its final decrement
+            // either makes observe_close return Closed or changes this ticket
+            // before the condvar predicate; it cannot be lost between them.
+            let ticket = {
+                let local = cpu.state.lock();
+                local.wake_ticket
+            };
             if let Some(row) = self.inner.pop_local(&cpu) {
                 return Ok(BoundTake::Row(self.claim_taken(&mut idle, cpu.id, row)));
             }
@@ -2840,10 +2847,6 @@ impl RunQueue {
             // ticket, which the pre-park re-check below observes) or stored
             // its row before the announcement was visible (and the scan finds
             // it).
-            let ticket = {
-                let local = cpu.state.lock();
-                local.wake_ticket
-            };
             idle.announce();
             // Sample the CPU wake ticket before this ownership recheck. A
             // returning owner either wins here or changes the ticket before
@@ -2892,7 +2895,7 @@ impl RunQueue {
             crate::el1_zone::count_host_executor_park();
             while local.rows.is_empty()
                 && local.wake_ticket == ticket
-                && self.inner.lifecycle() == QueueLifecycle::Open
+                && self.inner.lifecycle() != QueueLifecycle::Closed
                 && !executor.flush_requested()
             {
                 #[cfg(test)]
@@ -5726,6 +5729,10 @@ impl Scheduler {
 
     pub fn close(&self) {
         self.queue.close();
+        // Unused birth submissions otherwise keep drain_work alive until the
+        // unsafe post-join clear, while executor joins wait for that drain.
+        // Closing admission first excludes replacement runtime reservations.
+        self.kernel.revoke_unused_thread_birth_capacity();
         self.stop_preemption_driver();
     }
 
@@ -9691,6 +9698,130 @@ mod tests {
         );
 
         scheduler.wait_closed();
+    }
+
+    #[test]
+    fn unused_birth_capacity_does_not_keep_two_exiting_tasks_in_close() {
+        use crate::kernel::thread_adoption::{
+            ThreadBirthAdoptionFactory, ThreadBirthAdoptionReservation,
+        };
+        #[derive(Debug)]
+        struct BirthFactory {
+            scheduler: std::sync::Weak<Scheduler>,
+            owner: crate::kernel::objects::TaskKey,
+            task: std::sync::Weak<crate::kernel::objects::Task>,
+        }
+        impl ThreadBirthAdoptionFactory for BirthFactory {
+            fn executable_births(&self) -> bool {
+                true
+            }
+            fn owner(&self) -> crate::kernel::objects::TaskKey {
+                self.owner
+            }
+            fn reserve(
+                &self,
+                thread: crate::kernel::objects::ThreadKey,
+            ) -> Option<ThreadBirthAdoptionReservation> {
+                let scheduler = self.scheduler.upgrade()?;
+                let task = self.task.upgrade()?;
+                let submission = scheduler.reserve_process_birth(&task, thread).ok()?;
+                Some(ThreadBirthAdoptionReservation::new(
+                    self.owner, thread, submission,
+                ))
+            }
+        }
+        let (kernel, root) = bootstrap(23_978);
+        let peer = process_child(&kernel, &root, 23_979, "closing-peer");
+        let scheduler = scheduler_with_cpus(Arc::clone(&kernel), 2);
+        for (index, context) in [&root, &peer].into_iter().enumerate() {
+            context
+                .task()
+                .install_thread_adoption_factory(Arc::new(BirthFactory {
+                    scheduler: Arc::downgrade(&scheduler),
+                    owner: context.task().key(),
+                    task: Arc::downgrade(context.task()),
+                }))
+                .unwrap();
+            // The real ledger replenishes standing runtime reservations.
+            let priming = sibling(&kernel, context, 24_000 + index as i32);
+            kernel.exit_thread(&priming, None).unwrap();
+            publish(context, 978 + index as u64);
+            scheduler.make_runnable(context.thread().key()).unwrap();
+        }
+        assert!(
+            scheduler.queue.active_authority_count() > 0,
+            "real unused birth submissions retain drain work before close"
+        );
+        let first = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        let second = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        let root_running = scheduler.take(&first).unwrap();
+        let peer_running = scheduler.take(&second).unwrap();
+        scheduler.close();
+        assert_eq!(scheduler.claimed(), 2);
+        assert_eq!(
+            scheduler.queue.active_authority_count(),
+            0,
+            "unused birth reservations must retire before joining executors"
+        );
+        for context in [&peer, &root] {
+            kernel
+                .exit_task_key_eventually(
+                    context.task().key(),
+                    crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                )
+                .unwrap();
+        }
+        scheduler.settle_exited(root_running).unwrap();
+        scheduler.settle_exited(peer_running).unwrap();
+        assert_eq!(scheduler.queued_len(), 0);
+        assert_eq!(scheduler.claimed(), 0);
+        assert_eq!(scheduler.queue.inner.active_wake_admissions(), 0);
+        assert!(scheduler.queue.drain_ready_for_test());
+        assert_eq!(
+            scheduler.queue.inner.state.lock().lifecycle,
+            super::QueueLifecycle::Closed
+        );
+        scheduler.unregister_executor(&first).unwrap();
+        scheduler.unregister_executor(&second).unwrap();
+    }
+
+    #[test]
+    fn closing_undrained_executor_parks_until_last_obligation_retires() {
+        let (kernel, root) = bootstrap(22_978);
+        publish(&root, 978);
+        let scheduler = scheduler_with_cpus(kernel, 1);
+        let authority = scheduler
+            .admit_root(
+                root.thread().key(),
+                root.thread().execution_state().generation().unwrap(),
+            )
+            .unwrap();
+        let executor = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        scheduler.close();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        *scheduler.queue.inner.host_park_gate.lock() = Some(parked_tx);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_scheduler = Arc::clone(&scheduler);
+        let worker = thread::spawn(move || {
+            let result = worker_scheduler.take(&executor);
+            worker_scheduler.unregister_executor(&executor).unwrap();
+            done_tx
+                .send(matches!(result, Err(RunQueueError::Closed)))
+                .unwrap();
+        });
+        let parked = parked_rx.recv_timeout(Duration::from_secs(2));
+        // Release even on red so the witness never leaves a spinning actor.
+        drop(authority);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+        assert!(parked.is_ok(), "Closing + undrained must park, not spin");
+        assert!(scheduler.queue.drain_ready_for_test());
     }
 
     #[test]

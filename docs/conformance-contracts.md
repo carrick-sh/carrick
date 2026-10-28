@@ -2321,9 +2321,9 @@ published entrants. Two live executor threads prove independent observations,
 zero pre-entry hardware kicks and one active-peer kick. The loom binding uses
 the shipping gate and retains an edge-only cancellation counterexample.
 
-This candidate **requires pending-entry cancellation from the backend**. The
-model does not manufacture that guarantee for HVF. Run the raw signed WFI
-qualification on macOS with:
+The model requires pending-entry cancellation from the backend. The director
+qualified HVF: a kick completed before entry made the next run return CANCELED
+immediately. Run both raw signed qualification cases on macOS with:
 
 `just test-hvf-shutdown-kick`
 
@@ -2334,4 +2334,15 @@ memory, with a bound; production shutdown never polls. The parent kills and
 reaps a run that does not return within two seconds of its entry notification,
 without sending a recovery kick. A failed pre-entry qualification leaves this
 candidate pending a backend latch; a passing qualification still requires the
-director's signed `el1_files_exit_group_stress` on the PR artifact.
+director's signed `el1_files_exit_group_stress` on the PR artifact. The mirror
+spins after its marker so raw-VM WFI trapping cannot end its run.
+
+Closing host executors park on their CPU condvars while drain work remains.
+They sample the wake ticket before checking close readiness: a final release
+either makes that check return Closed or changes the ticket before sleep.
+Closing admission precedes a registry write barrier and safe revocation of
+unused thread-birth capacity. The pool's existing CAS preserves claimed/born
+entries, whose normal settlement remains responsible for their obligations.
+The VM-free binding primes actual thread pools with runtime adoption
+reservations containing real process-birth submissions. Two live tasks then
+exit during close; unused capacity must retire before executor joins.
