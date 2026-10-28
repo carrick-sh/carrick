@@ -90,12 +90,8 @@
       "ceiling": 39
     },
     {
-      "path": "crates/carrick-kernel/src/dispatch/net/sockopt.rs",
-      "ceiling": 6
-    },
-    {
       "path": "crates/carrick-kernel/src/dispatch/net/support.rs",
-      "ceiling": 5
+      "ceiling": 3
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/perf.rs",
