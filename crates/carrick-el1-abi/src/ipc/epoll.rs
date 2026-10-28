@@ -947,7 +947,7 @@ impl<'a> IpcRegion<'a> {
             return Ok(0);
         }
         const BATCH: usize = 32;
-        let mut cursor = 0u32;
+        let mut cursor = None;
         let mut count = 0;
         loop {
             let mut batch = [(EpollItemRef::default(), RawIpcObject::default(), 0u32, 0u32); BATCH];
@@ -955,11 +955,28 @@ impl<'a> IpcRegion<'a> {
             {
                 let mut guard = self.lock_epoll(epoll, wait)?;
                 let state = guard.epoll_state()?;
-                let mut number = if cursor == 0 {
-                    state.ready_head
-                } else {
-                    self.item(cursor)
-                        .map_or(0, |item| item.ready_next.load(Ordering::Relaxed))
+                let mut number = match cursor {
+                    None => state.ready_head,
+                    Some(previous) => {
+                        let next = self.live_item(previous).and_then(|item| {
+                            let next = item.ready_next.load(Ordering::Relaxed);
+                            // Deletion frees storage outside the epoll lock. A
+                            // reused slot must not supply another item's link.
+                            (item.flags.load(Ordering::Relaxed) & QUEUED != 0
+                                && item.epoll.load(Ordering::Relaxed) == pack(epoll)
+                                && self.live_item(previous).is_some())
+                            .then_some(next)
+                        });
+                        match next {
+                            Some(next) => next,
+                            None => {
+                                // Recount from the current list, dropping the
+                                // prefix count so a restart cannot double count.
+                                count = 0;
+                                state.ready_head
+                            }
+                        }
+                    }
                 };
                 while len < BATCH {
                     let Some(item) = self.item(number) else {
@@ -974,7 +991,7 @@ impl<'a> IpcRegion<'a> {
                         );
                         len += 1;
                     }
-                    cursor = number;
+                    cursor = Some(self.item_ref(number).ok_or(IpcError::Corrupt)?);
                     number = item.ready_next.load(Ordering::Relaxed);
                 }
                 if len == 0 {
