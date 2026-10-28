@@ -1251,6 +1251,7 @@ impl<'a> FsView<'a> {
                 };
                 return Ok(
                     match super::super::begin_timerfd_read(
+                        task.kernel,
                         memory,
                         address,
                         length,

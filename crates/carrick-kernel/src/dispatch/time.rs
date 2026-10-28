@@ -914,6 +914,7 @@ impl SyscallDispatcher {
                 crate::namespace::process::CAP_SYS_TIME,
             );
             Ok(adjtimex_bootstrap(
+                cx.kernel,
                 &clock,
                 &mut *cx.memory,
                 address.0,
@@ -947,7 +948,7 @@ impl SyscallDispatcher {
                 crate::namespace::process::CAP_SYS_TIME,
             );
             let clock = Arc::clone(cx.kernel.task().container().clock());
-            Ok(adjtimex_bootstrap(&clock, memory, address.0, can_adjust))
+            Ok(adjtimex_bootstrap(cx.kernel, &clock, memory, address.0, can_adjust))
         }
 
         fn x86_time(this, cx, result: GuestPtr) {

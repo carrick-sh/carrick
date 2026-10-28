@@ -1738,6 +1738,7 @@ mod futex_queue_authority {
             value: u64,
         ) -> DispatchOutcome {
             crate::dispatch::futex::dispatch_threaded_futex(
+                thread,
                 &self.clock,
                 &self.shared,
                 SyscallRequest::new(98, SyscallArgs::from([WORD, op, value, 0, 0, 0])),

@@ -2404,6 +2404,7 @@ impl<'a> ProcView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
                 return Ok(dispatch_futex_pi(
+                    cx.kernel,
                     memory,
                     address.0,
                     command,
