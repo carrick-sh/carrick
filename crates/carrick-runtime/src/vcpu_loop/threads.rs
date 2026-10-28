@@ -1467,21 +1467,20 @@ pub(super) fn wake_removed_persistent_sibling_threads(
 /// service cancellation retains the operation and queues the native terminal
 /// checkpoint; a host control quantum would instead try to load that PC.
 fn native_exception_owns_terminal_wake(thread: &carrick_kernel::kernel::Thread) -> bool {
-    use carrick_sched_core::object_wait::{OwnerEntry, ResumeDisposition};
     let Some((zone, record)) =
         carrick_kernel::el1_zone::zone().zip(thread.control_slot().zone_record())
     else {
         return false;
     };
-    let Some(rec) = zone.live(record) else {
-        return false;
-    };
-    let identity = rec.identity();
-    let owned = thread.control_slot().native_signal_owner()
-        && identity.tid == carrick_el1_abi::El1TaskId::from_linux_tid(thread.key().tid.raw()).raw()
-        && identity.serial == thread.key().serial.raw()
-        && rec.resume_disposition() == ResumeDisposition::OwnerContinuation(OwnerEntry::Exception);
-    owned && zone.live(record).is_some()
+    carrick_core::terminal::native_exception_retains_terminal_wake(
+        zone,
+        record,
+        thread.control_slot(),
+        carrick_core_abi::EntryTaskKey::from_raw(
+            carrick_el1_abi::El1TaskId::from_linux_tid(thread.key().tid.raw()).raw(),
+        ),
+        carrick_core_abi::EntryThreadGeneration::from_raw(thread.key().serial.raw()),
+    )
 }
 
 impl KernelState {

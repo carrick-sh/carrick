@@ -1396,7 +1396,7 @@ contracts = []
 
 [[surfaces]]
 path = "crates/carrick-core/src/terminal.rs"
-contracts = ["kernel.el1.thread-lifecycle", "process.native.terminal-child", "kernel.memory.owner-wait"]
+contracts = ["kernel.el1.thread-lifecycle", "process.native.terminal-child", "kernel.memory.owner-wait", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-kernel-example/src/personality.rs"
