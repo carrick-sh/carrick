@@ -2288,7 +2288,7 @@ IPC abandonment and release runtime/oracle acceptance remain director-owned.
 select wait. Completion folding retains the original result and the next
 unwritten byte across Editor, supply and physical waits. It must not restart
 the original syscall or convert an owner wait to a configuration failure.
-Each preparation covers at most one 4096-byte guest page; a permit and its
+Each preparation covers at most one portal-sized interval; a permit and its
 process-effect custody are released before parking. Group-exit cancellation
 settles through the existing owner cancellation route without another output.
 
@@ -2304,3 +2304,10 @@ A drop-sensitive physical dependency must release writer exclusion before the
 next preparation, even though the pending operation also retained its receipt.
 These fixtures prove the boundary, not attribution of the signed stress event.
 Thirty signed `el1_files_exit_group_stress` runs remain director-owned on HVF.
+
+The #1010 review witnesses preserve legacy timeout completion after fatal
+publication, authenticate the independent ASID generation on retained output,
+and drive the completion resume arm through both zone and physical parks.
+The group-exit witness retains two live sibling threads: output must first
+suspend on the owner refusal, then sibling cancellation prevents re-preparation.
+These VM-free witnesses do not replace the director's signed stress acceptance.

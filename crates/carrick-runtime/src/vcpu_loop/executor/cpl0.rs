@@ -1045,6 +1045,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 .dispatcher
                 .lock()
                 .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
+            let current_mm = submission
+                .execution_lease_mut()?
+                .task_state_authority()
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
             let outcome = self
                 .physical
                 .with_retained_forward(task, &retained.frame, |venue| {
@@ -1053,6 +1057,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                         &dispatcher,
                         &context,
                         venue,
+                        current_mm,
                     )
                     .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
                     match folded {

@@ -7872,9 +7872,10 @@ fn terminal_action_cannot_be_folded_into_a_guest_syscall_result() {
             &dispatcher,
             &context,
             &mut memory,
+            (context.shared().mm().id(), context.shared().mm().id().raw()),
         )
         .unwrap_err(),
-        MemoryError::Unsupported,
+        CompletionFoldError::TerminalAction,
     );
 }
 
@@ -7883,6 +7884,19 @@ fn completion_owner_wait_during_group_exit_is_not_a_configuration_failure() {
     use carrick_guest_mem::{GuestMemory, MemoryError};
     struct Refusing(carrick_el1_abi::PortalOwnerWait, usize);
     impl GuestMemory for Refusing {
+        fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+            carrick_guest_mem::UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            _: &[carrick_guest_mem::GuestWriteRange],
+        ) -> Result<
+            Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+            carrick_guest_mem::MemoryPrepareError,
+        > {
+            self.1 += 1;
+            Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(self.0))
+        }
         fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
             unreachable!()
         }
@@ -7892,7 +7906,24 @@ fn completion_owner_wait_during_group_exit_is_not_a_configuration_failure() {
         }
     }
     impl CurrentMmMemory for Refusing {}
-    let (_kernel, context) = bootstrap(15_709);
+    let (kernel, context) = bootstrap(15_709);
+    let sibling = kernel
+        .reserve_thread_clone(
+            &context,
+            crate::kernel::ClonePlan::from_flags(
+                LinuxCloneFlags::VM | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::THREAD,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
+        .prepare(ThreadId::synthetic_for_tests(15_712))
+        .unwrap()
+        .commit()
+        .unwrap()
+        .into_context()
+        .unwrap();
+    assert!(context.exact_thread_is_live() && sibling.exact_thread_is_live());
     let mm = context.shared().mm().id();
     let wait = unsafe {
         carrick_el1_abi::PortalOwnerWait::from_owner(
@@ -7911,8 +7942,23 @@ fn completion_owner_wait_during_group_exit_is_not_a_configuration_failure() {
         0,
         vec![GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, mm.raw()).unwrap()],
     );
+    let result = fold_continuation_completion(
+        completion,
+        &dispatcher,
+        &context,
+        &mut memory,
+        (mm, mm.raw()),
+    );
+    assert!(
+        result.is_ok(),
+        "owner wait escaped completion folding: {result:?}"
+    );
+    let Some(DispatchOutcome::CompletionCopyoutSuspended(pending)) = result.unwrap() else {
+        panic!("the live sibling's editor must suspend copyout");
+    };
+    assert_eq!(memory.1, 1, "the first fold must reach owner preparation");
     use carrick_el1_abi::Lifecycle;
-    context
+    sibling
         .lifecycle_page()
         .process_exit_custody()
         .cancellation_authority()
@@ -7920,21 +7966,14 @@ fn completion_owner_wait_during_group_exit_is_not_a_configuration_failure() {
             carrick_core::cancellation::ProcessCancellation::GroupExit,
             || panic!("no admitted effects"),
         );
-    let result = fold_continuation_completion(completion, &dispatcher, &context, &mut memory);
-    assert!(
-        result.is_ok(),
-        "owner wait escaped completion folding: {result:?}"
-    );
+    assert!(context.exact_thread_is_live() && sibling.exact_thread_is_live());
     assert_eq!(
-        memory.1, 0,
-        "terminal cancellation must precede memory access"
+        pending
+            .resume(&context, &mut memory, (mm, mm.raw()))
+            .unwrap(),
+        DispatchOutcome::OwnerCancelled(OwnerWaitCancellation::GroupExit)
     );
-    assert_eq!(
-        result.unwrap(),
-        Some(DispatchOutcome::OwnerCancelled(
-            OwnerWaitCancellation::GroupExit
-        ))
-    );
+    assert_eq!(memory.1, 1, "terminal resume must not reprepare output");
 }
 
 #[test]
@@ -8049,7 +8088,14 @@ fn completion_owner_wait_retains_output_progress_and_original_result() {
         );
         let dispatcher = crate::dispatch::SyscallDispatcher::new();
         let Some(DispatchOutcome::CompletionCopyoutSuspended(pending)) =
-            fold_continuation_completion(completion, &dispatcher, &context, &mut memory).unwrap()
+            fold_continuation_completion(
+                completion,
+                &dispatcher,
+                &context,
+                &mut memory,
+                (context.shared().mm().id(), context.shared().mm().id().raw()),
+            )
+            .unwrap()
         else {
             panic!("must retain refused output")
         };
@@ -8076,18 +8122,98 @@ fn completion_owner_wait_retains_output_progress_and_original_result() {
                     || panic!("no effects held"),
                 );
             assert_eq!(
-                pending.resume(&context, &mut memory),
+                pending
+                    .resume(&context, &mut memory, (mm, mm.raw()))
+                    .unwrap(),
                 DispatchOutcome::OwnerCancelled(OwnerWaitCancellation::GroupExit)
             );
             assert_eq!(memory.attempts, 2);
             assert_eq!(memory.commits, [(0x7fff, 1)]);
         } else {
             assert_eq!(
-                pending.resume(&context, &mut memory),
+                pending
+                    .resume(&context, &mut memory, (mm, mm.raw()))
+                    .unwrap(),
                 DispatchOutcome::Returned { value: 23 }
             );
             assert_eq!(memory.attempts, 4);
             assert_eq!(memory.commits, [(0x7fff, 1), (0x8000, 4096), (0x9000, 903)]);
         }
     }
+}
+
+#[test]
+fn completion_owner_wait_legacy_timeout_preserves_fatal_signal_delivery() {
+    use carrick_el1_abi::Lifecycle;
+    let (_kernel, context) = bootstrap(15_711);
+    let mm = context.shared().mm().id();
+    let mut memory = crate::dispatch::LinearMemory::new(0x7000, vec![0xa5; 16]);
+    context
+        .lifecycle_page()
+        .process_exit_custody()
+        .cancellation_authority()
+        .publish(
+            carrick_core::cancellation::ProcessCancellation::FatalSignal,
+            || panic!("no admitted effects"),
+        );
+    assert_eq!(
+        fold_continuation_completion(
+            ContinuationCompletion::ReturnWithGuestWrites(
+                0,
+                vec![GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, mm.raw()).unwrap()]
+            ),
+            &crate::dispatch::SyscallDispatcher::new(),
+            &context,
+            &mut memory,
+            (context.shared().mm().id(), context.shared().mm().id().raw()),
+        )
+        .unwrap(),
+        Some(DispatchOutcome::Returned { value: 0 }),
+    );
+    assert_eq!(memory.read_bytes(0x7000, 16).unwrap(), vec![0; 16]);
+}
+
+#[test]
+fn completion_owner_wait_authenticates_thread_and_independent_asid() {
+    let (_kernel, context) = bootstrap(15_713);
+    let (_other_kernel, other) = bootstrap(15_714);
+    let mm = context.shared().mm().id();
+    let operation = CompletionCopyout::new(
+        Ok(0),
+        vec![GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, 41).unwrap()],
+        &context,
+        (mm, 41),
+    )
+    .unwrap();
+    assert_eq!(operation.authenticate_identity(&context, (mm, 41)), Ok(()));
+    assert_eq!(
+        operation.authenticate_identity(&context, (mm, 42)),
+        Err(CompletionFoldError::AddressSpace)
+    );
+    assert_eq!(
+        operation.authenticate_identity(&other, (mm, 41)),
+        Err(CompletionFoldError::Thread)
+    );
+    let mut memory = crate::dispatch::LinearMemory::new(0x7000, vec![0xa5; 16]);
+    assert_eq!(
+        operation
+            .resume(&context, &mut memory, (mm, 42))
+            .unwrap_err(),
+        CompletionFoldError::AddressSpace
+    );
+    assert_eq!(memory.read_bytes(0x7000, 16).unwrap(), vec![0xa5; 16]);
+    assert_eq!(
+        fold_continuation_completion(
+            ContinuationCompletion::ReturnWithGuestWrites(
+                0,
+                vec![GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, 41).unwrap()]
+            ),
+            &crate::dispatch::SyscallDispatcher::new(),
+            &context,
+            &mut memory,
+            (mm, 42),
+        )
+        .unwrap_err(),
+        CompletionFoldError::AddressSpace
+    );
 }

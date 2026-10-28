@@ -941,6 +941,7 @@ fn s3_production_interrupted_sleep_copyout() {
             &dispatcher,
             &context,
             &mut memory,
+            (context.shared().mm().id(), context.shared().mm().id().raw()),
         )
         .unwrap(),
         Some(DispatchOutcome::errno(carrick_abi::LINUX_EINTR))
@@ -1018,7 +1019,8 @@ fn s3_production_ready_retained_timerfd_copyout() {
             ContinuationCompletion::TimerFdRead(read),
             &dispatcher,
             &context,
-            &mut memory
+            &mut memory,
+            (context.shared().mm().id(), context.shared().mm().id().raw()),
         )
         .unwrap(),
         Some(DispatchOutcome::Returned { value: 8 })

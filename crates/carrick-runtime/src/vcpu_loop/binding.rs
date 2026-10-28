@@ -7112,10 +7112,15 @@ mod tests {
             0,
             vec![GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, mm.raw()).unwrap()],
         );
-        let outcome =
-            fold_continuation_completion(completion, &dispatcher, &context, &mut Refusing(wait))
-                .unwrap()
-                .unwrap();
+        let outcome = fold_continuation_completion(
+            completion,
+            &dispatcher,
+            &context,
+            &mut Refusing(wait),
+            (context.shared().mm().id(), context.shared().mm().id().raw()),
+        )
+        .unwrap()
+        .unwrap();
         let (outcome, resume) = owner_copyin_route(outcome);
         assert_eq!(
             outcome,

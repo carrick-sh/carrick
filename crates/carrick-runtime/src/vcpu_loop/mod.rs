@@ -1612,8 +1612,19 @@ where
             &kernel.dispatcher,
             context,
             engine,
+            lease.task_state_authority().map_err(|_| {
+                RuntimeError::Dispatch(
+                    carrick_kernel::dispatch::DispatchError::CompletionInvariant(
+                        carrick_kernel::kernel::continuation::CompletionFoldError::ExecutionAuthority,
+                    ),
+                )
+            })?,
         )
-        .map_err(|error| RuntimeError::Configuration(error.to_string()))
+        .map_err(|error| {
+            RuntimeError::Dispatch(
+                carrick_kernel::dispatch::DispatchError::CompletionInvariant(error),
+            )
+        })
     }
 
     fn with_mm_mutation_authority<T>(
@@ -1998,10 +2009,26 @@ where
     ) -> Result<DispatchOutcome, RuntimeError> {
         match resume {
             binding::OwnedSyscallResume::Completion(pending) => {
-                let context = self.service_kernel_context.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration("completed wait lost exact context".to_owned())
-                })?;
-                Ok(pending.resume(context, engine))
+                use carrick_kernel::kernel::continuation::CompletionFoldError;
+                let resume = || {
+                    let context = self
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or(CompletionFoldError::ExecutionAuthority)?;
+                    let lease_guard = self.execution_lease.lock();
+                    let lease = lease_guard
+                        .as_ref()
+                        .ok_or(CompletionFoldError::ExecutionAuthority)?;
+                    let identity = lease
+                        .task_state_authority()
+                        .map_err(|_| CompletionFoldError::ExecutionAuthority)?;
+                    pending.resume(context, engine, identity)
+                };
+                resume().map_err(|error| {
+                    RuntimeError::Dispatch(
+                        carrick_kernel::dispatch::DispatchError::CompletionInvariant(error),
+                    )
+                })
             }
             binding::OwnedSyscallResume::CopyoutRedispatch => {
                 self.redispatch_threaded_syscall(kernel, engine, host_wait)
@@ -4505,6 +4532,20 @@ pub(crate) mod tests {
         exercise_owner_wait_schedule_at(nr, signum, native, release_wins, false);
     }
 
+    #[test]
+    fn serial_host_completion_owner_wait_resumes_through_zone_and_physical() {
+        for physical in [false, true] {
+            exercise_owner_wait_completion(
+                carrick_abi::syscall::nr::NANOSLEEP,
+                None,
+                false,
+                false,
+                physical,
+                true,
+            );
+        }
+    }
+
     fn exercise_owner_wait_schedule_at(
         nr: carrick_abi::CanonicalNr,
         signum: Option<i32>,
@@ -4512,17 +4553,36 @@ pub(crate) mod tests {
         release_wins: bool,
         physical: bool,
     ) {
-        #[derive(Debug)]
-        struct UnreadyBacking;
+        exercise_owner_wait_completion(nr, signum, native, release_wins, physical, false);
+    }
+
+    fn exercise_owner_wait_completion(
+        nr: carrick_abi::CanonicalNr,
+        signum: Option<i32>,
+        native: bool,
+        release_wins: bool,
+        physical: bool,
+        completion_copyout: bool,
+    ) {
+        struct UnreadyBacking {
+            ready: std::sync::atomic::AtomicBool,
+            wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+        }
+        impl std::fmt::Debug for UnreadyBacking {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("UnreadyBacking")
+            }
+        }
         impl carrick_guest_mem::PhysicalMemoryWait for UnreadyBacking {
             fn is_ready(&self) -> bool {
-                false
+                self.ready.load(std::sync::atomic::Ordering::Acquire)
             }
             fn enroll(
                 &self,
-                _: Arc<dyn Fn() + Send + Sync>,
+                wake: Arc<dyn Fn() + Send + Sync>,
             ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
-                (Box::new(()), false)
+                *self.wake.lock() = Some(wake);
+                (Box::new(()), self.is_ready())
             }
         }
         use carrick_abi::{LinuxCloneFlags, syscall::nr};
@@ -4789,6 +4849,10 @@ pub(crate) mod tests {
             (owner, object, table, token)
         });
 
+        let physical_backing = Arc::new(UnreadyBacking {
+            ready: std::sync::atomic::AtomicBool::new(false),
+            wake: Mutex::new(None),
+        });
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let mut engine = CrashCaptureTestEngine {
@@ -4860,7 +4924,7 @@ pub(crate) mod tests {
                     });
                     if physical {
                         engine.prepare_dependency =
-                            Some(carrick_guest_mem::OwnedMemoryWait(Arc::new(UnreadyBacking)));
+                            Some(carrick_guest_mem::OwnedMemoryWait(physical_backing.clone()));
                     }
                     let (first, resume) = if let Some((owner, object, _, raw)) = &ipc {
                         use carrick_kernel::kernel::continuation::ipc as host_ipc;
@@ -4904,6 +4968,54 @@ pub(crate) mod tests {
                             panic!("read must retain its exact operation on refusal");
                         };
                         (outcome, binding::OwnedSyscallResume::Ipc(pending))
+                    } else if completion_copyout {
+                        use carrick_kernel::kernel::continuation::{
+                            ContinuationCompletion, GuestOutputRange, fold_continuation_completion,
+                        };
+                        // Retain a real prepared nanosleep completion token, as
+                        // the trapped timeout path does before folding output.
+                        let request = SyscallRequest::from_raw(frame);
+                        let prepared = kernel
+                            .dispatcher
+                            .prepare_syscall(&root, request, &kernel.reporter)
+                            .unwrap();
+                        let syscall = match prepared {
+                            PreparedDispatch::Invoke(syscall)
+                            | PreparedDispatch::Complete { syscall, .. } => syscall,
+                        };
+                        state.service_kernel_context = Some(root.retain_exact());
+                        state.syscall_completion =
+                            SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
+                                syscall,
+                                root.retain_exact(),
+                                kernel.dispatcher.observers().cloned(),
+                            ));
+                        let first = fold_continuation_completion(
+                            ContinuationCompletion::ReturnWithGuestWrites(
+                                0,
+                                vec![
+                                    GuestOutputRange::new(
+                                        carrick_guest_mem::GuestVa::new(0x71_1020),
+                                        16,
+                                        root.shared().mm().id(),
+                                        process.asid_generation(),
+                                    )
+                                    .unwrap(),
+                                ],
+                            ),
+                            &kernel.dispatcher,
+                            &root,
+                            &mut engine,
+                            (root.shared().mm().id(), process.asid_generation()),
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert!(matches!(
+                            &first,
+                            DispatchOutcome::CompletionCopyoutSuspended(_)
+                        ));
+                        let (first, resume) = binding::owner_copyin_route(first);
+                        (first, resume.unwrap())
                     } else {
                         let first = state
                             .service_threaded_syscall(&kernel, &mut engine, frame, None)
@@ -5012,10 +5124,16 @@ pub(crate) mod tests {
                             &scheduler,
                         ));
                     if physical {
-                        let binding::OwnedSyscallResume::Ipc(pending) = resume else {
-                            panic!("retained pipe read")
+                        let first = match resume {
+                            binding::OwnedSyscallResume::Ipc(pending) => {
+                                job.state.pending_ipc_owner = Some(pending);
+                                first
+                            }
+                            binding::OwnedSyscallResume::Completion(pending) => {
+                                DispatchOutcome::CompletionCopyoutSuspended(pending)
+                            }
+                            _ => panic!("retained output operation"),
                         };
-                        job.state.pending_ipc_owner = Some(pending);
                         assert!(matches!(
                             job.route_outcome(&mut engine, &mut control, frame, first)
                                 .unwrap(),
@@ -5150,6 +5268,17 @@ pub(crate) mod tests {
                     if !killing {
                         release_tx.send(()).unwrap();
                         peer.join().unwrap();
+                        if completion_copyout && physical {
+                            physical_backing
+                                .ready
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            physical_backing
+                                .wake
+                                .lock()
+                                .take()
+                                .expect("physical park enrolled a wake")(
+                            );
+                        }
                     }
                     carrick_kernel::el1_zone::hand_back_completions();
                     assert_ne!(
@@ -5198,6 +5327,12 @@ pub(crate) mod tests {
                         authority: executor::ExecutionLeaseAuthoritySlot::new(Some(lease)),
                         exec_replacement: None,
                     };
+                    let (cell, injected) = binding::ExecutionLeaseCell::injected();
+                    if completion_copyout {
+                        job.state.execution_lease = cell;
+                    }
+                    let _publication = completion_copyout
+                        .then(|| injected.install(&mut resumed_submission.authority));
                     let mut resumed_control = executor::HvpatchQuantumControl::for_test(
                         &need_resched,
                         &mut resumed_submission,
@@ -5342,8 +5477,11 @@ pub(crate) mod tests {
                     if !killing {
                         assert_eq!(
                             engine.prepared_commits,
-                            usize::from(nr != nr::WAIT4 && !sleep)
+                            usize::from(completion_copyout || (nr != nr::WAIT4 && !sleep))
                         );
+                        if completion_copyout {
+                            assert_eq!(engine.guest_memory[&0x71_1020], vec![0; 16]);
+                        }
                         if nr == nr::PIPE2 {
                             assert_eq!(engine.guest_memory[&0x71_1020].len(), 8);
                             assert_eq!(root.resources().files().slot_count(), 2);

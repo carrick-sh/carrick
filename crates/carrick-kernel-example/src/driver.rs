@@ -625,6 +625,10 @@ pub(crate) fn drive(
                             &disp,
                             &task.context,
                             &mut mem.linear,
+                            (
+                                task.context.shared().mm().id(),
+                                task.process.asid_generation(),
+                            ),
                         )
                     };
 
