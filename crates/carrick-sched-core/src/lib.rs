@@ -931,7 +931,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
 
     fn advance_incarnation(&self) -> bool {
         self.incarnation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1).filter(|next| *next <= u64::MAX >> 4)
             })
             .is_ok()

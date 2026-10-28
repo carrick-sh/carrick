@@ -1080,7 +1080,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
     ) -> Result<HostObjectWakeReport, ObjectWaitError> {
         self.queue()
             .epoch
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
                 epoch.checked_add(1)
             })
             .map_err(|_| ObjectWaitError::Exhausted)?;
@@ -1359,7 +1359,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
     ) -> Result<ObjectWakeReport, ObjectWaitError> {
         self.queue()
             .epoch
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
                 epoch.checked_add(1)
             })
             .map_err(|_| ObjectWaitError::Exhausted)?;
@@ -1439,7 +1439,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
             };
         self.object
             .expired
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |old| {
+            .try_update(Ordering::Release, Ordering::Relaxed, |old| {
                 Some((old & !OWNER_EXCEPTION_ENTRY) | flags)
             })
             .ok();
@@ -1791,7 +1791,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         guard
             .queue()
             .publishers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
             .map_err(|_| ObjectWaitError::Exhausted)?;
         Ok(ObjectNotificationTicket {
             zone: self,
