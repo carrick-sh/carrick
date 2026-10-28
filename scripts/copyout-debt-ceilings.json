@@ -22,10 +22,6 @@
       "ceiling": 2
     },
     {
-      "path": "crates/carrick-kernel/src/dispatch/fs/legacy_aio.rs",
-      "ceiling": 2
-    },
-    {
       "path": "crates/carrick-kernel/src/dispatch/fs/notify.rs",
       "ceiling": 1
     },
@@ -75,7 +71,7 @@
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/net.rs",
-      "ceiling": 4
+      "ceiling": 3
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
@@ -99,7 +95,7 @@
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/net/support.rs",
-      "ceiling": 7
+      "ceiling": 5
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/perf.rs",
@@ -108,10 +104,6 @@
     {
       "path": "crates/carrick-kernel/src/dispatch/proc.rs",
       "ceiling": 17
-    },
-    {
-      "path": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "ceiling": 6
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/syslog.rs",

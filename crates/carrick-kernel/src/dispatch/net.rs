@@ -3506,8 +3506,10 @@ impl<'a> NetView<'a> {
                 }
                 // Always write back (zeroed revents on a not-ready probe) so a
                 // later timeout completion needs no further writes.
-                if write_kernel_struct_raw(memory, addresses[index], pollfd).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                let outcome = crate::dispatch::copyout::copyout_record(cx.kernel, memory, addresses[index], pollfd,
+                    DispatchOutcome::Returned { value: 0 });
+                if !matches!(outcome, DispatchOutcome::Returned { .. }) {
+                    return Ok(outcome);
                 }
             }
             let Some((wait_fds, sampling)) = park.filter(|_| ready == 0) else {
@@ -4045,5 +4047,46 @@ mod wait_source_tests {
                 "guest fd {fd} must not classify at all"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod s1_copyout_tests {
+    use super::*;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+
+    #[test]
+    fn s1_immediate_poll_preserves_owner_refusal() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x1000, 0xa5);
+        let input = LinuxPollFd {
+            fd: -1,
+            events: libc::POLLIN,
+            revents: 0x1234,
+        };
+        memory.seed(0x1000, input.abi_bytes());
+        memory.seed(0x1100, LinuxTimespec::new(0, 0).abi_bytes());
+        let wait = memory.refuse_next();
+        let request = SyscallRequest::new(73, SyscallArgs::from([0x1000, 1, 0x1100, 0, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&kernel, request, &mut memory, &CompatReporter::default())
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(
+            memory.inner.read_bytes(0x1000, 8).unwrap(),
+            input.abi_bytes()
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&kernel, request, &mut memory, &CompatReporter::default())
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let out: LinuxPollFd = read_kernel_struct(&memory, 0x1000).unwrap();
+        let (fd, events, revents) = (out.fd, out.events, out.revents);
+        assert_eq!((fd, events, revents), (-1, libc::POLLIN, 0));
     }
 }

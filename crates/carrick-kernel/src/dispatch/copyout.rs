@@ -23,7 +23,8 @@
 //! The order relative to side effects is the handler's obligation: call
 //! `prepare` before creating or installing anything, and treat a
 //! [`CopyoutRefusal`] as "return now". Consuming syscalls require retained
-//! operation authority and are deliberately outside this slice (#744).
+//! operation authority; bounded array consumers reserve their whole-record
+//! destination before dequeuing.
 //! Side-effect-free handlers (stat, clock reads) may prepare immediately
 //! before committing.
 
@@ -437,6 +438,98 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
     }
 }
 
+/// A bounded destination for whole records. The secured capacity is the
+/// consumption budget; no source may be advanced beyond it.
+pub(crate) struct PreparedArrayOut<'m, M: CurrentMmMemory> {
+    inner: PreparedCopyout<'m, M, 1>,
+    records: usize,
+}
+
+impl<M: CurrentMmMemory> PreparedArrayOut<'_, M> {
+    pub(crate) fn records(&self) -> usize {
+        self.records
+    }
+
+    pub(crate) fn commit(self, bytes: &[u8]) -> Result<(), CopyoutFault> {
+        self.commit_retaining(bytes).0
+    }
+
+    /// Keep cancellation custody through source/cursor publication after copyout.
+    pub(crate) fn commit_retaining(
+        self,
+        bytes: &[u8],
+    ) -> (Result<(), CopyoutFault>, Option<OwnerEffect>) {
+        if bytes.is_empty() {
+            return (Ok(()), self.inner.cancel_retaining());
+        }
+        self.inner.commit_retaining([bytes])
+    }
+}
+
+/// Secure a writable whole-record prefix, bounded by one portal.
+/// Valid destinations require one prepare. Real faults reduce the attempted
+/// window geometrically. Retain the first valid permit: releasing it to probe
+/// again would cache stale authority if a sibling changes the mapping.
+/// Transient refusals escape immediately, including during prefix selection.
+pub(crate) fn prepare_array<'m, M: CurrentMmMemory>(
+    context: &KernelContext,
+    memory: &'m mut M,
+    address: GuestVa,
+    records: usize,
+    record_size: usize,
+) -> Result<PreparedArrayOut<'m, M>, CopyoutRefusal> {
+    let address = address.raw();
+    assert!((1..=COPYOUT_MAX_BYTES).contains(&record_size));
+    let mut records = records.min(COPYOUT_MAX_BYTES / record_size);
+    // Each failed probe drops its borrow before the next attempt. Only the
+    // final successful permit escapes, exactly as in `prepare_memory`.
+    let memory_ptr: *mut M = memory;
+    loop {
+        // SAFETY: previous probes are dropped before another borrow; returning
+        // transfers the sole live borrow to the returned prepared destination.
+        let memory = unsafe { &mut *memory_ptr };
+        let legacy_valid = memory.user_memory_venue() != UserMemoryVenue::Legacy
+            || memory.guest_range_is_writable(address, records * record_size);
+        let out = prepare(
+            context,
+            memory,
+            [Some(UserSlot::new(address, records * record_size))],
+        )?;
+        if records == 0 || (legacy_valid && out.secured_capacity(0) == records * record_size) {
+            return Ok(PreparedArrayOut {
+                inner: out,
+                records,
+            });
+        }
+        drop(out);
+        records /= 2;
+    }
+}
+
+/// Copy bytes from a side-effect-free query, preserving transient refusals.
+pub(crate) fn copyout_bytes(
+    context: &KernelContext,
+    memory: &mut impl CurrentMmMemory,
+    address: GuestVa,
+    bytes: &[u8],
+    success: DispatchOutcome,
+) -> DispatchOutcome {
+    let address = address.raw();
+    for (index, chunk) in bytes.chunks(COPYOUT_MAX_BYTES).enumerate() {
+        let Some(address) = address.checked_add((index * COPYOUT_MAX_BYTES) as u64) else {
+            return CopyoutFault.outcome();
+        };
+        let out = match prepare(context, memory, [Some(UserSlot::new(address, chunk.len()))]) {
+            Ok(out) => out,
+            Err(refusal) => return refusal.into_outcome(),
+        };
+        if let Err(fault) = out.commit([chunk]) {
+            return fault.outcome();
+        }
+    }
+    success
+}
+
 /// One typed output record: exactly `T::ABI_SIZE` bytes at a guest address.
 pub(crate) struct UserOut<T: KernelAbi> {
     slot: UserSlot,
@@ -536,6 +629,8 @@ pub(crate) mod owner_fixture {
     pub(crate) struct OwnerRefusingMemory {
         pub(crate) inner: LinearMemory,
         refuse: Option<PortalOwnerWait>,
+        refuse_after: usize,
+        supply: Option<carrick_guest_mem::MemorySupplyRequest>,
         refuse_read: std::cell::Cell<Option<PortalOwnerWait>>,
         readonly: Vec<(u64, usize)>,
         pub(crate) prepares: usize,
@@ -547,6 +642,8 @@ pub(crate) mod owner_fixture {
             Self {
                 inner: LinearMemory::new(base, vec![fill; len]),
                 refuse: None,
+                refuse_after: 0,
+                supply: None,
                 refuse_read: std::cell::Cell::new(None),
                 readonly: Vec::new(),
                 prepares: 0,
@@ -555,9 +652,29 @@ pub(crate) mod owner_fixture {
 
         /// Refuse the next prepare with an Editor wait.
         pub(crate) fn refuse_next(&mut self) -> PortalOwnerWait {
+            self.refuse_after_prepares(0)
+        }
+
+        /// Refuse after `count` further preparation calls, for multi-window copies.
+        pub(crate) fn refuse_after_prepares(&mut self, count: usize) -> PortalOwnerWait {
             let wait = editor_wait();
             self.refuse = Some(wait);
+            self.refuse_after = count;
             wait
+        }
+
+        /// Model first-touch backing supply for an untouched private page.
+        pub(crate) fn refuse_next_supply_grant(
+            &mut self,
+        ) -> carrick_guest_mem::MemorySupplyRequest {
+            let request = carrick_guest_mem::MemorySupplyRequest::Grant(
+                carrick_el1_abi::PortalGrantWindow::decode([
+                    1, 2, 3, 1, 1, 0x1000, 0x2000, 3, 0x1000, 0, 0, 0, 0,
+                ])
+                .unwrap(),
+            );
+            self.supply = Some(request);
+            request
         }
 
         /// Refuse the next guest read with an Editor wait.
@@ -605,8 +722,13 @@ pub(crate) mod owner_fixture {
             ranges: &[GuestWriteRange],
         ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
             self.prepares += 1;
-            if let Some(wait) = self.refuse.take() {
+            if self.refuse_after != 0 {
+                self.refuse_after -= 1;
+            } else if let Some(wait) = self.refuse.take() {
                 return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            if let Some(request) = self.supply.take() {
+                return Err(MemoryPrepareError::Supply(request));
             }
             for range in ranges {
                 if !self.guest_range_is_writable(range.address().raw(), range.len()) {
@@ -673,6 +795,9 @@ pub(crate) mod owner_fixture {
                 }
                 Err(MemoryPrepareError::OwnerWait(wait)) => Err(MemoryError::OwnerWait(wait)),
                 Err(MemoryPrepareError::Fault(error)) => Err(error),
+                Err(MemoryPrepareError::Supply(request)) => {
+                    Err(MemoryError::Supply(Box::new(request)))
+                }
                 Err(_) => Err(MemoryError::Unsupported),
             }
         }
@@ -695,6 +820,121 @@ mod tests {
         crate::dispatch::SyscallDispatcher::new()
             .capture_one_task_context()
             .unwrap()
+    }
+
+    #[test]
+    fn s1_array_keeps_first_valid_permit_across_mapping_changes() {
+        struct ShrinkingMemory(OwnerRefusingMemory);
+        impl GuestMemory for ShrinkingMemory {
+            fn user_memory_venue(&self) -> UserMemoryVenue {
+                UserMemoryVenue::Owner
+            }
+            fn prepare_write(
+                &mut self,
+                ranges: &[GuestWriteRange],
+            ) -> Result<Box<dyn PreparedGuestWrite + '_>, carrick_guest_mem::MemoryPrepareError>
+            {
+                assert!(
+                    self.0.prepares < 12,
+                    "prefix selection must not revisit released authority indefinitely"
+                );
+                if self.0.prepares >= 2 {
+                    // An editor retires the previously valid prefix after its
+                    // permit was released to probe a larger destination.
+                    self.0.protect_readonly(BASE, 64);
+                }
+                self.0.prepare_write(ranges)
+            }
+            fn read_bytes_raw(
+                &self,
+                address: u64,
+                length: usize,
+            ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+                self.0.read_bytes_raw(address, length)
+            }
+            fn write_bytes_raw(
+                &mut self,
+                address: u64,
+                bytes: &[u8],
+            ) -> Result<(), carrick_guest_mem::MemoryError> {
+                self.0.write_bytes_raw(address, bytes)
+            }
+        }
+        impl CurrentMmMemory for ShrinkingMemory {}
+        let mut memory = ShrinkingMemory(OwnerRefusingMemory::new(BASE, 64, 0xa5));
+        let out = prepare_array(&context(), &mut memory, GuestVa::new(BASE), 8, 16).unwrap();
+        assert_eq!(out.records(), 4);
+        out.commit(&[7; 64]).unwrap();
+        assert_eq!(
+            memory.0.prepares, 2,
+            "retain the first valid permit instead of releasing it to probe again"
+        );
+    }
+
+    #[test]
+    fn s1_arrays_secure_only_whole_records_and_bound_preparation_work() {
+        for size in [12, 16, 32, 128] {
+            let mut memory = OwnerRefusingMemory::new(BASE, COPYOUT_MAX_BYTES * 2, 0xa5);
+            let out = prepare_array(
+                &context(),
+                &mut memory,
+                GuestVa::new(BASE),
+                usize::MAX,
+                size,
+            )
+            .unwrap();
+            assert_eq!(out.records(), COPYOUT_MAX_BYTES / size);
+            out.commit(&vec![7; (COPYOUT_MAX_BYTES / size) * size])
+                .unwrap();
+            assert_eq!(
+                memory.prepares, 1,
+                "valid bounded window uses exactly one permit"
+            );
+            let mut memory = OwnerRefusingMemory::new(BASE, COPYOUT_MAX_BYTES, 0xa5);
+            memory.protect_readonly(BASE + (3 * size) as u64, COPYOUT_MAX_BYTES - 3 * size);
+            let out = prepare_array(
+                &context(),
+                &mut memory,
+                GuestVa::new(BASE),
+                usize::MAX,
+                size,
+            )
+            .unwrap();
+            assert_eq!(out.records(), 2);
+            out.commit(&vec![7; 2 * size]).unwrap();
+            assert!(
+                memory.prepares <= 12,
+                "fault selection is logarithmic in the bounded record count"
+            );
+            assert_eq!(
+                memory
+                    .inner
+                    .read_bytes(BASE + (3 * size) as u64, size)
+                    .unwrap(),
+                vec![0xa5; size]
+            );
+        }
+    }
+
+    #[test]
+    fn s1_arrays_preserve_empty_and_faulted_destinations() {
+        let mut memory = OwnerRefusingMemory::new(BASE, 128, 0xa5);
+        let _ = memory.refuse_next();
+        prepare_array(&context(), &mut memory, GuestVa::new(0), 0, 128)
+            .unwrap()
+            .commit(&[])
+            .unwrap();
+        assert_eq!(memory.prepares, 0);
+        // The zero-output reservation did not consume the refusal.
+        assert!(prepare_array(&context(), &mut memory, GuestVa::new(BASE), 1, 128).is_err());
+        let out =
+            prepare_array(&context(), &mut memory, GuestVa::new(BASE + 0x2000), 1, 128).unwrap();
+        assert_eq!(out.records(), 0);
+        out.commit(&[]).unwrap();
+        let mut legacy = LinearMemory::new(BASE, vec![0; 128]);
+        let out =
+            prepare_array(&context(), &mut legacy, GuestVa::new(BASE + 0x2000), 1, 128).unwrap();
+        assert_eq!(out.records(), 0);
     }
 
     #[test]

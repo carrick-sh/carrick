@@ -213,16 +213,20 @@ pub(super) fn io_setup<M: CurrentMmMemory>(
     if current != 0 {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
     }
+    let out = match crate::dispatch::copyout::prepare(
+        cx.kernel,
+        cx.memory,
+        [Some(crate::dispatch::copyout::UserSlot::new(ctxp.0, 8))],
+    ) {
+        Ok(out) => out,
+        Err(refusal) => return Ok(refusal.into_outcome()),
+    };
     let raw = this.captured_mm().allocate_legacy_aio_context();
     let ctx_id = LegacyAioContextId::allocated_from(raw);
     this.captured_mm()
         .write_legacy_aio_contexts()
         .insert(ctx_id, std::collections::VecDeque::new());
-    if cx
-        .memory
-        .write_bytes(ctxp.0, &ctx_id.get().to_le_bytes())
-        .is_err()
-    {
+    if out.commit([&ctx_id.get().to_le_bytes()]).is_err() {
         this.captured_mm()
             .write_legacy_aio_contexts()
             .remove(&ctx_id);
@@ -350,25 +354,59 @@ pub(super) fn io_getevents<M: CurrentMmMemory>(
         Ok(value) => value,
         Err(errno) => return Ok(DispatchOutcome::errno(errno)),
     };
-    if range.max > 0 && (events.0 == 0 || cx.memory.read_bytes(events.0, 32).is_err()) {
-        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-    }
     let mm = this.captured_mm();
     let mut contexts = mm.write_legacy_aio_contexts();
     let Some(completions) = contexts.get_mut(&ctx) else {
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
     };
-    let available = completions.len().min(range.max as usize);
-    for (index, event) in completions.iter().take(available).enumerate() {
-        let Some(address) = events.0.checked_add((index as u64).saturating_mul(32)) else {
-            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+    let available = completions
+        .len()
+        .min(usize::try_from(range.max).unwrap_or(usize::MAX));
+    // Unlike a stream read, io_getevents has a minimum result count. Copy
+    // through bounded permits without shortening a ready result to one window.
+    // The queue stays intact until every copy finishes: refusal after an earlier
+    // window can redispatch safely because no completion has been consumed.
+    let mut copied = 0usize;
+    let mut effect = None;
+    while copied < available {
+        let Some(address) = copied
+            .checked_mul(32)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .and_then(|offset| events.0.checked_add(offset))
+        else {
+            break;
         };
-        if write_kernel_struct_raw(cx.memory, address, event).is_err() {
-            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+        let out = match crate::dispatch::copyout::prepare_array(
+            cx.kernel,
+            cx.memory,
+            carrick_guest_mem::GuestVa::new(address),
+            available - copied,
+            32,
+        ) {
+            Ok(out) => out,
+            Err(refusal) => return Ok(refusal.into_outcome()),
+        };
+        let count = out.records();
+        if count == 0 {
+            break;
         }
+        let mut bytes = Vec::with_capacity(count * 32);
+        for event in completions.range(copied..copied + count) {
+            bytes.extend_from_slice(event.abi_bytes());
+        }
+        let (result, next_effect) = out.commit_retaining(&bytes);
+        effect = effect.or(next_effect);
+        if let Err(fault) = result {
+            return Ok(fault.outcome());
+        }
+        copied += count;
     }
-    completions.drain(..available);
-    Ok(DispatchOutcome::returned_len_or_errno(available))
+    if available != 0 && copied == 0 {
+        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+    }
+    completions.drain(..copied);
+    drop(effect);
+    Ok(DispatchOutcome::returned_len_or_errno(copied))
 }
 
 impl<'a> FsView<'a> {
@@ -392,5 +430,95 @@ impl<'a> FsView<'a> {
         fn io_getevents(this, cx, raw_ctx: u64, min_nr: u64, nr: u64, events: GuestPtr, _timeout: GuestPtr) {
             io_getevents(this, cx, raw_ctx, min_nr, nr, events)
         }
+    }
+}
+
+#[cfg(test)]
+mod s1_tests {
+    use super::*;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+
+    #[test]
+    fn s1_aio_large_output_preserves_minimum_and_refused_window() {
+        for refuse_second in [false, true] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let mm = context.shared().mm();
+            let raw = mm.allocate_legacy_aio_context();
+            let id = LegacyAioContextId::allocated_from(raw);
+            let event = crate::linux_abi::LinuxIoEvent {
+                data: 711,
+                obj: 1,
+                result: 8,
+                result2: 0,
+            };
+            mm.write_legacy_aio_contexts()
+                .insert(id, std::iter::repeat_n(event, 130).collect());
+            let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0xa5);
+            let request = SyscallRequest::new(4, SyscallArgs::from([raw, 130, 130, 0x1000, 0, 0]));
+            if refuse_second {
+                let wait = memory.refuse_after_prepares(1);
+                assert_eq!(
+                    dispatcher
+                        .dispatch(&context, request, &mut memory, &CompatReporter::default())
+                        .unwrap(),
+                    DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+                );
+                assert_eq!(mm.write_legacy_aio_contexts().get(&id).unwrap().len(), 130);
+                assert_eq!(memory.inner.read_bytes(0x2000, 32).unwrap(), [0xa5; 32]);
+            }
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, request, &mut memory, &CompatReporter::default())
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 130 }
+            );
+            assert_eq!(memory.prepares, if refuse_second { 4 } else { 2 });
+            for index in 0..130 {
+                assert_eq!(
+                    memory.inner.read_bytes(0x1000 + index * 32, 32).unwrap(),
+                    event.abi_bytes()
+                );
+            }
+            assert!(mm.write_legacy_aio_contexts().get(&id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn s1_aio_copyout_refusal_preserves_completion() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mm = context.shared().mm();
+        let raw = mm.allocate_legacy_aio_context();
+        let id = LegacyAioContextId::allocated_from(raw);
+        let event = crate::linux_abi::LinuxIoEvent {
+            data: 711,
+            obj: 1,
+            result: 8,
+            result2: 0,
+        };
+        mm.write_legacy_aio_contexts()
+            .insert(id, [event].into_iter().collect());
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x1000, 0xa5);
+        let wait = memory.refuse_next();
+        let request = SyscallRequest::new(4, SyscallArgs::from([raw, 1, 1, 0x1000, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, request, &mut memory, &CompatReporter::default())
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(mm.write_legacy_aio_contexts().get(&id).unwrap().len(), 1);
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, request, &mut memory, &CompatReporter::default())
+                .unwrap(),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            memory.inner.read_bytes(0x1000, 32).unwrap(),
+            event.abi_bytes()
+        );
+        assert!(mm.write_legacy_aio_contexts().get(&id).unwrap().is_empty());
     }
 }
