@@ -204,10 +204,16 @@ fn procmap_query(
     memory: &mut impl CurrentMmMemory,
     arg: u64,
 ) -> DispatchOutcome {
-    let mut query: carrick_abi::LinuxProcmapQuery = match read_kernel_struct(memory, arg) {
-        Ok(query) => query,
-        Err(errno) => return DispatchOutcome::errno(errno),
-    };
+    let (mut query, mut name_offset) =
+        if let Some(resumed) = this.take_suspended_procmap_query(context, arg) {
+            resumed
+        } else {
+            match read_kernel_struct(memory, arg) {
+                Ok(query) => (query, 0usize),
+                Err(errno) => return DispatchOutcome::errno(errno),
+            }
+        };
+    let input_query = query;
     let size = query.size;
     if size < <carrick_abi::LinuxProcmapQuery as KernelAbi>::ABI_SIZE as u64 {
         return DispatchOutcome::errno(LINUX_EINVAL);
@@ -342,10 +348,10 @@ fn procmap_query(
     query.vma_name_size = name_bytes.as_ref().map_or(0, |bytes| bytes.len() as u32);
     query.build_id_size = 0;
     if let Some(name_bytes) = &name_bytes {
-        if name_bytes
-            .len()
-            .saturating_add(<carrick_abi::LinuxProcmapQuery as carrick_abi::KernelAbi>::ABI_SIZE)
-            <= super::super::copyout::COPYOUT_MAX_BYTES
+        if name_offset == 0
+            && name_bytes.len().saturating_add(
+                <carrick_abi::LinuxProcmapQuery as carrick_abi::KernelAbi>::ABI_SIZE,
+            ) <= super::super::copyout::COPYOUT_MAX_BYTES
         {
             let output = match super::super::copyout::prepare(
                 context,
@@ -368,24 +374,52 @@ fn procmap_query(
                 Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
             };
         }
-        let name_outcome = FsView::copyout_bytes(
-            context,
-            memory,
-            name_address,
-            name_bytes,
-            DispatchOutcome::Returned { value: 0 },
-        );
-        if !matches!(name_outcome, DispatchOutcome::Returned { value: 0 }) {
-            return name_outcome;
+        while name_offset < name_bytes.len() {
+            let chunk_len =
+                (name_bytes.len() - name_offset).min(super::super::copyout::COPYOUT_MAX_BYTES);
+            let Some(chunk_addr) = name_address.checked_add(name_offset as u64) else {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            };
+            let out = match super::super::copyout::prepare(
+                context,
+                memory,
+                [Some(super::super::copyout::UserSlot::new(
+                    chunk_addr, chunk_len,
+                ))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => {
+                    if name_offset > 0 {
+                        this.save_suspended_procmap_query(context, arg, input_query, name_offset);
+                    }
+                    return refusal.into_outcome();
+                }
+            };
+            if let Err(fault) = out.commit([&name_bytes[name_offset..name_offset + chunk_len]]) {
+                return fault.outcome();
+            }
+            name_offset += chunk_len;
         }
     }
-    FsView::copyout_bytes(
+    let out = match super::super::copyout::prepare(
         context,
         memory,
-        arg,
-        query.as_bytes(),
-        DispatchOutcome::Returned { value: 0 },
-    )
+        [Some(super::super::copyout::UserSlot::of::<
+            carrick_abi::LinuxProcmapQuery,
+        >(arg))],
+    ) {
+        Ok(out) => out,
+        Err(refusal) => {
+            if name_offset > 0 {
+                this.save_suspended_procmap_query(context, arg, input_query, name_offset);
+            }
+            return refusal.into_outcome();
+        }
+    };
+    match out.commit([query.as_bytes()]) {
+        Ok(()) => DispatchOutcome::Returned { value: 0 },
+        Err(fault) => fault.outcome(),
+    }
 }
 
 /// One Linux-visible interface with an IPv4 address. Flags and MTU stay in
@@ -2675,5 +2709,122 @@ mod tests {
         let written_name = memory.read_bytes(NAME_ADDR, 4008).unwrap();
         assert_eq!(&written_name[..4007], long_path.as_bytes());
         assert_eq!(written_name[4007], 0);
+
+        // Re-review P2: PROCMAP_QUERY with a 4008-byte name whose vma_name_addr
+        // overlaps the LinuxProcmapQuery record at QUERY_ADDR. When the first
+        // prepare (name) commits and overwrites QUERY_ADDR, and the second
+        // prepare (query record) is refused with OwnerMemoryWait, redispatch
+        // must use a snapshot of the original query input and return 0, not
+        // reread the overwritten query and return EINVAL (22).
+        struct NthPrepareRefusingMemory {
+            inner: OwnerRefusingMemory,
+            refuse_on_prepare: Option<usize>,
+        }
+        impl GuestMemory for NthPrepareRefusingMemory {
+            fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+                carrick_guest_mem::UserMemoryVenue::Owner
+            }
+            fn prepare_write(
+                &mut self,
+                ranges: &[carrick_guest_mem::GuestWriteRange],
+            ) -> Result<
+                Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+                carrick_guest_mem::MemoryPrepareError,
+            > {
+                if self.refuse_on_prepare == Some(self.inner.prepares) {
+                    self.refuse_on_prepare = None;
+                    let _ = self.inner.refuse_next();
+                }
+                self.inner.prepare_write(ranges)
+            }
+            fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+                self.inner.guest_range_is_writable(address, length)
+            }
+            fn read_bytes_raw(
+                &self,
+                address: u64,
+                length: usize,
+            ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+                self.inner.read_bytes_raw(address, length)
+            }
+            fn write_bytes_raw(
+                &mut self,
+                address: u64,
+                bytes: &[u8],
+            ) -> Result<(), carrick_guest_mem::MemoryError> {
+                self.inner.write_bytes_raw(address, bytes)
+            }
+        }
+        impl CurrentMmMemory for NthPrepareRefusingMemory {}
+
+        let second_prepare = memory.prepares + 1;
+        let mut mem2 = NthPrepareRefusingMemory {
+            inner: memory,
+            refuse_on_prepare: Some(second_prepare),
+        };
+        let overlap_query = carrick_abi::LinuxProcmapQuery {
+            size: core::mem::size_of::<carrick_abi::LinuxProcmapQuery>() as u64,
+            query_addr: 0x20_000,
+            vma_name_size: 4096,
+            vma_name_addr: QUERY_ADDR,
+            ..Default::default()
+        };
+        mem2.inner.seed(QUERY_ADDR, &[FILL; 4096]);
+        mem2.inner.seed(QUERY_ADDR, overlap_query.as_bytes());
+        let first_overlap = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::IOCTL.raw(),
+                    SyscallArgs::from([
+                        maps_fd as u64,
+                        carrick_abi::LINUX_PROCMAP_QUERY,
+                        QUERY_ADDR,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut mem2,
+                &reporter,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                first_overlap,
+                DispatchOutcome::OwnerMemoryWait { committed: 0, .. }
+            ),
+            "expected OwnerMemoryWait on second prepare, got {first_overlap:?}",
+        );
+        let retry_overlap = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::IOCTL.raw(),
+                    SyscallArgs::from([
+                        maps_fd as u64,
+                        carrick_abi::LINUX_PROCMAP_QUERY,
+                        QUERY_ADDR,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut mem2,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            retry_overlap,
+            DispatchOutcome::Returned { value: 0 },
+            "PROCMAP_QUERY redispatch after overlapping name copyout must return 0, not EINVAL",
+        );
+        let final_query: carrick_abi::LinuxProcmapQuery =
+            mem2.inner.read_struct(QUERY_ADDR).unwrap();
+        let final_name_size = final_query.vma_name_size;
+        assert_eq!(final_name_size, 4008);
+        let tail_name = mem2.inner.read_bytes(QUERY_ADDR + 104, 4008 - 104).unwrap();
+        assert_eq!(&tail_name[..4007 - 104], &long_path.as_bytes()[104..]);
+        assert_eq!(tail_name[4007 - 104], 0);
     }
 }
