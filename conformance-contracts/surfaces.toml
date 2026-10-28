@@ -222,7 +222,7 @@ contracts = ["kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.stage1-publication", "process.native.arm-admission"]
+contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.stage1-publication", "process.native.arm-admission", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
@@ -597,15 +597,15 @@ contracts = ["kernel.vcpu.vm-lifetime", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor.rs"
-contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy"]
+contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs"
-contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.scheduler.runnable-progress"]
+contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.scheduler.runnable-progress", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs"
-contracts = ["kernel.el1.guest-run-queue", "kernel.scheduler.host-wait-handoff", "kernel.signal.temporary-wait-mask"]
+contracts = ["kernel.el1.guest-run-queue", "kernel.scheduler.host-wait-handoff", "kernel.signal.temporary-wait-mask", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_vcpu_lifetime.rs"
@@ -613,7 +613,7 @@ contracts = ["kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/gic.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
+contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_gic.rs"
@@ -1273,7 +1273,7 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0-host/src/carrier_cpu.rs"
-contracts = ["kernel.mm.address-space-occupancy"]
+contracts = ["kernel.mm.address-space-occupancy", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0-host/src/carrier_memory.rs"
@@ -1861,7 +1861,7 @@ contracts = ["kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs"
-contracts = ["kernel.memory.owner-wait"]
+contracts = ["kernel.memory.owner-wait", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/owner_wait.rs"
@@ -2043,7 +2043,6 @@ contracts = ["kernel.native.host-file-venue"]
 path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs"
 contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.runnable-progress", "kernel.scheduler.preemption-lifecycle", "kernel.scheduler.preemption-cost", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
 
-# Executor-wide shutdown observation, including physical backend re-entry.
 [[surfaces]]
 path = "crates/carrick-hal/src/vcpu_run.rs"
 contracts = ["kernel.vcpu.shutdown-entry"]
@@ -2053,31 +2052,11 @@ path = "crates/carrick-hal/src/lib.rs"
 contracts = ["kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/binding.rs"
 contracts = ["kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/shutdown_loom.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap.rs"
 contracts = ["kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
@@ -2086,8 +2065,4 @@ contracts = ["kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/tests/support/shutdown_kick.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/carrier_cpu.rs"
 contracts = ["kernel.vcpu.shutdown-entry"]
