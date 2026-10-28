@@ -233,6 +233,14 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEntryHandle<'a, C> {
             completion,
         )
     }
+    /// Borrow the currently published source for this exact MM. Admission
+    /// authenticates ACTIVE, identity and key while retaining source lifetime;
+    /// the reservation mutex is not required to observe its publication.
+    pub fn live_notifications(self) -> Result<SpaceNotificationLease<'a, C>, ObjectWaitError> {
+        self.zone
+            .editor_notification(self.index, self.mm.get())
+            .ok_or(ObjectWaitError::Stale)
+    }
     pub fn notifications(
         self,
         incarnation: NonZeroU64,

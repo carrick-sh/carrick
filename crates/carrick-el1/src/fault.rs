@@ -20,7 +20,7 @@ pub fn panic_publication_detail() -> u64 {
 }
 
 pub use carrick_core::mm::fault::{
-    request_lazy_frames, root_fault_admission, root_mapping_incarnation,
+    RootMappingIncarnation, request_lazy_frames, root_fault_admission, root_mapping_incarnation,
 };
 
 /// Decode an EL0 translation fault that can be satisfied by publishing fresh
@@ -1011,6 +1011,13 @@ impl<'a> GrantMailboxes<'a> {
     pub fn own(own: &'a FrameGrantMailbox) -> Self {
         Self { own, peers: None }
     }
+
+    pub fn with_owner(self, owner: &'a OwnerFaultSupply<'a>) -> FaultSupply<'a> {
+        FaultSupply::Mailbox {
+            mailboxes: self,
+            owner: Some(owner),
+        }
+    }
 }
 
 /// A CPL0 fault can request physical supply without delegating leaf publication.
@@ -1046,15 +1053,30 @@ impl<'a> OwnerFaultSupply<'a> {
 }
 #[derive(Clone, Copy)]
 pub enum FaultSupply<'a> {
-    Mailbox(GrantMailboxes<'a>),
+    Mailbox {
+        mailboxes: GrantMailboxes<'a>,
+        owner: Option<&'a OwnerFaultSupply<'a>>,
+    },
     Owner(&'a OwnerFaultSupply<'a>),
 }
 impl<'a> From<GrantMailboxes<'a>> for FaultSupply<'a> {
     fn from(mailboxes: GrantMailboxes<'a>) -> Self {
-        Self::Mailbox(mailboxes)
+        Self::Mailbox {
+            mailboxes,
+            owner: None,
+        }
     }
 }
-impl FaultSupply<'_> {
+impl<'s> FaultSupply<'s> {
+    fn owner(self) -> Option<&'s OwnerFaultSupply<'s>> {
+        match self {
+            Self::Mailbox { owner, .. } => owner,
+            Self::Owner(owner) => Some(owner),
+        }
+    }
+    fn is_owner(self) -> bool {
+        matches!(self, Self::Owner(_))
+    }
     fn observe<C: Copy + Send + Sync + zerocopy::FromZeros>(
         self,
         spaces: SpaceAccess<'_, C>,
@@ -1062,9 +1084,7 @@ impl FaultSupply<'_> {
         cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
     ) -> Option<carrick_el1_abi::PortalOwnerWait> {
         use carrick_sched_core::spaces::notification::SpaceWaitCause;
-        let Self::Owner(owner) = self else {
-            return None;
-        };
+        let owner = self.owner()?;
         let handle = owner.handle.filter(|handle| handle.mm().raw() == mm)?;
         let source = spaces
             .venue()?
@@ -1083,7 +1103,7 @@ impl FaultSupply<'_> {
         Some(unsafe { carrick_el1_abi::PortalOwnerWait::from_owner(handle, cause, revision) })
     }
     fn wait(self, wait: Option<carrick_el1_abi::PortalOwnerWait>) {
-        if let (Self::Owner(owner), Some(wait)) = (self, wait) {
+        if let (Some(owner), Some(wait)) = (self.owner(), wait) {
             owner.outcome.set(OwnerFaultSupplyOutcome::Wait(wait));
         }
     }
@@ -1095,14 +1115,17 @@ impl FaultSupply<'_> {
         owner: NonZeroU64,
     ) -> Option<carrick_sched_core::spaces::SpaceEditor<'a, C>> {
         use carrick_sched_core::spaces::{EditAdmissionRefusal, notification::SpaceWaitCause};
-        if matches!(self, Self::Mailbox(_)) {
-            return spaces.try_begin_edit_bounded(
+        if matches!(self, Self::Mailbox { .. })
+            && let Some(editor) = spaces.try_begin_edit_bounded(
                 index,
                 mm,
                 owner,
                 carrick_el1_abi::EL1_GUEST_LOCK_SPINS,
-            );
+            )
+        {
+            return Some(editor);
         }
+        self.owner()?;
         let editor = self.observe(spaces, mm, SpaceWaitCause::Editor);
         let gate = self.observe(spaces, mm, SpaceWaitCause::Gate);
         match spaces
@@ -1295,7 +1318,7 @@ fn dispatch_classified_fault<
         let Some(owner) = NonZeroU64::new(slot + 1) else {
             return Action::Forward;
         };
-        if let FaultSupply::Owner(_) = supply {
+        if supply.owner().is_some() {
             let observed = supply.observe(
                 spaces,
                 mm_key,
@@ -1314,11 +1337,12 @@ fn dispatch_classified_fault<
                     supply.wait(observed);
                     return Action::Forward;
                 }
-                RootFaultAdmission::Declined => {
+                RootFaultAdmission::Declined if supply.is_owner() => {
                     supply.decline();
                     return Action::Forward;
                 }
-                _ => return Action::Forward,
+                _ if supply.is_owner() => return Action::Forward,
+                _ => {}
             }
         }
         // A closed gate (host pause or retirement) or another EL1 editor:
@@ -1381,7 +1405,7 @@ fn dispatch_classified_fault<
     }
 
     if let FaultClass::Protection(access) = fault {
-        if let FaultSupply::Owner(_) = supply
+        if supply.owner().is_some()
             && let Some(task) = current_task
         {
             let mm = task.mm.key.load(Ordering::Acquire);
@@ -1398,7 +1422,7 @@ fn dispatch_classified_fault<
                 far & !4095,
                 access,
             ) {
-                RootFaultAdmission::Declined => supply.decline(),
+                RootFaultAdmission::Declined if supply.is_owner() => supply.decline(),
                 RootFaultAdmission::Busy => supply.wait(observed),
                 _ => {}
             }
@@ -1470,13 +1494,13 @@ fn dispatch_classified_fault<
         ) {
             Ok(GuestPreparedCommit::Committed) => {
                 assert!(path.residency.record_commit(page));
-                if let FaultSupply::Mailbox(mailboxes) = supply {
+                if let FaultSupply::Mailbox { mailboxes, .. } = supply {
                     consume_served_refusals(mailboxes, mm_key, far, access);
                 }
                 return Action::Served;
             }
             Ok(GuestPreparedCommit::AlreadyResident) => {
-                if let FaultSupply::Mailbox(mailboxes) = supply {
+                if let FaultSupply::Mailbox { mailboxes, .. } = supply {
                     consume_served_refusals(mailboxes, mm_key, far, access);
                 }
                 return Action::Served;
@@ -1553,38 +1577,15 @@ fn dispatch_classified_fault<
         }
         return Action::Forward;
     }
-    let FaultSupply::Mailbox(mailboxes) = supply else {
+    let FaultSupply::Mailbox { mailboxes, .. } = supply else {
         return Action::Forward;
     };
     let mailbox = mailboxes.own;
-    // Only refusals cross back to EL1. Successful grants have already
-    // published and released their slot on the host, even after migration.
-    if consume_refusal(mailboxes, mm_key, far, access, || {
-        root_mapping_incarnation(
-            prepared.as_ref().and_then(|path| path.roots),
-            spaces,
-            slot as u32,
-            mm_key,
-            far,
-        )
-    }) {
-        return Action::Forward;
-    }
-
-    #[cfg(target_os = "none")]
-    if let Some(roots) = prepared.as_ref().and_then(|path| path.roots)
-        && let Some(slots) = prepared.as_ref().and_then(|path| path.file_slots)
-        && (carrick_core::mm::fault::FileFaultVenue {
-            roots,
-            spaces,
-            slots,
-            worker: slot as u32,
-            mailbox,
-        })
-        .publish(mm_key, far, access)
-    {
-        return Action::Forward;
-    }
+    let observed = supply.observe(
+        spaces,
+        mm_key,
+        carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+    );
     let incarnation = root_mapping_incarnation(
         prepared.as_ref().and_then(|path| path.roots),
         spaces,
@@ -1592,7 +1593,45 @@ fn dispatch_classified_fault<
         mm_key,
         far,
     );
-    if let Some(incarnation) = incarnation {
+    if incarnation == RootMappingIncarnation::Busy {
+        supply.wait(observed);
+        return Action::Forward;
+    }
+    let mapped = incarnation.mapped();
+    // Only refusals cross back to EL1. Successful grants have already
+    // published and released their slot on the host, even after migration.
+    if consume_refusal(mailboxes, mm_key, far, access, || mapped) {
+        return Action::Forward;
+    }
+
+    #[cfg(target_os = "none")]
+    if let Some(roots) = prepared.as_ref().and_then(|path| path.roots)
+        && let Some(slots) = prepared.as_ref().and_then(|path| path.file_slots)
+    {
+        let observed = supply.observe(
+            spaces,
+            mm_key,
+            carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+        );
+        match (carrick_core::mm::fault::FileFaultVenue {
+            roots,
+            spaces,
+            slots,
+            worker: slot as u32,
+            mailbox,
+        })
+        .try_publish(mm_key, far, access)
+        {
+            Ok(true) => return Action::Forward,
+            Ok(false) => {}
+            Err(crate::memory::reservations::Refusal::Busy) => {
+                supply.wait(observed);
+                return Action::Forward;
+            }
+            Err(_) => {}
+        }
+    }
+    if let Some(incarnation) = mapped {
         let _ = request_lazy_frames(mailbox, mm_key, far, access, incarnation);
     }
     Action::Forward
@@ -2516,6 +2555,7 @@ mod tests {
         assert!(
             !consume_refusal(GrantMailboxes::own(&mailbox), mm, va, 2, || {
                 root_mapping_incarnation(Some(&roots), SpaceAccess::source_free(&spaces), 0, mm, va)
+                    .mapped()
             }),
             "unreadable incarnation cannot authenticate an old refusal"
         );
