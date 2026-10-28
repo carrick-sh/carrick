@@ -2296,6 +2296,10 @@ mod child_tid_owner_tests {
             0x1000,
         );
         carrick_kernel::el1_zone::with_test_zone(zone, || {
+            // Before a zone continuation is enrolled, real generic/control
+            // wakes still must not offer the native exception to host load.
+            scheduler.wake(root.thread().key()).unwrap();
+            scheduler.wake_control(root.thread().key()).unwrap();
             assert_eq!(kernel.wake_native_terminal_members(&sibling).unwrap(), 0);
         });
         assert!(
@@ -2310,6 +2314,120 @@ mod child_tid_owner_tests {
             scheduler.try_take(&worker).unwrap().is_none(),
             "fault member was offered to load"
         );
+        scheduler.unregister_executor(&worker).unwrap();
+        scheduler.close();
+    }
+
+    #[test]
+    fn native_runnable_settlement_publishes_blocked_generation_until_host_handback() {
+        use crate::vcpu_loop::tests::{
+            EndpointTestSignalArrival, EndpointTestSignalPump, RuntimeTestExecutorKick,
+            test_carrier_graph_with_dispatcher,
+        };
+        use carrick_kernel::dispatch::SyscallDispatcher;
+        use carrick_kernel::kernel::objects::{BlockedReason, ThreadExecutionState};
+        use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken, OwnerEntry};
+
+        let (_runtime, scheduler, _kernel, root, _process, _) =
+            test_carrier_graph_with_dispatcher!(72_455, SyscallDispatcher::new());
+        root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+        let _sibling = root
+            .kernel()
+            .reserve_thread_clone(
+                &root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(72_456))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+        assert_eq!(root.task().threads().len(), 2);
+        let worker = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .unwrap();
+        let running = scheduler.try_take(&worker).unwrap().expect("root row");
+        let zone = leaked_zone();
+        let key = root.thread().key();
+        let record = zone
+            .alloc_record(carrick_el1_abi::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+                serial: key.serial.raw(),
+                mm: root.shared().mm().id().raw(),
+                file_table: root.resources().files().id().raw(),
+                generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let record = zone.record_ref(record);
+        let custody =
+            carrick_core::lifecycle::MemberControlCustody::retain(root.thread().control_slot())
+                .unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        let wait_key = ObjectWaitKey::native_service(record).unwrap();
+        zone.bind_object_wait(wait_key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let queue = zone
+            .object_wait(wait_key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let snapshot = queue.snapshot();
+        queue
+            .park_owner_until(
+                snapshot,
+                record.id,
+                OperationToken::new(1, 1).unwrap(),
+                0,
+                OwnerEntry::Exception,
+            )
+            .unwrap();
+        drop(queue);
+        root.thread().control_slot().bind_zone_record(record);
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            scheduler.settle_runnable(running).unwrap();
+            scheduler.wake(root.thread().key()).unwrap();
+            scheduler.wake_control(root.thread().key()).unwrap();
+            assert!(matches!(
+                root.thread().execution_state(),
+                ThreadExecutionState::Blocked { .. }
+            ));
+            assert_eq!(scheduler.queued_len(), 0);
+            assert_eq!(
+                zone.claim_for_host(
+                    record,
+                    None,
+                    carrick_el1_abi::Handback::Woken,
+                    &carrick_kernel::el1_zone::HostLockWait
+                ),
+                carrick_el1_abi::HostClaim::Claimed
+            );
+            // SAFETY: this fixture now owns the exact Host checkpoint.
+            unsafe {
+                assert!(zone.record(record.id).take_object_operation().is_some());
+                zone.record(record.id).consume_owner_continuation();
+            }
+            scheduler.publish_zone_handback(record);
+            let resumed = scheduler
+                .try_take(&worker)
+                .unwrap()
+                .expect("native handback must pass the real runtime generation auditor");
+            assert_eq!(resumed.thread_key(), root.thread().key());
+            scheduler
+                .settle_blocked(resumed, BlockedReason::HostWait)
+                .unwrap();
+        });
         scheduler.unregister_executor(&worker).unwrap();
         scheduler.close();
     }

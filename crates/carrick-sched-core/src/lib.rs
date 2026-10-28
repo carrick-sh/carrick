@@ -892,7 +892,30 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.native_owned.load(Ordering::Acquire) != 0
     }
 
+    /// Exception owners resume through their retained native fault operation,
+    /// never through a host CPU snapshot, even while physically host-owned.
+    pub fn requires_native_entry(&self) -> bool {
+        self.resume_disposition()
+            == object_wait::ResumeDisposition::OwnerContinuation(object_wait::OwnerEntry::Exception)
+    }
+
+    /// Physical host custody is insufficient to make a host continuation ready.
+    pub fn host_resume_ready(&self) -> bool {
+        matches!(
+            self.claim(),
+            Claim::Host { .. } | Claim::FirstEntryHost { .. }
+        ) && !self.requires_native_entry()
+    }
+
+    /// Adopted exception owners may predate the native-owned allocation hint.
+    pub fn has_native_execution_owner(&self) -> bool {
+        self.is_native_owned() || self.requires_native_entry()
+    }
+
     pub fn needs_host(&self) -> bool {
+        if self.requires_native_entry() {
+            return false;
+        }
         self.handback() == Some(Handback::Service)
             || self.host_wanted()
             || (!self.is_cancelled()
@@ -2940,10 +2963,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // an idle executor. A host-owned successor still needs that task's
         // exception/forwarding boundary, even when its MM is already here.
         rec.needs_host()
-            || ((self.executor_has_task(slot) || rec.is_native_owned())
+            || ((self.executor_has_task(slot) || rec.has_native_execution_owner())
                 && (self.installed_space(slot) == mm
                     || self.may_switch_to(slot, mm)
-                    || (rec.is_native_owned() && self.spaces.is_open(mm))))
+                    || (rec.has_native_execution_owner() && self.spaces.is_open(mm))))
     }
 
     /// Whether EL1 on `slot` may install address space `mm` itself: the
@@ -4320,17 +4343,38 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.place_from_claim(record, from)
     }
 
+    /// Retain an exception completion on a native run queue when every driver
+    /// is outside the guest. Queue custody survives a driver stepping away;
+    /// an eligible returning or idle driver can take/steal it. This does not
+    /// grant execution on the queue's CPU or bypass MM/affinity admission.
+    pub fn place_native_exception(&self, record: RecordRef) -> Option<HostPlacement> {
+        let rec = self.live(record)?;
+        if !rec.requires_native_entry() {
+            return None;
+        }
+        let from = rec.claim();
+        if !matches!(from, Claim::Host { .. }) {
+            return None;
+        }
+        self.place_from_claim(record.id, from).or_else(|| {
+            let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
+            self.requeue_from_claim(owner, record.id, from)
+        })
+    }
+
     fn place_from_claim(&self, record: RecordId, from: Claim) -> Option<HostPlacement> {
         let rec = self.record(record);
         let seq = rec.parked_sequence(from);
         let service = rec.needs_host() || rec.is_unadopted_birth();
-        let driven = service || rec.is_native_owned();
+        let driven = service || rec.has_native_execution_owner();
         if let Some(home) = rec.home() {
             // The host believes its thread runs on its home slot: only that
             // slot may run it, and only while it is in the guest.
             let guard = self.slot_lock(home, &SpinForever)?;
             let state = self.slot(home).state();
-            if !state.in_guest() || !rec.cas(from, Claim::Queued { slot: home, seq }) {
+            if !(state.in_guest() || (rec.requires_native_entry() && self.slot(home).is_live()))
+                || !rec.cas(from, Claim::Queued { slot: home, seq })
+            {
                 return None;
             }
             self.push_locked(&guard, record, None);

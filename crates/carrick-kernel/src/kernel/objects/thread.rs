@@ -516,11 +516,17 @@ struct ThreadExecutionRecord {
     task_state: Option<Box<MigratableTaskState>>,
     blocked_continuation: Option<Box<crate::kernel::continuation::BlockedContinuation>>,
     leased_continuation: Option<crate::kernel::continuation::ContinuationId>,
+    native_record_wait: Option<NativeRecordWait>,
     next_executor_epoch: u64,
     exec_invalidation_pending: bool,
     control_quantum: Option<SchedulerControlQuantum>,
     affinity_residency: Option<AffinityResidency>,
 }
+
+/// A native checkpoint still owns the saved CPU frame. Its exact handback
+/// (or retirement), rather than a generic wake, releases this dependency.
+#[derive(Clone, Copy, Debug)]
+struct NativeRecordWait(carrick_el1_abi::RecordRef);
 
 /// A migration nudge belongs to this loaded incarnation, never to an ambient
 /// host thread or a recycled executor slot. The weak capability cannot keep
@@ -581,6 +587,7 @@ impl ThreadExecutionRecord {
             task_state: None,
             blocked_continuation: None,
             leased_continuation: None,
+            native_record_wait: None,
             next_executor_epoch: 1,
             exec_invalidation_pending: false,
             control_quantum: None,
@@ -1485,10 +1492,64 @@ impl Thread {
         Ok(action)
     }
 
+    /// The native fault service retains execution even before its host zone
+    /// continuation is enrolled. Generic/control wakes cannot replace it.
+    fn native_exception_record(&self) -> Option<carrick_el1_abi::RecordRef> {
+        let (zone, record) = crate::el1_zone::zone()
+            .or_else(carrick_el1_abi::zone_tables)
+            .zip(self.control_slot().zone_record())?;
+        carrick_core::terminal::native_exception_retains_terminal_wake(
+            zone,
+            record,
+            self.control_slot(),
+            carrick_core_abi::EntryTaskKey::from_raw(
+                carrick_el1_abi::El1TaskId::from_linux_tid(self.key.tid.raw()).raw(),
+            ),
+            carrick_core_abi::EntryThreadGeneration::from_raw(self.key.serial.raw()),
+        )
+        .then_some(record)
+    }
+
+    fn native_execution_pending(&self, execution: &mut ThreadExecutionRecord) -> bool {
+        if execution.native_record_wait.is_none() {
+            execution.native_record_wait = self.native_exception_record().map(NativeRecordWait);
+        }
+        let Some(NativeRecordWait(record)) = execution.native_record_wait else {
+            return false;
+        };
+        let Some(zone) = crate::el1_zone::zone().or_else(carrick_el1_abi::zone_tables) else {
+            return true;
+        };
+        // Recheck the authenticated snapshot, including a checkpoint that
+        // completed/retired between authentication and installing this wait.
+        if zone
+            .live(record)
+            .is_some_and(|rec| !rec.host_resume_ready())
+        {
+            return true;
+        }
+        execution.native_record_wait = None;
+        false
+    }
+
+    fn claim_native_control(&self, execution: &mut ThreadExecutionRecord) {
+        if let Some(NativeRecordWait(record)) = execution.native_record_wait {
+            // An exception operation stays with its service. Once its native
+            // checkpoint has completed, ordinary control may claim the saved
+            // user frame (or kick its running slot), as for a zone wait.
+            let _ = crate::el1_zone::claim(record, None, carrick_el1_abi::Handback::Control);
+        }
+    }
+
     fn decide_scheduler_wake_action(
         &self,
         execution: &mut ThreadExecutionRecord,
     ) -> Result<ThreadSchedulerAction, ThreadExecutionError> {
+        if matches!(execution.state, ThreadExecutionState::Blocked { .. })
+            && self.native_execution_pending(execution)
+        {
+            return Ok(ThreadSchedulerAction::None);
+        }
         match execution.state {
             ThreadExecutionState::Blocked {
                 generation: predecessor,
@@ -1585,6 +1646,12 @@ impl Thread {
         &self,
         record: carrick_el1_abi::RecordRef,
     ) -> Option<crate::kernel::scheduler::ExactWakeTarget> {
+        if carrick_el1_abi::zone_tables().is_some_and(|zone| {
+            zone.live(record)
+                .is_some_and(|rec| !rec.host_resume_ready())
+        }) {
+            return None;
+        }
         let execution = self.execution.lock();
         let generation = execution.state.generation()?;
         let mut target =
@@ -1603,7 +1670,10 @@ impl Thread {
         } else if !matches!(
             execution.state,
             ThreadExecutionState::Running { .. } | ThreadExecutionState::SwitchingOut { .. }
-        ) {
+        ) && execution
+            .native_record_wait
+            .is_none_or(|wait| wait.0 != record)
+        {
             return None;
         }
         Some(target)
@@ -1625,6 +1695,14 @@ impl Thread {
         }
         let mut execution = self.execution.lock();
         let found = execution.state;
+        if matches!(found, ThreadExecutionState::Blocked { .. })
+            && self.native_execution_pending(&mut execution)
+        {
+            self.claim_native_control(&mut execution);
+            if self.native_execution_pending(&mut execution) {
+                return Ok(ThreadSchedulerAction::None);
+            }
+        }
         // A thread parked in the in-guest zone runs only once the host owns
         // its record. If EL1 holds it (it is running, or woken, on a vCPU
         // slot), the claim kicked that slot, whose executor hands it back at
@@ -2383,7 +2461,21 @@ impl Thread {
             execution.state = ThreadExecutionState::Exited { generation };
             execution.exec_invalidation_pending = false;
             execution.control_quantum = None;
+            execution.native_record_wait = None;
         } else {
+            let mut native_owner = self.native_execution_pending(&mut execution);
+            if native_owner && control_pending {
+                self.claim_native_control(&mut execution);
+                native_owner = self.native_execution_pending(&mut execution);
+            }
+            let settlement = if native_owner && matches!(settlement, ExecutionSettlement::Runnable)
+            {
+                ExecutionSettlement::Blocked(BlockedReason::HostWait)
+            } else {
+                settlement
+            };
+            let wake_pending = wake_pending && !native_owner;
+            let control_pending = control_pending && !native_owner;
             match settlement {
                 ExecutionSettlement::Runnable => {
                     execution.task_state = lease.task_state.take();
@@ -2448,7 +2540,7 @@ impl Thread {
                     // host-owned record is the readiness, so publish it here.
                     let zone_ready = continuation
                         .zone_wait()
-                        .is_some_and(|wait| crate::el1_zone::is_host_owned(wait.record));
+                        .is_some_and(|wait| crate::el1_zone::host_resume_ready(wait.record));
                     if zone_ready {
                         continuation.publish_ready_event(
                             crate::kernel::continuation::ContinuationEvent::Ready,
@@ -2521,6 +2613,7 @@ impl Thread {
                     self.retire_affinity_residency(&mut execution);
                     execution.state = ThreadExecutionState::Exited { generation };
                     execution.control_quantum = None;
+                    execution.native_record_wait = None;
                 }
             }
         }

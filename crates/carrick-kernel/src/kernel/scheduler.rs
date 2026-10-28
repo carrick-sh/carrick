@@ -3983,6 +3983,9 @@ impl Scheduler {
     /// wait becomes ready and the thread runnable (or, if it is still
     /// running and about to settle, kicked so it settles promptly).
     pub fn publish_zone_handback(&self, record: carrick_el1_abi::RecordRef) {
+        if crate::el1_zone::route_native_exception_handback(record) {
+            return;
+        }
         if crate::el1_zone::route_first_entry_handback(record) {
             return;
         }
@@ -4659,6 +4662,9 @@ impl Scheduler {
         executor: &ExecutorRegistration,
         record: carrick_el1_abi::RecordRef,
     ) -> Result<Option<RunnableThread>, RunQueueError> {
+        if crate::el1_zone::route_native_exception_handback(record) {
+            return Ok(None);
+        }
         let Some(key) = crate::el1_zone::thread_key_of(record) else {
             return Ok(None);
         };
@@ -5180,14 +5186,18 @@ impl Scheduler {
             .thread
             .scheduler_yield_from_executor(lease)
             .map_err(|(error, _lease)| error)?;
-        let successor = match action {
+        let native_blocked = match running.thread.execution_state() {
+            super::objects::ThreadExecutionState::Blocked { generation, .. } => Some(generation),
+            _ => None,
+        };
+        let successor = native_blocked.or_else(|| match action {
             ThreadSchedulerAction::Queue {
                 key, generation, ..
             } if key == running.key.thread => Some(generation),
             ThreadSchedulerAction::Queue { .. }
             | ThreadSchedulerAction::Kick { .. }
             | ThreadSchedulerAction::None => None,
-        };
+        });
         // A yield whose target was reaped in flight still settles: the same
         // early return that abandoned `settle_blocked` abandoned this one, and
         // an abandoned yield is what the executor loop reported as "executor
@@ -5199,7 +5209,11 @@ impl Scheduler {
                 running.thread_key(),
                 predecessor,
                 successor,
-                SchedulerGenerationTransition::Runnable,
+                if native_blocked.is_some() {
+                    SchedulerGenerationTransition::Blocked
+                } else {
+                    SchedulerGenerationTransition::Runnable
+                },
             ),
             None => GenerationTransitionOutcome::Recorded,
         };

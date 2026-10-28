@@ -1986,6 +1986,13 @@ fn exit_group_cancels_exception_service_before_publishing_host_wakes() {
             .find(|slot| fixture.zone.slot(*slot).queued() != 0)
             .unwrap();
         assert!(
+            fixture
+                .zone
+                .spaces
+                .is_open(fixture.zone.record(sibling.record.id).identity().mm),
+            "group exit retired the MM before the retained exception checkpoint"
+        );
+        assert!(
             !fixture.zone.head_needs_host(slot),
             "terminal checkpoint must stay native"
         );

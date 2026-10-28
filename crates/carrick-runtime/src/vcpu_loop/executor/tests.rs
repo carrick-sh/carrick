@@ -8642,6 +8642,9 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
         carrick_kernel::el1_zone::HandbackEvent::Ready(record) => {
             publish_scheduler.publish_zone_handback(record)
         }
+        carrick_kernel::el1_zone::HandbackEvent::NativeQueued => {
+            publish_scheduler.poke_executor_control()
+        }
     }));
     let mut backend = FakeFactory::default().create(&destination).unwrap();
     backend.idle_slot = Some(idle);

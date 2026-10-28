@@ -467,7 +467,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             self.send_sgis(&effects);
             return LoadResult::NeedsHost;
         }
-        if !self.enter_space(rec.identity().mm, rec.is_native_owned()) {
+        if !self.enter_space(rec.identity().mm, rec.has_native_execution_owner()) {
             zone.unswitch(slot, switched.record);
             return LoadResult::NeedsHost;
         }

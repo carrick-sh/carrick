@@ -4905,6 +4905,205 @@ mod serial_host {
     use super::*;
 
     #[test]
+    fn deferred_fault_completion_keeps_two_live_threads_out_of_host_load() {
+        fault_completion_to_host(true);
+    }
+
+    #[test]
+    fn native_exception_runnable_settlement_preserves_its_normal_host_handback() {
+        fault_completion_to_host(false);
+    }
+
+    fn fault_completion_to_host(enroll_zone_continuation: bool) {
+        use carrick_el1_abi::{Claim, SlotId, ThreadIdentity};
+        use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken, OwnerEntry};
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+            }
+        }
+        let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+        let zone = carrick_el1_abi::zone_tables().unwrap();
+        let (kernel, root) = bootstrap(15_390);
+        root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+        let sibling = kernel
+            .reserve_thread_clone(
+                &root,
+                crate::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(carrick_hal::ThreadId::synthetic_for_tests(15_391))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+        assert_eq!(root.task().threads().len(), 2);
+        publish(&root, 0x4000);
+        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let executor = scheduler
+            .register_executor(Arc::new(TestKick::default()))
+            .unwrap();
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        let running = scheduler.try_take(&executor).unwrap().expect("root row");
+        let slot = SlotId::new(0);
+        let id = zone
+            .current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid: carrick_el1_abi::El1TaskId::from_linux_tid(root.thread().key().tid.raw())
+                        .raw(),
+                    serial: root.thread().key().serial.raw(),
+                    mm: root.shared().mm().id().raw(),
+                    file_table: root.resources().files().id().raw(),
+                    generation: 1,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                },
+            )
+            .unwrap();
+        let record = zone.record_ref(id);
+        let custody =
+            carrick_core::lifecycle::MemberControlCustody::retain(root.thread().control_slot())
+                .unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        root.thread().control_slot().bind_zone_record(record);
+        let key = ObjectWaitKey::native_service(record).unwrap();
+        let defer = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >| {
+            let _ = owned.defer_handbacks();
+        };
+        zone.bind_object_wait_with_completion(key, &crate::el1_zone::HostLockWait, &defer)
+            .unwrap();
+        let ticket = zone
+            .admit_object_notification(key, &crate::el1_zone::HostLockWait, &defer)
+            .unwrap();
+        let queue = zone
+            .object_wait_with_completion(key, &crate::el1_zone::HostLockWait, &defer)
+            .unwrap();
+        queue
+            .park_owner_until(
+                queue.snapshot(),
+                id,
+                OperationToken::new(1, 1).unwrap(),
+                0,
+                OwnerEntry::Exception,
+            )
+            .unwrap();
+        drop(queue);
+        let Claim::Parked { seq } = zone.record(id).claim() else {
+            panic!("fault not parked")
+        };
+        let service = CarrierWaitService::new(Arc::clone(&scheduler));
+        if enroll_zone_continuation {
+            let continuation = BlockedContinuation::from_zone_park(
+                ContinuationCapture::from_lease(
+                    &root,
+                    running.lease(),
+                    request(73),
+                    RestartClass::RestartSyscall,
+                )
+                .unwrap(),
+                ZoneWait::new(record, seq),
+                None,
+            );
+            let mut registration = service.prepare_registration(&continuation);
+            scheduler.begin_switch_out(&running).unwrap();
+            service.enroll(&mut registration).unwrap();
+            scheduler
+                .settle_blocked_continuation(running, continuation, registration)
+                .unwrap();
+        } else {
+            scheduler.settle_runnable(running).unwrap();
+        }
+        ticket.publish(carrick_el1_abi::Waker::Host, &defer);
+        assert!(matches!(
+            zone.record(id).claim(),
+            Claim::Transferring { .. }
+        ));
+        // The host idle boundary returns after the completion was deferred.
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, root.shared().mm().id().raw(), None, 0);
+        let space = zone
+            .spaces
+            .publish_closed(root.shared().mm().id().raw(), 0x1000, 0)
+            .unwrap();
+        zone.spaces.open(space);
+        let publisher = Arc::clone(&scheduler);
+        crate::el1_zone::with_test_handback_publisher(
+            Arc::new(move |event| {
+                if let crate::el1_zone::HandbackEvent::Ready(record) = event {
+                    publisher.publish_zone_handback(record);
+                }
+            }),
+            || crate::el1_zone::hand_back_completions_in(zone),
+        );
+        assert!(
+            matches!(
+                root.thread().execution_state(),
+                ThreadExecutionState::Blocked { .. }
+            ),
+            "deferred exception completion made a host-load row"
+        );
+        assert_eq!(scheduler.queued_len(), 0);
+        assert!(scheduler.try_take(&executor).unwrap().is_none());
+        assert!(matches!(zone.record(id).claim(), Claim::Queued { .. }));
+        assert!(
+            !zone.head_needs_host(slot),
+            "fault completion returned to host service"
+        );
+        assert_eq!(sibling.task().threads().len(), 2);
+        // The native checkpoint consumes the retained fault operation. Its
+        // later host handback must wake even a lease settled before enrollment.
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, id);
+        // SAFETY: the checkpoint fixture owns this exact OnCpu continuation.
+        unsafe {
+            assert!(zone.record(id).take_object_operation().is_some());
+            zone.record(id).consume_owner_continuation();
+        }
+        assert!(!zone.record(id).requires_native_entry());
+        scheduler.wake(root.thread().key()).unwrap();
+        scheduler.wake_control(root.thread().key()).unwrap();
+        assert!(
+            scheduler.try_take(&executor).unwrap().is_none(),
+            "native frame was offered before its host handback"
+        );
+        zone.unswitch(slot, id);
+        assert_eq!(
+            zone.claim_for_host(
+                record,
+                None,
+                carrick_el1_abi::Handback::Woken,
+                &crate::el1_zone::HostLockWait
+            ),
+            carrick_el1_abi::HostClaim::Claimed
+        );
+        scheduler.publish_zone_handback(record);
+        let resumed = scheduler
+            .try_take(&executor)
+            .unwrap()
+            .expect("native handback lost blocked host continuation");
+        scheduler.settle_exited(resumed).unwrap();
+        scheduler.unregister_executor(&executor).unwrap();
+        scheduler.close();
+    }
+
+    #[test]
     fn fd_wait_pins_exact_open_description_until_cleanup_and_rejects_reuse() {
         let (_kernel, context) = bootstrap(15_225);
         let generation = publish(&context, 0x551);
