@@ -328,7 +328,11 @@ impl SyslogState {
 
     fn clear_locked(&mut self, owner_id: u32) {
         // syslog_clear in Linux only sets clear_seq = head_seq. It does NOT alter read_seq.
-        self.clear_seq = self.head_seq;
+        self.clear_through_locked(owner_id, self.head_seq);
+    }
+
+    fn clear_through_locked(&mut self, owner_id: u32, sequence: u64) {
+        self.clear_seq = self.clear_seq.max(sequence);
         self.drain_count = self.drain_count.saturating_add(1);
         crate::event_ring::rec_syslog_state(
             owner_id,
@@ -371,6 +375,29 @@ pub struct SyslogSnapshot {
     pub console_loglevel: u32,
     pub saved_console_loglevel: u32,
     pub console_enabled: bool,
+}
+
+/// A selected result and the exact clear boundary it can publish after copyout.
+/// The borrowed service prevents a snapshot from clearing another log.
+pub(crate) struct SyslogReadSnapshot<'a> {
+    service: &'a SyslogService,
+    data: Vec<u8>,
+    clear_through: u64,
+}
+
+impl SyslogReadSnapshot<'_> {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub(crate) fn clear(self) {
+        if !self.data.is_empty() {
+            self.service
+                .state
+                .lock()
+                .clear_through_locked(self.service.id, self.clear_through);
+        }
+    }
 }
 
 /// Kernel-wide syslog service.
@@ -507,6 +534,17 @@ impl SyslogService {
     pub fn read_all(&self, max_len: usize) -> Vec<u8> {
         let state = self.state.lock();
         state.read_all_locked(max_len)
+    }
+
+    /// Select by the caller's capacity, independently of copyout permit size.
+    /// Publication after delivery clears only through this snapshot's head.
+    pub(crate) fn read_snapshot(&self, max_len: usize) -> SyslogReadSnapshot<'_> {
+        let state = self.state.lock();
+        SyslogReadSnapshot {
+            service: self,
+            data: state.read_all_locked(max_len),
+            clear_through: state.head_seq,
+        }
     }
 
     /// Read all messages and clear the buffer (action 4).
