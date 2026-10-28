@@ -55,9 +55,6 @@ fn guest_script_source(script: &GuestScript, admission: &Admission) -> Result<St
         _ => Ok(script.source.to_owned()),
     }
 }
-/// Guest state shared by the job-start hook and the controller (the hook's
-/// flock, drain marker and assignment rendezvous); created by the template.
-const GUEST_STATE: &str = "/run/carrick-ci";
 /// Root, under the hook's flock: report whether the rendezvous is settled
 /// (approved, started or draining) and otherwise the hook's request, if any.
 const GUEST_ASSIGNMENT_READ: &str = r#"cd /run/carrick-ci || exit 1
@@ -71,6 +68,21 @@ const GUEST_ASSIGNMENT_APPROVE: &str = r#"cd /run/carrick-ci || exit 1
 if [ -e approved-policy ]; then [ "$(cat approved-policy)" = "$1" ] && exit 0; exit 4; fi
 umask 022
 printf '%s\n' "$1" > approved-policy.tmp && chmod 644 approved-policy.tmp && mv approved-policy.tmp approved-policy"#;
+/// Root: print the tool server's pending token request (#1012) under the
+/// request file's own lock. Exit 5 = this clone has no mint channel.
+const GUEST_MINT_READ: &str = r#"cd /run/carrick-ci || exit 1
+[ -f token-request ] && [ ! -L token-request ] || exit 5
+exec 9<token-request && /usr/bin/flock 9 && head -c 4097 <&9"#;
+/// Root: write stdin (the answer) into the runner-owned 0600 response file
+/// under its lock. The file and the root-owned directory are never replaced,
+/// so the write cannot follow a planted link; the token never enters argv.
+const GUEST_MINT_RESPOND: &str = r#"cd /run/carrick-ci || exit 1
+[ -f token-response ] && [ ! -L token-response ] || exit 5
+exec 9<token-response && /usr/bin/flock 9 && head -c 8192 > token-response"#;
+/// Root: empty the answered request under its lock.
+const GUEST_MINT_CLEAR: &str = r#"cd /run/carrick-ci || exit 1
+[ -f token-request ] && [ ! -L token-request ] || exit 5
+exec 9<token-request && /usr/bin/flock 9 && : > token-request"#;
 fn script_install_command(path: &str, source: &str) -> String {
     format!(
         "umask 077; printf '%s' {} > {} && chmod 755 {}",
@@ -360,9 +372,23 @@ impl Pve {
         Ok(output.stdout)
     }
     fn agent_output(&self, row: &Record, command: &[&str]) -> Result<GuestOutput, ScalerError> {
+        self.agent_output_input(row, command, None)
+    }
+    /// `input` becomes the command's stdin (`input-data`): secrets passed this
+    /// way travel in the PVE request body on curl's stdin, never in guest argv.
+    fn agent_output_input(
+        &self,
+        row: &Record,
+        command: &[&str],
+        input: Option<&str>,
+    ) -> Result<GuestOutput, ScalerError> {
         self.guard(row)?;
+        let mut body = json!({"command":command});
+        if let Some(input) = input {
+            body["input-data"] = input.into();
+        }
         let response = self.request(
-            PveCall::Post(json!({"command":command})),
+            PveCall::Post(body),
             &format!("{}/agent/exec", self.base(row.vm)),
         )?;
         let pid = response["pid"]
@@ -907,11 +933,20 @@ fn boot_and_register(
     let policy = gh.vet(admission, row.key)?;
     // The job-start hook reads this root-owned policy; jobs cannot write it.
     // Only the runner-owned rendezvous request is writable by the hook.
-    let rendezvous = if standing {
+    let mut rendezvous = if standing {
         format!(" && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/assignment.json")
     } else {
         String::new()
     };
+    if matches!(admission, Admission::Agent) {
+        // On-demand dispatch tokens (#1012): runner-owned request and
+        // response files in the root-owned state directory.
+        for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
+            rendezvous.push_str(&format!(
+                " && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/{file}"
+            ));
+        }
+    }
     pve.agent(
         row,
         &[
@@ -1518,6 +1553,85 @@ impl assignment::AssignmentExchange for GuestExchange<'_> {
         }
     }
 }
+/// The standing transport of on-demand dispatch tokens (#1012).
+struct GuestMint<'a> {
+    pve: &'a Pve,
+    row: Record,
+}
+impl GuestMint<'_> {
+    fn run(&self, script: &str, input: Option<&str>) -> Result<GuestOutput, ScalerError> {
+        let output = self
+            .pve
+            .agent_output_input(&self.row, &["/bin/sh", "-c", script], input)?;
+        match output.exit {
+            GuestExit(0) => Ok(output),
+            GuestExit(5) => Err(ScalerError::Guard("clone has no mint channel")),
+            _ => Err(ScalerError::External("guest mint exchange")),
+        }
+    }
+}
+impl mint::MintExchange for GuestMint<'_> {
+    fn read(&mut self) -> Result<Option<Vec<u8>>, ScalerError> {
+        let output = self.run(GUEST_MINT_READ, None)?;
+        Ok((!output.stdout.is_empty()).then(|| output.stdout.into_bytes()))
+    }
+    fn respond(&mut self, response: &mint::MintResponse) -> Result<(), ScalerError> {
+        self.run(GUEST_MINT_RESPOND, Some(&serde_json::to_string(response)?))
+            .map(drop)
+    }
+    fn clear(&mut self) -> Result<(), ScalerError> {
+        self.run(GUEST_MINT_CLEAR, None).map(drop)
+    }
+}
+/// How often one agent clone's request file is polled.
+const MINT_POLL: Duration = Duration::from_secs(3);
+/// Serve token requests from running, approved agent clones. Failures are
+/// logged; the request stays pending and the tool server's bounded wait
+/// falls back to the job token.
+fn serve_mints(
+    pve: &Pve,
+    minter: &impl mint::MintApi,
+    ledger: &mut Ledger,
+    path: &Path,
+    polled: &mut std::collections::BTreeMap<String, Instant>,
+) {
+    polled.retain(|name, _| {
+        ledger
+            .rows
+            .iter()
+            .any(|r| r.name == *name && r.state == State::Running)
+    });
+    let open: Vec<Record> = ledger
+        .rows
+        .iter()
+        .filter(|r| r.lane == CloneLane::Agent && r.state == State::Running && r.approved)
+        .filter(|r| {
+            polled
+                .get(&r.name)
+                .is_none_or(|at| at.elapsed() >= MINT_POLL)
+        })
+        .cloned()
+        .collect();
+    for row in open {
+        polled.insert(row.name.clone(), Instant::now());
+        let vm = row.vm.get();
+        let name = row.name.clone();
+        let mut exchange = GuestMint { pve, row };
+        match mint::serve_mint(minter, &mut exchange, &name, ledger, path) {
+            Ok(mint::MintServed::Idle) => {}
+            Ok(mint::MintServed::Ignored) => {
+                println!("vm={vm} token request ignored (malformed or already answered)");
+            }
+            Ok(mint::MintServed::Minted(scope)) => {
+                println!("vm={vm} minted a {} token", scope.label());
+            }
+            Ok(mint::MintServed::Refused(reason)) => {
+                println!("vm={vm} token request refused: {}", reason.describe());
+            }
+            Err(error) => eprintln!("vm={vm} token request failed: {error}; retried next poll"),
+        }
+    }
+}
 /// Serve every standing clone's assignment rendezvous (#333): GitHub may
 /// assign a clone any queued job with its labels, not the one it was minted
 /// for. Runs on a dedicated worker, independent of reconciliation, provisioning
@@ -1730,11 +1844,25 @@ pub(super) fn controller(
         let path = path.clone();
         let assignment_pve = Pve::local()?;
         let mut settled = Vec::new();
+        let minter = mint::AppMinter {
+            gh: &Github,
+            key: mint::AppKey::load()?,
+        };
+        if agents && !mint::MintApi::configured(&minter) {
+            eprintln!(
+                "no {} credential: dispatch token requests are refused",
+                mint::KEY_CREDENTIAL
+            );
+        }
+        let mut polled = std::collections::BTreeMap::new();
         Some(assignment::AssignmentService::start(move || {
             let pass = (|| -> Result<(), ScalerError> {
                 let mut ledger = publication.snapshot()?;
                 ledger.publication = Some(publication.clone());
                 revet_assignments(&assignment_pve, &Github, &mut ledger, &path, &mut settled);
+                if agents {
+                    serve_mints(&assignment_pve, &minter, &mut ledger, &path, &mut polled);
+                }
                 Ok(())
             })();
             if let Err(error) = pass {
@@ -2055,6 +2183,105 @@ mod tests {
             .args(["-c", &script, "sh", arg])
             .output()
             .unwrap()
+    }
+    /// A guest mint script in `state`, with `input` on stdin as `input-data`.
+    /// Hosts without util-linux `flock` (macOS) run it unlocked.
+    fn guest_mint(state: &Path, script: &str, input: &str) -> std::process::Output {
+        let mut script = script.replace("/run/carrick-ci", state.to_str().unwrap());
+        if !Path::new("/usr/bin/flock").exists() {
+            script = script.replace("/usr/bin/flock 9", "true");
+        }
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+    #[test]
+    fn serial_host_guest_mint_scripts_round_trip_with_the_tool_server() {
+        let state = tempfile::tempdir().unwrap();
+        let state = state.path().to_owned();
+        std::fs::write(
+            state.join("approved-policy"),
+            format!("agent run=41 attempt=2 sha={}\n", "a".repeat(40)),
+        )
+        .unwrap();
+        for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
+            std::fs::write(state.join(file), "").unwrap();
+        }
+        // No channel files: the controller sees exit 5, never a created file.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            guest_mint(empty.path(), GUEST_MINT_READ, "").status.code(),
+            Some(5)
+        );
+        assert!(!empty.path().join(mint::REQUEST_FILE).exists());
+        let client_state = state.clone();
+        let client = std::thread::spawn(move || {
+            crate::dispatch_mint::request(
+                &client_state,
+                mint::MintScope::Board,
+                Duration::from_secs(10),
+                None,
+            )
+            .ok()
+            .map(|token| token.secret().to_owned())
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let request: Value = loop {
+            let output = guest_mint(&state, GUEST_MINT_READ, "");
+            assert!(output.status.success());
+            if let Ok(request) = serde_json::from_slice(&output.stdout) {
+                break request;
+            }
+            assert!(Instant::now() < deadline, "no token request");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(request["scope"], "board");
+        let response = json!({"status":"minted","nonce":request["nonce"],
+            "token":"ghs_guestScriptFixture0123456789"});
+        assert!(
+            guest_mint(&state, GUEST_MINT_RESPOND, &response.to_string())
+                .status
+                .success()
+        );
+        assert!(guest_mint(&state, GUEST_MINT_CLEAR, "").status.success());
+        assert_eq!(
+            client.join().unwrap().as_deref(),
+            Some("ghs_guestScriptFixture0123456789")
+        );
+        for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
+            assert!(
+                std::fs::read(state.join(file)).unwrap().is_empty(),
+                "{file}"
+            );
+        }
+        // A planted link is refused, not written through.
+        std::fs::remove_file(state.join(mint::RESPONSE_FILE)).unwrap();
+        std::os::unix::fs::symlink(
+            state.join("approved-policy"),
+            state.join(mint::RESPONSE_FILE),
+        )
+        .unwrap();
+        assert_eq!(
+            guest_mint(&state, GUEST_MINT_RESPOND, "overwrite")
+                .status
+                .code(),
+            Some(5)
+        );
+        assert!(
+            std::fs::read_to_string(state.join("approved-policy"))
+                .unwrap()
+                .starts_with("agent ")
+        );
     }
     #[test]
     fn serial_host_guest_rendezvous_does_not_follow_assignment_symlinks() {

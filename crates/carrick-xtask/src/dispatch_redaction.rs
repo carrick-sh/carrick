@@ -62,6 +62,10 @@ impl DiagnosticSecrets {
                 gate.add(&value);
             }
         }
+        // On-demand App tokens (#1012) this process minted.
+        for value in crate::dispatch_mint::minted_secrets() {
+            gate.add(&value);
+        }
         if let Ok(state) = crate::agent_runner::state() {
             for path in [
                 "redaction-secrets.json",

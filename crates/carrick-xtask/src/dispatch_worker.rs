@@ -972,23 +972,56 @@ impl PublishEvent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TokenFallback {
-    /// `DISPATCH_PUBLISH_TOKEN` was empty or absent in the loop's environment.
-    NoAppToken,
+    /// The controller refused the on-demand publish mint (#1012).
+    MintRefused {
+        reason: crate::ci_scaler::mint::MintRefusal,
+    },
+    /// The controller's mint channel was absent or did not answer in time.
+    MintUnavailable {
+        reason: crate::dispatch_mint::MintUnavailable,
+    },
+    /// The PR is created for an earlier run's branch, deliberately with the
+    /// job token (that run's artifacts cannot gain an App binding).
+    PriorRunRecovery,
     /// An App-token operation failed with an authentication error.
     Rejected { operation: String, class: String },
 }
 impl TokenFallback {
     fn describe(&self) -> String {
+        use crate::dispatch_mint::MintFailure;
         match self {
-            Self::NoAppToken => "the publish token was empty or absent".into(),
+            Self::MintRefused { reason } => format!(
+                "the controller refused the publish token: {}",
+                MintFailure::Refused(*reason).describe()
+            ),
+            Self::MintUnavailable { reason } => format!(
+                "the publish token could not be minted: {}",
+                MintFailure::Unavailable(*reason).describe()
+            ),
+            Self::PriorRunRecovery => {
+                "the publish token was not used: the PR belongs to an earlier run's branch".into()
+            }
             Self::Rejected { operation, class } => {
                 format!("the publish token was rejected during {operation} ({class})")
             }
         }
     }
 }
+impl From<crate::dispatch_mint::MintFailure> for TokenFallback {
+    fn from(failure: crate::dispatch_mint::MintFailure) -> Self {
+        match failure {
+            crate::dispatch_mint::MintFailure::Refused(reason) => Self::MintRefused { reason },
+            crate::dispatch_mint::MintFailure::Unavailable(reason) => {
+                Self::MintUnavailable { reason }
+            }
+        }
+    }
+}
+/// The publish App token is minted on demand at the first write and reused
+/// for this publication; it never comes from the job environment.
 struct PublishCredential<'a> {
-    app: Option<String>,
+    app: Option<crate::ci_scaler::mint::AppToken>,
+    minted: bool,
     job: &'a str,
     wrote: bool,
     ci_triggered: bool,
@@ -997,24 +1030,39 @@ struct PublishCredential<'a> {
 impl<'a> PublishCredential<'a> {
     fn new(job: &'a str) -> Self {
         Self {
-            app: std::env::var("DISPATCH_PUBLISH_TOKEN")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            app: None,
+            minted: false,
             job,
             wrote: false,
             ci_triggered: false,
             fallback: None,
         }
     }
+    /// Use the job token for the rest of this publication without minting.
+    fn job_only(&mut self) {
+        if self.app.is_some() || !self.minted {
+            self.fallback = Some(TokenFallback::PriorRunRecovery);
+        }
+        self.app = None;
+        self.minted = true;
+    }
     fn write<T>(
         &mut self,
         event: PublishEvent,
         mut operation: impl FnMut(&str) -> Result<T, ScalerError>,
     ) -> Result<T, ScalerError> {
-        if self.app.is_none() && self.fallback.is_none() {
-            self.fallback = Some(TokenFallback::NoAppToken);
+        if !self.minted {
+            self.minted = true;
+            match crate::dispatch_mint::app_token(crate::ci_scaler::mint::MintScope::Publish) {
+                Ok(token) => self.app = Some(token),
+                Err(failure) => self.fallback = Some(failure.into()),
+            }
         }
-        let mut result = operation(self.app.as_deref().unwrap_or(self.job));
+        let mut result = operation(
+            self.app
+                .as_ref()
+                .map_or(self.job, crate::ci_scaler::mint::AppToken::secret),
+        );
         let class = match (&self.app, &result) {
             (Some(_), Err(e)) => publish_auth_marker(&e.to_string()),
             _ => None,
@@ -3507,7 +3555,7 @@ fn publish_commits(
             // creation run's artifacts. Use Actions identity for this recovery
             // create so the original run's branch remains independently owned.
             if id != run_id()? {
-                credential.app = None;
+                credential.job_only();
             }
             let created = credential.gh(
                 root,
@@ -4106,8 +4154,22 @@ mod tests {
             ..Applied::default()
         };
         assert!(applied.report().contains("reason not recorded"));
-        applied.token_fallback = Some(TokenFallback::NoAppToken);
-        assert!(applied.report().contains("empty or absent"));
+        applied.token_fallback = Some(TokenFallback::MintUnavailable {
+            reason: crate::dispatch_mint::MintUnavailable::Timeout,
+        });
+        assert!(
+            applied
+                .report()
+                .contains("could not be minted: controller did not answer in time")
+        );
+        applied.token_fallback = Some(TokenFallback::MintRefused {
+            reason: crate::ci_scaler::mint::MintRefusal::BudgetExhausted,
+        });
+        assert!(
+            applied
+                .report()
+                .contains("refused the publish token: per-job mint budget exhausted")
+        );
         applied.token_fallback = Some(TokenFallback::Rejected {
             operation: PublishEvent::PrCreate.label().into(),
             class: "http 401".into(),
@@ -4169,8 +4231,8 @@ mod tests {
         publication_fixture("publish-missing");
     }
     #[test]
-    fn empty_publish_token_keeps_publication_and_reports_ci_gap() {
-        publication_fixture("publish-empty");
+    fn refused_publish_mint_keeps_publication_and_records_its_reason() {
+        publication_fixture("publish-mint-refused");
     }
     fn publication_fixture(witness: &str) {
         publication_fixture_outcome(witness, |_, _| {});
@@ -4320,13 +4382,15 @@ fi
                 ])
                 .env(CHILD, "1")
                 .env_remove("DISPATCH_PUBLISH_TOKEN")
+                .env_remove("CARRICK_TEST_MINT_PUBLISH")
+                .env_remove("CARRICK_TEST_MINT_STATE")
                 .envs(if witness.starts_with("publish-token") {
                     vec![
-                        ("DISPATCH_PUBLISH_TOKEN", "opaque-publish-credential"),
+                        ("CARRICK_TEST_MINT_PUBLISH", "opaque-publish-credential"),
                         ("DISPATCH_TEST_WRITE_TOKEN", "opaque-publish-credential"),
                     ]
-                } else if witness == "publish-empty" {
-                    vec![("DISPATCH_PUBLISH_TOKEN", "")]
+                } else if witness == "publish-mint-refused" {
+                    vec![("CARRICK_TEST_MINT_PUBLISH", "refused:job_not_in_progress")]
                 } else {
                     vec![]
                 })
@@ -4623,6 +4687,17 @@ fi
                     "missing fallback note: {applied}"
                 );
                 assert!(applied.contains("mark the PR ready"));
+            }
+            match witness {
+                "publish-missing" => assert!(
+                    applied.contains("could not be minted: no controller mint channel"),
+                    "{applied}"
+                ),
+                "publish-mint-refused" => assert!(
+                    applied.contains("refused the publish token: assigned job is no longer"),
+                    "{applied}"
+                ),
+                _ => {}
             }
             assert!(!applied.contains("opaque-publish-credential"));
             return;

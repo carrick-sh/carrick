@@ -170,6 +170,7 @@ Wants=network-online.target
 
 [Service]
 LoadCredentialEncrypted=gh-token:/etc/credstore.encrypted/carrick-ci-gh-token
+LoadCredentialEncrypted=dispatch-app-key:/etc/credstore.encrypted/carrick-dispatch-app-key
 Environment=PATH=/root/carrick-ci/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # `$$` passes `$` to the shell; systemd would otherwise substitute it.
 ExecStart=/bin/sh -c 'GH_TOKEN=$$(cat "$${CREDENTIALS_DIRECTORY}/gh-token"); export GH_TOKEN; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1 --max-concurrency 1'
@@ -193,6 +194,35 @@ The owner's GitHub token is stored as a systemd encrypted credential at
 Willow's "forward over SSH stdin, never write it on the host", because a
 standing service must survive reboots. See
 [the security review](willow-pilot-security-review.md#contabo-standing-credential).
+
+## Dispatch App key
+
+The controller mints the dispatch tool server's publish and board tokens on
+demand (#1012; flow in [dispatch-worker.md](dispatch-worker.md#accounts-and-credentials)).
+It reads the `carrick-workers` App private key (PEM) from
+`$CREDENTIALS_DIRECTORY/dispatch-app-key`, loaded by the unit's second
+`LoadCredentialEncrypted=` line from
+`/etc/credstore.encrypted/carrick-dispatch-app-key` (root 0600). The owner
+pipes the key in on stdin
+(`systemd-creds encrypt --name=dispatch-app-key - /etc/credstore.encrypted/carrick-dispatch-app-key`)
+and never prints it. The key never enters a clone or GitHub Actions. The owner
+token stored beside it is already more powerful than the App key, so a host
+compromise already exposes more than this adds. The Mac minter keeps its own
+copy for the secrets other jobs still read.
+
+Without the credential the controller logs `no dispatch-app-key credential`
+at start and refuses every request as `unconfigured`; dispatch then publishes
+with the job token and records that reason.
+
+The exchange uses only the scoped PVE token's existing guest-agent exec
+right. At provisioning, an agent clone gets two more runner-owned 0600 files
+in `/run/carrick-ci`: `token-request` and `token-response`. The assignment
+worker polls each running, approved agent clone's request every three seconds.
+It writes the answer through the exec call's stdin (`input-data`), so a token
+never appears in a guest command line. The ledger row's `mints` field records
+each answered nonce, scope, job and refusal reason (never a token), before any
+mint is attempted. The journal logs `vm=<id> minted a publish token` or
+`token request refused: <reason>`, never token bytes.
 
 ## VM-local leases (owner decision #639)
 
