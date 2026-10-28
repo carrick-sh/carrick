@@ -15,7 +15,7 @@
     },
     {
       "crate_name": "carrick-kernel",
-      "ceiling": 31
+      "ceiling": 29
     },
     {
       "crate_name": "carrick-kernel-example",

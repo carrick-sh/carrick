@@ -1527,10 +1527,7 @@ impl Thread {
         };
         // Recheck the authenticated snapshot, including a checkpoint that
         // completed/retired between authentication and installing this wait.
-        if zone
-            .live(record)
-            .is_some_and(|rec| !rec.host_resume_ready())
-        {
+        if zone.host_resume_readiness(record) == Some(false) {
             return true;
         }
         execution.native_record_wait = None;
@@ -1651,10 +1648,9 @@ impl Thread {
         &self,
         record: carrick_el1_abi::RecordRef,
     ) -> Option<crate::kernel::scheduler::ExactWakeTarget> {
-        if carrick_el1_abi::zone_tables().is_some_and(|zone| {
-            zone.live(record)
-                .is_some_and(|rec| !rec.host_resume_ready())
-        }) {
+        if carrick_el1_abi::zone_tables()
+            .is_some_and(|zone| zone.host_resume_readiness(record) == Some(false))
+        {
             return None;
         }
         let execution = self.execution.lock();
