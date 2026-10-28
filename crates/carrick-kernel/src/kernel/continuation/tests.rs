@@ -4950,7 +4950,33 @@ mod serial_host {
             .into_context();
         assert_eq!(root.task().threads().len(), 2);
         publish(&root, 0x4000);
-        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        #[derive(Debug)]
+        struct NativeWaitPolicy {
+            stops: Arc<std::sync::Mutex<Vec<carrick_hal::scheduler::SchedulingStopReason>>>,
+        }
+        impl carrick_hal::scheduler::SchedulingPolicy for NativeWaitPolicy {
+            fn cpu_count(&self) -> usize {
+                1
+            }
+            fn select_cpu(
+                &self,
+                placement: &carrick_hal::scheduler::TaskPlacement<'_>,
+            ) -> carrick_hal::scheduler::GuestCpuId {
+                carrick_hal::scheduler::GuestCpuPolicy::new(1).select_cpu(placement)
+            }
+            fn on_event(&self, event: &carrick_hal::scheduler::SchedulingEvent) {
+                if let carrick_hal::scheduler::SchedulingEventKind::Stop(reason) = event.kind {
+                    self.stops.lock().unwrap().push(reason);
+                }
+            }
+        }
+        let stops = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let scheduler = Arc::new(Scheduler::new_with_policy(
+            Arc::clone(&kernel),
+            Arc::new(NativeWaitPolicy {
+                stops: Arc::clone(&stops),
+            }),
+        ));
         let executor = scheduler
             .register_executor(Arc::new(TestKick::default()))
             .unwrap();
@@ -5031,6 +5057,10 @@ mod serial_host {
         } else {
             scheduler.settle_runnable(running).unwrap();
         }
+        assert_eq!(
+            stops.lock().unwrap().last(),
+            Some(&carrick_hal::scheduler::SchedulingStopReason::HostWait)
+        );
         ticket.publish(carrick_el1_abi::Waker::Host, &defer);
         assert!(matches!(
             zone.record(id).claim(),

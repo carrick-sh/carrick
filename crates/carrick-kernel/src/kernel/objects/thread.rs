@@ -1386,10 +1386,15 @@ impl Thread {
         let base = Self::linux_run_state_from_execution(execution.state);
         let zone = match execution.state {
             ThreadExecutionState::Blocked { .. } => execution
-                .blocked_continuation
-                .as_ref()
-                .and_then(|continuation| continuation.zone_wait())
-                .and_then(|wait| crate::el1_zone::record_runs(wait.record))
+                .native_record_wait
+                .and_then(|wait| crate::el1_zone::record_runs(wait.0))
+                .or_else(|| {
+                    execution
+                        .blocked_continuation
+                        .as_ref()
+                        .and_then(|continuation| continuation.zone_wait())
+                        .and_then(|wait| crate::el1_zone::record_runs(wait.record))
+                })
                 .map(|runs| if runs { 'R' } else { 'S' }),
             ThreadExecutionState::Uninitialized
             | ThreadExecutionState::Running { .. }

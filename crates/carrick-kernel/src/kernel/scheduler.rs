@@ -5226,9 +5226,13 @@ impl Scheduler {
             .preemption
             .lock()
             .finalize_residency(running.binding.executor);
-        let stop_reason = match finalized {
-            Some(res) if !res.reasons.is_empty() => SchedulingStopReason::Preempted,
-            _ => SchedulingStopReason::Yielded,
+        let stop_reason = if native_blocked.is_some() {
+            SchedulingStopReason::HostWait
+        } else {
+            match finalized {
+                Some(res) if !res.reasons.is_empty() => SchedulingStopReason::Preempted,
+                _ => SchedulingStopReason::Yielded,
+            }
         };
         let sequence = self
             .queue

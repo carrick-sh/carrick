@@ -2404,6 +2404,29 @@ mod child_tid_owner_tests {
                 ThreadExecutionState::Blocked { .. }
             ));
             assert_eq!(scheduler.queued_len(), 0);
+            assert_eq!(root.thread().linux_run_state(), Some('S'));
+            assert_eq!(
+                zone.claim_for_host(
+                    record,
+                    None,
+                    carrick_el1_abi::Handback::Woken,
+                    &carrick_kernel::el1_zone::HostLockWait
+                ),
+                carrick_el1_abi::HostClaim::Claimed
+            );
+            let slot = carrick_el1_abi::SlotId::new(0);
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, root.shared().mm().id().raw(), Some(0), 0);
+            let space = zone
+                .spaces
+                .publish_closed(root.shared().mm().id().raw(), 0x1000, 0)
+                .unwrap();
+            zone.spaces.open(space);
+            zone.requeue_on(slot, record.id).unwrap();
+            assert_eq!(root.thread().linux_run_state(), Some('R'));
+            assert_eq!(zone.switch_in_full(slot).unwrap().record, record.id);
+            assert_eq!(root.thread().linux_run_state(), Some('R'));
+            zone.unswitch(slot, record.id);
             assert_eq!(
                 zone.claim_for_host(
                     record,
