@@ -273,7 +273,6 @@ pub(in crate::dispatch::fs) struct SuspendedCopyout {
     address: u64,
     bytes: Vec<u8>,
     offset: usize,
-    success: DispatchOutcome,
 }
 
 mod access;
@@ -876,7 +875,6 @@ impl<'a> FsView<'a> {
             address,
             &resumed.bytes,
             resumed.offset,
-            resumed.success,
         ))
     }
 
@@ -921,7 +919,6 @@ impl<'a> FsView<'a> {
             address: arg,
             bytes: Vec::new(),
             offset: name_offset,
-            success: DispatchOutcome::Returned { value: 0 },
         });
     }
 
@@ -971,12 +968,11 @@ impl<'a> FsView<'a> {
         kind: SuspendedCopyoutKind,
         address: u64,
         bytes: &[u8],
-        success: DispatchOutcome,
     ) -> DispatchOutcome {
         if let Some(outcome) = self.resume_copyout_bytes(context, memory, kind, address) {
             return outcome;
         }
-        self.copyout_bytes_from_offset(context, memory, kind, address, bytes, 0, success)
+        self.copyout_bytes_from_offset(context, memory, kind, address, bytes, 0)
     }
 
     fn copyout_bytes_from_offset<M: CurrentMmMemory>(
@@ -987,9 +983,9 @@ impl<'a> FsView<'a> {
         address: u64,
         bytes: &[u8],
         mut offset: usize,
-        success: DispatchOutcome,
     ) -> DispatchOutcome {
         use super::copyout::{COPYOUT_MAX_BYTES, UserSlot, prepare};
+        let success = DispatchOutcome::returned_len_or_errno(bytes.len());
         if bytes.is_empty() {
             return match prepare(context, memory, [Some(UserSlot::new(address, 0))]) {
                 Ok(out) => match out.commit([&[]]) {
@@ -1023,7 +1019,6 @@ impl<'a> FsView<'a> {
                         address,
                         bytes: bytes.to_vec(),
                         offset,
-                        success,
                     });
                     return refusal.into_outcome();
                 }

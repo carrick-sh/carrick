@@ -178,7 +178,6 @@ impl<'a> FsView<'a> {
             super::SuspendedCopyoutKind::GetXattr { size },
             buf_addr,
             &value,
-            DispatchOutcome::returned_len_or_errno(value.len()),
         ))
     }
 
@@ -224,7 +223,6 @@ impl<'a> FsView<'a> {
             super::SuspendedCopyoutKind::ListXattr { size },
             buf_addr,
             &list,
-            DispatchOutcome::returned_len_or_errno(list.len()),
         ))
     }
 
