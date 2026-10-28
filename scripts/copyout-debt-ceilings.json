@@ -18,28 +18,12 @@
       "ceiling": 6
     },
     {
-      "path": "crates/carrick-kernel/src/dispatch/fs.rs",
-      "ceiling": 4
-    },
-    {
       "path": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
       "ceiling": 2
     },
     {
-      "path": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
-      "ceiling": 31
-    },
-    {
       "path": "crates/carrick-kernel/src/dispatch/fs/legacy_aio.rs",
       "ceiling": 2
-    },
-    {
-      "path": "crates/carrick-kernel/src/dispatch/fs/locks.rs",
-      "ceiling": 3
-    },
-    {
-      "path": "crates/carrick-kernel/src/dispatch/fs/mount.rs",
-      "ceiling": 1
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/fs/notify.rs",
@@ -58,16 +42,8 @@
       "ceiling": 4
     },
     {
-      "path": "crates/carrick-kernel/src/dispatch/fs/stat.rs",
-      "ceiling": 5
-    },
-    {
       "path": "crates/carrick-kernel/src/dispatch/fs/transfer.rs",
       "ceiling": 3
-    },
-    {
-      "path": "crates/carrick-kernel/src/dispatch/fs/xattr.rs",
-      "ceiling": 2
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/futex.rs",
@@ -87,14 +63,6 @@
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/keys.rs",
-      "ceiling": 1
-    },
-    {
-      "path": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
-      "ceiling": 1
-    },
-    {
-      "path": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
       "ceiling": 1
     },
     {

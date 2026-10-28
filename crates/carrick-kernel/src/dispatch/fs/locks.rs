@@ -1152,14 +1152,13 @@ fn write_logical_record_lock_conflict(
     is_ofd: bool,
 ) -> DispatchOutcome {
     let Some(conflict) = conflict else {
-        return if memory
-            .write_bytes(arg, &(LINUX_F_UNLCK as i16).to_le_bytes())
-            .is_ok()
-        {
-            DispatchOutcome::Returned { value: 0 }
-        } else {
-            DispatchOutcome::errno(LINUX_EFAULT)
-        };
+        return FsView::copyout_bytes(
+            context,
+            memory,
+            arg,
+            &(LINUX_F_UNLCK as i16).to_le_bytes(),
+            DispatchOutcome::Returned { value: 0 },
+        );
     };
     let mut out = [0_u8; 32];
     let lock_type = if conflict.write {
@@ -1189,11 +1188,13 @@ fn write_logical_record_lock_conflict(
     out[8..16].copy_from_slice(&(conflict.range.start as i64).to_le_bytes());
     out[16..24].copy_from_slice(&len.to_le_bytes());
     out[24..28].copy_from_slice(&pid.to_le_bytes());
-    if memory.write_bytes(arg, &out).is_err() {
-        DispatchOutcome::errno(LINUX_EFAULT)
-    } else {
-        DispatchOutcome::Returned { value: 0 }
-    }
+    FsView::copyout_bytes(
+        context,
+        memory,
+        arg,
+        &out,
+        DispatchOutcome::Returned { value: 0 },
+    )
 }
 
 impl<'a> FsView<'a> {
@@ -2157,8 +2158,13 @@ impl<'a> FsView<'a> {
                         owner_type: owner_info.owner_type,
                         owner_pid: owner_info.owner_pid,
                     };
-                    cx.memory.write_struct(arg, &owner)?;
-                    DispatchOutcome::Returned { value: 0 }
+                    Self::copyout_bytes(
+                        cx.kernel,
+                        &mut *cx.memory,
+                        arg,
+                        zerocopy::IntoBytes::as_bytes(&owner),
+                        DispatchOutcome::Returned { value: 0 },
+                    )
                 }
                 LINUX_F_SETSIG => {
                     let Some(open_file) = this.open_file(fd.0) else {

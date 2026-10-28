@@ -54,11 +54,34 @@ fn linux_termio_bytes(termios: &LinuxTermios) -> [u8; LINUX_TERMIO_SIZE] {
 }
 
 fn write_linux_termio(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     address: u64,
     termios: &LinuxTermios,
 ) -> DispatchOutcome {
-    write_packed(memory, address, &linux_termio_bytes(termios))
+    FsView::copyout_bytes(
+        context,
+        memory,
+        address,
+        &linux_termio_bytes(termios),
+        DispatchOutcome::Returned { value: 0 },
+    )
+}
+
+fn copyout_termios2<M: CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
+    memory: &mut M,
+    address: u64,
+    value: &LinuxTermios,
+) -> DispatchOutcome {
+    let _: fn(&mut M, u64, &LinuxTermios) -> DispatchOutcome = write_termios2;
+    FsView::copyout_bytes(
+        context,
+        memory,
+        address,
+        zerocopy::IntoBytes::as_bytes(value),
+        DispatchOutcome::Returned { value: 0 },
+    )
 }
 
 fn merge_linux_termio(current: &LinuxTermios, bytes: &[u8]) -> Result<LinuxTermios, LinuxErrno> {
@@ -129,6 +152,7 @@ fn fd_is_proc_maps(this: &FsView<'_>, fd: i32) -> bool {
 
 fn pidfd_get_info(
     this: &FsView<'_>,
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     fd: i32,
     request: u64,
@@ -161,7 +185,13 @@ fn pidfd_get_info(
             info.exit_code = status.raw();
         }
     }
-    write_packed(memory, arg, &info.as_bytes()[..size])
+    FsView::copyout_bytes(
+        context,
+        memory,
+        arg,
+        &info.as_bytes()[..size],
+        DispatchOutcome::Returned { value: 0 },
+    )
 }
 
 fn is_pidfd_get_info(request: u64) -> bool {
@@ -292,14 +322,33 @@ fn procmap_query(
         bytes.push(0);
         bytes
     });
-    if let Some(name_bytes) = &name_bytes {
+    let name_slot = if let Some(name_bytes) = &name_bytes {
         if name_bytes.len() > name_capacity {
             return DispatchOutcome::errno(LINUX_E2BIG);
         }
-        if name_address == 0 || memory.write_bytes(name_address, name_bytes).is_err() {
+        if name_address == 0 {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
-    }
+        Some(super::super::copyout::UserSlot::new(
+            name_address,
+            name_bytes.len(),
+        ))
+    } else {
+        None
+    };
+    let output = match super::super::copyout::prepare(
+        context,
+        memory,
+        [
+            name_slot,
+            Some(super::super::copyout::UserSlot::of::<
+                carrick_abi::LinuxProcmapQuery,
+            >(arg)),
+        ],
+    ) {
+        Ok(output) => output,
+        Err(refusal) => return refusal.into_outcome(),
+    };
 
     query.vma_start = start;
     query.vma_end = end;
@@ -311,7 +360,7 @@ fn procmap_query(
     query.dev_minor = 0;
     query.vma_name_size = name_bytes.as_ref().map_or(0, |bytes| bytes.len() as u32);
     query.build_id_size = 0;
-    match write_kernel_struct_raw(memory, arg, &query) {
+    match output.commit([name_bytes.as_deref().unwrap_or(&[]), query.as_bytes()]) {
         Ok(()) => DispatchOutcome::Returned { value: 0 },
         Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
     }
@@ -706,7 +755,7 @@ impl<'a> FsView<'a> {
                 return Ok(procmap_query(this, cx.kernel, &mut *cx.memory, arg));
             }
             if is_pidfd_get_info(ioctl_request) {
-                return Ok(pidfd_get_info(this, &mut *cx.memory, fd.0, ioctl_request, arg));
+                return Ok(pidfd_get_info(this, cx.kernel, &mut *cx.memory, fd.0, ioctl_request, arg));
             }
             let changes_tty_state = matches!(
                 ioctl_request,
@@ -760,11 +809,17 @@ impl<'a> FsView<'a> {
                     LINUX_TCGETA | LINUX_TCGETS | LINUX_TCGETS2 => {
                         let termios = console.get_termios();
                         if ioctl_request == LINUX_TCGETS2 {
-                            write_termios2(&mut *cx.memory, arg, &termios)
+                            copyout_termios2(cx.kernel, &mut *cx.memory, arg, &termios)
                         } else if ioctl_request == LINUX_TCGETA {
-                            write_linux_termio(&mut *cx.memory, arg, &termios)
+                            write_linux_termio(cx.kernel, &mut *cx.memory, arg, &termios)
                         } else {
-                            write_kernel_struct(&mut *cx.memory, arg, &termios)
+                            super::super::copyout::copyout_record(
+                                cx.kernel,
+                                &mut *cx.memory,
+                                arg,
+                                &termios,
+                                DispatchOutcome::Returned { value: 0 },
+                            )
                         }
                     }
                     LINUX_TCSETS
@@ -810,7 +865,13 @@ impl<'a> FsView<'a> {
                     }
                     LINUX_TIOCGWINSZ => {
                         let winsize = console.get_winsize();
-                        write_kernel_struct(&mut *cx.memory, arg, &winsize)
+                        super::super::copyout::copyout_record(
+                            cx.kernel,
+                            &mut *cx.memory,
+                            arg,
+                            &winsize,
+                            DispatchOutcome::Returned { value: 0 },
+                        )
                     }
                     LINUX_TIOCSWINSZ => match cx.memory.read_bytes(arg, 8) {
                         Ok(b) => match LinuxWinsize::read_from_bytes(&b) {
@@ -850,9 +911,13 @@ impl<'a> FsView<'a> {
                     // (and then reopens it non-blocking). Answering it for the
                     // slave too made libuv treat the slave as a master and leave
                     // UV_HANDLE_BLOCKING_WRITES set (tty_pty / tty_pty_partial).
-                    LINUX_TIOCGPTN if role.is_master => {
-                        write_packed(&mut *cx.memory, arg, &role.index.to_le_bytes())
-                    }
+                    LINUX_TIOCGPTN if role.is_master => Self::copyout_bytes(
+                        cx.kernel,
+                        &mut *cx.memory,
+                        arg,
+                        &role.index.to_le_bytes(),
+                        DispatchOutcome::Returned { value: 0 },
+                    ),
                     LINUX_TIOCGPTN => DispatchOutcome::errno(LINUX_ENOTTY),
                     LINUX_TIOCSPTLCK => {
                         let mut buf = [0u8; 4];
@@ -872,11 +937,17 @@ impl<'a> FsView<'a> {
                         // glibc-aarch64 tcgetattr on a pty slave uses TCGETS2
                         // (the full 44-byte termios2); musl uses 36-byte TCGETS.
                         if ioctl_request == LINUX_TCGETS2 {
-                            write_termios2(&mut *cx.memory, arg, &termios)
+                            copyout_termios2(cx.kernel, &mut *cx.memory, arg, &termios)
                         } else if ioctl_request == LINUX_TCGETA {
-                            write_linux_termio(&mut *cx.memory, arg, &termios)
+                            write_linux_termio(cx.kernel, &mut *cx.memory, arg, &termios)
                         } else {
-                            write_kernel_struct(&mut *cx.memory, arg, &termios)
+                            super::super::copyout::copyout_record(
+                                cx.kernel,
+                                &mut *cx.memory,
+                                arg,
+                                &termios,
+                                DispatchOutcome::Returned { value: 0 },
+                            )
                         }
                     }
                     LINUX_TCSETS
@@ -922,7 +993,13 @@ impl<'a> FsView<'a> {
                                 .unwrap_or_else(LinuxWinsize::terminal_80x24),
                             None => LinuxWinsize::terminal_80x24(),
                         };
-                        write_kernel_struct(&mut *cx.memory, arg, &ws)
+                        super::super::copyout::copyout_record(
+                            cx.kernel,
+                            &mut *cx.memory,
+                            arg,
+                            &ws,
+                            DispatchOutcome::Returned { value: 0 },
+                        )
                     }
                     LINUX_TIOCSWINSZ => {
                         match cx.memory.read_bytes(arg, 8) {
@@ -987,7 +1064,13 @@ impl<'a> FsView<'a> {
                             )
                             .and_then(|group| i32::try_from(group).ok())
                             {
-                                Some(group) => write_packed(&mut *cx.memory, arg, &group.to_le_bytes()),
+                                Some(group) => Self::copyout_bytes(
+                                    cx.kernel,
+                                    &mut *cx.memory,
+                                    arg,
+                                    &group.to_le_bytes(),
+                                    DispatchOutcome::Returned { value: 0 },
+                                ),
                                 None => DispatchOutcome::errno(LINUX_ESRCH),
                             },
                             Err(errno) => DispatchOutcome::errno(errno),
@@ -1086,7 +1169,13 @@ impl<'a> FsView<'a> {
                             )
                             .and_then(|session| i32::try_from(session).ok())
                             {
-                                Some(session) => write_packed(&mut *cx.memory, arg, &session.to_le_bytes()),
+                                Some(session) => Self::copyout_bytes(
+                                    cx.kernel,
+                                    &mut *cx.memory,
+                                    arg,
+                                    &session.to_le_bytes(),
+                                    DispatchOutcome::Returned { value: 0 },
+                                ),
                                 None => DispatchOutcome::errno(LINUX_ESRCH),
                             },
                             Err(errno) => DispatchOutcome::errno(errno),
@@ -1174,7 +1263,13 @@ impl<'a> FsView<'a> {
                         if rc < 0 {
                             DispatchOutcome::errno(crate::host_to_linux_errno(get_last_error()))
                         } else {
-                            write_packed(&mut *cx.memory, arg, &(n as i32).to_le_bytes())
+                            Self::copyout_bytes(
+                                cx.kernel,
+                                &mut *cx.memory,
+                                arg,
+                                &(n as i32).to_le_bytes(),
+                                DispatchOutcome::Returned { value: 0 },
+                            )
                         }
                     }
                     LINUX_FIONBIO => {
@@ -1291,7 +1386,13 @@ impl<'a> FsView<'a> {
                     // only answers this for a user namespace).
                     LINUX_NS_GET_OWNER_UID => {
                         if ns_type == "user" {
-                            write_packed(&mut *cx.memory, arg, &0u32.to_le_bytes())
+                            Self::copyout_bytes(
+                                cx.kernel,
+                                &mut *cx.memory,
+                                arg,
+                                &0u32.to_le_bytes(),
+                                DispatchOutcome::Returned { value: 0 },
+                            )
                         } else {
                             DispatchOutcome::errno(LINUX_EINVAL)
                         }
@@ -1345,11 +1446,34 @@ impl<'a> FsView<'a> {
                     } else {
                         LinuxWinsize::terminal_80x24()
                     };
-                    write_kernel_struct(&mut *cx.memory, arg, &winsize)
+                    super::super::copyout::copyout_record(
+                        cx.kernel,
+                        &mut *cx.memory,
+                        arg,
+                        &winsize,
+                        DispatchOutcome::Returned { value: 0 },
+                    )
                 }
                 LINUX_TIOCGWINSZ => DispatchOutcome::errno(LINUX_ENOTTY),
                 LINUX_TCGETA => {
-                    if !cx.memory.guest_range_is_writable(arg, LINUX_TERMIO_SIZE) {
+                    if cx.memory.user_memory_venue()
+                        == carrick_guest_mem::UserMemoryVenue::Legacy
+                        && !cx.memory.guest_range_is_writable(arg, LINUX_TERMIO_SIZE)
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    let prepared = match super::super::copyout::prepare(
+                        cx.kernel,
+                        &mut *cx.memory,
+                        [Some(super::super::copyout::UserSlot::new(
+                            arg,
+                            LINUX_TERMIO_SIZE,
+                        ))],
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(refusal) => return Ok(refusal.into_outcome()),
+                    };
+                    if prepared.secured_capacity(0) == 0 {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                     if !fd_is_tty(&this.captured_file_table().read_open_files(), fd.0) {
@@ -1361,7 +1485,10 @@ impl<'a> FsView<'a> {
                         } else {
                             LinuxTermios::default_cooked()
                         };
-                        write_linux_termio(&mut *cx.memory, arg, &termios)
+                        match prepared.commit([&linux_termio_bytes(&termios)]) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
+                        }
                     }
                 }
                 LINUX_TCGETS | LINUX_TCGETS2 if fd_is_tty(&this.captured_file_table().read_open_files(), fd.0) => {
@@ -1382,9 +1509,15 @@ impl<'a> FsView<'a> {
                     // (the c_ispeed/c_ospeed tail). musl uses TCGETS, so a
                     // musl-only probe suite never exercised this path.
                     if ioctl_request == LINUX_TCGETS2 {
-                        write_termios2(&mut *cx.memory, arg, &termios)
+                        copyout_termios2(cx.kernel, &mut *cx.memory, arg, &termios)
                     } else {
-                        write_kernel_struct(&mut *cx.memory, arg, &termios)
+                        super::super::copyout::copyout_record(
+                            cx.kernel,
+                            &mut *cx.memory,
+                            arg,
+                            &termios,
+                            DispatchOutcome::Returned { value: 0 },
+                        )
                     }
                 }
                 LINUX_TCGETS | LINUX_TCGETS2 => DispatchOutcome::errno(LINUX_ENOTTY),
@@ -1392,7 +1525,13 @@ impl<'a> FsView<'a> {
                     if !fd_is_random_device(this, fd.0) {
                         DispatchOutcome::errno(LINUX_ENOTTY)
                     } else {
-                        write_packed(&mut *cx.memory, arg, &256i32.to_le_bytes())
+                        Self::copyout_bytes(
+                            cx.kernel,
+                            &mut *cx.memory,
+                            arg,
+                            &256i32.to_le_bytes(),
+                            DispatchOutcome::Returned { value: 0 },
+                        )
                     }
                 }
                 LINUX_FICLONE => {
@@ -1488,7 +1627,13 @@ impl<'a> FsView<'a> {
                             )
                                 .and_then(|group| i32::try_from(group).ok())
                             {
-                                Some(group) => write_packed(&mut *cx.memory, arg, &group.to_le_bytes()),
+                                Some(group) => Self::copyout_bytes(
+                                    cx.kernel,
+                                    &mut *cx.memory,
+                                    arg,
+                                    &group.to_le_bytes(),
+                                    DispatchOutcome::Returned { value: 0 },
+                                ),
                                 None => DispatchOutcome::errno(LINUX_ESRCH),
                             },
                             Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
@@ -1607,7 +1752,13 @@ impl<'a> FsView<'a> {
                             0
                         }
                     };
-                    write_packed(&mut *cx.memory, arg, &available.to_le_bytes())
+                    Self::copyout_bytes(
+                        cx.kernel,
+                        &mut *cx.memory,
+                        arg,
+                        &available.to_le_bytes(),
+                        DispatchOutcome::Returned { value: 0 },
+                    )
                 }
                 LINUX_FIONBIO => {
                     let Ok(bytes) = cx.memory.read_bytes(arg, 4) else {
@@ -1668,7 +1819,13 @@ impl<'a> FsView<'a> {
                                 let mut ifreq_name = [0u8; LINUX_IFNAMSIZ];
                                 let len = name.len().min(ifreq_name.len().saturating_sub(1));
                                 ifreq_name[..len].copy_from_slice(&name.as_bytes()[..len]);
-                                write_packed(&mut *cx.memory, arg, &ifreq_name)
+                                Self::copyout_bytes(
+                                    cx.kernel,
+                                    &mut *cx.memory,
+                                    arg,
+                                    &ifreq_name,
+                                    DispatchOutcome::Returned { value: 0 },
+                                )
                             } else {
                                 DispatchOutcome::errno(LINUX_ENODEV)
                             }
@@ -1698,10 +1855,12 @@ impl<'a> FsView<'a> {
                                     .find(|link| link.name == name)
                                     .and_then(|link| i32::try_from(link.index).ok())
                                 {
-                                    write_packed(
+                                    Self::copyout_bytes(
+                                        cx.kernel,
                                         &mut *cx.memory,
                                         arg + LINUX_IFNAMSIZ as u64,
                                         &ifindex.to_le_bytes(),
+                                        DispatchOutcome::Returned { value: 0 },
                                     )
                                 } else {
                                     DispatchOutcome::errno(LINUX_ENODEV)
@@ -1726,10 +1885,12 @@ impl<'a> FsView<'a> {
                             if arg == 0 {
                                 DispatchOutcome::errno(LINUX_EFAULT)
                             } else {
-                                write_packed(
+                                Self::copyout_bytes(
+                                    cx.kernel,
                                     &mut *cx.memory,
                                     arg,
                                     &(at_mark as i32).to_le_bytes(),
+                                    DispatchOutcome::Returned { value: 0 },
                                 )
                             }
                         }
@@ -1749,7 +1910,13 @@ impl<'a> FsView<'a> {
                                     } else if arg == 0 {
                                         DispatchOutcome::errno(LINUX_EFAULT)
                                     } else {
-                                        write_packed(&mut *cx.memory, arg, &0i32.to_le_bytes())
+                                        Self::copyout_bytes(
+                                            cx.kernel,
+                                            &mut *cx.memory,
+                                            arg,
+                                            &0i32.to_le_bytes(),
+                                            DispatchOutcome::Returned { value: 0 },
+                                        )
                                     }
                                 }
                                 // A non-socket fd (e.g. a FIFO): Linux's vfs_ioctl returns
@@ -1792,14 +1959,25 @@ impl<'a> FsView<'a> {
                             blob.extend_from_slice(req.as_bytes());
                             written += 1;
                         }
-                        if ifc_buf != 0
-                            && !blob.is_empty()
-                            && cx.memory.write_bytes(ifc_buf, &blob).is_err()
-                        {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
                         let new_len = (written * std::mem::size_of::<LinuxIfreq>()) as i32;
-                        write_packed(&mut *cx.memory, arg, &new_len.to_le_bytes())
+                        let blob_slot = (ifc_buf != 0 && !blob.is_empty()).then(|| {
+                            super::super::copyout::UserSlot::new(ifc_buf, blob.len())
+                        });
+                        let output = match super::super::copyout::prepare(
+                            cx.kernel,
+                            &mut *cx.memory,
+                            [
+                                blob_slot,
+                                Some(super::super::copyout::UserSlot::new(arg, 4)),
+                            ],
+                        ) {
+                            Ok(output) => output,
+                            Err(refusal) => return Ok(refusal.into_outcome()),
+                        };
+                        match output.commit([&blob, &new_len.to_le_bytes()]) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
+                        }
                     }
                     Err(errno) => DispatchOutcome::errno(errno),
                 },
@@ -1831,10 +2009,12 @@ impl<'a> FsView<'a> {
                         match ioctl_request {
                             LINUX_SIOCGIFFLAGS => {
                                 // ifr_flags is a `short` at offset IFNAMSIZ.
-                                write_packed(
+                                Self::copyout_bytes(
+                                    cx.kernel,
                                     &mut *cx.memory,
                                     arg + LINUX_IFNAMSIZ as u64,
                                     &iface.flags_linux.to_le_bytes(),
+                                    DispatchOutcome::Returned { value: 0 },
                                 )
                             }
                             LINUX_SIOCGIFADDR | LINUX_SIOCGIFNETMASK | LINUX_SIOCGIFBRDADDR => {
@@ -1848,13 +2028,21 @@ impl<'a> FsView<'a> {
                                 } else {
                                     sa[4..8].copy_from_slice(&iface.addr_be);
                                 }
-                                write_packed(&mut *cx.memory, arg + LINUX_IFNAMSIZ as u64, &sa)
+                                Self::copyout_bytes(
+                                    cx.kernel,
+                                    &mut *cx.memory,
+                                    arg + LINUX_IFNAMSIZ as u64,
+                                    &sa,
+                                    DispatchOutcome::Returned { value: 0 },
+                                )
                             }
                             // SIOCGIFMTU: ifr_mtu (i32) at offset IFNAMSIZ.
-                            _ => write_packed(
+                            _ => Self::copyout_bytes(
+                                cx.kernel,
                                 &mut *cx.memory,
                                 arg + LINUX_IFNAMSIZ as u64,
                                 &iface.mtu.to_le_bytes(),
+                                DispatchOutcome::Returned { value: 0 },
                             ),
                         }
                     }
@@ -1882,7 +2070,13 @@ impl<'a> FsView<'a> {
                             )
                                 .and_then(|session| i32::try_from(session).ok())
                             {
-                                Some(session) => write_packed(&mut *cx.memory, arg, &session.to_le_bytes()),
+                                Some(session) => Self::copyout_bytes(
+                                    cx.kernel,
+                                    &mut *cx.memory,
+                                    arg,
+                                    &session.to_le_bytes(),
+                                    DispatchOutcome::Returned { value: 0 },
+                                ),
                                 None => DispatchOutcome::errno(LINUX_ESRCH),
                             },
                             Err(_) => DispatchOutcome::errno(LINUX_ENOTTY),
@@ -2142,6 +2336,202 @@ mod tests {
             i32::from_le_bytes(bytes.try_into().unwrap()),
             10,
             "SIOCOUTQ after partial read must report remaining bytes"
+        );
+    }
+
+    #[test]
+    fn ioctl_tty_ifconf_and_pipe_wait_for_owner_refused_copyout() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use carrick_abi::syscall::nr;
+
+        const BASE: u64 = 0x4000_0000;
+        const FILL: u8 = 0xa5;
+        const OUT: u64 = BASE + 0x100;
+        const BUF: u64 = BASE + 0x200;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut memory = OwnerRefusingMemory::new(BASE, 0x2000, FILL);
+
+        let console = Arc::new(crate::vfs::VirtualConsole::new(Arc::clone(
+            dispatcher.pty_table(),
+        )));
+        let tty_fd = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::VirtualConsole {
+                        base: OpenDescriptionBase::new(0),
+                        console,
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        for (req, len) in [
+            (LINUX_TIOCGWINSZ, 8usize),
+            (LINUX_TCGETS, LINUX_TERMIOS_KERNEL_SIZE),
+            (LINUX_TCGETS2, LINUX_TERMIOS2_SIZE),
+            (LINUX_TCGETA, LINUX_TERMIO_SIZE),
+        ] {
+            memory.seed(OUT, &[FILL; 64]);
+            let wait = memory.refuse_next();
+            let refused = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::IOCTL.raw(),
+                        SyscallArgs::from([tty_fd as u64, req, OUT, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            assert_eq!(
+                refused,
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                "ioctl {req:#x} must wait on owner refusal instead of EFAULT",
+            );
+            assert_eq!(memory.read_bytes(OUT, len).unwrap(), vec![FILL; len]);
+            let retried = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::IOCTL.raw(),
+                        SyscallArgs::from([tty_fd as u64, req, OUT, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap();
+            assert_eq!(retried, DispatchOutcome::Returned { value: 0 });
+            assert_ne!(memory.read_bytes(OUT, len).unwrap(), vec![FILL; len]);
+        }
+
+        // SIOCGIFCONF on a host AF_INET socket: prepares both [ifc_buf, ifc_len].
+        let DispatchOutcome::Returned { value: sock_fd } = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::SOCKET.raw(),
+                    SyscallArgs::from([LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        else {
+            panic!("socket(AF_INET) failed");
+        };
+        let conf = LinuxIfconf {
+            ifc_len: 160,
+            __pad: [0; 4],
+            ifc_buf: BUF,
+        };
+        memory.seed(OUT, conf.as_bytes());
+        memory.seed(BUF, &[FILL; 160]);
+        let wait = memory.refuse_next();
+        let refused = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::IOCTL.raw(),
+                    SyscallArgs::from([sock_fd as u64, LINUX_SIOCGIFCONF, OUT, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            refused,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.read_bytes(BUF, 40).unwrap(), vec![FILL; 40]);
+        let retried = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::IOCTL.raw(),
+                    SyscallArgs::from([sock_fd as u64, LINUX_SIOCGIFCONF, OUT, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(retried, DispatchOutcome::Returned { value: 0 });
+        let out_len = i32::from_le_bytes(memory.read_bytes(OUT, 4).unwrap().try_into().unwrap());
+        assert!(
+            out_len >= 40,
+            "expected at least one interface in SIOCGIFCONF"
+        );
+        assert_ne!(memory.read_bytes(BUF, 40).unwrap(), vec![FILL; 40]);
+
+        // Pipe FIONREAD: refused copyout must not disturb queued pipe bytes.
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(nr::PIPE2.raw(), SyscallArgs::from([BUF, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let pipe_pair = memory.read_bytes(BUF, 8).unwrap();
+        let pipe_read_fd = i32::from_le_bytes(pipe_pair[..4].try_into().unwrap());
+        let pipe_write_fd = i32::from_le_bytes(pipe_pair[4..].try_into().unwrap());
+        memory.seed(BUF, b"queued-payload");
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::WRITE.raw(),
+                        SyscallArgs::from([pipe_write_fd as u64, BUF, 14, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 14 }
+        );
+        memory.seed(OUT, &[FILL; 4]);
+        let wait = memory.refuse_next();
+        let refused = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::IOCTL.raw(),
+                    SyscallArgs::from([pipe_read_fd as u64, LINUX_FIONREAD, OUT, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            refused,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.read_bytes(OUT, 4).unwrap(), vec![FILL; 4]);
+        let retried = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::IOCTL.raw(),
+                    SyscallArgs::from([pipe_read_fd as u64, LINUX_FIONREAD, OUT, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(retried, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(
+            i32::from_le_bytes(memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
+            14
         );
     }
 }

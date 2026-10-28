@@ -75,12 +75,17 @@ impl<'a> FsView<'a> {
             if bytes.len() > size {
                 return Ok(DispatchOutcome::errno(LINUX_ERANGE));
             }
-            cx.memory.write_bytes(address, &bytes)?;
             // Linux getcwd(2) returns the LENGTH of the buffer filled (including
             // the terminating NUL), not the buffer address. glibc tolerates a
             // positive non-length, but tools that use the return value as a
             // length (and the kernel ABI) require the real count.
-            Ok(DispatchOutcome::returned_len_or_errno(bytes.len()))
+            Ok(Self::copyout_bytes(
+                cx.kernel,
+                &mut *cx.memory,
+                address,
+                &bytes,
+                DispatchOutcome::returned_len_or_errno(bytes.len()),
+            ))
         }
 
         fn chdir(this, cx, pathname: GuestPtr) {

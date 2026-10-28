@@ -297,12 +297,14 @@ impl<'a> FsView<'a> {
         lookup.into_stat()
     }
 
-    fn statfs(
+    fn statfs<M: CurrentMmMemory>(
         &self,
+        context: &crate::kernel::KernelContext,
         pathname: GuestPtr,
         buffer: GuestPtr,
-        memory: &mut impl CurrentMmMemory,
+        memory: &mut M,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let _: fn(&mut M, u64, &LinuxStatfs) -> DispatchOutcome = write_statfs;
         let path = read_guest_c_string(memory, pathname.0)?;
         // An empty pathname is ENOENT (statfs has no AT_EMPTY_PATH form). glibc
         // pathconf(path, _PC_LINK_MAX) validates the path via statfs, so
@@ -332,10 +334,22 @@ impl<'a> FsView<'a> {
         } else {
             self.fs.rootfs_vfs.statfs()
         };
-        Ok(write_statfs(memory, buffer.0, &statfs))
+        Ok(super::super::copyout::copyout_record(
+            context,
+            memory,
+            buffer.0,
+            &statfs,
+            DispatchOutcome::Returned { value: 0 },
+        ))
     }
 
-    fn fstatfs(&self, fd: Fd, buf: GuestPtr, memory: &mut impl CurrentMmMemory) -> DispatchOutcome {
+    fn fstatfs(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: Fd,
+        buf: GuestPtr,
+        memory: &mut impl CurrentMmMemory,
+    ) -> DispatchOutcome {
         let record = match self.fd_stat_record(fd.0) {
             Ok(record) => record,
             Err(errno) => return DispatchOutcome::errno(errno),
@@ -345,7 +359,13 @@ impl<'a> FsView<'a> {
         } else {
             record.fs_identity.statfs()
         };
-        write_statfs(memory, buf.0, &statfs)
+        super::super::copyout::copyout_record(
+            context,
+            memory,
+            buf.0,
+            &statfs,
+            DispatchOutcome::Returned { value: 0 },
+        )
     }
 
     /// Single-component `newfstatat`/`statx` through a TRUSTED host dirfd:
@@ -541,13 +561,13 @@ impl<'a> FsView<'a> {
     define_syscall! {
         fn sys_statfs(this, cx, path: GuestPtr, buf: GuestPtr) {
 
-            this.statfs(path, buf, cx.memory)
+            this.statfs(cx.kernel, path, buf, cx.memory)
 
         }
 
         fn sys_fstatfs(this, cx, fd: Fd, buf: GuestPtr) {
 
-            Ok(this.fstatfs(fd, buf, cx.memory))
+            Ok(this.fstatfs(cx.kernel, fd, buf, cx.memory))
 
         }
 
@@ -790,19 +810,27 @@ impl<'a> FsView<'a> {
             encoded[8..16].copy_from_slice(&filesystem.to_le_bytes());
             encoded[16..24].copy_from_slice(&record.ino.to_le_bytes());
 
-            let mount_write = if mount_width == 8 {
-                cx.memory
-                    .write_bytes(mount_id.0, &(LEGACY_MOUNT_ID as u64).to_le_bytes())
-            } else {
-                cx.memory
-                    .write_bytes(mount_id.0, &LEGACY_MOUNT_ID.to_le_bytes())
-            };
-            if mount_write.is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
             let write_len = if available < HANDLE_BYTES { 8 } else { 24 };
-            if cx.memory.write_bytes(handle.0, &encoded[..write_len]).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            let mount_bytes_8 = (LEGACY_MOUNT_ID as u64).to_le_bytes();
+            let mount_bytes_4 = LEGACY_MOUNT_ID.to_le_bytes();
+            let mount_slice: &[u8] = if mount_width == 8 {
+                &mount_bytes_8
+            } else {
+                &mount_bytes_4
+            };
+            let prepared = match super::super::copyout::prepare(
+                cx.kernel,
+                &mut *cx.memory,
+                [
+                    Some(super::super::copyout::UserSlot::new(mount_id.0, mount_width)),
+                    Some(super::super::copyout::UserSlot::new(handle.0, write_len)),
+                ],
+            ) {
+                Ok(prepared) => prepared,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            if let Err(fault) = prepared.commit([mount_slice, &encoded[..write_len]]) {
+                return Ok(fault.outcome());
             }
             if available < HANDLE_BYTES {
                 return Ok(DispatchOutcome::errno(LINUX_EOVERFLOW));
@@ -965,6 +993,311 @@ mod tests {
             })
             .expect("pipe readlink target");
         assert_eq!(pipe_link, format!("pipe:[{}]", pipe_read.ino));
+    }
+
+    #[test]
+    fn statfs_and_fs_queries_wait_for_owner_refused_copyout_and_signalfd_retains_signal() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use carrick_abi::syscall::nr;
+
+        const BASE: u64 = 0x4000_0000;
+        const FILL: u8 = 0xa5;
+        const PATH: u64 = BASE + 0x40;
+        const OUT: u64 = BASE + 0x100;
+        const OUT2: u64 = BASE + 0x300;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut memory = OwnerRefusingMemory::new(BASE, 0x2000, FILL);
+        memory.seed(PATH, b"/\0");
+
+        let statfs_len = <LinuxStatfs as KernelAbi>::ABI_SIZE;
+        let wait = memory.refuse_next();
+        let refused = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(nr::STATFS.raw(), SyscallArgs::from([PATH, OUT, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            refused,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(
+            memory.read_bytes(OUT, statfs_len).unwrap(),
+            vec![FILL; statfs_len]
+        );
+        let retried = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(nr::STATFS.raw(), SyscallArgs::from([PATH, OUT, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(retried, DispatchOutcome::Returned { value: 0 });
+        assert_ne!(
+            memory.read_bytes(OUT, statfs_len).unwrap(),
+            vec![FILL; statfs_len]
+        );
+
+        // fstatfs on an open pipe fd
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(nr::PIPE2.raw(), SyscallArgs::from([OUT2, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let pipe_fd = i32::from_ne_bytes(memory.read_bytes(OUT2, 4).unwrap().try_into().unwrap());
+        memory.seed(OUT, &[FILL; 128]);
+        let wait = memory.refuse_next();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::FSTATFS.raw(),
+                        SyscallArgs::from([pipe_fd as u64, OUT, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::FSTATFS.raw(),
+                        SyscallArgs::from([pipe_fd as u64, OUT, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        // Consuming path in fs.rs: read_signalfd must NOT consume the pending
+        // signal when the copyout is refused by the owner, and must deliver it
+        // on the retry.
+        dispatcher.mark_process_signal_pending(&context, crate::linux_abi::LINUX_SIGUSR1);
+        let mask = carrick_abi::SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGUSR1);
+        let tid = crate::thread::ThreadId::from_wire_key(context.thread().key().tid.raw() as i32);
+        memory.seed(OUT, &[FILL; 128]);
+        let wait = memory.refuse_next();
+        let refused =
+            dispatcher
+                .fs_view()
+                .read_signalfd(&context, &mut memory, OUT, 128, mask, tid);
+        assert_eq!(
+            refused,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            "read_signalfd must wait on owner refusal without consuming the pending signal",
+        );
+        assert_eq!(memory.read_bytes(OUT, 128).unwrap(), vec![FILL; 128]);
+        let retried =
+            dispatcher
+                .fs_view()
+                .read_signalfd(&context, &mut memory, OUT, 128, mask, tid);
+        assert_eq!(retried, DispatchOutcome::Returned { value: 128 });
+        let signo = u32::from_le_bytes(memory.read_bytes(OUT, 4).unwrap().try_into().unwrap());
+        assert_eq!(signo, crate::linux_abi::LINUX_SIGUSR1 as u32);
+
+        // name_to_handle_at (multi-slot: [mount_id, handle])
+        memory.seed(OUT, &32u32.to_le_bytes());
+        memory.seed(OUT + 4, &[FILL; 20]);
+        memory.seed(OUT2, &[FILL; 4]);
+        let wait = memory.refuse_next();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::NAME_TO_HANDLE_AT.raw(),
+                        SyscallArgs::from([
+                            LINUX_AT_FDCWD as u64,
+                            PATH,
+                            OUT,
+                            OUT2,
+                            carrick_abi::LINUX_AT_HANDLE_FID,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.read_bytes(OUT2, 4).unwrap(), vec![FILL; 4]);
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::NAME_TO_HANDLE_AT.raw(),
+                        SyscallArgs::from([
+                            LINUX_AT_FDCWD as u64,
+                            PATH,
+                            OUT,
+                            OUT2,
+                            carrick_abi::LINUX_AT_HANDLE_FID,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_ne!(memory.read_bytes(OUT2, 4).unwrap(), vec![FILL; 4]);
+
+        // getcwd
+        memory.seed(OUT, &[FILL; 16]);
+        let wait = memory.refuse_next();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(nr::GETCWD.raw(), SyscallArgs::from([OUT, 16, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.read_bytes(OUT, 2).unwrap(), vec![FILL; 2]);
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(nr::GETCWD.raw(), SyscallArgs::from([OUT, 16, 0, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 2 }
+        );
+        assert_eq!(memory.read_bytes(OUT, 2).unwrap(), b"/\0");
+
+        // Open an in-memory file for fcntl(F_GETLK/F_GETOWN_EX) and cachestat
+        let file_path = BASE + 0x500;
+        memory.seed(file_path, b"/s4_test_file\0");
+        let DispatchOutcome::Returned { value: reg_fd } = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::OPENAT.raw(),
+                    SyscallArgs::from([
+                        LINUX_AT_FDCWD as u64,
+                        file_path,
+                        (crate::linux_abi::LINUX_O_CREAT | crate::linux_abi::LINUX_O_RDWR) as u64,
+                        0o644,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        else {
+            panic!("openat failed");
+        };
+
+        // fcntl(F_GETOWN_EX) and fcntl(F_GETLK)
+        memory.seed(OUT, &[FILL; 8]);
+        let wait = memory.refuse_next();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::FCNTL.raw(),
+                        SyscallArgs::from([
+                            reg_fd as u64,
+                            crate::linux_abi::LINUX_F_GETOWN_EX,
+                            OUT,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.read_bytes(OUT, 8).unwrap(), vec![FILL; 8]);
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::FCNTL.raw(),
+                        SyscallArgs::from([
+                            reg_fd as u64,
+                            crate::linux_abi::LINUX_F_GETOWN_EX,
+                            OUT,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+
+        // cachestat
+        memory.seed(OUT2, &[0u8; 16]);
+        memory.seed(OUT, &[FILL; 40]);
+        let wait = memory.refuse_next();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::CACHESTAT.raw(),
+                        SyscallArgs::from([reg_fd as u64, OUT2, OUT, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.read_bytes(OUT, 40).unwrap(), vec![FILL; 40]);
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::CACHESTAT.raw(),
+                        SyscallArgs::from([reg_fd as u64, OUT2, OUT, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(memory.read_bytes(OUT, 40).unwrap(), vec![0u8; 40]);
     }
 }
 
