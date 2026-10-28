@@ -201,6 +201,42 @@ impl HostSignalIngressProducer {
 }
 
 #[cfg(test)]
+pub(crate) struct HostSignalBridgeGuard {
+    test_name: &'static str,
+}
+
+#[cfg(test)]
+impl HostSignalBridgeGuard {
+    pub(crate) fn acquire(test_name: &'static str) -> Self {
+        assert_eq!(
+            carrick_signal_linux::take_pending_event_for(0),
+            None,
+            "{test_name}: preceding test leaked a pending process signal in carrick_signal_linux::PROC_PENDING"
+        );
+        Self { test_name }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HostSignalBridgeGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            carrick_signal_linux::clear_proc_pending();
+            carrick_signal_linux::clear_thread_pending();
+            return;
+        }
+        let leaked_proc = carrick_signal_linux::take_pending_event_for(0);
+        carrick_signal_linux::clear_proc_pending();
+        carrick_signal_linux::clear_thread_pending();
+        assert_eq!(
+            leaked_proc, None,
+            "{}: test completed without draining carrick_signal_linux::PROC_PENDING",
+            self.test_name
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use carrick_core_abi::{
@@ -314,6 +350,9 @@ mod tests {
     #[test]
     fn serial_host_process_event_queued_across_exec_keeps_task_serial() {
         use carrick_kernel::kernel::continuation::test_support::publish;
+        let _signal_guard = HostSignalBridgeGuard::acquire(
+            "serial_host_process_event_queued_across_exec_keeps_task_serial",
+        );
 
         let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             101,
@@ -376,6 +415,9 @@ mod tests {
         use carrick_kernel::kernel::ClonePlan;
         use carrick_kernel::kernel::continuation::test_support::publish;
         use carrick_kernel::kernel::objects::ExecutorId;
+        let _signal_guard = HostSignalBridgeGuard::acquire(
+            "serial_host_ingress_target_tracks_two_members_across_successive_execution_generations",
+        );
 
         let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             102,
@@ -617,6 +659,9 @@ mod tests {
 
     #[test]
     fn serial_host_process_sigint_keeps_process_scope_through_producer() {
+        let _signal_guard = HostSignalBridgeGuard::acquire(
+            "serial_host_process_sigint_keeps_process_scope_through_producer",
+        );
         let queue = SignalIngressQueue::<2>::new();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(61),
