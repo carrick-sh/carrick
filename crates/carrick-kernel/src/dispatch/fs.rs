@@ -256,8 +256,15 @@ pub(in crate::dispatch) fn carrier_buffer_is_not_owner_memory() -> super::Dispat
     ::core::cmp::Eq,
 )]
 pub(super) enum SuspendedCopyoutKind {
-    GetXattr { size: usize },
-    ListXattr { size: usize },
+    GetXattr {
+        size: usize,
+    },
+    ListXattr {
+        size: usize,
+    },
+    ProcmapQuery {
+        query: carrick_abi::LinuxProcmapQuery,
+    },
 }
 
 pub(in crate::dispatch::fs) struct SuspendedCopyout {
@@ -871,6 +878,51 @@ impl<'a> FsView<'a> {
             resumed.offset,
             resumed.success,
         ))
+    }
+
+    pub(super) fn take_suspended_procmap_query(
+        &self,
+        context: &crate::kernel::KernelContext,
+        arg: u64,
+    ) -> Option<(carrick_abi::LinuxProcmapQuery, usize)> {
+        let current_thread = Arc::downgrade(context.thread());
+        let mut lock_state = self.fs.classic_record_locks.state();
+        let table = &mut lock_state.suspended_copyouts;
+        table.retain(|entry| entry.thread.strong_count() > 0);
+        let pos = table
+            .iter()
+            .position(|entry| entry.thread.ptr_eq(&current_thread))?;
+        let entry = table.swap_remove(pos);
+        if let SuspendedCopyoutKind::ProcmapQuery { query } = entry.kind
+            && entry.address == arg
+        {
+            Some((query, entry.offset))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn save_suspended_procmap_query(
+        &self,
+        context: &crate::kernel::KernelContext,
+        arg: u64,
+        query: carrick_abi::LinuxProcmapQuery,
+        name_offset: usize,
+    ) {
+        let current_thread = Arc::downgrade(context.thread());
+        let mut lock_state = self.fs.classic_record_locks.state();
+        let table = &mut lock_state.suspended_copyouts;
+        table.retain(|entry| {
+            entry.thread.strong_count() > 0 && !entry.thread.ptr_eq(&current_thread)
+        });
+        table.push(SuspendedCopyout {
+            thread: current_thread,
+            kind: SuspendedCopyoutKind::ProcmapQuery { query },
+            address: arg,
+            bytes: Vec::new(),
+            offset: name_offset,
+            success: DispatchOutcome::Returned { value: 0 },
+        });
     }
 
     pub(super) fn copyout_bytes<M: CurrentMmMemory>(
