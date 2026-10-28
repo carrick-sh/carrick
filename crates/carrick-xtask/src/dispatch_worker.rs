@@ -1745,7 +1745,7 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
             .as_str()
             .unwrap_or_default();
         let issue = event["issue"]["number"].as_u64().unwrap_or_default();
-        agent_loop::RunCache::default().publication(
+        agent_loop::RunCache::for_guard(admit).publication(
             &root,
             &event["pull_request"],
             &event["dispatch_run"],
@@ -2270,6 +2270,7 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
             "loop.log",
             "loop-transcript.log",
             "pr-body.md",
+            HARVEST_PATCH,
         ]
         .contains(&name)
         {
@@ -3048,7 +3049,92 @@ fn publication_body(body: &str, source: &str, issue: u64) -> Result<String, Scal
     Ok(format!("{human}\n\n{source}{closing}{footer}"))
 }
 
+/// Publish the harvested work. A refusal never costs the commits: they are
+/// kept as a patch series in the handoff artifact so a continuation or the
+/// director can resume from them.
 fn publish(
+    root: &Path,
+    dispatch: &Dispatch,
+    receipt: &Receipt,
+    contract: &Contract,
+    report_path: &Path,
+    token: &str,
+    runs: &mut agent_loop::RunCache,
+) -> Result<Option<u64>, ScalerError> {
+    let mut preserve = None;
+    let result = publish_commits(
+        root,
+        dispatch,
+        receipt,
+        contract,
+        report_path,
+        token,
+        runs,
+        &mut preserve,
+    );
+    let (Err(error), Some(base)) = (&result, preserve) else {
+        return result;
+    };
+    let work = crate::agent_runner::state()?.join("work");
+    match preserve_harvest(&work, &base, token) {
+        Ok(Some(note)) => Err(ScalerError::Usage(format!("{error}; {note}"))),
+        Ok(None) => result,
+        Err(saving) => Err(ScalerError::Usage(format!(
+            "{error}; harvested commits could not be kept: {saving}"
+        ))),
+    }
+}
+
+const HARVEST_PATCH: &str = "harvest.patch";
+const HARVEST_PATCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// Write `base..HEAD` as a text patch series into the upload population and
+/// scan it like every other artifact. A bundle is binary and cannot pass the
+/// text-only scan; `git am` resumes from this series.
+fn preserve_harvest(work: &Path, base: &str, token: &str) -> Result<Option<String>, ScalerError> {
+    let Some(runner_temp) = std::env::var_os("RUNNER_TEMP") else {
+        return Ok(None);
+    };
+    let package = PathBuf::from(runner_temp).join("dispatch-output");
+    if !package.is_dir() {
+        return Ok(None);
+    }
+    let series = output(&mut git_invocation(
+        work,
+        &[
+            "format-patch",
+            "--stdout",
+            "--binary",
+            "--no-signature",
+            &format!("{base}..HEAD"),
+        ],
+    ))?;
+    if series.is_empty() {
+        return Ok(None);
+    }
+    if series.len() > HARVEST_PATCH_BYTES {
+        return Ok(Some(format!(
+            "harvested commits exceed {HARVEST_PATCH_BYTES} bytes and were not kept"
+        )));
+    }
+    if std::str::from_utf8(&series).is_err() {
+        return Ok(Some(
+            "harvested commits are not text-safe and were not kept".into(),
+        ));
+    }
+    let path = package.join(HARVEST_PATCH);
+    std::fs::write(&path, series)?;
+    if let Err(error) = mask_artifacts(&package, token) {
+        std::fs::remove_file(&path)?;
+        return Err(error);
+    }
+    Ok(Some(format!(
+        "harvested commits are kept in artifact {HARVEST_PATCH}; resume with `git am`"
+    )))
+}
+
+#[expect(clippy::too_many_arguments, reason = "one publication request")]
+fn publish_commits(
     root: &Path,
     dispatch: &Dispatch,
     receipt: &Receipt,
@@ -3056,6 +3142,7 @@ fn publish(
     report_path: &Path,
     token: &str,
     runs: &mut agent_loop::RunCache,
+    preserve: &mut Option<String>,
 ) -> Result<Option<u64>, ScalerError> {
     let mut credential = PublishCredential::new(token);
     let mut check = ReferenceCheck::new(reference_host());
@@ -3095,26 +3182,66 @@ fn publish(
             ScalerError::Guard("worker must rebase onto admitted main before publication")
         })?;
         let live_main = live_publication_main(&work, token)?;
-        let base = git(&work, &["merge-base", &live_main, "HEAD"])?;
-        let base = base.trim();
+        let mut base = git(&work, &["merge-base", &live_main, "HEAD"])?
+            .trim()
+            .to_owned();
+        *preserve = Some(base.clone());
         // Main and the branch tip admitted before this run are trusted history.
         // A worker may rebase across either without owning their messages.
         check_commit_closures(
             &work,
-            base,
+            &base,
             (!receipt.expected_tip.is_empty()).then_some(receipt.expected_tip.as_str()),
             dispatch.issue,
         )?;
-        let refused_workflow = git(
-            &work,
-            &["diff", "--name-only", "--no-renames", "-z", base, "HEAD"],
-        )?
-        .split('\0')
-        .any(|path| path.starts_with(".github/workflows/"));
-        if refused_workflow {
-            return Err(ScalerError::Guard(
-                "Refused workflow changes: dispatch publishing credentials cannot publish .github/workflows/*; the App token has no workflows permission",
+        let workflow_files = |from: &str, to: &str| -> Result<Vec<String>, ScalerError> {
+            Ok(git(
+                &work,
+                &[
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    from,
+                    to,
+                    "--",
+                    ".github/workflows/",
+                ],
+            )?
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
+        };
+        let own = workflow_files(&base, "HEAD")?;
+        if !own.is_empty() {
+            return Err(ScalerError::Usage(format!(
+                "Refused workflow changes: the run's own commits change {}; dispatch publishing credentials cannot publish .github/workflows/*, so the owner must publish or drop them",
+                own.join(", ")
+            )));
+        }
+        // GitHub refuses an App push when the branch's workflow files differ
+        // from the default branch, even if none of the pushed commits touch
+        // them. A base that is merely behind such a change is not a blocker:
+        // replay the run's commits onto current main.
+        if base != live_main && !workflow_files(&base, &live_main)?.is_empty() {
+            let rebase = output(&mut git_invocation(
+                &work,
+                &["rebase", "--rebase-merges", "--onto", &live_main, &base],
             ));
+            if let Err(error) = rebase {
+                let conflicts = git(&work, &["diff", "--name-only", "--diff-filter=U"])
+                    .unwrap_or_default()
+                    .lines()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                git(&work, &["rebase", "--abort"])?;
+                return Err(ScalerError::Usage(format!(
+                    "Rebase onto current main conflicts (main changed workflow files after the run's base); the run's commits are intact. Conflicting files: {conflicts}: {error}"
+                )));
+            }
+            base = live_main.clone();
+            *preserve = Some(base.clone());
         }
         let tip = git(
             &work,
@@ -3315,7 +3442,7 @@ fn publish(
                     "--head",
                     &dispatch.branch,
                     "--title",
-                    &draft_pr_title(&work, base, dispatch.issue, token)?,
+                    &draft_pr_title(&work, &base, dispatch.issue, token)?,
                     "--body-file",
                     path.to_str().ok_or(ScalerError::Guard("body path"))?,
                 ],
@@ -3726,6 +3853,14 @@ mod tests {
             worker_checkpoint(&state, &dispatch).is_err(),
             "double checkpoint failure left a new tree paired with an old receipt"
         );
+    }
+    #[test]
+    fn publish_rebases_onto_main_after_it_changes_workflow_files() {
+        publication_fixture("rebase-clean");
+    }
+    #[test]
+    fn publish_keeps_commits_when_the_rebase_conflicts() {
+        publication_fixture("rebase-conflict");
     }
     #[test]
     fn followup_worker_workflow_changes_remain_refused() {
@@ -4379,6 +4514,108 @@ fi
             assert!(!applied.contains("opaque-publish-credential"));
             return;
         }
+        if matches!(
+            witness,
+            "rebase-clean" | "rebase-conflict" | "worker-workflow"
+        ) {
+            let package = outer.join("dispatch-output");
+            std::fs::create_dir_all(&package).unwrap();
+            for name in ["raw.log", "transcript.md", "diffstat.txt"] {
+                std::fs::write(package.join(name), "").unwrap();
+            }
+            std::fs::write(
+                package.join("contract.json"),
+                serde_json::to_string(&contract).unwrap(),
+            )
+            .unwrap();
+        }
+        if matches!(witness, "rebase-clean" | "rebase-conflict") {
+            let conflict = witness == "rebase-conflict";
+            let worker_file = if conflict { "base" } else { "work.txt" };
+            std::fs::write(work.join(worker_file), "worker\n").unwrap();
+            git(&work, &["add", worker_file]).unwrap();
+            git(
+                &work,
+                &["commit", "-m", "fix(ci): implement the owner issue"],
+            )
+            .unwrap();
+            receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            // Main moves on after the worker's base and changes a workflow file.
+            git(&work, &["checkout", "-b", "advance", &receipt.base]).unwrap();
+            std::fs::create_dir_all(work.join(".github/workflows")).unwrap();
+            std::fs::write(work.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+            git(&work, &["add", ".github/workflows/ci.yml"]).unwrap();
+            if conflict {
+                std::fs::write(work.join("base"), "main\n").unwrap();
+                git(&work, &["add", "base"]).unwrap();
+            }
+            git(&work, &["commit", "-m", "ci: change a workflow"]).unwrap();
+            let main = git(&work, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            git(&work, &["checkout", &dispatch.branch]).unwrap();
+            git(
+                &work,
+                &[
+                    "--git-dir",
+                    outer.join("live-main.git").to_str().unwrap(),
+                    "fetch",
+                    work.to_str().unwrap(),
+                    "advance:refs/heads/main",
+                    "--force",
+                ],
+            )
+            .unwrap();
+            receipt.pr_body = Some("Publish the owner's change.".into());
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            if conflict {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("Rebase onto current main conflicts"),
+                    "{error}"
+                );
+                assert!(error.contains("Conflicting files: base"), "{error}");
+                assert!(error.contains(HARVEST_PATCH), "{error}");
+                assert!(!outer.join("push.args").exists());
+                assert_eq!(
+                    git(&work, &["rev-parse", "HEAD"]).unwrap().trim(),
+                    receipt.head
+                );
+                let patch =
+                    regular_text(&outer.join("dispatch-output").join(HARVEST_PATCH)).unwrap();
+                assert!(
+                    patch.contains("fix(ci): implement the owner issue"),
+                    "{patch}"
+                );
+            } else {
+                assert_eq!(result.unwrap(), Some(800));
+                assert_eq!(
+                    git(&work, &["rev-parse", "HEAD~2"]).unwrap().trim(),
+                    main,
+                    "commits were not replayed onto current main"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(work.join("work.txt")).unwrap(),
+                    "worker\n"
+                );
+                assert!(outer.join("push.args").exists());
+                assert_eq!(
+                    Applied::load().unwrap().rebased_onto.as_deref(),
+                    Some(main.as_str())
+                );
+                assert!(!outer.join("dispatch-output").join(HARVEST_PATCH).exists());
+            }
+            return;
+        }
         if witness == "worker-workflow" {
             std::fs::create_dir_all(work.join(".github/workflows")).unwrap();
             std::fs::write(work.join(".github/workflows/worker.yml"), "name: worker\n").unwrap();
@@ -4400,6 +4637,11 @@ fi
                 "worker workflow edit was published: {result:?}"
             );
             assert!(!outer.join("push.args").exists());
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains(".github/workflows/worker.yml"), "{error}");
+            assert!(error.contains(HARVEST_PATCH), "{error}");
+            let patch = regular_text(&outer.join("dispatch-output").join(HARVEST_PATCH)).unwrap();
+            assert!(patch.contains("fix(ci): worker workflow edit"), "{patch}");
             return;
         }
         if matches!(

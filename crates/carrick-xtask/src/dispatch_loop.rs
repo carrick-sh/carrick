@@ -984,6 +984,9 @@ pub(super) struct RunCache {
     bundles: LookupCache<(u64, RunId), std::collections::BTreeMap<String, String>>,
     branches: std::collections::BTreeMap<(u64, String), BranchSnapshot>,
     stored_gh_auth: bool,
+    /// Bind publication only through public comment receipts, never through
+    /// the artifact handoff, whatever credential the process holds.
+    public_receipts_only: bool,
 }
 struct BranchSnapshot {
     prs: Value,
@@ -993,6 +996,15 @@ impl RunCache {
     pub(super) fn for_controller() -> Self {
         Self {
             stored_gh_auth: true,
+            ..Self::default()
+        }
+    }
+    /// The hosted guard holds a read-only token for the API rate limit, but its
+    /// trust stays credential-free: only admission (`admit`) may read the
+    /// artifact handoff.
+    pub(super) fn for_guard(admit: bool) -> Self {
+        Self {
+            public_receipts_only: !admit,
             ..Self::default()
         }
     }
@@ -1012,7 +1024,8 @@ impl RunCache {
         if authenticated.run["id"] != run["id"] {
             return None;
         }
-        let credentialed = self.stored_gh_auth || std::env::var_os("GH_TOKEN").is_some();
+        let credentialed = !self.public_receipts_only
+            && (self.stored_gh_auth || std::env::var_os("GH_TOKEN").is_some());
         if credentialed
             && let Ok(text) = self.prior_artifact(root, issue, RunId(id), "handoff.json")
             && let Ok(handoff) = serde_json::from_str::<Value>(&text)
@@ -3436,6 +3449,32 @@ API
         });
     }
     #[test]
+    fn guard_publication_ignores_the_artifact_handoff_even_with_a_token() {
+        shared_fixture(|root| {
+            let (pr, _) = guard_publication_fixture(root);
+            assert_eq!(std::env::var("GH_TOKEN").unwrap(), "fixture-token");
+            let mut handoff: Value =
+                serde_json::from_str(&regular_text(&root.join("handoff.json")).unwrap()).unwrap();
+            handoff["applied"] = json!({"publication_pr":800});
+            std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
+            let run: Value =
+                serde_json::from_str(&regular_text(&root.join("run.json")).unwrap()).unwrap();
+            let branch = "work/dispatch-799-42";
+            assert!(
+                RunCache::for_guard(true)
+                    .publication(root, &pr, &run, 799, branch)
+                    .is_some(),
+                "admission lost the artifact handoff"
+            );
+            assert!(
+                RunCache::for_guard(false)
+                    .publication(root, &pr, &run, 799, branch)
+                    .is_none(),
+                "guard bound publication through the artifact handoff"
+            );
+        });
+    }
+    #[test]
     fn guard_publication_credentialed_admission_rechecks_artifact_ownership() {
         shared_fixture(|root| {
             let (pr, _) = guard_publication_fixture(root);
@@ -3446,7 +3485,14 @@ API
                 serde_json::from_str(&regular_text(&root.join("handoff.json")).unwrap()).unwrap();
             handoff["applied"] = json!({"publication_pr":800});
             std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
-            assert!(guard_publication(root).is_ok());
+            // Only admission reads the handoff; the guard stays on public receipts.
+            let run: Value =
+                serde_json::from_str(&regular_text(&root.join("run.json")).unwrap()).unwrap();
+            assert!(
+                RunCache::for_guard(true)
+                    .publication(root, &pr, &run, 799, "work/dispatch-799-42")
+                    .is_some()
+            );
             let mut dispatch = server(root).dispatch;
             dispatch.branch = pr["head"]["ref"].as_str().unwrap().into();
             assert!(require_owned_pr(root, &dispatch).is_ok());

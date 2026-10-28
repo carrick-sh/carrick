@@ -65,6 +65,10 @@ jobs:
         id: validate
         env:
           CARRICK_DISPATCH_BASE: ${{ steps.base.outputs.base }}
+          # Read-only (the job has contents: read) and used only for the API
+          # rate limit. Without --admit the guard still binds publication
+          # through public comment receipts, never the artifact handoff.
+          GH_TOKEN: ${{ github.token }}
         run: cargo run --locked --release -p carrick-xtask -- dispatch-worker guard --event "$GITHUB_EVENT_PATH"
 
       - name: Dispatch issue ${{ steps.validate.outputs.issue }}
