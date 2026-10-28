@@ -1334,7 +1334,10 @@ ci-install-semgrep:
     #!/usr/bin/env bash
     set -euo pipefail
     python3 -m venv "${RUNNER_TEMP:?}/semgrep"
-    "$RUNNER_TEMP/semgrep/bin/pip" install semgrep
+    # Wheels only: semgrep pins `ruamel.yaml.clib==0.2.12` as a source package
+    # that imports `ast.Str`, which Python 3.14 removed, so building it fails.
+    # With `--only-binary` pip resolves a release that ships a 3.14 wheel (#1000).
+    "$RUNNER_TEMP/semgrep/bin/pip" install --only-binary=:all: semgrep
     echo "$RUNNER_TEMP/semgrep/bin" >> "${GITHUB_PATH:?}"
 
 # The cross toolchains install from an actions/cache directory, so a slow
