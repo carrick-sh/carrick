@@ -2300,5 +2300,7 @@ converted that error directly into `RuntimeError::Configuration`. The progress
 binding refuses the second of three page chunks and requires exactly four
 preparations, three non-overlapping commits and the original return value.
 Cancellation after that refusal requires zero further preparations or commits.
+A drop-sensitive physical dependency must release writer exclusion before the
+next preparation, even though the pending operation also retained its receipt.
 These fixtures prove the boundary, not attribution of the signed stress event.
 Thirty signed `el1_files_exit_group_stress` runs remain director-owned on HVF.
