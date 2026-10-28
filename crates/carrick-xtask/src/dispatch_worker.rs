@@ -956,11 +956,43 @@ enum PublishEvent {
     PrCreate,
     BodyPatch,
 }
+impl PublishEvent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::BranchPush => "branch_push",
+            Self::PrPush => "pr_push",
+            Self::PrCreate => "pr_create",
+            Self::BodyPatch => "body_patch",
+        }
+    }
+}
+/// Why a publication wrote with the job token instead of the scoped App token.
+/// The error class is a fixed marker, never the error text, so it is safe to
+/// record in artifacts and comments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenFallback {
+    /// `DISPATCH_PUBLISH_TOKEN` was empty or absent in the loop's environment.
+    NoAppToken,
+    /// An App-token operation failed with an authentication error.
+    Rejected { operation: String, class: String },
+}
+impl TokenFallback {
+    fn describe(&self) -> String {
+        match self {
+            Self::NoAppToken => "the publish token was empty or absent".into(),
+            Self::Rejected { operation, class } => {
+                format!("the publish token was rejected during {operation} ({class})")
+            }
+        }
+    }
+}
 struct PublishCredential<'a> {
     app: Option<String>,
     job: &'a str,
     wrote: bool,
     ci_triggered: bool,
+    fallback: Option<TokenFallback>,
 }
 impl<'a> PublishCredential<'a> {
     fn new(job: &'a str) -> Self {
@@ -971,6 +1003,7 @@ impl<'a> PublishCredential<'a> {
             job,
             wrote: false,
             ci_triggered: false,
+            fallback: None,
         }
     }
     fn write<T>(
@@ -978,13 +1011,20 @@ impl<'a> PublishCredential<'a> {
         event: PublishEvent,
         mut operation: impl FnMut(&str) -> Result<T, ScalerError>,
     ) -> Result<T, ScalerError> {
+        if self.app.is_none() && self.fallback.is_none() {
+            self.fallback = Some(TokenFallback::NoAppToken);
+        }
         let mut result = operation(self.app.as_deref().unwrap_or(self.job));
-        if self.app.is_some()
-            && result
-                .as_ref()
-                .is_err_and(|e| publish_auth_failure(&e.to_string()))
-        {
+        let class = match (&self.app, &result) {
+            (Some(_), Err(e)) => publish_auth_marker(&e.to_string()),
+            _ => None,
+        };
+        if let Some(class) = class {
             self.app = None;
+            self.fallback = Some(TokenFallback::Rejected {
+                operation: event.label().into(),
+                class: class.into(),
+            });
             result = operation(self.job);
         }
         if result.is_ok() {
@@ -993,7 +1033,10 @@ impl<'a> PublishCredential<'a> {
                 && matches!(event, PublishEvent::PrPush | PublishEvent::PrCreate);
         }
         if self.wrote {
-            Applied::record(|a| a.ci_requires_owner = self.app.is_none() && !self.ci_triggered)?;
+            Applied::record(|a| {
+                a.ci_requires_owner = self.app.is_none() && !self.ci_triggered;
+                a.token_fallback = self.fallback.clone();
+            })?;
         }
         result
     }
@@ -1006,7 +1049,8 @@ impl<'a> PublishCredential<'a> {
         self.write(event, |token| gh_with_token(root, args, Some(token)))
     }
 }
-fn publish_auth_failure(error: &str) -> bool {
+/// The fixed marker that classified `error` as an authentication failure.
+fn publish_auth_marker(error: &str) -> Option<&'static str> {
     let error = error.to_ascii_lowercase();
     if [
         "http 403",
@@ -1020,7 +1064,7 @@ fn publish_auth_failure(error: &str) -> bool {
     .iter()
     .any(|marker| error.contains(marker))
     {
-        return false;
+        return None;
     }
     [
         "bad credentials",
@@ -1031,8 +1075,8 @@ fn publish_auth_failure(error: &str) -> bool {
         "authentication failed",
         "could not read username",
     ]
-    .iter()
-    .any(|marker| error.contains(marker))
+    .into_iter()
+    .find(|marker| error.contains(marker))
 }
 fn publish_permission_failure(error: &str) -> bool {
     let error = error.to_ascii_lowercase().replace(['`', '\'', '"'], "");
@@ -2390,6 +2434,8 @@ struct Applied {
     manual_repair: Option<String>,
     #[serde(default)]
     ci_requires_owner: bool,
+    #[serde(default)]
+    token_fallback: Option<TokenFallback>,
 }
 impl Applied {
     fn load() -> Result<Self, ScalerError> {
@@ -2460,9 +2506,15 @@ impl Applied {
                     .join(", ")
             },
             if self.ci_requires_owner {
-                "\n- CI won't start automatically: publication used the job token; mark the PR ready to start CI."
+                let why = self
+                    .token_fallback
+                    .as_ref()
+                    .map_or_else(|| "reason not recorded".into(), TokenFallback::describe);
+                format!(
+                    "\n- CI won't start automatically: publication used the job token ({why}); mark the PR ready to start CI."
+                )
             } else {
-                ""
+                String::new()
             }
         )
     }
@@ -4048,6 +4100,25 @@ mod tests {
         publication_fixture("publish-token-auth-patch-no-push");
     }
     #[test]
+    fn job_token_report_names_why_the_app_token_was_not_used() {
+        let mut applied = Applied {
+            ci_requires_owner: true,
+            ..Applied::default()
+        };
+        assert!(applied.report().contains("reason not recorded"));
+        applied.token_fallback = Some(TokenFallback::NoAppToken);
+        assert!(applied.report().contains("empty or absent"));
+        applied.token_fallback = Some(TokenFallback::Rejected {
+            operation: PublishEvent::PrCreate.label().into(),
+            class: "http 401".into(),
+        });
+        assert!(
+            applied
+                .report()
+                .contains("rejected during pr_create (http 401)")
+        );
+    }
+    #[test]
     fn publish_lease_rejection_is_not_retried_or_labelled_permission() {
         publication_fixture("publish-token-lease");
     }
@@ -4446,6 +4517,17 @@ fi
                         applied.contains("CI won't start automatically"),
                         "auth fallback omitted CI note"
                     );
+                    assert!(
+                        applied.contains("the publish token was"),
+                        "auth fallback omitted its reason: {applied}"
+                    );
+                    if witness == "publish-token-auth-push" {
+                        assert!(
+                            applied.contains("rejected during branch_push (")
+                                && !applied.contains("opaque-publish-credential"),
+                            "{applied}"
+                        );
+                    }
                     let file = if witness == "publish-token-auth-push" {
                         "push-attempts"
                     } else if witness.starts_with("publish-token-auth-patch") {
