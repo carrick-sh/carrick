@@ -451,9 +451,10 @@ mod tests {
             .expect("bootstrap");
             let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
             {
-                let _server = KernelDebugServer::install(kernel, &scope, None);
+                let _server = KernelDebugServer::install(kernel, &scope, None)
+                    .expect("debug server must be installed before connecting");
                 let endpoint = DebugEndpoint::for_run_id(&scope).expect("endpoint");
-                assert!(UnixStream::connect(endpoint.socket_path()).is_ok());
+                UnixStream::connect(endpoint.socket_path()).expect("installed listener");
             }
             assert!(matches!(
                 super::super::client::fetch(&scope, None),

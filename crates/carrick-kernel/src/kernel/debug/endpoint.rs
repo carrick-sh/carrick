@@ -1,7 +1,7 @@
 //! Socket location, permissions, and stale-owner rules for the kernel debug
 //! endpoint.
 //!
-//! The path is `/tmp/carrick-kernel/<uid>/<token>/snapshot.sock`, where
+//! The path is `/tmp/carrick-kernel-<uid>/<token>/snapshot.sock`, where
 //! `token` is the first 128 bits of `sha256(CARRICK_RUN_ID)` in hex. The run
 //! ID is hashed, never embedded: a run ID may carry a branch name, a ticket,
 //! or a host name, and a world-readable listing must not leak it. Parent
@@ -24,6 +24,9 @@
 //! rendezvous both sides must compute independently cannot depend on ambient
 //! per-process environment. Isolation is unchanged: the per-uid parent is
 //! 0700, the socket is 0600, and the peer uid is checked on every connection.
+//! Each uid's root is directly beneath `/tmp`: putting private uid roots
+//! beneath a common 0700 root let the first uid exclude every other user.
+//! The shared parent is never chmodded by an endpoint claim.
 //! 128 bits of digest is far past any collision concern for a directory name
 //! and is equally irreversible.
 //!
@@ -62,8 +65,8 @@ const SUN_PATH_CAPACITY: usize =
 /// Usable path bytes, reserving the terminating NUL.
 const MAX_SUN_PATH: usize = SUN_PATH_CAPACITY - 1;
 
-/// Override for the rendezvous base. Both the runtime and the client read it,
-/// so a caller that sets it must set it for both.
+/// Override for the shared parent of the per-uid rendezvous roots. Both the
+/// runtime and the client read it, so a caller must set it for both.
 const BASE_DIR_ENV: &str = "CARRICK_KERNEL_DEBUG_DIR";
 
 #[derive(Debug, thiserror::Error)]
@@ -94,7 +97,7 @@ pub struct DebugEndpoint {
 
 impl DebugEndpoint {
     /// Resolve the endpoint for an exact external run identity under the
-    /// ambient `$TMPDIR`.
+    /// fixed rendezvous parent (or its explicit override).
     pub fn for_run_id(run_id: &str) -> Result<Self, EndpointError> {
         Self::in_base(base_directory(), run_id)
     }
@@ -109,7 +112,9 @@ impl DebugEndpoint {
             return Err(EndpointError::MissingRunId);
         }
         let token = run_token(run_id);
-        let directory = base.join(uid_component()).join(token);
+        let directory = base
+            .join(format!("carrick-kernel-{}", uid_component()))
+            .join(token);
         let socket = directory.join(SOCKET_NAME);
         // Fail here, by name, rather than letting `bind` return a bare
         // `EINVAL` that no operator can act on.
@@ -292,7 +297,7 @@ fn run_token(run_id: &str) -> String {
 fn base_directory() -> PathBuf {
     std::env::var_os(BASE_DIR_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/carrick-kernel"))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 fn uid_component() -> String {
@@ -305,13 +310,14 @@ fn create_private_dir(base: &Path, path: &Path) -> Result<(), EndpointError> {
     fs::create_dir_all(path)?;
     // Re-apply the mode: `create_dir_all` honours the umask, so a permissive
     // umask would otherwise leave an 0755 directory behind. Walk up only as
-    // far as the base — the base's own parents are not ours to tighten.
+    // far as the private uid root. The base is a shared parent (normally
+    // /tmp), and tightening it would exclude other users from their roots.
     let mut current = Some(path);
     while let Some(directory) = current {
-        fs::set_permissions(directory, fs::Permissions::from_mode(DIRECTORY_MODE))?;
         if directory == base {
             break;
         }
+        fs::set_permissions(directory, fs::Permissions::from_mode(DIRECTORY_MODE))?;
         current = directory.parent();
     }
     Ok(())
