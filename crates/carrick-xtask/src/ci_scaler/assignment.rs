@@ -100,34 +100,68 @@ pub(super) fn merge_records<R, K: Ord>(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssignmentControl {
+    #[cfg(test)]
+    NextPass,
+    Stop,
+}
+
 /// A separately scheduled rendezvous worker. Shutdown wakes its timer and
 /// joins it; no detached worker survives the controller's ledger lock.
 pub(super) struct AssignmentService {
-    stop: std::sync::mpsc::Sender<()>,
+    control: std::sync::mpsc::Sender<AssignmentControl>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl AssignmentService {
-    pub(super) fn start(mut pass: impl FnMut() + Send + 'static) -> Self {
-        let (stop, wake) = std::sync::mpsc::channel();
+    pub(super) fn start(pass: impl FnMut() + Send + 'static) -> Self {
+        Self::start_with_boundary(pass, |wake| {
+            match wake.recv_timeout(Duration::from_secs(1)) {
+                #[cfg(test)]
+                Ok(AssignmentControl::NextPass) => true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => true,
+                Ok(AssignmentControl::Stop)
+                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => false,
+            }
+        })
+    }
+
+    fn start_with_boundary(
+        mut pass: impl FnMut() + Send + 'static,
+        mut wait_boundary: impl FnMut(&std::sync::mpsc::Receiver<AssignmentControl>) -> bool
+        + Send
+        + 'static,
+    ) -> Self {
+        let (control, wake) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             loop {
                 pass();
-                if wake.recv_timeout(Duration::from_secs(1))
-                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                {
+                if !wait_boundary(&wake) {
                     break;
                 }
             }
         });
         Self {
-            stop,
+            control,
             thread: Some(thread),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_controlled(pass: impl FnMut() + Send + 'static) -> Self {
+        Self::start_with_boundary(pass, |wake| {
+            matches!(wake.recv(), Ok(AssignmentControl::NextPass))
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance_pass(&self) {
+        let _ = self.control.send(AssignmentControl::NextPass);
     }
 }
 impl Drop for AssignmentService {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.control.send(AssignmentControl::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -929,12 +963,15 @@ mod tests {
             let (first_pass, first_pass_complete) = std::sync::mpsc::channel();
             let requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let worker_requested = requested.clone();
+            let passes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let worker_passes = passes.clone();
             let mut first_pass = Some(first_pass);
             let mut served = false;
-            let service = AssignmentService::start(move || {
+            let service = AssignmentService::start_controlled(move || {
                 if served {
                     return;
                 }
+                worker_passes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let mut ledger = worker_publication.snapshot().unwrap();
                 ledger.publication = Some(worker_publication.clone());
                 let mut row = row.clone();
@@ -946,9 +983,11 @@ mod tests {
                         serve(&api, &mut guest, &mut ledger, &mut row, &worker_path).unwrap(),
                         Revetted::Idle
                     );
-                    if let Some(first_pass) = first_pass.take() {
-                        first_pass.send(()).unwrap();
-                    }
+                    first_pass
+                        .take()
+                        .expect("idle pass ran more than once before pass boundary")
+                        .send(())
+                        .unwrap();
                     return;
                 }
                 let outcome = serve(&api, &mut guest, &mut ledger, &mut row, &worker_path).unwrap();
@@ -961,14 +1000,16 @@ mod tests {
                 served = true;
             });
             first_pass_complete
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap();
+                .recv()
+                .expect("first assignment pass did not complete");
             // The hook asks only AFTER the controller's original assignment
             // pass, exactly when it has entered provision/backoff.
             requested.store(true, std::sync::atomic::Ordering::Release);
+            service.advance_pass();
             approval
-                .recv_timeout(Duration::from_secs(2))
+                .recv()
                 .unwrap_or_else(|_| panic!("assignment stalled during {blocked_phase}"));
+            assert_eq!(passes.load(std::sync::atomic::Ordering::Acquire), 2);
             // A lifecycle write made from the pre-approval snapshot must not
             // erase the durable assignment; a worker write cannot roll back
             // a lifecycle transition either.

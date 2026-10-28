@@ -888,6 +888,63 @@ impl Drop for CancellationSignals {
 mod serial_host {
     use super::*;
 
+    #[derive(Default)]
+    struct MissingChildrenReader {
+        reads: usize,
+    }
+
+    impl MissingChildrenReader {
+        fn read(&mut self) -> io::Result<String> {
+            self.reads += 1;
+            assert!(
+                self.reads <= 2,
+                "reap_descendants_with retried missing children file {} times",
+                self.reads
+            );
+            Err(io::Error::from_raw_os_error(libc::ENOENT))
+        }
+    }
+
+    #[test]
+    fn missing_children_reader_rejects_third_attempt() {
+        let mut reader = MissingChildrenReader::default();
+        assert_eq!(
+            reader.read().unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            reader.read().unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(reader.reads, 2);
+        let third = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = reader.read();
+        }));
+        assert!(
+            third.is_err(),
+            "third missing-children read must fail closed"
+        );
+    }
+
+    fn wait_pidfd_ready(fd: libc::c_int) {
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let ready = unsafe { libc::poll(&mut poll, 1, -1) };
+            if ready == 1 {
+                assert_ne!(poll.revents & libc::POLLIN, 0);
+                return;
+            }
+            assert!(
+                ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted,
+                "unexpected pidfd poll result: {ready}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "isolated subreaper fixture invoked by missing-children regression"]
     fn missing_children_cleanup_fixture() {
@@ -898,20 +955,18 @@ mod serial_host {
         let mut child = Command::new("/bin/true").spawn().unwrap();
         let pid = child.id() as libc::pid_t;
         let exit = ExitEvents::pidfd(pid).unwrap();
-        let mut poll = libc::pollfd {
-            fd: exit.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
         // Exit readiness preserves the zombie for waitpid(-1) to reap.
-        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        wait_pidfd_ready(exit.as_raw_fd());
         let mut cleanup = super::Cleanup::new().unwrap();
+        let mut reader = MissingChildrenReader::default();
         super::complete_cleanup("missing children", || {
-            super::reap_descendants_with(&mut cleanup, || {
-                Err(io::Error::from_raw_os_error(libc::ENOENT))
-            })
+            super::reap_descendants_with(&mut cleanup, || reader.read())
         })
         .unwrap();
+        assert_eq!(
+            reader.reads, 2,
+            "missing-children cleanup must observe exact two-pass reader bound"
+        );
         assert_eq!(
             unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
             -1
@@ -941,18 +996,7 @@ mod serial_host {
             .spawn()
             .unwrap();
         writeln!(fixture.stdin.take().unwrap(), "{}", lock.path().display()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let status = loop {
-            if let Some(status) = fixture.try_wait().unwrap() {
-                break status;
-            }
-            if std::time::Instant::now() >= deadline {
-                fixture.kill().unwrap();
-                fixture.wait().unwrap();
-                panic!("missing children file wedged cleanup before lease release");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
+        let status = fixture.wait().unwrap();
         assert!(status.success(), "missing children cleanup failed");
         assert!(
             HostLease::try_exclusive(lock.path()).unwrap().is_some(),
