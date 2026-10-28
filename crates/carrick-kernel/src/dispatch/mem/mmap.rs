@@ -4299,10 +4299,13 @@ impl<'a> MemView<'a> {
                 let Some(bytes) = snapshot.get(source_offset..source_end) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
-                if cx.memory.write_bytes(addr, bytes).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                return Ok(crate::dispatch::FsView::copyout_bytes(
+                    cx.kernel,
+                    &mut *cx.memory,
+                    addr,
+                    bytes,
+                    DispatchOutcome::Returned { value: 0 },
+                ));
             }
             // Linux rejects remap_file_pages for addresses that are not in a
             // MAP_SHARED mapping; carrick does not emulate nonlinear remapping, so

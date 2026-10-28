@@ -819,6 +819,45 @@ impl<'a> FsView<'a> {
         self.cross.range_touches_secretmem(start, len)
     }
 
+    pub(super) fn copyout_bytes<M: CurrentMmMemory>(
+        context: &crate::kernel::KernelContext,
+        memory: &mut M,
+        address: u64,
+        bytes: &[u8],
+        success: DispatchOutcome,
+    ) -> DispatchOutcome {
+        use super::copyout::{COPYOUT_MAX_BYTES, UserSlot, prepare};
+        if bytes.is_empty() {
+            return match prepare(context, memory, [Some(UserSlot::new(address, 0))]) {
+                Ok(out) => match out.commit([&[]]) {
+                    Ok(()) => success,
+                    Err(fault) => fault.outcome(),
+                },
+                Err(refusal) => refusal.into_outcome(),
+            };
+        }
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let chunk_len = (bytes.len() - offset).min(COPYOUT_MAX_BYTES);
+            let Some(chunk_addr) = address.checked_add(offset as u64) else {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            };
+            let out = match prepare(
+                context,
+                memory,
+                [Some(UserSlot::new(chunk_addr, chunk_len))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return refusal.into_outcome(),
+            };
+            if let Err(fault) = out.commit([&bytes[offset..offset + chunk_len]]) {
+                return fault.outcome();
+            }
+            offset += chunk_len;
+        }
+        success
+    }
+
     pub fn read_signalfd<M: CurrentMmMemory>(
         &self,
         context: &crate::kernel::KernelContext,
@@ -832,15 +871,41 @@ impl<'a> FsView<'a> {
         if length < SIGINFO_LEN {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
-        let max = length / SIGINFO_LEN;
-        let out = self.cross.take_signalfd_bytes(context, tid, mask, max);
-        if out.is_empty() {
+        let authority = super::signal::signal_authority_for(context, tid);
+        if authority
+            .thread_pending()
+            .union(authority.task_pending())
+            .intersect(mask)
+            .is_empty()
+        {
             return DispatchOutcome::errno(LINUX_EAGAIN);
         }
-        if memory.write_bytes(address, &out).is_err() {
+        let max = (length / SIGINFO_LEN).min(64);
+        let output = match super::copyout::prepare(
+            context,
+            memory,
+            [Some(super::copyout::UserSlot::new(
+                address,
+                max * SIGINFO_LEN,
+            ))],
+        ) {
+            Ok(output) => output,
+            Err(refusal) => return refusal.into_outcome(),
+        };
+        let take_max = output.secured_capacity(0) / SIGINFO_LEN;
+        if take_max == 0 {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
-        DispatchOutcome::returned_len_or_errno(out.len())
+        let out = self.cross.take_signalfd_bytes(context, tid, mask, take_max);
+        if out.is_empty() {
+            let _ = output.cancel_retaining();
+            return DispatchOutcome::errno(LINUX_EAGAIN);
+        }
+        let written = out.len();
+        match output.commit([&out]) {
+            Ok(()) => DispatchOutcome::returned_len_or_errno(written),
+            Err(fault) => fault.outcome(),
+        }
     }
 
     pub(super) fn perf_event_state(&self, fd: i32) -> Option<Arc<super::perf::PerfEventState>> {
@@ -859,7 +924,13 @@ impl<'a> FsView<'a> {
             .cross
             .perf_event_ioctl_out(cx.reporter, fd, state, request, arg)
         {
-            Ok(Some(bytes)) => write_packed(&mut *cx.memory, arg, &bytes),
+            Ok(Some(bytes)) => Self::copyout_bytes(
+                cx.kernel,
+                &mut *cx.memory,
+                arg,
+                &bytes,
+                DispatchOutcome::Returned { value: 0 },
+            ),
             Ok(None) => DispatchOutcome::Returned { value: 0 },
             Err(errno) => DispatchOutcome::errno(errno),
         }
@@ -874,11 +945,23 @@ impl<'a> FsView<'a> {
     ) -> DispatchOutcome {
         match self.cross.perf_event_read_bytes(state, length) {
             Ok(bytes) => {
-                if memory.write_bytes(address, &bytes).is_err() {
-                    DispatchOutcome::errno(LINUX_EFAULT)
-                } else {
-                    DispatchOutcome::returned_len_or_errno(bytes.len())
-                }
+                let context = self.capture_one_task_context().or_else(|_| {
+                    let binding = self.kernel_binding.read();
+                    binding
+                        .capture_threads()?
+                        .pop()
+                        .ok_or(crate::kernel::KernelError::UnknownTask(binding.task_id()))
+                });
+                let Ok(context) = context else {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
+                };
+                Self::copyout_bytes(
+                    &context,
+                    memory,
+                    address,
+                    &bytes,
+                    DispatchOutcome::returned_len_or_errno(bytes.len()),
+                )
             }
             Err(errno) => DispatchOutcome::errno(errno),
         }
@@ -2446,8 +2529,13 @@ impl<'a> FsView<'a> {
             // nr_recently_evicted (5 × u64). Only nr_cache is non-zero.
             let mut cs = [0u8; 40];
             cs[0..8].copy_from_slice(&nr_cache.to_le_bytes());
-            memory.write_bytes(cstat.0, &cs)?;
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(Self::copyout_bytes(
+                cx.kernel,
+                memory,
+                cstat.0,
+                &cs,
+                DispatchOutcome::Returned { value: 0 },
+            ))
         }
 
         fn fdatasync(this, cx, fd: Fd) {

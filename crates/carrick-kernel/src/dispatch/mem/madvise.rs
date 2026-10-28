@@ -635,8 +635,13 @@ impl<'a> MemView<'a> {
             else {
                 return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
             };
-            memory.write_bytes(vec.0, &bytes)?;
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(crate::dispatch::FsView::copyout_bytes(
+                cx.kernel,
+                memory,
+                vec.0,
+                &bytes,
+                DispatchOutcome::Returned { value: 0 },
+            ))
         }
 
         mm_mutation fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
