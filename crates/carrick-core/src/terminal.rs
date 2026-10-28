@@ -17,6 +17,28 @@ use crate::lifecycle::{
     Lifecycle, MemberControl, MemberExitKind, MembershipFloor, NonfinalExitMembership,
 };
 
+/// Native exception service cancellation owns its retained checkpoint. The
+/// host terminal batch must not turn that checkpoint into a host resume.
+/// Authenticate the member and record incarnation before issuing the verdict.
+pub fn native_exception_retains_terminal_wake<C: carrick_core_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    record: carrick_sched_core::RecordRef,
+    member: &dyn MemberControl,
+    task: EntryTaskKey,
+    generation: EntryThreadGeneration,
+) -> bool {
+    use carrick_sched_core::object_wait::{OwnerEntry, ResumeDisposition};
+    let Some(rec) = zone.live(record) else {
+        return false;
+    };
+    let identity = rec.identity();
+    let owned = member.exit_custody().native_signal_owner()
+        && identity.tid == task.raw()
+        && identity.serial == generation.raw()
+        && rec.resume_disposition() == ResumeDisposition::OwnerContinuation(OwnerEntry::Exception);
+    owned && zone.live(record).is_some()
+}
+
 pub struct PoolMemberObservation<'a> {
     pub entry: EntryRef,
     /// The control slot retained by this member, even if its shared pool
