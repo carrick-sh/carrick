@@ -682,7 +682,7 @@ pub(crate) fn claim_group_stop(threads: &[crate::kernel::ThreadKey]) {
 /// (`Some(true)`: queued, on a vCPU, or claimed by the host to run) or parked
 /// there (`Some(false)`); `None` if the record is gone.
 pub fn record_runs(record: RecordRef) -> Option<bool> {
-    let rec = zone_tables()?.live(record)?;
+    let rec = zone().or_else(zone_tables)?.live(record)?;
     match rec.claim() {
         carrick_el1_abi::Claim::Parked { .. } | carrick_el1_abi::Claim::Transferring { .. } => {
             Some(false)
