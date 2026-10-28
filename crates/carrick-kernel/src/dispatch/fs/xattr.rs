@@ -148,11 +148,21 @@ impl<'a> FsView<'a> {
         size: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         // getxattr(path/fd, name, value, size)
+        let buf_addr = value_ptr.0;
+        let size = size as usize;
+        if size > 0
+            && let Some(outcome) = Self::resume_copyout_bytes(
+                context,
+                memory,
+                super::SuspendedCopyoutKind::GetXattr { size },
+                buf_addr,
+            )
+        {
+            return Ok(outcome);
+        }
         let follow = target.follow();
         let resolved = self.xattr_target_path(memory, target)?;
         let name = read_guest_c_string(memory, name_ptr.0)?;
-        let buf_addr = value_ptr.0;
-        let size = size as usize;
         let value = self.fs.rootfs_vfs.get_xattr(&resolved, &name, follow)?;
         // size == 0 is the "tell me how big" probe: return the length without
         // copying anything.
@@ -162,9 +172,10 @@ impl<'a> FsView<'a> {
         if value.len() > size {
             return Ok(DispatchOutcome::errno(LINUX_ERANGE));
         }
-        Ok(Self::copyout_bytes(
+        Ok(Self::copyout_bytes_with_kind(
             context,
             memory,
+            super::SuspendedCopyoutKind::GetXattr { size },
             buf_addr,
             &value,
             DispatchOutcome::returned_len_or_errno(value.len()),
@@ -180,10 +191,20 @@ impl<'a> FsView<'a> {
         size: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         // listxattr(path/fd, list, size)
-        let follow = target.follow();
-        let resolved = self.xattr_target_path(memory, target)?;
         let buf_addr = list_ptr.0;
         let size = size as usize;
+        if size > 0
+            && let Some(outcome) = Self::resume_copyout_bytes(
+                context,
+                memory,
+                super::SuspendedCopyoutKind::ListXattr { size },
+                buf_addr,
+            )
+        {
+            return Ok(outcome);
+        }
+        let follow = target.follow();
+        let resolved = self.xattr_target_path(memory, target)?;
         let names = self.fs.rootfs_vfs.list_xattr(&resolved, follow)?;
         // Assemble the NUL-separated, NUL-terminated name list Linux returns.
         let mut list = Vec::new();
@@ -197,9 +218,10 @@ impl<'a> FsView<'a> {
         if list.len() > size {
             return Ok(DispatchOutcome::errno(LINUX_ERANGE));
         }
-        Ok(Self::copyout_bytes(
+        Ok(Self::copyout_bytes_with_kind(
             context,
             memory,
+            super::SuspendedCopyoutKind::ListXattr { size },
             buf_addr,
             &list,
             DispatchOutcome::returned_len_or_errno(list.len()),

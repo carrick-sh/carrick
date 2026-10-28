@@ -15030,3 +15030,396 @@ fn fcntl_getlk_and_getown_ex_wait_for_owner_refused_copyout_without_mutating_loc
     );
     assert_eq!(memory.read_bytes(OUT_ADDR, 8).unwrap(), [0u8; 8]);
 }
+
+#[test]
+fn xattr_partial_copyout_resumes_after_owner_wait_when_output_overlaps_name_or_fd_is_replaced() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use carrick_abi::syscall::nr;
+    use carrick_guest_mem::{
+        CurrentMmMemory, GuestMemory, GuestWriteRange, MemoryError, MemoryPrepareError,
+        PreparedGuestWrite, UserMemoryVenue,
+    };
+    struct NthPrepareRefusingMemory {
+        inner: OwnerRefusingMemory,
+        refuse_on_prepare: Option<usize>,
+    }
+
+    impl NthPrepareRefusingMemory {
+        fn new(base: u64, len: usize, fill: u8) -> Self {
+            Self {
+                inner: OwnerRefusingMemory::new(base, len, fill),
+                refuse_on_prepare: None,
+            }
+        }
+
+        fn refuse_prepare_at(&mut self, call_index: usize) {
+            self.refuse_on_prepare = Some(call_index);
+        }
+
+        fn seed(&mut self, address: u64, bytes: &[u8]) {
+            self.inner.seed(address, bytes);
+        }
+    }
+
+    impl GuestMemory for NthPrepareRefusingMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            if self.refuse_on_prepare == Some(self.inner.prepares) {
+                self.refuse_on_prepare = None;
+                let _ = self.inner.refuse_next();
+            }
+            self.inner.prepare_write(ranges)
+        }
+
+        fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+            self.inner.guest_range_is_writable(address, length)
+        }
+
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.inner.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.inner.write_bytes_raw(address, bytes)
+        }
+    }
+
+    impl CurrentMmMemory for NthPrepareRefusingMemory {}
+
+    use carrick_vfs::fs_backend::{
+        BackendError, FsBackend, HostFdOpen, MemoryBackend, OverlayEntry, OverlayEntryKind,
+        OverlayRenameOutcome,
+    };
+    use carrick_vfs::rootfs::{RootFsEntryKind, RootFsMetadata};
+
+    #[derive(Default)]
+    struct XattrTestBackend {
+        inner: MemoryBackend,
+        xattrs: parking_lot::Mutex<std::collections::BTreeMap<(String, String), Vec<u8>>>,
+    }
+
+    impl FsBackend for XattrTestBackend {
+        fn lookup(&self, path: &str) -> Option<OverlayEntry> {
+            self.inner.lookup(path)
+        }
+        fn lookup_kind(&self, path: &str) -> Option<OverlayEntryKind> {
+            self.inner.lookup_kind(path)
+        }
+        fn metadata(&self, path: &str) -> Option<RootFsMetadata> {
+            self.inner.metadata(path)
+        }
+        fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+            self.inner.file_contents(path)
+        }
+        fn make_dir(&self, path: &str) -> Result<(), BackendError> {
+            self.inner.make_dir(path)
+        }
+        fn create_file(&self, path: &str) -> Result<(), BackendError> {
+            self.inner.create_file(path)
+        }
+        fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
+            self.inner.set_file_contents(path, contents)
+        }
+        fn remove_entry(&self, path: &str) -> bool {
+            self.inner.remove_entry(path)
+        }
+        fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
+            self.inner.mark_deleted(path)
+        }
+        fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind, Option<u64>)> {
+            self.inner.child_names(dir)
+        }
+        fn deleted_child_names(&self, dir: &str) -> Vec<String> {
+            self.inner.deleted_child_names(dir)
+        }
+        fn rename_overlay_entry(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> Result<OverlayRenameOutcome, BackendError> {
+            self.inner.rename_overlay_entry(from, to)
+        }
+        fn open_raw_fd(
+            &self,
+            path: &str,
+            write: bool,
+            create: bool,
+            trunc: bool,
+        ) -> HostFdOpen<i32> {
+            self.inner.open_raw_fd(path, write, create, trunc)
+        }
+        fn set_xattr(
+            &self,
+            path: &str,
+            name: &str,
+            value: &[u8],
+            _flags: i32,
+            _follow: bool,
+        ) -> Result<(), crate::linux_abi::LinuxErrno> {
+            self.xattrs
+                .lock()
+                .insert((path.to_owned(), name.to_owned()), value.to_vec());
+            Ok(())
+        }
+        fn get_xattr(
+            &self,
+            path: &str,
+            name: &str,
+            _follow: bool,
+        ) -> Result<Vec<u8>, crate::linux_abi::LinuxErrno> {
+            self.xattrs
+                .lock()
+                .get(&(path.to_owned(), name.to_owned()))
+                .cloned()
+                .ok_or(carrick_abi::LINUX_ENODATA)
+        }
+    }
+
+    const BASE: u64 = 0x4000_0000;
+    const FILL: u8 = 0xa5;
+    const PATH_A: u64 = BASE + 0x20;
+    const PATH_B: u64 = BASE + 0x40;
+    const NAME: u64 = BASE + 0x80;
+    const VAL_IN: u64 = BASE + 0x100;
+    const OUT_BUF: u64 = BASE + 0x2000;
+
+    let backend = XattrTestBackend::default();
+    backend.set_file_contents("/file_a", b"a".to_vec()).unwrap();
+    backend.set_file_contents("/file_b", b"b".to_vec()).unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let mut memory = NthPrepareRefusingMemory::new(BASE, 0x8000, FILL);
+
+    let big_a: Vec<u8> = (0..5000).map(|i| b'A' + (i % 26) as u8).collect();
+    let big_b: Vec<u8> = (0..5000).map(|i| b'a' + (i % 26) as u8).collect();
+    memory.seed(PATH_A, b"/file_a\0");
+    memory.seed(PATH_B, b"/file_b\0");
+    memory.seed(NAME, b"user.big\0");
+    memory.seed(VAL_IN, &big_a);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::SETXATTR.raw(),
+                    SyscallArgs::from([PATH_A, NAME, VAL_IN, 5000, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    memory.seed(VAL_IN, &big_b);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::SETXATTR.raw(),
+                    SyscallArgs::from([PATH_B, NAME, VAL_IN, 5000, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+
+    // 1. Overlapping output/input-name case: place the input name inside the
+    // first 4096 bytes of OUT_BUF, refuse the 2nd chunk prepare (at offset 4096),
+    // and verify redispatch finishes and returns 5000 instead of ENAMETOOLONG (36).
+    let overlap_name = OUT_BUF + 16;
+    memory.seed(OUT_BUF, &[FILL; 5000]);
+    memory.seed(overlap_name, b"user.big\0");
+    let second_prepare = memory.inner.prepares + 1;
+    memory.refuse_prepare_at(second_prepare);
+    let first = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                nr::GETXATTR.raw(),
+                SyscallArgs::from([PATH_A, overlap_name, OUT_BUF, 5000, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(
+        matches!(first, DispatchOutcome::OwnerMemoryWait { .. }),
+        "expected OwnerMemoryWait on second chunk prepare, got {first:?}",
+    );
+    let resumed = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                nr::GETXATTR.raw(),
+                SyscallArgs::from([PATH_A, overlap_name, OUT_BUF, 5000, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(resumed, DispatchOutcome::Returned { value: 5000 });
+    assert_eq!(memory.read_bytes(OUT_BUF, 5000).unwrap(), big_a);
+
+    // 2. Replacing the fd during suspension must not change which file is read:
+    // open file_a on fd_a and file_b on fd_b, start fgetxattr(fd_a, ..., 5000),
+    // refuse the 2nd chunk prepare after 4096 bytes from file_a are written,
+    // dup3(fd_b, fd_a, 0) during the suspension, and verify redispatch completes
+    // with file_a's 5000 bytes.
+    let DispatchOutcome::Returned { value: fd_a } = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                nr::OPENAT.raw(),
+                SyscallArgs::from([LINUX_AT_FDCWD, PATH_A, LINUX_O_RDONLY, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    else {
+        panic!("expected file_a openat to succeed");
+    };
+    let DispatchOutcome::Returned { value: fd_b } = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                nr::OPENAT.raw(),
+                SyscallArgs::from([LINUX_AT_FDCWD, PATH_B, LINUX_O_RDONLY, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    else {
+        panic!("expected file_b openat to succeed");
+    };
+
+    memory.seed(OUT_BUF, &[FILL; 5000]);
+    let second_prepare = memory.inner.prepares + 1;
+    memory.refuse_prepare_at(second_prepare);
+    let first_fd = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                nr::FGETXATTR.raw(),
+                SyscallArgs::from([fd_a as u64, NAME, OUT_BUF, 5000, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(
+        matches!(first_fd, DispatchOutcome::OwnerMemoryWait { .. }),
+        "expected OwnerMemoryWait on fgetxattr second chunk prepare, got {first_fd:?}",
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::DUP3.raw(),
+                    SyscallArgs::from([fd_b as u64, fd_a as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd_a },
+    );
+    let resumed_fd = dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                nr::FGETXATTR.raw(),
+                SyscallArgs::from([fd_a as u64, NAME, OUT_BUF, 5000, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(resumed_fd, DispatchOutcome::Returned { value: 5000 });
+    assert_eq!(memory.read_bytes(OUT_BUF, 5000).unwrap(), big_a);
+}
+
+#[test]
+fn signalfd_read_bounds_permit_secures_available_records_and_consumes_on_genuine_fault() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+
+    const BASE: u64 = 0x4000_0000;
+    const FILL: u8 = 0xa5;
+    const OUT: u64 = BASE + 0x100;
+
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let tid = crate::thread::ThreadId::from_wire_key(context.thread().key().tid.raw() as i32);
+    let mask = carrick_abi::SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGUSR1);
+    let mut memory = OwnerRefusingMemory::new(BASE, 0x4000, FILL);
+
+    // Defect 2: one pending signal with an 8192-byte buffer must return 128
+    // without exceeding the 4096-byte single-permit limit.
+    dispatcher.mark_process_signal_pending(&context, crate::linux_abi::LINUX_SIGUSR1);
+    assert_eq!(
+        dispatcher
+            .fs_view()
+            .read_signalfd(&context, &mut memory, OUT, 8192, mask, tid),
+        DispatchOutcome::Returned { value: 128 },
+    );
+    let signo = u32::from_le_bytes(memory.read_bytes(OUT, 4).unwrap().try_into().unwrap());
+    assert_eq!(signo, crate::linux_abi::LINUX_SIGUSR1 as u32);
+
+    // Defect 4: one pending signal with count 256 where only the first 128 bytes
+    // are writable must return 128 instead of EFAULT.
+    memory.protect_readonly(OUT + 128, 128);
+    dispatcher.mark_process_signal_pending(&context, crate::linux_abi::LINUX_SIGUSR1);
+    assert_eq!(
+        dispatcher
+            .fs_view()
+            .read_signalfd(&context, &mut memory, OUT, 256, mask, tid),
+        DispatchOutcome::Returned { value: 128 },
+    );
+
+    // Defect 5: a transient owner refusal preserves the pending signal, whereas
+    // a genuine fault (writing to read-only or unmapped memory) consumes the
+    // faulting signal so the next nonblocking read returns EAGAIN (11).
+    dispatcher.mark_process_signal_pending(&context, crate::linux_abi::LINUX_SIGUSR1);
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .fs_view()
+            .read_signalfd(&context, &mut memory, OUT + 128, 128, mask, tid),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert!(
+        context
+            .shared()
+            .pending_signals()
+            .present()
+            .contains(crate::linux_abi::LINUX_SIGUSR1),
+        "transient owner refusal must preserve the pending signal",
+    );
+    assert_eq!(
+        dispatcher
+            .fs_view()
+            .read_signalfd(&context, &mut memory, OUT + 128, 128, mask, tid),
+        DispatchOutcome::errno(LINUX_EFAULT),
+    );
+    assert_eq!(
+        dispatcher
+            .fs_view()
+            .read_signalfd(&context, &mut memory, OUT, 128, mask, tid),
+        DispatchOutcome::errno(LINUX_EAGAIN),
+        "genuine fault on signalfd read must consume the faulting signal",
+    );
+}

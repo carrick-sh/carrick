@@ -248,6 +248,28 @@ pub(in crate::dispatch) fn carrier_buffer_is_not_owner_memory() -> super::Dispat
     super::DispatchError::MemoryPreparation("a carrier record buffer is never owner memory".into())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SuspendedCopyoutKind {
+    Bytes,
+    GetXattr { size: usize },
+    ListXattr { size: usize },
+}
+
+struct SuspendedCopyout {
+    thread: std::sync::Weak<crate::kernel::Thread>,
+    kind: SuspendedCopyoutKind,
+    address: u64,
+    bytes: Vec<u8>,
+    offset: usize,
+    success: DispatchOutcome,
+}
+
+fn suspended_copyouts() -> &'static parking_lot::Mutex<Vec<SuspendedCopyout>> {
+    static SUSPENDED: std::sync::OnceLock<parking_lot::Mutex<Vec<SuspendedCopyout>>> =
+        std::sync::OnceLock::new();
+    SUSPENDED.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
 mod access;
 mod attr;
 mod close_dup;
@@ -819,11 +841,75 @@ impl<'a> FsView<'a> {
         self.cross.range_touches_secretmem(start, len)
     }
 
+    pub(super) fn resume_copyout_bytes<M: CurrentMmMemory>(
+        context: &crate::kernel::KernelContext,
+        memory: &mut M,
+        kind: SuspendedCopyoutKind,
+        address: u64,
+    ) -> Option<DispatchOutcome> {
+        let current_thread = Arc::downgrade(context.thread());
+        let resumed = {
+            let mut table = suspended_copyouts().lock();
+            table.retain(|entry| entry.thread.strong_count() > 0);
+            let pos = table
+                .iter()
+                .position(|entry| entry.thread.ptr_eq(&current_thread))?;
+            let entry = table.swap_remove(pos);
+            if entry.kind == kind && entry.address == address {
+                Some(entry)
+            } else {
+                None
+            }
+        }?;
+        Some(Self::copyout_bytes_from_offset(
+            context,
+            memory,
+            kind,
+            address,
+            &resumed.bytes,
+            resumed.offset,
+            resumed.success,
+        ))
+    }
+
     pub(super) fn copyout_bytes<M: CurrentMmMemory>(
         context: &crate::kernel::KernelContext,
         memory: &mut M,
         address: u64,
         bytes: &[u8],
+        success: DispatchOutcome,
+    ) -> DispatchOutcome {
+        Self::copyout_bytes_with_kind(
+            context,
+            memory,
+            SuspendedCopyoutKind::Bytes,
+            address,
+            bytes,
+            success,
+        )
+    }
+
+    pub(super) fn copyout_bytes_with_kind<M: CurrentMmMemory>(
+        context: &crate::kernel::KernelContext,
+        memory: &mut M,
+        kind: SuspendedCopyoutKind,
+        address: u64,
+        bytes: &[u8],
+        success: DispatchOutcome,
+    ) -> DispatchOutcome {
+        if let Some(outcome) = Self::resume_copyout_bytes(context, memory, kind, address) {
+            return outcome;
+        }
+        Self::copyout_bytes_from_offset(context, memory, kind, address, bytes, 0, success)
+    }
+
+    fn copyout_bytes_from_offset<M: CurrentMmMemory>(
+        context: &crate::kernel::KernelContext,
+        memory: &mut M,
+        kind: SuspendedCopyoutKind,
+        address: u64,
+        bytes: &[u8],
+        mut offset: usize,
         success: DispatchOutcome,
     ) -> DispatchOutcome {
         use super::copyout::{COPYOUT_MAX_BYTES, UserSlot, prepare};
@@ -836,7 +922,6 @@ impl<'a> FsView<'a> {
                 Err(refusal) => refusal.into_outcome(),
             };
         }
-        let mut offset = 0usize;
         while offset < bytes.len() {
             let chunk_len = (bytes.len() - offset).min(COPYOUT_MAX_BYTES);
             let Some(chunk_addr) = address.checked_add(offset as u64) else {
@@ -848,7 +933,24 @@ impl<'a> FsView<'a> {
                 [Some(UserSlot::new(chunk_addr, chunk_len))],
             ) {
                 Ok(out) => out,
-                Err(refusal) => return refusal.into_outcome(),
+                Err(refusal) => {
+                    if offset > 0 || !matches!(kind, SuspendedCopyoutKind::Bytes) {
+                        let current_thread = Arc::downgrade(context.thread());
+                        let mut table = suspended_copyouts().lock();
+                        table.retain(|entry| {
+                            entry.thread.strong_count() > 0 && !entry.thread.ptr_eq(&current_thread)
+                        });
+                        table.push(SuspendedCopyout {
+                            thread: current_thread,
+                            kind,
+                            address,
+                            bytes: bytes.to_vec(),
+                            offset,
+                            success,
+                        });
+                    }
+                    return refusal.into_outcome();
+                }
             };
             if let Err(fault) = out.commit([&bytes[offset..offset + chunk_len]]) {
                 return fault.outcome();
@@ -871,40 +973,62 @@ impl<'a> FsView<'a> {
         if length < SIGINFO_LEN {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
-        let authority = super::signal::signal_authority_for(context, tid);
-        if authority
-            .thread_pending()
-            .union(authority.task_pending())
-            .intersect(mask)
-            .is_empty()
-        {
-            return DispatchOutcome::errno(LINUX_EAGAIN);
+        let max_records = length / SIGINFO_LEN;
+        let mut total_written = 0usize;
+        for _ in 0..max_records {
+            let authority = super::signal::signal_authority_for(context, tid);
+            if authority
+                .thread_pending()
+                .union(authority.task_pending())
+                .intersect(mask)
+                .is_empty()
+            {
+                break;
+            }
+            let Some(rec_addr) = address.checked_add(total_written as u64) else {
+                let _ = self.cross.take_signalfd_bytes(context, tid, mask, 1);
+                return if total_written > 0 {
+                    DispatchOutcome::returned_len_or_errno(total_written)
+                } else {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                };
+            };
+            let output = match super::copyout::prepare(
+                context,
+                memory,
+                [Some(super::copyout::UserSlot::new(rec_addr, SIGINFO_LEN))],
+            ) {
+                Ok(output) => output,
+                Err(refusal) => {
+                    return if total_written > 0 {
+                        DispatchOutcome::returned_len_or_errno(total_written)
+                    } else {
+                        refusal.into_outcome()
+                    };
+                }
+            };
+            let out = self.cross.take_signalfd_bytes(context, tid, mask, 1);
+            if out.is_empty() {
+                let _ = output.cancel_retaining();
+                break;
+            }
+            match output.commit([&out]) {
+                Ok(()) => {
+                    total_written += out.len();
+                }
+                Err(fault) => {
+                    return if total_written > 0 {
+                        DispatchOutcome::returned_len_or_errno(total_written)
+                    } else {
+                        fault.outcome()
+                    };
+                }
+            }
         }
-        let max = (length / SIGINFO_LEN).min(64);
-        let output = match super::copyout::prepare(
-            context,
-            memory,
-            [Some(super::copyout::UserSlot::new(
-                address,
-                max * SIGINFO_LEN,
-            ))],
-        ) {
-            Ok(output) => output,
-            Err(refusal) => return refusal.into_outcome(),
-        };
-        let take_max = output.secured_capacity(0) / SIGINFO_LEN;
-        if take_max == 0 {
-            return DispatchOutcome::errno(LINUX_EFAULT);
-        }
-        let out = self.cross.take_signalfd_bytes(context, tid, mask, take_max);
-        if out.is_empty() {
-            let _ = output.cancel_retaining();
-            return DispatchOutcome::errno(LINUX_EAGAIN);
-        }
-        let written = out.len();
-        match output.commit([&out]) {
-            Ok(()) => DispatchOutcome::returned_len_or_errno(written),
-            Err(fault) => fault.outcome(),
+        if total_written == 0 {
+            DispatchOutcome::errno(LINUX_EAGAIN)
+        } else {
+            DispatchOutcome::returned_len_or_errno(total_written)
         }
     }
 
