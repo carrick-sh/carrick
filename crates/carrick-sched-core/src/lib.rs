@@ -1751,6 +1751,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
                     cancelled: true,
                     ..
                 } if seq == self.seq => {
+                    rec.retire_cancelled_metadata_operation();
                     if rec.has_object_operation() {
                         // Cancellation must reach the adapter while its exact
                         // endpoint token is still retained by this incarnation.
@@ -2581,6 +2582,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// party that allocated it and never published a park).
     pub fn free_record(&self, id: RecordId) {
         let record = self.record(id);
+        record.retire_cancelled_metadata_operation();
         // A pending operation owns an external endpoint pin. Keep this
         // record reachable until its adapter consumes/cancels that token;
         // recycling it would lose the only completion authority.

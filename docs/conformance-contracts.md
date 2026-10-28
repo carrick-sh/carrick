@@ -2255,3 +2255,29 @@ but keeps the execution gate closed. The host admission adapter calls the same
 `Reservations::import_image` operation; its node-exhaustion witness verifies
 rollback returns nodes rather than confusing allocator high-water with live use.
 This still does not prove installed physical backing or exec commit.
+
+### Abandoned metadata waits during sibling exit (#978)
+
+`kernel.el1.deferred-handback-identity` also covers metadata wait receipts
+abandoned before resume. Their token owns no external endpoint pin, so the
+exclusive cancellation owner retires the receipt before recycling its record.
+A producer still transferring the record retains custody until its existing
+completion boundary; cancellation never frees underneath that producer.
+The VM-free witnesses require one incarnation advance and zero orphan ready
+publications, including a deferred completion and stale cancellation after reuse.
+These are constant-work retirement assertions, not timing measurements.
+
+The scheduler binding admits two live threads, parks one on the metadata
+object queue, publishes the leader's task-exit intent, then uses the real
+control wake and executor exit settlement without resuming the operation.
+A second schedule publishes an object completion before the control wake:
+the transfer already retains the request and delivers exactly one runnable
+sibling on the unmodified implementation. It does not reproduce a lost control
+wake or prove the idle-vCPU doorbell/kick route. No wake protocol is changed.
+
+IPC operation tokens still retain their external descriptor pins for their
+existing adapter. Calling `ipc::finish` from `ZoneWait::drop` would introduce
+peer-wake callbacks under `Thread.execution` and
+`Scheduler.generation_transition`; that lock-order gap is outside this
+metadata-only repair. Signed `el1_files_exit_group_stress`, idle-vCPU behavior,
+IPC abandonment and release runtime/oracle acceptance remain director-owned.
