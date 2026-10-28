@@ -1110,24 +1110,59 @@ pub(crate) fn prepare_value_result<'m, M: CurrentMmMemory>(
     addresses: ValueResultAddresses,
     value_len: usize,
 ) -> Result<Result<PreparedValueResult<'m, M>, ValueResultFault>, CopyoutRefusal> {
-    let capacity = match read_u32_before_effects(memory, addresses.length.raw())? {
-        Ok(capacity) if (capacity as i32) < 0 => return Ok(Err(ValueResultFault::NegativeLength)),
-        Ok(capacity) => (capacity as usize).min(value_len),
-        Err(fault) => return Ok(Err(ValueResultFault::Memory(fault))),
+    let capacity = match ValueResultCapacity::capture(memory, addresses.length)? {
+        Ok(capacity) => capacity,
+        Err(fault) => return Ok(Err(fault)),
     };
-    Ok(Ok(PreparedValueResult {
-        inner: prepare(
-            context,
-            memory,
-            [
-                Some(UserSlot::new(addresses.value.raw(), capacity)),
-                Some(UserSlot::new(
-                    addresses.length.raw(),
-                    std::mem::size_of::<u32>(),
-                )),
-            ],
-        )?,
-    }))
+    capacity
+        .prepare(context, memory, addresses, value_len)
+        .map(Ok)
+}
+
+/// A validated input snapshot shared by a query and its output admission.
+/// Preparing from it never consults the caller's mutable length word again.
+pub(crate) struct ValueResultCapacity(usize);
+
+impl ValueResultCapacity {
+    pub(crate) fn capture<M: CurrentMmMemory>(
+        memory: &M,
+        length: GuestVa,
+    ) -> Result<Result<Self, ValueResultFault>, CopyoutRefusal> {
+        Ok(match read_u32_before_effects(memory, length.raw())? {
+            Ok(capacity) if (capacity as i32) < 0 => Err(ValueResultFault::NegativeLength),
+            Ok(capacity) => Ok(Self(capacity as usize)),
+            Err(fault) => Err(ValueResultFault::Memory(fault)),
+        })
+    }
+
+    pub(crate) fn bounded_len(&self, value_len: usize) -> usize {
+        self.0.min(value_len)
+    }
+
+    pub(crate) fn prepare<'m, M: CurrentMmMemory>(
+        self,
+        context: &KernelContext,
+        memory: &'m mut M,
+        addresses: ValueResultAddresses,
+        value_len: usize,
+    ) -> Result<PreparedValueResult<'m, M>, CopyoutRefusal> {
+        Ok(PreparedValueResult {
+            inner: prepare(
+                context,
+                memory,
+                [
+                    Some(UserSlot::new(
+                        addresses.value.raw(),
+                        self.bounded_len(value_len),
+                    )),
+                    Some(UserSlot::new(
+                        addresses.length.raw(),
+                        std::mem::size_of::<u32>(),
+                    )),
+                ],
+            )?,
+        })
+    }
 }
 
 impl<M: CurrentMmMemory> PreparedValueResult<'_, M> {

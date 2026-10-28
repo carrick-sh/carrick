@@ -5,7 +5,7 @@
 //! tracking, SO_DOMAIN, SO_PROTOCOL, SO_PEERCRED, IPV6_ADDRFORM) and
 //! AF_NETLINK socket option handling.
 
-use crate::dispatch::copyout::{ValueResultAddresses, prepare_value_result};
+use crate::dispatch::copyout::{ValueResultAddresses, ValueResultCapacity, prepare_value_result};
 use carrick_abi::{LINUX_AF_PACKET, LINUX_SOL_PACKET};
 use carrick_guest_mem::GuestVa;
 use carrick_vfs::errno::HostSyscallResult as _;
@@ -1267,20 +1267,16 @@ impl<'a> NetView<'a> {
                     return Ok(DispatchOutcome::errno(errno));
                 }
             };
-            // Read the guest's reported optlen so we don't overflow.
-            let mut optlen = match crate::dispatch::copyout::read_u32_before_effects(memory, optlen_addr) {
-                Ok(Ok(length)) => length,
+            // Snapshot the capacity once for both the host query and output
+            // admission. A sibling may change the guest word during the query.
+            let capacity = match ValueResultCapacity::capture(memory, GuestVa::new(optlen_addr)) {
+                Ok(Ok(capacity)) => capacity,
                 Ok(Err(fault)) => return Ok(fault.outcome()),
                 Err(refusal) => return Ok(refusal.into_outcome()),
             };
-            // A negative optlen (as a signed int) is EINVAL on Linux. (getsockopt01
-            // "invalid optlen") macOS would clamp the u32 and read successfully.
-            if (optlen as i32) < 0 {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let cap = optlen.min(256) as usize;
+            let cap = capacity.bounded_len(256);
             let mut buf = vec![0u8; cap];
-            optlen = cap as u32;
+            let mut optlen = cap as u32;
             let rc = unsafe {
                 libc::getsockopt(
                     host_fd.get(),
@@ -1315,10 +1311,9 @@ impl<'a> NetView<'a> {
             if used > 0 && optval_addr == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
-            let out = match prepare_value_result(context, memory,
+            let out = match capacity.prepare(context, memory,
                 ValueResultAddresses::new(GuestVa::new(optval_addr), GuestVa::new(optlen_addr)), used) {
-                Ok(Ok(out)) => out,
-                Ok(Err(fault)) => return Ok(fault.outcome()),
+                Ok(out) => out,
                 Err(refusal) => return Ok(refusal.into_outcome()),
             };
             out.commit(&buf[..used], optlen)?;
@@ -1757,6 +1752,117 @@ mod s2_tests {
                 other => panic!("socket: {other:?}"),
             }
         }
+    }
+
+    // Snapshot the first length read, then model a sibling changing the
+    // backing word before the host query and destination preparation finish.
+    struct ChangingCapacityMemory {
+        inner: std::cell::RefCell<crate::dispatch::LinearMemory>,
+        replacement: std::cell::Cell<Option<u32>>,
+        length_reads: std::cell::Cell<usize>,
+    }
+
+    impl GuestMemory for ChangingCapacityMemory {
+        fn read_bytes_raw(
+            &self,
+            address: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            let bytes = self.inner.borrow().read_bytes_raw(address, length)?;
+            if address == 0x5010 && length == 4 {
+                self.length_reads.set(self.length_reads.get() + 1);
+                if let Some(replacement) = self.replacement.take() {
+                    self.inner
+                        .borrow_mut()
+                        .write_bytes_raw(address, &replacement.to_ne_bytes())?;
+                }
+            }
+            Ok(bytes)
+        }
+
+        fn write_bytes_raw(
+            &mut self,
+            address: u64,
+            bytes: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            self.inner.get_mut().write_bytes_raw(address, bytes)
+        }
+    }
+
+    impl CurrentMmMemory for ChangingCapacityMemory {}
+
+    fn check_host_option_capacity_snapshot(replacement: u32) {
+        let mut guest = QueryGuest::new();
+        let fd = guest.socket(crate::linux_abi::LINUX_AF_INET, LINUX_SOCK_DGRAM);
+        guest.memory.seed(0x5020, &37i32.to_ne_bytes());
+        assert_eq!(
+            guest.call(
+                208,
+                [
+                    fd,
+                    crate::linux_abi::LINUX_SOL_IP as u64,
+                    crate::linux_abi::LINUX_IP_TTL as u64,
+                    0x5020,
+                    4,
+                    0
+                ]
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let mut memory = ChangingCapacityMemory {
+            inner: std::cell::RefCell::new(crate::dispatch::LinearMemory::new(
+                0x5000,
+                vec![0xa5; 0x1000],
+            )),
+            replacement: std::cell::Cell::new(Some(replacement)),
+            length_reads: std::cell::Cell::new(0),
+        };
+        memory.write_bytes_raw(0x5010, &4u32.to_ne_bytes()).unwrap();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(701));
+        let futex = crate::thread::FutexTable::new();
+        let outcome = guest
+            .dispatcher
+            .dispatch_threaded(
+                &guest.context,
+                SyscallRequest::new(
+                    209,
+                    SyscallArgs::from([
+                        fd,
+                        crate::linux_abi::LINUX_SOL_IP as u64,
+                        crate::linux_abi::LINUX_IP_TTL as u64,
+                        0x5000,
+                        0x5010,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+                ThreadCtx::new(registry.main_tid(), &registry, &futex),
+            )
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(
+            memory.inner.borrow().read_bytes(0x5000, 4).unwrap(),
+            37i32.to_ne_bytes(),
+            "the full value must use the original capacity"
+        );
+        assert_eq!(
+            memory.inner.borrow().read_bytes(0x5010, 4).unwrap(),
+            4u32.to_ne_bytes()
+        );
+        assert_eq!(memory.length_reads.get(), 1, "capture optlen once");
+        assert_eq!(memory.replacement.get(), None, "sibling mutation occurred");
+    }
+
+    #[test]
+    fn s2_host_option_keeps_capacity_when_length_shrinks() {
+        check_host_option_capacity_snapshot(1);
+    }
+
+    #[test]
+    fn s2_host_option_keeps_capacity_when_length_turns_negative() {
+        check_host_option_capacity_snapshot(u32::MAX);
     }
 
     #[test]
