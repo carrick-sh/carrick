@@ -398,6 +398,72 @@ fn restore_requeues_and_rearms_an_undelivered_harvest() {
 }
 
 #[test]
+fn ready_count_requires_shared_zone_only_proof() {
+    let r = region();
+    let ep = r.create_epoll(&Spin).unwrap();
+    let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
+    add(r, ep, efd, EpollMember::EventFd, 4, IN | ONESHOT);
+    eventfd_write(r, efd, 1);
+    assert_eq!(
+        r.epoll_zone_only_ready_count(ep, 4, &Spin)
+            .unwrap()
+            .unwrap()
+            .records(),
+        1
+    );
+    r.epoll_set_host_items(ep, 1, &Spin).unwrap();
+    assert!(
+        r.epoll_zone_only_ready_count(ep, 4, &Spin)
+            .unwrap()
+            .is_none()
+    );
+    assert!(r.epoll_ready_probe(ep, &Spin).unwrap());
+    r.epoll_set_host_items(ep, 0, &Spin).unwrap();
+    assert_eq!(
+        r.epoll_zone_only_ready_count(ep, 4, &Spin)
+            .unwrap()
+            .unwrap()
+            .records(),
+        1
+    );
+    assert_eq!(harvest(r, ep, 4).len(), 1);
+}
+
+#[test]
+fn bounded_ready_count_preserves_edges_and_oneshots() {
+    for mode in [ET, ONESHOT] {
+        let r = region();
+        let ep = r.create_epoll(&Spin).unwrap();
+        assert_eq!(r.epoll_ready_count(ep, 32, &Spin).unwrap(), 0);
+        for fd in 4..39 {
+            let efd = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
+            add(r, ep, efd, EpollMember::EventFd, fd, IN | mode);
+            eventfd_write(r, efd, 1);
+        }
+        // A stale level stays queued until harvest, but is not reportable.
+        let stale = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
+        add(r, ep, stale, EpollMember::EventFd, 40, IN | mode);
+        eventfd_write(r, stale, 1);
+        eventfd_read(r, stale);
+        assert_eq!(r.epoll_ready_count(ep, 0, &Spin).unwrap(), 0);
+        assert_eq!(r.epoll_ready_count(ep, 1, &Spin).unwrap(), 1);
+        assert_eq!(r.epoll_ready_count(ep, 33, &Spin).unwrap(), 33);
+        assert_eq!(r.epoll_ready_count(ep, usize::MAX, &Spin).unwrap(), 35);
+        assert_eq!(r.epoll_ready_count(ep, usize::MAX, &Spin).unwrap(), 35);
+        let delivered = harvest(r, ep, 40);
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|report| report.data)
+                .collect::<Vec<_>>(),
+            (4..39).collect::<Vec<_>>()
+        );
+        assert_eq!(r.epoll_ready_count(ep, 40, &Spin).unwrap(), 0);
+        assert!(!r.epoll_ready_probe(ep, &Spin).unwrap());
+    }
+}
+
+#[test]
 fn ready_probe_does_not_consume() {
     let r = region();
     let ep = r.create_epoll(&Spin).unwrap();
