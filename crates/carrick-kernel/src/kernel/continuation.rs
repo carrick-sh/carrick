@@ -2902,7 +2902,7 @@ impl CompletionCopyout {
     ) -> DispatchOutcome {
         use crate::dispatch::copyout::{UserSlot, prepare};
         use carrick_guest_mem::MemoryReadWait;
-        static ZEROES: [u8; 4096] = [0; 4096];
+        const ZEROES: &[u8; 4096] = &[0; 4096];
         if let Some(cancelled) = owner_wait_cancellation(context) {
             return DispatchOutcome::OwnerCancelled(cancelled);
         }
