@@ -20,7 +20,7 @@ use crate::linux_abi::LinuxErrno;
 #[cfg(any(test, feature = "test-support"))]
 use super::fd_table::{OpenDescription, OpenDescriptionBase, kernel_file_description};
 use super::fd_table::{TimerFdInner, TimerFdState};
-use super::{DispatchOutcome, GuestPtr, read_kernel_struct, time};
+use super::{DispatchOutcome, GuestPtr, read_kernel_struct, time, write_kernel_struct};
 
 fn copyout_format_time_record<T: carrick_abi::KernelAbi>(
     context: &crate::kernel::KernelContext,
@@ -858,7 +858,7 @@ pub fn complete_interrupted_sleep(
         // redispatch the original sleep. Keep this single legacy debt site
         // until completion routing can retain that result across suspension.
         if !matches!(
-            super::write_kernel_struct(memory, address.0, &rem),
+            write_kernel_struct(memory, address.0, &rem),
             DispatchOutcome::Returned { value: 0 }
         ) {
             return DispatchOutcome::errno(LINUX_EFAULT);
