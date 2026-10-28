@@ -985,7 +985,9 @@ mod tests {
                     );
                     first_pass
                         .take()
-                        .expect("idle pass ran more than once before pass boundary")
+                        .unwrap_or_else(|| {
+                            panic!("idle pass ran more than once before pass boundary")
+                        })
                         .send(())
                         .unwrap();
                     return;
@@ -999,16 +1001,25 @@ mod tests {
                 approved.send(()).unwrap();
                 served = true;
             });
+            const TEST_HANG_GUARD: Duration = Duration::from_secs(60);
             first_pass_complete
-                .recv()
-                .expect("first assignment pass did not complete");
+                .recv_timeout(TEST_HANG_GUARD)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "60s hang guard expired waiting for first assignment pass (not a verdict deadline): {err}"
+                    )
+                });
             // The hook asks only AFTER the controller's original assignment
             // pass, exactly when it has entered provision/backoff.
             requested.store(true, std::sync::atomic::Ordering::Release);
             service.advance_pass();
             approval
-                .recv()
-                .unwrap_or_else(|_| panic!("assignment stalled during {blocked_phase}"));
+                .recv_timeout(TEST_HANG_GUARD)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "60s hang guard expired waiting for assignment approval during {blocked_phase} (not a verdict deadline): {err}"
+                    )
+                });
             assert_eq!(passes.load(std::sync::atomic::Ordering::Acquire), 2);
             // A lifecycle write made from the pre-approval snapshot must not
             // erase the durable assignment; a worker write cannot roll back

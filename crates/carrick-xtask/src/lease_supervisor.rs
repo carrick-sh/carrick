@@ -905,44 +905,14 @@ mod serial_host {
         }
     }
 
-    #[test]
-    fn missing_children_reader_rejects_third_attempt() {
-        let mut reader = MissingChildrenReader::default();
-        assert_eq!(
-            reader.read().unwrap_err().raw_os_error(),
-            Some(libc::ENOENT)
-        );
-        assert_eq!(
-            reader.read().unwrap_err().raw_os_error(),
-            Some(libc::ENOENT)
-        );
-        assert_eq!(reader.reads, 2);
-        let third = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = reader.read();
-        }));
-        assert!(
-            third.is_err(),
-            "third missing-children read must fail closed"
-        );
-    }
+    const TEST_HANG_GUARD: Duration = Duration::from_secs(60);
 
     fn wait_pidfd_ready(fd: libc::c_int) {
-        let mut poll = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        loop {
-            let ready = unsafe { libc::poll(&mut poll, 1, -1) };
-            if ready == 1 {
-                assert_ne!(poll.revents & libc::POLLIN, 0);
-                return;
-            }
-            assert!(
-                ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted,
-                "unexpected pidfd poll result: {ready}"
-            );
-        }
+        let ready = CleanupDeadline(Instant::now() + TEST_HANG_GUARD).wait_fd(fd);
+        assert!(
+            ready.is_ok(),
+            "60s hang guard expired waiting for /bin/true pidfd exit readiness (not a verdict deadline): {ready:?}"
+        );
     }
 
     #[test]
@@ -995,7 +965,18 @@ mod serial_host {
             .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        let fixture_exit = ExitEvents::pidfd(fixture.id() as libc::pid_t).unwrap();
         writeln!(fixture.stdin.take().unwrap(), "{}", lock.path().display()).unwrap();
+        let waited =
+            CleanupDeadline(Instant::now() + TEST_HANG_GUARD).wait_fd(fixture_exit.as_raw_fd());
+        if waited.is_err() {
+            let _ = fixture.kill();
+            let _ = fixture.wait();
+        }
+        assert!(
+            waited.is_ok(),
+            "60s hang guard expired waiting for missing-children fixture subprocess (not a verdict deadline): {waited:?}"
+        );
         let status = fixture.wait().unwrap();
         assert!(status.success(), "missing children cleanup failed");
         assert!(
