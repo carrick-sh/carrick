@@ -463,6 +463,87 @@ fn bounded_ready_count_preserves_edges_and_oneshots() {
     }
 }
 
+/// A scan releases the epoll lock between batches. Reusing its last item
+/// must not replace the cursor's link with the new registration's empty link.
+#[test]
+fn ready_count_survives_cursor_replacement_between_batches() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct PausedScan {
+        entered: mpsc::SyncSender<()>,
+        resume: mpsc::Receiver<()>,
+        paused: AtomicU32,
+    }
+    impl LockWait for PausedScan {
+        fn wait(&self, _attempt: u32) -> bool {
+            if self.paused.swap(1, Ordering::Relaxed) == 0 {
+                self.entered.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            core::hint::spin_loop();
+            true
+        }
+    }
+
+    // Exercise the bounded count and the old boolean probe through the same
+    // shared scan. Neither may consume the continuously ready tail edge.
+    for probe in [false, true] {
+        let r = region();
+        let ep = r.create_epoll(&Spin).unwrap();
+        let mut stale = Vec::new();
+        for fd in 1..=32 {
+            let member = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
+            add(r, ep, member, EpollMember::EventFd, fd, IN | ET);
+            eventfd_write(r, member, 1);
+            eventfd_read(r, member);
+            stale.push(member);
+        }
+        let tail = r.create_eventfd(0, EventMode::Counter, &Spin).unwrap();
+        add(r, ep, tail, EpollMember::EventFd, 33, IN | ET);
+        eventfd_write(r, tail, 1);
+        let cursor = {
+            let mut guard = r.lock_epoll(ep, &Spin).unwrap();
+            r.item_ref(guard.find_item(32, 0x1020).unwrap()).unwrap()
+        };
+        let held = r.lock(stale[0], &Spin).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+        let scan = std::thread::spawn(move || {
+            let wait = PausedScan {
+                entered: entered_tx,
+                resume: resume_rx,
+                paused: AtomicU32::new(0),
+            };
+            if probe {
+                usize::from(r.epoll_ready_probe(ep, &wait).unwrap())
+            } else {
+                r.epoll_ready_count(ep, 33, &wait).unwrap()
+            }
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        r.epoll_delete(ep, 32, 0x1020, &Spin).unwrap();
+        add(r, ep, stale[31], EpollMember::EventFd, 32, IN | ET);
+        let replacement = {
+            let mut guard = r.lock_epoll(ep, &Spin).unwrap();
+            r.item_ref(guard.find_item(32, 0x1020).unwrap()).unwrap()
+        };
+        assert_eq!(cursor.number, replacement.number, "fixture reuses storage");
+        assert_ne!(cursor.generation, replacement.generation);
+        drop(held);
+        resume_tx.send(()).unwrap();
+        let count = scan.join().unwrap();
+        let reports = harvest(r, ep, 33);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].data, 33);
+        assert_eq!(count, 1, "the continuously ready tail must be counted");
+        assert!(
+            harvest(r, ep, 33).is_empty(),
+            "the ET edge was delivered once"
+        );
+    }
+}
+
 #[test]
 fn ready_probe_does_not_consume() {
     let r = region();
