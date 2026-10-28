@@ -2391,6 +2391,7 @@ pub fn cross_root_exit<X: ForkStockCrossing>(
     crossing.cross_root_exit(&exit as *const _ as u64, u64::from(worker))
 }
 
+#[track_caller]
 fn fatal() -> ! {
     panic!("native aarch64 process service failure")
 }
