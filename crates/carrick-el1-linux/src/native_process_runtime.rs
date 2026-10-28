@@ -5172,6 +5172,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         match outcome {
             None => Ok(NativeResume::NoPending),
             Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),
+            Some(LifecycleOutcome::HostCustody) => {
+                // An adopted host member has no pool entry to retire in the
+                // ring. Its cancelled fault has completed, but its exact host
+                // terminal owner still owes Kernel thread retirement.
+                self.handoff = carrick_core::entry::yield_current_to_host(
+                    self.binding,
+                    self.source,
+                    self.record.id,
+                );
+                if self.take_handoff_receipt().is_none() {
+                    return Err(NativeProcessError::Quarantined.run_failure_reason());
+                }
+                self.current.linux.mark_pending_host_work();
+                Ok(NativeResume::Left(None))
+            }
             Some(LifecycleOutcome::Transferred {
                 progress: carrick_core::Served::Idle,
                 ..

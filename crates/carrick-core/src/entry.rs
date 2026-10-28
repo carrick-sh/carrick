@@ -266,6 +266,10 @@ pub fn prepare_handoff<C: EntryContext>(
     })
 }
 impl<C: EntryContext> HandoffStart<'_, C> {
+    fn published_yield(self, published: bool) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+        published.then(|| self.published())
+    }
+
     pub(crate) fn published(self) -> carrick_core_abi::EntryHandoffReceipt<C> {
         // SAFETY: callers invoke this only after their existing exact-record
         // publication succeeds, using the captured prepublication custody.
@@ -315,6 +319,39 @@ pub fn publish_handoff_yield<C: EntryContext>(
         return None;
     }
     Some(start.published())
+}
+
+/// Yield a consumed native continuation to its host execution owner. The
+/// selected record stays queued for host service, with the exact handoff
+/// receipt retained by the caller; it must not return to user execution.
+pub fn yield_current_to_host<C: EntryContext>(
+    binding: ExecutionBinding,
+    source: BornInZoneSource<'_, C>,
+    record: carrick_sched_core::RecordId,
+) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+    let start = prepare_handoff(binding, source, record)?;
+    let retained = source.zone.record(record);
+    if retained.has_object_operation()
+        || retained.resume_disposition()
+            != carrick_sched_core::object_wait::ResumeDisposition::UserReturn
+    {
+        return None;
+    }
+    if !matches!(
+        source.zone.claim_for_host(
+            source.zone.record_ref(record),
+            None,
+            carrick_sched_core::Handback::Control,
+            &carrick_sched_core::ShortLockSpin,
+        ),
+        carrick_sched_core::HostClaim::El1Held { slot } if slot == source.slot
+    ) {
+        return None;
+    }
+    // The successful transition proves publication even if the host claims
+    // the row immediately after the queue lock is released. Do not reread
+    // its now independently owned custody to decide whether we handed off.
+    start.published_yield(source.zone.unswitch(source.slot, record))
 }
 
 /// Authenticate and retire the current record through its existing owner.
@@ -389,6 +426,63 @@ const _: () = ();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_claim_after_yield_does_not_revoke_publication_receipt() {
+        use carrick_sched_core::{
+            Handback, HostClaim, ShortLockSpin, SlotId, ThreadIdentity, ZoneTables,
+        };
+        let layout = std::alloc::Layout::new::<ZoneTables>();
+        // SAFETY: zero is the valid initial zone state; the Box owns the allocation.
+        let zone = unsafe {
+            let pointer = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+            assert!(!pointer.is_null());
+            std::boxed::Box::from_raw(pointer)
+        };
+        let slot = SlotId::new(0);
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(7),
+            generation: SnapshotGeneration::from_raw(11),
+            mm: EntryMmKey::from_raw(13),
+            thread_generation: EntryThreadGeneration::from_raw(17),
+        };
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 0, Some(0), 0);
+        zone.enter_guest(slot);
+        let space = zone.spaces.publish_closed(13, 0x1000, 0x1000).unwrap();
+        zone.spaces.open(space);
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 7,
+                serial: 17,
+                mm: 13,
+                generation: 11,
+                file_table: 0,
+                affinity: 0,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        assert!(zone.mark_native_owned(record));
+        zone.requeue_preempted(slot, record);
+        assert_eq!(zone.switch_in(slot), Some(record));
+        assert!(zone.install_space(slot, 13).is_some());
+        let source = BornInZoneSource { zone: &zone, slot };
+        let start = prepare_handoff(binding, source, record).unwrap();
+        let reference = zone.record_ref(record);
+        assert!(matches!(
+            zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin),
+            HostClaim::El1Held { .. }
+        ));
+        let published = zone.unswitch(slot, record);
+        // Deterministically interleave the host claimant before receipt completion.
+        assert!(matches!(
+            zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin),
+            HostClaim::Claimed
+        ));
+        assert!(start.published_yield(published).is_some());
+    }
 
     #[test]
     fn wrong_generation_cannot_complete_admitted_entry() {

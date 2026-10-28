@@ -3429,8 +3429,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// space could not be installed): it goes back to the head of the run
     /// queue, still queued, for the slot's executor to take
     /// ([`Self::take_service_head`]).
-    pub fn unswitch(&self, slot: SlotId, record: RecordId) {
-        let _ = self.unswitch_with(slot, record, &SpinForever);
+    /// Returns whether this call published the queued record. A subsequent
+    /// claimant may already own it when the caller observes this result.
+    pub fn unswitch(&self, slot: SlotId, record: RecordId) -> bool {
+        self.unswitch_with(slot, record, &SpinForever)
     }
 
     /// [`Self::unswitch`], waiting for the slot lock as `wait` says. False:

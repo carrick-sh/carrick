@@ -350,3 +350,241 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
     );
     scheduler.close();
 }
+
+#[test]
+fn serial_host_adopted_fault_checkpoint_transfers_terminal_custody() {
+    use crate::native_process_runtime::NativeResume;
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_guest_arch::{Access, FaultInfo};
+    use carrick_sched_core::object_wait::{ObjectWaitKey, ResumeDisposition};
+
+    let (kernel, root) = bootstrap(41);
+    let root = Box::leak(Box::new(root));
+    root.thread().set_affinity(carrick_hal::CpuAffinity::all(2));
+    let page = Box::leak(Box::new(root.lifecycle_page()));
+    let page = &**page;
+    let fixture = Box::leak(Box::new(Fixture::with_identity(
+        0x10000,
+        asid(1),
+        page,
+        root.thread().control_slot(),
+        ThreadIdentity {
+            tid: root.thread().key().tid.raw() as u64,
+            serial: root.thread().key().serial.raw(),
+            mm: root.shared().mm().id().raw(),
+            file_table: root.resources().files().id().raw(),
+            generation: root.task().key().serial.raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 3,
+            lifecycle_page: page as *const _ as u64,
+            control_slot: root.thread().control_slot() as *const _ as u64,
+        },
+    )));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let mut root_service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut root_service,
+            |_| (),
+        )
+        .unwrap();
+    let sibling = clone_thread(root, 42);
+    let control = sibling.thread().control_slot();
+    assert!(control.publish_visible_tid(42));
+    assert!(
+        control.entry().is_none(),
+        "adopted host member, not a pool birth"
+    );
+    let scheduler = Arc::new(Scheduler::new(kernel.clone()));
+    let executor = scheduler
+        .register_executor(Arc::new(Kick::default()))
+        .unwrap();
+    publish(sibling, 0x700);
+    scheduler.make_runnable(sibling.thread().key()).unwrap();
+    let running = scheduler.try_take(&executor).unwrap().unwrap();
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 2);
+    fixture
+        .zone
+        .publish_slot(slot, fixture.leader.mm, Some(1), 3);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
+    run_as(
+        fixture,
+        42,
+        root.task().key().serial.raw(),
+        sibling.thread().key().serial.raw(),
+        control,
+    );
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let mut native = ThreadCtx::ZERO;
+    native.pc = 0x401234;
+    with_process_entry(
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot,
+        },
+        &fixture.task,
+        &native,
+        fixture_ttbr0(fixture),
+        page,
+        control,
+        &mut service,
+        |entry| {
+            assert!(matches!(
+                entry.begin_service(
+                    ServiceOperation::Fault(FaultInfo {
+                        address: UserVa::new(0x4000),
+                        access: Access::Read,
+                        present: false,
+                    }),
+                    None
+                ),
+                Ok(NativeResume::Left(None))
+            ));
+            assert!(entry.take_handoff_receipt().is_some());
+        },
+    )
+    .unwrap();
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let record = notice.record;
+    let key = ObjectWaitKey::native_service(record).unwrap();
+    // SAFETY: the fixture retains this control and exact record through ticket
+    // completion and the host retirement below.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(record.id).identity(),
+        )
+    }
+    .unwrap();
+    let owner = registry().for_record(fixture.zone, record).unwrap();
+    carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+        scheduler.settle_runnable(running).unwrap();
+        scheduler.wake_control(sibling.thread().key()).unwrap();
+    });
+    assert!(scheduler.try_take(&executor).unwrap().is_none());
+    assert_eq!(
+        fixture.zone.record(record.id).resume_disposition(),
+        ResumeDisposition::OwnerContinuation(
+            carrick_sched_core::object_wait::OwnerEntry::Exception
+        )
+    );
+    // The host executor's real park boundary releases home and MM custody.
+    fixture.zone.unhome(slot, record.id, 3);
+    let mut cpu = crate::sched::FakeCpu::default();
+    crate::dispatch::native_service_idle(fixture.zone, slot, &mut cpu);
+    run_as_leader(fixture);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut root_service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+        scheduler.wake_control(sibling.thread().key()).unwrap();
+    });
+    assert!(
+        scheduler.try_take(&executor).unwrap().is_none(),
+        "no exception-owner host load"
+    );
+    ticket
+        .complete(true)
+        .unwrap_or_else(|_| panic!("cancelled ticket ACK"));
+    fixture
+        .zone
+        .object_wait(key, &ShortLockSpin)
+        .unwrap()
+        .notify_object(slot, &mut Default::default())
+        .unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(slot)
+        .or_else(|| fixture.zone.steal(slot));
+    assert_eq!(
+        selected.map(|selected| selected.record),
+        Some(record.id),
+        "fault ACK must retain a native checkpoint: claim={:?} queues={:?}",
+        fixture.zone.record(record.id).claim(),
+        [
+            fixture.zone.slot(fixture.slot).queued(),
+            fixture.zone.slot(slot).queued()
+        ]
+    );
+    fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
+    run_as(
+        fixture,
+        42,
+        root.task().key().serial.raw(),
+        sibling.thread().key().serial.raw(),
+        control,
+    );
+    let resumed = resume_selected(
+        &owner,
+        registry(),
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot,
+        },
+        &fixture.task,
+        record.id,
+        &mut service,
+    );
+    assert_eq!(
+        map_resume(resumed, &mut service, &fixture.task, slot),
+        crate::sched::ResumeAction::Left,
+        "adopted fault terminal checkpoint must transfer host custody without EL0 return",
+    );
+    assert!(control.host_exit_requested());
+    assert_eq!(
+        fixture.zone.record(record.id).resume_disposition(),
+        ResumeDisposition::UserReturn
+    );
+    assert!(
+        fixture.zone.head_needs_host(slot),
+        "terminal host job must remain deliverable"
+    );
+    let ready = fixture
+        .zone
+        .take_service_head(slot)
+        .expect("exact terminal host handback");
+    assert_eq!(ready, record);
+    let terminal = carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+        scheduler.adopt_zone_handback(&executor, ready)
+    })
+    .unwrap()
+    .expect("terminal host row");
+    assert_eq!(terminal.thread().key(), sibling.thread().key());
+    kernel.exit_thread(sibling, None).unwrap();
+    let birth =
+        carrick_kernel::kernel::host_birth_identity(sibling.task().key(), sibling.thread().key())
+            .unwrap();
+    page.publish_exact_host_retirement(control, birth.retirement());
+    scheduler.settle_exited(terminal).unwrap();
+    fixture.zone.free_record(record.id);
+    fixture.zone.enter_guest(fixture.slot);
+    assert!(matches!(
+        resume_closing_root(fixture, &mut root_service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(
+        root_service
+            .crossing
+            .root_exit_status
+            .load(Ordering::Acquire),
+        7
+    );
+    scheduler.close();
+}
