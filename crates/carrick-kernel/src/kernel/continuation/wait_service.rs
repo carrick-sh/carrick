@@ -727,7 +727,7 @@ impl CarrierWaitServiceInner {
             // Freed: nothing holds the thread back any longer.
             return true;
         };
-        if matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. }) {
+        if rec.host_resume_ready() {
             return true;
         }
         let (seq, kind) = match event {

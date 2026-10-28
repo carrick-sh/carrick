@@ -868,9 +868,7 @@ impl ReadinessProbe {
                 record, deadline, ..
             } => {
                 if carrick_el1_abi::zone_tables().is_some_and(|zone| {
-                    zone.live(*record).is_none_or(|rec| {
-                        matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. })
-                    })
+                    zone.live(*record).is_none_or(|rec| rec.host_resume_ready())
                 }) {
                     return Some(ContinuationEvent::Ready);
                 }

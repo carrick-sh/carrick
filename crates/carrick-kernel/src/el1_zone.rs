@@ -309,12 +309,29 @@ pub fn kick_slot(slot: SlotId) {
 /// Claim `record` for `kind` (with `seq`, only that park). A thread EL1 holds
 /// has its slot kicked; the caller then waits for the handback.
 pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
-    let Some(zone) = zone_tables() else {
+    let Some(zone) = zone().or_else(zone_tables) else {
         return HostClaim::Stale;
     };
+    if zone
+        .live(record)
+        .is_some_and(|rec| rec.requires_native_entry())
+    {
+        // Only the fault service may complete/cancel its retained operation.
+        // A host readiness claim must not interrupt that service with a
+        // fabricated completion. Quiescence owners retain the core custody API.
+        route_native_exception_in_zone(zone, record);
+        return HostClaim::Deferred;
+    }
     let outcome = zone.claim_for_host(record, seq, kind, &HostLockWait);
     if let HostClaim::El1Held { slot } = outcome {
         kick_slot(slot);
+    }
+    if zone
+        .live(record)
+        .is_some_and(|rec| rec.requires_native_entry())
+    {
+        route_native_exception_in_zone(zone, record);
+        return HostClaim::Deferred;
     }
     outcome
 }
@@ -335,17 +352,12 @@ pub fn hand_back_foreign_timer(slot: SlotId) {
     }
 }
 
-/// Whether the host owns `record` (a wake, a signal, a timeout or a
-/// handback claimed it), so its thread may run.
-pub fn is_host_owned(record: RecordRef) -> bool {
-    zone_tables().is_some_and(|zone| {
-        zone.live(record).is_some_and(|rec| {
-            matches!(
-                rec.claim(),
-                carrick_el1_abi::Claim::Host { .. } | carrick_el1_abi::Claim::FirstEntryHost { .. }
-            )
-        })
-    })
+/// Whether host custody also licenses resuming this thread on the host.
+/// Native exception custody belongs to its fault-service checkpoint.
+pub fn host_resume_ready(record: RecordRef) -> bool {
+    zone()
+        .or_else(zone_tables)
+        .is_some_and(|zone| zone.live(record).is_some_and(|rec| rec.host_resume_ready()))
 }
 
 /// Retire a parked thread whose host continuation is gone: free a record
@@ -721,7 +733,7 @@ fn thread_record_runs_in(
 
 /// The kernel thread a record names.
 pub fn thread_key_of(record: RecordRef) -> Option<crate::kernel::ThreadKey> {
-    let zone = zone_tables()?;
+    let zone = zone().or_else(zone_tables)?;
     let rec = zone.live(record)?;
     let identity = rec.identity();
     let tid = i32::try_from(identity.tid).ok()?;
@@ -967,6 +979,9 @@ pub enum HandbackEvent<'a> {
     DeferredCaptured(&'a [RecordRef]),
     /// A host-owned record can be offered to its continuation.
     Ready(RecordRef),
+    /// A native queue retained work without a live driver. Wake execution
+    /// capacity through the scheduler control epoch, without a host task row.
+    NativeQueued,
 }
 
 pub type HandbackPublisher = Arc<dyn Fn(HandbackEvent<'_>) + Send + Sync>;
@@ -1022,10 +1037,48 @@ fn publish_handback_in_zone(
     zone.counters
         .host_handbacks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if route_native_exception_in_zone(zone, record) {
+        return;
+    }
     if route_first_entry_in_zone(zone, record) {
         return;
     }
     publish(record);
+}
+
+/// Route at readiness publication, before any scheduler row or reactor event
+/// can be produced. Host custody of a fault is not a host-resumable context.
+pub(crate) fn route_native_exception_handback(record: RecordRef) -> bool {
+    zone()
+        .or_else(zone_tables)
+        .is_some_and(|zone| route_native_exception_in_zone(zone, record))
+}
+
+fn route_native_exception_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
+    let Some(rec) = zone.live(record) else {
+        return false;
+    };
+    if !rec.requires_native_entry() {
+        return false;
+    }
+    if let Some(placement) = zone.place_native_exception(record) {
+        deliver_placement(Some(placement));
+        if !zone.slot(placement.slot).is_live() {
+            deliver_handback_event(HandbackEvent::NativeQueued);
+        }
+        // A queue retained on a stopped/away driver is also stealable. Wake
+        // live eligible drivers once; a later driver checks queues on entry.
+        if !zone.slot(placement.slot).is_live() && rec.home().is_none() {
+            for index in 0..carrick_sched_core::ZONE_SLOTS {
+                let slot = SlotId::new(index as u8);
+                if zone.slot(slot).is_live() && zone.record_allows_slot(record.id, slot) {
+                    zone.owe_resched(slot);
+                    resched_slot(slot);
+                }
+            }
+        }
+    }
+    true
 }
 
 /// An uninitialized Born thread has reserved activation capacity, but no
@@ -1882,6 +1935,7 @@ mod tests {
             deferred_completion_reaches_idle_boundary(
                 carrick_el1_abi::LinuxTaskState::mark_pending_host_work,
                 |_| {},
+                false,
             );
         }
 
@@ -1893,6 +1947,7 @@ mod tests {
             deferred_completion_reaches_idle_boundary(
                 carrick_el1_abi::LinuxTaskState::mark_pending_host_work,
                 bind_task,
+                false,
             );
         }
 
@@ -1904,6 +1959,53 @@ mod tests {
             deferred_completion_reaches_idle_boundary(
                 carrick_el1_abi::LinuxTaskState::record_completed_with_work,
                 bind_task,
+                false,
+            );
+        }
+
+        #[test]
+        fn deferred_exception_completion_never_publishes_host_readiness() {
+            deferred_completion_reaches_idle_boundary(
+                carrick_el1_abi::LinuxTaskState::mark_pending_host_work,
+                |_| {},
+                true,
+            );
+        }
+
+        #[test]
+        fn deferred_exception_completion_retains_an_away_drivers_queue() {
+            deferred_completion_reaches_idle_boundary(
+                carrick_el1_abi::LinuxTaskState::mark_pending_host_work,
+                |slot| {
+                    let zone = zone_tables().unwrap();
+                    assert!(zone.step_away(
+                        SlotId::new(slot as u8),
+                        11,
+                        &mut |_| panic!("completion is still transferring"),
+                        &mut |_| panic!("no queued record yet")
+                    ));
+                },
+                true,
+            );
+        }
+
+        #[test]
+        fn deferred_exception_completion_without_a_live_driver_is_stealable() {
+            deferred_completion_reaches_idle_boundary(
+                carrick_el1_abi::LinuxTaskState::mark_pending_host_work,
+                |slot| {
+                    let zone = zone_tables().unwrap();
+                    let slot = SlotId::new(slot as u8);
+                    let record = zone.slot(slot).host_record().unwrap();
+                    zone.unhome(slot, record, 0);
+                    assert!(zone.leave_slot(
+                        slot,
+                        11,
+                        &mut |_| panic!("completion is still transferring"),
+                        &mut |_| panic!("no queued record yet")
+                    ));
+                },
+                true,
             );
         }
 
@@ -1922,6 +2024,7 @@ mod tests {
         fn deferred_completion_reaches_idle_boundary(
             ring: fn(&carrick_el1_abi::LinuxTaskState),
             between: impl FnOnce(usize),
+            exception_owner: bool,
         ) {
             use carrick_sched_core::object_wait::{
                 ObjectWaitKey, OperationToken, OwnedObjectWakeEffects,
@@ -1951,10 +2054,14 @@ mod tests {
             let zone = zone_tables().unwrap();
             let ready = Arc::new(Mutex::new(Vec::new()));
             let seen = Arc::clone(&ready);
-            register_handback_publisher(Arc::new(move |event| {
-                if let HandbackEvent::Ready(record) = event {
-                    seen.lock().unwrap().push(record);
+            let capacity_wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen_capacity = Arc::clone(&capacity_wakes);
+            register_handback_publisher(Arc::new(move |event| match event {
+                HandbackEvent::Ready(record) => seen.lock().unwrap().push(record),
+                HandbackEvent::NativeQueued => {
+                    seen_capacity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                HandbackEvent::DeferredCaptured(_) => {}
             }));
             // The guest venue (`deliver_completion`): defer what could not be
             // placed, then ring the venue slot's pending-host-work doorbell.
@@ -1972,30 +2079,45 @@ mod tests {
                 .admit_object_notification(key, &HostLockWait, &completion)
                 .unwrap();
             let record = zone
-                .alloc_record(ThreadIdentity {
-                    tid: 2,
-                    serial: 43,
-                    mm: 2,
-                    file_table: 1,
-                    generation: 267,
-                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
-                    affinity: 0,
-                    lifecycle_page: 0,
-                    control_slot: 0,
-                })
+                .current_or_new(
+                    SlotId::new(SLOT as u8),
+                    ThreadIdentity {
+                        tid: 2,
+                        serial: 43,
+                        mm: 2,
+                        file_table: 1,
+                        generation: 267,
+                        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                        affinity: 0,
+                        lifecycle_page: 0,
+                        control_slot: 0,
+                    },
+                )
                 .unwrap();
             let reference = zone.record_ref(record);
             {
                 let guard = zone
                     .object_wait_with_completion(key, &HostLockWait, &completion)
                     .unwrap();
-                guard
-                    .park(
-                        guard.snapshot(),
-                        record,
-                        OperationToken::new(403, 11).unwrap(),
-                    )
-                    .unwrap();
+                if exception_owner {
+                    guard
+                        .park_owner_until(
+                            guard.snapshot(),
+                            record,
+                            OperationToken::new(403, 11).unwrap(),
+                            0,
+                            carrick_sched_core::object_wait::OwnerEntry::Exception,
+                        )
+                        .unwrap();
+                } else {
+                    guard
+                        .park(
+                            guard.snapshot(),
+                            record,
+                            OperationToken::new(403, 11).unwrap(),
+                        )
+                        .unwrap();
+                }
             }
             ticket.publish(Waker::Host, &completion);
             // The captured #641 state: deferred, unplaced, doorbell rung.
@@ -2005,12 +2127,50 @@ mod tests {
             ));
             assert_eq!(zone.record(record).handback(), Some(Handback::Resumed));
             assert!(task.linux.has_pending_host_work() || task.linux.served_boundary_pending());
+            if exception_owner {
+                // No vCPU was in the guest when the fault completion fired.
+                // Its returning driver is stopped at this idle boundary.
+                zone.drive(SlotId::new(SLOT as u8), 11);
+                zone.publish_slot(SlotId::new(SLOT as u8), 2, Some(0), 0);
+                let space = zone.spaces.publish_closed(2, 0x1000, 0).unwrap();
+                zone.spaces.open(space);
+            }
             between(SLOT);
             // The idle executor's boundary consumes the doorbell.
             let (kernel, _context) = crate::kernel::continuation::test_support::bootstrap(164_100);
             let _ = crate::el1_delegation::settle_el1_boundary(SLOT, &kernel);
             assert!(!task.linux.has_pending_host_work());
             assert!(!task.linux.served_boundary_pending());
+            if exception_owner {
+                assert!(
+                    ready.lock().unwrap().is_empty(),
+                    "exception completion offered a host-ready continuation"
+                );
+                assert!(
+                    matches!(zone.record(record).claim(), Claim::Queued { .. }),
+                    "exception owner lost native queue custody"
+                );
+                let Claim::Queued { slot: owner, .. } = zone.record(record).claim() else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    capacity_wakes.load(std::sync::atomic::Ordering::Relaxed),
+                    usize::from(!zone.slot(owner).is_live()),
+                    "unplaced native work owes one execution-capacity notification"
+                );
+                let slot = SlotId::new(SLOT as u8);
+                zone.step_back(slot, 11);
+                zone.drive(slot, 11);
+                // A returning idle driver has no host task to install the MM.
+                zone.publish_slot(slot, 0, Some(0), 0);
+                assert!(!zone.head_needs_host(owner));
+                let selected = zone
+                    .switch_in_full(slot)
+                    .or_else(|| zone.steal(slot))
+                    .unwrap();
+                assert_eq!(selected.record, record);
+                return;
+            }
             assert!(
                 matches!(zone.record(record).claim(), Claim::Host { .. }),
                 "consumed doorbell left the deferred handback stranded: {:?}",

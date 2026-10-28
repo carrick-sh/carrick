@@ -794,6 +794,9 @@ impl HvpatchRuntimeDirectory {
                     carrick_kernel::el1_zone::HandbackEvent::Ready(record) => {
                         scheduler.publish_zone_handback(record);
                     }
+                    carrick_kernel::el1_zone::HandbackEvent::NativeQueued => {
+                        scheduler.poke_executor_control();
+                    }
                 }
             }
         }));
