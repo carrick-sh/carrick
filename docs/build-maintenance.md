@@ -35,6 +35,15 @@ job-level env on the GitHub-hosted jobs that compile; jobs that never compile
 and jobs on the self-hosted Mac do not receive them. GitHub-hosted jobs
 without the R2 secrets (fork and Dependabot pull requests) fall back to the
 bounded GitHub Actions cache (#858).
+When it selects R2, each job's "Start compiler cache" step
+(`scripts/ci/compiler-cache-start.sh`) starts the server once sccache is
+installed, before any compile. A missing binary fails the job. Refused
+credentials (`AccessDenied`, `InvalidAccessKeyId`, `SignatureDoesNotMatch`,
+`NoSuchBucket`) fail the job at once. Any other startup failure, such as an
+R2 5xx or a startup timeout, is retried once; after that, reading jobs
+compile uncached (`CARRICK_SCCACHE=0`) with a "Compiler cache unavailable"
+warning instead of failing with no verdict on the code, while `cache-warm`
+still fails (#961).
 Self-hosted runners (the `carrick-macos-ci` PR runners) keep a persistent
 15G cache per runner in `~/.cache/carrick-sccache/<runner name>`, outside the
 job workspace (#938). Each runner builds in one fixed checkout path, so its own
