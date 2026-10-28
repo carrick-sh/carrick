@@ -7940,8 +7940,28 @@ fn completion_owner_wait_during_group_exit_is_not_a_configuration_failure() {
 #[test]
 fn completion_owner_wait_retains_output_progress_and_original_result() {
     use carrick_guest_mem::{GuestMemory, MemoryError, MemoryPrepareError, UserMemoryVenue};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Debug)]
+    struct Dependency(Arc<AtomicBool>);
+    impl Drop for Dependency {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    impl carrick_guest_mem::PhysicalMemoryWait for Dependency {
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn enroll(
+            &self,
+            _: Arc<dyn Fn() + Send + Sync>,
+        ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+            (Box::new(()), true)
+        }
+    }
     struct Memory {
-        wait: carrick_el1_abi::PortalOwnerWait,
+        wait: Option<carrick_guest_mem::MemoryReadWait>,
+        released: Option<Arc<AtomicBool>>,
         attempts: usize,
         commits: Vec<(u64, usize)>,
     }
@@ -7970,7 +7990,25 @@ fn completion_owner_wait_retains_output_progress_and_original_result() {
             self.attempts += 1;
             assert_eq!(ranges.len(), 1);
             if self.attempts == 2 {
-                return Err(MemoryPrepareError::OwnerWait(self.wait));
+                return Err(match self.wait.take().unwrap() {
+                    carrick_guest_mem::MemoryReadWait::Owner(wait) => {
+                        MemoryPrepareError::OwnerWait(wait)
+                    }
+                    carrick_guest_mem::MemoryReadWait::Physical(wait) => {
+                        MemoryPrepareError::Physical(wait)
+                    }
+                    carrick_guest_mem::MemoryReadWait::Supply(request) => {
+                        MemoryPrepareError::Supply(request)
+                    }
+                });
+            }
+            if self.attempts > 2
+                && let Some(released) = &self.released
+            {
+                assert!(
+                    released.load(Ordering::Acquire),
+                    "retained physical writer still held during re-preparation"
+                );
             }
             let (address, len) = (ranges[0].address().raw(), ranges[0].len());
             assert!(len <= 4096);
@@ -7991,9 +8029,17 @@ fn completion_owner_wait_retains_output_progress_and_original_result() {
             7,
         )
     };
-    for cancel in [false, true] {
+    for (cancel, physical) in [(false, false), (false, true), (true, false)] {
+        let released = physical.then(|| Arc::new(AtomicBool::new(false)));
+        let dependency = match &released {
+            Some(released) => carrick_guest_mem::MemoryReadWait::Physical(
+                carrick_guest_mem::OwnedMemoryWait(Arc::new(Dependency(Arc::clone(released)))),
+            ),
+            None => carrick_guest_mem::MemoryReadWait::Owner(wait),
+        };
         let mut memory = Memory {
-            wait,
+            wait: Some(dependency),
+            released,
             attempts: 0,
             commits: Vec::new(),
         };
@@ -8007,10 +8053,17 @@ fn completion_owner_wait_retains_output_progress_and_original_result() {
         else {
             panic!("must retain refused output")
         };
-        assert_eq!(
-            pending.wait(),
-            &carrick_guest_mem::MemoryReadWait::Owner(wait)
-        );
+        if physical {
+            assert!(matches!(
+                pending.wait(),
+                carrick_guest_mem::MemoryReadWait::Physical(_)
+            ));
+        } else {
+            assert_eq!(
+                pending.wait(),
+                &carrick_guest_mem::MemoryReadWait::Owner(wait)
+            );
+        }
         assert_eq!(memory.commits, [(0x7fff, 1)]);
         if cancel {
             use carrick_el1_abi::Lifecycle;

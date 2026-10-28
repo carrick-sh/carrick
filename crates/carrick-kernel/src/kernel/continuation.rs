@@ -2966,7 +2966,12 @@ impl OwnedCompletionCopyout {
         context: &KernelContext,
         memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
-        self.operation.resume(context, memory)
+        let Self { operation, wait } = self;
+        // The retained physical receipt can itself own writer exclusion.
+        // Release it before acquiring the next output permit, then let the
+        // operation resample terminal cancellation after that release.
+        drop(wait);
+        operation.resume(context, memory)
     }
 }
 
