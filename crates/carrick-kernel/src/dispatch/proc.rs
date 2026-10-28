@@ -3835,10 +3835,12 @@ impl<'a> ProcView<'a> {
                         DispatchOutcome::returned_len(offset)?
                     });
                 };
-                let out = match super::copyout::prepare(
+                let out = match super::copyout::prepare_array(
                     cx.kernel,
                     cx.memory,
-                    [Some(super::copyout::UserSlot::new(chunk_addr, chunk_len))],
+                    carrick_guest_mem::GuestVa::new(chunk_addr),
+                    chunk_len,
+                    1,
                 ) {
                     Ok(out) => out,
                     Err(refusal) => return Ok(if offset == 0 {
@@ -3847,21 +3849,32 @@ impl<'a> ProcView<'a> {
                         DispatchOutcome::returned_len(offset)?
                     }),
                 };
-                // Generate only after securing this chunk. A later refusal or
+                let admitted = out.records();
+                if admitted == 0 {
+                    return Ok(if offset == 0 {
+                        DispatchOutcome::errno(LINUX_EFAULT)
+                    } else {
+                        DispatchOutcome::returned_len(offset)?
+                    });
+                }
+                // Generate only the secured byte prefix. A later refusal or
                 // address fault returns the bytes already delivered, so retry
                 // never replaces an earlier random prefix with new data.
-                let mut bytes = vec![0; chunk_len];
+                let mut bytes = vec![0; admitted];
                 if getrandom::fill(&mut bytes).is_err() {
                     fill_deterministic_bootstrap_random(&mut bytes);
                 }
-                if let Err(fault) = out.commit([&bytes]) {
+                if let Err(fault) = out.commit(&bytes) {
                     return Ok(if offset == 0 {
                         fault.outcome()
                     } else {
                         DispatchOutcome::returned_len(offset)?
                     });
                 }
-                offset += chunk_len;
+                offset += admitted;
+                if admitted < chunk_len {
+                    return Ok(DispatchOutcome::returned_len(offset)?);
+                }
             }
             Ok(DispatchOutcome::returned_len(length)?)
         }
@@ -8841,6 +8854,43 @@ mod copyout_refusal_s3_tests {
             Ok(4)
         );
         assert_eq!(memory.read_bytes(OUT_BUF, 4).unwrap(), b"test");
+    }
+
+    #[test]
+    fn getrandom_returns_accessible_prefix_within_first_chunk() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(BASE, 16, FILL);
+        let reporter = CompatReporter::default();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::GETRANDOM.raw(),
+                        SyscallArgs::from([BASE, 32, 0, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 16 },
+        );
+        assert_ne!(memory.read_bytes(BASE, 16).unwrap(), [FILL; 16]);
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::GETRANDOM.raw(),
+                        SyscallArgs::from([BASE + 16, 32, 0, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::errno(LINUX_EFAULT),
+        );
     }
 
     #[test]
