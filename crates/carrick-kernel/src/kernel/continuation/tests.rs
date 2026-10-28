@@ -4914,6 +4914,7 @@ mod serial_host {
         fault_completion_to_host(false);
     }
 
+    #[cfg(test)]
     fn fault_completion_to_host(enroll_zone_continuation: bool) {
         use carrick_el1_abi::{Claim, SlotId, ThreadIdentity};
         use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken, OwnerEntry};

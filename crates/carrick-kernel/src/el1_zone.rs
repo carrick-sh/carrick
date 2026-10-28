@@ -312,10 +312,7 @@ pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
     let Some(zone) = zone().or_else(zone_tables) else {
         return HostClaim::Stale;
     };
-    if zone
-        .live(record)
-        .is_some_and(|rec| rec.requires_native_entry())
-    {
+    if zone.requires_native_entry(record) {
         // Only the fault service may complete/cancel its retained operation.
         // A host readiness claim must not interrupt that service with a
         // fabricated completion. Quiescence owners retain the core custody API.
@@ -326,10 +323,7 @@ pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
     if let HostClaim::El1Held { slot } = outcome {
         kick_slot(slot);
     }
-    if zone
-        .live(record)
-        .is_some_and(|rec| rec.requires_native_entry())
-    {
+    if zone.requires_native_entry(record) {
         route_native_exception_in_zone(zone, record);
         return HostClaim::Deferred;
     }
@@ -357,7 +351,7 @@ pub fn hand_back_foreign_timer(slot: SlotId) {
 pub fn host_resume_ready(record: RecordRef) -> bool {
     zone()
         .or_else(zone_tables)
-        .is_some_and(|zone| zone.live(record).is_some_and(|rec| rec.host_resume_ready()))
+        .is_some_and(|zone| zone.host_resume_readiness(record) == Some(true))
 }
 
 /// Retire a parked thread whose host continuation is gone: free a record

@@ -867,9 +867,9 @@ impl ReadinessProbe {
             Self::Zone {
                 record, deadline, ..
             } => {
-                if carrick_el1_abi::zone_tables().is_some_and(|zone| {
-                    zone.live(*record).is_none_or(|rec| rec.host_resume_ready())
-                }) {
+                if carrick_el1_abi::zone_tables()
+                    .is_some_and(|zone| zone.host_resume_readiness(*record).unwrap_or(true))
+                {
                     return Some(ContinuationEvent::Ready);
                 }
                 // The publish gate claims the record for the timeout, or

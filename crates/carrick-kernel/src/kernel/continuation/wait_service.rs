@@ -723,11 +723,8 @@ impl CarrierWaitServiceInner {
         let Some(tables) = carrick_el1_abi::zone_tables() else {
             return true;
         };
-        let Some(rec) = tables.live(record) else {
-            // Freed: nothing holds the thread back any longer.
-            return true;
-        };
-        if rec.host_resume_ready() {
+        // Retired records no longer retain a native execution dependency.
+        if tables.host_resume_readiness(record).unwrap_or(true) {
             return true;
         }
         let (seq, kind) = match event {

@@ -2040,6 +2040,18 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         (record.incarnation() == r.incarnation && record.claim() != Claim::Free).then_some(record)
     }
 
+    /// Exact-incarnation host readiness. A retired record has no remaining
+    /// execution dependency; a live exception owner must finish natively.
+    pub fn host_resume_readiness(&self, record: RecordRef) -> Option<bool> {
+        self.live(record).map(ZoneRecord::host_resume_ready)
+    }
+
+    /// Whether this exact incarnation still requires its native checkpoint.
+    pub fn requires_native_entry(&self, record: RecordRef) -> bool {
+        self.live(record)
+            .is_some_and(ZoneRecord::requires_native_entry)
+    }
+
     /// Take the lock of `bucket`, waiting per `wait`.
     pub fn lock(&self, bucket: usize, wait: &impl LockWait<C>) -> Option<BucketGuard<'_, C>> {
         let lock = &self.buckets[bucket % ZONE_BUCKETS].lock;
