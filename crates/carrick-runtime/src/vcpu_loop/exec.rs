@@ -4461,6 +4461,10 @@ pub(crate) mod tests {
 
     #[test]
     fn serial_host_synchronous_signal_return_publishes_bridge_before_native_checkpoint() {
+        let _signal_guard =
+            crate::vcpu_loop::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+                "serial_host_synchronous_signal_return_publishes_bridge_before_native_checkpoint",
+            );
         struct IngressRegion(Box<carrick_test_support::TestEl1Region>);
         impl Drop for IngressRegion {
             fn drop(&mut self) {

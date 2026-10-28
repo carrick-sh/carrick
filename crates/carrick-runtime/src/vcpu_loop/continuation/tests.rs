@@ -420,6 +420,9 @@ fn logical_group_wait_dispatch_builds_an_any_child_continuation() {
 
 #[test]
 fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership",
+    );
     let (_kernel, context) = bootstrap(153_693);
     let generation = publish(&context, 0x708);
     let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
@@ -470,6 +473,9 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
     use carrick_guest_mem::GuestMemory;
     use std::time::{Duration, Instant};
     use zerocopy::IntoBytes;
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline",
+    );
 
     let (kernel, leader) = bootstrap(153_799);
     let sleeper = kernel
@@ -600,6 +606,9 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
 
 #[test]
 fn serial_host_native_forwarded_read_publishes_distinct_ingress_domains() {
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_native_forwarded_read_publishes_distinct_ingress_domains",
+    );
     let (_kernel, context) = bootstrap(153_694);
     let generation = publish(&context, 0x709);
     let control = context.thread().control_slot();
@@ -686,6 +695,9 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
         NativeSignalFixture, take_signal_copies,
     };
     use carrick_personality_linux::signal::arm;
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress",
+    );
 
     for (restart, eligible, nr, tid_number) in [
         (false, true, 63, 153_694),
@@ -815,6 +827,9 @@ fn serial_host_empty_native_checkpoint_restarts_forwarded_read() {
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
     use carrick_sched_core::process::TaskSerial;
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_empty_native_checkpoint_restarts_forwarded_read",
+    );
 
     let fixture = NativeSignalFixture::new(
         ExecutionBinding {
@@ -852,6 +867,9 @@ fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
         SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill",
+    );
 
     let (_kernel, context) = bootstrap(153_831);
     let generation = publish(&context, 0x741);
@@ -922,6 +940,9 @@ fn serial_host_ignored_sigint_does_not_interrupt_forwarded_read() {
         SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_ignored_sigint_does_not_interrupt_forwarded_read",
+    );
 
     let (_kernel, context) = bootstrap(153_832);
     let generation = publish(&context, 0x742);
@@ -977,6 +998,9 @@ fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
     use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
     };
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_sibling_stealing_process_sigint_restarts_blocked_read",
+    );
 
     let (_kernel, context) = bootstrap(153_833);
     let generation = publish(&context, 0x743);
@@ -1085,6 +1109,9 @@ fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
     };
     use carrick_guest_mem::GuestMemory;
     use carrick_personality_linux::abi::thread::BlockedMask;
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask",
+    );
 
     let (_kernel, context) = bootstrap(153_834);
     let generation = publish(&context, 0x744);
@@ -1188,6 +1215,9 @@ fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
     use carrick_guest_mem::GuestMemory;
     use carrick_personality_linux::abi::thread::BlockedMask;
     use carrick_personality_linux::signal::arm;
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint",
+    );
 
     let (_kernel, context) = bootstrap(153_801);
     let generation = publish(&context, 0x720);
@@ -1285,6 +1315,9 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
         NativeSignalFixture, take_signal_copies,
     };
     use carrick_guest_mem::GuestMemory;
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_two_live_reads_share_one_process_signal_wake",
+    );
 
     let (kernel, leader) = bootstrap(153_697);
     let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
@@ -1418,6 +1451,9 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
 
 #[test]
 fn serial_host_timed_recv_waiter_keeps_deadline_when_peer_claims_signal() {
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "serial_host_timed_recv_waiter_keeps_deadline_when_peer_claims_signal",
+    );
     let (kernel, leader) = bootstrap(153_820);
     let worker = kernel
         .reserve_thread_clone(
@@ -1481,6 +1517,9 @@ fn serial_host_timed_recv_waiter_keeps_deadline_when_peer_claims_signal() {
 
 #[test]
 fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_requeue() {
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_requeue",
+    );
     let (kernel, context) = bootstrap(15_468);
     let generation = publish(&context, 0x913);
     drop(kernel);
@@ -1576,6 +1615,9 @@ fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_
 
 #[test]
 fn kernel_native_guest_signal_continuation_cancels_and_delivers_without_host_sidecars() {
+    let _signal_guard = super::super::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+        "kernel_native_guest_signal_continuation_cancels_and_delivers_without_host_sidecars",
+    );
     let (kernel, context) = bootstrap(15_469);
     let generation = publish(&context, 0x914);
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));

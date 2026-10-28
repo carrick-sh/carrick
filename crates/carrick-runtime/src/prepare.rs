@@ -1573,8 +1573,8 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
     use carrick_spec::{
-        ExecBackendRequest, FsBackendKind, NetworkNamespaceSpec, PidMode, Platform, RunSpec,
-        StdioMode,
+        BackendCapabilities, ExecBackendRequest, FsBackendKind, NetworkNamespaceSpec, PidMode,
+        RunSpec, StdioMode,
     };
 
     struct ContinueInterceptor;
@@ -1767,12 +1767,76 @@ mod tests {
                 seccomp_policy: carrick_spec::SeccompPolicy::ContainerDefault,
                 cap_add: Vec::new(),
             },
-            platform: Platform::Aarch64,
+            platform: BackendCapabilities::current().host_isa,
             exec_backend: ExecBackendRequest::HvPatch,
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    struct ProcessCarrierTestGuard {
+        test_name: &'static str,
+    }
+
+    impl ProcessCarrierTestGuard {
+        fn acquire(test_name: &'static str) -> Self {
+            assert_eq!(
+                crate::carrier::live_container_count(),
+                0,
+                "{test_name}: preceding test leaked a live container in process_carrier"
+            );
+            let snapshot = crate::vm_lifecycle::process_snapshot();
+            assert_eq!(
+                snapshot.active, None,
+                "{test_name}: preceding test leaked an active VM in vm_lifecycle"
+            );
+            assert!(
+                snapshot.terminal.is_none(),
+                "{test_name}: preceding test left a terminal vm_lifecycle violation: {:?}",
+                snapshot.terminal
+            );
+            drop(
+                crate::carrier::CarrierRuntime::new_explicit().unwrap_or_else(|err| {
+                    panic!(
+                        "{test_name}: preceding test leaked an active carrier in independent_carrier_gate: {err}"
+                    )
+                }),
+            );
+            Self { test_name }
+        }
+    }
+
+    impl Drop for ProcessCarrierTestGuard {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let _ = crate::carrier::shutdown();
+                crate::carrier::reset_after_fork_child();
+                return;
+            }
+            crate::carrier::shutdown().unwrap_or_else(|err| {
+                panic!("{}: process_carrier shutdown failed: {err}", self.test_name)
+            });
+            let snapshot = crate::vm_lifecycle::process_snapshot();
+            assert_eq!(
+                snapshot.active, None,
+                "{}: VM remained active in vm_lifecycle after shutdown",
+                self.test_name
+            );
+            assert!(
+                snapshot.terminal.is_none(),
+                "{}: vm_lifecycle recorded a terminal violation: {:?}",
+                self.test_name,
+                snapshot.terminal
+            );
+            drop(
+                crate::carrier::CarrierRuntime::new_explicit().unwrap_or_else(|err| {
+                    panic!(
+                        "{}: carrier remained active in independent_carrier_gate after shutdown: {err}",
+                        self.test_name
+                    )
+                }),
+            );
+        }
+    }
+
     fn test_launch() -> LaunchContext {
         LaunchContext::from_process_env().expect("a foreground launch context needs no env")
     }
@@ -1840,9 +1904,10 @@ mod tests {
         ));
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn prepare_failure_releases_pid_placement() {
+        let _carrier_guard =
+            ProcessCarrierTestGuard::acquire("prepare_failure_releases_pid_placement");
         let mut spec = hvpatch_run_spec();
         spec.process.pid = PidMode::Private;
         spec.mounts.rootfs_layers = vec![Utf8PathBuf::from(
@@ -1854,13 +1919,12 @@ mod tests {
         assert!(matches!(err, RuntimeError::FsBackend(_)), "{err}");
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn prepare_on_holds_and_rolls_back_the_exact_carrier_lease() {
-        // Other compatibility-prepare tests may already have opened the CLI
-        // process carrier. Task 1 requires `Runtime::prepare` to share that
-        // exact owner until Task 5 rewires every caller.
-        let carrier = crate::carrier::process_carrier().expect("process carrier");
+        let _carrier_guard = ProcessCarrierTestGuard::acquire(
+            "prepare_on_holds_and_rolls_back_the_exact_carrier_lease",
+        );
+        let carrier = crate::carrier::CarrierRuntime::new_explicit().expect("explicit carrier");
         let launch = test_launch();
         let lease = carrier.reserve(launch.clone()).expect("reserve");
         let prepared = prepare_on(
@@ -1896,11 +1960,42 @@ mod tests {
             carrier.snapshot().expect("snapshot").registered_containers,
             0
         );
+        carrier
+            .shutdown_wait()
+            .expect("shutdown explicit carrier after prepare_on checks");
+    }
+
+    #[test]
+    fn process_carrier_test_guard_isolates_leaked_and_concurrent_prepare_leases() {
+        prepare_failure_releases_pid_placement();
+        prepare_on_holds_and_rolls_back_the_exact_carrier_lease();
+
+        let unwound = std::panic::catch_unwind(|| {
+            let _carrier_guard = ProcessCarrierTestGuard::acquire("simulated_unwound_prepare_test");
+            let _carrier = crate::carrier::process_carrier().expect("process carrier");
+            panic!("simulated test failure while process carrier is active");
+        });
+        assert!(unwound.is_err());
+
+        prepare_on_holds_and_rolls_back_the_exact_carrier_lease();
+
+        let _leaked = crate::carrier::process_carrier().expect("ungated process carrier");
+        let detected = std::panic::catch_unwind(|| {
+            let _carrier_guard = ProcessCarrierTestGuard::acquire("detects_unguarded_leak");
+        });
+        assert!(
+            detected.is_err(),
+            "ProcessCarrierTestGuard::acquire must fail loudly when a prior test leaked process_carrier()"
+        );
+        drop(_leaked);
+        crate::carrier::shutdown().expect("clean up deliberate unguarded leak");
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn execute_releases_pid_placement_after_the_run() {
+        let _carrier_guard =
+            ProcessCarrierTestGuard::acquire("execute_releases_pid_placement_after_the_run");
         let mut spec = hvpatch_run_spec();
         spec.process.pid = PidMode::Private;
         let result = Runtime::prepare(&spec, test_launch(), RuntimeExtensions::default())
@@ -1914,6 +2009,8 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn hvpatch_uses_container_entrypoint_resolution() {
+        let _carrier_guard =
+            ProcessCarrierTestGuard::acquire("hvpatch_uses_container_entrypoint_resolution");
         let result = Runtime::execute(&hvpatch_run_spec())
             .expect("hvpatch container setup should classify a missing entrypoint");
         assert_eq!(result.exit_code, 127);
@@ -1924,6 +2021,9 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn hvpatch_uses_container_entrypoint_resolution_for_every_container_in_one_carrier() {
+        let _carrier_guard = ProcessCarrierTestGuard::acquire(
+            "hvpatch_uses_container_entrypoint_resolution_for_every_container_in_one_carrier",
+        );
         for round in 0..2 {
             let result = Runtime::execute(&hvpatch_run_spec())
                 .expect("hvpatch container setup should classify a missing entrypoint");

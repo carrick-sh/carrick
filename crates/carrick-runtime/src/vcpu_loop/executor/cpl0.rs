@@ -1661,11 +1661,67 @@ mod tests {
         assert!(!ForwardAuthority::InZoneChild.may_use_host_task_context());
     }
 
+    #[derive(Default)]
+    struct IsolatedHostSignalBridge;
+
+    impl carrick_hal::HostSignalBridge for IsolatedHostSignalBridge {
+        fn claim_pending_in_for(&self, _tid: i32, _eligible: SigSet) -> bool {
+            false
+        }
+        fn has_unblocked_pending_for(
+            &self,
+            _tid: i32,
+            _block_mask: carrick_abi::SigBlockMask,
+        ) -> bool {
+            false
+        }
+        fn take_pending_for(&self, _tid: i32) -> i32 {
+            0
+        }
+        fn take_pending_in_for(&self, _tid: i32, _wait_set: SigSet) -> i32 {
+            0
+        }
+        fn publish_pending_for(&self, _tid: i32, _signum: i32) {}
+        fn publish_process_signal(&self, _signum: i32) {}
+        fn last_sender_for(&self, _signum: i32) -> i32 {
+            0
+        }
+        fn raise_for_self(&self, _signum: i32) {}
+        fn wake_all_waiters(&self) {}
+        fn ensure_host_handler(&self, _linux_signum: i32) {}
+        fn set_host_ignore(&self, _linux_signum: i32) {}
+        fn set_host_default(&self, _linux_signum: i32) {}
+        fn reset_routed_handlers_after_execve(&self, _ignored: SigSet) {}
+        fn xsig_enqueue(
+            &self,
+            _target_host_pid: i32,
+            _signum: i32,
+            _code: i32,
+            _sender_ns_pid: i32,
+            _sender_uid: u32,
+            _value: i64,
+            _target_ns_tid: i32,
+        ) -> bool {
+            false
+        }
+        fn xsig_nudge(&self, _target_host_pid: i32) {}
+        fn xsig_drain_for_self(&self) -> Vec<(i32, i32, i32, u32, i64, i32)> {
+            Vec::new()
+        }
+        fn host_to_linux_signum(&self, host_signum: i32) -> i32 {
+            host_signum
+        }
+        fn linux_to_host_signum(&self, linux_signum: i32) -> i32 {
+            linux_signum
+        }
+    }
+
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
-        let input = RootBootstrap::for_reference_model(
+        let input = RootBootstrap::for_one_task_adapter(
             pid,
             ThreadId::synthetic_for_tests(pid),
             "kvm continuation test".to_owned(),
+            Arc::new(IsolatedHostSignalBridge),
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
@@ -1906,5 +1962,41 @@ mod tests {
             probe_event.is_none(),
             "signal blocked by ppoll sigmask must not interrupt the wait"
         );
+    }
+
+    #[test]
+    fn host_signal_bridge_guard_isolates_unwound_process_signal_from_wait_readiness_probes() {
+        let unwound = std::panic::catch_unwind(|| {
+            let _signal_guard =
+                crate::vcpu_loop::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+                    "simulated_unwound_signal_test",
+                );
+            carrick_signal_linux::publish_process_signal(2);
+            carrick_signal_linux::publish_pending_for(14_001, 2);
+            panic!("simulated signal-publication test failure before draining bridge");
+        });
+        assert!(unwound.is_err());
+
+        let _post_unwind_guard =
+            crate::vcpu_loop::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+                "verify_clean_after_unwind",
+            );
+        drop(_post_unwind_guard);
+
+        carrick_signal_linux::publish_process_signal(2);
+        kvm_block_forward_ppoll_host_readiness_installs_temporary_signal_mask_and_binds_futex();
+        kvm_block_forward_pselect6_installs_temporary_signal_mask_and_binds_futex();
+        let detected = std::panic::catch_unwind(|| {
+            let _signal_guard =
+                crate::vcpu_loop::signal_ingress_producer::HostSignalBridgeGuard::acquire(
+                    "detects_unguarded_signal_leak",
+                );
+        });
+        assert!(
+            detected.is_err(),
+            "HostSignalBridgeGuard::acquire must fail loudly when a prior test leaked PROC_PENDING"
+        );
+        carrick_signal_linux::clear_proc_pending();
+        carrick_signal_linux::clear_thread_pending();
     }
 }
