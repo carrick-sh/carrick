@@ -20,10 +20,10 @@ dispatcher's syscalls byte for byte and prove the in-zone routing.
 """
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls; carrick-kernel::dispatch::native_files::tests::in_zone_pipe_stat_matches_the_dispatchers_pipe_record; carrick-kernel::dispatch::native_files::tests::native_open_read_and_fstat_serve_the_loader_through_one_vfs; carrick-kernel::dispatch::native_files::tests::native_relative_open_resolves_with_the_callers_cwd; carrick-personality-linux::native_host_file::tests::in_zone_objects_never_build_a_host_request; carrick-personality-linux::native_host_file::tests::in_zone_fstat_is_answered_in_ring_with_the_shared_record; carrick-el1-linux::dispatch::tests::native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout"
+vm_free = "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls; carrick-kernel::dispatch::native_files::tests::in_zone_pipe_stat_matches_the_dispatchers_pipe_record; carrick-kernel::dispatch::native_files::tests::native_open_read_and_fstat_serve_the_loader_through_one_vfs; carrick-kernel::dispatch::native_files::tests::native_relative_open_resolves_with_the_callers_cwd; carrick-personality-linux::native_host_file::tests::in_zone_objects_never_build_a_host_request; carrick-personality-linux::native_host_file::tests::in_zone_fstat_is_answered_in_ring_with_the_shared_record; carrick-el1-linux::dispatch::tests::native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout; carrick-kernel::dispatch::mem::native_successor::tests::successor_image_rows_cover_every_user_leaf_and_make_elf_pages_lazy"
 
 [bindings.unresolved]
 embed_structural = "The director owns the signed carrier binding and exact-artifact verification for this venue."
 observation = "No versioned WorkObservation counts venue crossings yet; the routing witnesses prove zero host requests for in-zone objects."
-embed = "The signed native pipeline witness (`sh -c 'ls / | head -2'`) waits on the exec successor's image import (#894 ruling 1)."
+embed = "The signed native pipeline witnesses (`sh -c 'ls / | head -2'`, `true | true`) bind the exec successor's image import and RELRO end to end (#894 ruling 1); acceptance waits on the director's recorded signed run. A static-pie successor witness is tracked as a follow-up."
 docker = "Semantics come from the syscall specifications; the dispatcher's own syscalls are the in-tree oracle for byte equality."

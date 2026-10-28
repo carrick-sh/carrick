@@ -2030,3 +2030,7 @@ contracts = ["kernel.native.host-file-venue"]
 [[surfaces]]
 path = "crates/carrick-syscall-abi/src/stat.rs"
 contracts = ["kernel.native.host-file-venue"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/mem/native_successor.rs"
+contracts = ["kernel.native.host-file-venue"]
