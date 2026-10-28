@@ -1359,6 +1359,8 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     #[cfg(test)]
     closing_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    service_cancel_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     pool_control_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     pool_retained_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
@@ -3198,6 +3200,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             signal_check_hook: SpinLock::new(None),
             #[cfg(test)]
             closing_race_hook: SpinLock::new(None),
+            #[cfg(test)]
+            service_cancel_hook: SpinLock::new(None),
             #[cfg(test)]
             pool_control_hook: SpinLock::new(None),
             #[cfg(test)]
@@ -5596,7 +5600,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                     }
                 }
-                page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
                 let wake = Some(ExitWakeCustody {
                     channel: channel.clone(),
                 });
@@ -5693,6 +5696,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
         if first_close {
+            #[cfg(test)]
+            if let Some(hook) = self.runtime.service_cancel_hook.lock().take() {
+                hook();
+            }
             let service_records: Vec<_> = {
                 let graph = self.runtime.graph.lock();
                 graph
@@ -5710,6 +5717,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.runtime
                     .cancel_service(record, self.source.slot, self.service)?;
             }
+            // Native exception owners must have their cancellation checkpoint
+            // queued before the host can admit its one-shot terminal wake batch.
+            page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
             // Closing requests host retirement; it does not retire live zone
             // records. A deferred control wake is owned by that record's vCPU
             // or producer until its handback reaches the host continuation.

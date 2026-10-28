@@ -1463,6 +1463,27 @@ pub(super) fn wake_removed_persistent_sibling_threads(
     Ok(())
 }
 
+/// A native exception's saved PC is not a host re-entry instruction. Its
+/// service cancellation retains the operation and queues the native terminal
+/// checkpoint; a host control quantum would instead try to load that PC.
+fn native_exception_owns_terminal_wake(thread: &carrick_kernel::kernel::Thread) -> bool {
+    use carrick_sched_core::object_wait::{OwnerEntry, ResumeDisposition};
+    let Some((zone, record)) =
+        carrick_kernel::el1_zone::zone().zip(thread.control_slot().zone_record())
+    else {
+        return false;
+    };
+    let Some(rec) = zone.live(record) else {
+        return false;
+    };
+    let identity = rec.identity();
+    let owned = thread.control_slot().native_signal_owner()
+        && identity.tid == carrick_el1_abi::El1TaskId::from_linux_tid(thread.key().tid.raw()).raw()
+        && identity.serial == thread.key().serial.raw()
+        && rec.resume_disposition() == ResumeDisposition::OwnerContinuation(OwnerEntry::Exception);
+    owned && zone.live(record).is_some()
+}
+
 impl KernelState {
     /// Apply the native owner's exact cancellation requests at the first host
     /// boundary of Closing. A control wake reaches both a loaded EL0 spinner
@@ -1540,6 +1561,12 @@ impl KernelState {
                     | carrick_el1_abi::HostClaim::Stale => {}
                 }
                 woken += 1;
+                continue;
+            }
+            if native_exception_owns_terminal_wake(&thread) {
+                // begin_closing publishes exit_wait only after cancel_service
+                // has queued these exact retained owners. Leave their native
+                // checkpoint responsible for both service and member retirement.
                 continue;
             }
             if let Err(error) = scheduler.wake_control(thread.key())
@@ -2182,6 +2209,110 @@ mod child_tid_owner_tests {
             assert!(!ptr.is_null());
             &*ptr
         }
+    }
+
+    #[test]
+    fn native_terminal_wake_keeps_exception_member_out_of_host_run_queue() {
+        use crate::vcpu_loop::tests::{
+            EndpointTestSignalArrival, EndpointTestSignalPump, RuntimeTestExecutorKick,
+            test_carrier_graph_with_dispatcher,
+        };
+        use carrick_kernel::dispatch::SyscallDispatcher;
+        use carrick_kernel::kernel::objects::{BlockedReason, ThreadExecutionState};
+        use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken, OwnerEntry};
+
+        let (_runtime, scheduler, kernel, root, _process, _) =
+            test_carrier_graph_with_dispatcher!(72_450, SyscallDispatcher::new());
+        root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+        let sibling = root
+            .kernel()
+            .reserve_thread_clone(
+                &root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(72_451))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+        assert_eq!(root.task().threads().len(), 2);
+        let worker = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .unwrap();
+        let running = scheduler.take(&worker).unwrap();
+        scheduler
+            .settle_blocked(running, BlockedReason::HostWait)
+            .unwrap();
+        let zone = leaked_zone();
+        let key = root.thread().key();
+        let record = zone
+            .alloc_record(carrick_el1_abi::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+                serial: key.serial.raw(),
+                mm: root.shared().mm().id().raw(),
+                file_table: root.resources().files().id().raw(),
+                generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let record = zone.record_ref(record);
+        let custody =
+            carrick_core::lifecycle::MemberControlCustody::retain(root.thread().control_slot())
+                .unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        let wait_key = ObjectWaitKey::native_service(record).unwrap();
+        zone.bind_object_wait(wait_key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let queue = zone
+            .object_wait(wait_key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let snapshot = queue.snapshot();
+        queue
+            .park_owner_until(
+                snapshot,
+                record.id,
+                OperationToken::new(1, 1).unwrap(),
+                0,
+                OwnerEntry::Exception,
+            )
+            .unwrap();
+        drop(queue);
+        root.thread().control_slot().bind_zone_record(record);
+        root.thread().control_slot().request_host_exit();
+        root.lifecycle_page().publish_exit_wait(
+            carrick_core_abi::EntryMmKey::from_raw(root.shared().mm().id().raw()),
+            0x1000,
+        );
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            assert_eq!(kernel.wake_native_terminal_members(&sibling).unwrap(), 0);
+        });
+        assert!(
+            matches!(
+                root.thread().execution_state(),
+                ThreadExecutionState::Blocked { .. }
+            ),
+            "native fault cancellation must run its terminal checkpoint, not host load"
+        );
+        assert_eq!(scheduler.queued_len(), 0);
+        assert!(
+            scheduler.try_take(&worker).unwrap().is_none(),
+            "fault member was offered to load"
+        );
+        scheduler.unregister_executor(&worker).unwrap();
+        scheduler.close();
     }
 
     /// A joiner parked in the zone queue of `mm` on the CLEARTID word, as EL1
