@@ -1162,20 +1162,7 @@ impl SyscallDispatcher {
             // The old (current) limit is reported BEFORE the new one is applied,
             // and it is the TARGET's, not the caller's.
             let old = target.rlimit(resource);
-            if old_limit.0 != 0 {
-                let out = match super::copyout::UserOut::<carrick_abi::LinuxRlimit>::new(
-                    old_limit.0,
-                )
-                .prepare(cx.kernel, memory)
-                {
-                    Ok(out) => out,
-                    Err(refusal) => return Ok(refusal.into_outcome()),
-                };
-                if out.commit(&old).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-            }
-            if new_limit.0 != 0 {
+            let new = if new_limit.0 != 0 {
                 let bytes = match memory.read_bytes(new_limit.0, 16) {
                     Ok(b) => b,
                     Err(_) => {
@@ -1218,7 +1205,26 @@ impl SyscallDispatcher {
                 } else {
                     rlim_cur
                 };
-                let limit = LinuxRlimit::new(soft, rlim_max);
+                Some(LinuxRlimit::new(soft, rlim_max))
+            } else {
+                None
+            };
+            // Input and permission errors precede any access to old_limit.
+            if old_limit.0 != 0 {
+                let out = match super::copyout::UserOut::<carrick_abi::LinuxRlimit>::new(
+                    old_limit.0,
+                )
+                .prepare(cx.kernel, memory)
+                {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                if out.commit(&old).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+            }
+            if let Some(limit) = new {
+                let soft = limit.rlim_cur;
                 // Published on the TARGET task, which is the whole point.
                 let _ = target.replace_rlimit(resource, |_current| Ok::<_, ()>(limit));
                 if matches!(
@@ -1838,5 +1844,42 @@ mod owner_sleep_tests {
             DispatchOutcome::Returned { value: 0 },
             "the absolute 30 ms deadline expired during the owner wait"
         );
+    }
+}
+
+#[cfg(test)]
+mod s3_review_tests {
+    use super::*;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+
+    #[test]
+    fn prlimit_invalid_input_precedes_output_preparation() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x4000, 4096, 0xa5);
+        memory.seed(0x4000, carrick_abi::LinuxRlimit::new(2, 1).abi_bytes());
+        memory.refuse_next();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::PRLIMIT64.raw(),
+                        SyscallArgs::from([
+                            0,
+                            carrick_abi::LINUX_RLIMIT_CORE as u64,
+                            0x4000,
+                            0x4100,
+                            0,
+                            0
+                        ])
+                    ),
+                    &mut memory,
+                    &crate::compat::CompatReporter::default()
+                )
+                .unwrap(),
+            DispatchOutcome::errno(LINUX_EINVAL)
+        );
+        assert_eq!(memory.prepares, 0);
     }
 }
