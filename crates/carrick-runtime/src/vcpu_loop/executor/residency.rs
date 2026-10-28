@@ -189,11 +189,15 @@ fn materialize_zone_in(
     // SAFETY: the host owns the record (checked above); its context is
     // frozen until the loader frees it.
     let parked = unsafe { *rec.ctx_mut() };
-    let ctx = parked
-        .host_resume(rec.resume_disposition())
-        .ok_or_else(|| {
-            TrapError::Hypervisor("owned zone continuation lost its native entry".to_owned())
-        })?;
+    let disposition = rec.resume_disposition();
+    let ctx = parked.host_resume(disposition).ok_or_else(|| {
+        TrapError::Hypervisor(format!(
+            "owned zone continuation cannot resume on host: \
+             record={record:?} disposition={disposition:?} \
+             pc={:#x} pstate={:#x}",
+            parked.native.pc, parked.native.pstate,
+        ))
+    })?;
     let mut state = (**base).clone();
     state.gprs = ctx.x;
     // Zone settlement retained this job's translation state through its
