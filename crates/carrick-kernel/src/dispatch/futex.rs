@@ -51,6 +51,21 @@ pub(crate) fn relative_from_absolute_timespec(
     clock.scale_timeout(dur)
 }
 
+/// Wake accounting belongs to the queue being woken; no queue means no scope.
+pub(crate) struct PiFutexWake<'a> {
+    table: &'a crate::thread::FutexTable,
+    scope: Option<&'a carrick_observability::work_meter::WorkScope>,
+}
+
+impl<'a> PiFutexWake<'a> {
+    pub(crate) fn new(
+        table: &'a crate::thread::FutexTable,
+        scope: Option<&'a carrick_observability::work_meter::WorkScope>,
+    ) -> Self {
+        Self { table, scope }
+    }
+}
+
 pub(crate) fn dispatch_futex_pi(
     context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
@@ -58,8 +73,7 @@ pub(crate) fn dispatch_futex_pi(
     command: u64,
     word: u32,
     tid: u32,
-    futex: Option<&crate::thread::FutexTable>,
-    work_scope: Option<&carrick_observability::work_meter::WorkScope>,
+    wake: Option<PiFutexWake<'_>>,
 ) -> DispatchOutcome {
     // The low 30 bits of a PI-futex word hold the owner TID (FUTEX_TID_MASK,
     // imported from carrick-abi); the upper two are FUTEX_WAITERS/OWNER_DIED.
@@ -110,10 +124,10 @@ pub(crate) fn dispatch_futex_pi(
             if let Err(fault) = out.commit([&0u32.to_ne_bytes()]) {
                 return fault.outcome();
             }
-            if let Some(futex) = futex {
-                let woken = futex.wake(address, 1);
+            if let Some(wake) = wake {
+                let woken = wake.table.wake(address, 1);
                 crate::event_ring::rec_futex_wake(address, woken);
-                if let Some(scope) = work_scope {
+                if let Some(scope) = wake.scope {
                     let _ = scope.add(
                         carrick_observability::work_meter::WorkMetric::FutexQueueVisits,
                         1 + u64::from(woken),
@@ -241,8 +255,7 @@ pub(crate) fn dispatch_threaded_futex(
             command,
             word,
             guest_tid,
-            Some(futex),
-            work_scope,
+            Some(PiFutexWake::new(futex, work_scope)),
         );
     }
 
