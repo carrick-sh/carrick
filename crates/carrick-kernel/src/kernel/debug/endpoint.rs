@@ -460,6 +460,38 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn claiming_an_endpoint_does_not_privatize_the_shared_parent() {
+        let temp = tempfile::Builder::new()
+            .prefix("ck")
+            .tempdir_in("/tmp")
+            .expect("parent");
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o1777))
+            .expect("shared parent");
+        let endpoint =
+            DebugEndpoint::in_base(temp.path().to_path_buf(), "shared-parent").expect("endpoint");
+        endpoint.claim(1).expect("claim");
+        assert_eq!(
+            fs::metadata(temp.path())
+                .expect("parent metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o1777,
+            "one uid must not take away another uid's access to the rendezvous parent"
+        );
+    }
+
+    #[test]
+    fn a_private_legacy_root_cannot_block_the_default_endpoint() {
+        let endpoint = DebugEndpoint::for_run_id("independent-user-root").expect("endpoint");
+        assert!(
+            !endpoint.socket_path().starts_with("/tmp/carrick-kernel"),
+            "a different uid's 0700 legacy root must not be an ancestor of our socket: {}",
+            endpoint.socket_path().display()
+        );
+    }
+
+    #[test]
     fn a_live_owner_is_never_stolen() {
         let (_temp, endpoint) = scoped_endpoint("run-live-owner");
         endpoint.claim(1).expect("claim");
