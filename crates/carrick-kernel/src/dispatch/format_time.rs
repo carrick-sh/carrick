@@ -20,10 +20,52 @@ use crate::linux_abi::LinuxErrno;
 #[cfg(any(test, feature = "test-support"))]
 use super::fd_table::{OpenDescription, OpenDescriptionBase, kernel_file_description};
 use super::fd_table::{TimerFdInner, TimerFdState};
-use super::{
-    DispatchOutcome, GuestPtr, read_kernel_struct, time, write_kernel_struct,
-    write_kernel_struct_raw,
-};
+use super::{DispatchOutcome, GuestPtr, read_kernel_struct, time};
+
+fn prepare_format_time_copyout<'m, M: CurrentMmMemory, const N: usize>(
+    memory: &'m mut M,
+    slots: [Option<super::copyout::UserSlot>; N],
+) -> Result<super::copyout::PreparedCopyout<'m, M, N>, Option<super::copyout::CopyoutRefusal>> {
+    let memory_ptr: *mut M = memory;
+    if let Some(result) = super::resources::with_active_context(|context| {
+        super::copyout::prepare(context, unsafe { &mut *memory_ptr }, slots)
+    }) {
+        return result.map_err(Some);
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static FALLBACK_CONTEXT: Option<crate::kernel::KernelContext> =
+                super::SyscallDispatcher::new()
+                    .capture_one_task_context()
+                    .ok();
+        }
+        if let Some(result) = FALLBACK_CONTEXT.with(|context| {
+            context
+                .as_ref()
+                .map(|ctx| super::copyout::prepare(ctx, memory, slots))
+        }) {
+            return result.map_err(Some);
+        }
+    }
+    Err(None)
+}
+
+fn copyout_format_time_record<T: carrick_abi::KernelAbi>(
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    value: &T,
+    success: DispatchOutcome,
+) -> DispatchOutcome {
+    match prepare_format_time_copyout(memory, [Some(super::copyout::UserSlot::of::<T>(address))]) {
+        Ok(out) => match out.commit([value.abi_bytes()]) {
+            Ok(()) => success,
+            Err(fault) => fault.outcome(),
+        },
+        Err(Some(refusal)) => refusal.into_outcome(),
+        Err(None) => DispatchOutcome::errno(LINUX_EFAULT),
+    }
+}
 
 /// Exact timerfd read retained while a blocking read is parked outside the
 /// dispatcher.  The functional lease keeps this particular description alive
@@ -118,11 +160,24 @@ impl BlockingTimerFdRead {
         let value = LinuxTimerfdExpirations {
             expirations: timer.expirations,
         };
+        let out = match prepare_format_time_copyout(
+            memory,
+            [Some(
+                super::copyout::UserSlot::of::<LinuxTimerfdExpirations>(self.address),
+            )],
+        ) {
+            Ok(out) => out,
+            Err(Some(refusal)) => return TimerFdReadStep::Done(refusal.into_outcome()),
+            Err(None) => return TimerFdReadStep::Done(DispatchOutcome::errno(LINUX_EFAULT)),
+        };
         // Linux consumes the ready expiration before attempting the guest
         // copyout: a bad destination returns EFAULT, and a later nonblocking
         // read observes EAGAIN rather than the old count.
         timer.expirations = 0;
-        if write_kernel_struct_raw(memory, self.address, &value).is_err() {
+        if out
+            .commit([carrick_abi::KernelAbi::abi_bytes(&value)])
+            .is_err()
+        {
             return TimerFdReadStep::Done(DispatchOutcome::errno(LINUX_EFAULT));
         }
         TimerFdReadStep::Done(DispatchOutcome::returned_len_or_errno(
@@ -527,12 +582,14 @@ pub(super) fn adjtimex_bootstrap(
         && !modes.contains(LinuxTimexModes::OFFSET)
     {
         let invalid = LinuxTimex::invalid_mode_error_state();
-        return match write_kernel_struct(memory, address, &invalid) {
-            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Errno {
+        return copyout_format_time_record(
+            memory,
+            address,
+            &invalid,
+            DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             },
-            other => other,
-        };
+        );
     }
     if timex.modes == 0 {
         let state = clock.adjtimex_state();
@@ -541,10 +598,12 @@ pub(super) fn adjtimex_bootstrap(
         let time = linux_timex_time(now, status);
         let current = linux_timex_from_state(time, &state);
         let value = linux_time_state_from_status(status);
-        return match write_kernel_struct(memory, address, &current) {
-            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned { value },
-            other => other,
-        };
+        return copyout_format_time_record(
+            memory,
+            address,
+            &current,
+            DispatchOutcome::Returned { value },
+        );
     }
     if modes == LinuxTimexModes::OFFSET_SS_READ {
         let state = clock.adjtimex_state();
@@ -555,10 +614,12 @@ pub(super) fn adjtimex_bootstrap(
         current.modes = timex.modes;
         current.offset = 0;
         let value = linux_time_state_from_status(status);
-        return match write_kernel_struct(memory, address, &current) {
-            DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned { value },
-            other => other,
-        };
+        return copyout_format_time_record(
+            memory,
+            address,
+            &current,
+            DispatchOutcome::Returned { value },
+        );
     }
     if !can_adjust {
         return DispatchOutcome::Errno { errno: LINUX_EPERM };
@@ -658,6 +719,15 @@ pub(super) fn adjtimex_bootstrap(
         step_realtime_ns = Some(delta_ns);
     }
 
+    let out = match prepare_format_time_copyout(
+        memory,
+        [Some(super::copyout::UserSlot::of::<LinuxTimex>(address))],
+    ) {
+        Ok(out) => out,
+        Err(Some(refusal)) => return refusal.into_outcome(),
+        Err(None) => return DispatchOutcome::errno(LINUX_EFAULT),
+    };
+
     if let Some(delta_ns) = step_realtime_ns {
         if let Err(errno) = clock.try_step_realtime_offset_ns(delta_ns) {
             return DispatchOutcome::Errno { errno };
@@ -719,9 +789,9 @@ pub(super) fn adjtimex_bootstrap(
     let mut current = linux_timex_from_state(time, &updated_state);
     current.modes = timex.modes;
     let value = linux_time_state_from_status(status);
-    match write_kernel_struct(memory, address, &current) {
-        DispatchOutcome::Returned { value: 0 } => DispatchOutcome::Returned { value },
-        other => other,
+    match out.commit([carrick_abi::KernelAbi::abi_bytes(&current)]) {
+        Ok(()) => DispatchOutcome::Returned { value },
+        Err(fault) => fault.outcome(),
     }
 }
 
@@ -808,14 +878,12 @@ pub fn complete_interrupted_sleep(
 ) -> DispatchOutcome {
     if let Some(address) = remaining {
         let rem = linux_timespec_from_duration(duration);
-        match write_kernel_struct(memory, address.0, &rem) {
-            DispatchOutcome::Returned { value: 0 } => {}
-            _ => {
-                return DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                };
-            }
-        }
+        return copyout_format_time_record(
+            memory,
+            address.0,
+            &rem,
+            DispatchOutcome::Errno { errno: LINUX_EINTR },
+        );
     }
     DispatchOutcome::Errno { errno: LINUX_EINTR }
 }

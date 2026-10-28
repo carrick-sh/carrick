@@ -1479,7 +1479,15 @@ impl<'a> ProcView<'a> {
                         .as_ref()
                         .and_then(|t| t.registry.thread_name(t.tid))
                         .unwrap_or_else(|| this.proc.lock().task_name);
-                    memory.write_bytes(arg2, &name)?;
+                    let out = match super::copyout::prepare(
+                        cx.kernel,
+                        memory,
+                        [Some(super::copyout::UserSlot::new(arg2, name.len()))],
+                    ) {
+                        Ok(out) => out,
+                        Err(refusal) => return Ok(refusal.into_outcome()),
+                    };
+                    out.commit([&name])?;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_PR_SET_PDEATHSIG => {
@@ -1491,10 +1499,15 @@ impl<'a> ProcView<'a> {
                 }
                 LINUX_PR_GET_PDEATHSIG => {
                     let pdeathsig = this.proc.lock().pdeathsig;
-                    if memory
-                        .write_bytes(arg2, &(pdeathsig as i32).to_ne_bytes())
-                        .is_err()
-                    {
+                    let out = match super::copyout::prepare(
+                        cx.kernel,
+                        memory,
+                        [Some(super::copyout::UserSlot::new(arg2, 4))],
+                    ) {
+                        Ok(out) => out,
+                        Err(refusal) => return Ok(refusal.into_outcome()),
+                    };
+                    if out.commit([&(pdeathsig as i32).to_ne_bytes()]).is_err() {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                     DispatchOutcome::Returned { value: 0 }
@@ -1610,7 +1623,16 @@ impl<'a> ProcView<'a> {
                         proc.child_subreaper != 0
                             && proc.child_subreaper_owner == proc.logical_pid(),
                     );
-                    memory.write_bytes(arg2, &value.to_ne_bytes())?;
+                    drop(proc);
+                    let out = match super::copyout::prepare(
+                        cx.kernel,
+                        memory,
+                        [Some(super::copyout::UserSlot::new(arg2, 4))],
+                    ) {
+                        Ok(out) => out,
+                        Err(refusal) => return Ok(refusal.into_outcome()),
+                    };
+                    out.commit([&value.to_ne_bytes()])?;
                     DispatchOutcome::Returned { value: 0 }
                 }
                 // PR_SET_TIMERSLACK: arg2 = new slack in ns (0 → reset to the
@@ -1752,10 +1774,18 @@ impl<'a> ProcView<'a> {
             let cpu_value = cpu.to_ne_bytes();
             let node_value = 0u32.to_ne_bytes();
 
-            if cpu_address.0 != 0 && memory.write_bytes(cpu_address.0, &cpu_value).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
-            if node_address.0 != 0 && memory.write_bytes(node_address.0, &node_value).is_err() {
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                memory,
+                [
+                    super::copyout::UserSlot::optional(cpu_address.0, 4),
+                    super::copyout::UserSlot::optional(node_address.0, 4),
+                ],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            if out.commit([&cpu_value, &node_value]).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -1945,11 +1975,20 @@ impl<'a> ProcView<'a> {
             let (head, len) = cx.kernel.thread().robust_list();
             let len = if len == 0 { ROBUST_LIST_HEAD_SIZE } else { u64::from(len) };
             let memory = &mut *cx.memory;
-            if memory.write_bytes(head_ptr.0, &head.to_le_bytes()).is_err()
-                || memory
-                    .write_bytes(len_ptr.0, &len.to_le_bytes())
-                    .is_err()
-            {
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                memory,
+                [
+                    Some(super::copyout::UserSlot::new(head_ptr.0, 8)),
+                    Some(super::copyout::UserSlot::new(len_ptr.0, 8)),
+                ],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            let head_bytes = head.to_le_bytes();
+            let len_bytes = len.to_le_bytes();
+            if out.commit([&head_bytes, &len_bytes]).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -2039,7 +2078,15 @@ impl<'a> ProcView<'a> {
             }
             let mask = target.affinity();
             let buf = carrick_core::affinity::affinity_to_bytes(mask.words(), kernel_bytes);
-            memory.write_bytes(address.0, &buf)?;
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                memory,
+                [Some(super::copyout::UserSlot::new(address.0, buf.len()))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            out.commit([&buf])?;
             Ok(DispatchOutcome::returned_len(kernel_bytes)?)
         }
 
@@ -2125,7 +2172,15 @@ impl<'a> ProcView<'a> {
             }
             let memory = &mut *cx.memory;
             let prio: i32 = 0;
-            memory.write_bytes(address.0, &prio.to_le_bytes())?;
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                memory,
+                [Some(super::copyout::UserSlot::new(address.0, 4))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            out.commit([&prio.to_le_bytes()])?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -2162,7 +2217,15 @@ impl<'a> ProcView<'a> {
             let memory = &mut *cx.memory;
             let mut buf = [0u8; SCHED_ATTR_SIZE_VER0 as usize];
             buf[0..4].copy_from_slice(&(SCHED_ATTR_SIZE_VER0 as u32).to_le_bytes());
-            memory.write_bytes(attr.0, &buf)?;
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                memory,
+                [Some(super::copyout::UserSlot::new(attr.0, buf.len()))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            out.commit([&buf])?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -2244,11 +2307,13 @@ impl<'a> ProcView<'a> {
             if address.0 == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
-            memory.write_bytes(
+            Ok(super::copyout::copyout_record(
+                cx.kernel,
+                memory,
                 address.0,
-                zerocopy::IntoBytes::as_bytes(&carrick_abi::LINUX_SCHED_OTHER_SLICE),
-            )?;
-            Ok(DispatchOutcome::Returned { value: 0 })
+                &carrick_abi::LINUX_SCHED_OTHER_SLICE,
+                DispatchOutcome::Returned { value: 0 },
+            ))
         }
 
         fn futex(this, cx, address: GuestPtr, operation: u64, value: u64, timeout_address: GuestPtr) {
@@ -2463,7 +2528,15 @@ impl<'a> ProcView<'a> {
                     let current = if let Some(location) = shared_location {
                         let mirror = shared_futex_load(location);
                         if mirror != word && location.is_mirror() {
-                            let _ = memory.write_bytes(address.0, &mirror.to_ne_bytes());
+                            let out = match super::copyout::prepare(
+                                cx.kernel,
+                                memory,
+                                [Some(super::copyout::UserSlot::new(address.0, 4))],
+                            ) {
+                                Ok(out) => out,
+                                Err(refusal) => return Ok(refusal.into_outcome()),
+                            };
+                            let _ = out.commit([&mirror.to_ne_bytes()]);
                         }
                         mirror
                     } else {
@@ -2596,8 +2669,13 @@ impl<'a> ProcView<'a> {
                     LinuxUtsname::carrick_aarch64_with_nodename(&nodename)
                 }
             };
-            memory.write_bytes(address.0, uts.abi_bytes())?;
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(super::copyout::copyout_record(
+                cx.kernel,
+                memory,
+                address.0,
+                &uts,
+                DispatchOutcome::Returned { value: 0 },
+            ))
         }
 
         fn ptrace(this, cx, request: u64, pid: Pid, addr: GuestPtr, data: u64) {
@@ -2880,7 +2958,18 @@ impl<'a> ProcView<'a> {
                                 if request != LINUX_PTRACE_POKETEXT {
                                     match ptrace_witness.with_revalidated(
                                         || -> Result<DispatchOutcome, LinuxErrno> {
-                                            match cx.memory.write_bytes(addr.0, &staged_data) {
+                                            let out = match super::copyout::prepare(
+                                                cx.kernel,
+                                                cx.memory,
+                                                [Some(super::copyout::UserSlot::new(
+                                                    addr.0,
+                                                    staged_data.len(),
+                                                ))],
+                                            ) {
+                                                Ok(out) => out,
+                                                Err(refusal) => return Ok(refusal.into_outcome()),
+                                            };
+                                            match out.commit([&staged_data]) {
                                                 Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
                                                 Err(_) => Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
                                             }
@@ -3733,12 +3822,39 @@ impl<'a> ProcView<'a> {
             // Linux caps getrandom at 2^31-1 and returns a short count; clamp so a
             // huge length can't OOM-abort the runtime. Probe: bigread (read class).
             let length = length.min(crate::dispatch::MAX_RW_COUNT);
-            let memory = &mut *cx.memory;
             let mut bytes = vec![0; length];
             if getrandom::fill(&mut bytes).is_err() {
                 fill_deterministic_bootstrap_random(&mut bytes);
             }
-            memory.write_bytes(address.0, &bytes)?;
+            if length == 0 {
+                let out = match super::copyout::prepare(
+                    cx.kernel,
+                    cx.memory,
+                    [Some(super::copyout::UserSlot::new(address.0, 0))],
+                ) {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                out.commit([&[][..]])?;
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            let mut offset = 0usize;
+            while offset < length {
+                let chunk_len = (length - offset).min(super::copyout::COPYOUT_MAX_BYTES);
+                let Some(chunk_addr) = address.0.checked_add(offset as u64) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                };
+                let out = match super::copyout::prepare(
+                    cx.kernel,
+                    cx.memory,
+                    [Some(super::copyout::UserSlot::new(chunk_addr, chunk_len))],
+                ) {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                out.commit([&bytes[offset..offset + chunk_len]])?;
+                offset += chunk_len;
+            }
             Ok(DispatchOutcome::returned_len(length)?)
         }
 
@@ -3834,29 +3950,53 @@ pub(super) struct ProcessVmRwArgs {
     is_read: bool,
 }
 
-/// Copy the flattened byte stream from `src` iovecs into `dst` iovecs WITHIN a
-/// single guest address space — the `process_vm_readv`/`process_vm_writev` case
-/// where the caller IS the target (`pid == getpid()`). Walks both iovec lists
-/// with independent cursors, transferring `min(remaining_src, remaining_dst)`
-/// per step and stopping when either side is exhausted (Linux transfers the
-/// shorter of the two flattened lengths). The gated `read_bytes`/`write_bytes`
-/// enforce PROT_NONE / out-of-bounds, so a bad `iov_base` faults here. Returns
-/// the byte count copied, or `EFAULT` when the FIRST access faults (once any
-/// byte has moved Linux returns the partial count, not an error).
-fn process_vm_copy_self<M: CurrentMmMemory>(
+fn prepare_proc_copyout<'m, M: CurrentMmMemory, const N: usize>(
+    context: Option<&crate::kernel::KernelContext>,
+    memory: &'m mut M,
+    slots: [Option<super::copyout::UserSlot>; N],
+) -> Result<super::copyout::PreparedCopyout<'m, M, N>, Option<super::copyout::CopyoutRefusal>> {
+    if let Some(ctx) = context {
+        return super::copyout::prepare(ctx, memory, slots).map_err(Some);
+    }
+    let memory_ptr: *mut M = memory;
+    if let Some(res) = super::resources::with_active_context(|ctx| {
+        super::copyout::prepare(ctx, unsafe { &mut *memory_ptr }, slots)
+    }) {
+        return res.map_err(Some);
+    }
+    #[cfg(test)]
+    {
+        std::thread_local! {
+            static FALLBACK_CONTEXT: Option<crate::kernel::KernelContext> =
+                super::SyscallDispatcher::new()
+                    .capture_one_task_context()
+                    .ok();
+        }
+        if let Some(res) = FALLBACK_CONTEXT.with(|ctx| {
+            ctx.as_ref()
+                .map(|c| super::copyout::prepare(c, memory, slots))
+        }) {
+            return res.map_err(Some);
+        }
+    }
+    Err(None)
+}
+
+fn process_vm_copy_self_with_context<M: CurrentMmMemory>(
+    context: Option<&crate::kernel::KernelContext>,
     memory: &mut M,
     src: &[LinuxIovec],
     dst: &[LinuxIovec],
-) -> Result<i64, LinuxErrno> {
-    // Bound a single read/write allocation; a large transfer streams in chunks.
-    const CHUNK: u64 = 1 << 20;
+) -> Result<Result<i64, LinuxErrno>, super::copyout::CopyoutRefusal> {
+    // Bound a single read/write allocation to COPYOUT_MAX_BYTES; a large transfer streams in chunks.
+    const CHUNK: u64 = super::copyout::COPYOUT_MAX_BYTES as u64;
     let mut copied: u64 = 0;
     let (mut si, mut so, mut di, mut dofs) = (0usize, 0u64, 0usize, 0u64);
-    let fault = |copied: u64| -> Result<i64, LinuxErrno> {
+    let fault = |copied: u64| -> Result<Result<i64, LinuxErrno>, super::copyout::CopyoutRefusal> {
         if copied == 0 {
-            Err(LINUX_EFAULT)
+            Ok(Err(LINUX_EFAULT))
         } else {
-            Ok(copied as i64)
+            Ok(Ok(copied as i64))
         }
     };
     loop {
@@ -3884,14 +4024,49 @@ fn process_vm_copy_self<M: CurrentMmMemory>(
             Ok(bytes) => bytes,
             Err(_) => return fault(copied),
         };
-        if memory.write_bytes(dst_addr, &bytes).is_err() {
+        let out = match prepare_proc_copyout(
+            context,
+            memory,
+            [Some(super::copyout::UserSlot::new(dst_addr, want_usize))],
+        ) {
+            Ok(out) => out,
+            Err(Some(refusal)) => {
+                if copied == 0 {
+                    return Err(refusal);
+                }
+                return Ok(Ok(copied as i64));
+            }
+            Err(None) => return fault(copied),
+        };
+        if out.commit([&bytes]).is_err() {
             return fault(copied);
         }
         copied += want;
         so += want;
         dofs += want;
     }
-    Ok(copied as i64)
+    Ok(Ok(copied as i64))
+}
+
+/// Copy the flattened byte stream from `src` iovecs into `dst` iovecs WITHIN a
+/// single guest address space — the `process_vm_readv`/`process_vm_writev` case
+/// where the caller IS the target (`pid == getpid()`). Walks both iovec lists
+/// with independent cursors, transferring `min(remaining_src, remaining_dst)`
+/// per step and stopping when either side is exhausted (Linux transfers the
+/// shorter of the two flattened lengths). The gated `read_bytes`/`write_bytes`
+/// enforce PROT_NONE / out-of-bounds, so a bad `iov_base` faults here. Returns
+/// the byte count copied, or `EFAULT` when the FIRST access faults (once any
+/// byte has moved Linux returns the partial count, not an error).
+#[cfg_attr(not(test), allow(dead_code))]
+fn process_vm_copy_self<M: CurrentMmMemory>(
+    memory: &mut M,
+    src: &[LinuxIovec],
+    dst: &[LinuxIovec],
+) -> Result<i64, LinuxErrno> {
+    match process_vm_copy_self_with_context(None, memory, src, dst) {
+        Ok(res) => res,
+        Err(_) => Err(LINUX_EFAULT),
+    }
 }
 
 impl<'a> ProcView<'a> {
@@ -3992,9 +4167,15 @@ impl<'a> ProcView<'a> {
             } else {
                 (&local, &remote)
             };
-            return match process_vm_copy_self(&mut *cx.memory, src, dst) {
-                Ok(value) => Ok(DispatchOutcome::Returned { value }),
-                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            return match process_vm_copy_self_with_context(
+                Some(cx.kernel),
+                &mut *cx.memory,
+                src,
+                dst,
+            ) {
+                Ok(Ok(value)) => Ok(DispatchOutcome::Returned { value }),
+                Ok(Err(errno)) => Ok(DispatchOutcome::errno(errno)),
+                Err(refusal) => Ok(refusal.into_outcome()),
             };
         }
 
@@ -4018,9 +4199,11 @@ impl<'a> ProcView<'a> {
                 } else {
                     (&local, &remote)
                 };
-                match process_vm_copy_self(&mut *cx.memory, src, dst) {
-                    Ok(value) => Ok(DispatchOutcome::Returned { value }),
-                    Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                match process_vm_copy_self_with_context(Some(cx.kernel), &mut *cx.memory, src, dst)
+                {
+                    Ok(Ok(value)) => Ok(DispatchOutcome::Returned { value }),
+                    Ok(Err(errno)) => Ok(DispatchOutcome::errno(errno)),
+                    Err(refusal) => Ok(refusal.into_outcome()),
                 }
             }
             crate::kernel::MmRelation::Foreign(foreign) => {
@@ -4125,13 +4308,35 @@ impl<'a> ProcView<'a> {
                                 .min(want - delivered)
                                 .min(PAGE_SIZE - (local_va % PAGE_SIZE));
                             let slice = &read_buf[delivered as usize..(delivered + take) as usize];
-                            if let Err(error) = cx.memory.write_bytes(local_va, slice) {
+                            let out = match super::copyout::prepare(
+                                cx.kernel,
+                                cx.memory,
+                                [Some(super::copyout::UserSlot::new(local_va, slice.len()))],
+                            ) {
+                                Ok(out) => out,
+                                Err(refusal) => {
+                                    tracing::debug!(
+                                        target: "carrick::process_vm",
+                                        local_va = format_args!("{local_va:#x}"),
+                                        len = slice.len(),
+                                        copied = copied + delivered,
+                                        ?refusal,
+                                        "process_vm_readv local scatter prepare refused"
+                                    );
+                                    if copied + delivered == 0 {
+                                        return Ok(refusal.into_outcome());
+                                    }
+                                    local_fault = true;
+                                    break;
+                                }
+                            };
+                            if let Err(error) = out.commit([slice]) {
                                 tracing::debug!(
                                     target: "carrick::process_vm",
                                     local_va = format_args!("{local_va:#x}"),
                                     len = slice.len(),
                                     copied = copied + delivered,
-                                    %error,
+                                    ?error,
                                     "process_vm_readv local scatter write faulted"
                                 );
                                 local_fault = true;
@@ -8503,6 +8708,365 @@ mod process_identity_dispatch_tests {
             returned(call(&mut dispatcher, &root, SYS_GETSID, second_pid)),
             leader_pid,
             "a zombie keeps the retired session's namespace identity",
+        );
+    }
+}
+
+#[cfg(test)]
+mod copyout_refusal_s3_tests {
+    use super::*;
+    use crate::compat::CompatReporter;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use carrick_abi::syscall::nr;
+    use carrick_abi::{
+        KernelAbi, LINUX_CAPABILITY_VERSION_3, LINUX_CLOCK_MONOTONIC, LINUX_EINVAL,
+        LINUX_RLIMIT_CORE, LinuxRlimit, LinuxUtsname,
+    };
+    use carrick_guest_mem::GuestMemory;
+
+    const BASE: u64 = 0x4000_0000;
+    const LEN: usize = 0x4000;
+    const FILL: u8 = 0xa5;
+    const IN_BUF: u64 = BASE + 0x100;
+    const OUT_BUF: u64 = BASE + 0x400;
+
+    struct S3Guest {
+        dispatcher: SyscallDispatcher,
+        reporter: CompatReporter,
+        memory: OwnerRefusingMemory,
+    }
+
+    impl S3Guest {
+        fn new() -> Self {
+            Self {
+                dispatcher: SyscallDispatcher::new(),
+                reporter: CompatReporter::default(),
+                memory: OwnerRefusingMemory::new(BASE, LEN, FILL),
+            }
+        }
+
+        fn call(&mut self, number: u64, args: [u64; 6]) -> DispatchOutcome {
+            let context = self.dispatcher.capture_one_task_context().unwrap();
+            self.dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    &mut self.memory,
+                    &self.reporter,
+                )
+                .expect("dispatch")
+        }
+    }
+
+    #[test]
+    fn uname_waits_for_owner_refused_copyout_instead_of_efault() {
+        let mut g = S3Guest::new();
+        let wait = g.memory.refuse_next();
+        assert_eq!(
+            g.call(nr::UNAME.raw(), [OUT_BUF, 0, 0, 0, 0, 0]),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        assert_eq!(
+            g.memory
+                .read_bytes(OUT_BUF, LinuxUtsname::ABI_SIZE)
+                .unwrap(),
+            vec![FILL; LinuxUtsname::ABI_SIZE],
+        );
+        assert_eq!(
+            g.call(nr::UNAME.raw(), [OUT_BUF, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(&g.memory.read_bytes(OUT_BUF, 6).unwrap(), b"Linux\0");
+    }
+
+    #[test]
+    fn capget_waits_for_owner_refused_copyout_instead_of_efault() {
+        let mut g = S3Guest::new();
+        let mut hdr = [0u8; 8];
+        hdr[..4].copy_from_slice(&LINUX_CAPABILITY_VERSION_3.to_le_bytes());
+        g.memory.seed(IN_BUF, &hdr);
+
+        let wait = g.memory.refuse_next();
+        assert_eq!(
+            g.call(nr::CAPGET.raw(), [IN_BUF, OUT_BUF, 0, 0, 0, 0]),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        assert_eq!(g.memory.read_bytes(OUT_BUF, 24).unwrap(), [FILL; 24]);
+
+        assert_eq!(
+            g.call(nr::CAPGET.raw(), [IN_BUF, OUT_BUF, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_ne!(g.memory.read_bytes(OUT_BUF, 24).unwrap(), [FILL; 24]);
+
+        // Also verify getresuid and getgroups credential copyouts used by IPC permission classes.
+        g.memory.seed(OUT_BUF, &[FILL; 24]);
+        let wait_uid = g.memory.refuse_next();
+        assert_eq!(
+            g.call(
+                nr::GETRESUID.raw(),
+                [OUT_BUF, OUT_BUF + 4, OUT_BUF + 8, 0, 0, 0],
+            ),
+            DispatchOutcome::OwnerMemoryWait {
+                wait: wait_uid,
+                committed: 0
+            },
+        );
+        assert_eq!(g.memory.read_bytes(OUT_BUF, 12).unwrap(), [FILL; 12]);
+        assert_eq!(
+            g.call(
+                nr::GETRESUID.raw(),
+                [OUT_BUF, OUT_BUF + 4, OUT_BUF + 8, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(g.memory.read_bytes(OUT_BUF, 12).unwrap(), [0u8; 12]);
+    }
+
+    #[test]
+    fn coarse_clock_gettime_and_clock_getres_wait_for_owner_refused_copyout_instead_of_efault() {
+        let mut g = S3Guest::new();
+        let wait = g.memory.refuse_next();
+        assert_eq!(
+            g.call(
+                nr::CLOCK_GETTIME.raw(),
+                [LINUX_CLOCK_MONOTONIC_COARSE as u64, OUT_BUF, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        assert_eq!(g.memory.read_bytes(OUT_BUF, 16).unwrap(), [FILL; 16]);
+        assert_eq!(
+            g.call(
+                nr::CLOCK_GETTIME.raw(),
+                [LINUX_CLOCK_MONOTONIC_COARSE as u64, OUT_BUF, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_ne!(g.memory.read_bytes(OUT_BUF, 16).unwrap(), [FILL; 16]);
+
+        g.memory.seed(OUT_BUF, &[FILL; 16]);
+        let wait_res = g.memory.refuse_next();
+        assert_eq!(
+            g.call(
+                nr::CLOCK_GETRES.raw(),
+                [LINUX_CLOCK_MONOTONIC_COARSE as u64, OUT_BUF, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::OwnerMemoryWait {
+                wait: wait_res,
+                committed: 0
+            },
+        );
+        assert_eq!(g.memory.read_bytes(OUT_BUF, 16).unwrap(), [FILL; 16]);
+        assert_eq!(
+            g.call(
+                nr::CLOCK_GETRES.raw(),
+                [LINUX_CLOCK_MONOTONIC_COARSE as u64, OUT_BUF, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_ne!(g.memory.read_bytes(OUT_BUF, 16).unwrap(), [FILL; 16]);
+    }
+
+    #[test]
+    fn futex_pi_lock_and_unlock_wait_for_owner_refused_copyout_without_waking_waiters() {
+        let mut g = S3Guest::new();
+        g.memory.seed(OUT_BUF, &0u32.to_ne_bytes());
+
+        let wait_lock = g.memory.refuse_next();
+        assert_eq!(
+            g.call(nr::FUTEX.raw(), [OUT_BUF, LINUX_FUTEX_LOCK_PI, 0, 0, 0, 0],),
+            DispatchOutcome::OwnerMemoryWait {
+                wait: wait_lock,
+                committed: 0
+            },
+        );
+        assert_eq!(g.memory.read_bytes(OUT_BUF, 4).unwrap(), 0u32.to_ne_bytes());
+
+        assert_eq!(
+            g.call(nr::FUTEX.raw(), [OUT_BUF, LINUX_FUTEX_LOCK_PI, 0, 0, 0, 0],),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let owner_tid =
+            u32::from_ne_bytes(g.memory.read_bytes(OUT_BUF, 4).unwrap().try_into().unwrap());
+        assert_ne!(owner_tid, 0);
+
+        let wait_unlock = g.memory.refuse_next();
+        assert_eq!(
+            g.call(
+                nr::FUTEX.raw(),
+                [OUT_BUF, LINUX_FUTEX_UNLOCK_PI, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::OwnerMemoryWait {
+                wait: wait_unlock,
+                committed: 0
+            },
+        );
+        assert_eq!(
+            g.memory.read_bytes(OUT_BUF, 4).unwrap(),
+            owner_tid.to_ne_bytes(),
+            "refused FUTEX_UNLOCK_PI copyout must not clear owner word",
+        );
+
+        assert_eq!(
+            g.call(
+                nr::FUTEX.raw(),
+                [OUT_BUF, LINUX_FUTEX_UNLOCK_PI, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(g.memory.read_bytes(OUT_BUF, 4).unwrap(), 0u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn timer_create_refused_copyout_does_not_leak_posix_timer() {
+        let mut g = S3Guest::new();
+        assert_eq!(
+            g.call(
+                nr::TIMER_CREATE.raw(),
+                [LINUX_CLOCK_MONOTONIC as u64, 0, OUT_BUF, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let id0 = i32::from_ne_bytes(g.memory.read_bytes(OUT_BUF, 4).unwrap().try_into().unwrap());
+        g.memory.seed(OUT_BUF, &[FILL; 4]);
+
+        let wait = g.memory.refuse_next();
+        assert_eq!(
+            g.call(
+                nr::TIMER_CREATE.raw(),
+                [LINUX_CLOCK_MONOTONIC as u64, 0, OUT_BUF, 0, 0, 0],
+            ),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        assert_eq!(g.memory.read_bytes(OUT_BUF, 4).unwrap(), [FILL; 4]);
+        // No successor timer may have been allocated before the refused copyout.
+        assert_eq!(
+            g.call(
+                nr::TIMER_GETTIME.raw(),
+                [(id0 + 1) as u64, IN_BUF, 0, 0, 0, 0],
+            ),
+            DispatchOutcome::errno(LINUX_EINVAL),
+        );
+
+        assert_eq!(
+            g.call(
+                nr::TIMER_CREATE.raw(),
+                [LINUX_CLOCK_MONOTONIC as u64, 0, OUT_BUF, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let id1 = i32::from_ne_bytes(g.memory.read_bytes(OUT_BUF, 4).unwrap().try_into().unwrap());
+        assert_eq!(
+            id1,
+            id0 + 1,
+            "first created timer after retry must get the next unallocated id",
+        );
+        let _ = g.call(nr::TIMER_DELETE.raw(), [id0 as u64, 0, 0, 0, 0, 0]);
+        let _ = g.call(nr::TIMER_DELETE.raw(), [id1 as u64, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn prlimit64_refused_copyout_does_not_mutate_limit_before_retry() {
+        let mut g = S3Guest::new();
+        let new_limit = LinuxRlimit {
+            rlim_cur: 4096,
+            rlim_max: 8192,
+        };
+        g.memory.seed(IN_BUF, new_limit.abi_bytes());
+
+        let wait = g.memory.refuse_next();
+        assert_eq!(
+            g.call(
+                nr::PRLIMIT64.raw(),
+                [0, LINUX_RLIMIT_CORE as u64, IN_BUF, OUT_BUF, 0, 0],
+            ),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        assert_eq!(
+            g.memory.read_bytes(OUT_BUF, LinuxRlimit::ABI_SIZE).unwrap(),
+            vec![FILL; LinuxRlimit::ABI_SIZE],
+        );
+
+        // Retry succeeds, returning the pre-mutation limit in OUT_BUF and applying new_limit.
+        assert_eq!(
+            g.call(
+                nr::PRLIMIT64.raw(),
+                [0, LINUX_RLIMIT_CORE as u64, IN_BUF, OUT_BUF, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        let old_bytes = g.memory.read_bytes(OUT_BUF, LinuxRlimit::ABI_SIZE).unwrap();
+        let old_cur = u64::from_ne_bytes(old_bytes[..8].try_into().unwrap());
+        assert_ne!(
+            old_cur, 4096,
+            "old_limit must reflect the limit before mutation"
+        );
+    }
+
+    #[test]
+    fn syslog_consuming_read_and_read_clear_do_not_consume_on_refused_copyout() {
+        let mut g = S3Guest::new();
+        let context = g.dispatcher.capture_one_task_context().unwrap();
+        context.task().with_caps(|caps| {
+            caps.effective |= 1u64 << crate::namespace::process::CAP_SYSLOG;
+            caps.permitted |= 1u64 << crate::namespace::process::CAP_SYSLOG;
+        });
+        context.syslog().clear();
+        let _ = context.syslog().read_consuming(65536);
+        context.syslog().append(6, 0, 100, b"alpha\n".to_vec());
+        context.syslog().append(6, 0, 101, b"bravo\n".to_vec());
+
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [9, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 18 },
+        );
+
+        // 1) SYSLOG_ACTION_READ (2) must not consume unread bytes when copyout is refused.
+        let wait = g.memory.refuse_next();
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [2, OUT_BUF, 9, 0, 0, 0]),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        assert_eq!(g.memory.read_bytes(OUT_BUF, 9).unwrap(), [FILL; 9]);
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [9, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 18 },
+            "refused SYSLOG_ACTION_READ must not consume unread bytes",
+        );
+
+        // Retry of SYSLOG_ACTION_READ consumes the first record (9 bytes).
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [2, OUT_BUF, 9, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 9 },
+        );
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [9, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 9 },
+        );
+
+        // 2) SYSLOG_ACTION_READ_CLEAR (4) must not clear the buffer when copyout is refused.
+        let wait2 = g.memory.refuse_next();
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [4, OUT_BUF, 64, 0, 0, 0]),
+            DispatchOutcome::OwnerMemoryWait {
+                wait: wait2,
+                committed: 0
+            },
+        );
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [3, OUT_BUF, 64, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 18 },
+            "refused SYSLOG_ACTION_READ_CLEAR must not clear syslog buffer",
+        );
+
+        // Retry of SYSLOG_ACTION_READ_CLEAR reads all records from clear_seq and clears.
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [4, OUT_BUF, 64, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 18 },
+        );
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [3, OUT_BUF, 64, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
         );
     }
 }

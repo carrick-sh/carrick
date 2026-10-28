@@ -50,6 +50,13 @@ use std::time::Duration;
 use super::*;
 use carrick_abi::syscall::nr;
 
+// Keep `io_buffers::write_u32` referenced until Slice S2 retires `io_buffers.rs`.
+const _: fn(
+    &mut crate::dispatch::LinearMemory,
+    u64,
+    u32,
+) -> Result<(), crate::linux_abi::LinuxErrno> = super::write_u32;
+
 syscall_table! {
     /// Per-module syscall routing for the `time` subsystem (Task A1).
     ///
@@ -275,7 +282,13 @@ impl SyscallDispatcher {
             if old_value != 0 {
                 let previous =
                     timerfd_itimerspec(&state.clock, timer.clock_id, timer.interval, timer.deadline);
-                if write_kernel_struct_raw(memory, old_value, &previous).is_err() {
+                let out = match super::copyout::UserOut::<LinuxItimerspec>::new(old_value)
+                    .prepare(cx.kernel, memory)
+                {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                if out.commit(&previous).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
@@ -463,9 +476,14 @@ impl SyscallDispatcher {
             let idx = which as usize;
             if old_address.0 != 0 {
                 let prev = itimerval_from_state(this.proc.lock().itimers[idx]);
-                let outcome = write_kernel_struct(memory, old_address.0, &prev);
-                if !matches!(outcome, DispatchOutcome::Returned { .. }) {
-                    return Ok(outcome);
+                let out = match super::copyout::UserOut::<LinuxItimerval>::new(old_address.0)
+                    .prepare(cx.kernel, memory)
+                {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                if let Err(fault) = out.commit(&prev) {
+                    return Ok(fault.outcome());
                 }
             }
             if let Some(v) = new_value {
@@ -709,6 +727,14 @@ impl SyscallDispatcher {
                     }
                 }
             }
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                memory,
+                [Some(super::copyout::UserSlot::new(id_out.0, 4))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
             let timer_id = this.timers.posix_create_with_target_and_value(
                 clock_id as i32,
                 signum,
@@ -721,7 +747,7 @@ impl SyscallDispatcher {
             // bytes overruns a guest `kernel_timer_t` (int) buffer and trips its
             // stack canary (LTP timer_delete01: "stack smashing detected").
             let id_bytes = (timer_id).to_le_bytes();
-            if memory.write_bytes(id_out.0, &id_bytes).is_err() {
+            if out.commit([&id_bytes]).is_err() {
                 let _ = this.timers.posix_delete(timer_id);
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
@@ -795,6 +821,17 @@ impl SyscallDispatcher {
                 value: value_ns,
                 interval: interval_ns,
             };
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                memory,
+                [super::copyout::UserSlot::optional(
+                    old_ptr.0,
+                    LinuxItimerspec::ABI_SIZE,
+                )],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
             // Route the arm through the backend `TimerDelivery` (HVF/KVM each
             // spawn their own firing mechanism; signum/si_value were captured at
             // timer_create and live on the slot, so only value/interval pass). No
@@ -818,10 +855,7 @@ impl SyscallDispatcher {
                     si_value: 0,
                 });
                 let old_spec = build_itimerspec_ns(prev.spec);
-                if memory
-                    .write_bytes(old_ptr.0, old_spec.as_bytes())
-                    .is_err()
-                {
+                if out.commit([old_spec.as_bytes()]).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
             }
@@ -839,7 +873,18 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             let spec = build_itimerspec_ns(remaining);
-            memory.write_bytes(cur_ptr.0, spec.as_bytes())?;
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                memory,
+                [Some(super::copyout::UserSlot::new(
+                    cur_ptr.0,
+                    LinuxItimerspec::ABI_SIZE,
+                ))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            out.commit([spec.as_bytes()])?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -908,13 +953,18 @@ impl SyscallDispatcher {
         fn x86_time(this, cx, result: GuestPtr) {
             let now = cx.kernel.task().container().clock().realtime_now();
             let seconds = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
-            if result.0 != 0
-                && cx
-                    .memory
-                    .write_bytes(result.0, &seconds.to_ne_bytes())
-                    .is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            if result.0 != 0 {
+                let out = match super::copyout::prepare(
+                    cx.kernel,
+                    cx.memory,
+                    [Some(super::copyout::UserSlot::new(result.0, 8))],
+                ) {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                if out.commit([&seconds.to_ne_bytes()]).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
             }
             Ok(DispatchOutcome::Returned { value: seconds })
         }
@@ -1111,8 +1161,18 @@ impl SyscallDispatcher {
             // The old (current) limit is reported BEFORE the new one is applied,
             // and it is the TARGET's, not the caller's.
             let old = target.rlimit(resource);
-            if old_limit.0 != 0 && write_kernel_struct_raw(memory, old_limit.0, &old).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            if old_limit.0 != 0 {
+                let out = match super::copyout::UserOut::<carrick_abi::LinuxRlimit>::new(
+                    old_limit.0,
+                )
+                .prepare(cx.kernel, memory)
+                {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                if out.commit(&old).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
             }
             if new_limit.0 != 0 {
                 let bytes = match memory.read_bytes(new_limit.0, 16) {

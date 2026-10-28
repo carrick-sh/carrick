@@ -89,12 +89,31 @@ impl SyscallDispatcher {
                         crate::event_ring::rec_syslog(owner_id, action, len, 0);
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    if let Some(data) = syslog.read_consuming(len as usize) {
-                        if !data.is_empty() {
-                            cx.memory.write_bytes(buf.0, &data)?;
+                    let unread = syslog.size_unread();
+                    if unread > 0 {
+                        let cap = (len as usize)
+                            .min(unread)
+                            .min(super::copyout::COPYOUT_MAX_BYTES);
+                        let out = match super::copyout::prepare(
+                            cx.kernel,
+                            cx.memory,
+                            [Some(super::copyout::UserSlot::new(buf.0, cap))],
+                        ) {
+                            Ok(out) => out,
+                            Err(refusal) => return Ok(refusal.into_outcome()),
+                        };
+                        let secured = out.secured_capacity(0);
+                        if secured == 0 {
+                            let _ = out.commit([&[]]);
+                            return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EFAULT));
                         }
-                        crate::event_ring::rec_syslog(owner_id, action, len, data.len() as i32);
-                        return Ok(DispatchOutcome::returned_len(data.len())?);
+                        if let Some(data) = syslog.read_consuming(secured) {
+                            if !data.is_empty() {
+                                out.commit([&data])?;
+                            }
+                            crate::event_ring::rec_syslog(owner_id, action, len, data.len() as i32);
+                            return Ok(DispatchOutcome::returned_len(data.len())?);
+                        }
                     }
 
                     // Buffer is empty relative to this reader: park interruptibly using WaitOnFds.
@@ -123,9 +142,18 @@ impl SyscallDispatcher {
                         crate::event_ring::rec_syslog(owner_id, action, len, 0);
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    let data = syslog.read_all(len as usize);
+                    let data =
+                        syslog.read_all((len as usize).min(super::copyout::COPYOUT_MAX_BYTES));
                     if !data.is_empty() {
-                        cx.memory.write_bytes(buf.0, &data)?;
+                        let out = match super::copyout::prepare(
+                            cx.kernel,
+                            cx.memory,
+                            [Some(super::copyout::UserSlot::new(buf.0, data.len()))],
+                        ) {
+                            Ok(out) => out,
+                            Err(refusal) => return Ok(refusal.into_outcome()),
+                        };
+                        out.commit([&data])?;
                     }
                     crate::event_ring::rec_syslog(owner_id, action, len, data.len() as i32);
                     Ok(DispatchOutcome::returned_len(data.len())?)
@@ -139,10 +167,20 @@ impl SyscallDispatcher {
                         crate::event_ring::rec_syslog(owner_id, action, len, 0);
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    let data = syslog.read_clear(len as usize);
+                    let data =
+                        syslog.read_all((len as usize).min(super::copyout::COPYOUT_MAX_BYTES));
                     if !data.is_empty() {
-                        cx.memory.write_bytes(buf.0, &data)?;
+                        let out = match super::copyout::prepare(
+                            cx.kernel,
+                            cx.memory,
+                            [Some(super::copyout::UserSlot::new(buf.0, data.len()))],
+                        ) {
+                            Ok(out) => out,
+                            Err(refusal) => return Ok(refusal.into_outcome()),
+                        };
+                        out.commit([&data])?;
                     }
+                    syslog.clear();
                     crate::event_ring::rec_syslog(owner_id, action, len, data.len() as i32);
                     Ok(DispatchOutcome::returned_len(data.len())?)
                 }
