@@ -854,7 +854,7 @@ struct PendingWait {
 }
 #[derive(Clone, Copy)]
 enum PendingWaitOutput {
-    Wait4,
+    Wait4 { rusage: UserVa },
     WaitId { nowait: bool },
 }
 struct ExitWakeCustody {
@@ -3917,9 +3917,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if options.bits() & !LinuxWaitOptions::WAIT4_SUPPORTED.bits() != 0 {
             return Err(NativeProcessError::Invalid);
         }
-        if options.intersects(LinuxWaitOptions::WUNTRACED | LinuxWaitOptions::WCONTINUED) {
-            return Err(NativeProcessError::Unsupported);
-        }
         let graph = self.runtime.graph.lock();
         let row = graph
             .owner
@@ -3946,7 +3943,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(WaitQuery {
             target,
             class: carrick_personality_linux::lifecycle::wait_child_class(options),
-            job_control: WaitJobControl::NONE,
+            job_control: WaitJobControl {
+                stopped: options.contains(LinuxWaitOptions::WUNTRACED),
+                continued: options.contains(LinuxWaitOptions::WCONTINUED),
+            },
         })
     }
     fn waitid_query(
@@ -4038,7 +4038,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             Ok(())
                         } else {
                             match output {
-                                PendingWaitOutput::Wait4 => {
+                                PendingWaitOutput::Wait4 { .. } => {
                                     self.service.copy_status(&mm, status, zombie.status)
                                 }
                                 PendingWaitOutput::WaitId { .. } => {
@@ -4083,7 +4083,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     };
                     let result = match (&consumed.selection, output) {
                         (WaitSelection::Exited(_), PendingWaitOutput::WaitId { .. }) => 0,
-                        (WaitSelection::Exited(zombie), PendingWaitOutput::Wait4) => {
+                        (WaitSelection::Exited(zombie), PendingWaitOutput::Wait4 { rusage }) => {
+                            if rusage.raw() != 0 {
+                                use carrick_abi::KernelAbi;
+                                let usage = carrick_abi::LinuxRusage::from_accounting(
+                                    u64::try_from(zombie.rusage.user_time.as_micros())
+                                        .unwrap_or(u64::MAX),
+                                    u64::try_from(zombie.rusage.system_time.as_micros())
+                                        .unwrap_or(u64::MAX),
+                                    0,
+                                    0,
+                                );
+                                // Linux consumes the child before copying rusage.
+                                // A bad rusage address reports EFAULT after reap,
+                                // while a status-copy refusal above retains it.
+                                self.service
+                                    .copy_signal_bytes(&mm, rusage, usage.abi_bytes())?;
+                            }
                             i64::from(zombie.namespace_pid)
                         }
                         _ => return Err(NativeProcessError::NoChild),
@@ -6823,9 +6839,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         _options: LinuxWaitOptions,
         _rusage: UserVa,
     ) -> LifecycleOutcome {
-        if _rusage.raw() != 0 {
-            return self.fail(NativeProcessError::Unsupported);
-        }
         let query = match self.wait4_query(_pid, _options) {
             Ok(query) => query,
             Err(error) => return self.fail(error),
@@ -6834,7 +6847,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             query,
             _status,
             _options.contains(LinuxWaitOptions::WNOHANG),
-            PendingWaitOutput::Wait4,
+            PendingWaitOutput::Wait4 { rusage: _rusage },
         ) {
             Ok(outcome) => outcome,
             Err(error) => self.fail(error),
@@ -11724,6 +11737,32 @@ mod tests {
         exit_wake_contended: Option<LinuxWaitStatus>,
         cleanup_on_exit: bool,
     ) {
+        compact_root_fork_wait_with_outputs(
+            (
+                interrupt_wait,
+                catch_child_exit,
+                default_stop,
+                signal_exit_continuation,
+                exit_wake_contended,
+                cleanup_on_exit,
+            ),
+            (LinuxWaitOptions::empty(), UserVa::new(0)),
+        );
+    }
+    mod wait4;
+    fn compact_root_fork_wait_with_outputs(
+        configuration: (bool, bool, bool, bool, Option<LinuxWaitStatus>, bool),
+        wait: (LinuxWaitOptions, UserVa),
+    ) {
+        let (
+            interrupt_wait,
+            catch_child_exit,
+            default_stop,
+            signal_exit_continuation,
+            exit_wake_contended,
+            cleanup_on_exit,
+        ) = configuration;
+        let _ = host_test_support::take_signal_copies();
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -11840,6 +11879,18 @@ mod tests {
                 runtime.graph.lock().owner.task(child).unwrap().parent(),
                 Some(parent)
             );
+            if !wait.0.is_empty() || wait.1.raw() != 0 {
+                let LifecycleOutcome::Returned { result, .. } = entry.wait4(
+                    ProcessWaitPid::from_syscall_argument(u64::MAX),
+                    UserVa::new(1),
+                    wait.0 | LinuxWaitOptions::WNOHANG,
+                    UserVa::new(1),
+                ) else {
+                    panic!("nonblocking wait must return without parking")
+                };
+                assert_eq!(result.raw(), 0, "WNOHANG must not touch either output");
+                assert!(host_test_support::take_signal_copies().is_empty());
+            }
             if default_stop {
                 use carrick_personality_linux::signal::ProcessSignals;
                 entry
@@ -11868,8 +11919,8 @@ mod tests {
                 entry.wait4(
                     ProcessWaitPid::from_syscall_argument(u64::MAX),
                     UserVa::new(0x8000),
-                    LinuxWaitOptions::empty(),
-                    UserVa::new(0),
+                    wait.0,
+                    wait.1,
                 )
             });
             entry.publication_wait_probe = None;
@@ -11895,8 +11946,14 @@ mod tests {
             assert!(entry.take_handoff_receipt().is_some());
         }
         let (child_address, child_words, child_record) = {
-            let graph = runtime.graph.lock();
-            let row = graph.owner.task(child).unwrap();
+            let mut graph = runtime.graph.lock();
+            let row = graph.owner.task_mut(child).unwrap();
+            if wait.1.raw() != 0 {
+                row.native_mut().resources_mut().usage = TaskRusage {
+                    user_time: Duration::from_micros(1_250_000),
+                    system_time: Duration::from_micros(2_500_000),
+                };
+            }
             (
                 row.native().resources().address,
                 *row.context(),
@@ -12183,7 +12240,8 @@ mod tests {
             .store(parent_identity.serial, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(parent_identity.lifecycle_page, parent_identity.control_slot);
-        service.refuse_copy = true;
+        let retry_status = wait.1.raw() == 0;
+        service.refuse_copy = retry_status;
         {
             let mut parent_entry = runtime
                 .enter(source, &task, words(address), &mut service)
@@ -12226,32 +12284,54 @@ mod tests {
             else {
                 panic!("resumed wait return")
             };
-            assert_eq!(result.raw(), NativeProcessError::Fault.errno());
-            assert!(runtime.namespace_child_key(parent, 42).is_some());
+            assert_eq!(
+                result.raw(),
+                if retry_status || wait.1.raw() == 1 {
+                    -14
+                } else {
+                    42
+                }
+            );
+            assert_eq!(
+                runtime.namespace_child_key(parent, 42).is_some(),
+                retry_status
+            );
         }
         service.refuse_copy = false;
         let mut parent_entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
-        let LifecycleOutcome::Returned { result, .. } = parent_entry.wait4(
-            ProcessWaitPid::from_syscall_argument(42),
-            UserVa::new(0x8000),
-            LinuxWaitOptions::empty(),
-            UserVa::new(0x9000),
-        ) else {
-            panic!("rusage refusal")
-        };
-        assert_eq!(result.raw(), NativeProcessError::Unsupported.errno());
-        assert!(runtime.namespace_child_key(parent, 42).is_some());
-        let LifecycleOutcome::Returned { result, .. } = parent_entry.wait4(
-            ProcessWaitPid::from_syscall_argument(42),
-            UserVa::new(0x8000),
-            LinuxWaitOptions::empty(),
-            UserVa::new(0),
-        ) else {
-            panic!("reap return")
-        };
-        assert_eq!(result.raw(), 42);
+        if retry_status {
+            let LifecycleOutcome::Returned { result, .. } = parent_entry.wait4(
+                ProcessWaitPid::from_syscall_argument(42),
+                UserVa::new(0x8000),
+                wait.0,
+                wait.1,
+            ) else {
+                panic!("reap return")
+            };
+            assert_eq!(result.raw(), 42);
+        }
+        if wait.1.raw() != 0 {
+            assert_eq!(
+                parent_entry.service.copies.last(),
+                Some(&LinuxWaitStatus::exited(7))
+            );
+        }
+        if wait.1.raw() > 1 {
+            let copies = host_test_support::take_signal_copies();
+            let usage = copies
+                .iter()
+                .find(|(address, _)| *address == wait.1)
+                .unwrap();
+            assert_eq!(usage.1.len(), carrick_syscall_abi::LINUX_RUSAGE_BYTES);
+            let expected: Vec<u8> = [1_i64, 250_000, 2, 500_000]
+                .into_iter()
+                .flat_map(i64::to_ne_bytes)
+                .collect();
+            assert_eq!(&usage.1[..32], &expected);
+            assert!(usage.1[32..].iter().all(|byte| *byte == 0));
+        }
         if signal_exit_continuation || exit_wake_contended.is_some() {
             let copied = parent_entry.service.copies.last().unwrap();
             assert_eq!(
