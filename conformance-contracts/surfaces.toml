@@ -292,6 +292,7 @@ contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.preemption-
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/scheduler.rs"
 contracts = [
+  "kernel.vcpu.shutdown-entry",
   "kernel.scheduler.host-wait-handoff",
   "kernel.scheduler.runnable-progress",
   "kernel.scheduler.preemption-lifecycle",
@@ -1809,7 +1810,7 @@ contracts = ["kernel.scheduler.runnable-progress"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/thread_ledger.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
+contracts = ["kernel.scheduler.runnable-progress", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/lifecycle.rs"
