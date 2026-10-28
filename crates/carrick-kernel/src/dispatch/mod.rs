@@ -2626,6 +2626,7 @@ fn write_termios2(
 /// handle `Result<(), MemoryError>` directly (typically because they
 /// have post-write bookkeeping that the `DispatchOutcome::Errno` shape
 /// would short-circuit). Same wire-size guarantee.
+#[cfg(test)]
 fn write_kernel_struct_raw<T: KernelAbi>(
     memory: &mut impl CurrentMmMemory,
     address: u64,

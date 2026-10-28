@@ -1383,7 +1383,9 @@ mod copyout_refusal_s3_tests {
         assert!(expected.len() > super::super::copyout::COPYOUT_MAX_BYTES);
         let mut memory = OwnerRefusingMemory::new(0x10000, 8192, 0xa5);
         assert_eq!(
-            dispatcher.fs_view().read_perf_event(&context, &mut memory, 0x10000, 8192, &state),
+            dispatcher
+                .fs_view()
+                .read_perf_event(&context, &mut memory, 0x10000, 8192, &state),
             DispatchOutcome::Returned {
                 value: expected.len() as i64
             }
@@ -1408,17 +1410,23 @@ mod copyout_refusal_s3_tests {
         let mut memory = OwnerRefusingMemory::new(0x10000, 16, 0xa5);
         let wait = memory.refuse_next();
         assert_eq!(
-            dispatcher.fs_view().read_perf_event(&context, &mut memory, 0x10000, 0, &state),
+            dispatcher
+                .fs_view()
+                .read_perf_event(&context, &mut memory, 0x10000, 0, &state),
             DispatchOutcome::errno(LINUX_ENOSPC)
         );
         assert_eq!(memory.prepares, 0);
         assert_eq!(
-            dispatcher.fs_view().read_perf_event(&context, &mut memory, 0x10000, 8, &state),
+            dispatcher
+                .fs_view()
+                .read_perf_event(&context, &mut memory, 0x10000, 8, &state),
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         );
         assert_eq!(memory.read_bytes(0x10000, 8).unwrap(), [0xa5; 8]);
         assert_eq!(
-            dispatcher.fs_view().read_perf_event(&context, &mut memory, 0xffff, 8, &state),
+            dispatcher
+                .fs_view()
+                .read_perf_event(&context, &mut memory, 0xffff, 8, &state),
             DispatchOutcome::errno(LINUX_EFAULT)
         );
     }
