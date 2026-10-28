@@ -240,6 +240,7 @@ pub(super) enum OwnerSupplyWait {
 /// The syscall operation to resume after an owner-memory dependency.
 /// A retained transfer cannot fall through to numeric syscall redispatch.
 pub(super) enum OwnedSyscallResume {
+    Completion(Box<carrick_kernel::kernel::continuation::OwnedCompletionCopyout>),
     CopyoutRedispatch,
     Ipc(carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation),
     Io(OwnedIoResume),
@@ -256,6 +257,10 @@ pub(super) fn owner_copyin_route(
     outcome: DispatchOutcome,
 ) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
     let (wait, resume) = match outcome {
+        DispatchOutcome::CompletionCopyoutSuspended(pending) => (
+            pending.wait().clone(),
+            OwnedSyscallResume::Completion(pending),
+        ),
         DispatchOutcome::WriteCopyInSuspended(pending) => (
             pending.wait().clone(),
             OwnedSyscallResume::Io(OwnedIoResume::PreparedWrite(pending)),
@@ -7059,6 +7064,88 @@ mod tests {
     use carrick_guest_mem::GuestMemory;
     use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn completed_wait_copyout_uses_the_existing_owner_resume_route() {
+        use carrick_guest_mem::{
+            CurrentMmMemory, GuestVa, MemoryError, MemoryPrepareError, UserMemoryVenue,
+        };
+        use carrick_kernel::kernel::continuation::{
+            ContinuationCompletion, GuestOutputRange, OwnerWaitCancellation,
+            fold_continuation_completion,
+        };
+        struct Refusing(carrick_el1_abi::PortalOwnerWait);
+        impl GuestMemory for Refusing {
+            fn user_memory_venue(&self) -> UserMemoryVenue {
+                UserMemoryVenue::Owner
+            }
+            fn prepare_write(
+                &mut self,
+                _: &[carrick_guest_mem::GuestWriteRange],
+            ) -> Result<Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>, MemoryPrepareError>
+            {
+                Err(MemoryPrepareError::OwnerWait(self.0))
+            }
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                unreachable!()
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                panic!("must prepare output")
+            }
+        }
+        impl CurrentMmMemory for Refusing {}
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mm = context.shared().mm().id();
+        let wait = unsafe {
+            carrick_el1_abi::PortalOwnerWait::from_owner(
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    carrick_el1_abi::ReservationMm::new(mm.raw()).unwrap(),
+                    NonZeroU64::new(1).unwrap(),
+                ),
+                carrick_el1_abi::PortalWaitCause::Editor,
+                7,
+            )
+        };
+        let completion = ContinuationCompletion::ReturnWithGuestWrites(
+            0,
+            vec![GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, mm.raw()).unwrap()],
+        );
+        let outcome =
+            fold_continuation_completion(completion, &dispatcher, &context, &mut Refusing(wait))
+                .unwrap()
+                .unwrap();
+        let (outcome, resume) = owner_copyin_route(outcome);
+        assert_eq!(
+            outcome,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        let Some(OwnedSyscallResume::Completion(pending)) = resume else {
+            panic!("lost completed wait ownership")
+        };
+        assert_eq!(
+            pending.wait(),
+            &carrick_guest_mem::MemoryReadWait::Owner(wait)
+        );
+        use carrick_el1_abi::Lifecycle;
+        context
+            .lifecycle_page()
+            .process_exit_custody()
+            .cancellation_authority()
+            .publish(
+                carrick_core::cancellation::ProcessCancellation::GroupExit,
+                || panic!("no effects"),
+            );
+        assert!(matches!(
+            super::super::owner_wait::OwnerWait::new((), OwnedSyscallResume::Completion(pending))
+                .settle(
+                    || carrick_kernel::kernel::continuation::owner_wait_cancellation(&context),
+                    |_| false
+                ),
+            super::super::owner_wait::Settlement::Cancelled(OwnerWaitCancellation::GroupExit)
+        ));
+    }
 
     #[test]
     fn owner_copyin_route_keeps_the_transfer_for_zone_resume() {

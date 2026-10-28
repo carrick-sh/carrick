@@ -7877,3 +7877,164 @@ fn terminal_action_cannot_be_folded_into_a_guest_syscall_result() {
         MemoryError::Unsupported,
     );
 }
+
+#[test]
+fn completion_owner_wait_during_group_exit_is_not_a_configuration_failure() {
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+    struct Refusing(carrick_el1_abi::PortalOwnerWait, usize);
+    impl GuestMemory for Refusing {
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            unreachable!()
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            self.1 += 1;
+            Err(MemoryError::OwnerWait(self.0))
+        }
+    }
+    impl CurrentMmMemory for Refusing {}
+    let (_kernel, context) = bootstrap(15_709);
+    let mm = context.shared().mm().id();
+    let wait = unsafe {
+        carrick_el1_abi::PortalOwnerWait::from_owner(
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                std::num::NonZeroU64::new(1).unwrap(),
+                carrick_el1_abi::ReservationMm::new(mm.raw()).unwrap(),
+                std::num::NonZeroU64::new(1).unwrap(),
+            ),
+            carrick_el1_abi::PortalWaitCause::Editor,
+            7,
+        )
+    };
+    let mut memory = Refusing(wait, 0);
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let completion = ContinuationCompletion::ReturnWithGuestWrites(
+        0,
+        vec![GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, mm.raw()).unwrap()],
+    );
+    use carrick_el1_abi::Lifecycle;
+    context
+        .lifecycle_page()
+        .process_exit_custody()
+        .cancellation_authority()
+        .publish(
+            carrick_core::cancellation::ProcessCancellation::GroupExit,
+            || panic!("no admitted effects"),
+        );
+    let result = fold_continuation_completion(completion, &dispatcher, &context, &mut memory);
+    assert!(
+        result.is_ok(),
+        "owner wait escaped completion folding: {result:?}"
+    );
+    assert_eq!(
+        memory.1, 0,
+        "terminal cancellation must precede memory access"
+    );
+    assert_eq!(
+        result.unwrap(),
+        Some(DispatchOutcome::OwnerCancelled(
+            OwnerWaitCancellation::GroupExit
+        ))
+    );
+}
+
+#[test]
+fn completion_owner_wait_retains_output_progress_and_original_result() {
+    use carrick_guest_mem::{GuestMemory, MemoryError, MemoryPrepareError, UserMemoryVenue};
+    struct Memory {
+        wait: carrick_el1_abi::PortalOwnerWait,
+        attempts: usize,
+        commits: Vec<(u64, usize)>,
+    }
+    struct Output<'a>(&'a mut Memory, u64, usize);
+    impl carrick_guest_mem::PreparedGuestWrite for Output<'_> {
+        fn commit(self: Box<Self>, bytes: &[&[u8]]) {
+            assert_eq!(bytes[0], vec![0; self.2]);
+            self.0.commits.push((self.1, self.2));
+        }
+    }
+    impl GuestMemory for Memory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            unreachable!()
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            panic!("owner completion must prepare output")
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[carrick_guest_mem::GuestWriteRange],
+        ) -> Result<Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>, MemoryPrepareError>
+        {
+            self.attempts += 1;
+            assert_eq!(ranges.len(), 1);
+            if self.attempts == 2 {
+                return Err(MemoryPrepareError::OwnerWait(self.wait));
+            }
+            let (address, len) = (ranges[0].address().raw(), ranges[0].len());
+            assert!(len <= 4096);
+            Ok(Box::new(Output(self, address, len)))
+        }
+    }
+    impl CurrentMmMemory for Memory {}
+    let (_kernel, context) = bootstrap(15_710);
+    let mm = context.shared().mm().id();
+    let wait = unsafe {
+        carrick_el1_abi::PortalOwnerWait::from_owner(
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                std::num::NonZeroU64::new(1).unwrap(),
+                carrick_el1_abi::ReservationMm::new(mm.raw()).unwrap(),
+                std::num::NonZeroU64::new(1).unwrap(),
+            ),
+            carrick_el1_abi::PortalWaitCause::Editor,
+            7,
+        )
+    };
+    for cancel in [false, true] {
+        let mut memory = Memory {
+            wait,
+            attempts: 0,
+            commits: Vec::new(),
+        };
+        let completion = ContinuationCompletion::ReturnWithGuestWrites(
+            23,
+            vec![GuestOutputRange::new(GuestVa::new(0x7fff), 5000, mm, mm.raw()).unwrap()],
+        );
+        let dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let Some(DispatchOutcome::CompletionCopyoutSuspended(pending)) =
+            fold_continuation_completion(completion, &dispatcher, &context, &mut memory).unwrap()
+        else {
+            panic!("must retain refused output")
+        };
+        assert_eq!(
+            pending.wait(),
+            &carrick_guest_mem::MemoryReadWait::Owner(wait)
+        );
+        assert_eq!(memory.commits, [(0x7fff, 1)]);
+        if cancel {
+            use carrick_el1_abi::Lifecycle;
+            context
+                .lifecycle_page()
+                .process_exit_custody()
+                .cancellation_authority()
+                .publish(
+                    carrick_core::cancellation::ProcessCancellation::GroupExit,
+                    || panic!("no effects held"),
+                );
+            assert_eq!(
+                pending.resume(&context, &mut memory),
+                DispatchOutcome::OwnerCancelled(OwnerWaitCancellation::GroupExit)
+            );
+            assert_eq!(memory.attempts, 2);
+            assert_eq!(memory.commits, [(0x7fff, 1)]);
+        } else {
+            assert_eq!(
+                pending.resume(&context, &mut memory),
+                DispatchOutcome::Returned { value: 23 }
+            );
+            assert_eq!(memory.attempts, 4);
+            assert_eq!(memory.commits, [(0x7fff, 1), (0x8000, 4096), (0x9000, 903)]);
+        }
+    }
+}

@@ -2281,3 +2281,24 @@ peer-wake callbacks under `Thread.execution` and
 `Scheduler.generation_transition`; that lock-order gap is outside this
 metadata-only repair. Signed `el1_files_exit_group_stress`, idle-vCPU behavior,
 IPC abandonment and release runtime/oracle acceptance remain director-owned.
+
+### Completed wait output during exit (#1009)
+
+`kernel.memory.owner-wait` includes zero output from a completed sleep or
+select wait. Completion folding retains the original result and the next
+unwritten byte across Editor, supply and physical waits. It must not restart
+the original syscall or convert an owner wait to a configuration failure.
+Each preparation covers at most one 4096-byte guest page; a permit and its
+process-effect custody are released before parking. Group-exit cancellation
+settles through the existing owner cancellation route without another output.
+
+The VM-free bindings `completion_owner_wait_during_group_exit_is_not_a_configuration_failure`
+and `completion_owner_wait_retains_output_progress_and_original_result` drive
+production completion folding with owner-refusing memory. Main returned
+`MemoryError::OwnerWait(Editor)` after group-exit publication; the runtime
+converted that error directly into `RuntimeError::Configuration`. The progress
+binding refuses the second of three page chunks and requires exactly four
+preparations, three non-overlapping commits and the original return value.
+Cancellation after that refusal requires zero further preparations or commits.
+These fixtures prove the boundary, not attribution of the signed stress event.
+Thirty signed `el1_files_exit_group_stress` runs remain director-owned on HVF.
