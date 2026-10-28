@@ -808,7 +808,7 @@ impl JobPolicy {
     }
 }
 
-fn admission_lock(dir: &Path) -> Result<File, ScalerError> {
+fn admission_lock(dir: &Path) -> Result<crate::lock_file::OwnedFileLock, ScalerError> {
     use std::os::fd::AsRawFd;
     let file = OpenOptions::new()
         .read(true)
@@ -818,7 +818,23 @@ fn admission_lock(dir: &Path) -> Result<File, ScalerError> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(file)
+    Ok(crate::lock_file::OwnedFileLock::from_locked(file))
+}
+fn acquire_controller_lock(dir: &Path) -> Result<crate::lock_file::OwnedFileLock, ScalerError> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(dir.join("controller.lock"))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(ScalerError::Guard("another controller owns this ledger"));
+    }
+    Ok(crate::lock_file::OwnedFileLock::from_locked(lock))
 }
 pub fn quiesce_guest(dir: &Path) -> Result<Assignment, ScalerError> {
     let mut lock = admission_lock(dir)?;
@@ -1480,5 +1496,47 @@ mod timeout_tests {
         ] {
             assert!(hook_run_sha("pull_request_review", &merge, webhook.as_ref()).is_err());
         }
+    }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn unrelated_fork_exec_cannot_extend_admission_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("admission.lock"), b"").unwrap();
+        let lock = admission_lock(temp.path()).unwrap();
+        let immediate = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                drop(lock);
+                let probe = File::open(temp.path().join("admission.lock")).unwrap();
+                let unlocked = probe.try_lock().is_ok();
+                let _ = probe.unlock();
+                unlocked
+            },
+            || {
+                let probe = File::open(temp.path().join("admission.lock")).unwrap();
+                assert!(probe.try_lock().is_ok());
+                let _ = probe.unlock();
+            },
+        );
+        assert!(
+            immediate,
+            "unrelated pre-exec child retained dropped admission.lock despite CLOEXEC"
+        );
+    }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn unrelated_fork_exec_cannot_extend_controller_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock = acquire_controller_lock(temp.path()).unwrap();
+        let immediate = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                drop(lock);
+                acquire_controller_lock(temp.path()).is_ok()
+            },
+            || assert!(acquire_controller_lock(temp.path()).is_ok()),
+        );
+        assert!(
+            immediate,
+            "unrelated pre-exec child retained dropped controller.lock despite CLOEXEC"
+        );
     }
 }

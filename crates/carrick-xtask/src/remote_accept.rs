@@ -1444,12 +1444,11 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
         // SAFETY: mkfifo reads a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c_gate.as_ptr(), 0o600) }, 0);
         // Fake `just`: blocks until the test opens the gate, then succeeds.
-        fs::write(
+        crate::lock_file::tests::write_test_executable(
             bin.join("just"),
             "#!/bin/sh\nread line < \"$CARRICK_TEST_GATE\"\nexit 0\n",
-        )
-        .unwrap();
-        fs::set_permissions(bin.join("just"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::Permissions::from_mode(0o755),
+        );
         let runs = root.join("gate-runs").to_string_lossy().into_owned();
         let lock_dir = root
             .join("gate-worktree.lock")

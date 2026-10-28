@@ -514,18 +514,7 @@ pub(super) fn controller(
     group: u64,
     one_job: bool,
 ) -> Result<(), ScalerError> {
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(dir.join("controller.lock"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(ScalerError::Guard("another controller owns this ledger"));
-    }
+    let _lock = super::acquire_controller_lock(dir)?;
     let gh = Github;
     let path = dir.join("mac-ledger.json");
     let mut ledger = MacLedger::load(&path)?;

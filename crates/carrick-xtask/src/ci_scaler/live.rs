@@ -7,7 +7,6 @@ use super::site::{Headroom, Site};
 use super::*;
 use serde_json::{Value, json};
 use std::net::Ipv4Addr;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
 #[derive(Clone, Deserialize)]
@@ -1695,18 +1694,7 @@ pub(super) fn controller(
         return Err(ScalerError::Guard("the pilot admission is one clone only"));
     }
     let pve = Pve::local()?;
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(dir.join("controller.lock"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(ScalerError::Guard("another controller owns this ledger"));
-    }
+    let _lock = super::acquire_controller_lock(dir)?;
     let inventory = pve.inventory()?;
     let contabo_standing =
         pve.site.node == site::CONTABO.node && matches!(admission, Admission::Standing);
