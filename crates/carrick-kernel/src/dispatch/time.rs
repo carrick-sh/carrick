@@ -1165,8 +1165,9 @@ impl SyscallDispatcher {
             let new = if new_limit.0 != 0 {
                 let bytes = match memory.read_bytes(new_limit.0, 16) {
                     Ok(b) => b,
-                    Err(_) => {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    Err(error) => {
+                        return Ok(super::copyout::CopyoutRefusal::from_read_error(error)
+                            .map_or_else(|| DispatchOutcome::errno(LINUX_EFAULT), |refusal| refusal.into_outcome()));
                     }
                 };
                 let rlim_cur = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
@@ -1851,6 +1852,59 @@ mod owner_sleep_tests {
 mod s3_review_tests {
     use super::*;
     use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+
+    #[test]
+    fn prlimit_input_refusal_waits_before_output_or_mutation() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x4000, 4096, 0xa5);
+        memory.seed(0x4000, carrick_abi::LinuxRlimit::new(1, 2).abi_bytes());
+        let before = context.task().rlimit(carrick_abi::LinuxResource::Core);
+        let wait = memory.refuse_next_read();
+        let request = SyscallRequest::new(
+            nr::PRLIMIT64.raw(),
+            SyscallArgs::from([
+                0,
+                carrick_abi::LINUX_RLIMIT_CORE as u64,
+                0x4000,
+                0x4100,
+                0,
+                0,
+            ]),
+        );
+        let reporter = crate::compat::CompatReporter::default();
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, request, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.prepares, 0);
+        assert_eq!(
+            context.task().rlimit(carrick_abi::LinuxResource::Core),
+            before
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, request, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            context.task().rlimit(carrick_abi::LinuxResource::Core),
+            carrick_abi::LinuxRlimit::new(1, 2)
+        );
+        let bad = SyscallRequest::new(
+            nr::PRLIMIT64.raw(),
+            SyscallArgs::from([0, carrick_abi::LINUX_RLIMIT_CORE as u64, 0x8000, 0, 0, 0]),
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, bad, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+    }
 
     #[test]
     fn prlimit_invalid_input_precedes_output_preparation() {

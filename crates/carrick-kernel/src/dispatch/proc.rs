@@ -4030,7 +4030,14 @@ fn process_vm_copy_self_with_context<M: CurrentMmMemory>(
         let dst_addr = dst[di].iov_base.wrapping_add(dofs);
         let bytes = match memory.read_bytes(src_addr, want_usize) {
             Ok(bytes) => bytes,
-            Err(_) => return fault(copied),
+            Err(error) => {
+                if copied == 0 {
+                    if let Some(refusal) = super::copyout::CopyoutRefusal::from_read_error(error) {
+                        return Err(refusal);
+                    }
+                }
+                return fault(copied);
+            }
         };
         let out = match prepare_proc_copyout(
             context,
@@ -8805,6 +8812,36 @@ mod copyout_refusal_s3_tests {
     }
 
     impl carrick_guest_mem::CurrentMmMemory for RefuseSecond {}
+
+    #[test]
+    fn process_vm_input_refusal_preserves_wait_and_destination() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(BASE, LEN, FILL);
+        memory.seed(IN_BUF, b"test");
+        let src = [LinuxIovec {
+            iov_base: IN_BUF,
+            iov_len: 4,
+        }];
+        let dst = [LinuxIovec {
+            iov_base: OUT_BUF,
+            iov_len: 4,
+        }];
+        let wait = memory.refuse_next_read();
+        assert_eq!(
+            process_vm_copy_self_with_context(Some(&context), &mut memory, &src, &dst)
+                .unwrap_err()
+                .into_outcome(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.prepares, 0);
+        assert_eq!(memory.read_bytes(OUT_BUF, 4).unwrap(), [FILL; 4]);
+        assert_eq!(
+            process_vm_copy_self_with_context(Some(&context), &mut memory, &src, &dst).unwrap(),
+            Ok(4)
+        );
+        assert_eq!(memory.read_bytes(OUT_BUF, 4).unwrap(), b"test");
+    }
 
     #[test]
     fn getrandom_later_refusal_returns_committed_prefix() {
