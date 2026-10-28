@@ -94,6 +94,9 @@ impl From<MintNonce> for String {
     }
 }
 impl MintNonce {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
     pub fn random() -> Result<Self, ScalerError> {
         let mut bytes = [0_u8; 16];
         File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -202,6 +205,8 @@ pub(super) trait MintApi {
     fn run(&self, run: RunId, attempt: u32) -> Result<Value, ScalerError>;
     fn configured(&self) -> bool;
     fn mint(&self, scope: MintScope) -> Result<AppToken, ScalerError>;
+    /// Best-effort, bounded revocation of a token this controller minted.
+    fn revoke(&self, token: &AppToken) -> Result<(), ScalerError>;
 }
 
 /// The per-clone transport: the PVE guest agent in production.
@@ -209,7 +214,10 @@ pub(super) trait MintExchange {
     /// The raw request, or `None` while the request file is empty.
     fn read(&mut self) -> Result<Option<Vec<u8>>, ScalerError>;
     fn respond(&mut self, response: &MintResponse) -> Result<(), ScalerError>;
-    fn clear(&mut self) -> Result<(), ScalerError>;
+    /// Empty the request file, under its lock, only while it still holds
+    /// `nonce` (always for `None`, an unparseable request), so a request the
+    /// tool server wrote after the read is never wiped.
+    fn clear(&mut self, nonce: Option<&MintNonce>) -> Result<(), ScalerError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,14 +229,55 @@ pub(super) enum MintServed {
     Refused(MintRefusal),
 }
 
-/// Serve one pending token request for ledger row `name`.
-pub(super) fn serve_mint(
-    api: &impl MintApi,
-    exchange: &mut impl MintExchange,
-    name: &str,
+/// Tokens this controller minted, held in memory per clone row (never in the
+/// ledger) until the clone's job ends. A controller restart forgets them;
+/// they then simply expire within the hour.
+#[derive(Default)]
+pub(super) struct HeldTokens(std::collections::BTreeMap<String, Vec<AppToken>>);
+impl HeldTokens {
+    fn hold(&mut self, name: &str, token: AppToken) {
+        self.0.entry(name.to_owned()).or_default().push(token);
+    }
+    /// Revoke every token held for a row that is no longer running (its job
+    /// finished and it is reaping, destroyed or gone). Failures are logged
+    /// and the token dropped; it expires on its own.
+    pub(super) fn revoke_finished(&mut self, api: &impl MintApi, ledger: &Ledger) -> usize {
+        let finished: Vec<String> = self
+            .0
+            .keys()
+            .filter(|name| {
+                !ledger
+                    .rows
+                    .iter()
+                    .any(|r| r.name == **name && r.state == State::Running)
+            })
+            .cloned()
+            .collect();
+        let mut revoked = 0;
+        for name in finished {
+            for token in self.0.remove(&name).unwrap_or_default() {
+                match api.revoke(&token) {
+                    Ok(()) => revoked += 1,
+                    Err(error) => eprintln!("row={name} token revocation failed: {error}"),
+                }
+            }
+        }
+        revoked
+    }
+    #[cfg(test)]
+    fn held(&self, name: &str) -> usize {
+        self.0.get(name).map_or(0, Vec::len)
+    }
+}
+
+/// Run `f` on a freshly refreshed ledger under the controller admission lock.
+/// Only ledger reads and saves happen here: guest I/O, GitHub reads and the
+/// mint itself run outside it, so a stalled clone or API cannot hold up
+/// admission or the lifecycle loop.
+fn admitted<T>(
     ledger: &mut Ledger,
-    path: &Path,
-) -> Result<MintServed, ScalerError> {
+    f: impl FnOnce(&mut Ledger) -> Result<T, ScalerError>,
+) -> Result<T, ScalerError> {
     let admission = assignment::Refusals::admission_lock(ledger);
     let _guard = admission
         .as_ref()
@@ -238,6 +287,30 @@ pub(super) fn serve_mint(
         })
         .transpose()?;
     ledger.refresh()?;
+    f(ledger)
+}
+
+/// The request-log and per-scope budget, checked before GitHub and again on
+/// the fresh row before the durable entry is written.
+fn budget_refusal(row: &Record, scope: MintScope, job: JobId) -> Option<MintRefusal> {
+    let minted = row
+        .mints
+        .iter()
+        .filter(|m| m.refused.is_none() && m.scope == Some(scope) && m.job == Some(job))
+        .count();
+    (row.mints.len() >= LOG_LIMIT || minted >= MINTS_PER_SCOPE)
+        .then_some(MintRefusal::BudgetExhausted)
+}
+
+/// Serve one pending token request for ledger row `name`.
+pub(super) fn serve_mint(
+    api: &impl MintApi,
+    exchange: &mut impl MintExchange,
+    name: &str,
+    ledger: &mut Ledger,
+    path: &Path,
+    held: &mut HeldTokens,
+) -> Result<MintServed, ScalerError> {
     let Some(bytes) = exchange.read()? else {
         return Ok(MintServed::Idle);
     };
@@ -248,69 +321,102 @@ pub(super) fn serve_mint(
         .as_ref()
         .and_then(|v| v["nonce"].as_str())
         .and_then(|n| MintNonce::try_from(n.to_owned()).ok());
-    let index = ledger
-        .rows
-        .iter()
-        .position(|r| r.name == name)
-        .ok_or(ScalerError::Guard("mint request has no ledger row"))?;
     let (Some(value), Some(nonce)) = (value, nonce) else {
-        exchange.clear()?;
+        exchange.clear(None)?;
         return Ok(MintServed::Ignored);
     };
-    if ledger.rows[index].mints.iter().any(|m| m.nonce == nonce) {
-        exchange.clear()?;
+    let row = admitted(ledger, |ledger| {
+        ledger
+            .rows
+            .iter()
+            .find(|r| r.name == name)
+            .cloned()
+            .ok_or(ScalerError::Guard("mint request has no ledger row"))
+    })?;
+    if row.mints.iter().any(|m| m.nonce == nonce) {
+        exchange.clear(Some(&nonce))?;
         return Ok(MintServed::Ignored);
     }
-    let row = ledger.rows[index].clone();
     let decision = if row.mints.len() >= LOG_LIMIT {
         Err(MintRefusal::BudgetExhausted)
     } else {
         decide(api, &row, value)?
     };
-    let refused = match decision {
-        Err(reason) => Some(reason),
-        Ok(_) if !api.configured() => Some(MintRefusal::Unconfigured),
-        Ok(_) => None,
+    // Durable before the mint: a crash afterwards cannot reset the budget.
+    let refused = admitted(ledger, |ledger| {
+        let row = ledger
+            .rows
+            .iter_mut()
+            .find(|r| r.name == name)
+            .ok_or(ScalerError::Guard("mint request has no ledger row"))?;
+        if row.mints.iter().any(|m| m.nonce == nonce) {
+            return Ok(None);
+        }
+        let refused = match decision {
+            Err(reason) => Some(reason),
+            Ok((scope, job)) => budget_refusal(row, scope, job)
+                .or((!api.configured()).then_some(MintRefusal::Unconfigured)),
+        };
+        if row.mints.len() < LOG_LIMIT {
+            row.mints.push(MintEntry {
+                nonce: nonce.clone(),
+                scope: decision.ok().map(|(scope, _)| scope),
+                job: decision.ok().map(|(_, job)| job),
+                refused,
+            });
+            ledger.save(path)?;
+        }
+        Ok(Some(refused))
+    })?;
+    let Some(refused) = refused else {
+        exchange.clear(Some(&nonce))?;
+        return Ok(MintServed::Ignored);
     };
-    if row.mints.len() < LOG_LIMIT {
-        ledger.rows[index].mints.push(MintEntry {
-            nonce: nonce.clone(),
-            scope: decision.ok().map(|(scope, _)| scope),
-            job: decision.ok().map(|(_, job)| job),
-            refused,
-        });
-        // Durable before the mint: a crash afterwards cannot reset the budget.
-        ledger.save(path)?;
-    }
     let outcome = match (decision, refused) {
         (Ok((scope, _)), None) => match api.mint(scope) {
             Ok(token) => Ok((scope, token)),
             Err(error) => {
-                eprintln!("vm row={name} {} mint failed: {error}", scope.label());
-                if let Some(entry) = ledger.rows[index].mints.last_mut() {
-                    entry.refused = Some(MintRefusal::MintFailed);
-                }
-                ledger.save(path)?;
+                eprintln!("row={name} {} mint failed: {error}", scope.label());
+                admitted(ledger, |ledger| {
+                    if let Some(entry) = ledger
+                        .rows
+                        .iter_mut()
+                        .filter(|r| r.name == name)
+                        .flat_map(|r| r.mints.iter_mut())
+                        .find(|m| m.nonce == nonce)
+                    {
+                        entry.refused = Some(MintRefusal::MintFailed);
+                    }
+                    ledger.save(path)
+                })?;
                 Err(MintRefusal::MintFailed)
             }
         },
         (_, Some(reason)) | (Err(reason), None) => Err(reason),
     };
     let (response, served) = match outcome {
-        Ok((scope, token)) => (
-            MintResponse::Minted {
-                nonce,
-                token: token.0,
-            },
-            MintServed::Minted(scope),
-        ),
+        Ok((scope, token)) => {
+            held.hold(name, token.clone());
+            (
+                MintResponse::Minted {
+                    nonce: nonce.clone(),
+                    token: token.0,
+                },
+                MintServed::Minted(scope),
+            )
+        }
         Err(reason) => (
-            MintResponse::Refused { nonce, reason },
+            MintResponse::Refused {
+                nonce: nonce.clone(),
+                reason,
+            },
             MintServed::Refused(reason),
         ),
     };
+    // Clear before answering: once the tool server sees the answer it may
+    // write its next request, which a later clear would wipe.
+    exchange.clear(Some(&nonce))?;
     exchange.respond(&response)?;
-    exchange.clear()?;
     Ok(served)
 }
 
@@ -337,13 +443,8 @@ fn decide(
     if key.run.0 != request.run_id || key.attempt != request.run_attempt || !full_sha(&sha) {
         return Ok(Err(MintRefusal::IdentityMismatch));
     }
-    let minted = row
-        .mints
-        .iter()
-        .filter(|m| m.refused.is_none() && m.scope == Some(scope) && m.job == Some(key.job))
-        .count();
-    if minted >= MINTS_PER_SCOPE {
-        return Ok(Err(MintRefusal::BudgetExhausted));
+    if let Some(refusal) = budget_refusal(row, scope, key.job) {
+        return Ok(Err(refusal));
     }
     let job = api.job(key.job)?;
     if job["id"].as_u64() != Some(key.job.0)
@@ -478,6 +579,35 @@ impl MintApi for AppMinter<'_> {
             scope,
         )
     }
+    fn revoke(&self, token: &AppToken) -> Result<(), ScalerError> {
+        let mut command = Command::new("curl");
+        command.args([
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--max-time",
+            "10",
+            "--config",
+            "-",
+            "--request",
+            "DELETE",
+            "https://api.github.com/installation/token",
+        ]);
+        execute(
+            &mut command,
+            revoke_config(token)?.as_bytes(),
+            Duration::from_secs(15),
+        )
+        .map(drop)
+    }
+}
+/// The token travels only in curl's stdin config, never in argv.
+fn revoke_config(token: &AppToken) -> Result<String, ScalerError> {
+    Ok(format!(
+        "header = {}\nheader = \"Accept: application/vnd.github+json\"\nheader = \"X-GitHub-Api-Version: 2022-11-28\"\n",
+        serde_json::to_string(&format!("Authorization: Bearer {}", token.secret()))?
+    ))
 }
 fn mint_config(jwt: &str, scope: MintScope) -> Result<String, ScalerError> {
     Ok(format!(
@@ -504,12 +634,27 @@ fn parse_minted(bytes: &[u8], scope: MintScope) -> Result<AppToken, ScalerError>
     let expected: Option<Vec<&str>> = grant["repositories"]
         .as_array()
         .map(|repos| repos.iter().filter_map(Value::as_str).collect());
-    if response["permissions"] != grant["permissions"] || repositories != expected {
+    if !granted_within(&response["permissions"], &grant["permissions"]) || repositories != expected
+    {
         return Err(ScalerError::Guard(
             "minted token scope differs from the fixed grant",
         ));
     }
     Ok(AppToken(token.to_owned()))
+}
+
+/// Every requested permission at exactly its requested level; the only
+/// extra GitHub may add is `metadata: read` (implied by repository access).
+fn granted_within(granted: &Value, requested: &Value) -> bool {
+    let (Some(granted), Some(requested)) = (granted.as_object(), requested.as_object()) else {
+        return false;
+    };
+    requested
+        .iter()
+        .all(|(name, level)| granted.get(name) == Some(level))
+        && granted.iter().all(|(name, level)| {
+            requested.contains_key(name) || (name == "metadata" && level == "read")
+        })
 }
 
 #[cfg(test)]
@@ -551,11 +696,22 @@ mod tests {
             .into_bytes()
     }
 
+    /// The admission lock the doubles probe: no guest, GitHub or mint call
+    /// may run while serve_mint holds it.
+    type Admission = std::sync::Arc<std::sync::Mutex<()>>;
+    fn assert_free(admission: &RefCell<Option<Admission>>, call: &str) {
+        if let Some(lock) = admission.borrow().as_ref() {
+            assert!(lock.try_lock().is_ok(), "admission held across {call}");
+        }
+    }
+
     struct Api {
         job_status: &'static str,
         configured: bool,
         mints: RefCell<Vec<MintScope>>,
         reads: RefCell<u32>,
+        revoked: RefCell<Vec<String>>,
+        admission: RefCell<Option<Admission>>,
     }
     impl Api {
         fn new() -> Self {
@@ -564,11 +720,14 @@ mod tests {
                 configured: true,
                 mints: RefCell::new(vec![]),
                 reads: RefCell::new(0),
+                revoked: RefCell::new(vec![]),
+                admission: RefCell::new(None),
             }
         }
     }
     impl MintApi for Api {
         fn job(&self, job: JobId) -> Result<Value, ScalerError> {
+            assert_free(&self.admission, "a GitHub job read");
             *self.reads.borrow_mut() += 1;
             Ok(
                 json!({"id":job.0,"run_id":41,"run_attempt":2,"runner_id":900,
@@ -576,6 +735,7 @@ mod tests {
             )
         }
         fn run(&self, run: RunId, attempt: u32) -> Result<Value, ScalerError> {
+            assert_free(&self.admission, "a GitHub run read");
             Ok(
                 json!({"id":run.0,"run_attempt":attempt,"head_sha":SHA,"head_branch":"main",
                 "event":"issues","path":DISPATCH_WORKFLOW,
@@ -588,51 +748,152 @@ mod tests {
             self.configured
         }
         fn mint(&self, scope: MintScope) -> Result<AppToken, ScalerError> {
+            assert_free(&self.admission, "the mint");
             self.mints.borrow_mut().push(scope);
-            Ok(AppToken(SECRET.into()))
+            Ok(AppToken(format!("{SECRET}{}", self.mints.borrow().len())))
+        }
+        fn revoke(&self, token: &AppToken) -> Result<(), ScalerError> {
+            self.revoked.borrow_mut().push(token.secret().to_owned());
+            Ok(())
         }
     }
 
+    /// The guest files as the tool server sees them: once it reads an
+    /// answer it writes `next` at once, as a back-to-back caller would.
     #[derive(Default)]
     struct Exchange {
         request: Option<Vec<u8>>,
+        next: Vec<Vec<u8>>,
         responses: Vec<String>,
         cleared: u32,
+        admission: RefCell<Option<Admission>>,
     }
     impl MintExchange for Exchange {
         fn read(&mut self) -> Result<Option<Vec<u8>>, ScalerError> {
+            assert_free(&self.admission, "a guest read");
             Ok(self.request.clone())
         }
         fn respond(&mut self, response: &MintResponse) -> Result<(), ScalerError> {
+            assert_free(&self.admission, "a guest response");
             self.responses.push(serde_json::to_string(response)?);
+            if !self.next.is_empty() {
+                self.request = Some(self.next.remove(0));
+            }
             Ok(())
         }
-        fn clear(&mut self) -> Result<(), ScalerError> {
-            self.request = None;
+        fn clear(&mut self, nonce: Option<&MintNonce>) -> Result<(), ScalerError> {
+            assert_free(&self.admission, "a guest clear");
+            let holds = |bytes: &Vec<u8>| {
+                nonce.is_none_or(|n| String::from_utf8_lossy(bytes).contains(&n.0))
+            };
+            if self.request.as_ref().is_some_and(holds) {
+                self.request = None;
+            }
             self.cleared += 1;
             Ok(())
         }
     }
 
-    fn serve(api: &Api, row: Record, bytes: Vec<u8>) -> (MintServed, Exchange, Ledger) {
-        let dir = tempfile::tempdir().unwrap();
+    const NAME: &str = "carrick-ci-41-2-77-1";
+    /// A ledger with a live publication, so the admission lock is real.
+    fn published(row: Record) -> (tempfile::TempDir, Ledger) {
         let mut ledger = Ledger {
             rows: vec![row],
             ..Ledger::default()
         };
+        ledger.publication = Some(assignment::Publication::new(ledger.clone()));
+        (tempfile::tempdir().unwrap(), ledger)
+    }
+    fn serve(api: &Api, row: Record, bytes: Vec<u8>) -> (MintServed, Exchange, Ledger) {
+        let (dir, mut ledger) = published(row);
+        let admission = assignment::Refusals::admission_lock(&ledger);
+        *api.admission.borrow_mut() = admission.clone();
         let mut exchange = Exchange {
             request: Some(bytes),
+            admission: RefCell::new(admission),
             ..Exchange::default()
         };
         let served = serve_mint(
             api,
             &mut exchange,
-            "carrick-ci-41-2-77-1",
+            NAME,
             &mut ledger,
             &dir.path().join("ledger.json"),
+            &mut HeldTokens::default(),
         )
         .unwrap();
         (served, exchange, ledger)
+    }
+    fn nonce_request(nonce: &str, scope: &str) -> Vec<u8> {
+        json!({"nonce":nonce,"scope":scope,"run_id":41,"run_attempt":2,"sha":SHA})
+            .to_string()
+            .into_bytes()
+    }
+
+    #[test]
+    fn back_to_back_requests_are_both_answered() {
+        let api = Api::new();
+        let (dir, mut ledger) = published(row());
+        let mut exchange = Exchange {
+            request: Some(nonce_request(NONCE, "board")),
+            next: vec![nonce_request(&"e".repeat(32), "publish")],
+            ..Exchange::default()
+        };
+        let mut held = HeldTokens::default();
+        let path = dir.path().join("ledger.json");
+        for expected in [MintScope::Board, MintScope::Publish] {
+            assert_eq!(
+                serve_mint(&api, &mut exchange, NAME, &mut ledger, &path, &mut held).unwrap(),
+                MintServed::Minted(expected)
+            );
+        }
+        assert_eq!(
+            *api.mints.borrow(),
+            vec![MintScope::Board, MintScope::Publish]
+        );
+        assert!(exchange.responses[1].contains(&"e".repeat(32)));
+        assert_eq!(held.held(NAME), 2);
+    }
+
+    #[test]
+    fn tokens_are_revoked_when_the_job_ends_and_not_before() {
+        let api = Api::new();
+        let (dir, mut ledger) = published(row());
+        let mut exchange = Exchange {
+            request: Some(request("publish", 41)),
+            ..Exchange::default()
+        };
+        let mut held = HeldTokens::default();
+        let path = dir.path().join("ledger.json");
+        serve_mint(&api, &mut exchange, NAME, &mut ledger, &path, &mut held).unwrap();
+        assert_eq!(held.revoke_finished(&api, &ledger), 0);
+        assert!(api.revoked.borrow().is_empty(), "revoked while running");
+        ledger.rows[0].state = State::Reaping;
+        assert_eq!(held.revoke_finished(&api, &ledger), 1);
+        assert_eq!(*api.revoked.borrow(), vec![format!("{SECRET}1")]);
+        assert_eq!(held.revoke_finished(&api, &ledger), 0, "revoked twice");
+        // A refused request holds nothing to revoke.
+        let mut api = Api::new();
+        api.job_status = "completed";
+        let (dir, mut ledger) = published(row());
+        let mut exchange = Exchange {
+            request: Some(request("board", 41)),
+            ..Exchange::default()
+        };
+        let mut held = HeldTokens::default();
+        serve_mint(
+            &api,
+            &mut exchange,
+            NAME,
+            &mut ledger,
+            &dir.path().join("ledger.json"),
+            &mut held,
+        )
+        .unwrap();
+        ledger.rows.clear();
+        assert_eq!(held.revoke_finished(&api, &ledger), 0);
+        let config = revoke_config(&AppToken(SECRET.into())).unwrap();
+        assert!(config.contains(&format!("Bearer {SECRET}")));
     }
 
     #[test]
@@ -768,6 +1029,21 @@ mod tests {
         let mut wider = ok.clone();
         wider["permissions"]["administration"] = "write".into();
         assert!(parse_minted(wider.to_string().as_bytes(), MintScope::Publish).is_err());
+        // GitHub adds metadata:read to repository grants; nothing else extra.
+        let mut metadata = ok.clone();
+        metadata["permissions"]["metadata"] = "read".into();
+        assert!(parse_minted(metadata.to_string().as_bytes(), MintScope::Publish).is_ok());
+        metadata["permissions"]["metadata"] = "write".into();
+        assert!(parse_minted(metadata.to_string().as_bytes(), MintScope::Publish).is_err());
+        let mut upgraded = ok.clone();
+        upgraded["permissions"]["pull_requests"] = "admin".into();
+        assert!(parse_minted(upgraded.to_string().as_bytes(), MintScope::Publish).is_err());
+        let mut missing = ok.clone();
+        missing["permissions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("contents");
+        assert!(parse_minted(missing.to_string().as_bytes(), MintScope::Publish).is_err());
         let board = json!({"token":SECRET,"permissions":{"organization_projects":"write"}});
         assert!(parse_minted(board.to_string().as_bytes(), MintScope::Board).is_ok());
         assert!(parse_minted(board.to_string().as_bytes(), MintScope::Publish).is_err());

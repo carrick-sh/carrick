@@ -94,12 +94,15 @@ How a token is requested:
    never from the request. `publish` is
    `{"repositories":["carrick"],"permissions":{"contents":"write","pull_requests":"write"}}`.
    `board` is `{"permissions":{"organization_projects":"write"}}`. It rejects
-   a minted token whose granted permissions differ from that grant.
+   a minted token unless it has every requested permission at exactly the
+   requested level; the only extra it accepts is the `metadata: read` that
+   GitHub adds to repository grants.
 4. The answer goes back as stdin of a root shell in the clone (never in a
    command line) into `/run/carrick-ci/token-response`. That file is runner-owned
    0600 in a root-owned directory, so the model accounts cannot read it and the
    runner cannot swap it for a link. The tool server reads it and erases it at
-   once, then keeps the token only in memory for at most 45 minutes.
+   once, then keeps the token only in memory for at most 45 minutes. The
+   controller revokes every token it minted for the clone once the job ends.
 
 The tool server waits at most 60 seconds for an answer. If the controller
 refuses, the channel is missing (any runner other than a ctb agent clone), the
@@ -109,8 +112,12 @@ with the controller's reason (for example `budget_exhausted` or
 `job_not_in_progress`) or `mint_unavailable` (`no_channel`, `no_assignment`,
 `timeout`, `malformed`). The outcome comment states the same reason. The board
 reports `unavailable` with that reason, and the run continues. The tool server
-remembers a refusal or a missing channel for 45 minutes and a timeout or
-failed mint for five, so a down controller costs one bounded wait per interval.
+remembers a decided refusal (identity mismatch, no assignment, scope, invalid
+request, finished job, exhausted budget) for 45 minutes. It asks again after
+five minutes when the channel was unavailable, the mint failed or the
+controller had no key, so a down controller costs one bounded wait per
+interval. Requests from one process are serialized, because they share one
+request file and one response file.
 
 The tool server uses the publish token only for the fixed-refspec branch push
 and PR creation or body PATCH, including restoration, and the board token only

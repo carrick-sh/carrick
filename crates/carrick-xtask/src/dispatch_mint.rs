@@ -65,51 +65,86 @@ struct Cached {
     at: Instant,
     result: Result<AppToken, MintFailure>,
 }
-fn cache() -> &'static std::sync::Mutex<Vec<Cached>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<Cached>>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+/// The process-wide token cache. `entries` is what redaction reads and is
+/// never held across a wait; `requests` serializes exchanges, because two
+/// concurrent requests through the one request/response file pair would
+/// overwrite and erase each other's answers.
+struct TokenCache {
+    entries: std::sync::Mutex<Vec<Cached>>,
+    requests: std::sync::Mutex<()>,
 }
+impl TokenCache {
+    const fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+            requests: std::sync::Mutex::new(()),
+        }
+    }
+    fn cached(
+        &self,
+        scope: MintScope,
+    ) -> Result<Option<Result<AppToken, MintFailure>>, MintFailure> {
+        let mut entries = self.entries.lock().map_err(|_| POISONED)?;
+        entries.retain(|c| c.at.elapsed() < if transient(&c.result) { RETRY } else { FRESH });
+        Ok(entries
+            .iter()
+            .find(|c| c.scope == scope)
+            .map(|c| c.result.clone()))
+    }
+    fn get(
+        &self,
+        scope: MintScope,
+        fetch: impl FnOnce() -> Result<AppToken, MintFailure>,
+    ) -> Result<AppToken, MintFailure> {
+        if let Some(result) = self.cached(scope)? {
+            return result;
+        }
+        let _request = self.requests.lock().map_err(|_| POISONED)?;
+        // Another caller may have fetched this scope while we waited.
+        if let Some(result) = self.cached(scope)? {
+            return result;
+        }
+        let result = fetch();
+        self.entries.lock().map_err(|_| POISONED)?.push(Cached {
+            scope,
+            at: Instant::now(),
+            result: result.clone(),
+        });
+        result
+    }
+    fn secrets(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|c| c.result.as_ref().ok().map(|t| t.secret().to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+const POISONED: MintFailure = MintFailure::Unavailable(MintUnavailable::Malformed);
+static CACHE: TokenCache = TokenCache::new();
 
 /// Every token this process minted, for diagnostic redaction and the
 /// artifact scan. Real installation tokens are also caught by their `ghs_`
 /// shape in later processes.
 pub(crate) fn minted_secrets() -> Vec<String> {
-    cache()
-        .lock()
-        .map(|cache| {
-            cache
-                .iter()
-                .filter_map(|c| c.result.as_ref().ok().map(|t| t.secret().to_owned()))
-                .collect()
-        })
-        .unwrap_or_default()
+    CACHE.secrets()
 }
 
-/// A token for `scope`, minted on demand. Refusals that cannot change during
-/// this job are remembered; a transient failure is asked again after [`RETRY`].
+/// A token for `scope`, minted on demand. A refusal that cannot change during
+/// the job is remembered for [`FRESH`]; an unavailable channel, a failed mint
+/// or an unconfigured controller is asked again after [`RETRY`].
 pub(crate) fn app_token(scope: MintScope) -> Result<AppToken, MintFailure> {
-    let poisoned = |_| MintFailure::Unavailable(MintUnavailable::Malformed);
-    {
-        let mut cache = cache().lock().map_err(poisoned)?;
-        cache.retain(|c| c.at.elapsed() < if transient(&c.result) { RETRY } else { FRESH });
-        if let Some(cached) = cache.iter().find(|c| c.scope == scope) {
-            return cached.result.clone();
-        }
-    }
-    // Not held across the bounded wait: redaction reads the cache meanwhile.
-    let result = request_token(scope);
-    cache().lock().map_err(poisoned)?.push(Cached {
-        scope,
-        at: Instant::now(),
-        result: result.clone(),
-    });
-    result
+    CACHE.get(scope, || request_token(scope))
 }
 fn transient(result: &Result<AppToken, MintFailure>) -> bool {
     matches!(
         result,
-        Err(MintFailure::Refused(MintRefusal::MintFailed)
-            | MintFailure::Unavailable(MintUnavailable::Timeout | MintUnavailable::Malformed))
+        Err(MintFailure::Unavailable(_)
+            | MintFailure::Refused(MintRefusal::MintFailed | MintRefusal::Unconfigured))
     )
 }
 
@@ -174,7 +209,9 @@ pub(crate) fn request(
     owner: Option<u32>,
 ) -> Result<AppToken, MintFailure> {
     let unavailable = MintFailure::Unavailable;
-    let mut response = open(state.join(RESPONSE_FILE))?;
+    // Fail fast without a channel; each poll reopens the answer so its lock
+    // is released (on close) between polls and the controller can write.
+    drop(open(state.join(RESPONSE_FILE))?);
     let binding = match crate::ci_scaler::read_policy(&state.join("approved-policy"), owner) {
         Ok(JobPolicy::Agent(binding)) => binding,
         _ => return Err(unavailable(MintUnavailable::NoAssignment)),
@@ -199,7 +236,7 @@ pub(crate) fn request(
     }
     let deadline = Instant::now() + wait;
     loop {
-        if let Some(answer) = take_answer(&mut response, &nonce)? {
+        if let Some(answer) = take_answer(&state.join(RESPONSE_FILE), &nonce)? {
             return answer.into_result().map_err(MintFailure::Refused);
         }
         if Instant::now() >= deadline {
@@ -213,7 +250,8 @@ pub(crate) fn request(
     }
 }
 /// Read and erase the answer under its lock; `None` until ours arrives.
-fn take_answer(file: &mut File, nonce: &MintNonce) -> Result<Option<MintResponse>, MintFailure> {
+fn take_answer(path: &Path, nonce: &MintNonce) -> Result<Option<MintResponse>, MintFailure> {
+    let file = &mut open(path.to_owned())?;
     lock(file)?;
     let mut bytes = Vec::new();
     file.rewind()
@@ -285,12 +323,105 @@ mod tests {
         assert_eq!(request.run_id, 41);
         assert_eq!(request.run_attempt, 2);
         assert_eq!(request.sha, SHA);
-        std::fs::write(
-            state.join(RESPONSE_FILE),
-            serde_json::to_vec(&respond(request.nonce)).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(state.join(REQUEST_FILE), "").unwrap();
+        // Same order and locks as the guest scripts: clear, then answer.
+        let mut file = open(state.join(REQUEST_FILE)).unwrap();
+        lock(&file).unwrap();
+        erase(&mut file).unwrap();
+        drop(file);
+        let mut file = open(state.join(RESPONSE_FILE)).unwrap();
+        lock(&file).unwrap();
+        erase(&mut file).unwrap();
+        file.write_all(&serde_json::to_vec(&respond(request.nonce)).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_callers_share_one_request_per_scope() {
+        let cache = std::sync::Arc::new(TokenCache::new());
+        let fetches = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let (cache, fetches) = (cache.clone(), fetches.clone());
+                std::thread::spawn(move || {
+                    cache
+                        .get(MintScope::Board, || {
+                            fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(100));
+                            Ok(AppToken::for_test("ghs_sharedFixture0123456789"))
+                        })
+                        .ok()
+                        .map(|t| t.secret().to_owned())
+                })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(
+                caller.join().unwrap().as_deref(),
+                Some("ghs_sharedFixture0123456789")
+            );
+        }
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(cache.secrets(), vec!["ghs_sharedFixture0123456789"]);
+    }
+
+    #[test]
+    fn concurrent_scopes_are_serialized_through_the_one_channel() {
+        let dir = channel();
+        let cache = std::sync::Arc::new(TokenCache::new());
+        let state = dir.path().to_owned();
+        let controller = std::thread::spawn(move || {
+            for _ in 0..2 {
+                answer(&state, |nonce| MintResponse::Minted {
+                    token: format!("ghs_{}", nonce.as_str()),
+                    nonce,
+                });
+            }
+        });
+        let callers: Vec<_> = [MintScope::Board, MintScope::Publish]
+            .into_iter()
+            .map(|scope| {
+                let (cache, state) = (cache.clone(), dir.path().to_owned());
+                std::thread::spawn(move || {
+                    cache
+                        .get(scope, || {
+                            request(&state, scope, Duration::from_secs(5), None)
+                        })
+                        .err()
+                })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(
+                caller.join().unwrap(),
+                None,
+                "a concurrent request was lost"
+            );
+        }
+        controller.join().unwrap();
+        assert_eq!(cache.secrets().len(), 2);
+    }
+
+    #[test]
+    fn unavailable_and_failed_mints_retry_but_decided_refusals_stay() {
+        for failure in [
+            MintFailure::Unavailable(MintUnavailable::NoChannel),
+            MintFailure::Unavailable(MintUnavailable::NoAssignment),
+            MintFailure::Unavailable(MintUnavailable::Timeout),
+            MintFailure::Refused(MintRefusal::MintFailed),
+            MintFailure::Refused(MintRefusal::Unconfigured),
+        ] {
+            assert!(transient(&Err(failure)), "{failure:?}");
+        }
+        for reason in [
+            MintRefusal::IdentityMismatch,
+            MintRefusal::NotAssigned,
+            MintRefusal::ScopeNotAllowed,
+            MintRefusal::InvalidRequest,
+            MintRefusal::JobNotInProgress,
+            MintRefusal::BudgetExhausted,
+        ] {
+            assert!(!transient(&Err(MintFailure::Refused(reason))), "{reason:?}");
+        }
     }
 
     #[test]
