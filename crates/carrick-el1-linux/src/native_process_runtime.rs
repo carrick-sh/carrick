@@ -5097,6 +5097,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .filter(|pending| {
                 core::ptr::eq(pending.caller.control(), self.control)
                     || (self.source.zone.record(self.record.id).is_native_owned()
+                        // A host-custody member (no pool entry) retires
+                        // through the host protocol below, never here.
+                        && self.control.entry().is_some()
                         && carrick_core::lifecycle::recorded_member_exit_kind(
                             self.control,
                             self.control.entry(),
@@ -5133,10 +5136,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .record(self.record.id)
                     .consume_owner_continuation();
             }
-            if let Err(error) = self.abandon_leaving_operation() {
-                return Some(self.run_failed(error.run_failure_reason()));
-            }
             if let Some(status) = self.pending_close_status() {
+                // A losing exit_group caller leaves: release its operation
+                // token before retirement. A wait or IPC handback below keeps
+                // its operation, which decides completion.
+                if let Err(error) = self.abandon_leaving_operation() {
+                    return Some(self.run_failed(error.run_failure_reason()));
+                }
                 return Some(match self.retire_closing_member(status) {
                     Ok(outcome) => outcome,
                     Err(error) => self.run_failed(error.run_failure_reason()),
@@ -5145,17 +5151,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // Wait/IPC handbacks re-enter the saved syscall instruction too.
             // Their owned operation, rather than a readiness scalar or a new
             // dispatch, decides completion below.
-            self.retire_thread_identity(self.calling_tid);
-            let Some(receipt) =
-                carrick_core::entry::retire_current(self.binding, self.source, self.record.id)
-            else {
-                return Some(self.run_failed(NativeProcessError::Quarantined.run_failure_reason()));
-            };
-            self.handoff = Some(receipt);
-            return Some(LifecycleOutcome::Transferred {
-                progress: carrick_core::Served::Idle,
-                result: SyscallResult::new(0),
-            });
         }
         self.resume_pending_wait()
     }

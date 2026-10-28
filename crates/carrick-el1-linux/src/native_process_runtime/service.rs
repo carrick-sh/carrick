@@ -54,6 +54,9 @@ impl PendingServiceReply {
 enum CarrierContinuation {
     Completed(SyscallResult),
     Parked(TaskKey),
+    /// A contended memory edit made no effect: the saved context re-enters
+    /// the syscall instruction, which runs the call again from the start.
+    Replay,
 }
 
 /// A staged host-file crossing: the ring-owned request/reply record (its
@@ -519,7 +522,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .transpose()?;
         let carrier_continuation =
             matches!(operation, ServiceOperation::CarrierWork { .. }).then(|| {
-                if self.owns_parked_operation() {
+                if replay {
+                    CarrierContinuation::Replay
+                } else if self.owns_parked_operation() {
                     CarrierContinuation::Parked(self.key)
                 } else {
                     CarrierContinuation::Completed(SyscallResult::new(
@@ -1591,6 +1596,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         Some(CarrierContinuation::Completed(result)) => {
                             Ok(NativeResume::Returned(result))
                         }
+                        // The parked context replays its own svc at EL0.
+                        Some(CarrierContinuation::Replay) => Ok(NativeResume::NoPending),
                         Some(CarrierContinuation::Parked(caller))
                             if caller == self.key && self.owns_parked_operation() =>
                         {
