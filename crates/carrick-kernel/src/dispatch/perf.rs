@@ -493,48 +493,6 @@ impl SyscallDispatcher {
         ))
     }
 
-    /// `read(2)` on a perf event fd: report the counter in the `read_format`
-    /// layout; a buffer smaller than the format needs is ENOSPC (verified
-    /// against the oracle). Reads never drain — a counting fd re-reports.
-    #[allow(dead_code)]
-    pub(super) fn read_perf_event<M: CurrentMmMemory>(
-        &self,
-        context: &crate::kernel::KernelContext,
-        memory: &mut M,
-        address: u64,
-        length: usize,
-        state: &Arc<PerfEventState>,
-    ) -> DispatchOutcome {
-        match self.perf_event_read_bytes(state, length) {
-            Ok(bytes) => {
-                let mut offset = 0;
-                while offset < bytes.len() {
-                    let chunk_len = (bytes.len() - offset).min(super::copyout::COPYOUT_MAX_BYTES);
-                    let Some(chunk_address) = address.checked_add(offset as u64) else {
-                        return DispatchOutcome::errno(LINUX_EFAULT);
-                    };
-                    let out = match super::copyout::prepare(
-                        context,
-                        memory,
-                        [Some(super::copyout::UserSlot::new(
-                            chunk_address,
-                            chunk_len,
-                        ))],
-                    ) {
-                        Ok(out) => out,
-                        Err(refusal) => return refusal.into_outcome(),
-                    };
-                    if out.commit([&bytes[offset..offset + chunk_len]]).is_err() {
-                        return DispatchOutcome::errno(LINUX_EFAULT);
-                    }
-                    offset += chunk_len;
-                }
-                DispatchOutcome::returned_len_or_errno(bytes.len())
-            }
-            Err(errno) => DispatchOutcome::errno(errno),
-        }
-    }
-
     pub(in crate::dispatch) fn perf_event_ioctl_out(
         &self,
         reporter: &CompatReporter,
@@ -576,43 +534,6 @@ impl SyscallDispatcher {
                 reporter.record(CompatEvent::unhandled_ioctl(fd, request, arg));
                 Err(LINUX_ENOTTY)
             }
-        }
-    }
-
-    /// perf event ioctls. Called from the `ioctl` handler once the fd is known
-    /// to be a perf event; unknown requests report unhandled and ENOTTY like
-    /// every other fd kind.
-    #[allow(dead_code)]
-    pub(super) fn perf_event_ioctl<M: CurrentMmMemory>(
-        &self,
-        cx: &mut SyscallCtx<M>,
-        fd: i32,
-        state: &Arc<PerfEventState>,
-        request: u64,
-        arg: u64,
-    ) -> DispatchOutcome {
-        let out = if request == LINUX_PERF_EVENT_IOC_ID {
-            match super::copyout::prepare(
-                cx.kernel,
-                cx.memory,
-                [Some(super::copyout::UserSlot::new(arg, 8))],
-            ) {
-                Ok(out) => Some(out),
-                Err(refusal) => return refusal.into_outcome(),
-            }
-        } else {
-            None
-        };
-        match self.perf_event_ioctl_out(cx.reporter, fd, state, request, arg) {
-            Ok(Some(bytes)) => match out {
-                Some(out) => match out.commit([&bytes]) {
-                    Ok(()) => DispatchOutcome::Returned { value: 0 },
-                    Err(fault) => fault.outcome(),
-                },
-                None => DispatchOutcome::errno(LINUX_EFAULT),
-            },
-            Ok(None) => DispatchOutcome::Returned { value: 0 },
-            Err(errno) => DispatchOutcome::errno(errno),
         }
     }
 
@@ -1339,6 +1260,77 @@ mod tests {
         assert_eq!(value, 0, "a reaped counter reports its frozen value");
     }
     #[test]
+    fn s3_review_real_perf_open_read_preserves_editor_refusal() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let mut dispatcher = SyscallDispatcher::new();
+        let fd = open_sw_fd(&mut dispatcher, &mut memory(), LINUX_PERF_COUNT_SW_DUMMY);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut output = OwnerRefusingMemory::new(MEM_BASE, 16384, 0xa5);
+        let wait = output.refuse_next();
+        let request = SyscallRequest::new(
+            carrick_abi::syscall::nr::READ.raw(),
+            SyscallArgs::from([fd as u64, OUT, 8, 0, 0, 0]),
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, request, &mut output, &CompatReporter::default())
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(output.read_bytes(OUT, 8).unwrap(), [0xa5; 8]);
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, request, &mut output, &CompatReporter::default())
+                .unwrap(),
+            DispatchOutcome::Returned { value: 8 }
+        );
+        assert_eq!(output.read_bytes(OUT, 8).unwrap(), [0; 8]);
+    }
+
+    #[test]
+    fn s3_review_real_perf_ioctl_preserves_editor_refusal() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let mut dispatcher = SyscallDispatcher::new();
+        let fd = open_sw_fd(&mut dispatcher, &mut memory(), LINUX_PERF_COUNT_SW_DUMMY);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut output = OwnerRefusingMemory::new(MEM_BASE, 16384, 0xa5);
+        let wait = output.refuse_next();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        carrick_abi::syscall::nr::IOCTL.raw(),
+                        SyscallArgs::from([fd as u64, LINUX_PERF_EVENT_IOC_ENABLE, 0, 0, 0, 0])
+                    ),
+                    &mut output,
+                    &CompatReporter::default()
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(output.prepares, 0);
+        let request = SyscallRequest::new(
+            carrick_abi::syscall::nr::IOCTL.raw(),
+            SyscallArgs::from([fd as u64, LINUX_PERF_EVENT_IOC_ID, OUT, 0, 0, 0]),
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, request, &mut output, &CompatReporter::default())
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(output.read_bytes(OUT, 8).unwrap(), [0xa5; 8]);
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, request, &mut output, &CompatReporter::default())
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_ne!(output.read_bytes(OUT, 8).unwrap(), [0xa5; 8]);
+    }
+
+    #[test]
     fn confined_policy_denies_perf_event_open_with_eperm() {
         // Under the Docker default-profile model the syscall is EPERM at the
         // dispatch seam — the handler's honest behavior is unconfined-only,
@@ -1391,7 +1383,7 @@ mod copyout_refusal_s3_tests {
         assert!(expected.len() > super::super::copyout::COPYOUT_MAX_BYTES);
         let mut memory = OwnerRefusingMemory::new(0x10000, 8192, 0xa5);
         assert_eq!(
-            dispatcher.read_perf_event(&context, &mut memory, 0x10000, 8192, &state),
+            dispatcher.fs_view().read_perf_event(&context, &mut memory, 0x10000, 8192, &state),
             DispatchOutcome::Returned {
                 value: expected.len() as i64
             }
@@ -1416,17 +1408,17 @@ mod copyout_refusal_s3_tests {
         let mut memory = OwnerRefusingMemory::new(0x10000, 16, 0xa5);
         let wait = memory.refuse_next();
         assert_eq!(
-            dispatcher.read_perf_event(&context, &mut memory, 0x10000, 0, &state),
+            dispatcher.fs_view().read_perf_event(&context, &mut memory, 0x10000, 0, &state),
             DispatchOutcome::errno(LINUX_ENOSPC)
         );
         assert_eq!(memory.prepares, 0);
         assert_eq!(
-            dispatcher.read_perf_event(&context, &mut memory, 0x10000, 8, &state),
+            dispatcher.fs_view().read_perf_event(&context, &mut memory, 0x10000, 8, &state),
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         );
         assert_eq!(memory.read_bytes(0x10000, 8).unwrap(), [0xa5; 8]);
         assert_eq!(
-            dispatcher.read_perf_event(&context, &mut memory, 0xffff, 8, &state),
+            dispatcher.fs_view().read_perf_event(&context, &mut memory, 0xffff, 8, &state),
             DispatchOutcome::errno(LINUX_EFAULT)
         );
     }

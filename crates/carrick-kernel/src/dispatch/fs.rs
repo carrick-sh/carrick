@@ -1133,6 +1133,7 @@ impl<'a> FsView<'a> {
 
     pub(super) fn read_perf_event<M: CurrentMmMemory>(
         &self,
+        context: &crate::kernel::KernelContext,
         memory: &mut M,
         address: u64,
         length: usize,
@@ -1140,18 +1141,8 @@ impl<'a> FsView<'a> {
     ) -> DispatchOutcome {
         match self.cross.perf_event_read_bytes(state, length) {
             Ok(bytes) => {
-                let context = self.capture_one_task_context().or_else(|_| {
-                    let binding = self.kernel_binding.read();
-                    binding
-                        .capture_threads()?
-                        .pop()
-                        .ok_or(crate::kernel::KernelError::UnknownTask(binding.task_id()))
-                });
-                let Ok(context) = context else {
-                    return DispatchOutcome::errno(LINUX_EFAULT);
-                };
                 Self::copyout_bytes(
-                    &context,
+                    context,
                     memory,
                     address,
                     &bytes,
