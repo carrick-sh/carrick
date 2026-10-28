@@ -1140,15 +1140,13 @@ impl<'a> FsView<'a> {
         state: &Arc<super::perf::PerfEventState>,
     ) -> DispatchOutcome {
         match self.cross.perf_event_read_bytes(state, length) {
-            Ok(bytes) => {
-                Self::copyout_bytes(
-                    context,
-                    memory,
-                    address,
-                    &bytes,
-                    DispatchOutcome::returned_len_or_errno(bytes.len()),
-                )
-            }
+            Ok(bytes) => Self::copyout_bytes(
+                context,
+                memory,
+                address,
+                &bytes,
+                DispatchOutcome::returned_len_or_errno(bytes.len()),
+            ),
             Err(errno) => DispatchOutcome::errno(errno),
         }
     }

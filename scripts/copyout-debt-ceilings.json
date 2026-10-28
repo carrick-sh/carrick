@@ -6,6 +6,10 @@
       "ceiling": 2
     },
     {
+      "path": "crates/carrick-kernel/src/dispatch/format_time.rs",
+      "ceiling": 1
+    },
+    {
       "path": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
       "ceiling": 2
     },
@@ -43,7 +47,7 @@
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "ceiling": 7
+      "ceiling": 6
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/mqueue.rs",
