@@ -277,6 +277,9 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
+        if address.raw() == 1 {
+            return Err(NativeProcessError::Fault);
+        }
         if let Some(error) = self.child_copy_error {
             return Err(error);
         }

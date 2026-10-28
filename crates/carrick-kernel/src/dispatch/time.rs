@@ -1507,16 +1507,7 @@ pub(super) fn rusage_from(
     maxrss_bytes: u64,
     majflt: u64,
 ) -> LinuxRusage {
-    let timeval = |us: u64| crate::linux_abi::LinuxTimeval {
-        tv_sec: (us / 1_000_000) as i64,
-        tv_usec: (us % 1_000_000) as i64,
-    };
-    let mut ru = LinuxRusage::zeroed();
-    ru.ru_utime = timeval(user_us);
-    ru.ru_stime = timeval(system_us);
-    ru.ru_maxrss = (maxrss_bytes / 1024) as i64;
-    ru.ru_majflt = majflt as i64;
-    ru
+    LinuxRusage::from_accounting(user_us, system_us, maxrss_bytes, majflt)
 }
 
 /// Render an interval-timer's state as an `itimerval`, computing the time

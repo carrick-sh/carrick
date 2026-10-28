@@ -1842,6 +1842,25 @@ const _: () =
     assert!(core::mem::size_of::<LinuxRusage>() == carrick_syscall_abi::LINUX_RUSAGE_BYTES);
 
 impl LinuxRusage {
+    /// Render the shared process accounting counters in the Linux wire format.
+    pub const fn from_accounting(
+        user_us: u64,
+        system_us: u64,
+        maxrss_bytes: u64,
+        majflt: u64,
+    ) -> Self {
+        let mut usage = Self::zeroed();
+        usage.ru_utime =
+            LinuxTimeval::new((user_us / 1_000_000) as i64, (user_us % 1_000_000) as i64);
+        usage.ru_stime = LinuxTimeval::new(
+            (system_us / 1_000_000) as i64,
+            (system_us % 1_000_000) as i64,
+        );
+        usage.ru_maxrss = (maxrss_bytes / 1024) as i64;
+        usage.ru_majflt = majflt as i64;
+        usage
+    }
+
     pub const fn zeroed() -> Self {
         Self {
             ru_utime: LinuxTimeval::new(0, 0),
