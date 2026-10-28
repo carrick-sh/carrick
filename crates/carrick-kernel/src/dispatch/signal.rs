@@ -1170,13 +1170,33 @@ impl<'a> SignalView<'a> {
         if length < SIGINFO_LEN {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
-        let max = length / SIGINFO_LEN;
-        let out = self.take_signalfd_bytes(context, tid, mask, max);
+        let destination = match crate::dispatch::copyout::prepare_array(
+            context,
+            memory,
+            carrick_guest_mem::GuestVa::new(address),
+            length / SIGINFO_LEN,
+            SIGINFO_LEN,
+        ) {
+            Ok(out) => out,
+            Err(refusal) => return refusal.into_outcome(),
+        };
+        if destination.records() == 0 {
+            let pending = Self::required_signal_thread(context, tid)
+                .signal_state()
+                .pending()
+                .union(context.shared().pending_signals().present());
+            return DispatchOutcome::errno(if pending.intersect(mask).is_empty() {
+                LINUX_EAGAIN
+            } else {
+                LINUX_EFAULT
+            });
+        }
+        let out = self.take_signalfd_bytes(context, tid, mask, destination.records());
         if out.is_empty() {
             return DispatchOutcome::errno(LINUX_EAGAIN);
         }
-        if memory.write_bytes(address, &out).is_err() {
-            return DispatchOutcome::errno(LINUX_EFAULT);
+        if let Err(fault) = destination.commit(&out) {
+            return fault.outcome();
         }
         DispatchOutcome::returned_len_or_errno(out.len())
     }
@@ -1948,7 +1968,9 @@ impl<'a> SignalView<'a> {
                 if on_altstack {
                     current.ss_flags |= LINUX_SS_ONSTACK as i32;
                 }
-                memory.write_bytes(old_ss, current.abi_bytes())?;
+                let outcome = crate::dispatch::copyout::copyout_record(cx.kernel, memory, old_ss, &current,
+                    DispatchOutcome::Returned { value: 0 });
+                if !matches!(outcome, DispatchOutcome::Returned { .. }) { return Ok(outcome); }
             }
 
             if ss != 0 {
@@ -2092,9 +2114,9 @@ impl<'a> SignalView<'a> {
             };
             if old_action != 0 {
                 let prev = Self::signal_action_static(cx.kernel, signum);
-                if write_kernel_struct_raw(memory, old_action, &prev).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
+                let outcome = crate::dispatch::copyout::copyout_record(cx.kernel, memory, old_action, &prev,
+                    DispatchOutcome::Returned { value: 0 });
+                if !matches!(outcome, DispatchOutcome::Returned { .. }) { return Ok(outcome); }
             }
             if let Some(sa) = new_sa {
                 Self::install_signal_action(cx.kernel, signum, sa);
@@ -2163,12 +2185,10 @@ impl<'a> SignalView<'a> {
             } else {
                 None
             };
-            if old_set != 0
-                && memory
-                    .write_bytes(old_set, &previous_mask.raw().to_le_bytes())
-                    .is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            if old_set != 0 {
+                let outcome = crate::dispatch::copyout::copyout_bytes(cx.kernel, memory, carrick_guest_mem::GuestVa::new(old_set),
+                    &previous_mask.raw().to_le_bytes(), DispatchOutcome::Returned { value: 0 });
+                if !matches!(outcome, DispatchOutcome::Returned { .. }) { return Ok(outcome); }
             }
             if let Some(mask) = new_mask {
                 this.restore_signal_mask(cx.kernel, tid, mask);
@@ -2193,13 +2213,8 @@ impl<'a> SignalView<'a> {
                 .signal_state()
                 .pending()
                 .union(cx.kernel.shared().pending_signals().present());
-            if memory
-                .write_bytes(set_ptr, &pending.raw().to_le_bytes())
-                .is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(crate::dispatch::copyout::copyout_bytes(cx.kernel, memory, carrick_guest_mem::GuestVa::new(set_ptr),
+                &pending.raw().to_le_bytes(), DispatchOutcome::Returned { value: 0 }))
         }
 
         /// rt_sigtimedwait(set_ptr, info_ptr, timeout_ptr, sigset_size): wait for signals.
@@ -2235,11 +2250,15 @@ impl<'a> SignalView<'a> {
 
             this.drain_xsignals_process_directed(cx.kernel);
             let memory = &mut *cx.memory;
+            let out = match crate::dispatch::copyout::prepare(cx.kernel, memory,
+                [crate::dispatch::copyout::UserSlot::optional(info_ptr, 128)]) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
             if let Some(pending) = this.take_pending_in_from(cx.kernel, tid, wait_set) {
                 return Ok(rt_sigtimedwait_deliver(
                     this.cross.host_signal(),
-                    memory,
-                    info_ptr,
+                    out,
                     pending.signum,
                     pending.siginfo,
                 ));
@@ -2250,8 +2269,7 @@ impl<'a> SignalView<'a> {
                 let queued = this.take_pending_siginfo(cx.kernel, tid, signum);
                 return Ok(rt_sigtimedwait_deliver(
                     this.cross.host_signal(),
-                    memory,
-                    info_ptr,
+                    out,
                     signum,
                     queued,
                 ));
@@ -3222,14 +3240,13 @@ fn install_host_handlers_for_wait_set(
 /// zeroed siginfo carrying just si_signo. The kernel re-stamps si_signo. (M9)
 fn rt_sigtimedwait_deliver(
     host_signal: &dyn carrick_hal::HostSignalBridge,
-    memory: &mut impl CurrentMmMemory,
-    info_ptr: u64,
+    out: crate::dispatch::copyout::PreparedCopyout<'_, impl CurrentMmMemory, 1>,
     signum: i32,
     queued: Option<LinuxSiginfo>,
 ) -> DispatchOutcome {
     #[cfg(not(test))]
     let _ = host_signal;
-    if info_ptr != 0 {
+    if out.capacity(0) != 0 {
         // No carrick-queued payload (the host-kill routed path): synthesize the
         // SI_USER siginfo from the recorded last sender, exactly as async
         // delivery (`deliver_pending_signal`) does — LTP tse_unmasked_matching
@@ -3252,8 +3269,8 @@ fn rt_sigtimedwait_deliver(
         // fault; LTP tse_bad_address). Swallowing it and returning the signum
         // made glibc's sigwaitinfo copy its own buffer to the bad pointer in
         // USERSPACE — killing the guest with SIGSEGV where Linux returns -1.
-        if memory.write_bytes(info_ptr, si.as_bytes()).is_err() {
-            return DispatchOutcome::errno(LINUX_EFAULT);
+        if let Err(fault) = out.commit([si.as_bytes()]) {
+            return fault.outcome();
         }
     }
     DispatchOutcome::returned_i32(signum)
@@ -3626,6 +3643,64 @@ pub(crate) fn bootstrap_signal_send_as(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn s1_signal_copyout_refusal_preserves_pending_signal() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use crate::dispatch::{CompatReporter, SyscallArgs, SyscallDispatcher, SyscallRequest};
+        for signalfd in [true, false] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let tid = context.thread().registry_id();
+            let mask = SigSet::from_raw(1 << (34 - 1));
+            dispatcher.mark_signal_pending(&context, tid, 34);
+            let mut memory = OwnerRefusingMemory::new(0x1000, 0x1000, 0xa5);
+            memory.seed(0x1000, &mask.raw().to_le_bytes());
+            let wait = memory.refuse_next();
+            let request = SyscallRequest::new(137, SyscallArgs::from([0x1000, 0x1100, 0, 8, 0, 0]));
+            let result = if signalfd {
+                dispatcher.read_signalfd(&context, &mut memory, 0x1100, 128, mask, tid)
+            } else {
+                dispatcher
+                    .dispatch(&context, request, &mut memory, &CompatReporter::default())
+                    .unwrap()
+            };
+            assert_eq!(
+                result,
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(memory.inner.read_bytes(0x1100, 128).unwrap(), [0xa5; 128]);
+            let result = if signalfd {
+                dispatcher.read_signalfd(&context, &mut memory, 0x1100, 128, mask, tid)
+            } else {
+                dispatcher
+                    .dispatch(&context, request, &mut memory, &CompatReporter::default())
+                    .unwrap()
+            };
+            assert_eq!(
+                result,
+                DispatchOutcome::Returned {
+                    value: if signalfd { 128 } else { 34 }
+                }
+            );
+            assert_eq!(
+                u32::from_le_bytes(
+                    memory
+                        .inner
+                        .read_bytes(0x1100, 4)
+                        .unwrap()
+                        .try_into()
+                        .unwrap()
+                ),
+                34
+            );
+            assert!(
+                dispatcher
+                    .take_pending_in_from(&context, tid, mask)
+                    .is_none()
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -19,6 +19,7 @@ use carrick_abi::{
 
 use super::support::*;
 use super::*;
+use crate::dispatch::copyout::{self, PreparedArrayOut};
 use crate::dispatch::{
     CurrentMmMemory, DispatchError, DispatchOutcome, Fd, FdWaitCompletion, GuestPtr, HostFd,
     OpenDescription, OpenFile, SyscallCtx, SyscallRequest,
@@ -146,12 +147,36 @@ fn zone_epoll_wait_fds(
     )
 }
 
+/// Serialize both guest ABI layouts into the already secured destination.
+fn write_epoll_events<M: CurrentMmMemory>(
+    out: PreparedArrayOut<'_, M>,
+    ready: &[LinuxEpollEvent],
+    guest_abi: LinuxGuestAbi,
+) -> Result<DispatchOutcome, DispatchError> {
+    let mut bytes = Vec::new();
+    for event in ready {
+        match guest_abi {
+            LinuxGuestAbi::Aarch64 => bytes.extend_from_slice(event.abi_bytes()),
+            LinuxGuestAbi::X86_64 => {
+                let wire = LinuxX8664EpollEvent {
+                    events: event.events,
+                    data: event.data,
+                };
+                bytes.extend_from_slice(wire.abi_bytes());
+            }
+        }
+    }
+    match out.commit(&bytes) {
+        Ok(()) => Ok(DispatchOutcome::returned_len(ready.len())?),
+        Err(fault) => Ok(fault.outcome()),
+    }
+}
+
 /// Write the zone reports, then the host reports, as one `epoll_wait`
 /// result. An unwritable buffer reports nothing (`EFAULT`) and queues the
 /// zone items again, as Linux re-queues items whose copy failed.
 fn deliver_epoll_reports<M: CurrentMmMemory>(
-    memory: &mut M,
-    events_address: u64,
+    out: PreparedArrayOut<'_, M>,
     guest_abi: LinuxGuestAbi,
     take: &ZoneTake,
     host: Vec<LinuxEpollEvent>,
@@ -170,7 +195,7 @@ fn deliver_epoll_reports<M: CurrentMmMemory>(
         all.extend(host);
         (all, &take.taken[take.taken.len()..])
     };
-    let outcome = write_epoll_events(memory, events_address, &all, guest_abi)?;
+    let outcome = write_epoll_events(out, &all, guest_abi)?;
     if let Some(zone) = &take.zone {
         if matches!(outcome, DispatchOutcome::Errno { .. }) {
             zone.restore(&take.taken);
@@ -1313,8 +1338,74 @@ impl<'a> NetView<'a> {
     fn epoll_pwait_wait_core<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
-        args: EpollPwaitWaitArgs,
+        mut args: EpollPwaitWaitArgs,
+        context: &crate::kernel::KernelContext,
     ) -> Result<DispatchOutcome, DispatchError> {
+        if !args.open_file.description.is_epoll() {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        }
+        let event_size = match args.guest_abi {
+            LinuxGuestAbi::Aarch64 => LinuxEpollEvent::ABI_SIZE,
+            LinuxGuestAbi::X86_64 => LinuxX8664EpollEvent::ABI_SIZE,
+        };
+        let out = match copyout::prepare_array(
+            context,
+            memory,
+            carrick_guest_mem::GuestVa::new(args.events_address),
+            args.max_events,
+            event_size,
+        ) {
+            Ok(out) => out,
+            Err(refusal) => return Ok(refusal.into_outcome()),
+        };
+        if out.records() == 0 {
+            // An invalid destination must not drain host edges or disarm an
+            // item. A timeout with no ready source never accesses the buffer.
+            if self.epoll_ready_events(args.epfd, LINUX_EPOLLIN) != 0 {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            if args.timeout_ms == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            let (kq_fd, zoned) = args
+                .open_file
+                .description
+                .inspect_kind(|open| match open {
+                    OpenDescription::Epoll { kqueue, zone, .. } => {
+                        Some((kqueue.poll_fd(), zone.is_some()))
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .ok_or(LINUX_EINVAL)?;
+            let files = self.captured_file_table();
+            let fds = if zoned {
+                zone_epoll_wait_fds(
+                    &files,
+                    args.epfd,
+                    kq_fd,
+                    carrick_abi::LinuxPollEvents::IN,
+                    &[],
+                )
+            } else {
+                WaitFds::raw_one(kq_fd, libc::POLLIN).with_redispatch_and_watched_slots(
+                    &files,
+                    [args.epfd],
+                    [],
+                )
+            };
+            return Ok(DispatchOutcome::WaitOnFds {
+                fds: match fds {
+                    Ok(fds) => fds,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                },
+                timeout: (args.timeout_ms >= 0)
+                    .then(|| Duration::from_millis(args.timeout_ms as u64)),
+                sig_mask: args.sig_mask,
+                completion: FdWaitCompletion::Poll { on_timeout: 0 },
+            });
+        }
+        args.max_events = out.records();
         let zone = args
             .open_file
             .description
@@ -1324,7 +1415,7 @@ impl<'a> NetView<'a> {
             })
             .flatten();
         let Some(zone) = zone else {
-            return self.epoll_pwait_host_core(memory, args, ZoneTake::default());
+            return self.epoll_pwait_host_core(out, args, ZoneTake::default());
         };
         let harvested = zone.harvest(args.max_events);
         // Mixed sets alternate which half reports first (see `ZoneTake`).
@@ -1342,22 +1433,16 @@ impl<'a> NetView<'a> {
             || (harvested.host_items == 0 && !take.events.is_empty())
         {
             crate::probes::epoll_result(args.epfd, take.events.len() as i32, 0, args.timeout_ms, 0);
-            return deliver_epoll_reports(
-                memory,
-                args.events_address,
-                args.guest_abi,
-                &take,
-                Vec::new(),
-            );
+            return deliver_epoll_reports(out, args.guest_abi, &take, Vec::new());
         }
-        self.epoll_pwait_host_core(memory, args, take)
+        self.epoll_pwait_host_core(out, args, take)
     }
 
-    // core stays byte-for-byte identical (one pre-existing unused destructure).
+    // Destination admission is shared by the host and zone halves.
     #[allow(unused_variables)]
     fn epoll_pwait_host_core<M: CurrentMmMemory>(
         &self,
-        memory: &mut M,
+        out: PreparedArrayOut<'_, M>,
         args: EpollPwaitWaitArgs,
         take: ZoneTake,
     ) -> Result<DispatchOutcome, DispatchError> {
@@ -1405,7 +1490,7 @@ impl<'a> NetView<'a> {
                 timeout_ms,
                 0,
             );
-            return deliver_epoll_reports(memory, events_address, guest_abi, &take, ready);
+            return deliver_epoll_reports(out, guest_abi, &take, ready);
         }
 
         // Multiplexer-backed readiness (kqueue on macOS, epoll on Linux). The
@@ -2366,7 +2451,7 @@ impl<'a> NetView<'a> {
                 timeout_ms,
                 0,
             );
-            deliver_epoll_reports(memory, events_address, guest_abi, &take, ready)
+            deliver_epoll_reports(out, guest_abi, &take, ready)
         }
     }
 }
@@ -3084,6 +3169,221 @@ mod nested_epoll_readiness_tests {
             0,
             "outer epoll must not report ready after inner epoll description is closed"
         );
+    }
+
+    #[test]
+    fn s1_epoll_refusal_keeps_pipe_bytes_and_pending_report() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let mut dispatcher = SyscallDispatcher::new();
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut setup = LinearMemory::new(0x1000, vec![0; 0x2000]);
+        let epfd = create_epoll(&mut dispatcher, &kernel, &mut setup, &reporter);
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &kernel,
+                    SyscallRequest::new(59, SyscallArgs::from([0x1800, 0, 0, 0, 0, 0])),
+                    &mut setup,
+                    &reporter
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let fds = setup.read_bytes(0x1800, 8).unwrap();
+        let reader = i32::from_le_bytes(fds[..4].try_into().unwrap());
+        let writer = i32::from_le_bytes(fds[4..].try_into().unwrap());
+        setup.write_bytes(0x1900, b"pipe").unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &kernel,
+                    SyscallRequest::new(64, SyscallArgs::from([writer as u64, 0x1900, 4, 0, 0, 0])),
+                    &mut setup,
+                    &reporter
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        write_guest_epoll_event(&mut setup, 0x1000, LINUX_EPOLLIN | LINUX_EPOLLONESHOT, 711);
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &kernel,
+                    SyscallRequest::new(
+                        21,
+                        SyscallArgs::from([
+                            epfd as u64,
+                            LINUX_EPOLL_CTL_ADD,
+                            reader as u64,
+                            0x1000,
+                            0,
+                            0
+                        ])
+                    ),
+                    &mut setup,
+                    &reporter
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x1000, 0xa5);
+        let request = memory.refuse_next_supply_grant();
+        let call = SyscallRequest::new(22, SyscallArgs::from([epfd as u64, 0x1100, 1, 0, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&kernel, call, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::OwnerMemorySupply {
+                request,
+                committed: 0
+            }
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&kernel, call, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 1 }
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &kernel,
+                    SyscallRequest::new(63, SyscallArgs::from([reader as u64, 0x1200, 4, 0, 0, 0])),
+                    &mut setup,
+                    &reporter
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(setup.read_bytes(0x1200, 4).unwrap(), b"pipe");
+    }
+
+    #[test]
+    fn s1_epoll_copyout_encodes_both_guest_layouts() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let dispatcher = SyscallDispatcher::new();
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        for abi in [LinuxGuestAbi::Aarch64, LinuxGuestAbi::X86_64] {
+            let mut memory = OwnerRefusingMemory::new(0x1000, 32, 0xa5);
+            let size = match abi {
+                LinuxGuestAbi::Aarch64 => 16,
+                LinuxGuestAbi::X86_64 => 12,
+            };
+            let out = copyout::prepare_array(
+                &kernel,
+                &mut memory,
+                carrick_guest_mem::GuestVa::new(0x1000),
+                1,
+                size,
+            )
+            .unwrap();
+            let event = LinuxEpollEvent {
+                events: LINUX_EPOLLIN,
+                _pad: 0,
+                data: 711,
+            };
+            assert_eq!(
+                write_epoll_events(out, &[event], abi).unwrap(),
+                DispatchOutcome::Returned { value: 1 }
+            );
+            assert_eq!(
+                memory.inner.read_bytes(0x1000, 4).unwrap(),
+                LINUX_EPOLLIN.to_le_bytes()
+            );
+            assert_eq!(
+                memory
+                    .inner
+                    .read_bytes(0x1000 + size as u64 - 8, 8)
+                    .unwrap(),
+                711u64.to_le_bytes()
+            );
+            assert_eq!(
+                memory
+                    .inner
+                    .read_bytes(0x1000 + size as u64, 32 - size)
+                    .unwrap(),
+                vec![0xa5; 32 - size]
+            );
+        }
+    }
+
+    #[test]
+    fn s1_epoll_copyout_refusal_preserves_oneshot_and_edge_readiness() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        for supply in [true, false] {
+            for flags in [LINUX_EPOLLONESHOT, LINUX_EPOLLET] {
+                let mut dispatcher = SyscallDispatcher::new();
+                let kernel = dispatcher.capture_one_task_context().unwrap();
+                let reporter = CompatReporter::default();
+                let mut setup = LinearMemory::new(0x1000, vec![0; 0x2000]);
+                let efd = create_eventfd(&mut dispatcher, &kernel, &mut setup, &reporter, 1);
+                let epfd = create_epoll(&mut dispatcher, &kernel, &mut setup, &reporter);
+                write_guest_epoll_event(&mut setup, 0x1000, LINUX_EPOLLIN | flags, 711);
+                assert_eq!(
+                    dispatcher
+                        .dispatch(
+                            &kernel,
+                            SyscallRequest::new(
+                                21,
+                                SyscallArgs::from([
+                                    epfd as u64,
+                                    LINUX_EPOLL_CTL_ADD,
+                                    efd as u64,
+                                    0x1000,
+                                    0,
+                                    0
+                                ])
+                            ),
+                            &mut setup,
+                            &reporter
+                        )
+                        .unwrap(),
+                    DispatchOutcome::Returned { value: 0 }
+                );
+                let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0xa5);
+                let expected = if supply {
+                    DispatchOutcome::OwnerMemorySupply {
+                        request: memory.refuse_next_supply_grant(),
+                        committed: 0,
+                    }
+                } else {
+                    DispatchOutcome::OwnerMemoryWait {
+                        wait: memory.refuse_next(),
+                        committed: 0,
+                    }
+                };
+                let request =
+                    SyscallRequest::new(22, SyscallArgs::from([epfd as u64, 0x1100, 1, 0, 0, 0]));
+                assert_eq!(
+                    dispatcher
+                        .dispatch(&kernel, request, &mut memory, &reporter)
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(memory.read_bytes(0x1100, 16).unwrap(), [0xa5; 16]);
+                assert_eq!(
+                    memory.prepares, 1,
+                    "refusal must stop before any state consumption"
+                );
+                assert_eq!(
+                    dispatcher
+                        .dispatch(&kernel, request, &mut memory, &reporter)
+                        .unwrap(),
+                    DispatchOutcome::Returned { value: 1 }
+                );
+                let event: LinuxEpollEvent = read_kernel_struct(&memory, 0x1100).unwrap();
+                assert_eq!(event.events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+                let data = event.data;
+                assert_eq!(data, 711);
+                assert_eq!(
+                    dispatcher
+                        .dispatch(&kernel, request, &mut memory, &reporter)
+                        .unwrap(),
+                    DispatchOutcome::Returned { value: 0 }
+                );
+            }
+        }
     }
 
     #[test]
@@ -4274,6 +4574,7 @@ impl<'a> NetView<'a> {
                     timeout_ms,
                     sig_mask,
                 },
+                cx.kernel,
             )
 
         }
@@ -4382,6 +4683,7 @@ impl<'a> NetView<'a> {
                     timeout_ms,
                     sig_mask,
                 },
+                cx.kernel,
             )
         }
 

@@ -210,51 +210,6 @@ pub(super) fn drain_pending_epoll_ready(
     pending_ready.drain(..take).collect()
 }
 
-pub(super) fn write_epoll_events<M: CurrentMmMemory>(
-    memory: &mut M,
-    events_address: u64,
-    ready: &[LinuxEpollEvent],
-    guest_abi: LinuxGuestAbi,
-) -> Result<DispatchOutcome, DispatchError> {
-    let event_size = match guest_abi {
-        LinuxGuestAbi::Aarch64 => <LinuxEpollEvent as KernelAbi>::ABI_SIZE,
-        LinuxGuestAbi::X86_64 => <LinuxX8664EpollEvent as KernelAbi>::ABI_SIZE,
-    };
-    let Some(total_size) = ready.len().checked_mul(event_size) else {
-        return Err(DispatchError::LengthTooLarge(u64::MAX));
-    };
-    if !memory.guest_range_is_writable(events_address, total_size) {
-        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-    }
-    for (index, event) in ready.iter().enumerate() {
-        let offset = index
-            .checked_mul(event_size)
-            .and_then(|offset| u64::try_from(offset).ok())
-            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-        let address = events_address.checked_add(offset).ok_or(LINUX_EFAULT);
-        let Ok(address) = address else {
-            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-        };
-        match guest_abi {
-            LinuxGuestAbi::Aarch64 => {
-                if write_kernel_struct_raw(memory, address, event).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-            }
-            LinuxGuestAbi::X86_64 => {
-                let wire = LinuxX8664EpollEvent {
-                    events: event.events,
-                    data: event.data,
-                };
-                if write_kernel_struct_raw(memory, address, &wire).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-            }
-        }
-    }
-    Ok(DispatchOutcome::returned_len(ready.len())?)
-}
-
 /// Translate one multiplexer [`carrick_hal::event::PollEvent`] to Linux epoll event bits.
 /// Direction-sensitive (jiixyj/epoll-shim model): the multiplexer reports one
 /// readiness direction per event, so read readiness -> EPOLLIN (read EOF ->
