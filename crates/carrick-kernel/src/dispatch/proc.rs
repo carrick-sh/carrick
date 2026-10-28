@@ -2410,8 +2410,7 @@ impl<'a> ProcView<'a> {
                     command,
                     word,
                     guest_tid,
-                    thread.map(|t| t.futex),
-                    thread.and_then(|t| t.work_scope),
+                    thread.map(|t| super::futex::PiFutexWake::new(t.futex, t.work_scope)),
                 ));
             }
 
