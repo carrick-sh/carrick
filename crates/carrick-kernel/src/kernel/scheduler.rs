@@ -5729,11 +5729,19 @@ impl Scheduler {
 
     pub fn close(&self) {
         self.queue.close();
-        // Unused birth submissions otherwise keep drain_work alive until the
-        // unsafe post-join clear, while executor joins wait for that drain.
-        // Closing admission first excludes replacement runtime reservations.
-        self.kernel.revoke_unused_thread_birth_capacity();
         self.stop_preemption_driver();
+    }
+
+    /// Close admission, then retire unused birth capacity before waiting for
+    /// executor drain. Unlike close(), this waits out registry publishers.
+    /// Call without a registry guard; publishers must not depend on its return.
+    pub fn close_and_retire_unused_birth_capacity(&self) {
+        if self.queue.inner.lifecycle() == QueueLifecycle::Open {
+            self.close();
+        }
+        // Unused submissions otherwise outlive the joins they prevent. Keep
+        // the registry barrier outside nonblocking close's admission protocol.
+        self.kernel.revoke_unused_thread_birth_capacity();
     }
 
     pub fn wait_closed(&self) {
@@ -9760,7 +9768,7 @@ mod tests {
             .unwrap();
         let root_running = scheduler.take(&first).unwrap();
         let peer_running = scheduler.take(&second).unwrap();
-        scheduler.close();
+        scheduler.close_and_retire_unused_birth_capacity();
         assert_eq!(scheduler.claimed(), 2);
         assert_eq!(
             scheduler.queue.active_authority_count(),
