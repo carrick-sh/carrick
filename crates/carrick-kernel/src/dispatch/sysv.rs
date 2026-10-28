@@ -1149,7 +1149,7 @@ impl SysvIpcService {
         namespace: &SysvIpcNamespace,
         cx: &mut SyscallCtx<M>,
         req: MsgReceiveRequest<'_>,
-    ) -> Result<Option<usize>, LinuxErrno> {
+    ) -> Result<Option<DispatchOutcome>, LinuxErrno> {
         msg_queue_receive(namespace, cx, req)
     }
 
@@ -2561,10 +2561,10 @@ impl<'a> IpcView<'a> {
                     }
                     let bytes = shmid_ds_bytes(&segment, &this.cred_snapshot());
                     let memory = &mut *cx.memory;
-                    if memory.write_bytes(buf, &bytes).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                    Ok(DispatchOutcome::Returned { value: 0 })
+                    Ok(super::copyout::copyout_bytes(
+                        cx.kernel, memory, carrick_guest_mem::GuestVa::new(buf),
+                        &bytes, DispatchOutcome::Returned { value: 0 },
+                    ))
                 }
                 LINUX_IPC_SET => {
                     // IPC_SET applies the permission bits from the guest's
@@ -2656,9 +2656,10 @@ impl<'a> IpcView<'a> {
                     if buf != 0 {
                         let bytes = shmid_ds_bytes(&segment, &this.cred_snapshot());
                         let memory = &mut *cx.memory;
-                        if memory.write_bytes(buf, &bytes).is_err() {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
+                        return Ok(super::copyout::copyout_bytes(
+                            cx.kernel, memory, carrick_guest_mem::GuestVa::new(buf),
+                            &bytes, DispatchOutcome::returned_i32(target_id),
+                        ));
                     }
                     Ok(DispatchOutcome::returned_i32(target_id))
                 }
@@ -2683,9 +2684,10 @@ impl<'a> IpcView<'a> {
                             put(&mut bytes, 1, used_ids.max(0) as u64);
                         }
                         let memory = &mut *cx.memory;
-                        if memory.write_bytes(buf, &bytes).is_err() {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
+                        return Ok(super::copyout::copyout_bytes(
+                            cx.kernel, memory, carrick_guest_mem::GuestVa::new(buf),
+                            &bytes, DispatchOutcome::Returned { value: (used_ids - 1).max(0) },
+                        ));
                     }
                     Ok(DispatchOutcome::Returned {
                         value: (used_ids - 1).max(0),
@@ -2862,9 +2864,7 @@ impl<'a> IpcView<'a> {
                         operator,
                     },
                 ) {
-                    Ok(Some(received)) => {
-                        return Ok(DispatchOutcome::returned_len(received)?);
-                    }
+                    Ok(Some(outcome)) => return Ok(outcome),
                     Ok(None) => {
                         saw_would_block = true;
                         if flags.contains(MsgOpFlags::NOWAIT) {
@@ -2887,9 +2887,7 @@ impl<'a> IpcView<'a> {
                                     operator,
                                 },
                             ) {
-                                Ok(Some(received)) => {
-                                    return Ok(DispatchOutcome::returned_len(received)?);
-                                }
+                                Ok(Some(outcome)) => return Ok(outcome),
                                 Ok(None) => {
                                     if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
                                         return Ok(DispatchOutcome::errno(LINUX_EINTR));
@@ -3376,7 +3374,7 @@ fn msg_queue_receive<M: CurrentMmMemory>(
     namespace: &SysvIpcNamespace,
     cx: &mut SyscallCtx<M>,
     req: MsgReceiveRequest<'_>,
-) -> Result<Option<usize>, LinuxErrno> {
+) -> Result<Option<DispatchOutcome>, LinuxErrno> {
     let MsgReceiveRequest {
         id,
         subject,
@@ -3404,7 +3402,45 @@ fn msg_queue_receive<M: CurrentMmMemory>(
         return Err(LINUX_E2BIG);
     }
     let copy_len = message.payload.len().min(msgsz);
-    let text_addr = msgp.checked_add(8).ok_or(LINUX_EFAULT)?;
+    // The type slot is validated first, so a wrapping payload address cannot
+    // publish when the type address itself overflows the guest range.
+    let text_addr = msgp.wrapping_add(8);
+    if copy_len + 8 <= super::copyout::COPYOUT_MAX_BYTES {
+        let out = match super::copyout::prepare(
+            cx.kernel,
+            cx.memory,
+            [
+                Some(super::copyout::UserSlot::new(msgp, 8)),
+                Some(super::copyout::UserSlot::new(text_addr, copy_len)),
+            ],
+        ) {
+            Ok(out) => out,
+            Err(refusal) => return Ok(Some(refusal.into_outcome())),
+        };
+        let consume = !flags.contains(MsgOpFlags::COPY);
+        if consume {
+            let removed = queue.messages.remove(idx);
+            queue.cbytes = queue.cbytes.saturating_sub(removed.payload.len() as u64);
+            queue.qnum = queue.messages.len() as u64;
+            queue.rtime = unix_now_secs();
+            queue.lrpid = operator;
+        }
+        drop(queue);
+        // Linux consumes an ordinary receive even on a genuine copy fault;
+        // MSG_COPY leaves it queued. A transient refusal above does neither.
+        let (result, effect) = out.commit_retaining([
+            &message.msg_type.raw().to_le_bytes(),
+            &message.payload[..copy_len],
+        ]);
+        if consume {
+            wake_msg_queue_waiters(&entry.path, id, cx.kernel.kernel().shared_futex());
+        }
+        drop(effect);
+        result.map_err(|_| LINUX_EFAULT)?;
+        return Ok(Some(DispatchOutcome::returned_len_or_errno(copy_len)));
+    }
+    // Counted debt: a larger message needs a retained output snapshot and
+    // cursor before a second permit can refuse (#986).
     if cx
         .memory
         .write_bytes(msgp, &message.msg_type.raw().to_le_bytes())
@@ -3429,7 +3465,7 @@ fn msg_queue_receive<M: CurrentMmMemory>(
         drop(queue);
         wake_msg_queue_waiters(&entry.path, id, cx.kernel.kernel().shared_futex());
     }
-    Ok(Some(copy_len))
+    Ok(Some(DispatchOutcome::returned_len_or_errno(copy_len)))
 }
 
 fn sorted_msg_queue_ids(namespace: &SysvIpcNamespace) -> Vec<MsgQueueId> {
@@ -3460,9 +3496,10 @@ fn write_msginfo<M: CurrentMmMemory>(
     addr: u64,
     metrics: MsgQueueMetrics,
     cmd: u64,
-) -> Result<(), LinuxErrno> {
+) -> DispatchOutcome {
+    let success = DispatchOutcome::returned_len_or_errno(metrics.queues.saturating_sub(1));
     if addr == 0 {
-        return Ok(());
+        return success;
     }
     let mut out = [0u8; 36];
     let put = |out: &mut [u8], idx: usize, value: i32| {
@@ -3478,7 +3515,13 @@ fn write_msginfo<M: CurrentMmMemory>(
         put(&mut out, 1, metrics.messages as i32);
         put(&mut out, 6, metrics.bytes.min(i32::MAX as u64) as i32);
     }
-    cx.memory.write_bytes(addr, &out).map_err(|_| LINUX_EFAULT)
+    super::copyout::copyout_bytes(
+        cx.kernel,
+        cx.memory,
+        carrick_guest_mem::GuestVa::new(addr),
+        &out,
+        success,
+    )
 }
 
 fn msg_stat_by_index<M: CurrentMmMemory>(
@@ -3506,12 +3549,13 @@ fn msg_stat_by_index<M: CurrentMmMemory>(
     if enforce_read_permission && !queue.can_read(subject) {
         return Err(LINUX_EACCES);
     }
-    if buf != 0 {
-        cx.memory
-            .write_bytes(buf, &queue.stat_bytes())
-            .map_err(|_| LINUX_EFAULT)?;
-    }
-    Ok(DispatchOutcome::Returned { value: id.as_i64() })
+    Ok(super::copyout::copyout_bytes(
+        cx.kernel,
+        cx.memory,
+        carrick_guest_mem::GuestVa::new(buf),
+        &queue.stat_bytes(),
+        DispatchOutcome::Returned { value: id.as_i64() },
+    ))
 }
 
 fn sysv_msgctl<M: CurrentMmMemory>(
@@ -3526,8 +3570,7 @@ fn sysv_msgctl<M: CurrentMmMemory>(
     match cmd {
         LINUX_IPC_INFO | LINUX_MSG_INFO => {
             let metrics = msg_queue_metrics(this.sysv);
-            write_msginfo(cx, buf, metrics, cmd)?;
-            return DispatchOutcome::returned_len(metrics.queues.saturating_sub(1));
+            return Ok(write_msginfo(cx, buf, metrics, cmd));
         }
         LINUX_MSG_STAT | LINUX_MSG_STAT_ANY => {
             return msg_stat_by_index(this.sysv, cx, msqid, buf, &subject, cmd == LINUX_MSG_STAT);
@@ -3577,10 +3620,13 @@ fn sysv_msgctl<M: CurrentMmMemory>(
             if !queue.can_read(&subject) {
                 return Err(LINUX_EACCES);
             }
-            cx.memory
-                .write_bytes(buf, &queue.stat_bytes())
-                .map_err(|_| LINUX_EFAULT)?;
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(super::copyout::copyout_bytes(
+                cx.kernel,
+                cx.memory,
+                carrick_guest_mem::GuestVa::new(buf),
+                &queue.stat_bytes(),
+                DispatchOutcome::Returned { value: 0 },
+            ))
         }
         LINUX_IPC_SET => {
             if buf == 0 {
@@ -4253,9 +4299,13 @@ impl<'a> IpcView<'a> {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
                 if arg != 0 {
-                    if cx.memory.write_bytes(arg, out.as_bytes()).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
+                    return Ok(super::copyout::copyout_bytes(
+                        cx.kernel,
+                        cx.memory,
+                        carrick_guest_mem::GuestVa::new(arg),
+                        out.as_bytes(),
+                        DispatchOutcome::Returned { value: 0 },
+                    ));
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -4404,6 +4454,16 @@ impl<'a> IpcView<'a> {
                 for v in &vals {
                     out.extend_from_slice(&v.to_le_bytes());
                 }
+                if out.len() <= super::copyout::COPYOUT_MAX_BYTES {
+                    return Ok(super::copyout::copyout_bytes(
+                        cx.kernel,
+                        cx.memory,
+                        carrick_guest_mem::GuestVa::new(arg),
+                        &out,
+                        DispatchOutcome::Returned { value: 0 },
+                    ));
+                }
+                // A large GETALL snapshot needs retained multi-permit output (#986).
                 if cx.memory.write_bytes(arg, &out).is_err() {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
@@ -4530,9 +4590,13 @@ impl<'a> IpcView<'a> {
             for field in fields {
                 bytes.extend_from_slice(&field.to_le_bytes());
             }
-            if cx.memory.write_bytes(arg, &bytes).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
+            return Ok(super::copyout::copyout_bytes(
+                cx.kernel,
+                cx.memory,
+                carrick_guest_mem::GuestVa::new(arg),
+                &bytes,
+                DispatchOutcome::Returned { value: max_index },
+            ));
         }
         Ok(DispatchOutcome::Returned { value: max_index })
     }
@@ -4576,9 +4640,15 @@ impl<'a> IpcView<'a> {
                 __unused3: 0,
                 __unused4: 0,
             };
-            if cx.memory.write_bytes(arg, out.as_bytes()).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
+            return Ok(super::copyout::copyout_bytes(
+                cx.kernel,
+                cx.memory,
+                carrick_guest_mem::GuestVa::new(arg),
+                out.as_bytes(),
+                DispatchOutcome::Returned {
+                    value: guest_semid.as_i64(),
+                },
+            ));
         }
         Ok(DispatchOutcome::Returned {
             value: guest_semid.as_i64(),
@@ -4615,6 +4685,180 @@ impl Drop for SetallInterleavingGuard {
 mod ipc_set_tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn s5_sysv_queries_preserve_owner_refusals() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let dispatcher = SyscallDispatcher::new();
+        let container = Arc::new(crate::kernel::Container::new(
+            crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new(format!(
+                "s5-711505-{}",
+                std::process::id()
+            ))),
+        ));
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            711505,
+            crate::thread::ThreadId::synthetic_for_tests(711505),
+            "s5-sysv".to_owned(),
+        )
+        .unwrap()
+        .with_container(container);
+        let (_kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        dispatcher.rebind_kernel(context.task_binding());
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x4000, 0xa5);
+        let _backing = insert_test_shm_segment(&dispatcher, 4242, 4096);
+        let call = |memory: &mut OwnerRefusingMemory, number: u64, args: [u64; 6]| {
+            dispatcher
+                .dispatch_normalized(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &CompatReporter::default(),
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let fd = |outcome| {
+            if let DispatchOutcome::Returned { value } = outcome {
+                value as u64
+            } else {
+                panic!("create: {outcome:?}")
+            }
+        };
+        let msg = fd(call(&mut memory, nr::MSGGET.raw(), [0, 0o600, 0, 0, 0, 0]));
+        let sem = fd(call(&mut memory, nr::SEMGET.raw(), [0, 2, 0o600, 0, 0, 0]));
+        for (number, args) in [
+            (nr::SHMCTL.raw(), [4242, LINUX_IPC_STAT, 0x2000, 0, 0, 0]),
+            (nr::SHMCTL.raw(), [0, LINUX_SHM_STAT, 0x2000, 0, 0, 0]),
+            (
+                nr::SHMCTL.raw(),
+                [4242, LINUX_SHM_STAT_ANY, 0x2000, 0, 0, 0],
+            ),
+            (nr::SHMCTL.raw(), [0, LINUX_IPC_INFO, 0x2000, 0, 0, 0]),
+            (nr::SHMCTL.raw(), [0, LINUX_SHM_INFO, 0x2000, 0, 0, 0]),
+            (nr::MSGCTL.raw(), [msg, LINUX_IPC_STAT, 0x2000, 0, 0, 0]),
+            (nr::MSGCTL.raw(), [0, LINUX_MSG_STAT, 0x2000, 0, 0, 0]),
+            (nr::MSGCTL.raw(), [0, LINUX_IPC_INFO, 0x2000, 0, 0, 0]),
+            (nr::MSGCTL.raw(), [0, LINUX_MSG_INFO, 0x2000, 0, 0, 0]),
+            (nr::SEMCTL.raw(), [sem, 0, LINUX_IPC_STAT, 0x2000, 0, 0]),
+            (nr::SEMCTL.raw(), [sem, 0, LINUX_GETALL, 0x2000, 0, 0]),
+            (nr::SEMCTL.raw(), [0, 0, LINUX_IPC_INFO, 0x2000, 0, 0]),
+            (nr::SEMCTL.raw(), [0, 0, LINUX_SEM_STAT, 0x2000, 0, 0]),
+        ] {
+            memory.seed(0x2000, &[0xa5; 128]);
+            let expected = call(&mut memory, number, args);
+            assert!(
+                matches!(expected, DispatchOutcome::Returned { .. }),
+                "{number}: {expected:?}"
+            );
+            let bytes = memory.read_bytes(0x2000, 128).unwrap();
+            memory.seed(0x2000, &[0xa5; 128]);
+            let wait = memory.refuse_next();
+            assert_eq!(
+                call(&mut memory, number, args),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                "syscall {number}"
+            );
+            assert_eq!(memory.read_bytes(0x2000, 128).unwrap(), vec![0xa5; 128]);
+            assert_eq!(call(&mut memory, number, args), expected);
+            assert_eq!(memory.read_bytes(0x2000, 128).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn s5_sysv_receive_refusal_preserves_message_and_type() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let dispatcher = SyscallDispatcher::new();
+        let container = Arc::new(crate::kernel::Container::new(
+            crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new(format!(
+                "s5-711506-{}",
+                std::process::id()
+            ))),
+        ));
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            711506,
+            crate::thread::ThreadId::synthetic_for_tests(711506),
+            "s5-sysv".to_owned(),
+        )
+        .unwrap()
+        .with_container(container);
+        let (_kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        dispatcher.rebind_kernel(context.task_binding());
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x4000, 0xa5);
+        let call = |memory: &mut OwnerRefusingMemory, number: u64, args: [u64; 6]| {
+            dispatcher
+                .dispatch_normalized(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &CompatReporter::default(),
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let DispatchOutcome::Returned { value: queue } =
+            call(&mut memory, nr::MSGGET.raw(), [0, 0o600, 0, 0, 0, 0])
+        else {
+            panic!("msgget")
+        };
+        memory.seed(0x1800, &23i64.to_ne_bytes());
+        memory.seed(0x1808, b"retained message");
+        assert_eq!(
+            call(
+                &mut memory,
+                nr::MSGSND.raw(),
+                [queue as u64, 0x1800, 16, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let wait = memory.refuse_next();
+        let args = [queue as u64, 0x2000, 16, 0, MsgOpFlags::NOWAIT.bits(), 0];
+        assert_eq!(
+            call(&mut memory, nr::MSGRCV.raw(), args),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.read_bytes(0x2000, 24).unwrap(), vec![0xa5; 24]);
+        assert_eq!(
+            call(&mut memory, nr::MSGRCV.raw(), args),
+            DispatchOutcome::Returned { value: 16 }
+        );
+        assert_eq!(memory.read_bytes(0x2000, 8).unwrap(), 23i64.to_ne_bytes());
+        assert_eq!(memory.read_bytes(0x2008, 16).unwrap(), b"retained message");
+        assert_eq!(
+            call(&mut memory, nr::MSGRCV.raw(), args),
+            DispatchOutcome::errno(LINUX_ENOMSG)
+        );
+        assert_eq!(
+            call(
+                &mut memory,
+                nr::MSGSND.raw(),
+                [queue as u64, 0x1800, 16, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call(
+                &mut memory,
+                nr::MSGRCV.raw(),
+                [queue as u64, 0, 16, 0, MsgOpFlags::NOWAIT.bits(), 0]
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            call(&mut memory, nr::MSGRCV.raw(), args),
+            DispatchOutcome::errno(LINUX_ENOMSG)
+        );
+        assert_eq!(
+            call(
+                &mut memory,
+                nr::MSGCTL.raw(),
+                [queue as u64, LINUX_IPC_RMID, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+    }
 
     struct FailingUnmapMemory {
         inner: LinearMemory,

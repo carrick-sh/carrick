@@ -1593,3 +1593,142 @@ pub(crate) fn would_block_outcome(
         }
     }
 }
+
+#[cfg(test)]
+mod s5_consuming_read_tests {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use crate::dispatch::*;
+    use carrick_abi::syscall::nr;
+    use carrick_guest_mem::GuestMemory;
+
+    #[test]
+    fn s5_pipe_read_refusal_preserves_bytes_and_retry_delivers_exactly_once() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x4000, 0xa5);
+        let call = |memory: &mut OwnerRefusingMemory, number: u64, args: [u64; 6]| {
+            dispatcher
+                .dispatch_normalized(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &crate::compat::CompatReporter::default(),
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            call(
+                &mut memory,
+                nr::PIPE2.raw(),
+                [0x1000, carrick_abi::LINUX_O_NONBLOCK, 0, 0, 0, 0]
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let pair = memory.read_bytes(0x1000, 8).unwrap();
+        let reader = i32::from_ne_bytes(pair[..4].try_into().unwrap()) as u64;
+        let writer = i32::from_ne_bytes(pair[4..].try_into().unwrap()) as u64;
+        memory.seed(0x1800, b"retained pipe payload");
+        assert_eq!(
+            call(&mut memory, nr::WRITE.raw(), [writer, 0x1800, 21, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 21 }
+        );
+        for supply in [false, true] {
+            let expected = if supply {
+                DispatchOutcome::OwnerMemorySupply {
+                    request: memory.refuse_next_supply_grant(),
+                    committed: 0,
+                }
+            } else {
+                DispatchOutcome::OwnerMemoryWait {
+                    wait: memory.refuse_next(),
+                    committed: 0,
+                }
+            };
+            assert_eq!(
+                call(&mut memory, nr::READ.raw(), [reader, 0x2000, 8192, 0, 0, 0]),
+                expected
+            );
+            assert_eq!(memory.inner.read_bytes(0x2000, 21).unwrap(), vec![0xa5; 21]);
+        }
+        assert_eq!(
+            call(&mut memory, nr::READ.raw(), [reader, 0x2000, 8192, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 21 }
+        );
+        assert_eq!(
+            memory.read_bytes(0x2000, 21).unwrap(),
+            b"retained pipe payload"
+        );
+        assert_eq!(
+            call(&mut memory, nr::WRITE.raw(), [writer, 0x1800, 21, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 21 }
+        );
+        assert_eq!(
+            call(&mut memory, nr::READ.raw(), [reader, 0, 8192, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+        );
+        assert_eq!(
+            call(&mut memory, nr::READ.raw(), [reader, 0x2000, 8192, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 21 }
+        );
+        assert_eq!(
+            memory.read_bytes(0x2000, 21).unwrap(),
+            b"retained pipe payload"
+        );
+        for length in [1usize, 4096, 8192] {
+            let payload: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            memory.seed(0x1800, &payload);
+            assert_eq!(
+                call(
+                    &mut memory,
+                    nr::WRITE.raw(),
+                    [writer, 0x1800, length as u64, 0, 0, 0]
+                ),
+                DispatchOutcome::returned_len_or_errno(length)
+            );
+            let mut delivered = 0;
+            while delivered < length {
+                let count = (length - delivered).min(crate::dispatch::copyout::COPYOUT_MAX_BYTES);
+                let prepares = memory.prepares;
+                assert_eq!(
+                    call(&mut memory, nr::READ.raw(), [reader, 0x2000, 8192, 0, 0, 0]),
+                    DispatchOutcome::returned_len_or_errno(count)
+                );
+                assert_eq!(
+                    memory.prepares,
+                    prepares + 1,
+                    "one bounded permit per successful read"
+                );
+                assert_eq!(
+                    memory.read_bytes(0x2000, count).unwrap(),
+                    payload[delivered..delivered + count]
+                );
+                delivered += count;
+            }
+        }
+        let prepares = memory.prepares;
+        let _wait = memory.refuse_next();
+        assert_eq!(
+            call(&mut memory, nr::READ.raw(), [reader, 0, 8192, 0, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_EAGAIN)
+        );
+        assert_eq!(
+            memory.prepares, prepares,
+            "empty read must not prepare output"
+        );
+        assert_eq!(
+            call(&mut memory, nr::READ.raw(), [reader, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call(&mut memory, nr::CLOSE.raw(), [writer, 0, 0, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            call(&mut memory, nr::READ.raw(), [reader, 0, 8192, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(memory.prepares, prepares, "EOF must not prepare output");
+    }
+}

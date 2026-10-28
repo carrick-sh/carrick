@@ -1321,12 +1321,12 @@ impl<'a> FsView<'a> {
                 };
                 let wait_authority = WaitFdAuthority::logical(task.slot_authority);
                 let outcome = read_pipe(
+                    task.kernel,
                     memory,
                     address,
                     length,
                     &pipe,
                     flags,
-                    task.fd.0,
                     wait_authority,
                 );
                 return Ok(match outcome {
@@ -3109,13 +3109,12 @@ impl<'a> FsView<'a> {
                             }
                             return Ok(DispatchOutcome::errno(LINUX_EBADF));
                         };
-                        match read_pipe(
+                        match read_pipe_unprepared(
                             memory,
                             iov.iov_base,
                             len,
                             &pipe,
                             flags,
-                            fd.0,
                             wait_authority,
                         ) {
                             DispatchOutcome::Returned { value } => {

@@ -67,7 +67,7 @@
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/mqueue.rs",
-      "ceiling": 3
+      "ceiling": 2
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/net.rs",
@@ -111,7 +111,7 @@
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/sysv.rs",
-      "ceiling": 12
+      "ceiling": 3
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/time.rs",
