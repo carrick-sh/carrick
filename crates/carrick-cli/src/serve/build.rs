@@ -637,6 +637,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(VolumeSpaceSource::Statvfs.available(dir.path()).is_ok());
 
+        // `from_env` must stay wired to live `statvfs`, while `test_limits`
+        // uses the injected reading without touching the filesystem.
+        let missing = dir.path().join("missing");
+        let prod_err = BuildContextLimits::from_env()
+            .unwrap()
+            .for_destination(&missing)
+            .err()
+            .expect("production limits must probe destination via statvfs");
+        assert_eq!(prod_err.kind(), io::ErrorKind::NotFound);
+        assert!(test_limits().for_destination(&missing).is_ok());
+
         use std::os::unix::ffi::OsStrExt;
         let bad = Path::new(std::ffi::OsStr::from_bytes(b"bad\0path"));
         let err = VolumeAvailableBytes::probe(bad).unwrap_err();
@@ -647,20 +658,26 @@ mod tests {
     async fn low_volume_headroom_clamps_http_build_before_entry_validation() {
         let root = tempfile::tempdir().unwrap();
         let gz = gzip_tar(|builder| append_link(builder, "sub", root.path(), false));
-        let limits = test_limits().with_available_space(VolumeAvailableBytes::from_bytes(
-            BUILD_CONTEXT_DISK_FLOOR_BYTES,
-        ));
-        let response = build_response("", Bytes::from(gz), limits).await;
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let body = BodyExt::collect(response.into_body())
-            .await
-            .unwrap()
-            .to_bytes();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(
-            text.contains("expanded build context bytes exceeds configured cap of 0"),
-            "unexpected 413 body: {text}"
-        );
+        for (available, expected_cap) in [
+            (BUILD_CONTEXT_DISK_FLOOR_BYTES, 0_u64),
+            (BUILD_CONTEXT_DISK_FLOOR_BYTES + 256, 256_u64),
+        ] {
+            let limits =
+                test_limits().with_available_space(VolumeAvailableBytes::from_bytes(available));
+            let response = build_response("", Bytes::from(gz.clone()), limits).await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body = BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(
+                text.contains(&format!(
+                    "expanded build context bytes exceeds configured cap of {expected_cap}"
+                )),
+                "unexpected 413 body for cap {expected_cap}: {text}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -674,28 +691,33 @@ mod tests {
                 .append_data(&mut header, "bomb", std::io::repeat(0).take(2048))
                 .unwrap();
         });
-        let limits = BuildContextLimits {
-            expanded: 1024,
-            ..test_limits()
+        for (available, expected_cap) in [
+            (BUILD_CONTEXT_DISK_FLOOR_BYTES, 0_u64),
+            (BUILD_CONTEXT_DISK_FLOOR_BYTES + 512, 512_u64),
+        ] {
+            let limits = BuildContextLimits {
+                expanded: 1024,
+                ..test_limits()
+            }
+            .with_available_space(VolumeAvailableBytes::from_bytes(available));
+            let response = build_response("", Bytes::from(gz.clone()), limits).await;
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body = BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(
+                text.contains(&format!(
+                    "expanded build context bytes exceeds configured cap of {expected_cap}"
+                )),
+                "unexpected 413 body for cap {expected_cap}: {text}"
+            );
+            assert!(
+                !text.contains("1024"),
+                "body reported unclamped cap for cap {expected_cap}: {text}"
+            );
         }
-        .with_available_space(VolumeAvailableBytes::from_bytes(
-            BUILD_CONTEXT_DISK_FLOOR_BYTES + 512,
-        ));
-        let response = build_response("", Bytes::from(gz), limits).await;
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let body = BodyExt::collect(response.into_body())
-            .await
-            .unwrap()
-            .to_bytes();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(
-            text.contains("expanded build context bytes exceeds configured cap of 512"),
-            "unexpected 413 body: {text}"
-        );
-        assert!(
-            !text.contains("1024"),
-            "body reported unclamped cap: {text}"
-        );
     }
 
     fn gzip_tar(append: impl FnOnce(&mut tar::Builder<&mut Vec<u8>>)) -> Vec<u8> {
