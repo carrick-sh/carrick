@@ -1739,6 +1739,19 @@ struct ExecSibling {
 
 #[cfg(test)]
 fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSibling {
+    add_service_sibling(
+        fixture,
+        parked_read.then_some(carrick_core_abi::service::ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Syscall,
+        }),
+    )
+}
+
+#[cfg(test)]
+fn add_service_sibling(
+    fixture: &NativeSignalFixture,
+    operation: Option<carrick_core_abi::service::ServiceOperation>,
+) -> ExecSibling {
     let binding = ExecutionBinding {
         task: carrick_core_abi::EntryTaskKey::from_raw(42),
         generation: carrick_core_abi::SnapshotGeneration::from_raw(12),
@@ -1843,7 +1856,7 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
         )
         .unwrap();
 
-    let service_ticket = if parked_read {
+    let service_ticket = if let Some(operation) = operation {
         let source = BornInZoneSource {
             zone: fixture.zone,
             slot,
@@ -1862,12 +1875,7 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
             .unwrap();
         assert!(
             matches!(
-                sibling.begin_service(
-                    carrick_core_abi::service::ServiceOperation::CarrierWork {
-                        entry: OwnerEntry::Syscall,
-                    },
-                    None,
-                ),
+                sibling.begin_service(operation, None),
                 Ok(NativeResume::Left(None))
             ),
             "real native service wait must release its execution slot"
@@ -1902,6 +1910,144 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
         slot,
         record,
         service_ticket,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn exit_group_cancels_exception_service_before_publishing_host_wakes() {
+    use carrick_core_abi::service::ServiceOperation;
+    use carrick_guest_arch::{Access, FaultInfo};
+    use carrick_sched_core::object_wait::ResumeDisposition;
+
+    for stop_sibling_slot in [false, true] {
+        let fixture = native_exec_fixture();
+        let mut sibling = add_service_sibling(
+            &fixture,
+            Some(ServiceOperation::Fault(FaultInfo {
+                address: UserVa::new(0x4000),
+                access: Access::Read,
+                present: false,
+            })),
+        );
+        // Both fixture CPUs may execute this retained member.
+        fixture.zone.record(sibling.record.id).set_affinity(0b11);
+        assert_eq!(fixture.page.live(), 2);
+        assert_eq!(
+            fixture.zone.record(sibling.record.id).resume_disposition(),
+            ResumeDisposition::OwnerContinuation(OwnerEntry::Exception)
+        );
+        assert!(!fixture.zone.record(sibling.record.id).is_native_owned());
+        if stop_sibling_slot {
+            fixture
+                .zone
+                .leave_guest(sibling.slot, &carrick_sched_core::ShortLockSpin);
+        }
+        let page = fixture.page;
+        *fixture.runtime.service_cancel_hook.lock() = Some(Box::new(move || {
+            assert!(
+                page.exit_wait().is_none(),
+                "host terminal wakes became visible before native service cancellation"
+            );
+        }));
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        let mut service = fixture.service();
+        {
+            let mut root = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    source,
+                    fixture.task,
+                    fixture.address,
+                    &words(fixture.address),
+                    &mut service,
+                )
+                .unwrap();
+            assert!(matches!(
+                root.exit_group(7),
+                LifecycleOutcome::Transferred { .. }
+            ));
+            assert!(root.take_run_failure().is_none());
+        }
+        assert!(fixture.page.exit_wait().is_some());
+        assert!(sibling.control.host_exit_requested());
+        sibling
+            .service_ticket
+            .take()
+            .unwrap()
+            .complete(true)
+            .unwrap_or_else(|_| panic!("cancelled fault ticket must settle"));
+        let slot = [fixture.slot, sibling.slot]
+            .into_iter()
+            .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+            .unwrap();
+        assert!(
+            !fixture.zone.head_needs_host(slot),
+            "terminal checkpoint must stay native"
+        );
+        assert_eq!(
+            fixture.zone.switch_in_full(slot).unwrap().record,
+            sibling.record.id
+        );
+        assert!(!fixture.zone.current_affinity_excludes_cpu(slot));
+        let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+            .unwrap()
+            .words;
+        let mut sibling_service = fixture.service();
+        {
+            let mut member = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    BornInZoneSource {
+                        zone: fixture.zone,
+                        slot,
+                    },
+                    sibling.task,
+                    fixture.address,
+                    &saved,
+                    &mut sibling_service,
+                )
+                .unwrap();
+            assert!(matches!(
+                member.resume_checkpoint(),
+                Ok(NativeResume::Left(None))
+            ));
+            assert!(member.take_run_failure().is_none());
+        }
+        assert!(fixture.zone.live(sibling.record).is_none());
+        let slot = [fixture.slot, sibling.slot]
+            .into_iter()
+            .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+            .unwrap();
+        assert_eq!(
+            fixture.zone.switch_in_full(slot).unwrap().record,
+            fixture.record.id
+        );
+        let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+            .unwrap()
+            .words;
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot,
+                },
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(root.resume_checkpoint(),
+            Ok(NativeResume::Left(Some(status))) if status == LinuxWaitStatus::exited(7)));
+        assert!(root.take_run_failure().is_none());
     }
 }
 
