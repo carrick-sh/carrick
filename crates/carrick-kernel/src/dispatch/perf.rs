@@ -499,6 +499,7 @@ impl SyscallDispatcher {
     #[allow(dead_code)]
     pub(super) fn read_perf_event<M: CurrentMmMemory>(
         &self,
+        context: &crate::kernel::KernelContext,
         memory: &mut M,
         address: u64,
         length: usize,
@@ -506,7 +507,15 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         match self.perf_event_read_bytes(state, length) {
             Ok(bytes) => {
-                if memory.write_bytes(address, &bytes).is_err() {
+                let out = match super::copyout::prepare(
+                    context,
+                    memory,
+                    [Some(super::copyout::UserSlot::new(address, bytes.len()))],
+                ) {
+                    Ok(out) => out,
+                    Err(refusal) => return refusal.into_outcome(),
+                };
+                if out.commit([&bytes]).is_err() {
                     DispatchOutcome::errno(LINUX_EFAULT)
                 } else {
                     DispatchOutcome::returned_len_or_errno(bytes.len())
@@ -572,8 +581,26 @@ impl SyscallDispatcher {
         request: u64,
         arg: u64,
     ) -> DispatchOutcome {
+        let out = if request == LINUX_PERF_EVENT_IOC_ID {
+            match super::copyout::prepare(
+                cx.kernel,
+                cx.memory,
+                [Some(super::copyout::UserSlot::new(arg, 8))],
+            ) {
+                Ok(out) => Some(out),
+                Err(refusal) => return refusal.into_outcome(),
+            }
+        } else {
+            None
+        };
         match self.perf_event_ioctl_out(cx.reporter, fd, state, request, arg) {
-            Ok(Some(bytes)) => write_packed(&mut *cx.memory, arg, &bytes),
+            Ok(Some(bytes)) => match out {
+                Some(out) => match out.commit([&bytes]) {
+                    Ok(()) => DispatchOutcome::Returned { value: 0 },
+                    Err(fault) => fault.outcome(),
+                },
+                None => DispatchOutcome::errno(LINUX_EFAULT),
+            },
             Ok(None) => DispatchOutcome::Returned { value: 0 },
             Err(errno) => DispatchOutcome::errno(errno),
         }
@@ -603,8 +630,15 @@ impl SyscallDispatcher {
                 Err(PerfAttrError::SizeMismatch) => {
                     // The kernel writes its supported size back into attr.size
                     // alongside E2BIG so the caller can retry.
-                    let _ = memory
-                        .write_bytes(attr.0 + 4, &LINUX_PERF_ATTR_SIZE_SUPPORTED.to_le_bytes());
+                    let out = match super::copyout::prepare(
+                        cx.kernel,
+                        memory,
+                        [Some(super::copyout::UserSlot::new(attr.0 + 4, 4))],
+                    ) {
+                        Ok(out) => out,
+                        Err(refusal) => return Ok(refusal.into_outcome()),
+                    };
+                    let _ = out.commit([&LINUX_PERF_ATTR_SIZE_SUPPORTED.to_le_bytes()]);
                     return Ok(DispatchOutcome::errno(LINUX_E2BIG));
                 }
                 Err(PerfAttrError::Invalid) => {

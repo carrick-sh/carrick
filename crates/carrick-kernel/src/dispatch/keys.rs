@@ -232,6 +232,7 @@ fn read_payload<M: CurrentMmMemory>(
 /// hold it — `keyctl06` fails an implementation that reports the truncated
 /// count instead, and fails one that overruns the buffer.
 fn write_truncated<M: CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
     memory: &mut M,
     address: GuestPtr,
     buffer_len: usize,
@@ -240,7 +241,17 @@ fn write_truncated<M: CurrentMmMemory>(
     let full = bytes.len();
     if address.0 != 0 && buffer_len != 0 {
         let copied = full.min(buffer_len);
-        memory.write_bytes(address.0, &bytes[..copied])?;
+        if copied > 0 {
+            let out = match super::copyout::prepare(
+                context,
+                memory,
+                [Some(super::copyout::UserSlot::new(address.0, copied))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            out.commit([&bytes[..copied]])?;
+        }
     }
     Ok(DispatchOutcome::returned_len(full)?)
 }
@@ -457,7 +468,7 @@ fn keyctl_op<M: CurrentMmMemory>(
             let key = scope.resolve(serial_arg(arg2), false)?;
             let described = service.describe(&caller, key)?;
             let length = usize::try_from(arg4).unwrap_or(usize::MAX);
-            write_truncated(cx.memory, GuestPtr(arg3), length, &described.0)
+            write_truncated(cx.kernel, cx.memory, GuestPtr(arg3), length, &described.0)
         }
 
         KeyctlOp::Clear => {
@@ -500,7 +511,7 @@ fn keyctl_op<M: CurrentMmMemory>(
             let key = scope.resolve(serial_arg(arg2), false)?;
             let payload = service.read(&caller, key)?;
             let length = usize::try_from(arg4).unwrap_or(usize::MAX);
-            write_truncated(cx.memory, GuestPtr(arg3), length, &payload.0)
+            write_truncated(cx.kernel, cx.memory, GuestPtr(arg3), length, &payload.0)
         }
 
         KeyctlOp::SetReqkeyKeyring => {

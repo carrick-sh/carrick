@@ -319,15 +319,55 @@ fn validate_program(insns: &[BpfInsn]) -> Result<(), ProgRejection> {
 
 /// Write the load log into the guest's buffer (NUL-terminated, truncated to
 /// `log_size`), when one was requested. Best-effort: the load's own verdict
-/// is not displaced by a log-write fault.
-fn write_prog_log<M: CurrentMmMemory>(memory: &mut M, attr: &BpfProgLoadAttr, message: &str) {
+/// is not displaced by a log-write fault, while a transient owner refusal
+/// parks before any fd installation.
+fn write_prog_log<M: CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
+    memory: &mut M,
+    attr: &BpfProgLoadAttr,
+    message: &str,
+) -> Result<(), super::copyout::CopyoutRefusal> {
     if attr.log_level == 0 || attr.log_buf == 0 || attr.log_size == 0 {
-        return;
+        return Ok(());
     }
-    let capacity = attr.log_size as usize;
+    let capacity = (attr.log_size as usize).min(super::copyout::COPYOUT_MAX_BYTES);
     let mut bytes = message.as_bytes()[..message.len().min(capacity - 1)].to_vec();
     bytes.push(0);
-    let _ = memory.write_bytes(attr.log_buf, &bytes);
+    let out = super::copyout::prepare(
+        context,
+        memory,
+        [Some(super::copyout::UserSlot::new(
+            attr.log_buf,
+            bytes.len(),
+        ))],
+    )?;
+    let _ = out.commit([&bytes]);
+    Ok(())
+}
+
+fn copyout_bpf_bytes<M: CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
+    memory: &mut M,
+    address: u64,
+    bytes: &[u8],
+) -> Result<Result<(), super::copyout::CopyoutFault>, super::copyout::CopyoutRefusal> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let chunk = &bytes[offset..(offset + super::copyout::COPYOUT_MAX_BYTES).min(bytes.len())];
+        let Some(chunk_addr) = address.checked_add(offset as u64) else {
+            return Ok(Err(super::copyout::CopyoutFault));
+        };
+        let out = super::copyout::prepare(
+            context,
+            memory,
+            [Some(super::copyout::UserSlot::new(chunk_addr, chunk.len()))],
+        )?;
+        if let Err(fault) = out.commit([chunk]) {
+            return Ok(Err(fault));
+        }
+        offset += chunk.len();
+    }
+    Ok(Ok(()))
 }
 
 impl SyscallDispatcher {
@@ -397,8 +437,11 @@ impl SyscallDispatcher {
                     let map = this.bpf_map_fd(attr.map_fd as i32)?;
                     let key = cx.memory.read_bytes(attr.key, map.key_size() as usize)?;
                     let value = map.lookup(&key)?;
-                    cx.memory.write_bytes(attr.value_or_next_key, &value)?;
-                    Ok(DispatchOutcome::Returned { value: 0 })
+                    match copyout_bpf_bytes(cx.kernel, cx.memory, attr.value_or_next_key, &value) {
+                        Ok(Ok(())) => Ok(DispatchOutcome::Returned { value: 0 }),
+                        Ok(Err(fault)) => Err(fault.into()),
+                        Err(refusal) => Ok(refusal.into_outcome()),
+                    }
                 }
 
                 BpfCmd::MapUpdateElem => {
@@ -428,8 +471,11 @@ impl SyscallDispatcher {
                     let map = this.bpf_map_fd(attr.map_fd as i32)?;
                     let key = cx.memory.read_bytes(attr.key, map.key_size() as usize)?;
                     let next = map.next_key(&key)?;
-                    cx.memory.write_bytes(attr.value_or_next_key, &next)?;
-                    Ok(DispatchOutcome::Returned { value: 0 })
+                    match copyout_bpf_bytes(cx.kernel, cx.memory, attr.value_or_next_key, &next) {
+                        Ok(Ok(())) => Ok(DispatchOutcome::Returned { value: 0 }),
+                        Ok(Err(fault)) => Err(fault.into()),
+                        Err(refusal) => Ok(refusal.into_outcome()),
+                    }
                 }
 
                 BpfCmd::ProgLoad => {
@@ -439,7 +485,7 @@ impl SyscallDispatcher {
                     };
                     if attr.insn_cnt == 0 {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                    }
+                    };
                     if attr.insn_cnt > LINUX_BPF_MAXINSNS {
                         return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_E2BIG));
                     }
@@ -460,14 +506,20 @@ impl SyscallDispatcher {
                         .collect();
                     match validate_program(&insns) {
                         Err(rejection) => {
-                            write_prog_log(cx.memory, &attr, rejection.log);
+                            if let Err(refusal) =
+                                write_prog_log(cx.kernel, cx.memory, &attr, rejection.log)
+                            {
+                                return Ok(refusal.into_outcome());
+                            }
                             Ok(DispatchOutcome::errno(rejection.errno))
                         }
                         Ok(()) => {
                             // Loaded. An empty log tells the caller validation
                             // recorded nothing (Linux writes its verifier
                             // trace here; carrick has none to give).
-                            write_prog_log(cx.memory, &attr, "");
+                            if let Err(refusal) = write_prog_log(cx.kernel, cx.memory, &attr, "") {
+                                return Ok(refusal.into_outcome());
+                            }
                             let description = OpenDescription::BpfProg {
                                 base: OpenDescriptionBase::new(carrick_abi::LINUX_O_RDWR),
                                 prog: Arc::new(BpfProg {

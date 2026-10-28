@@ -443,7 +443,15 @@ impl SyscallDispatcher {
                 // header and returns EINVAL, so a probing caller can retry with
                 // the right version (LTP capget02). version is the first u32.
                 let pref = crate::linux_abi::LINUX_CAPABILITY_VERSION_3;
-                let _ = memory.write_bytes(header_address.0, &pref.to_le_bytes());
+                let out = match super::copyout::prepare(
+                    cx.kernel,
+                    memory,
+                    [Some(super::copyout::UserSlot::new(header_address.0, 4))],
+                ) {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                let _ = out.commit([&pref.to_le_bytes()]);
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             // pid < 0 is EINVAL (not ESRCH). A positive pid that isn't the caller
@@ -475,10 +483,16 @@ impl SyscallDispatcher {
             let caps = cx.kernel.task().caps();
             let words = linux_capability_data_words(header.version);
             let data = capability_words(&caps, words);
-            if memory
-                .write_bytes(data_address.0, capability_data_bytes(&data).as_slice())
-                .is_err()
-            {
+            let bytes = capability_data_bytes(&data);
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                memory,
+                [Some(super::copyout::UserSlot::new(data_address.0, bytes.len()))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            if out.commit([bytes.as_slice()]).is_err() {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -492,7 +506,15 @@ impl SyscallDispatcher {
                 // the header so a probing caller can retry with the right one,
                 // then EINVAL (capset02).
                 let pref = crate::linux_abi::LINUX_CAPABILITY_VERSION_3;
-                let _ = memory.write_bytes(header_address.0, &pref.to_le_bytes());
+                let out = match super::copyout::prepare(
+                    cx.kernel,
+                    memory,
+                    [Some(super::copyout::UserSlot::new(header_address.0, 4))],
+                ) {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                let _ = out.commit([&pref.to_le_bytes()]);
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if header.pid < 0 {
@@ -927,31 +949,43 @@ impl SyscallDispatcher {
 
         fn getresuid(this, cx, ruid_ptr: GuestPtr, euid_ptr: GuestPtr, suid_ptr: GuestPtr) {
             let creds = this.cred_snapshot();
-            for (ptr, value) in [
-                (ruid_ptr, creds.ruid),
-                (euid_ptr, creds.euid),
-                (suid_ptr, creds.suid),
-            ] {
-                if ptr.0 == 0 {
-                    continue;
-                }
-                cx.memory.write_bytes(ptr.0, &value.raw().to_le_bytes())?;
-            }
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                cx.memory,
+                [
+                    super::copyout::UserSlot::optional(ruid_ptr.0, 4),
+                    super::copyout::UserSlot::optional(euid_ptr.0, 4),
+                    super::copyout::UserSlot::optional(suid_ptr.0, 4),
+                ],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            let ruid = creds.ruid.raw().to_le_bytes();
+            let euid = creds.euid.raw().to_le_bytes();
+            let suid = creds.suid.raw().to_le_bytes();
+            out.commit([&ruid, &euid, &suid])?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn getresgid(this, cx, rgid_ptr: GuestPtr, egid_ptr: GuestPtr, sgid_ptr: GuestPtr) {
             let creds = this.cred_snapshot();
-            for (ptr, value) in [
-                (rgid_ptr, creds.rgid),
-                (egid_ptr, creds.egid),
-                (sgid_ptr, creds.sgid),
-            ] {
-                if ptr.0 == 0 {
-                    continue;
-                }
-                cx.memory.write_bytes(ptr.0, &value.raw().to_le_bytes())?;
-            }
+            let out = match super::copyout::prepare(
+                cx.kernel,
+                cx.memory,
+                [
+                    super::copyout::UserSlot::optional(rgid_ptr.0, 4),
+                    super::copyout::UserSlot::optional(egid_ptr.0, 4),
+                    super::copyout::UserSlot::optional(sgid_ptr.0, 4),
+                ],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            let rgid = creds.rgid.raw().to_le_bytes();
+            let egid = creds.egid.raw().to_le_bytes();
+            let sgid = creds.sgid.raw().to_le_bytes();
+            out.commit([&rgid, &egid, &sgid])?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -975,7 +1009,24 @@ impl SyscallDispatcher {
             for g in &groups {
                 bytes.extend_from_slice(&g.raw().to_le_bytes());
             }
-            cx.memory.write_bytes(list.0, &bytes)?;
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                let chunk =
+                    &bytes[offset..(offset + super::copyout::COPYOUT_MAX_BYTES).min(bytes.len())];
+                let Some(chunk_addr) = list.0.checked_add(offset as u64) else {
+                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EFAULT));
+                };
+                let out = match super::copyout::prepare(
+                    cx.kernel,
+                    cx.memory,
+                    [Some(super::copyout::UserSlot::new(chunk_addr, chunk.len()))],
+                ) {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                out.commit([chunk])?;
+                offset += chunk.len();
+            }
             Ok(DispatchOutcome::returned_len(groups.len())?)
         }
 

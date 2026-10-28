@@ -20,9 +20,37 @@ use super::outcome::{DispatchOutcome, SharedFutexTarget};
 use super::request::SyscallRequest;
 use super::{
     duration_from_linux_timespec, linux_timeout_timespec_is_valid, read_timespec, read_u32,
-    write_u32,
 };
 use crate::compat::CompatReporter;
+
+fn prepare_futex_copyout<'m, M: CurrentMmMemory, const N: usize>(
+    memory: &'m mut M,
+    slots: [Option<super::copyout::UserSlot>; N],
+) -> Result<super::copyout::PreparedCopyout<'m, M, N>, Option<super::copyout::CopyoutRefusal>> {
+    let memory_ptr: *mut M = memory;
+    if let Some(result) = super::resources::with_active_context(|context| {
+        super::copyout::prepare(context, unsafe { &mut *memory_ptr }, slots)
+    }) {
+        return result.map_err(Some);
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static FALLBACK_CONTEXT: Option<crate::kernel::KernelContext> =
+                super::SyscallDispatcher::new()
+                    .capture_one_task_context()
+                    .ok();
+        }
+        if let Some(result) = FALLBACK_CONTEXT.with(|context| {
+            context
+                .as_ref()
+                .map(|ctx| super::copyout::prepare(ctx, memory, slots))
+        }) {
+            return result.map_err(Some);
+        }
+    }
+    Err(None)
+}
 
 /// Convert an ABSOLUTE futex deadline (FUTEX_WAIT_BITSET) to the remaining
 /// duration from now, on the host monotonic clock (or realtime when
@@ -73,10 +101,18 @@ pub(crate) fn dispatch_futex_pi(
     match command {
         LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI => {
             if owner == 0 {
-                if let Err(errno) = write_u32(memory, address, tid) {
-                    return DispatchOutcome::Errno { errno };
-                }
-                return DispatchOutcome::Returned { value: 0 };
+                let out = match prepare_futex_copyout(
+                    memory,
+                    [Some(super::copyout::UserSlot::new(address, 4))],
+                ) {
+                    Ok(out) => out,
+                    Err(Some(refusal)) => return refusal.into_outcome(),
+                    Err(None) => return DispatchOutcome::errno(LINUX_EFAULT),
+                };
+                return match out.commit([&tid.to_ne_bytes()]) {
+                    Ok(()) => DispatchOutcome::Returned { value: 0 },
+                    Err(fault) => fault.outcome(),
+                };
             }
             if owner == tid {
                 return DispatchOutcome::Errno {
@@ -91,8 +127,16 @@ pub(crate) fn dispatch_futex_pi(
             if owner != tid {
                 return DispatchOutcome::Errno { errno: LINUX_EPERM };
             }
-            if let Err(errno) = write_u32(memory, address, 0) {
-                return DispatchOutcome::Errno { errno };
+            let out = match prepare_futex_copyout(
+                memory,
+                [Some(super::copyout::UserSlot::new(address, 4))],
+            ) {
+                Ok(out) => out,
+                Err(Some(refusal)) => return refusal.into_outcome(),
+                Err(None) => return DispatchOutcome::errno(LINUX_EFAULT),
+            };
+            if let Err(fault) = out.commit([&0u32.to_ne_bytes()]) {
+                return fault.outcome();
             }
             if let Some(futex) = futex {
                 let woken = futex.wake(address, 1);
@@ -359,7 +403,15 @@ pub(crate) fn dispatch_threaded_futex(
                 // the mirror flag — `mirror` is already the authoritative current
                 // value used for the compare below regardless.
                 if mirror != word && location.is_mirror() {
-                    let _ = memory.write_bytes(address, &mirror.to_ne_bytes());
+                    let out = match prepare_futex_copyout(
+                        memory,
+                        [Some(super::copyout::UserSlot::new(address, 4))],
+                    ) {
+                        Ok(out) => out,
+                        Err(Some(refusal)) => return refusal.into_outcome(),
+                        Err(None) => return DispatchOutcome::errno(LINUX_EFAULT),
+                    };
+                    let _ = out.commit([&mirror.to_ne_bytes()]);
                 }
                 mirror
             } else {
