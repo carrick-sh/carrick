@@ -404,13 +404,23 @@ pub(crate) fn arm_resched(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapError
     }
 }
 
-/// Clear PSTATE.I on this (the caller's own) vCPU when it is about to resume
-/// at EL0, so an interrupt pending for the in-guest scheduler is taken at
-/// the first EL0 instruction (GIC mode only; the guest never sees the bit,
-/// `carrick_hal::el0_visible_pstate`).
-pub(crate) fn unmask_el0_irqs(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapError> {
+/// The pending interrupt that requires an EL0 IRQ boundary.
+#[derive(Clone, Copy)]
+pub(crate) enum El0IrqBoundary {
+    /// Only the GIC has a reschedule SGI; the legacy lane has none to deliver.
+    Reschedule,
+    /// A shutdown kick is pending in either the GIC or the legacy SDK line.
+    Shutdown,
+}
+
+/// Clear PSTATE.I on the caller's vCPU before resuming EL0.
+/// Rescheduling uses the GIC; shutdown also uses the legacy SDK IRQ line.
+pub(crate) fn unmask_el0_irqs(
+    vcpu: &applevisor::vcpu::Vcpu,
+    boundary: El0IrqBoundary,
+) -> Result<(), TrapError> {
     use applevisor::prelude::Reg;
-    if interrupt_model() != InterruptModel::Gic {
+    if interrupt_model() != InterruptModel::Gic && matches!(boundary, El0IrqBoundary::Reschedule) {
         return Ok(());
     }
     use applevisor::prelude::SysReg;
@@ -882,6 +892,16 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("crate::probes::vcpu_run_enter").next())
             .expect("shutdown entry arm path");
-        assert!(shutdown.contains("crate::gic::unmask_el0_irqs(vcpu)?"));
+        assert!(shutdown.contains("El0IrqBoundary::Shutdown"));
+        let armed = shutdown
+            .find("*kick_armed = true")
+            .expect("tracked shutdown IRQ");
+        let unmask = shutdown
+            .find("unmask_el0_irqs")
+            .expect("unmask pending shutdown IRQ");
+        assert!(
+            armed < unmask,
+            "failed unmask must still withdraw the armed IRQ"
+        );
     }
 }

@@ -8229,7 +8229,7 @@ impl HvfInner {
                     // makes no EL1-served syscall would never take the SGI
                     // (nor the slice timer it starts) and a queued thread
                     // would wait behind it forever.
-                    crate::gic::unmask_el0_irqs(vcpu)?;
+                    crate::gic::unmask_el0_irqs(vcpu, crate::gic::El0IrqBoundary::Reschedule)?;
                 }
             }
             // The engine accounts the guest CPU time via `guest_cpu::timed_run`
@@ -8246,10 +8246,10 @@ impl HvfInner {
                     carrick_el1_abi::mark_pending_host_work(usize::from(slot.raw()));
                 }
                 crate::gic::arm_kick(vcpu)?;
+                *kick_armed = true;
                 // A host-resumed native EL0 context can have I masked.
                 // The pending SGI must reach its scheduler IRQ boundary.
-                crate::gic::unmask_el0_irqs(vcpu)?;
-                *kick_armed = true;
+                crate::gic::unmask_el0_irqs(vcpu, crate::gic::El0IrqBoundary::Shutdown)?;
             }
             crate::probes::vcpu_run_enter(vcpu.id());
             vcpu.run().map_err(hvf_error)?;
