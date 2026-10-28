@@ -14631,3 +14631,402 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
     assert!(matches!(result, DispatchOutcome::Returned { value } if value > 0));
     assert_eq!(Arc::strong_count(&physical), 1);
 }
+
+#[test]
+fn fs_queries_and_signalfd_wait_for_owner_refused_copyout_without_consuming_state() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use carrick_abi::syscall::nr;
+
+    const BASE: u64 = 0x4000_0000;
+    const FILL: u8 = 0xa5;
+    const PATH: u64 = BASE + 0x40;
+    const NAME: u64 = BASE + 0x80;
+    const VAL: u64 = BASE + 0xc0;
+    const OUT: u64 = BASE + 0x100;
+    const OUT2: u64 = BASE + 0x300;
+
+    let target_tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    let lower = tempfile::tempdir_in(&target_tmp).unwrap_or_else(|_| tempfile::tempdir().unwrap());
+    std::fs::write(lower.path().join("item"), b"hello").unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(lower.path()).unwrap();
+    dispatcher.set_fs_backend(Box::new(backend));
+    dispatcher.set_rootfs_layer(RootFs::from_immutable_host_dir(lower.path()).unwrap());
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let mut memory = OwnerRefusingMemory::new(BASE, 0x2000, FILL);
+
+    // 1. read_signalfd in fs.rs must return OwnerMemoryWait without consuming
+    // the pending signal, and deliver the exact signal on the retry.
+    dispatcher.mark_process_signal_pending(&context, crate::linux_abi::LINUX_SIGUSR1);
+    let mask = carrick_abi::SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGUSR1);
+    let tid = crate::thread::ThreadId::from_wire_key(context.thread().key().tid.raw() as i32);
+    memory.seed(OUT, &[FILL; 128]);
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .fs_view()
+            .read_signalfd(&context, &mut memory, OUT, 128, mask, tid),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(memory.read_bytes(OUT, 128).unwrap(), vec![FILL; 128]);
+    assert!(
+        context
+            .shared()
+            .pending_signals()
+            .present()
+            .contains(crate::linux_abi::LINUX_SIGUSR1),
+        "refused signalfd copyout must leave pending signal intact",
+    );
+    assert_eq!(
+        dispatcher
+            .fs_view()
+            .read_signalfd(&context, &mut memory, OUT, 128, mask, tid),
+        DispatchOutcome::Returned { value: 128 },
+    );
+    let signo = u32::from_le_bytes(memory.read_bytes(OUT, 4).unwrap().try_into().unwrap());
+    assert_eq!(signo, crate::linux_abi::LINUX_SIGUSR1 as u32);
+
+    // 2. getcwd (mount.rs) and getxattr / listxattr (xattr.rs -> fs.rs::copyout_bytes).
+    memory.seed(OUT, &[FILL; 16]);
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(nr::GETCWD.raw(), SyscallArgs::from([OUT, 16, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(memory.read_bytes(OUT, 2).unwrap(), vec![FILL; 2]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(nr::GETCWD.raw(), SyscallArgs::from([OUT, 16, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 2 },
+    );
+    assert_eq!(memory.read_bytes(OUT, 2).unwrap(), b"/\0");
+
+    memory.seed(PATH, b"/item\0");
+    memory.seed(NAME, b"user.tag\0");
+    memory.seed(VAL, b"v1");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::SETXATTR.raw(),
+                    SyscallArgs::from([PATH, NAME, VAL, 2, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    memory.seed(OUT, &[FILL; 16]);
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::GETXATTR.raw(),
+                    SyscallArgs::from([PATH, NAME, OUT, 16, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(memory.read_bytes(OUT, 2).unwrap(), vec![FILL; 2]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::GETXATTR.raw(),
+                    SyscallArgs::from([PATH, NAME, OUT, 16, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 2 },
+    );
+    assert_eq!(memory.read_bytes(OUT, 2).unwrap(), b"v1");
+
+    memory.seed(OUT2, &[FILL; 16]);
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::LISTXATTR.raw(),
+                    SyscallArgs::from([PATH, OUT2, 16, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(memory.read_bytes(OUT2, 9).unwrap(), vec![FILL; 9]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::LISTXATTR.raw(),
+                    SyscallArgs::from([PATH, OUT2, 16, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 9 },
+    );
+    assert_eq!(memory.read_bytes(OUT2, 9).unwrap(), b"user.tag\0");
+}
+
+#[test]
+fn fcntl_getlk_and_getown_ex_wait_for_owner_refused_copyout_without_mutating_locks() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use carrick_abi::syscall::nr;
+    use std::os::fd::IntoRawFd;
+
+    const BASE: u64 = 0x4000_0000;
+    const FILL: u8 = 0xa5;
+    const FLOCK_ADDR: u64 = BASE + 0x100;
+    const OUT_ADDR: u64 = BASE + 0x200;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let mut memory = OwnerRefusingMemory::new(BASE, 0x2000, FILL);
+
+    let host_fd = tempfile::tempfile().unwrap().into_raw_fd();
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(host_fd, &mut st) }, 0);
+    let file_id = LeaseFileId::Inode {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+    };
+    let DispatchOutcome::Returned { value: fd } = dispatcher.install_fd(
+        OpenDescription::HostFile {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            host_fd: HostFdRef::new(host_fd),
+            metadata: RootFsMetadata {
+                path: "/host-lock-target".into(),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 64,
+            },
+            writable: true,
+        },
+        0,
+    ) else {
+        panic!("install host file fd");
+    };
+
+    let seed_wrlck_probe = |memory: &mut OwnerRefusingMemory| {
+        let mut flock = [0u8; 32];
+        flock[0..2].copy_from_slice(&(LINUX_F_WRLCK as i16).to_le_bytes());
+        flock[2..4].copy_from_slice(&(libc::SEEK_SET as i16).to_le_bytes());
+        flock[8..16].copy_from_slice(&0i64.to_le_bytes());
+        flock[16..24].copy_from_slice(&16i64.to_le_bytes());
+        flock[24..28].copy_from_slice(&777i32.to_le_bytes());
+        memory.seed(FLOCK_ADDR, &flock);
+    };
+
+    // 1. Uncontended F_GETLK (writes 2-byte F_UNLCK): refused copyout must
+    // wait without overwriting l_type, then write F_UNLCK on retry.
+    seed_wrlck_probe(&mut memory);
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::FCNTL.raw(),
+                    SyscallArgs::from([fd as u64, LINUX_F_GETLK, FLOCK_ADDR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(
+        i16::from_le_bytes(
+            memory
+                .read_bytes(FLOCK_ADDR, 2)
+                .unwrap()
+                .try_into()
+                .unwrap()
+        ),
+        LINUX_F_WRLCK as i16,
+        "uncontended F_GETLK must not overwrite l_type before retry",
+    );
+    assert!(dispatcher.fs_view().fs.classic_record_locks.is_empty());
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::FCNTL.raw(),
+                    SyscallArgs::from([fd as u64, LINUX_F_GETLK, FLOCK_ADDR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        i16::from_le_bytes(
+            memory
+                .read_bytes(FLOCK_ADDR, 2)
+                .unwrap()
+                .try_into()
+                .unwrap()
+        ),
+        LINUX_F_UNLCK as i16,
+    );
+
+    // 2. Contended F_GETLK and F_OFD_GETLK (writes 32-byte conflicting flock):
+    // refused copyout must wait without mutating the lock table or caller buffer.
+    let blocker = LogicalRecordLockRequest {
+        file: file_id,
+        owner: LogicalRecordLockOwner::Process { pid: 99, serial: 9 },
+        range: LogicalRecordLockRange { start: 4, end: 12 },
+        write: true,
+    };
+    assert_eq!(
+        dispatcher
+            .fs_view()
+            .fs
+            .classic_record_locks
+            .try_set(blocker),
+        Ok(()),
+    );
+    for cmd in [LINUX_F_GETLK, LINUX_F_OFD_GETLK] {
+        seed_wrlck_probe(&mut memory);
+        let wait = memory.refuse_next();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::FCNTL.raw(),
+                        SyscallArgs::from([fd as u64, cmd, FLOCK_ADDR, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        assert_eq!(
+            i64::from_le_bytes(
+                memory
+                    .read_bytes(FLOCK_ADDR + 8, 8)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            0,
+            "refused conflict copyout must leave caller flock untouched",
+        );
+        assert_eq!(
+            dispatcher
+                .fs_view()
+                .fs
+                .classic_record_locks
+                .state()
+                .locks
+                .len(),
+            1,
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::FCNTL.raw(),
+                        SyscallArgs::from([fd as u64, cmd, FLOCK_ADDR, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(
+            i64::from_le_bytes(
+                memory
+                    .read_bytes(FLOCK_ADDR + 8, 8)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            4,
+        );
+        if cmd == LINUX_F_OFD_GETLK {
+            assert_eq!(
+                i32::from_le_bytes(
+                    memory
+                        .read_bytes(FLOCK_ADDR + 24, 4)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                ),
+                -1,
+            );
+        }
+    }
+
+    // 3. F_GETOWN_EX: refused copyout must wait without overwriting caller buffer.
+    memory.seed(OUT_ADDR, &[FILL; 8]);
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::FCNTL.raw(),
+                    SyscallArgs::from([fd as u64, LINUX_F_GETOWN_EX, OUT_ADDR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(memory.read_bytes(OUT_ADDR, 8).unwrap(), vec![FILL; 8]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::FCNTL.raw(),
+                    SyscallArgs::from([fd as u64, LINUX_F_GETOWN_EX, OUT_ADDR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(memory.read_bytes(OUT_ADDR, 8).unwrap(), [0u8; 8]);
+}

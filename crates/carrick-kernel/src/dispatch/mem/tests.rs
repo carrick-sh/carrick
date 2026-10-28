@@ -7760,3 +7760,102 @@ fn mprotect_and_restore_leaves_one_merged_dynamic_row() {
     let rows: Vec<_> = mem.dynamic_maps.iter().map(|r| (r.start, r.end)).collect();
     assert_eq!(rows, vec![(start, end)], "the restore must re-merge");
 }
+
+#[test]
+fn remap_file_pages_and_mincore_wait_for_owner_refused_copyout_without_mutating_snapshots() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use carrick_abi::syscall::nr;
+
+    const BASE: u64 = 0x4000_0000;
+    const FILL: u8 = 0xa5;
+    let page = LINUX_PAGE_SIZE;
+    let vec_addr = BASE + 2 * page + 0x100;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let mut memory = OwnerRefusingMemory::new(BASE, (3 * page) as usize, FILL);
+    dispatcher.record_dynamic_mapping(
+        BASE,
+        2 * page,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        ProcMapSharing::Shared,
+        "/shared-remap".to_owned(),
+    );
+    memory.seed(BASE, b"page-zero");
+    memory.seed(BASE + page, b"page-one!");
+
+    // 1. remap_file_pages: refused copyout must return OwnerMemoryWait without
+    // caching remap_snapshots or overwriting page 0, and must commit on retry.
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::REMAP_FILE_PAGES.raw(),
+                    SyscallArgs([BASE, page, 0, 1, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert!(
+        dispatcher.mem().lock().remap_snapshots.is_empty(),
+        "refused remap_file_pages copyout must not populate remap_snapshots",
+    );
+    assert_eq!(memory.read_bytes(BASE, 9).unwrap(), b"page-zero");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::REMAP_FILE_PAGES.raw(),
+                    SyscallArgs([BASE, page, 0, 1, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert!(dispatcher.mem().lock().remap_snapshots.contains_key(&BASE));
+    assert_eq!(memory.read_bytes(BASE, 9).unwrap(), b"page-one!");
+
+    // 2. mincore: refused copyout must return OwnerMemoryWait without touching
+    // the caller's residency vector, and overwrite [FILL; 2] on retry.
+    memory.seed(vec_addr, &[FILL; 2]);
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::MINCORE.raw(),
+                    SyscallArgs([BASE, 2 * page, vec_addr, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(memory.read_bytes(vec_addr, 2).unwrap(), vec![FILL; 2]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::MINCORE.raw(),
+                    SyscallArgs([BASE, 2 * page, vec_addr, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(memory.read_bytes(vec_addr, 2).unwrap(), vec![0u8, 0u8]);
+}
