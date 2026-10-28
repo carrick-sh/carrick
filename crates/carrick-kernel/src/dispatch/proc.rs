@@ -3822,27 +3822,18 @@ impl<'a> ProcView<'a> {
             // Linux caps getrandom at 2^31-1 and returns a short count; clamp so a
             // huge length can't OOM-abort the runtime. Probe: bigread (read class).
             let length = length.min(crate::dispatch::MAX_RW_COUNT);
-            let mut bytes = vec![0; length];
-            if getrandom::fill(&mut bytes).is_err() {
-                fill_deterministic_bootstrap_random(&mut bytes);
-            }
             if length == 0 {
-                let out = match super::copyout::prepare(
-                    cx.kernel,
-                    cx.memory,
-                    [Some(super::copyout::UserSlot::new(address.0, 0))],
-                ) {
-                    Ok(out) => out,
-                    Err(refusal) => return Ok(refusal.into_outcome()),
-                };
-                out.commit([&[][..]])?;
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             let mut offset = 0usize;
             while offset < length {
                 let chunk_len = (length - offset).min(super::copyout::COPYOUT_MAX_BYTES);
                 let Some(chunk_addr) = address.0.checked_add(offset as u64) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    return Ok(if offset == 0 {
+                        DispatchOutcome::errno(LINUX_EFAULT)
+                    } else {
+                        DispatchOutcome::returned_len(offset)?
+                    });
                 };
                 let out = match super::copyout::prepare(
                     cx.kernel,
@@ -3850,9 +3841,26 @@ impl<'a> ProcView<'a> {
                     [Some(super::copyout::UserSlot::new(chunk_addr, chunk_len))],
                 ) {
                     Ok(out) => out,
-                    Err(refusal) => return Ok(refusal.into_outcome()),
+                    Err(refusal) => return Ok(if offset == 0 {
+                        refusal.into_outcome()
+                    } else {
+                        DispatchOutcome::returned_len(offset)?
+                    }),
                 };
-                out.commit([&bytes[offset..offset + chunk_len]])?;
+                // Generate only after securing this chunk. A later refusal or
+                // address fault returns the bytes already delivered, so retry
+                // never replaces an earlier random prefix with new data.
+                let mut bytes = vec![0; chunk_len];
+                if getrandom::fill(&mut bytes).is_err() {
+                    fill_deterministic_bootstrap_random(&mut bytes);
+                }
+                if let Err(fault) = out.commit([&bytes]) {
+                    return Ok(if offset == 0 {
+                        fault.outcome()
+                    } else {
+                        DispatchOutcome::returned_len(offset)?
+                    });
+                }
                 offset += chunk_len;
             }
             Ok(DispatchOutcome::returned_len(length)?)
@@ -8755,6 +8763,145 @@ mod copyout_refusal_s3_tests {
                     &self.reporter,
                 )
                 .expect("dispatch")
+        }
+    }
+
+    // Refuse only the second chunk so the real dispatcher must preserve progress.
+    struct RefuseSecond(OwnerRefusingMemory);
+
+    impl GuestMemory for RefuseSecond {
+        fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+            self.0.user_memory_venue()
+        }
+
+        fn prepare_write(
+            &mut self,
+            ranges: &[carrick_guest_mem::GuestWriteRange],
+        ) -> Result<
+            Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+            carrick_guest_mem::MemoryPrepareError,
+        > {
+            if self.0.prepares == 1 {
+                self.0.refuse_next();
+            }
+            self.0.prepare_write(ranges)
+        }
+
+        fn read_bytes_raw(
+            &self,
+            address: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            self.0.read_bytes_raw(address, length)
+        }
+
+        fn write_bytes_raw(
+            &mut self,
+            address: u64,
+            bytes: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            self.0.write_bytes_raw(address, bytes)
+        }
+    }
+
+    impl carrick_guest_mem::CurrentMmMemory for RefuseSecond {}
+
+    #[test]
+    fn getrandom_later_refusal_returns_committed_prefix() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = RefuseSecond(OwnerRefusingMemory::new(BASE, LEN, FILL));
+        let chunk = super::super::copyout::COPYOUT_MAX_BYTES;
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::GETRANDOM.raw(),
+                    SyscallArgs::from([BASE, (chunk * 2) as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: chunk as i64
+            }
+        );
+        assert_ne!(memory.read_bytes(BASE, chunk).unwrap(), vec![FILL; chunk]);
+        assert_eq!(
+            memory.read_bytes(BASE + chunk as u64, chunk).unwrap(),
+            vec![FILL; chunk]
+        );
+        assert_eq!(memory.0.prepares, 2);
+    }
+
+    #[test]
+    fn immediate_s3_results_do_not_prepare_output() {
+        let mut g = S3Guest::new();
+        let DispatchOutcome::Returned { value: groups } = g.call(nr::GETGROUPS.raw(), [0; 6])
+        else {
+            panic!("group count query");
+        };
+        g.memory.refuse_next();
+        for (number, args, expected) in [
+            (nr::GETRANDOM.raw(), [OUT_BUF, 0, 0, 0, 0, 0], 0),
+            (nr::GETGROUPS.raw(), [0, OUT_BUF, 0, 0, 0, 0], groups),
+            (nr::GETCPU.raw(), [0; 6], 0),
+            (
+                nr::CLOCK_GETRES.raw(),
+                [LINUX_CLOCK_MONOTONIC as u64, 0, 0, 0, 0, 0],
+                0,
+            ),
+        ] {
+            assert_eq!(
+                g.call(number, args),
+                DispatchOutcome::Returned { value: expected }
+            );
+        }
+        assert_eq!(
+            g.call(nr::TIMER_GETTIME.raw(), [u64::MAX, OUT_BUF, 0, 0, 0, 0]),
+            DispatchOutcome::errno(LINUX_EINVAL)
+        );
+        assert_eq!(g.memory.prepares, 0);
+    }
+
+    #[test]
+    fn syslog_empty_and_zero_length_results_do_not_prepare_output() {
+        let mut g = S3Guest::new();
+        let context = g.dispatcher.capture_one_task_context().unwrap();
+        context.task().with_caps(|caps| {
+            caps.effective |= 1u64 << crate::namespace::process::CAP_SYSLOG;
+            caps.permitted |= 1u64 << crate::namespace::process::CAP_SYSLOG;
+        });
+        context.syslog().clear();
+        g.memory.refuse_next();
+        for (action, len) in [(2, 0), (3, 64), (4, 64)] {
+            assert_eq!(
+                g.call(nr::SYSLOG.raw(), [action, OUT_BUF, len, 0, 0, 0]),
+                DispatchOutcome::Returned { value: 0 }
+            );
+        }
+        context
+            .syslog()
+            .append(6, 0, 100, b"record too long\n".to_vec());
+        assert_eq!(
+            g.call(nr::SYSLOG.raw(), [3, OUT_BUF, 1, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(g.memory.prepares, 0);
+    }
+
+    #[test]
+    fn s3_bad_output_pointers_remain_efault() {
+        let mut g = S3Guest::new();
+        for (number, args) in [
+            (nr::UNAME.raw(), [BASE - 8, 0, 0, 0, 0, 0]),
+            (nr::GETRANDOM.raw(), [BASE - 8, 4, 0, 0, 0, 0]),
+            (nr::GETRESUID.raw(), [BASE - 8, 0, 0, 0, 0, 0]),
+        ] {
+            assert_eq!(g.call(number, args), DispatchOutcome::errno(LINUX_EFAULT));
         }
     }
 

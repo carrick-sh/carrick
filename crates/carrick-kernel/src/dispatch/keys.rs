@@ -241,16 +241,25 @@ fn write_truncated<M: CurrentMmMemory>(
     let full = bytes.len();
     if address.0 != 0 && buffer_len != 0 {
         let copied = full.min(buffer_len);
-        if copied > 0 {
+        let mut offset = 0;
+        while offset < copied {
+            let chunk_len = (copied - offset).min(super::copyout::COPYOUT_MAX_BYTES);
+            let Some(chunk_address) = address.0.checked_add(offset as u64) else {
+                return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EFAULT));
+            };
             let out = match super::copyout::prepare(
                 context,
                 memory,
-                [Some(super::copyout::UserSlot::new(address.0, copied))],
+                [Some(super::copyout::UserSlot::new(
+                    chunk_address,
+                    chunk_len,
+                ))],
             ) {
                 Ok(out) => out,
                 Err(refusal) => return Ok(refusal.into_outcome()),
             };
-            out.commit([&bytes[..copied]])?;
+            out.commit([&bytes[offset..offset + chunk_len]])?;
+            offset += chunk_len;
         }
     }
     Ok(DispatchOutcome::returned_len(full)?)
@@ -582,5 +591,64 @@ fn keyctl_op<M: CurrentMmMemory>(
         | KeyctlOp::Move
         | KeyctlOp::Capabilities
         | KeyctlOp::WatchKey => Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP)),
+    }
+}
+
+#[cfg(test)]
+mod copyout_refusal_s3_tests {
+    use super::*;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use carrick_guest_mem::GuestMemory;
+
+    #[test]
+    fn key_payload_larger_than_one_permit_copies_all_bytes() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let chunk = super::super::copyout::COPYOUT_MAX_BYTES;
+        for length in [
+            chunk + 1,
+            chunk * 2 + 1,
+            carrick_abi::keyring::LINUX_KEY_USER_PAYLOAD_MAX,
+        ] {
+            let mut memory = OwnerRefusingMemory::new(0x10000, length, 0xa5);
+            let payload = vec![0x5a; length];
+            assert_eq!(
+                write_truncated(&context, &mut memory, GuestPtr(0x10000), length, &payload)
+                    .unwrap(),
+                DispatchOutcome::Returned {
+                    value: length as i64
+                },
+            );
+            assert_eq!(memory.read_bytes(0x10000, length).unwrap(), payload);
+            assert_eq!(memory.prepares, length.div_ceil(chunk));
+        }
+    }
+
+    #[test]
+    fn key_payload_empty_queries_refusals_and_bad_pointers() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x10000, 16, 0xa5);
+        let wait = memory.refuse_next();
+        for (address, capacity, bytes, count) in [
+            (0x10000, 0, &b"data"[..], 4),
+            (0, 4, &b"data"[..], 4),
+            (0x10000, 4, &b""[..], 0),
+        ] {
+            assert_eq!(
+                write_truncated(&context, &mut memory, GuestPtr(address), capacity, bytes).unwrap(),
+                DispatchOutcome::Returned { value: count }
+            );
+        }
+        assert_eq!(memory.prepares, 0);
+        assert_eq!(
+            write_truncated(&context, &mut memory, GuestPtr(0x10000), 4, b"data").unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.read_bytes(0x10000, 4).unwrap(), [0xa5; 4]);
+        assert!(matches!(
+            write_truncated(&context, &mut memory, GuestPtr(0xffff), 4, b"data"),
+            Err(DispatchError::Errno(carrick_abi::LINUX_EFAULT)),
+        ));
     }
 }
