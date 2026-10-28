@@ -762,7 +762,14 @@ impl<'a> NetView<'a> {
             // AF_NETLINK recv: drain the queued dump reply. The source address
             // (if requested) is the kernel: sockaddr_nl with pid=0.
             if this.fd_is_netlink(fd) {
-                let drained = this.netlink_recv(fd, buf_addr, len, flags, memory);
+                let drained = this.netlink_recv(cx.kernel, super::netlink::NetlinkReceive {
+                    fd: Fd(fd),
+                    buffer: GuestPtr(buf_addr),
+                    capacity: len,
+                    flags: LinuxMsgFlags::from_bits_retain(flags),
+                    source: (src_addr != 0 && src_len_addr != 0)
+                        .then_some((GuestPtr(src_addr), GuestPtr(src_len_addr))),
+                }, memory);
                 if let DispatchOutcome::Returned { .. } = drained
                     && src_addr != 0
                     && src_len_addr != 0
@@ -2886,7 +2893,12 @@ impl<'a> NetView<'a> {
             if total == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            let chunk = self.netlink_drain(fd, total);
+            let chunk = self
+                .netlink_drain(fd, total, |_| Ok::<_, std::convert::Infallible>(()))
+                .ok()
+                .flatten()
+                .map(|drained| drained.bytes)
+                .unwrap_or_default();
             if chunk.is_empty() {
                 return Ok(self.empty_netlink_recv(fd, flags));
             }
@@ -3901,5 +3913,176 @@ fn copy_send_payload(
             dst[..len].copy_from_slice(&bytes[..len]);
         }
         (None, None) => {}
+    }
+}
+
+#[cfg(test)]
+mod s6_netlink_copyout_tests {
+    use super::*;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use crate::dispatch::{CompatReporter, SyscallArgs, SyscallRequest};
+    use carrick_guest_mem::GuestMemory;
+
+    #[test]
+    fn s6_netlink_recvfrom_refusal_preserves_queued_bytes() {
+        for size in [1, 32, 4096] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let reporter = CompatReporter::default();
+            let DispatchOutcome::Returned { value: fd } = dispatcher
+                .netlink_socket(LINUX_SOCK_DGRAM | LinuxSocketTypeFlags::NONBLOCK.bits(), 0)
+            else {
+                panic!("netlink socket");
+            };
+            let payload = vec![0x71; size];
+            dispatcher
+                .enqueue_netlink_message(fd as i32, &payload)
+                .unwrap();
+            let mut memory = OwnerRefusingMemory::new(0x1000, 0x4000, 0xa5);
+            let wait = memory.refuse_next();
+            // Capacity exceeds the permit; actual queued bytes decide preparation.
+            let call = SyscallRequest::new(
+                207,
+                SyscallArgs::from([
+                    fd as u64,
+                    0x1000,
+                    16384,
+                    LinuxMsgFlags::DONTWAIT.bits() as u64,
+                    0,
+                    0,
+                ]),
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, call, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(memory.read_bytes(0x1000, size).unwrap(), vec![0xa5; size]);
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, call, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: size as i64 }
+            );
+            assert_eq!(memory.read_bytes(0x1000, size).unwrap(), payload);
+            assert_eq!(memory.prepares, 2);
+            let prepares = memory.prepares;
+            memory.refuse_next();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, call, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::errno(LINUX_EAGAIN)
+            );
+            assert_eq!(memory.prepares, prepares, "empty queue does not prepare");
+        }
+    }
+}
+
+#[cfg(test)]
+mod s6_netlink_fault_tests {
+    use super::*;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use crate::dispatch::{CompatReporter, SyscallArgs, SyscallRequest};
+    use carrick_guest_mem::GuestMemory;
+
+    #[test]
+    fn s6_netlink_supply_preserves_bytes_and_real_fault_keeps_consumption() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let DispatchOutcome::Returned { value: fd } =
+            dispatcher.netlink_socket(LINUX_SOCK_DGRAM | LinuxSocketTypeFlags::NONBLOCK.bits(), 0)
+        else {
+            panic!("netlink socket");
+        };
+        dispatcher
+            .enqueue_netlink_message(fd as i32, b"supply")
+            .unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0xa5);
+        let request = memory.refuse_next_supply_grant();
+        let call = SyscallRequest::new(
+            207,
+            SyscallArgs::from([
+                fd as u64,
+                0x1000,
+                32,
+                LinuxMsgFlags::DONTWAIT.bits() as u64,
+                0,
+                0,
+            ]),
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, call, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::OwnerMemorySupply {
+                request,
+                committed: 0
+            }
+        );
+        assert_eq!(memory.read_bytes(0x1000, 6).unwrap(), [0xa5; 6]);
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, call, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 6 }
+        );
+        assert_eq!(memory.read_bytes(0x1000, 6).unwrap(), b"supply");
+
+        dispatcher
+            .enqueue_netlink_message(fd as i32, b"fault")
+            .unwrap();
+        let bad = SyscallRequest::new(
+            207,
+            SyscallArgs::from([
+                fd as u64,
+                0x9000,
+                32,
+                LinuxMsgFlags::DONTWAIT.bits() as u64,
+                0,
+                0,
+            ]),
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, bad, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, call, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::errno(LINUX_EAGAIN)
+        );
+
+        dispatcher
+            .enqueue_netlink_message(fd as i32, b"zero")
+            .unwrap();
+        memory.refuse_next();
+        let prepares = memory.prepares;
+        let zero = SyscallRequest::new(207, SyscallArgs::from([fd as u64, 0x9000, 0, 0, 0, 0]));
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, zero, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(memory.prepares, prepares);
+        assert!(matches!(
+            dispatcher
+                .dispatch(&context, call, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { committed: 0, .. }
+        ));
+        assert_eq!(
+            dispatcher
+                .dispatch(&context, call, &mut memory, &reporter)
+                .unwrap(),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(memory.read_bytes(0x1000, 4).unwrap(), b"zero");
     }
 }

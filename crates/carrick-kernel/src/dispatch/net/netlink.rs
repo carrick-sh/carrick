@@ -10,6 +10,27 @@ use super::*;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+/// Receive arguments shared with the syscall's source-address completion.
+pub(in crate::dispatch) struct NetlinkReceive {
+    pub fd: Fd,
+    pub buffer: GuestPtr,
+    pub capacity: usize,
+    pub flags: LinuxMsgFlags,
+    pub source: Option<(GuestPtr, GuestPtr)>,
+}
+
+/// Queue bytes and the destination authority admitted before their removal.
+pub(super) struct NetlinkDrain<T> {
+    pub bytes: Vec<u8>,
+    pub authority: T,
+}
+
+enum NetlinkAdmissionError {
+    Empty,
+    Deferred,
+    Refused(crate::dispatch::copyout::CopyoutRefusal),
+}
+
 impl<'a> NetView<'a> {
     /// Create a synthetic AF_NETLINK socket. Linux accepts SOCK_RAW and
     /// SOCK_DGRAM for netlink (they're equivalent there); other socket
@@ -107,16 +128,61 @@ impl<'a> NetView<'a> {
     /// or block/EAGAIN while a blocking caller waits for a future kernel event.
     pub(in crate::dispatch) fn netlink_recv(
         &self,
-        fd: i32,
-        buf_addr: u64,
-        len: usize,
-        flags: i32,
+        context: &crate::kernel::KernelContext,
+        request: NetlinkReceive,
         memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
+        use crate::dispatch::copyout::{self, COPYOUT_MAX_BYTES, UserSlot};
+
+        let fd = request.fd.0;
+        let buf_addr = request.buffer.0;
+        let len = request.capacity;
+        let flags = request.flags.bits();
         if len == 0 {
             return DispatchOutcome::Returned { value: 0 };
         }
-        let chunk = self.netlink_drain(fd, len);
+        // The existing drain authority owns readiness sampling and consumption.
+        // A sibling cannot replace the sample during destination admission.
+        if request.source.is_none()
+            && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
+        {
+            let drained = self.netlink_drain(fd, len, |count| {
+                if count == 0 {
+                    return Err(NetlinkAdmissionError::Empty);
+                }
+                if count > COPYOUT_MAX_BYTES {
+                    return Err(NetlinkAdmissionError::Deferred);
+                }
+                copyout::prepare(context, memory, [Some(UserSlot::new(buf_addr, count))])
+                    .map_err(NetlinkAdmissionError::Refused)
+            });
+            match drained {
+                Ok(Some(drained)) => {
+                    // The permit retains effect custody across both the queue
+                    // removal and publication. A genuine fault retains the old
+                    // consumption behavior; transient refusal never drains.
+                    return match drained.authority.commit([&drained.bytes]) {
+                        Ok(()) => DispatchOutcome::returned_len_or_errno(drained.bytes.len()),
+                        Err(fault) => fault.outcome(),
+                    };
+                }
+                Ok(None) | Err(NetlinkAdmissionError::Empty) => {
+                    return self.empty_netlink_recv(fd, flags);
+                }
+                Err(NetlinkAdmissionError::Refused(refusal)) => return refusal.into_outcome(),
+                Err(NetlinkAdmissionError::Deferred) => {}
+            }
+        }
+        // Counted #986 debt: a larger receive, or a source-address completion
+        // after payload publication, needs retained receive progress. Do not
+        // suspend after draining, split into replayable permits, or shorten a
+        // netlink dump to disguise that missing continuation shape.
+        let chunk = self
+            .netlink_drain(fd, len, |_| Ok::<_, std::convert::Infallible>(()))
+            .ok()
+            .flatten()
+            .map(|drained| drained.bytes)
+            .unwrap_or_default();
         if chunk.is_empty() {
             return self.empty_netlink_recv(fd, flags);
         }
@@ -129,19 +195,28 @@ impl<'a> NetView<'a> {
     /// Pop up to `max` bytes from the netlink recv queue. Our synthetic
     /// reply is built as one contiguous dump, so a single drain that fits
     /// the caller's buffer returns the whole thing.
-    pub(super) fn netlink_drain(&self, fd: i32, max: usize) -> Vec<u8> {
+    pub(super) fn netlink_drain<T, E>(
+        &self,
+        fd: i32,
+        max: usize,
+        before_drain: impl FnOnce(usize) -> Result<T, E>,
+    ) -> Result<Option<NetlinkDrain<T>>, E> {
         let Some(open_file) = self.open_file(fd) else {
-            return Vec::new();
+            return Ok(None);
         };
         let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
         else {
-            return Vec::new();
+            return Ok(None);
         };
         let OpenDescription::Netlink { recv_queue, .. } = &mut *open else {
-            return Vec::new();
+            return Ok(None);
         };
         let take = recv_queue.len().min(max);
-        recv_queue.drain(..take).collect()
+        let authority = before_drain(take)?;
+        Ok(Some(NetlinkDrain {
+            bytes: recv_queue.drain(..take).collect(),
+            authority,
+        }))
     }
 
     pub(super) fn empty_netlink_recv(&self, fd: i32, flags: i32) -> DispatchOutcome {
