@@ -1282,6 +1282,7 @@ where
                 kick.interrupt_for_shutdown();
             }
         }
+        self.scheduler.close_and_retire_unused_birth_capacity();
         let mut failures = Vec::new();
         if let Err(error) = self
             .resolver

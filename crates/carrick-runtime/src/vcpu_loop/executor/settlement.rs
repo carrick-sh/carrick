@@ -386,7 +386,7 @@ where
     B: PersistentTaskBinding + Send + Sync + 'static,
     R: TaskBindingResolver<B>,
 {
-    scheduler.close();
+    scheduler.close_and_retire_unused_birth_capacity();
     resolver
         .cancel_dormant(scheduler, ExecutionFailure::SnapshotRestoreFailed)
         .map_err(|error| error.to_string())?;
