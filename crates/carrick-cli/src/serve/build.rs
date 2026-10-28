@@ -117,6 +117,58 @@ const DEFAULT_BUILD_CONTEXT_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_BUILD_CONTEXT_ENTRIES: usize = 1_000_000;
 const BUILD_CONTEXT_DISK_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Unprivileged free space (`f_bavail * f_frsize`) on the build context's
+/// destination volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VolumeAvailableBytes(u64);
+
+impl VolumeAvailableBytes {
+    #[cfg(test)]
+    const fn from_bytes(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    fn probe(dest: &Path) -> io::Result<Self> {
+        let path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(dest.as_os_str()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in context path"))?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `stat` is writable storage for
+        // the full libc record. It is read only after statvfs reports success.
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful statvfs initialized the output record above.
+        let stat = unsafe { stat.assume_init() };
+        Ok(Self(
+            (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64),
+        ))
+    }
+
+    const fn usable_above_floor(self) -> u64 {
+        self.0.saturating_sub(BUILD_CONTEXT_DISK_FLOOR_BYTES)
+    }
+}
+
+/// Source of the destination volume's free-space measurement. Production always
+/// probes the live volume via `statvfs`; tests inject a fixed reading so HTTP
+/// `/build` verdicts do not depend on host disk fullness.
+#[derive(Clone, Copy, Debug)]
+enum VolumeSpaceSource {
+    Statvfs,
+    #[cfg(test)]
+    Fixed(VolumeAvailableBytes),
+}
+
+impl VolumeSpaceSource {
+    fn available(self, dest: &Path) -> io::Result<VolumeAvailableBytes> {
+        match self {
+            Self::Statvfs => VolumeAvailableBytes::probe(dest),
+            #[cfg(test)]
+            Self::Fixed(available) => Ok(available),
+        }
+    }
+}
+
 /// Operator limits for one build request. The expanded cap is also clamped to
 /// the free space on the context's actual temporary volume minus 1 GiB.
 #[derive(Clone, Copy)]
@@ -124,6 +176,7 @@ pub(crate) struct BuildContextLimits {
     pub compressed: usize,
     expanded: u64,
     entries: usize,
+    space: VolumeSpaceSource,
 }
 
 impl BuildContextLimits {
@@ -156,29 +209,23 @@ impl BuildContextLimits {
             )?,
             entries: usize::try_from(entries)
                 .map_err(|_| "build entry cap exceeds this host's address size".to_owned())?,
+            space: VolumeSpaceSource::Statvfs,
         })
     }
 
-    fn for_destination(mut self, dest: &Path) -> io::Result<Self> {
-        let path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(dest.as_os_str()))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in context path"))?;
-        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        // SAFETY: `path` is NUL-terminated and `stat` is writable storage for
-        // the full libc record. It is read only after statvfs reports success.
-        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a successful statvfs initialized the output record above.
-        let stat = unsafe { stat.assume_init() };
-        let available = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
-        self = self.bounded_by_available(available);
-        Ok(self)
+    #[cfg(test)]
+    const fn with_available_space(mut self, available: VolumeAvailableBytes) -> Self {
+        self.space = VolumeSpaceSource::Fixed(available);
+        self
     }
 
-    fn bounded_by_available(mut self, available: u64) -> Self {
-        self.expanded = self
-            .expanded
-            .min(available.saturating_sub(BUILD_CONTEXT_DISK_FLOOR_BYTES));
+    fn for_destination(self, dest: &Path) -> io::Result<Self> {
+        let available = self.space.available(dest)?;
+        Ok(self.bounded_by_available(available))
+    }
+
+    fn bounded_by_available(mut self, available: VolumeAvailableBytes) -> Self {
+        self.expanded = self.expanded.min(available.usable_above_floor());
         self
     }
 }
@@ -560,6 +607,9 @@ mod tests {
             compressed: DEFAULT_BUILD_CONTEXT_COMPRESSED_BYTES,
             expanded: 32 * 1024 * 1024,
             entries: 10_000,
+            space: VolumeSpaceSource::Fixed(VolumeAvailableBytes::from_bytes(
+                BUILD_CONTEXT_DISK_FLOOR_BYTES + DEFAULT_BUILD_CONTEXT_EXPANDED_BYTES,
+            )),
         }
     }
 
@@ -568,11 +618,84 @@ mod tests {
         let limits = test_limits();
         assert_eq!(
             limits
-                .bounded_by_available(BUILD_CONTEXT_DISK_FLOOR_BYTES + 4096)
+                .bounded_by_available(VolumeAvailableBytes::from_bytes(
+                    BUILD_CONTEXT_DISK_FLOOR_BYTES + 4096,
+                ))
                 .expanded,
             4096
         );
-        assert_eq!(limits.bounded_by_available(4096).expanded, 0);
+        assert_eq!(
+            limits
+                .bounded_by_available(VolumeAvailableBytes::from_bytes(4096))
+                .expanded,
+            0
+        );
+    }
+
+    #[test]
+    fn volume_available_bytes_probes_live_directory_and_rejects_nul_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(VolumeSpaceSource::Statvfs.available(dir.path()).is_ok());
+
+        use std::os::unix::ffi::OsStrExt;
+        let bad = Path::new(std::ffi::OsStr::from_bytes(b"bad\0path"));
+        let err = VolumeAvailableBytes::probe(bad).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn low_volume_headroom_clamps_http_build_before_entry_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let gz = gzip_tar(|builder| append_link(builder, "sub", root.path(), false));
+        let limits = test_limits().with_available_space(VolumeAvailableBytes::from_bytes(
+            BUILD_CONTEXT_DISK_FLOOR_BYTES,
+        ));
+        let response = build_response("", Bytes::from(gz), limits).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("expanded build context bytes exceeds configured cap of 0"),
+            "unexpected 413 body: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn low_volume_headroom_reports_clamped_cap_in_413_body() {
+        let gz = gzip_tar(|builder| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(2048);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "bomb", std::io::repeat(0).take(2048))
+                .unwrap();
+        });
+        let limits = BuildContextLimits {
+            expanded: 1024,
+            ..test_limits()
+        }
+        .with_available_space(VolumeAvailableBytes::from_bytes(
+            BUILD_CONTEXT_DISK_FLOOR_BYTES + 512,
+        ));
+        let response = build_response("", Bytes::from(gz), limits).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("expanded build context bytes exceeds configured cap of 512"),
+            "unexpected 413 body: {text}"
+        );
+        assert!(
+            !text.contains("1024"),
+            "body reported unclamped cap: {text}"
+        );
     }
 
     fn gzip_tar(append: impl FnOnce(&mut tar::Builder<&mut Vec<u8>>)) -> Vec<u8> {
