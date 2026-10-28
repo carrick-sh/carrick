@@ -1329,6 +1329,7 @@ dependencies = [
 name = "carrick-xtask"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "carrick-conformance",
  "carrick-el1-abi",
  "carrick-guest-arch",
@@ -1338,6 +1339,7 @@ dependencies = [
  "libc",
  "proc-macro2",
  "quote",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

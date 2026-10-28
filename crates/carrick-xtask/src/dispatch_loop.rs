@@ -221,14 +221,16 @@ impl Board {
             "issue":item("issue"),"pr":self.pr.map(|number| json!({"number":number,"item":item("pr")}))})
     }
 }
+/// The board App token, minted on demand by the controller (#1012) and
+/// reused for at most 45 minutes. Without it the board reports unavailable.
+fn board_token() -> Result<crate::ci_scaler::mint::AppToken, ScalerError> {
+    crate::dispatch_mint::app_token(crate::ci_scaler::mint::MintScope::Board).map_err(|failure| {
+        ScalerError::Usage(format!("board token unavailable: {}", failure.describe()))
+    })
+}
 impl Server<'_> {
     fn board_api(&self, query: &str, variables: Value) -> Result<Value, ScalerError> {
-        let token = std::env::var("DISPATCH_BOARD_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .ok_or(ScalerError::Guard(
-                "DISPATCH_BOARD_TOKEN is empty or absent",
-            ))?;
+        let token = board_token()?;
         let state = crate::agent_runner::state()?;
         std::fs::create_dir_all(&state)?;
         let mut request = tempfile::NamedTempFile::new_in(&state)?;
@@ -240,7 +242,7 @@ impl Server<'_> {
             .args(["api", "graphql", "--input"])
             .arg(request.path())
             .current_dir(self.root)
-            .env("GH_TOKEN", token)
+            .env("GH_TOKEN", token.secret())
             .env_remove("GITHUB_TOKEN")
             .env_remove("DISPATCH_BOARD_TOKEN")
             .env_remove("DISPATCH_PUBLISH_TOKEN");
@@ -262,14 +264,7 @@ impl Server<'_> {
         Ok(response["data"].clone())
     }
     fn board(&self) -> Result<Board, ScalerError> {
-        if std::env::var("DISPATCH_BOARD_TOKEN")
-            .unwrap_or_default()
-            .is_empty()
-        {
-            return Err(ScalerError::Guard(
-                "DISPATCH_BOARD_TOKEN is empty or absent",
-            ));
-        }
+        board_token()?;
         // Re-resolve ownership before using any PR as a board destination.
         let pr = if self.pr.is_some() {
             let pr = require_owned_pr(self.root, &self.dispatch)?;
@@ -3104,7 +3099,7 @@ mod tests {
                 state["board"]["reason"]
                     .as_str()
                     .unwrap()
-                    .contains("DISPATCH_BOARD_TOKEN"),
+                    .contains("board token unavailable: no controller mint channel"),
                 "missing board token reason not reported"
             );
         });
@@ -3113,6 +3108,7 @@ mod tests {
     fn board_token_is_masked_in_responses_comments_and_artifacts() {
         shared_fixture(|root| {
             let mut server = server(root);
+            assert!(board_token().is_ok(), "board token was not minted");
             let response = server.respond(br#"{"tool":"opaque-board-credential","arguments":{}}"#);
             assert!(
                 !response.to_string().contains("opaque-board-credential"),
@@ -3615,6 +3611,10 @@ API
     fn publish_token_is_masked_in_responses_comments_and_artifacts() {
         shared_fixture(|root| {
             let mut server = server(root);
+            assert!(
+                crate::dispatch_mint::app_token(crate::ci_scaler::mint::MintScope::Publish).is_ok(),
+                "publish token was not minted"
+            );
             assert!(
                 crate::dispatch_redaction::DiagnosticSecrets::capture()
                     .unwrap()
@@ -5090,8 +5090,11 @@ exec /usr/bin/git "$@"
                     },
                 )
                 .env("GITHUB_RUN_ATTEMPT", "1")
+                .env_remove("DISPATCH_PUBLISH_TOKEN")
+                .env_remove("DISPATCH_BOARD_TOKEN")
+                .env_remove("CARRICK_TEST_MINT_STATE")
                 .env(
-                    "DISPATCH_PUBLISH_TOKEN",
+                    "CARRICK_TEST_MINT_PUBLISH",
                     if std::thread::current()
                         .name()
                         .unwrap()
@@ -5103,7 +5106,7 @@ exec /usr/bin/git "$@"
                     },
                 )
                 .env(
-                    "DISPATCH_BOARD_TOKEN",
+                    "CARRICK_TEST_MINT_BOARD",
                     if std::thread::current()
                         .name()
                         .unwrap()

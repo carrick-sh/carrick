@@ -166,13 +166,11 @@ jobs:
         id: loop
         if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
         timeout-minutes: 47
+        # Publish and board App tokens are minted on demand by the ctb
+        # controller through the runner state directory (#1012).
         env:
           GH_TOKEN: ${{ github.token }}
-          DISPATCH_BOARD_TOKEN: ${{ secrets.DISPATCH_BOARD_TOKEN }}
-          DISPATCH_PUBLISH_TOKEN: ${{ secrets.DISPATCH_PUBLISH_TOKEN }}
         run: |
-          if [ -n "$DISPATCH_BOARD_TOKEN" ]; then echo "::add-mask::$DISPATCH_BOARD_TOKEN"; fi
-          if [ -n "$DISPATCH_PUBLISH_TOKEN" ]; then echo "::add-mask::$DISPATCH_PUBLISH_TOKEN"; fi
           CARRICK_DISPATCH_STEP_STARTED_AT=$(date +%s)
           export CARRICK_DISPATCH_STEP_STARTED_AT
           "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load -- \

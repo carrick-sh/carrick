@@ -70,27 +70,58 @@ The runner holds the job-scoped `GITHUB_TOKEN` with exactly `contents: write`,
 alone uses it for GitHub reads, comments, closing-reference checks and run
 lookups. Publication also uses it when the publish credential is unavailable.
 
-`DISPATCH_BOARD_TOKEN` is a separate one-hour `carrick-workers` App installation
-token, down-scoped at mint to `{"organization_projects":"write"}`. Only the
-loop step receives the secret, and only the runner-uid tool server uses it.
-Both model accounts receive cleared environments. The workflow masks it before
-the loop starts; diagnostic redaction and the complete artifact scan also cover
-its exact bytes. No App private key enters GitHub Actions. The director adds
-the Mac minter after landing; until the secret exists, reads and status updates
-report `unavailable` with the missing-token reason and the run continues.
+The publish and board tokens are one-hour `carrick-workers` App installation
+tokens that the standing ctb controller mints when the tool server needs one
+(#1012). They are not repository secrets, and no workflow step receives them.
+Minting on demand means a job that waited in the runner queue, or a turn that
+runs close to an hour, still writes with a fresh token.
 
-`DISPATCH_PUBLISH_TOKEN` is a separate one-hour `carrick-workers` App
-installation token, down-scoped at mint to
-`{"repositories":["carrick"],"permissions":{"contents":"write","pull_requests":"write"}}`.
-Only the loop step receives it. The runner-uid tool server uses it only for the
-fixed-refspec branch push and PR creation or body PATCH, including restoration.
-Git and GitHub subprocesses receive it as `GH_TOKEN` only for those writes;
-reads, comments, closing-reference checks and run lookups keep the job token.
-The director adds the Mac minter after landing; no App private key enters the job.
-Both model accounts receive cleared environments, and the publish token is
-masked and included in diagnostic redaction and the complete artifact scan.
-The App has no workflow permission, so dispatch continues to refuse workflow
-file changes and reports an App push refusal explicitly.
+How a token is requested:
+
+1. Right before its first publication write, or its first board read or
+   update, the runner-uid tool server writes a request (`publish` or `board`,
+   a random nonce, and the run, attempt and SHA from the root-owned
+   `approved-policy`) into `/run/carrick-ci/token-request`.
+2. The controller reads the request through the scoped PVE guest agent. It
+   checks that the runner is a running agent clone it approved for this exact
+   run and attempt, that GitHub reports the assigned `worker` job of
+   `dispatch-worker.yml` in progress on that runner at that SHA, and that the
+   job has mint budget left (six tokens per scope, 32 answered requests per
+   clone). The ledger records each answered nonce before any mint, never the
+   token.
+3. The controller signs an App JWT with the key from its systemd credential
+   and mints a token with a fixed grant. The grant comes from the controller,
+   never from the request. `publish` is
+   `{"repositories":["carrick"],"permissions":{"contents":"write","pull_requests":"write"}}`.
+   `board` is `{"permissions":{"organization_projects":"write"}}`. It rejects
+   a minted token whose granted permissions differ from that grant.
+4. The answer goes back as stdin of a root shell in the clone (never in a
+   command line) into `/run/carrick-ci/token-response`. That file is runner-owned
+   0600 in a root-owned directory, so the model accounts cannot read it and the
+   runner cannot swap it for a link. The tool server reads it and erases it at
+   once, then keeps the token only in memory for at most 45 minutes.
+
+The tool server waits at most 60 seconds for an answer. If the controller
+refuses, the channel is missing (any runner other than a ctb agent clone), the
+runner has no approved `agent` policy or no answer arrives, publication uses
+the job token. The artifact records why in `token_fallback`: `mint_refused`
+with the controller's reason (for example `budget_exhausted` or
+`job_not_in_progress`) or `mint_unavailable` (`no_channel`, `no_assignment`,
+`timeout`, `malformed`). The outcome comment states the same reason. The board
+reports `unavailable` with that reason, and the run continues. The tool server
+remembers a refusal or a missing channel for 45 minutes and a timeout or
+failed mint for five, so a down controller costs one bounded wait per interval.
+
+The tool server uses the publish token only for the fixed-refspec branch push
+and PR creation or body PATCH, including restoration, and the board token only
+for project-1 reads and status updates of the dispatch issue and PR. Git and
+GitHub subprocesses receive a token as `GH_TOKEN` only for those calls; reads,
+comments, closing-reference checks and run lookups keep the job token. Both
+model accounts receive cleared environments. Diagnostic redaction and the
+complete artifact scan cover every token the process minted, and every
+installation token by its `ghs_` shape. No App private key enters a clone or
+GitHub Actions. The App has no workflow permission, so dispatch continues to
+refuse workflow file changes and reports an App push refusal explicitly.
 
 The publish token shares the `carrick-workers` App identity with the ctb-w1..w4
 worker VMs, which run untrusted LLM workers. Comments, reviews and inline
@@ -117,7 +148,7 @@ is not reused at admission. If an earlier run pushed a branch but never
 created its PR, a later run creates that PR with the job token: it cannot add
 an App publication binding to the original run's immutable artifacts.
 
-If the publish secret is absent or empty, publication uses the job token. An
+If no publish token can be minted, publication uses the job token. An
 authentication failure from an App push, PR create or body PATCH retries
 that operation once with the job token and keeps the job token for the rest
 of publication, including restoration. Bad credentials, HTTP 401 and Git's
@@ -171,7 +202,7 @@ There are no tool arguments for issue, PR, repository or scope. Only `select_bra
 
 | Tool | Policy |
 | --- | --- |
-| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; includes project-1 status for this issue and its current owned dispatch PR when present. Board reads use the separate board token, are tagged `github-api(project-1)` and untrusted, and degrade to `unavailable` on missing credentials or API failure. The query caps fields and each item’s project memberships at 100 and rejects truncated connections; responses are capped at 64 KiB. Includes the label/comment/review trigger verbatim and provenance. Optional sources degrade individually to `unavailable` with endpoint, HTTP status when available, and bounded redacted stderr; unverifiable authors remain `unverified`. Errors are request-scoped, deduplicated and tagged `github-api(error)` with `untrusted:true`. `sources` is a fixed response field retained when chronological context is clipped; `sources_omitted` reports overflow of its half-response budget. Only trigger/issue reads are mandatory. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
+| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; includes project-1 status for this issue and its current owned dispatch PR when present. Board reads use the separate on-demand board token, are tagged `github-api(project-1)` and untrusted, and degrade to `unavailable` on missing credentials or API failure. The query caps fields and each item’s project memberships at 100 and rejects truncated connections; responses are capped at 64 KiB. Includes the label/comment/review trigger verbatim and provenance. Optional sources degrade individually to `unavailable` with endpoint, HTTP status when available, and bounded redacted stderr; unverifiable authors remain `unverified`. Errors are request-scoped, deduplicated and tagged `github-api(error)` with `untrusted:true`. `sources` is a fixed response field retained when chronological context is clipped; `sources_omitted` reports overflow of its half-response budget. Only trigger/issue reads are mandatory. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
 | `set_status {status}` | Three attempts. Accepts exactly `Todo`, `In progress`, `In review` or `Blocked`; Done stays with merges. The server freshly resolves only the admitted issue and its owned dispatch PR in org project 1. No item/project fields are accepted. Items absent from the board are left absent. An item with any other set status (including Done) is left alone and reported as `left: <status>`. Each confirmed mutation is recorded; a partial failure reports only confirmed changes and marks the board unavailable without failing the run. |
 | `select_branch {branch}` | Before workers begin, selects the new run branch or an authenticated issue-linked branch. Reads and retains its remote tip for the publication lease. |
 | `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity, a completed `carrick-agent` worker with successful upload, and the issue-derived upload bundle name. Review runs must keep the workflow blob from their head’s merge base with main. The returned contract, handoff or worker-transcript text is tagged with its dispatch provenance and marked untrusted. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
@@ -398,11 +429,13 @@ ownership, publication, socket/environment isolation and workflow wiring. They
 cannot establish deployed acceptance. The director must push from the Mac
 (App tokens cannot push workflow edits), deploy the new controller and verify
 agent-template accounts/tools and the pinned launcher roster/capacity APIs.
-For #833 rollout, add the Mac publish-token minter with the repository and
-permissions above. Verify that both a new dispatch PR and a continuation push
-start CI for their current head without an owner push or ready event.
-For #811/#842 rollout, add the Mac board-token minter, then verify a trial
-reads both board items and changes only those items through the scoped tool.
+For #1012 rollout, load the App key as the controller's `dispatch-app-key`
+credential ([contabo-kvm.md](contabo-kvm.md#dispatch-app-key)) and redeploy the
+controller. Verify that both a new dispatch PR and a continuation push start
+CI for their current head without an owner push or ready event, and that the
+journal shows one `minted a publish token` line per publication. Then verify a
+trial reads both board items and changes only those items through the scoped
+tool.
 Continue an owned PR with a worker-proposed body and check the live body,
 exactly one closing line, outcome action list and retired model uids. These live
 checks require the deployed workflow and credential; portable fixture tests do

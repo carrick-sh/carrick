@@ -16,6 +16,7 @@ pub mod command;
 pub mod commit_trailers;
 pub mod copyout_debt;
 pub mod debt_moves;
+mod dispatch_mint;
 mod dispatch_redaction;
 pub mod dispatch_worker;
 pub mod fixtures;

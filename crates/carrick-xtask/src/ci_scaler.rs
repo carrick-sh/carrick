@@ -16,6 +16,7 @@ mod github;
 pub(crate) use github::dispatch_workflow_unchanged;
 mod live;
 mod mac;
+pub(crate) mod mint;
 mod site;
 
 pub use assignment::{
@@ -30,6 +31,10 @@ pub use mac::{
 };
 
 pub const POOL: &str = "carrick-ci";
+/// Guest state shared by the job-start hook, the dispatch tool server and the
+/// controller (the hook's flock, drain marker, assignment rendezvous and token
+/// requests); created by the template.
+pub(crate) const GUEST_STATE: &str = "/run/carrick-ci";
 pub const REPOSITORY: &str = "carrick-sh/carrick";
 pub const DISPATCH_OWNER: &str = "tjfontaine";
 /// Credentialed agent clones, served by the same Contabo controller.
@@ -176,6 +181,9 @@ pub struct Record {
     pub assigned_key: Option<JobKey>,
     #[serde(default)]
     pub approved: bool,
+    /// Answered on-demand dispatch token requests (#1012); never token bytes.
+    #[serde(default)]
+    pub mints: Vec<mint::MintEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +289,7 @@ impl Ledger {
             failure: None,
             assigned_key: None,
             approved: false,
+            mints: Vec::new(),
         };
         self.rows.push(row.clone());
         Ok(row)
@@ -322,6 +331,11 @@ impl Ledger {
                         other.approved || (row.assigned_key == other.assigned_key && row.approved);
                     row.assigned = other.assigned;
                     row.assigned_key = other.assigned_key;
+                }
+                // Only the assignment worker writes the mint log, and it only
+                // grows (a failed mint rewrites its own last entry in place).
+                if other.mints.len() >= row.mints.len() {
+                    row.mints = other.mints.clone();
                 }
             },
         );
