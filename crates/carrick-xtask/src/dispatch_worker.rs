@@ -4235,8 +4235,11 @@ fi
                 ),
             ] {
                 let path = bin.join(name);
-                std::fs::write(&path, script).unwrap();
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                crate::lock_file::tests::write_test_executable(
+                    path,
+                    script,
+                    std::fs::Permissions::from_mode(0o700),
+                );
             }
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -5449,8 +5452,11 @@ fi
         let base = git(&actor, &["rev-parse", "HEAD"]).unwrap();
         let poison = format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display());
         for script in [actor.join("poison.sh"), actor.join(".git/hooks/pre-commit")] {
-            std::fs::write(&script, &poison).unwrap();
-            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::lock_file::tests::write_test_executable(
+                script,
+                &poison,
+                std::fs::Permissions::from_mode(0o700),
+            );
         }
         git(&actor, &["config", "filter.poison.clean", "./poison.sh"]).unwrap();
         std::fs::write(actor.join(".gitattributes"), "data filter=poison\n").unwrap();
@@ -5496,8 +5502,11 @@ fi
         let admission = steps[0]["run"].as_str().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let pgrep = temp.path().join("pgrep");
-        std::fs::write(&pgrep, "#!/bin/sh\nexit \"$PGREP_RESULT\"\n").unwrap();
-        std::fs::set_permissions(&pgrep, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::lock_file::tests::write_test_executable(
+            &pgrep,
+            "#!/bin/sh\nexit \"$PGREP_RESULT\"\n",
+            std::fs::Permissions::from_mode(0o700),
+        );
         for (result, admitted) in [("0", false), ("1", true), ("2", false)] {
             let output = Command::new("/bin/sh")
                 .args(["-eu", "-c", admission])

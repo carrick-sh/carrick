@@ -1027,10 +1027,29 @@ mod tests {
         let (target, artifact) = old_artifact(temp.path());
         let lock = File::create(target.join("debug/.cargo-lock")).unwrap();
         lock.lock().unwrap();
+        let lock = OwnedFileLock::from_locked(lock);
         let output = prune(&target, true);
         assert!(
             artifact.exists() && output.contains("Cargo lock is held"),
             "{output}"
+        );
+        let immediate = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                drop(lock);
+                let probe = File::open(target.join("debug/.cargo-lock")).unwrap();
+                let unlocked = probe.try_lock().is_ok();
+                let _ = probe.unlock();
+                unlocked
+            },
+            || {
+                let probe = File::open(target.join("debug/.cargo-lock")).unwrap();
+                assert!(probe.try_lock().is_ok());
+                let _ = probe.unlock();
+            },
+        );
+        assert!(
+            immediate,
+            "unrelated pre-exec child retained dropped Cargo lock despite CLOEXEC"
         );
     }
     #[test]
@@ -1056,6 +1075,7 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success() && !artifact.exists(), "{output:?}");
         lock.try_lock().unwrap();
+        let _lock = OwnedFileLock::from_locked(lock);
     }
     #[test]
     fn killed_native_pruner_has_no_surviving_deletion_child() {
@@ -1074,6 +1094,7 @@ mod tests {
             .open(target.join("debug/.cargo-lock"))
             .unwrap();
         lock.try_lock().unwrap();
+        let _lock = OwnedFileLock::from_locked(lock);
         let output = child.wait_with_output().unwrap();
         assert!(!output.status.success() && artifact.exists(), "{output:?}");
     }
@@ -1330,8 +1351,11 @@ mod tests {
         // Deny both commands so this control also works for root test users.
         for name in ["sudo", "lsof"] {
             let path = bin.join(name);
-            fs::write(&path, "#!/bin/sh\necho 'permission denied' >&2\nexit 1\n").unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::lock_file::tests::write_test_executable(
+                path,
+                "#!/bin/sh\necho 'permission denied' >&2\nexit 1\n",
+                fs::Permissions::from_mode(0o755),
+            );
         }
         let output = Command::new(std::env::current_exe().unwrap())
             .args([

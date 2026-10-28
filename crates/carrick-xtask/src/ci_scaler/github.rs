@@ -1477,8 +1477,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gh = dir.path().join("gh");
         for status in ["404", "403"] {
-            std::fs::write(&gh,format!("#!/bin/sh\nprintf '%s' '{{\"message\":\"sensitive-body\",\"status\":\"{status}\"}}'\nexit 1\n")).unwrap();
-            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::lock_file::tests::write_test_executable(
+                &gh,
+                format!(
+                    "#!/bin/sh\nprintf '%s' '{{\"message\":\"sensitive-body\",\"status\":\"{status}\"}}'\nexit 1\n"
+                ),
+                std::fs::Permissions::from_mode(0o755),
+            );
             let decision = Github::cancel_superseded_with(
                 &cleanup_entry(),
                 |method, endpoint, body, paginate| {

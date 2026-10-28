@@ -460,12 +460,11 @@ mod tests {
             }
             let marker = temp.path().join("runner-work-executed");
             let wrapper = temp.path().join("sccache");
-            std::fs::write(
+            crate::lock_file::tests::write_test_executable(
                 &wrapper,
                 format!("#!/bin/sh\ntouch '{}'\nexit 91\n", marker.display()),
-            )
-            .unwrap();
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+                std::fs::Permissions::from_mode(0o700),
+            );
             std::fs::write(cargo_home.join(filename), format!(
                 "[build]\nrustc-wrapper = '{}'\n[env]\nSCCACHE_SERVER_UDS = '{}'\nRUSTC_WORKSPACE_WRAPPER = '{}'\n",
                 wrapper.display(), temp.path().join("runner.sock").display(), wrapper.display()
@@ -520,12 +519,11 @@ mod tests {
         std::fs::create_dir(&state).unwrap();
         let state = state.canonicalize().unwrap();
         let proxy = b"#!/bin/sh\nprintf 'private proxy:%s\\n' \"$0\"\n";
-        std::fs::write(cargo.join("bin/rustup"), proxy).unwrap();
-        std::fs::set_permissions(
+        crate::lock_file::tests::write_test_executable(
             cargo.join("bin/rustup"),
+            proxy,
             std::fs::Permissions::from_mode(0o500),
-        )
-        .unwrap();
+        );
         std::os::unix::fs::symlink("rustup", cargo.join("bin/cargo")).unwrap();
         std::fs::write(cargo.join("registry/cache/sample"), "original crate").unwrap();
         std::fs::write(

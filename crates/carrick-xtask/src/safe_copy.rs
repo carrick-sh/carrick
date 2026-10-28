@@ -445,12 +445,11 @@ mod tests {
         assert!(!source.join(".git/refs/heads/work/test").exists());
         let marker = tmp.path().join("executed");
         let script = source.join(".git/hooks/post-checkout");
-        std::fs::write(
-            &script,
+        crate::lock_file::tests::write_test_executable(
+            script,
             format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::Permissions::from_mode(0o755),
+        );
         repository(&source, &target, "work/test", None).unwrap();
         assert_eq!(
             git(&source, &["rev-parse", "HEAD"]).unwrap(),

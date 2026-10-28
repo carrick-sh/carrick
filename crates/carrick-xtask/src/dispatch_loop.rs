@@ -3245,7 +3245,9 @@ mod tests {
         comment["body"] = body.replace("\nDispatch run:", "\nPublication receipt:\n```json\n{\"issue\":799,\"branch\":\"work/dispatch-799-42\",\"publication_pr\":800}\n```\nDispatch run:").into();
         let receipt = comment.clone();
         let curl = root.join("bin/curl");
-        std::fs::write(&curl, r#"#!/bin/sh
+        crate::lock_file::tests::write_test_executable(
+            &curl,
+            r#"#!/bin/sh
 test -z "$GH_TOKEN" && test -z "$GITHUB_TOKEN" || exit 97
 for endpoint do :; done
 exec /usr/bin/python3 - "$RUNNER_TEMP" "$endpoint" <<'API'
@@ -3262,11 +3264,20 @@ if endpoint in ['issues/800/comments','issues/799/comments']:
  print(path.read_text());sys.exit()
 sys.exit(94)
 API
-"#).unwrap();
-        std::fs::set_permissions(curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+"#,
+            std::fs::Permissions::from_mode(0o700),
+        );
         let gh_path = root.join("bin/gh");
         let gh_script = regular_text(&gh_path).unwrap();
-        std::fs::write(&gh_path, gh_script.replacen("#!/bin/sh\n", "#!/bin/sh\ntest -n \"$GH_TOKEN\" || { echo 'credential-free guard attempted gh' >&2; exit 97; }\n", 1)).unwrap();
+        crate::lock_file::tests::write_test_executable(
+            &gh_path,
+            gh_script.replacen(
+                "#!/bin/sh\n",
+                "#!/bin/sh\ntest -n \"$GH_TOKEN\" || { echo 'credential-free guard attempted gh' >&2; exit 97; }\n",
+                1,
+            ),
+            std::fs::Permissions::from_mode(0o700),
+        );
         (pr, receipt)
     }
     fn guard_publication(root: &Path) -> Result<(), ScalerError> {
@@ -3480,7 +3491,11 @@ API
             let (pr, _) = guard_publication_fixture(root);
             assert_eq!(std::env::var("GH_TOKEN").unwrap(), "fixture-token");
             // A credentialed recheck must work even when public API access fails.
-            std::fs::write(root.join("bin/curl"), "#!/bin/sh\nexit 96\n").unwrap();
+            crate::lock_file::tests::write_test_executable(
+                root.join("bin/curl"),
+                "#!/bin/sh\nexit 96\n",
+                std::fs::Permissions::from_mode(0o700),
+            );
             let mut handoff: Value =
                 serde_json::from_str(&regular_text(&root.join("handoff.json")).unwrap()).unwrap();
             handoff["applied"] = json!({"publication_pr":800});
@@ -3510,8 +3525,11 @@ API
             assert!(std::env::var_os("GITHUB_RUN_ID").is_none());
             assert!(std::env::var_os("GH_TOKEN").is_none());
             let curl = root.join("bin/curl");
-            std::fs::write(&curl, "#!/bin/sh\nexit 96\n").unwrap();
-            std::fs::set_permissions(curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::lock_file::tests::write_test_executable(
+                &curl,
+                "#!/bin/sh\nexit 96\n",
+                std::fs::Permissions::from_mode(0o700),
+            );
             let mut pr: Value =
                 serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
             pr["user"]["login"] = "carrick-workers[bot]".into();
@@ -5033,8 +5051,11 @@ exec /usr/bin/git "$@"
                 ),
             ] {
                 let path = bin.join(name);
-                std::fs::write(&path, source).unwrap();
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                crate::lock_file::tests::write_test_executable(
+                    path,
+                    source,
+                    std::fs::Permissions::from_mode(0o700),
+                );
             }
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
