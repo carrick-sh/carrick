@@ -846,20 +846,23 @@ pub(super) fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec 
 }
 
 pub fn complete_interrupted_sleep(
-    context: &crate::kernel::KernelContext,
+    _context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     remaining: Option<GuestPtr>,
     duration: Duration,
 ) -> DispatchOutcome {
     if let Some(address) = remaining {
         let rem = linux_timespec_from_duration(duration);
-        return copyout_format_time_record(
-            context,
-            memory,
-            address.0,
-            &rem,
-            DispatchOutcome::Errno { errno: LINUX_EINTR },
-        );
+        // #986: the consumed sleep completion has no retained output cursor.
+        // A bare owner wait would discard EINTR and its saved remainder, then
+        // redispatch the original sleep. Keep this single legacy debt site
+        // until completion routing can retain that result across suspension.
+        if !matches!(
+            super::write_kernel_struct(memory, address.0, &rem),
+            DispatchOutcome::Returned { value: 0 }
+        ) {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
     }
     DispatchOutcome::Errno { errno: LINUX_EINTR }
 }

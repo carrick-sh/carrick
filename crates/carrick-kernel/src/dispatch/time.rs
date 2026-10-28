@@ -1854,6 +1854,37 @@ mod s3_review_tests {
     use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
 
     #[test]
+    fn interrupted_sleep_refusal_does_not_redispatch_consumed_wait() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x4000, 4096, 0xa5);
+        memory.refuse_next();
+        let remaining = crate::kernel::continuation::GuestOutputRange::new(
+            carrick_guest_mem::GuestVa::new(0x4000),
+            16,
+            context.shared().mm_id(),
+            0,
+        )
+        .unwrap();
+        let completion = crate::kernel::continuation::ContinuationCompletion::InterruptedSleep {
+            remaining: Some((remaining, Duration::from_millis(750))),
+        };
+        // Until #986 retains output completions across owner waits, preserve the
+        // old fault result rather than return a bare wait that restarts sleep.
+        assert_eq!(
+            crate::kernel::continuation::fold_continuation_completion(
+                completion,
+                &dispatcher,
+                &context,
+                &mut memory,
+            )
+            .unwrap(),
+            Some(DispatchOutcome::errno(LINUX_EFAULT))
+        );
+        assert_eq!(memory.read_bytes(0x4000, 16).unwrap(), [0xa5; 16]);
+    }
+
+    #[test]
     fn prlimit_input_refusal_waits_before_output_or_mutation() {
         let mut dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();
