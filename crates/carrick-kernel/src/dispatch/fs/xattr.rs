@@ -151,7 +151,7 @@ impl<'a> FsView<'a> {
         let buf_addr = value_ptr.0;
         let size = size as usize;
         if size > 0
-            && let Some(outcome) = Self::resume_copyout_bytes(
+            && let Some(outcome) = self.resume_copyout_bytes(
                 context,
                 memory,
                 super::SuspendedCopyoutKind::GetXattr { size },
@@ -172,7 +172,7 @@ impl<'a> FsView<'a> {
         if value.len() > size {
             return Ok(DispatchOutcome::errno(LINUX_ERANGE));
         }
-        Ok(Self::copyout_bytes_with_kind(
+        Ok(self.copyout_bytes_with_kind(
             context,
             memory,
             super::SuspendedCopyoutKind::GetXattr { size },
@@ -194,7 +194,7 @@ impl<'a> FsView<'a> {
         let buf_addr = list_ptr.0;
         let size = size as usize;
         if size > 0
-            && let Some(outcome) = Self::resume_copyout_bytes(
+            && let Some(outcome) = self.resume_copyout_bytes(
                 context,
                 memory,
                 super::SuspendedCopyoutKind::ListXattr { size },
@@ -218,7 +218,7 @@ impl<'a> FsView<'a> {
         if list.len() > size {
             return Ok(DispatchOutcome::errno(LINUX_ERANGE));
         }
-        Ok(Self::copyout_bytes_with_kind(
+        Ok(self.copyout_bytes_with_kind(
             context,
             memory,
             super::SuspendedCopyoutKind::ListXattr { size },

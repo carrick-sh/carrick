@@ -248,26 +248,25 @@ pub(in crate::dispatch) fn carrier_buffer_is_not_owner_memory() -> super::Dispat
     super::DispatchError::MemoryPreparation("a carrier record buffer is never owner memory".into())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) enum SuspendedCopyoutKind {
-    Bytes,
     GetXattr { size: usize },
     ListXattr { size: usize },
 }
 
-struct SuspendedCopyout {
+pub(in crate::dispatch::fs) struct SuspendedCopyout {
     thread: std::sync::Weak<crate::kernel::Thread>,
     kind: SuspendedCopyoutKind,
     address: u64,
     bytes: Vec<u8>,
     offset: usize,
     success: DispatchOutcome,
-}
-
-fn suspended_copyouts() -> &'static parking_lot::Mutex<Vec<SuspendedCopyout>> {
-    static SUSPENDED: std::sync::OnceLock<parking_lot::Mutex<Vec<SuspendedCopyout>>> =
-        std::sync::OnceLock::new();
-    SUSPENDED.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
 mod access;
@@ -842,6 +841,7 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn resume_copyout_bytes<M: CurrentMmMemory>(
+        &self,
         context: &crate::kernel::KernelContext,
         memory: &mut M,
         kind: SuspendedCopyoutKind,
@@ -849,7 +849,8 @@ impl<'a> FsView<'a> {
     ) -> Option<DispatchOutcome> {
         let current_thread = Arc::downgrade(context.thread());
         let resumed = {
-            let mut table = suspended_copyouts().lock();
+            let mut lock_state = self.fs.classic_record_locks.state();
+            let table = &mut lock_state.suspended_copyouts;
             table.retain(|entry| entry.thread.strong_count() > 0);
             let pos = table
                 .iter()
@@ -861,7 +862,7 @@ impl<'a> FsView<'a> {
                 None
             }
         }?;
-        Some(Self::copyout_bytes_from_offset(
+        Some(self.copyout_bytes_from_offset(
             context,
             memory,
             kind,
@@ -879,17 +880,40 @@ impl<'a> FsView<'a> {
         bytes: &[u8],
         success: DispatchOutcome,
     ) -> DispatchOutcome {
-        Self::copyout_bytes_with_kind(
-            context,
-            memory,
-            SuspendedCopyoutKind::Bytes,
-            address,
-            bytes,
-            success,
-        )
+        use super::copyout::{COPYOUT_MAX_BYTES, UserSlot, prepare};
+        if bytes.is_empty() {
+            return match prepare(context, memory, [Some(UserSlot::new(address, 0))]) {
+                Ok(out) => match out.commit([&[]]) {
+                    Ok(()) => success,
+                    Err(fault) => fault.outcome(),
+                },
+                Err(refusal) => refusal.into_outcome(),
+            };
+        }
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let chunk_len = (bytes.len() - offset).min(COPYOUT_MAX_BYTES);
+            let Some(chunk_addr) = address.checked_add(offset as u64) else {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            };
+            let out = match prepare(
+                context,
+                memory,
+                [Some(UserSlot::new(chunk_addr, chunk_len))],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return refusal.into_outcome(),
+            };
+            if let Err(fault) = out.commit([&bytes[offset..offset + chunk_len]]) {
+                return fault.outcome();
+            }
+            offset += chunk_len;
+        }
+        success
     }
 
     pub(super) fn copyout_bytes_with_kind<M: CurrentMmMemory>(
+        &self,
         context: &crate::kernel::KernelContext,
         memory: &mut M,
         kind: SuspendedCopyoutKind,
@@ -897,13 +921,14 @@ impl<'a> FsView<'a> {
         bytes: &[u8],
         success: DispatchOutcome,
     ) -> DispatchOutcome {
-        if let Some(outcome) = Self::resume_copyout_bytes(context, memory, kind, address) {
+        if let Some(outcome) = self.resume_copyout_bytes(context, memory, kind, address) {
             return outcome;
         }
-        Self::copyout_bytes_from_offset(context, memory, kind, address, bytes, 0, success)
+        self.copyout_bytes_from_offset(context, memory, kind, address, bytes, 0, success)
     }
 
     fn copyout_bytes_from_offset<M: CurrentMmMemory>(
+        &self,
         context: &crate::kernel::KernelContext,
         memory: &mut M,
         kind: SuspendedCopyoutKind,
@@ -934,21 +959,20 @@ impl<'a> FsView<'a> {
             ) {
                 Ok(out) => out,
                 Err(refusal) => {
-                    if offset > 0 || !matches!(kind, SuspendedCopyoutKind::Bytes) {
-                        let current_thread = Arc::downgrade(context.thread());
-                        let mut table = suspended_copyouts().lock();
-                        table.retain(|entry| {
-                            entry.thread.strong_count() > 0 && !entry.thread.ptr_eq(&current_thread)
-                        });
-                        table.push(SuspendedCopyout {
-                            thread: current_thread,
-                            kind,
-                            address,
-                            bytes: bytes.to_vec(),
-                            offset,
-                            success,
-                        });
-                    }
+                    let current_thread = Arc::downgrade(context.thread());
+                    let mut lock_state = self.fs.classic_record_locks.state();
+                    let table = &mut lock_state.suspended_copyouts;
+                    table.retain(|entry| {
+                        entry.thread.strong_count() > 0 && !entry.thread.ptr_eq(&current_thread)
+                    });
+                    table.push(SuspendedCopyout {
+                        thread: current_thread,
+                        kind,
+                        address,
+                        bytes: bytes.to_vec(),
+                        offset,
+                        success,
+                    });
                     return refusal.into_outcome();
                 }
             };
