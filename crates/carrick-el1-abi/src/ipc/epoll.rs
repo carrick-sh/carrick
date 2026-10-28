@@ -69,7 +69,13 @@ pub const MAX_MEMBER_ITEMS: usize = 4;
 
 /// A bounded readiness snapshot whose shared epoll record had no host items.
 /// This is not a membership lease; a later ADD may change the set.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ZoneOnlyEpollReadyCount {
     records: usize,
 }
