@@ -333,6 +333,18 @@ impl ZoneEpoll {
             .unwrap_or(false)
     }
 
+    /// Count only when the shared authority proves there are no host items.
+    pub(crate) fn ready_count(
+        &self,
+        limit: usize,
+    ) -> Option<carrick_el1_abi::ipc::epoll::ZoneOnlyEpollReadyCount> {
+        self.owner
+            .region()
+            .epoll_zone_only_ready_count(self.object, limit, &HostLockWait)
+            .ok()
+            .flatten()
+    }
+
     /// Whether the zone half has a reportable item (non-consuming).
     pub(crate) fn ready(&self) -> bool {
         self.owner

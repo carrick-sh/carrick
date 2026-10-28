@@ -1348,6 +1348,34 @@ impl<'a> NetView<'a> {
             LinuxGuestAbi::Aarch64 => LinuxEpollEvent::ABI_SIZE,
             LinuxGuestAbi::X86_64 => LinuxX8664EpollEvent::ABI_SIZE,
         };
+        if args.timeout_ms == 0 {
+            let limit = args.max_events.min(copyout::COPYOUT_MAX_BYTES / event_size);
+            let (zone, queued) = args
+                .open_file
+                .description
+                .inspect_kind(|open| match open {
+                    OpenDescription::Epoll {
+                        zone,
+                        pending_ready,
+                        ..
+                    } => Some((zone.clone(), pending_ready.len().min(limit))),
+                    _ => None,
+                })
+                .flatten()
+                .ok_or(LINUX_EINVAL)?;
+            // Only the neutral membership authority can certify zone-only
+            // eligibility. Host-backed/unknown sets keep prepare-first ordering
+            // until #986 owns host selection and retention across suspension.
+            if let Some(count) = zone
+                .as_ref()
+                .and_then(|zone| zone.ready_count(limit - queued))
+            {
+                args.max_events = queued + count.records();
+                if args.max_events == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+            }
+        }
         let out = match copyout::prepare_array(
             context,
             memory,
@@ -3306,6 +3334,120 @@ mod nested_epoll_readiness_tests {
                 vec![0xa5; 32 - size]
             );
         }
+    }
+
+    #[test]
+    fn s1_host_epoll_refusals_preserve_edge_and_empty_host_policy() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        for supply in [false, true] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let kernel = dispatcher.capture_one_task_context().unwrap();
+            let reporter = CompatReporter::default();
+            let mut setup = LinearMemory::new(0x1000, vec![0; 0x2000]);
+            let fd = match dispatcher.host_socket_install(LINUX_AF_INET, LINUX_SOCK_DGRAM, 0) {
+                DispatchOutcome::Returned { value } => value as i32,
+                other => panic!("host UDP socket: {other:?}"),
+            };
+            let epfd = create_epoll(&mut dispatcher, &kernel, &mut setup, &reporter);
+            write_guest_epoll_event(&mut setup, 0x1000, LINUX_EPOLLOUT | LINUX_EPOLLET, 711);
+            assert_eq!(
+                dispatcher
+                    .dispatch(
+                        &kernel,
+                        SyscallRequest::new(
+                            21,
+                            SyscallArgs::from([
+                                epfd as u64,
+                                LINUX_EPOLL_CTL_ADD,
+                                fd as u64,
+                                0x1000,
+                                0,
+                                0
+                            ])
+                        ),
+                        &mut setup,
+                        &reporter
+                    )
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            let mut memory = OwnerRefusingMemory::new(0x1000, 0x2000, 0xa5);
+            let expected = if supply {
+                DispatchOutcome::OwnerMemorySupply {
+                    request: memory.refuse_next_supply_grant(),
+                    committed: 0,
+                }
+            } else {
+                DispatchOutcome::OwnerMemoryWait {
+                    wait: memory.refuse_next(),
+                    committed: 0,
+                }
+            };
+            let request =
+                SyscallRequest::new(22, SyscallArgs::from([epfd as u64, 0x1100, 1, 0, 0, 0]));
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(memory.read_bytes(0x1100, 16).unwrap(), [0xa5; 16]);
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 1 }
+            );
+            let event: LinuxEpollEvent = read_kernel_struct(&memory, 0x1100).unwrap();
+            assert_ne!(event.events & LINUX_EPOLLOUT, 0);
+            let data = event.data;
+            assert_eq!(data, 711);
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            // Deliberate #986 limitation: a host-backed set keeps prepare-first
+            // ordering even when the previously delivered edge is no longer ready.
+            let wait = memory.refuse_next();
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&kernel, request, &mut memory, &reporter)
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn s1_empty_epoll_skips_owner_preparation() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let mut dispatcher = SyscallDispatcher::new();
+        let kernel = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut setup = LinearMemory::new(0x1000, vec![0; 0x2000]);
+        let epfd = create_epoll(&mut dispatcher, &kernel, &mut setup, &reporter);
+        let mut memory = OwnerRefusingMemory::new(0x1000, 16, 0xa5);
+        memory.refuse_next();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &kernel,
+                    SyscallRequest::new(22, SyscallArgs::from([epfd as u64, 0x1000, 64, 0, 0, 0])),
+                    &mut memory,
+                    &reporter
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(memory.prepares, 0);
     }
 
     #[test]

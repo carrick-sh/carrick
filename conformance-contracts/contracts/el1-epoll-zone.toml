@@ -42,11 +42,13 @@ an epoll costs no host exit in steady state.
 """
 
 [bindings]
+# VM-free component evidence; signed execution and exit budgets stay unchanged.
+vm_free = "carrick-el1-abi::ipc::epoll::tests::{bounded_ready_count_preserves_edges_and_oneshots,ready_count_requires_shared_zone_only_proof}; carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::{s1_empty_epoll_skips_owner_preparation,s1_host_epoll_refusals_preserve_edge_and_empty_host_policy}"
 embed = "carrick-embed::el1_sched::el1_epoll_eventfd_pingpong_stays_in_guest"
 docker = "probe:epollzonepingpong|epollzonetrigger|epollzonetimeout|epollzoneeintr|epollzoneclose|epollzonemixed|epollzonesigmask"
 
 [bindings.unresolved]
-vm_free = "The in-zone epoll record and its harvest are pure carrick-el1-abi code; their unit tests are added with the record (stage 1)."
+host_preflight = "Director-approved #986 boundary: any host-backed member keeps prepare-first ordering. An empty timeout=0 call under Editor refusal suspends, then returns 0 on redispatch; Linux returns 0 immediately. Host selection/retention and the original deadline remain #986 work."
 embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts host exits and forwarded epoll_pwait per round trip < 0.01 over the difference of two run lengths outside the contract evaluator."
 
 [[structural_budgets]]

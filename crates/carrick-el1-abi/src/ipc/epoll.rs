@@ -67,6 +67,19 @@ pub const IPC_EPOLL_ITEMS: usize = 16384;
 /// wake list is bounded.
 pub const MAX_MEMBER_ITEMS: usize = 4;
 
+/// A bounded readiness snapshot whose shared epoll record had no host items.
+/// This is not a membership lease; a later ADD may change the set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZoneOnlyEpollReadyCount {
+    records: usize,
+}
+
+impl ZoneOnlyEpollReadyCount {
+    pub const fn records(self) -> usize {
+        self.records
+    }
+}
+
 /// Linux epoll event bits this record interprets (uapi `eventpoll.h`).
 pub mod events {
     pub const IN: u32 = 0x001;
@@ -892,8 +905,44 @@ impl<'a> IpcRegion<'a> {
         epoll: IpcObjectHandle,
         wait: &W,
     ) -> Result<bool, IpcError> {
+        self.epoll_ready_count(epoll, 1, wait)
+            .map(|count| count != 0)
+    }
+
+    /// Return a count only when the shared membership authority proves this
+    /// is a zone-only set. Host-backed sets require their existing selector.
+    pub fn epoll_zone_only_ready_count<W: LockWait>(
+        &self,
+        epoll: IpcObjectHandle,
+        limit: usize,
+        wait: &W,
+    ) -> Result<Option<ZoneOnlyEpollReadyCount>, IpcError> {
+        if self.epoll_host_items(epoll, wait)? != 0 {
+            return Ok(None);
+        }
+        let records = self.epoll_ready_count(epoll, limit, wait)?;
+        Ok((self.epoll_host_items(epoll, wait)? == 0)
+            .then_some(ZoneOnlyEpollReadyCount { records }))
+    }
+
+    /// Count at most `limit` reportable items without consuming reports,
+    /// clearing edge latches or disarming one-shots. Like the existing probe,
+    /// the scan normalizes pending publications into the ordered ready list.
+    /// This is a snapshot, not a reservation: concurrent member changes may
+    /// invalidate it before harvest.
+    /// A zero limit touches neither the object nor its members.
+    pub fn epoll_ready_count<W: LockWait>(
+        &self,
+        epoll: IpcObjectHandle,
+        limit: usize,
+        wait: &W,
+    ) -> Result<usize, IpcError> {
+        if limit == 0 {
+            return Ok(0);
+        }
         const BATCH: usize = 32;
         let mut cursor = 0u32;
+        let mut count = 0;
         loop {
             let mut batch = [(EpollItemRef::default(), RawIpcObject::default(), 0u32, 0u32); BATCH];
             let mut len = 0;
@@ -923,7 +972,7 @@ impl<'a> IpcRegion<'a> {
                     number = item.ready_next.load(Ordering::Relaxed);
                 }
                 if len == 0 {
-                    return Ok(false);
+                    return Ok(count);
                 }
             }
             for &(_, member, kind, requested) in &batch[..len] {
@@ -936,11 +985,14 @@ impl<'a> IpcRegion<'a> {
                     Err(error) => return Err(error),
                 };
                 if level & (requested | events::ALWAYS) != 0 {
-                    return Ok(true);
+                    count += 1;
+                    if count == limit {
+                        return Ok(count);
+                    }
                 }
             }
             if len < BATCH {
-                return Ok(false);
+                return Ok(count);
             }
         }
     }
