@@ -322,33 +322,14 @@ fn procmap_query(
         bytes.push(0);
         bytes
     });
-    let name_slot = if let Some(name_bytes) = &name_bytes {
+    if let Some(name_bytes) = &name_bytes {
         if name_bytes.len() > name_capacity {
             return DispatchOutcome::errno(LINUX_E2BIG);
         }
         if name_address == 0 {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
-        Some(super::super::copyout::UserSlot::new(
-            name_address,
-            name_bytes.len(),
-        ))
-    } else {
-        None
-    };
-    let output = match super::super::copyout::prepare(
-        context,
-        memory,
-        [
-            name_slot,
-            Some(super::super::copyout::UserSlot::of::<
-                carrick_abi::LinuxProcmapQuery,
-            >(arg)),
-        ],
-    ) {
-        Ok(output) => output,
-        Err(refusal) => return refusal.into_outcome(),
-    };
+    }
 
     query.vma_start = start;
     query.vma_end = end;
@@ -360,10 +341,51 @@ fn procmap_query(
     query.dev_minor = 0;
     query.vma_name_size = name_bytes.as_ref().map_or(0, |bytes| bytes.len() as u32);
     query.build_id_size = 0;
-    match output.commit([name_bytes.as_deref().unwrap_or(&[]), query.as_bytes()]) {
-        Ok(()) => DispatchOutcome::Returned { value: 0 },
-        Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
+    if let Some(name_bytes) = &name_bytes {
+        if name_bytes
+            .len()
+            .saturating_add(<carrick_abi::LinuxProcmapQuery as carrick_abi::KernelAbi>::ABI_SIZE)
+            <= super::super::copyout::COPYOUT_MAX_BYTES
+        {
+            let output = match super::super::copyout::prepare(
+                context,
+                memory,
+                [
+                    Some(super::super::copyout::UserSlot::new(
+                        name_address,
+                        name_bytes.len(),
+                    )),
+                    Some(super::super::copyout::UserSlot::of::<
+                        carrick_abi::LinuxProcmapQuery,
+                    >(arg)),
+                ],
+            ) {
+                Ok(output) => output,
+                Err(refusal) => return refusal.into_outcome(),
+            };
+            return match output.commit([name_bytes.as_slice(), query.as_bytes()]) {
+                Ok(()) => DispatchOutcome::Returned { value: 0 },
+                Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
+            };
+        }
+        let name_outcome = FsView::copyout_bytes(
+            context,
+            memory,
+            name_address,
+            name_bytes,
+            DispatchOutcome::Returned { value: 0 },
+        );
+        if !matches!(name_outcome, DispatchOutcome::Returned { value: 0 }) {
+            return name_outcome;
+        }
     }
+    FsView::copyout_bytes(
+        context,
+        memory,
+        arg,
+        query.as_bytes(),
+        DispatchOutcome::Returned { value: 0 },
+    )
 }
 
 /// One Linux-visible interface with an IPv4 address. Flags and MTU stay in
@@ -1456,24 +1478,7 @@ impl<'a> FsView<'a> {
                 }
                 LINUX_TIOCGWINSZ => DispatchOutcome::errno(LINUX_ENOTTY),
                 LINUX_TCGETA => {
-                    if cx.memory.user_memory_venue()
-                        == carrick_guest_mem::UserMemoryVenue::Legacy
-                        && !cx.memory.guest_range_is_writable(arg, LINUX_TERMIO_SIZE)
-                    {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                    let prepared = match super::super::copyout::prepare(
-                        cx.kernel,
-                        &mut *cx.memory,
-                        [Some(super::super::copyout::UserSlot::new(
-                            arg,
-                            LINUX_TERMIO_SIZE,
-                        ))],
-                    ) {
-                        Ok(prepared) => prepared,
-                        Err(refusal) => return Ok(refusal.into_outcome()),
-                    };
-                    if prepared.secured_capacity(0) == 0 {
+                    if !cx.memory.guest_range_is_writable(arg, LINUX_TERMIO_SIZE) {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                     if !fd_is_tty(&this.captured_file_table().read_open_files(), fd.0) {
@@ -1485,10 +1490,7 @@ impl<'a> FsView<'a> {
                         } else {
                             LinuxTermios::default_cooked()
                         };
-                        match prepared.commit([&linux_termio_bytes(&termios)]) {
-                            Ok(()) => DispatchOutcome::Returned { value: 0 },
-                            Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
-                        }
+                        write_linux_termio(cx.kernel, &mut *cx.memory, arg, &termios)
                     }
                 }
                 LINUX_TCGETS | LINUX_TCGETS2 if fd_is_tty(&this.captured_file_table().read_open_files(), fd.0) => {
@@ -2533,5 +2535,145 @@ mod tests {
             i32::from_le_bytes(memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
             14
         );
+    }
+
+    #[test]
+    fn procmap_query_with_4008_byte_name_and_tcgeta_on_regular_file_respect_owner_copyout_bounds() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use carrick_abi::syscall::nr;
+        use carrick_guest_mem::GuestMemory;
+
+        const BASE: u64 = 0x10_000;
+        const FILL: u8 = 0xa5;
+        const QUERY_ADDR: u64 = BASE + 0x100;
+        const NAME_ADDR: u64 = BASE + 0x400;
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let long_path = format!("/{}", "a".repeat(4006));
+        assert_eq!(long_path.len() + 1, 4008);
+        dispatcher.set_address_space_regions(vec![carrick_vfs::ProcMapsEntry {
+            start: 0x20_000,
+            end: 0x21_000,
+            read: true,
+            write: false,
+            execute: true,
+            sharing: carrick_vfs::ProcMapSharing::Private,
+            path: long_path.clone(),
+        }]);
+        let maps_fd = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                        base: OpenDescriptionBase::new(LINUX_O_RDONLY),
+                        path: "/proc/self/maps".to_owned(),
+                        contents: Vec::new(),
+                        offset: 0,
+                    })),
+                    LINUX_O_RDONLY,
+                    0,
+                ),
+            )
+            .unwrap();
+        let regular_fd = dispatcher
+            .install_fd_at_or_above(
+                maps_fd + 1,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                        base: OpenDescriptionBase::new(LINUX_O_RDONLY),
+                        path: "/tmp/regular".to_owned(),
+                        contents: b"hello".to_vec(),
+                        offset: 0,
+                    })),
+                    LINUX_O_RDONLY,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut memory = OwnerRefusingMemory::new(BASE, 0x4000, FILL);
+
+        // Defect 6: TCGETA on a regular-file fd with a valid pointer and an
+        // Editor refusal must return ENOTTY (25) immediately, not OwnerMemoryWait.
+        let _wait = memory.refuse_next();
+        let tcgeta_regular = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::IOCTL.raw(),
+                    SyscallArgs::from([regular_fd as u64, LINUX_TCGETA, QUERY_ADDR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            tcgeta_regular,
+            DispatchOutcome::errno(LINUX_ENOTTY),
+            "TCGETA on a regular file must decide ENOTTY before preparing output",
+        );
+
+        // Defect 3: PROCMAP_QUERY with a 4008-byte name (4007 chars + NUL) plus
+        // the 104-byte LinuxProcmapQuery record must wait on owner refusal and
+        // succeed on retry without exceeding the 4096-byte single-permit bound.
+        let query = carrick_abi::LinuxProcmapQuery {
+            size: core::mem::size_of::<carrick_abi::LinuxProcmapQuery>() as u64,
+            query_addr: 0x20_000,
+            vma_name_size: 4096,
+            vma_name_addr: NAME_ADDR,
+            ..Default::default()
+        };
+        memory.seed(QUERY_ADDR, query.as_bytes());
+        memory.seed(NAME_ADDR, &[FILL; 4096]);
+        let wait = memory.refuse_next();
+        let refused = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::IOCTL.raw(),
+                    SyscallArgs::from([
+                        maps_fd as u64,
+                        carrick_abi::LINUX_PROCMAP_QUERY,
+                        QUERY_ADDR,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            refused,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        let retried = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::IOCTL.raw(),
+                    SyscallArgs::from([
+                        maps_fd as u64,
+                        carrick_abi::LINUX_PROCMAP_QUERY,
+                        QUERY_ADDR,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(retried, DispatchOutcome::Returned { value: 0 });
+        let out_query: carrick_abi::LinuxProcmapQuery = memory.read_struct(QUERY_ADDR).unwrap();
+        let out_name_size = out_query.vma_name_size;
+        assert_eq!(out_name_size, 4008);
+        let written_name = memory.read_bytes(NAME_ADDR, 4008).unwrap();
+        assert_eq!(&written_name[..4007], long_path.as_bytes());
+        assert_eq!(written_name[4007], 0);
     }
 }
