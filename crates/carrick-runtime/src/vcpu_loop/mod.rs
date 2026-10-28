@@ -1997,6 +1997,12 @@ where
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         match resume {
+            binding::OwnedSyscallResume::Completion(pending) => {
+                let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration("completed wait lost exact context".to_owned())
+                })?;
+                Ok(pending.resume(context, engine))
+            }
             binding::OwnedSyscallResume::CopyoutRedispatch => {
                 self.redispatch_threaded_syscall(kernel, engine, host_wait)
             }

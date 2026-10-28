@@ -45,7 +45,8 @@ enum ZoneWaitPolicy {
 impl ZoneWaitPolicy {
     fn for_owner_resume(resume: &OwnedSyscallResume) -> Self {
         match resume {
-            OwnedSyscallResume::CopyoutRedispatch
+            OwnedSyscallResume::Completion(_)
+            | OwnedSyscallResume::CopyoutRedispatch
             | OwnedSyscallResume::Ipc(_)
             | OwnedSyscallResume::Io(_)
             | OwnedSyscallResume::Sleep(_)

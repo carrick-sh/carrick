@@ -1632,6 +1632,7 @@ impl BlockedContinuation {
             | DispatchOutcome::RecvfromAddressSuspended(_)
             | DispatchOutcome::OwnerCancelled(_)
             | DispatchOutcome::DirectoryReadSuspended(_)
+            | DispatchOutcome::CompletionCopyoutSuspended(_)
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
             | DispatchOutcome::OwnerPhysicalWait { .. }
@@ -2862,6 +2863,113 @@ pub fn raise_sigpipe_for_blocking_write(
     outcome
 }
 
+/// A completed wait owns its remaining output, never the original syscall.
+/// Re-dispatching select or sleep here would start a second wait. Progress is
+/// advanced only after secured copyout, with no permit retained while parked.
+#[derive(Debug, PartialEq, Eq)]
+struct CompletionCopyout {
+    result: Result<i64, LinuxErrno>,
+    writes: std::collections::VecDeque<GuestOutputRange>,
+    offset: usize,
+    thread: ThreadKey,
+}
+
+/// Suspended output from a completed wait, with exact progress and dependency.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OwnedCompletionCopyout {
+    operation: CompletionCopyout,
+    wait: carrick_guest_mem::MemoryReadWait,
+}
+
+impl CompletionCopyout {
+    fn new(
+        result: Result<i64, LinuxErrno>,
+        writes: Vec<GuestOutputRange>,
+        context: &KernelContext,
+    ) -> Self {
+        Self {
+            result,
+            writes: writes.into(),
+            offset: 0,
+            thread: context.thread().key(),
+        }
+    }
+
+    pub fn resume(
+        mut self,
+        context: &KernelContext,
+        memory: &mut impl CurrentMmMemory,
+    ) -> DispatchOutcome {
+        use crate::dispatch::copyout::{UserSlot, prepare};
+        use carrick_guest_mem::MemoryReadWait;
+        static ZEROES: [u8; 4096] = [0; 4096];
+        if let Some(cancelled) = owner_wait_cancellation(context) {
+            return DispatchOutcome::OwnerCancelled(cancelled);
+        }
+        if self.thread != context.thread().key() {
+            return DispatchOutcome::errno(crate::linux_abi::LINUX_EFAULT);
+        }
+        while let Some(range) = self.writes.front().copied() {
+            if range.mm != context.shared().mm().id() {
+                return DispatchOutcome::errno(crate::linux_abi::LINUX_EFAULT);
+            }
+            let address = range.start().raw() + self.offset as u64;
+            // One guest page and one portal permit per bounded effect.
+            let len = (range.len() - self.offset).min(4096 - (address as usize & 4095));
+            let output = match prepare(context, memory, [Some(UserSlot::new(address, len))]) {
+                Ok(output) => output,
+                Err(refusal) => {
+                    let outcome = refusal.into_outcome();
+                    let wait = match outcome {
+                        DispatchOutcome::OwnerMemoryWait { wait, .. } => {
+                            MemoryReadWait::Owner(wait)
+                        }
+                        DispatchOutcome::OwnerMemorySupply { request, .. } => {
+                            MemoryReadWait::Supply(request)
+                        }
+                        DispatchOutcome::OwnerPhysicalWait { wait, .. } => {
+                            MemoryReadWait::Physical(wait)
+                        }
+                        other => return other,
+                    };
+                    return DispatchOutcome::CompletionCopyoutSuspended(Box::new(
+                        OwnedCompletionCopyout {
+                            operation: self,
+                            wait,
+                        },
+                    ));
+                }
+            };
+            if let Err(fault) = output.commit([&ZEROES[..len]]) {
+                return fault.outcome();
+            }
+            self.offset += len;
+            if self.offset == range.len() {
+                self.writes.pop_front();
+                self.offset = 0;
+            }
+        }
+        match self.result {
+            Ok(value) => DispatchOutcome::Returned { value },
+            Err(errno) => DispatchOutcome::Errno { errno },
+        }
+    }
+}
+
+impl OwnedCompletionCopyout {
+    pub fn wait(&self) -> &carrick_guest_mem::MemoryReadWait {
+        &self.wait
+    }
+
+    pub fn resume(
+        self,
+        context: &KernelContext,
+        memory: &mut impl CurrentMmMemory,
+    ) -> DispatchOutcome {
+        self.operation.resume(context, memory)
+    }
+}
+
 /// Interpret and fold a completed continuation outcome into the resulting `DispatchOutcome`.
 ///
 /// Handlers that perform memory operations (like zeroing fd-set ranges on timeout or copying
@@ -2884,16 +2992,10 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
             Some(DispatchOutcome::Returned { value })
         }
         ContinuationCompletion::ReturnWithGuestWrites(value, writes) => {
-            for range in writes {
-                memory.zero_guest_range(range.start().raw(), range.len())?;
-            }
-            Some(DispatchOutcome::Returned { value })
+            Some(CompletionCopyout::new(Ok(value), writes, context).resume(context, memory))
         }
         ContinuationCompletion::ErrnoWithGuestWrites(errno, writes) => {
-            for range in writes {
-                memory.zero_guest_range(range.start().raw(), range.len())?;
-            }
-            Some(DispatchOutcome::Errno { errno })
+            Some(CompletionCopyout::new(Err(errno), writes, context).resume(context, memory))
         }
         ContinuationCompletion::BlockingWrite { mut write, outcome } => {
             let outcome = match outcome {
