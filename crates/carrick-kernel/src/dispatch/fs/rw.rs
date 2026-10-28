@@ -1418,7 +1418,7 @@ impl<'a> FsView<'a> {
                 drop(open);
                 // Report the counter in the attr.read_format layout; a
                 // short buffer is ENOSPC. Reads never drain the value.
-                return Ok(self.read_perf_event(memory, address, length, &state));
+                return Ok(self.read_perf_event(task.kernel, memory, address, length, &state));
             }
             // read() on an fs context (the kernel's fsconfig error-log
             // channel) is unimplemented — EINVAL, documented in
