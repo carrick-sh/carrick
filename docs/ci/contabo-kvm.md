@@ -219,7 +219,20 @@ right. At provisioning, an agent clone gets two more runner-owned 0600 files
 in `/run/carrick-ci`: `token-request` and `token-response`. The assignment
 worker polls each running, approved agent clone's request every three seconds.
 It writes the answer through the exec call's stdin (`input-data`), so a token
-never appears in a guest command line. The ledger row's `mints` field records
+never appears in a guest command line. It empties the request (only while it
+still holds the answered nonce) before writing the answer, so a back-to-back
+request is never lost. The runner owns both files and could hold their locks,
+so each guest script waits at most three seconds for a lock and is killed
+after ten. The controller's admission lock covers only ledger reads and saves,
+never guest calls, GitHub reads or the mint; the budget entry is still saved
+before the mint.
+
+The controller keeps each token it minted in memory beside the clone's row,
+never in the ledger. Once that row is no longer running (its job finished and
+it is reaping or gone), it revokes the tokens with
+`DELETE /installation/token`, best effort, ten-second bound, token in curl's
+stdin config. Tokens forgotten by a controller restart expire within the
+hour. The ledger row's `mints` field records
 each answered nonce, scope, job and refusal reason (never a token), before any
 mint is attempted. The journal logs `vm=<id> minted a publish token` or
 `token request refused: <reason>`, never token bytes.

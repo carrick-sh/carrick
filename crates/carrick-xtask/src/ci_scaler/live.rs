@@ -69,20 +69,27 @@ if [ -e approved-policy ]; then [ "$(cat approved-policy)" = "$1" ] && exit 0; e
 umask 022
 printf '%s\n' "$1" > approved-policy.tmp && chmod 644 approved-policy.tmp && mv approved-policy.tmp approved-policy"#;
 /// Root: print the tool server's pending token request (#1012) under the
-/// request file's own lock. Exit 5 = this clone has no mint channel.
+/// request file's own lock. Exit 5 = this clone has no mint channel. The
+/// runner owns the file and could hold its lock forever, so every guest mint
+/// script waits at most three seconds for it (exit 6) and is killed after ten.
 const GUEST_MINT_READ: &str = r#"cd /run/carrick-ci || exit 1
 [ -f token-request ] && [ ! -L token-request ] || exit 5
-exec 9<token-request && /usr/bin/flock 9 && head -c 4097 <&9"#;
+exec 9<token-request && timeout 10 /usr/bin/flock -w 3 9 || exit 6
+head -c 4097 <&9"#;
 /// Root: write stdin (the answer) into the runner-owned 0600 response file
 /// under its lock. The file and the root-owned directory are never replaced,
 /// so the write cannot follow a planted link; the token never enters argv.
 const GUEST_MINT_RESPOND: &str = r#"cd /run/carrick-ci || exit 1
 [ -f token-response ] && [ ! -L token-response ] || exit 5
-exec 9<token-response && /usr/bin/flock 9 && head -c 8192 > token-response"#;
-/// Root: empty the answered request under its lock.
+exec 9<token-response && timeout 10 /usr/bin/flock -w 3 9 || exit 6
+timeout 10 head -c 8192 > token-response"#;
+/// Root: empty the request under its lock, only while it still holds the
+/// nonce `$1` (any request when `$1` is empty): a request written after the
+/// controller's read is never wiped.
 const GUEST_MINT_CLEAR: &str = r#"cd /run/carrick-ci || exit 1
 [ -f token-request ] && [ ! -L token-request ] || exit 5
-exec 9<token-request && /usr/bin/flock 9 && : > token-request"#;
+exec 9<token-request && timeout 10 /usr/bin/flock -w 3 9 || exit 6
+if [ -z "$1" ] || grep -qF -- "\"$1\"" token-request; then : > token-request; fi"#;
 fn script_install_command(path: &str, source: &str) -> String {
     format!(
         "umask 077; printf '%s' {} > {} && chmod 755 {}",
@@ -1559,28 +1566,44 @@ struct GuestMint<'a> {
     row: Record,
 }
 impl GuestMint<'_> {
-    fn run(&self, script: &str, input: Option<&str>) -> Result<GuestOutput, ScalerError> {
-        let output = self
-            .pve
-            .agent_output_input(&self.row, &["/bin/sh", "-c", script], input)?;
+    fn run(
+        &self,
+        script: &str,
+        arg: &str,
+        input: Option<&str>,
+    ) -> Result<GuestOutput, ScalerError> {
+        let output =
+            self.pve
+                .agent_output_input(&self.row, &["/bin/sh", "-c", script, "sh", arg], input)?;
         match output.exit {
             GuestExit(0) => Ok(output),
             GuestExit(5) => Err(ScalerError::Guard("clone has no mint channel")),
+            GuestExit(6) => Err(ScalerError::External("guest mint file lock held")),
             _ => Err(ScalerError::External("guest mint exchange")),
         }
     }
 }
 impl mint::MintExchange for GuestMint<'_> {
     fn read(&mut self) -> Result<Option<Vec<u8>>, ScalerError> {
-        let output = self.run(GUEST_MINT_READ, None)?;
+        let output = self.run(GUEST_MINT_READ, "", None)?;
         Ok((!output.stdout.is_empty()).then(|| output.stdout.into_bytes()))
     }
     fn respond(&mut self, response: &mint::MintResponse) -> Result<(), ScalerError> {
-        self.run(GUEST_MINT_RESPOND, Some(&serde_json::to_string(response)?))
-            .map(drop)
+        self.run(
+            GUEST_MINT_RESPOND,
+            "",
+            Some(&serde_json::to_string(response)?),
+        )
+        .map(drop)
     }
-    fn clear(&mut self) -> Result<(), ScalerError> {
-        self.run(GUEST_MINT_CLEAR, None).map(drop)
+    fn clear(&mut self, nonce: Option<&mint::MintNonce>) -> Result<(), ScalerError> {
+        // The nonce is 32 hex digits; it is safe as an argument.
+        self.run(
+            GUEST_MINT_CLEAR,
+            nonce.map_or("", mint::MintNonce::as_str),
+            None,
+        )
+        .map(drop)
     }
 }
 /// How often one agent clone's request file is polled.
@@ -1594,7 +1617,12 @@ fn serve_mints(
     ledger: &mut Ledger,
     path: &Path,
     polled: &mut std::collections::BTreeMap<String, Instant>,
+    held: &mut mint::HeldTokens,
 ) {
+    let revoked = held.revoke_finished(minter, ledger);
+    if revoked > 0 {
+        println!("revoked {revoked} dispatch token(s) of finished clones");
+    }
     polled.retain(|name, _| {
         ledger
             .rows
@@ -1617,7 +1645,7 @@ fn serve_mints(
         let vm = row.vm.get();
         let name = row.name.clone();
         let mut exchange = GuestMint { pve, row };
-        match mint::serve_mint(minter, &mut exchange, &name, ledger, path) {
+        match mint::serve_mint(minter, &mut exchange, &name, ledger, path, held) {
             Ok(mint::MintServed::Idle) => {}
             Ok(mint::MintServed::Ignored) => {
                 println!("vm={vm} token request ignored (malformed or already answered)");
@@ -1855,13 +1883,21 @@ pub(super) fn controller(
             );
         }
         let mut polled = std::collections::BTreeMap::new();
+        let mut held = mint::HeldTokens::default();
         Some(assignment::AssignmentService::start(move || {
             let pass = (|| -> Result<(), ScalerError> {
                 let mut ledger = publication.snapshot()?;
                 ledger.publication = Some(publication.clone());
                 revet_assignments(&assignment_pve, &Github, &mut ledger, &path, &mut settled);
                 if agents {
-                    serve_mints(&assignment_pve, &minter, &mut ledger, &path, &mut polled);
+                    serve_mints(
+                        &assignment_pve,
+                        &minter,
+                        &mut ledger,
+                        &path,
+                        &mut polled,
+                        &mut held,
+                    );
                 }
                 Ok(())
             })();
@@ -2187,12 +2223,17 @@ mod tests {
     /// A guest mint script in `state`, with `input` on stdin as `input-data`.
     /// Hosts without util-linux `flock` (macOS) run it unlocked.
     fn guest_mint(state: &Path, script: &str, input: &str) -> std::process::Output {
+        guest_mint_arg(state, script, "", input)
+    }
+    fn guest_mint_arg(state: &Path, script: &str, arg: &str, input: &str) -> std::process::Output {
         let mut script = script.replace("/run/carrick-ci", state.to_str().unwrap());
         if !Path::new("/usr/bin/flock").exists() {
-            script = script.replace("/usr/bin/flock 9", "true");
+            script = script
+                .replace("timeout 10 /usr/bin/flock -w 3 9", "true")
+                .replace("timeout 10 head", "head");
         }
         let mut child = Command::new("/bin/sh")
-            .args(["-c", &script])
+            .args(["-c", &script, "sh", arg])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -2253,7 +2294,27 @@ mod tests {
                 .status
                 .success()
         );
-        assert!(guest_mint(&state, GUEST_MINT_CLEAR, "").status.success());
+        // A clear for another nonce leaves the request in place.
+        assert!(
+            guest_mint_arg(&state, GUEST_MINT_CLEAR, &"0".repeat(32), "")
+                .status
+                .success()
+        );
+        assert!(
+            !std::fs::read(state.join(mint::REQUEST_FILE))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            guest_mint_arg(
+                &state,
+                GUEST_MINT_CLEAR,
+                request["nonce"].as_str().unwrap(),
+                ""
+            )
+            .status
+            .success()
+        );
         assert_eq!(
             client.join().unwrap().as_deref(),
             Some("ghs_guestScriptFixture0123456789")
@@ -2281,6 +2342,29 @@ mod tests {
             std::fs::read_to_string(state.join("approved-policy"))
                 .unwrap()
                 .starts_with("agent ")
+        );
+    }
+    /// A runner holding the request lock cannot stall the controller.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serial_host_guest_mint_scripts_fail_fast_on_a_held_lock() {
+        use std::os::unix::io::AsRawFd;
+        let state = tempfile::tempdir().unwrap();
+        for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
+            std::fs::write(state.path().join(file), "{}").unwrap();
+        }
+        let held = File::open(state.path().join(mint::REQUEST_FILE)).unwrap();
+        // SAFETY: flock on a descriptor this test owns.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        for script in [GUEST_MINT_READ, GUEST_MINT_CLEAR] {
+            let start = Instant::now();
+            let output = guest_mint(state.path(), script, "");
+            assert_eq!(output.status.code(), Some(6));
+            assert!(start.elapsed() < Duration::from_secs(8));
+        }
+        assert_eq!(
+            std::fs::read_to_string(state.path().join(mint::REQUEST_FILE)).unwrap(),
+            "{}"
         );
     }
     #[test]
