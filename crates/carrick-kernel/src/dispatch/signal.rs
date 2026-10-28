@@ -1179,6 +1179,7 @@ impl<'a> SignalView<'a> {
                 break;
             }
             let Some(record_address) = address.checked_add(written as u64) else {
+                let _ = self.take_pending_in_from(context, tid, mask);
                 return if written == 0 {
                     DispatchOutcome::errno(LINUX_EFAULT)
                 } else {
@@ -1202,6 +1203,9 @@ impl<'a> SignalView<'a> {
                 }
             };
             if destination.records() == 0 {
+                // Linux dequeues the signal whose record copy hits a genuine
+                // address fault. Only an owner refusal above preserves it.
+                let _ = self.take_pending_in_from(context, tid, mask);
                 return if written == 0 {
                     DispatchOutcome::errno(LINUX_EFAULT)
                 } else {
@@ -3690,6 +3694,26 @@ mod tests {
             DispatchOutcome::errno(LINUX_EAGAIN)
         );
         assert_eq!(memory.prepares, 0);
+    }
+
+    #[test]
+    fn s1_signalfd_true_fault_consumes_faulting_signal() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let tid = context.thread().registry_id();
+        let mask = SigSet::from_raw(1 << 33);
+        dispatcher.mark_signal_pending(&context, tid, 34);
+        dispatcher.mark_signal_pending(&context, tid, 34);
+        let mut memory = OwnerRefusingMemory::new(0x1000, 128, 0xa5);
+        assert_eq!(
+            dispatcher.read_signalfd(&context, &mut memory, 0x1000, 256, mask, tid),
+            DispatchOutcome::Returned { value: 128 }
+        );
+        assert_eq!(
+            dispatcher.read_signalfd(&context, &mut memory, 0x1000, 128, mask, tid),
+            DispatchOutcome::errno(LINUX_EAGAIN)
+        );
     }
 
     #[test]
