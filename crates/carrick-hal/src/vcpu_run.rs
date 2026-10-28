@@ -5,6 +5,8 @@
 //! A backend must either latch cancellation across entry, or supply a durable
 //! interrupt when shutdown was observed. See the signed HVF qualification.
 use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicU8, Ordering},
@@ -67,6 +69,7 @@ impl<W: RunStateWord> VcpuRunState<W> {
         RunEntry {
             state: self,
             shutdown,
+            _owner_thread: PhantomData,
         }
     }
 }
@@ -75,6 +78,7 @@ impl<W: RunStateWord> VcpuRunState<W> {
 pub struct RunEntry<'a, W: RunStateWord = AtomicU8> {
     state: &'a VcpuRunState<W>,
     shutdown: bool,
+    _owner_thread: PhantomData<Rc<()>>,
 }
 impl<W: RunStateWord> RunEntry<'_, W> {
     pub fn shutdown_requested(&self) -> bool {
@@ -94,10 +98,13 @@ thread_local! {
 /// Installs the runtime-owned state for this executor's lifetime. Backends
 /// discover it at the physical entry, so nested engine loops cannot bypass it.
 #[must_use]
-pub struct ExecutorRunScope(Option<Arc<VcpuRunState>>);
+pub struct ExecutorRunScope(Option<Arc<VcpuRunState>>, PhantomData<Rc<()>>);
 impl ExecutorRunScope {
     pub fn install(state: Arc<VcpuRunState>) -> Self {
-        Self(CURRENT.with(|current| current.replace(Some(state))))
+        Self(
+            CURRENT.with(|current| current.replace(Some(state))),
+            PhantomData,
+        )
     }
 }
 impl Drop for ExecutorRunScope {
@@ -112,12 +119,17 @@ impl Drop for ExecutorRunScope {
 pub struct PhysicalRunEntry {
     state: Option<Arc<VcpuRunState>>,
     shutdown: bool,
+    _owner_thread: PhantomData<Rc<()>>,
 }
 impl PhysicalRunEntry {
     pub fn current() -> Self {
         let state = CURRENT.with(|current| current.borrow().clone());
         let shutdown = state.as_ref().is_some_and(|state| state.publish_entry());
-        Self { state, shutdown }
+        Self {
+            state,
+            shutdown,
+            _owner_thread: PhantomData,
+        }
     }
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown
