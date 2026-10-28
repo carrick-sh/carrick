@@ -13,6 +13,39 @@ use carrick_vfs::errno::HostSyscallResult as _;
 use super::support::*;
 use super::*;
 
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+enum HostSockoptValue {
+    Bytes,
+    IpTtl,
+}
+
+impl HostSockoptValue {
+    fn query_len(self, capacity: &ValueResultCapacity) -> usize {
+        match self {
+            // Query the complete host int even for a short guest buffer. Darwin
+            // does not implement Linux's byte-form result for short IP_TTL.
+            Self::IpTtl => std::mem::size_of::<i32>(),
+            Self::Bytes => capacity.bounded_len(256),
+        }
+    }
+
+    fn output_len(self, capacity: &ValueResultCapacity, available: usize) -> usize {
+        let bounded = capacity.bounded_len(available);
+        match self {
+            Self::IpTtl => {
+                let int_len = std::mem::size_of::<i32>();
+                let wire_len = if capacity.bounded_len(int_len) < int_len {
+                    1
+                } else {
+                    int_len
+                };
+                bounded.min(wire_len)
+            }
+            Self::Bytes => bounded,
+        }
+    }
+}
+
 const LINUX_DEFAULT_SOCKBUF: i32 = 212_992;
 const LINUX_TCP_INFO: i32 = 11;
 
@@ -1274,7 +1307,13 @@ impl<'a> NetView<'a> {
                 Ok(Err(fault)) => return Ok(fault.outcome()),
                 Err(refusal) => return Ok(refusal.into_outcome()),
             };
-            let cap = capacity.bounded_len(256);
+            let format = if level == crate::linux_abi::LINUX_SOL_IP
+                && optname == crate::linux_abi::LINUX_IP_TTL {
+                HostSockoptValue::IpTtl
+            } else {
+                HostSockoptValue::Bytes
+            };
+            let cap = format.query_len(&capacity);
             let mut buf = vec![0u8; cap];
             let mut optlen = cap as u32;
             let rc = unsafe {
@@ -1304,7 +1343,7 @@ impl<'a> NetView<'a> {
                 };
                 return Ok(DispatchOutcome::errno(errno));
             }
-            let used = (optlen as usize).min(buf.len());
+            let used = format.output_len(&capacity, (optlen as usize).min(buf.len()));
             // A NULL optval with a value to return is EFAULT on Linux (the kernel
             // copies `used` bytes out); macOS silently succeeds. (getsockopt01
             // "invalid option buffer")
@@ -1316,7 +1355,9 @@ impl<'a> NetView<'a> {
                 Ok(out) => out,
                 Err(refusal) => return Ok(refusal.into_outcome()),
             };
-            out.commit(&buf[..used], optlen)?;
+            // A host's returned length is not Linux output authority. Report
+            // only the normalized prefix secured from the original capacity.
+            out.commit_clamped(&buf[..used])?;
             Ok(DispatchOutcome::Returned { value: 0 })
 
         }
@@ -1866,6 +1907,35 @@ mod s2_tests {
     }
 
     #[test]
+    fn s2_host_option_lengths_follow_linux_wire_rules() {
+        for offered in [0u32, 1, 2, 3, 4, 5, 256] {
+            let mut memory = OwnerRefusingMemory::new(0x5000, 32, 0xa5);
+            memory.seed(0x5010, &offered.to_ne_bytes());
+            let capacity = ValueResultCapacity::capture(&memory, GuestVa::new(0x5010))
+                .unwrap()
+                .unwrap();
+            assert_eq!(HostSockoptValue::IpTtl.query_len(&capacity), 4);
+            assert_eq!(
+                HostSockoptValue::Bytes.query_len(&capacity),
+                (offered as usize).min(256)
+            );
+            // Include Darwin-style truncated ints and oversized host lengths.
+            for available in [0usize, 1, 2, 3, 4, 8, 256] {
+                assert_eq!(
+                    HostSockoptValue::Bytes.output_len(&capacity, available),
+                    (offered as usize).min(available)
+                );
+                let linux_wire_len = if offered < 4 { 1 } else { 4 };
+                assert_eq!(
+                    HostSockoptValue::IpTtl.output_len(&capacity, available),
+                    (offered as usize).min(available).min(linux_wire_len),
+                    "IP_TTL capacity={offered}, host available={available}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn s2_negative_option_length_skips_owner_preparation() {
         let mut guest = QueryGuest::new();
         let fd = guest.socket(crate::linux_abi::LINUX_AF_INET, LINUX_SOCK_STREAM);
@@ -1994,7 +2064,7 @@ mod s2_tests {
                 );
             }
             // Truncation and zero capacity still publish the clamped length.
-            for capacity in [0u32, 1, 2, 4, u32::MAX >> 1] {
+            for capacity in [0u32, 1, 2, 3, 4, u32::MAX >> 1] {
                 guest.memory.seed(0x5000, &[0xa5; 8]);
                 guest.memory.seed(0x5010, &capacity.to_ne_bytes());
                 assert_eq!(
@@ -2016,7 +2086,8 @@ mod s2_tests {
                         .memory
                         .read_bytes(0x5000 + written as u64, 8 - written)
                         .unwrap(),
-                    vec![0xa5; 8 - written]
+                    vec![0xa5; 8 - written],
+                    "fd={fd}, level={level}, option={name}, capacity={capacity}, written={written}"
                 );
                 assert_eq!(
                     guest.memory.read_bytes(0x5010, 4).unwrap(),
