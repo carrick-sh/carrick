@@ -104,13 +104,14 @@ fn qualify(before_entry: bool) {
             0,
         );
         assert_ne!(memory, libc::MAP_FAILED);
-        // mov x0,#1; adr x1,marker; stlr x0,[x1]; wfi; b wfi
+        // mov x0,#1; adr x1,marker; stlr x0,[x1]; then WFI or b .
+        // Raw-VM WFI can trap: the in-run mirror must spin until kicked.
         // The marker at +0x100 proves the mirror kick follows guest execution.
         let code = [
             0xd2800020_u32,
             0x100007e1,
             0xc89ffc20,
-            0xd503207f,
+            if before_entry { 0xd503207f } else { 0x14000000 },
             0x17ffffff,
         ];
         for (i, instruction) in code.into_iter().enumerate() {
@@ -134,7 +135,8 @@ fn qualify(before_entry: bool) {
             0
         );
         assert_eq!(hv::hv_vcpu_set_reg(vcpu, hv::hv_reg_t::PC, GPA), 0);
-        // EL1h, IRQ/FIQ masked, translation off: WFI waits inside HVF.
+        // EL1h, IRQ/FIQ masked, translation off. The before-entry latch
+        // must return CANCELED before executing this raw VM's WFI.
         assert_eq!(hv::hv_vcpu_set_reg(vcpu, hv::hv_reg_t::CPSR, 0x3c5), 0);
         let (ready_tx, ready_rx) = mpsc::channel();
         let (kick_tx, kick_rx) = mpsc::channel();
@@ -150,7 +152,7 @@ fn qualify(before_entry: bool) {
                 // guest. Observe its single store with a bounded diagnostic
                 // loop, rather than assuming that a host sleep proves entry.
                 while (&*(marker_address as *const AtomicU64)).load(Ordering::Acquire) == 0 {
-                    assert!(Instant::now() < deadline, "guest never reached WFI loop");
+                    assert!(Instant::now() < deadline, "guest never reached spin loop");
                     std::thread::yield_now();
                 }
                 observed.store(1, Ordering::Release);
