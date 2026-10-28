@@ -2280,30 +2280,36 @@ impl<'a> SignalView<'a> {
             }
 
             this.drain_xsignals_process_directed(cx.kernel);
-            let memory = &mut *cx.memory;
-            let out = match crate::dispatch::copyout::prepare(cx.kernel, memory,
-                [crate::dispatch::copyout::UserSlot::optional(info_ptr, 128)]) {
-                Ok(out) => out,
-                Err(refusal) => return Ok(refusal.into_outcome()),
-            };
-            if let Some(pending) = this.take_pending_in_from(cx.kernel, tid, wait_set) {
-                return Ok(rt_sigtimedwait_deliver(
-                    this.cross.host_signal(),
-                    out,
-                    pending.signum,
-                    pending.siginfo,
-                ));
-            }
-            let signum = this.cross.host_signal().take_pending_in_for(tid.raw(), wait_set);
-            if signum != carrick_hal::NO_PENDING_SIGNAL {
-                // A host-delivered signal carries no carrick-queued payload.
-                let queued = this.take_pending_siginfo(cx.kernel, tid, signum);
-                return Ok(rt_sigtimedwait_deliver(
-                    this.cross.host_signal(),
-                    out,
-                    signum,
-                    queued,
-                ));
+            // An empty wait has no siginfo output. Inspect both pending
+            // authorities without dequeueing before admitting the destination.
+            if Self::signal_authority_for(cx.kernel, tid).has_pending_in(wait_set)
+                || this.cross.host_signal().claim_pending_in_for(tid.raw(), wait_set)
+            {
+                let memory = &mut *cx.memory;
+                let out = match crate::dispatch::copyout::prepare(cx.kernel, memory,
+                    [crate::dispatch::copyout::UserSlot::optional(info_ptr, 128)]) {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
+                if let Some(pending) = this.take_pending_in_from(cx.kernel, tid, wait_set) {
+                    return Ok(rt_sigtimedwait_deliver(
+                        this.cross.host_signal(),
+                        out,
+                        pending.signum,
+                        pending.siginfo,
+                    ));
+                }
+                let signum = this.cross.host_signal().take_pending_in_for(tid.raw(), wait_set);
+                if signum != carrick_hal::NO_PENDING_SIGNAL {
+                    // A host-delivered signal carries no carrick-queued payload.
+                    let queued = this.take_pending_siginfo(cx.kernel, tid, signum);
+                    return Ok(rt_sigtimedwait_deliver(
+                        this.cross.host_signal(),
+                        out,
+                        signum,
+                        queued,
+                    ));
+                }
             }
             let block_mask = SigBlockMask::for_signal_wait(
                 wait_set,
@@ -3694,6 +3700,44 @@ mod tests {
             DispatchOutcome::errno(LINUX_EAGAIN)
         );
         assert_eq!(memory.prepares, 0);
+    }
+
+    #[test]
+    fn s1_empty_sigtimedwait_skips_owner_preparation() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use crate::dispatch::{CompatReporter, SyscallArgs, SyscallRequest};
+        for info in [0x1100, 0x9000] {
+            for editor in [true, false] {
+                let mut dispatcher = SyscallDispatcher::new();
+                let context = dispatcher.capture_one_task_context().unwrap();
+                let tid = context.thread().registry_id();
+                let mask = SigSet::EMPTY.with(34);
+                dispatcher.restore_signal_mask(&context, tid, SigSet::EMPTY.with(35));
+                dispatcher.mark_signal_pending(&context, tid, 35);
+                let mut memory = OwnerRefusingMemory::new(0x1000, 0x1000, 0xa5);
+                memory.seed(0x1000, &mask.raw().to_le_bytes());
+                memory.seed(0x1040, &[0; 16]);
+                if editor {
+                    memory.refuse_next();
+                }
+                let request =
+                    SyscallRequest::new(137, SyscallArgs::from([0x1000, info, 0x1040, 8, 0, 0]));
+                assert_eq!(
+                    dispatcher
+                        .dispatch(&context, request, &mut memory, &CompatReporter::default())
+                        .unwrap(),
+                    DispatchOutcome::errno(LINUX_EAGAIN),
+                    "no matching signal, info={info:#x}, editor={editor}"
+                );
+                assert_eq!(memory.prepares, 0, "unused siginfo must not be prepared");
+                assert_eq!(memory.inner.read_bytes(0x1100, 128).unwrap(), [0xa5; 128]);
+                assert!(
+                    dispatcher
+                        .take_pending_in_from(&context, tid, SigSet::EMPTY.with(35))
+                        .is_some()
+                );
+            }
+        }
     }
 
     #[test]
