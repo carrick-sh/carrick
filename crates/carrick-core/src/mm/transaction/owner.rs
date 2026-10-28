@@ -331,6 +331,23 @@ impl<
     }
 
     pub fn admitted_handle(&self, mm: ReservationMm, slot: u32) -> Result<El1MmHandle, MmError> {
+        if let Some(zone) = self.zone {
+            let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
+            if !self.roots.admitted(index, mm) {
+                return Err(MmError::Stale);
+            }
+            let entry = zone
+                .space_entry(NonZeroU64::new(mm.raw()).ok_or(MmError::Stale)?)
+                .ok_or(MmError::Stale)?;
+            let source = entry.live_notifications().map_err(|_| MmError::Stale)?;
+            // SAFETY: root admission published this exact MM notification
+            // incarnation. The retained source excludes reuse while observed;
+            // every later operation revalidates the handle before effects.
+            return Ok(unsafe {
+                El1MmHandle::from_admitted_owner(self.carrier, mm, source.identity().incarnation)
+            });
+        }
+        // Explicit source-free model fixtures have no publication source.
         let root = self.root(mm, slot)?;
         // SAFETY: this exact root is production-admitted and retained above.
         Ok(unsafe {

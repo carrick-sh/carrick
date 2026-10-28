@@ -161,12 +161,19 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
     entry
         .import_in_zone_standard_signals()
         .unwrap_or_else(|_| fatal());
-    entry.resume_checkpoint().unwrap_or_else(|reason| {
+    let outcome = entry.resume_checkpoint().unwrap_or_else(|reason| {
         super::native_run_failure::complete_native_run_failure(
             common_entry::execution_binding(task),
             reason,
         )
-    })
+    });
+    if matches!(outcome, NativeResume::NoPending) {
+        // SAFETY: this exact record is selected by the execution owner.
+        unsafe {
+            source.zone.record(record).consume_metadata_operation();
+        }
+    }
+    outcome
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -188,6 +195,10 @@ pub fn resume_production(
             }
             let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
             return crate::sched::ResumeAction::Left;
+        }
+        // SAFETY: this exact record is selected by the execution owner.
+        unsafe {
+            zone.record(record).consume_metadata_operation();
         }
         return crate::sched::ResumeAction::NoPending;
     };
@@ -234,18 +245,15 @@ pub(super) fn process_record_for_call(
     control: &ThreadControlSlot,
 ) -> Result<RecordId, NativeProcessError> {
     let lane = source.zone.slot(source.slot);
-    if let Some(record) = lane.current() {
-        return Ok(record);
-    }
-    let host_record = lane.host_record();
-    if let Some(record) = host_record
+    let existing = lane.current().or_else(|| lane.host_record());
+    if let Some(record) = existing
         && unsafe { source.zone.record(record).ctx_mut() }
             .address_context()
             .is_some()
     {
         return Ok(record);
     }
-    init_process_record(source, task, native, ttbr0, host_record, control)
+    init_process_record(source, task, native, ttbr0, existing, control)
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]

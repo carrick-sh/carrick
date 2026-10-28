@@ -1523,6 +1523,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         );
     }
 
+    /// Consume a resumed metadata operation receipt under the execution
+    /// owner's exclusive `OnCpu` custody without disturbing adapter-owned
+    /// tokens (`index != u64::MAX`).
+    ///
+    /// # Safety
+    /// Caller exclusively owns the `OnCpu` record on its execution slot.
+    pub unsafe fn consume_metadata_operation(&self) -> bool {
+        self.object
+            .operation
+            .compare_exchange(u64::MAX, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Transfer a pending operation to its adapter exactly once.
     ///
     /// # Safety

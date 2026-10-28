@@ -894,8 +894,12 @@ impl Fixture {
                 true,
             )
             .unwrap();
-        owner.finish_import().unwrap();
         drop(owner);
+        super::aarch64_process::Portal::for_zone(NonZeroU64::MIN, table, zone)
+            .root_any(mm, 0)
+            .unwrap()
+            .finish_import()
+            .unwrap();
 
         let tables = crate::mm_portal::test_support::Tables::new(root_gpa, IPA, 2);
         let maintenance = CallerInvalidatesAsid;

@@ -346,8 +346,8 @@ fn composed_native_supply(
             carrick_el1_abi::EntryThreadGeneration::from_raw(identity.serial),
         )
         .unwrap();
-    let supply = OwnerFaultSupply::new(portal).with_handle(handle);
     let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+    let supply = OwnerFaultSupply::new(portal).with_handle(handle);
     if let Some(absent_page) = absent_page {
         let fault_page = VA + absent_page as u64 * 4096;
         let neighbor = VA + (1 - absent_page) as u64 * 4096;
@@ -370,7 +370,7 @@ fn composed_native_supply(
                 crate::cow_resolver::native_fault_supply(
                     true,
                     carrick_el1::fault::GrantMailboxes::own(&mailbox),
-                    &supply
+                    &supply,
                 ),
                 Some(carrick_el1::fault::PreparedFaultPath {
                     residency,
@@ -434,7 +434,7 @@ fn composed_native_supply(
                 crate::cow_resolver::native_fault_supply(
                     true,
                     carrick_el1::fault::GrantMailboxes::own(&mailbox),
-                    &retry
+                    &retry,
                 ),
                 Some(carrick_el1::fault::PreparedFaultPath {
                     residency,
@@ -488,7 +488,7 @@ fn composed_native_supply(
                     crate::cow_resolver::native_fault_supply(
                         true,
                         carrick_el1::fault::GrantMailboxes::own(&mailbox),
-                        &busy
+                        &busy,
                     ),
                     Some(carrick_el1::fault::PreparedFaultPath {
                         residency,
@@ -845,7 +845,7 @@ fn composed_native_supply(
             crate::cow_resolver::native_fault_supply(
                 true,
                 carrick_el1::fault::GrantMailboxes::own(&mailbox),
-                &supply
+                &supply,
             ),
             Some(carrick_el1::fault::PreparedFaultPath {
                 residency,
@@ -975,7 +975,7 @@ fn composed_native_supply(
             crate::cow_resolver::native_fault_supply(
                 true,
                 carrick_el1::fault::GrantMailboxes::own(&mailbox),
-                &backing_supply
+                &backing_supply,
             ),
             Some(carrick_el1::fault::PreparedFaultPath {
                 residency,
@@ -1270,4 +1270,395 @@ fn composed_native_supply(
         "child table clear cannot alter the parent's translation"
     );
     stock.shutdown();
+}
+
+/// Two live threads of one MM: while sibling B holds the reservation root or
+/// MM editor preparing a first-touch grant for a shared block, thread A's
+/// write into that block must wait on the shared owner publication and retry
+/// rather than erasing `Busy` to `None` and forwarding an empty mailbox to
+/// host first-touch (`backend-refused` -> `SIGSEGV`, #1008).
+#[test]
+fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
+    use crate::native_process_runtime::NativeResume;
+    use carrick_core_abi::service::ServiceOperation;
+    use carrick_el1::fault::{GrantMailboxes, NoopCowResolver, PreparedFaultPath};
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let sibling_slot = SlotId::new(1);
+    fixture.zone.drive(sibling_slot, 1);
+    fixture.zone.publish_slot(sibling_slot, 1, Some(1), 2);
+    fixture.zone.enter_guest(sibling_slot);
+    fixture.zone.install_space(sibling_slot, 1).unwrap();
+    let (_, sibling) =
+        imported_thread_on_slot(fixture, sibling_slot, |identity| identity.affinity = 2);
+    let mut service = fixture.process_service();
+    let portal = fixture.region.portal_slots();
+    assert!(portal.bind_carrier(NonZeroU64::MIN));
+
+    assert_eq!(fixture.page.live(), 2);
+    assert!(fixture.zone.live(sibling).is_some());
+    assert!(
+        !fixture
+            .zone
+            .slot(fixture.slot)
+            .current()
+            .is_some_and(|record| fixture.zone.record(record).is_native_owned())
+    );
+    let mut cpu = crate::sched::FakeCpu::default();
+    let handle = crate::cow_resolver::admitted_fault_mm_handle(
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        fixture.slot,
+        &fixture.task,
+    )
+    .expect("admitted reservation root must supply the exact MM handle before native entry");
+
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    let sibling_access = crate::sched::object_wait::space_access(fixture.zone, sibling_slot);
+    let index = access.find(handle.mm().raw()).unwrap();
+    let residency = carrick_el1::cow::test_support::residency_table();
+    let words = fixture.tables.live(&fixture.maintenance);
+    let counters = carrick_el1_abi::Counters::new();
+
+    // 1. Host-cloned (`!native`) mailbox venue (exact #1008 capture shape):
+    // Sibling B holds the reservation root lock on slot 1 while inspecting/planning
+    // a grant for the shared block. Thread A faults on slot 0.
+    let mailbox_a = carrick_el1_abi::FrameGrantMailbox::new();
+    for release_before_enroll in [true, false] {
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0x92000046,
+            far: VA + 8,
+            elr: 0x401234,
+            ..Default::default()
+        };
+        frame.x[3] = 0x7abc;
+
+        if release_before_enroll {
+            let held_root = fixture
+                .region
+                .table()
+                .lock_in(
+                    sibling_access,
+                    index.index(),
+                    handle.mm(),
+                    u32::from(sibling_slot.raw()),
+                )
+                .unwrap();
+            let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+            assert_eq!(
+                carrick_el1::fault::dispatch_fault_with_prepared(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    access,
+                    crate::cow_resolver::native_fault_supply(
+                        false,
+                        GrantMailboxes::own(&mailbox_a),
+                        &supply,
+                    ),
+                    Some(PreparedFaultPath {
+                        residency: &residency,
+                        resolver: &mut SelectionWords(&words),
+                        roots: Some(fixture.region.table()),
+                        file_slots: Some(portal),
+                    }),
+                    &mut NoopCowResolver,
+                ),
+                carrick_el1_abi::Action::Forward
+            );
+            assert!(
+                mailbox_a.claim_request().is_none(),
+                "contended root cannot publish an unauthenticated request"
+            );
+            let OwnerFaultSupplyOutcome::Wait(wait) = supply.outcome() else {
+                panic!(
+                    "host-born mailbox fault erased Busy instead of waiting on sibling root owner: {:?}",
+                    supply.outcome()
+                );
+            };
+            assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Reservations);
+            assert_eq!(wait.handle(), handle);
+            drop(held_root);
+            assert_eq!(
+                crate::cow_resolver::park_fault_owner_wait(
+                    fixture.zone,
+                    &fixture.task,
+                    &counters,
+                    fixture.slot,
+                    &mut cpu,
+                    &crate::sched::HardwareUserWord,
+                    &mut frame,
+                    wait,
+                ),
+                None,
+                "release before enrollment must retry immediately without parking"
+            );
+        } else {
+            let locked_gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let parked_gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let released_gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let table = fixture.region.table();
+            let zone = fixture.zone;
+            std::thread::scope(|scope| {
+                let sibling_locked = locked_gate.clone();
+                let sibling_parked = parked_gate.clone();
+                let sibling_released = released_gate.clone();
+                let sibling_thread = scope.spawn(move || {
+                    let held_root = table
+                        .lock_in(
+                            crate::sched::object_wait::space_access(zone, sibling_slot),
+                            index.index(),
+                            handle.mm(),
+                            u32::from(sibling_slot.raw()),
+                        )
+                        .unwrap();
+                    sibling_locked.wait();
+                    sibling_parked.wait();
+                    drop(held_root);
+                    sibling_released.wait();
+                });
+                locked_gate.wait();
+                let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+                assert_eq!(
+                    carrick_el1::fault::dispatch_fault_with_prepared(
+                        &mut frame,
+                        &counters,
+                        core::slice::from_ref(&fixture.task),
+                        access,
+                        crate::cow_resolver::native_fault_supply(
+                            false,
+                            GrantMailboxes::own(&mailbox_a),
+                            &supply,
+                        ),
+                        Some(PreparedFaultPath {
+                            residency: &residency,
+                            resolver: &mut SelectionWords(&words),
+                            roots: Some(fixture.region.table()),
+                            file_slots: Some(portal),
+                        }),
+                        &mut NoopCowResolver,
+                    ),
+                    carrick_el1_abi::Action::Forward
+                );
+                assert!(
+                    mailbox_a.claim_request().is_none(),
+                    "contended root cannot publish an unauthenticated request"
+                );
+                let OwnerFaultSupplyOutcome::Wait(wait) = supply.outcome() else {
+                    panic!(
+                        "host-born mailbox fault erased Busy instead of waiting on sibling root owner: {:?}",
+                        supply.outcome()
+                    );
+                };
+                assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Reservations);
+                assert_eq!(wait.handle(), handle);
+                fixture.task.linux.mark_pending_host_work();
+                assert_eq!(
+                    crate::cow_resolver::park_fault_owner_wait(
+                        fixture.zone,
+                        &fixture.task,
+                        &counters,
+                        fixture.slot,
+                        &mut cpu,
+                        &crate::sched::HardwareUserWord,
+                        &mut frame,
+                        wait,
+                    ),
+                    Some(carrick_el1_abi::Action::Idle)
+                );
+                assert!(fixture.task.linux.take_host_work_doorbell().is_some());
+                assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
+                assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+                parked_gate.wait();
+                released_gate.wait();
+                sibling_thread.join().unwrap();
+            });
+            assert_eq!(
+                fixture.zone.slot(fixture.slot).queued(),
+                1,
+                "sibling root release must wake the parked fault waiter onto its slot"
+            );
+            assert_eq!(fixture.task.service_notice.take().unwrap(), None);
+            let mut handoff = None;
+            let mut zone = crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            };
+            assert_eq!(
+                crate::dispatch::native_scheduler(
+                    &mut zone,
+                    &fixture.task,
+                    &counters,
+                    fixture.slot,
+                    &mut handoff,
+                )
+                .idle_entry(&mut frame, 0),
+                carrick_el1_abi::Action::Served
+            );
+            assert_eq!(cpu.wfis, 0);
+            let record = fixture.zone.slot(fixture.slot).current().unwrap();
+            assert!(
+                registry()
+                    .for_record(fixture.zone, fixture.zone.record_ref(record))
+                    .is_none(),
+                "host-born fault wait resumes before any NativeProcessRuntime registration"
+            );
+            assert!(unsafe { fixture.zone.record(record).consume_metadata_operation() });
+            assert!(!unsafe { fixture.zone.record(record).consume_metadata_operation() });
+            assert_eq!(frame.elr, 0x401234, "resume exact fault PC");
+            assert_eq!(frame.x[3], 0x7abc, "resume exact fault registers");
+        }
+    }
+
+    // Retry after sibling B releases the reservation root lock: thread A's
+    // mailbox now receives the authenticated FrameGrantRequest for the block.
+    let retry_supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    let mut retry_frame = carrick_el1_abi::TrapFrame {
+        esr: 0x92000046,
+        far: VA + 8,
+        elr: 0x401234,
+        ..Default::default()
+    };
+    assert_eq!(
+        carrick_el1::fault::dispatch_fault_with_prepared(
+            &mut retry_frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            access,
+            crate::cow_resolver::native_fault_supply(
+                false,
+                GrantMailboxes::own(&mailbox_a),
+                &retry_supply,
+            ),
+            Some(PreparedFaultPath {
+                residency: &residency,
+                resolver: &mut SelectionWords(&words),
+                roots: Some(fixture.region.table()),
+                file_slots: Some(portal),
+            }),
+            &mut NoopCowResolver,
+        ),
+        carrick_el1_abi::Action::Forward
+    );
+    assert_eq!(retry_supply.outcome(), OwnerFaultSupplyOutcome::Unavailable);
+    let request = mailbox_a
+        .claim_request()
+        .expect("uncontended retry must publish an authenticated frame grant request");
+    assert_eq!(request.mm_key, handle.mm().raw());
+    assert_eq!(request.fault_va, VA + 8);
+    assert!(mailbox_a.complete_resolved_owner_fault(request));
+
+    // 2. Native owner venue (`native = true`): sibling B holds the MM editor
+    // while preparing publication; thread A waits on `PortalWaitCause::Editor`.
+    let editor = access
+        .try_begin_edit(index, handle.mm().raw(), NonZeroU64::new(2).unwrap())
+        .unwrap();
+    let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x92000046,
+        far: VA + 8,
+        ..Default::default()
+    };
+    assert_eq!(
+        carrick_el1::fault::dispatch_fault_with_prepared(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            access,
+            crate::cow_resolver::native_fault_supply(
+                true,
+                GrantMailboxes::own(&mailbox_a),
+                &supply,
+            ),
+            Some(PreparedFaultPath {
+                residency: &residency,
+                resolver: &mut SelectionWords(&words),
+                roots: Some(fixture.region.table()),
+                file_slots: Some(portal),
+            }),
+            &mut NoopCowResolver,
+        ),
+        carrick_el1_abi::Action::Forward
+    );
+    let OwnerFaultSupplyOutcome::Wait(wait) = supply.outcome() else {
+        panic!(
+            "valid shared-MM write lost sibling publication: {:?}",
+            supply.outcome()
+        );
+    };
+    assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Editor);
+    assert_eq!(wait.handle(), handle);
+    let mut saved = Aarch64ParkedContext::ZERO;
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+    let result = with_process_entry(
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        },
+        &fixture.task,
+        &saved.native,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |entry| {
+            entry
+                .begin_owner_service_wait(
+                    ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+                        address: UserVa::new(frame.far),
+                        access: carrick_guest_arch::Access::Write,
+                        present: false,
+                    }),
+                    wait,
+                )
+                .unwrap()
+        },
+    )
+    .unwrap();
+    assert!(matches!(result, NativeResume::Left(None)));
+    assert_eq!(fixture.task.service_notice.take().unwrap(), None);
+    crate::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu);
+    drop(editor);
+    let mut handoff = None;
+    let mut zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    assert_eq!(
+        crate::dispatch::native_scheduler(
+            &mut zone,
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff,
+        )
+        .idle_entry(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    let record = fixture.zone.slot(fixture.slot).current().unwrap();
+    let owner = registry()
+        .for_record(fixture.zone, fixture.zone.record_ref(record))
+        .unwrap();
+    assert!(matches!(
+        resume_selected(
+            &owner,
+            registry(),
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot
+            },
+            &fixture.task,
+            record,
+            &mut service,
+        ),
+        NativeResume::NoPending
+    ));
+    assert!(
+        !registry().signal_checkpoint_needed(fixture.zone, fixture.zone.record_ref(record)),
+        "sibling contention wait must never manufacture SIGSEGV"
+    );
+    assert_eq!(fixture.page.claimed_count(), 0);
 }

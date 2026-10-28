@@ -1011,7 +1011,8 @@ fn arm_native_service_exit(
     let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
     let slot = SlotId::from_index(frame.slot as usize)?;
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
-    let record = zone.slot(slot).current()?;
+    let lane = zone.slot(slot);
+    let record = lane.current().or_else(|| lane.host_record())?;
     if !zone.record(record).is_native_owned() {
         return None;
     }

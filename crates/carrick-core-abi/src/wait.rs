@@ -143,6 +143,9 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
     pub fn key(&self) -> ObjectWaitKey {
         self.source.key(self.cause)
     }
+    pub fn observed_snapshot(&self) -> ObjectWaitSnapshot {
+        self.source.observed_revision(self.cause, self.revision)
+    }
 
     pub fn park_host(
         self,

@@ -2122,11 +2122,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     /// Publish the execution owner before making a freshly allocated record
-    /// runnable. Only its allocator may call this while it remains Free.
+    /// runnable, or while its running slot adopts an already switched-in root.
     pub fn mark_native_owned(&self, id: RecordId) -> bool {
         let record = self.record(id);
-        if record.claim() != Claim::Free {
-            return false;
+        match record.claim() {
+            Claim::Free => {}
+            Claim::OnCpu { slot, .. } | Claim::OnCpuRequested { slot, .. }
+                if self.slot(slot).current() == Some(id) => {}
+            _ => return false,
         }
         record.native_owned.store(1, Ordering::Release);
         true

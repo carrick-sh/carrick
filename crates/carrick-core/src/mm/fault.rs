@@ -39,6 +39,24 @@ pub fn request_lazy_frames(
     })
 }
 
+/// Whether the reservation root maps this guest VA now, is contended by an
+/// in-flight sibling/host reservation operation, or has no mapping covering it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootMappingIncarnation {
+    Busy,
+    Mapped(ReservationIncarnation),
+    Unmapped,
+}
+
+impl RootMappingIncarnation {
+    pub fn mapped(self) -> Option<ReservationIncarnation> {
+        match self {
+            Self::Mapped(incarnation) => Some(incarnation),
+            Self::Busy | Self::Unmapped => None,
+        }
+    }
+}
+
 /// The node that owns this guest VA now. This is a node identity, distinct
 /// from the root generation and from any physical owner generation.
 pub fn root_mapping_incarnation<
@@ -51,15 +69,28 @@ pub fn root_mapping_incarnation<
     slot: u32,
     mm_key: u64,
     va: u64,
-) -> Option<ReservationIncarnation> {
-    let roots = roots?;
-    let mm = ReservationMm::new(mm_key)?;
-    let index = spaces.find(mm_key)?.index();
+) -> RootMappingIncarnation {
+    let Some(roots) = roots else {
+        return RootMappingIncarnation::Unmapped;
+    };
+    let Some(mm) = ReservationMm::new(mm_key) else {
+        return RootMappingIncarnation::Unmapped;
+    };
+    let Some(index) = spaces.find(mm_key).map(|index| index.index()) else {
+        return RootMappingIncarnation::Unmapped;
+    };
     if !roots.admitted(index, mm) {
-        return None;
+        return RootMappingIncarnation::Unmapped;
     }
-    let mut root = roots.lock_in(spaces, index, mm, slot).ok()?;
-    root.node(va).map(|(_, incarnation)| incarnation)
+    let mut root = match roots.lock_in(spaces, index, mm, slot) {
+        Ok(root) => root,
+        Err(crate::mm::reservation::Refusal::Busy) => return RootMappingIncarnation::Busy,
+        Err(_) => return RootMappingIncarnation::Unmapped,
+    };
+    match root.node(va) {
+        Some((_, incarnation)) => RootMappingIncarnation::Mapped(incarnation),
+        None => RootMappingIncarnation::Unmapped,
+    }
 }
 
 /// Whether a delegated MM's root lets this prepared page be committed:
@@ -233,17 +264,34 @@ impl<
 > FileFaultVenue<'_, Policy, Geometry, Slots, Context>
 {
     pub fn publish(&self, mm_key: u64, va: u64, access: u64) -> bool {
+        self.try_publish(mm_key, va, access).unwrap_or(false)
+    }
+
+    pub fn try_publish(
+        &self,
+        mm_key: u64,
+        va: u64,
+        access: u64,
+    ) -> Result<bool, crate::mm::reservation::Refusal> {
+        let mut busy = false;
         let owner_source = core::cell::Cell::new(false);
-        let run = || -> Option<bool> {
+        let mut run = || -> Option<bool> {
             let mm = carrick_core_abi::ReservationMm::new(mm_key)?;
             let index = self.spaces.find(mm_key)?;
             if !self.roots.admitted(index.index(), mm) {
                 return None;
             }
-            let mut root = self
+            let mut root = match self
                 .roots
                 .lock_in(self.spaces, index.index(), mm, self.worker)
-                .ok()?;
+            {
+                Ok(root) => root,
+                Err(crate::mm::reservation::Refusal::Busy) => {
+                    busy = true;
+                    return None;
+                }
+                Err(_) => return None,
+            };
             let (mapping, reservation_incarnation) = root.node(va)?;
             mapping.host_backing?;
             owner_source.set(true);
@@ -273,7 +321,11 @@ impl<
             }
             Some(true)
         };
-        run().unwrap_or(owner_source.get())
+        let outcome = run();
+        if busy {
+            return Err(crate::mm::reservation::Refusal::Busy);
+        }
+        Ok(outcome.unwrap_or(owner_source.get()))
     }
 }
 

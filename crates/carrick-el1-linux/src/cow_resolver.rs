@@ -4,6 +4,8 @@
 #[cfg(target_os = "none")]
 use carrick_el1::fault::*;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+extern crate alloc;
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use carrick_el1_abi::CurrentTask;
 use carrick_el1_abi::{Action, Counters, TrapFrame};
 use core::sync::atomic::Ordering;
@@ -162,7 +164,10 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
     }
 }
 
-/// Select the existing supply protocol for the authenticated execution lane.
+/// Born-in-zone threads select from the MM owner instead of the legacy host
+/// grant mailbox; host-born siblings retain the mailbox request path for
+/// uncontended first touch while attaching the admitted MM owner so
+/// reservation/editor/gate contention waits on the owner's publication.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) fn native_fault_supply<'a>(
     native: bool,
@@ -172,7 +177,84 @@ pub(crate) fn native_fault_supply<'a>(
     if native {
         carrick_el1::fault::FaultSupply::Owner(owner)
     } else {
-        carrick_el1::fault::FaultSupply::Mailbox(mailboxes)
+        mailboxes.with_owner(owner)
+    }
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn admitted_fault_mm_handle(
+    zone: &carrick_el1_abi::ZoneTables,
+    roots: &carrick_el1::memory::reservations::SharedReservations,
+    carrier: core::num::NonZeroU64,
+    slot: carrick_sched_core::SlotId,
+    task: &carrick_el1_abi::CurrentTask,
+) -> Option<carrick_el1_abi::El1MmHandle> {
+    if let Some(record) = zone
+        .slot(slot)
+        .current()
+        .filter(|record| zone.record(*record).is_native_owned())
+        && let Some((_, control)) = task.lifecycle_refs()
+        && let Ok(handle) = control.service.bound_mm(
+            zone.record_ref(record),
+            carrick_el1_abi::EntryThreadGeneration::from_raw(zone.record(record).identity().serial),
+        )
+    {
+        return Some(handle);
+    }
+    let mm = carrick_el1_abi::ReservationMm::new(task.mm.key.load(Ordering::Acquire))?;
+    crate::aarch64_process::Portal::for_zone(carrier, roots, zone)
+        .admitted_handle(mm, u32::from(slot.raw()))
+        .ok()
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn park_fault_owner_wait<C: crate::sched::ThreadCpu, U: crate::sched::UserWord>(
+    zone: &carrick_el1_abi::ZoneTables,
+    task: &carrick_el1_abi::CurrentTask,
+    counters: &Counters,
+    slot: carrick_sched_core::SlotId,
+    cpu: &mut C,
+    user: &U,
+    frame: &mut TrapFrame,
+    wait: carrick_el1_abi::PortalOwnerWait,
+) -> Option<Action> {
+    use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
+    let enrollment =
+        carrick_core_abi::wait::PortalWaitEnrollment::for_owner(zone, wait.handle(), wait).ok()?;
+    let resume = carrick_el1::substrate::sched::object_wait::OperationResumePc::new(frame.elr)?;
+    let operation = OperationToken::metadata_request(wait.revision().max(1))?;
+    let mut handoff = None;
+    let mut sched_zone = crate::dispatch::Zone {
+        tables: zone,
+        cpu,
+        user,
+    };
+    let mut sched =
+        crate::dispatch::native_scheduler(&mut sched_zone, task, counters, slot, &mut handoff);
+    match sched.park_object(
+        frame,
+        enrollment.key(),
+        enrollment.observed_snapshot(),
+        resume,
+        operation,
+        None,
+    ) {
+        Ok(parked) => {
+            let served = if sched.task.linux.has_pending_host_work() {
+                sched.leave_after_object_park(parked)
+            } else {
+                sched.resume_after_object_park(frame, parked, 0)
+            };
+            Some(match served {
+                Some(carrick_el1::substrate::sched::Served::Returned { .. }) => Action::Served,
+                Some(carrick_el1::substrate::sched::Served::Idle) | None => Action::Idle,
+            })
+        }
+        Err((ObjectWaitError::Changed, _)) => None,
+        Err(_) => {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        }
     }
 }
 
@@ -203,64 +285,68 @@ pub fn dispatch_fault(
         let portal = unsafe {
             &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
         };
-        let mut supply = OwnerFaultSupply::new(portal);
+        let roots = carrick_el1::memory::reservations::shared_guest();
+        let slot = carrick_sched_core::SlotId::new(frame.slot as u8);
+        let task = &current_tasks[frame.slot as usize];
         let native = zone
-            .slot(carrick_sched_core::SlotId::new(frame.slot as u8))
+            .slot(slot)
             .current()
             .is_some_and(|record| zone.record(record).is_native_owned());
-        if native {
-            let slot = carrick_sched_core::SlotId::new(frame.slot as u8);
-            if let Some(record) = zone.slot(slot).current()
-                && let Some(task) = current_tasks.get(frame.slot as usize)
-                && let Some((_, control)) = task.lifecycle_refs()
-                && let Ok(handle) = control.service.bound_mm(
-                    zone.record_ref(record),
-                    carrick_el1_abi::EntryThreadGeneration::from_raw(
-                        zone.record(record).identity().serial,
-                    ),
-                )
-            {
-                supply = supply.with_handle(handle);
-            }
-        }
-        let action = dispatch_fault_with_descriptor_txns(
-            frame,
-            counters,
-            current_tasks,
-            carrick_el1::substrate::sched::object_wait::space_access(
-                zone,
-                carrick_sched_core::SlotId::new(frame.slot as u8),
-            ),
-            Some(DescriptorTxnPath {
-                slots: carrick_el1_abi::descriptor_txn_slots_guest(),
-                applier: &mut HardwareDescriptorTxnApplier,
-            }),
-            native_fault_supply(
-                native,
-                GrantMailboxes {
-                    own: mailbox,
-                    peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
-                },
-                &supply,
-            ),
-            Some(PreparedFaultPath::<_> {
-                residency: carrick_el1::isa::frame_grant_residency_guest(),
-                resolver: &mut HardwarePreparedResolver,
-                roots: Some(carrick_el1::memory::reservations::shared_guest()),
-                file_slots: Some(unsafe {
-                    &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+        let handle = portal
+            .carrier()
+            .and_then(|carrier| admitted_fault_mm_handle(zone, roots, carrier, slot, task));
+        let mailboxes = carrick_el1::fault::GrantMailboxes {
+            own: mailbox,
+            peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
+        };
+        loop {
+            let supply = match handle {
+                Some(handle) => OwnerFaultSupply::new(portal).with_handle(handle),
+                None => OwnerFaultSupply::new(portal),
+            };
+            let action = dispatch_fault_with_descriptor_txns(
+                frame,
+                counters,
+                current_tasks,
+                carrick_el1::substrate::sched::object_wait::space_access(zone, slot),
+                Some(DescriptorTxnPath {
+                    slots: carrick_el1_abi::descriptor_txn_slots_guest(),
+                    applier: &mut HardwareDescriptorTxnApplier,
                 }),
-            }),
-            &mut HardwareCowResolver {
-                service_slot: None,
-                publication: None,
-                completion: None,
-            },
-        );
-        if let OwnerFaultSupplyOutcome::Wait(wait) = supply.outcome() {
-            *owner_wait = Some(wait);
+                native_fault_supply(native, mailboxes, &supply),
+                Some(PreparedFaultPath::<_> {
+                    residency: carrick_el1::isa::frame_grant_residency_guest(),
+                    resolver: &mut HardwarePreparedResolver,
+                    roots: Some(roots),
+                    file_slots: Some(portal),
+                }),
+                &mut HardwareCowResolver {
+                    service_slot: None,
+                    publication: None,
+                    completion: None,
+                },
+            );
+            if let OwnerFaultSupplyOutcome::Wait(wait) = supply.outcome() {
+                if native {
+                    *owner_wait = Some(wait);
+                    return action;
+                }
+                if let Some(parked) = park_fault_owner_wait(
+                    zone,
+                    task,
+                    counters,
+                    slot,
+                    &mut crate::sched::HardwareCpu,
+                    &crate::sched::HardwareUserWord,
+                    frame,
+                    wait,
+                ) {
+                    return parked;
+                }
+                continue;
+            }
+            return action;
         }
-        action
     }
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     {
