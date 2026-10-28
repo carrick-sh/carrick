@@ -322,7 +322,7 @@ pub(crate) struct WorkerKick {
     pub(crate) binding: Mutex<Option<ExecutorBinding>>,
     pub(crate) hardware: Mutex<Option<ExactHardwareKick>>,
     pub(crate) need_resched: AtomicBool,
-    shutdown_interrupted: AtomicBool,
+    pub(crate) run_state: Arc<carrick_hal::vcpu_run::VcpuRunState>,
     /// The executor waits for work in the guest's scheduler (EL1 plan 1d):
     /// a scheduler wake reaches it by forcing its vCPU out.
     guest_idle: Mutex<Option<GuestIdleTarget>>,
@@ -354,7 +354,7 @@ impl WorkerKick {
             binding: Mutex::new(None),
             hardware: Mutex::new(None),
             need_resched: AtomicBool::new(false),
-            shutdown_interrupted: AtomicBool::new(false),
+            run_state: Arc::new(carrick_hal::vcpu_run::VcpuRunState::default()),
             guest_idle: Mutex::new(None),
             receipts,
             #[cfg(test)]
@@ -402,29 +402,36 @@ impl WorkerKick {
     /// Force the worker out of any guest run it is in when the pool shuts
     /// down. A guest that halts in-zone (a parent in `wait4` whose child the
     /// run already failed) never exits on its own, so the join would wait
-    /// forever; `need_resched` covers a kick that lands before guest entry.
+    /// forever. The executor-wide run state covers pre-entry shutdown; physical
+    /// entry also checks it inside backend re-entry loops. The final entry gap
+    /// still requires a latched backend kick (signed HVF qualification).
     ///
     /// A worker waiting in the guest's scheduler gets durable host work on
     /// its zone slot before the kick, exactly as a scheduler wake does
     /// (`wake_from_guest_idle`): the vCPU may be running a native thread at
     /// EL0 there, and only published host work makes the guest scheduler
-    /// leave for the executor (#900). The hardware kick follows either way.
+    /// leave for the executor (#900). The hardware kick follows only for a published physical entry.
     pub(crate) fn interrupt_for_shutdown(&self) {
-        self.shutdown_interrupted.store(true, Ordering::Release);
+        // Serialize with bind/unbind's reschedule clearing. They may consume
+        // fairness requests, but cannot clear a newly published shutdown kick.
+        let _binding = self.binding.lock();
         self.need_resched.store(true, Ordering::Release);
         let guest_idle = self.guest_idle.lock();
+        // Publish current-mailbox work even if this worker has not entered yet.
+        // The hardware exit is only an accelerator for a published entry.
         if let Some(GuestIdleTarget::Zone(slot)) = *guest_idle {
-            carrick_kernel::el1_zone::kick_slot(slot);
+            carrick_el1_abi::mark_pending_host_work(usize::from(slot.raw()));
         }
-        if let Some(hardware) = self.hardware.lock().as_ref() {
-            hardware.handle.kick();
-        }
+        self.run_state.request_shutdown(|| {
+            if let Some(hardware) = self.hardware.lock().as_ref() {
+                hardware.handle.kick();
+            }
+        });
         drop(guest_idle);
     }
 
     pub(crate) fn is_shutdown_interrupted(&self) -> bool {
-        self.shutdown_interrupted.load(Ordering::Acquire)
-            && self.need_resched.load(Ordering::Acquire)
+        self.run_state.shutdown_requested()
     }
 
     /// Publish the destination before the final host queue scan. A publisher
@@ -452,7 +459,7 @@ impl ExecutorKick for WorkerKick {
         if current.is_some() {
             return false;
         }
-        if !self.shutdown_interrupted.load(Ordering::Acquire) {
+        if !self.run_state.shutdown_requested() {
             self.need_resched.store(false, Ordering::Release);
         }
         *current = Some(binding);
@@ -463,7 +470,7 @@ impl ExecutorKick for WorkerKick {
         let mut current = self.binding.lock();
         if *current == Some(binding) {
             *current = None;
-            if !self.shutdown_interrupted.load(Ordering::Acquire) {
+            if !self.run_state.shutdown_requested() {
                 self.need_resched.store(false, Ordering::Release);
             }
         }

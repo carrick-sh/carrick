@@ -8234,8 +8234,26 @@ impl HvfInner {
             }
             // The engine accounts the guest CPU time via `guest_cpu::timed_run`
             // around its `vcpu.run()` call, so do NOT double-account here.
+            // Publish each physical entry, including internally resumed EL1
+            // exits. Shutdown is executor-wide, independent of task/mailbox.
+            let entry = carrick_hal::vcpu_run::PhysicalRunEntry::current();
+            if entry.shutdown_requested() {
+                // Do not abandon EL1 with a switched record or a lock held.
+                // Drain through its normal host boundary with durable work
+                // and an owner-thread interrupt, even if the exit kick was
+                // issued before this entry was published.
+                if let Some(slot) = mailbox.leased_slot() {
+                    carrick_el1_abi::mark_pending_host_work(usize::from(slot.raw()));
+                }
+                crate::gic::arm_kick(vcpu)?;
+                // A host-resumed native EL0 context can have I masked.
+                // The pending SGI must reach its scheduler IRQ boundary.
+                crate::gic::unmask_el0_irqs(vcpu)?;
+                *kick_armed = true;
+            }
             crate::probes::vcpu_run_enter(vcpu.id());
             vcpu.run().map_err(hvf_error)?;
+            drop(entry);
             VCPU_RUN_EXITS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let exit = vcpu.get_exit_info();
             let class = carrick_el1_abi::HostExitClass::from_hvf(

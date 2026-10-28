@@ -124,6 +124,7 @@ where
             };
         }
     };
+    let _run_scope = carrick_hal::vcpu_run::ExecutorRunScope::install(Arc::clone(&kick.run_state));
     let mut startup_sent = false;
     let lifecycle = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
         receipts.record(executor_id, ExecutorPoolEvent::Created);
@@ -1410,6 +1411,9 @@ where
                 }
                 ExecutorExit::Preempted
                     if kick.is_shutdown_interrupted()
+                        // A consumed fairness preemption still drains normally.
+                        // The sticky entry latch must not depend on this receipt.
+                        && kick.need_resched.load(std::sync::atomic::Ordering::Acquire)
                         && running.thread().affinity().is_allowed(guest_cpu) =>
                 {
                     drop(submission_authority);
@@ -1643,6 +1647,11 @@ fn next_runnable<F: PersistentExecutor>(
                     return Err(error.into());
                 }
             }
+            if kick.is_shutdown_interrupted() {
+                backend.disarm_guest_idle();
+                drop(idle_wait);
+                return Ok(Some(scheduler.take(registration)?));
+            }
             let waited = backend.wait_in_guest();
             backend.disarm_guest_idle();
             drop(idle_wait);
@@ -1754,6 +1763,10 @@ fn next_runnable<F: PersistentExecutor>(
             return Err(error.into());
         }
     }
+    if kick.is_shutdown_interrupted() {
+        drop(idle_wait);
+        return Ok(Some(scheduler.take(registration)?));
+    }
     backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
     let waited = backend.wait_in_guest();
     drop(idle_wait);
@@ -1783,6 +1796,9 @@ const fn process_leader_event_identity(task_pid: i32, tid: i32) -> Option<(i32, 
         None
     }
 }
+
+#[cfg(all(test, feature = "loom"))]
+mod shutdown_loom;
 
 #[cfg(test)]
 pub(crate) mod tests;

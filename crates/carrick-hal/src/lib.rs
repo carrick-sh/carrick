@@ -64,6 +64,7 @@ pub use futex::{
     SHARED_FUTEX_MAX_SLICE_NS, SharedWaitStep, classify_wait_slice, shared_wait_sliced,
 };
 pub mod threaded;
+pub mod vcpu_run;
 pub use threaded::{
     Aarch64CoreRegisters, CowArmGeneration, CowFaultResolution, El1FrameGrantReady,
     El1FrameGrantRequest, ExecPredecessorIdentity, ForkLeafDisposition, ForkProjectionError,

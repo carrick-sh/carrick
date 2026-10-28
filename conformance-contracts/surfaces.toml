@@ -2042,3 +2042,52 @@ contracts = ["kernel.native.host-file-venue"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs"
 contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.runnable-progress", "kernel.scheduler.preemption-lifecycle", "kernel.scheduler.preemption-cost", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
+
+# Executor-wide shutdown observation, including physical backend re-entry.
+[[surfaces]]
+path = "crates/carrick-hal/src/vcpu_run.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/lib.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor/binding.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor/shutdown_loom.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/tests/support/shutdown_kick.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0-host/src/carrier_cpu.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]

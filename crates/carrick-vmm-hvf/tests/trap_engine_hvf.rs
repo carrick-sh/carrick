@@ -326,3 +326,6 @@ fn trap_engine_hvf_unseeded_gettid_traps_to_the_host() {
         );
     });
 }
+
+#[path = "support/shutdown_kick.rs"]
+mod shutdown_kick;
