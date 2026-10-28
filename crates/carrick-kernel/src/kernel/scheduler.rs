@@ -10116,6 +10116,8 @@ mod tests {
             }
         }
 
+        include!("scheduler/exit_drain_tests.rs");
+
         #[test]
         fn failed_zone_load_settlement_retires_only_its_owned_continuation() {
             let _region = ZoneRegion::new();

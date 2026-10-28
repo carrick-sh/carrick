@@ -1494,6 +1494,35 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.object.expired.load(Ordering::Acquire) & OBJECT_HOST_CONTINUATION != 0
     }
 
+    /// Retire a cancelled metadata receipt under the cancellation owner's
+    /// exclusive Host/Transferring custody. Unlike an IPC operation, this
+    /// token has no external pin or adapter cleanup: its only resource is
+    /// this record. Do not manufacture an orphan adapter handback for it.
+    pub(crate) fn retire_cancelled_metadata_operation(&self) {
+        if !self.is_cancelled()
+            || !matches!(
+                self.claim(),
+                Claim::Host { .. }
+                    | Claim::Transferring {
+                        cancelled: true,
+                        ..
+                    }
+            )
+            || self.object.queue.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
+        // The reserved metadata index cannot name an external operation.
+        // The CAS consumes that receipt once; all adapter-owned tokens stay
+        // attached until the adapter releases their endpoint pins.
+        let _ = self.object.operation.compare_exchange(
+            u64::MAX,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     /// Transfer a pending operation to its adapter exactly once.
     ///
     /// # Safety

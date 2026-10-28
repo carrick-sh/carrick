@@ -3418,3 +3418,104 @@ fn switched_affinity_change_prompts_only_the_exact_excluded_owner() {
     zone.affinity_change_effects(reference, &mut effects);
     assert_eq!(effects, WakeEffects::default());
 }
+
+// #978: an exit loser never resumes its object operation. The
+// cancellation owner must retire metadata receipts without an adapter.
+#[test]
+fn cancelled_metadata_wait_releases_record_without_resume() {
+    cancelled_metadata_wait(false);
+}
+
+#[test]
+fn cancelled_deferred_metadata_wait_releases_record_without_resume() {
+    cancelled_metadata_wait(true);
+}
+
+fn cancelled_metadata_wait(deferred: bool) {
+    use crate::object_wait::{ObjectWaitKey, OperationToken, OwnedObjectWakeEffects};
+    let zone = zone();
+    let key = ObjectWaitKey::metadata_request(17).unwrap();
+    let complete = |owned: OwnedObjectWakeEffects<'_>| {
+        let _ = owned.defer_handbacks();
+    };
+    zone.bind_object_wait_with_completion(key, &HostWait, &complete)
+        .unwrap();
+    let source = zone
+        .admit_object_notification(key, &HostWait, &complete)
+        .unwrap();
+    let id = zone.alloc_record(identity(101)).unwrap();
+    let record = zone.record_ref(id);
+    {
+        let guard = zone
+            .object_wait_with_completion(key, &HostWait, &complete)
+            .unwrap();
+        guard
+            .park_host_rechecked(
+                guard.snapshot(),
+                id,
+                OperationToken::metadata_request(17).unwrap(),
+                || true,
+            )
+            .unwrap();
+    }
+    if deferred {
+        source.publish(Waker::El1 { slot: SLOT }, &complete);
+        assert!(matches!(
+            zone.record(id).claim(),
+            Claim::Transferring { .. }
+        ));
+        assert_eq!(
+            zone.claim_for_host(record, None, Handback::Control, &HostWait),
+            HostClaim::Deferred
+        );
+    } else {
+        assert_eq!(
+            zone.claim_for_host(record, None, Handback::Control, &HostWait),
+            HostClaim::Claimed
+        );
+    }
+    match zone.claim_for_host(record, None, Handback::Cancelled, &HostWait) {
+        HostClaim::Claimed | HostClaim::AlreadyHost => zone.free_record(id),
+        HostClaim::Deferred | HostClaim::Stale => {}
+        other => panic!("unexpected cancellation: {other:?}"),
+    }
+    let mut delivered = 0;
+    zone.take_completion_handbacks(&HostWait, &mut |_| delivered += 1);
+    assert_eq!(
+        delivered, 0,
+        "no continuation remains to consume cancellation"
+    );
+    assert!(
+        zone.live(record).is_none(),
+        "cancelled metadata operation leaked {:?}",
+        zone.record(id).object_wait_census()
+    );
+    assert_eq!(zone.record(id).incarnation(), record.incarnation + 1);
+    let replacement = zone.alloc_record(identity(102)).unwrap();
+    assert_eq!(replacement, id);
+    let live = zone.record_ref(replacement);
+    {
+        let guard = zone
+            .object_wait_with_completion(key, &HostWait, &complete)
+            .unwrap();
+        guard
+            .park_host_rechecked(
+                guard.snapshot(),
+                replacement,
+                OperationToken::metadata_request(17).unwrap(),
+                || true,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        zone.claim_for_host(record, None, Handback::Cancelled, &HostWait),
+        HostClaim::Stale
+    );
+    assert!(!zone.record(replacement).is_cancelled());
+    assert!(zone.record(replacement).has_object_operation());
+    match zone.claim_for_host(live, None, Handback::Cancelled, &HostWait) {
+        HostClaim::Claimed | HostClaim::AlreadyHost => zone.free_record(replacement),
+        other => panic!("unexpected replacement cancellation: {other:?}"),
+    }
+    assert!(zone.live(live).is_none());
+}

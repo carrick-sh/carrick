@@ -673,7 +673,7 @@ contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle"
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/tests.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.terminal-child"]
+contracts = ["kernel.el1.thread-lifecycle", "kernel.el1.deferred-handback-identity", "process.native.short-lock", "kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/sched.rs"
@@ -2034,3 +2034,7 @@ contracts = ["kernel.native.host-file-venue"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/native_successor.rs"
 contracts = ["kernel.native.host-file-venue"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs"
+contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.runnable-progress", "kernel.scheduler.preemption-lifecycle", "kernel.scheduler.preemption-cost", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
