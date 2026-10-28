@@ -6194,3 +6194,89 @@ fn libpython_old_deferred_recipe_and_owner_copy_refusals() {
     }
     assert_eq!(recipes.snapshot().private_file.len(), 1);
 }
+
+#[test]
+fn remap_file_pages_on_shared_mapping_wait_for_owner_refused_copyout_leaving_private_file_mappings_intact()
+ {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use carrick_abi::syscall::nr;
+
+    const BASE: u64 = 0x4000_0000;
+    const FILL: u8 = 0xa5;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x42; 2 * PAGE as usize]);
+    let mut arena = arena_memory();
+    let private_file = returned(host_mmap(
+        &mut dispatcher,
+        &mut arena,
+        0,
+        2 * PAGE,
+        LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let fixed_rw = returned(host_mmap(
+        &mut dispatcher,
+        &mut arena,
+        private_file + PAGE,
+        PAGE,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+        FILE_FD,
+    )) as u64;
+    assert_eq!(fixed_rw, private_file + PAGE);
+    let private_before = dispatcher.mem().lock().private_file_maps.len();
+    assert!(private_before >= 1);
+
+    dispatcher.record_dynamic_mapping(
+        BASE,
+        2 * PAGE,
+        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+        carrick_vfs::ProcMapSharing::Shared,
+        "/shared-window".to_owned(),
+    );
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let reporter = CompatReporter::default();
+    let mut memory = OwnerRefusingMemory::new(BASE, (2 * PAGE) as usize, FILL);
+    memory.seed(BASE, b"slot-0");
+    memory.seed(BASE + PAGE, b"slot-1");
+
+    let wait = memory.refuse_next();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::REMAP_FILE_PAGES.raw(),
+                    SyscallArgs([BASE, PAGE, 0, 1, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert!(dispatcher.mem().lock().remap_snapshots.is_empty());
+    assert_eq!(
+        dispatcher.mem().lock().private_file_maps.len(),
+        private_before
+    );
+    assert_eq!(memory.read_bytes(BASE, 6).unwrap(), b"slot-0");
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::REMAP_FILE_PAGES.raw(),
+                    SyscallArgs([BASE, PAGE, 0, 1, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(memory.read_bytes(BASE, 6).unwrap(), b"slot-1");
+}

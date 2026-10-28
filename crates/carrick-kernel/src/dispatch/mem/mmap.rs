@@ -4266,21 +4266,8 @@ impl<'a> MemView<'a> {
             };
             if let Some(map) = shared_map {
                 let map_len = map.end.saturating_sub(map.start);
-                let snapshot = {
-                    let mem_authority_28 = this.mem();
-                    let mut mem = mem_authority_28.lock();
-                    if let Some(snapshot) = mem.remap_snapshots.get(&map.start) {
-                        snapshot.clone()
-                    } else {
-                        let Ok(map_len_usize) = usize::try_from(map_len) else {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                        };
-                        let Ok(bytes) = cx.memory.read_bytes(map.start, map_len_usize) else {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        };
-                        mem.remap_snapshots.insert(map.start, bytes.clone());
-                        bytes
-                    }
+                let Ok(map_len_usize) = usize::try_from(map_len) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
                 let source_offset = match pgoff
                     .checked_mul(this.linux_page_size())
@@ -4296,16 +4283,40 @@ impl<'a> MemView<'a> {
                 let Some(source_end) = source_offset.checked_add(size_usize) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
+                if source_end > map_len_usize {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                let cached_snapshot = {
+                    let mem_authority_28 = this.mem();
+                    let mem = mem_authority_28.lock();
+                    mem.remap_snapshots.get(&map.start).cloned()
+                };
+                let (snapshot, was_cached) = if let Some(snapshot) = cached_snapshot {
+                    (snapshot, true)
+                } else {
+                    let Ok(bytes) = cx.memory.read_bytes(map.start, map_len_usize) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    };
+                    (bytes, false)
+                };
                 let Some(bytes) = snapshot.get(source_offset..source_end) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
-                return Ok(crate::dispatch::FsView::copyout_bytes(
+                let outcome = crate::dispatch::FsView::copyout_bytes(
                     cx.kernel,
                     &mut *cx.memory,
                     addr,
                     bytes,
                     DispatchOutcome::Returned { value: 0 },
-                ));
+                );
+                if !was_cached && matches!(outcome, DispatchOutcome::Returned { value: 0 }) {
+                    let mem_authority_28 = this.mem();
+                    let mut mem = mem_authority_28.lock();
+                    mem.remap_snapshots
+                        .entry(map.start)
+                        .or_insert_with(|| snapshot.clone());
+                }
+                return Ok(outcome);
             }
             // Linux rejects remap_file_pages for addresses that are not in a
             // MAP_SHARED mapping; carrick does not emulate nonlinear remapping, so
