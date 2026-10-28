@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use carrick_abi::{SigBlockMask, SigSet, WaitSigMask};
 use carrick_fatal::carrick_fatal;
-use carrick_guest_mem::{CurrentMmMemory, GuestVa, MemoryError, SharedFutexLocation};
+use carrick_guest_mem::{CurrentMmMemory, GuestVa, SharedFutexLocation};
 use parking_lot::Mutex;
 
 use crate::dispatch::fd_wait::BlockingFdWait;
@@ -2872,6 +2872,7 @@ struct CompletionCopyout {
     writes: std::collections::VecDeque<GuestOutputRange>,
     offset: usize,
     thread: ThreadKey,
+    mm: (MmId, u64),
 }
 
 /// Suspended output from a completed wait, with exact progress and dependency.
@@ -2881,41 +2882,77 @@ pub struct OwnedCompletionCopyout {
     wait: carrick_guest_mem::MemoryReadWait,
 }
 
+/// Broken execution ownership, never a guest pointer fault or an owner wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CompletionFoldError {
+    #[error("terminal action cannot be folded into a guest syscall result")]
+    TerminalAction,
+    #[error("completed output reached a different thread")]
+    Thread,
+    #[error("completed output MM/ASID identity changed")]
+    AddressSpace,
+    #[error("completed output lost its exact execution authority")]
+    ExecutionAuthority,
+}
+
 impl CompletionCopyout {
+    fn authenticate_identity(
+        &self,
+        context: &KernelContext,
+        current_mm: (MmId, u64),
+    ) -> Result<(), CompletionFoldError> {
+        if self.thread != context.thread().key() {
+            return Err(CompletionFoldError::Thread);
+        }
+        if current_mm.0 != context.shared().mm().id() || self.mm != current_mm {
+            return Err(CompletionFoldError::AddressSpace);
+        }
+        Ok(())
+    }
     fn new(
         result: Result<i64, LinuxErrno>,
         writes: Vec<GuestOutputRange>,
         context: &KernelContext,
-    ) -> Self {
-        Self {
+        current_mm: (MmId, u64),
+    ) -> Result<Self, CompletionFoldError> {
+        if writes
+            .iter()
+            .any(|range| (range.mm, range.asid_generation) != current_mm)
+        {
+            return Err(CompletionFoldError::AddressSpace);
+        }
+        Ok(Self {
             result,
             writes: writes.into(),
             offset: 0,
             thread: context.thread().key(),
-        }
+            mm: current_mm,
+        })
     }
 
     pub fn resume(
+        self,
+        context: &KernelContext,
+        memory: &mut impl CurrentMmMemory,
+        current_mm: (MmId, u64),
+    ) -> Result<DispatchOutcome, CompletionFoldError> {
+        self.authenticate_identity(context, current_mm)?;
+        Ok(self.copyout(context, memory))
+    }
+
+    fn copyout(
         mut self,
         context: &KernelContext,
         memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
-        use crate::dispatch::copyout::{UserSlot, prepare};
+        use crate::dispatch::copyout::{COPYOUT_MAX_BYTES, UserSlot, prepare};
         use carrick_guest_mem::MemoryReadWait;
-        const ZEROES: &[u8; 4096] = &[0; 4096];
-        if let Some(cancelled) = owner_wait_cancellation(context) {
-            return DispatchOutcome::OwnerCancelled(cancelled);
-        }
-        if self.thread != context.thread().key() {
-            return DispatchOutcome::errno(crate::linux_abi::LINUX_EFAULT);
-        }
+        const ZEROES: &[u8; COPYOUT_MAX_BYTES] = &[0; COPYOUT_MAX_BYTES];
         while let Some(range) = self.writes.front().copied() {
-            if range.mm != context.shared().mm().id() {
-                return DispatchOutcome::errno(crate::linux_abi::LINUX_EFAULT);
-            }
             let address = range.start().raw() + self.offset as u64;
-            // One guest page and one portal permit per bounded effect.
-            let len = (range.len() - self.offset).min(4096 - (address as usize & 4095));
+            // One portal-sized interval and one permit per bounded effect.
+            let len = (range.len() - self.offset)
+                .min(COPYOUT_MAX_BYTES - (address as usize % COPYOUT_MAX_BYTES));
             let output = match prepare(context, memory, [Some(UserSlot::new(address, len))]) {
                 Ok(output) => output,
                 Err(refusal) => {
@@ -2965,13 +3002,18 @@ impl OwnedCompletionCopyout {
         self,
         context: &KernelContext,
         memory: &mut impl CurrentMmMemory,
-    ) -> DispatchOutcome {
+        current_mm: (MmId, u64),
+    ) -> Result<DispatchOutcome, CompletionFoldError> {
         let Self { operation, wait } = self;
         // The retained physical receipt can itself own writer exclusion.
         // Release it before acquiring the next output permit, then let the
         // operation resample terminal cancellation after that release.
         drop(wait);
-        operation.resume(context, memory)
+        operation.authenticate_identity(context, current_mm)?;
+        if let Some(cancelled) = owner_wait_cancellation(context) {
+            return Ok(DispatchOutcome::OwnerCancelled(cancelled));
+        }
+        operation.resume(context, memory, current_mm)
     }
 }
 
@@ -2981,27 +3023,33 @@ impl OwnedCompletionCopyout {
 /// interrupted sleep remaining durations) mutate `memory`. Returns `Some(outcome)` if the continuation
 /// completed with a concrete return value, errno, or intermediate wait step, or `None` if the original
 /// syscall request must be re-dispatched.
+/// `current_mm` is the MM/ASID identity authenticated by the running execution lease.
 pub fn fold_continuation_completion<M: CurrentMmMemory>(
     completion: ContinuationCompletion,
     dispatcher: &SyscallDispatcher,
     context: &KernelContext,
     memory: &mut M,
-) -> Result<Option<DispatchOutcome>, MemoryError> {
+    current_mm: (MmId, u64),
+) -> Result<Option<DispatchOutcome>, CompletionFoldError> {
     Ok(match completion {
         ContinuationCompletion::ResumeRetainedMemory
-        | ContinuationCompletion::OwnerCancelled(_) => return Err(MemoryError::Unsupported),
+        | ContinuationCompletion::OwnerCancelled(_) => {
+            return Err(CompletionFoldError::TerminalAction);
+        }
         ContinuationCompletion::Return(value) => Some(DispatchOutcome::Returned { value }),
         ContinuationCompletion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
         ContinuationCompletion::Redispatch => None,
         ContinuationCompletion::RedispatchWithPartial(value) => {
             Some(DispatchOutcome::Returned { value })
         }
-        ContinuationCompletion::ReturnWithGuestWrites(value, writes) => {
-            Some(CompletionCopyout::new(Ok(value), writes, context).resume(context, memory))
-        }
-        ContinuationCompletion::ErrnoWithGuestWrites(errno, writes) => {
-            Some(CompletionCopyout::new(Err(errno), writes, context).resume(context, memory))
-        }
+        ContinuationCompletion::ReturnWithGuestWrites(value, writes) => Some(
+            CompletionCopyout::new(Ok(value), writes, context, current_mm)?
+                .resume(context, memory, current_mm)?,
+        ),
+        ContinuationCompletion::ErrnoWithGuestWrites(errno, writes) => Some(
+            CompletionCopyout::new(Err(errno), writes, context, current_mm)?
+                .resume(context, memory, current_mm)?,
+        ),
         ContinuationCompletion::BlockingWrite { mut write, outcome } => {
             let outcome = match outcome {
                 BlockingWriteOutcome::Resume => match crate::dispatch::drive_blocking_write(

@@ -319,6 +319,10 @@ fn ptrace_attach_and_wait_on_ancestor_root_continuation_wait4() {
         &tracer.dispatcher,
         &tracer.context,
         &mut tracer.memory.linear,
+        (
+            tracer.context.shared().mm().id(),
+            tracer.context.shared().mm().id().raw(),
+        ),
     )
     .expect("fold continuation completion");
     assert_eq!(
@@ -429,6 +433,10 @@ fn ptrace_attach_and_wait_on_ancestor_root_continuation_waitid() {
         &tracer.dispatcher,
         &tracer.context,
         &mut tracer.memory.linear,
+        (
+            tracer.context.shared().mm().id(),
+            tracer.context.shared().mm().id().raw(),
+        ),
     )
     .expect("fold continuation completion");
     assert_eq!(
@@ -544,6 +552,10 @@ fn ptrace_attach_and_wait_on_non_child_sibling_continuation_wait4() {
         &tracer.dispatcher,
         &tracer.context,
         &mut tracer.memory.linear,
+        (
+            tracer.context.shared().mm().id(),
+            tracer.context.shared().mm().id().raw(),
+        ),
     )
     .expect("fold continuation completion");
     assert_eq!(
@@ -659,6 +671,10 @@ fn ptrace_attach_and_wait_on_non_child_sibling_continuation_waitid() {
         &tracer.dispatcher,
         &tracer.context,
         &mut tracer.memory.linear,
+        (
+            tracer.context.shared().mm().id(),
+            tracer.context.shared().mm().id().raw(),
+        ),
     )
     .expect("fold continuation completion");
     assert_eq!(
@@ -1109,6 +1125,10 @@ fn control_normal_child_wait_continuation_succeeds() {
         &root.dispatcher,
         &root.context,
         &mut root.memory.linear,
+        (
+            root.context.shared().mm().id(),
+            root.context.shared().mm().id().raw(),
+        ),
     )
     .expect("fold continuation completion");
     assert_eq!(
@@ -1214,6 +1234,10 @@ fn ptrace_lost_wake_window_ancestor_root_wait4() {
         &tracer.dispatcher,
         &tracer.context,
         &mut tracer.memory.linear,
+        (
+            tracer.context.shared().mm().id(),
+            tracer.context.shared().mm().id().raw(),
+        ),
     )
     .expect("fold continuation completion");
     assert_eq!(
@@ -1330,6 +1354,10 @@ fn ptrace_lost_wake_window_ancestor_root_waitid() {
         &tracer.dispatcher,
         &tracer.context,
         &mut tracer.memory.linear,
+        (
+            tracer.context.shared().mm().id(),
+            tracer.context.shared().mm().id().raw(),
+        ),
     )
     .expect("fold continuation completion");
     assert_eq!(
@@ -1454,6 +1482,10 @@ fn ptrace_lost_wake_window_non_child_sibling_wait4() {
         &tracer.dispatcher,
         &tracer.context,
         &mut tracer.memory.linear,
+        (
+            tracer.context.shared().mm().id(),
+            tracer.context.shared().mm().id().raw(),
+        ),
     )
     .expect("fold continuation completion");
     assert_eq!(
@@ -1575,6 +1607,10 @@ fn ptrace_lost_wake_window_non_child_sibling_waitid() {
         &tracer.dispatcher,
         &tracer.context,
         &mut tracer.memory.linear,
+        (
+            tracer.context.shared().mm().id(),
+            tracer.context.shared().mm().id().raw(),
+        ),
     )
     .expect("fold continuation completion");
     assert_eq!(
@@ -1688,6 +1724,10 @@ impl TestProcess {
                 &self.dispatcher,
                 &self.context,
                 &mut self.memory.linear,
+                (
+                    self.context.shared().mm().id(),
+                    self.context.shared().mm().id().raw()
+                ),
             )
             .expect("fold continuation completion"),
             None,

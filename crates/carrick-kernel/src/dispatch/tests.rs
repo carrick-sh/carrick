@@ -333,7 +333,11 @@ mod overlay_dispatch_tests {
         };
         let completion = continuation.resume(event, &context).unwrap().completion;
         assert_eq!(
-            fold_continuation_completion(completion, &dispatcher, &context, &mut memory).unwrap(),
+            fold_continuation_completion(completion,
+&dispatcher,
+&context,
+&mut memory,
+(context.shared().mm().id(), context.shared().mm().id().raw()),).unwrap(),
             Some(DispatchOutcome::Returned { value: if vector { 24 } else { 8 } })
         );
         assert_eq!(

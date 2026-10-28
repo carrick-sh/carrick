@@ -1146,6 +1146,8 @@ impl CurrentMmMemory for LinearMemory {}
 #[derive(Debug, ::thiserror::Error)]
 #[allow(private_interfaces)]
 pub enum DispatchError {
+    #[error("continuation execution invariant failed: {0}")]
+    CompletionInvariant(crate::kernel::continuation::CompletionFoldError),
     #[error("the launch kernel exported its Linux process authority")]
     SourceKernelAuthorityTransferred,
     #[error("owner memory preparation failed: {0}")]
