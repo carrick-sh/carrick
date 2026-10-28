@@ -1170,35 +1170,62 @@ impl<'a> SignalView<'a> {
         if length < SIGINFO_LEN {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
-        let destination = match crate::dispatch::copyout::prepare_array(
-            context,
-            memory,
-            carrick_guest_mem::GuestVa::new(address),
-            length / SIGINFO_LEN,
-            SIGINFO_LEN,
-        ) {
-            Ok(out) => out,
-            Err(refusal) => return refusal.into_outcome(),
-        };
-        if destination.records() == 0 {
-            let pending = Self::required_signal_thread(context, tid)
-                .signal_state()
-                .pending()
-                .union(context.shared().pending_signals().present());
-            return DispatchOutcome::errno(if pending.intersect(mask).is_empty() {
-                LINUX_EAGAIN
-            } else {
-                LINUX_EFAULT
-            });
+        let mut written = 0;
+        let capacity = length.min(crate::dispatch::copyout::COPYOUT_MAX_BYTES) / SIGINFO_LEN;
+        for _ in 0..capacity {
+            // Peek before securing exactly one record. In particular, an empty
+            // nonblocking read must not fault or wait on an unused destination.
+            if !Self::signal_authority_for(context, tid).has_pending_in(mask) {
+                break;
+            }
+            let Some(record_address) = address.checked_add(written as u64) else {
+                return if written == 0 {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                } else {
+                    DispatchOutcome::returned_len_or_errno(written)
+                };
+            };
+            let destination = match crate::dispatch::copyout::prepare_array(
+                context,
+                memory,
+                carrick_guest_mem::GuestVa::new(record_address),
+                1,
+                SIGINFO_LEN,
+            ) {
+                Ok(out) => out,
+                Err(refusal) => {
+                    return if written == 0 {
+                        refusal.into_outcome()
+                    } else {
+                        DispatchOutcome::returned_len_or_errno(written)
+                    };
+                }
+            };
+            if destination.records() == 0 {
+                return if written == 0 {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                } else {
+                    DispatchOutcome::returned_len_or_errno(written)
+                };
+            }
+            let out = self.take_signalfd_bytes(context, tid, mask, 1);
+            if out.is_empty() {
+                break;
+            }
+            if let Err(fault) = destination.commit(&out) {
+                return if written == 0 {
+                    fault.outcome()
+                } else {
+                    DispatchOutcome::returned_len_or_errno(written)
+                };
+            }
+            written += out.len();
         }
-        let out = self.take_signalfd_bytes(context, tid, mask, destination.records());
-        if out.is_empty() {
-            return DispatchOutcome::errno(LINUX_EAGAIN);
+        if written == 0 {
+            DispatchOutcome::errno(LINUX_EAGAIN)
+        } else {
+            DispatchOutcome::returned_len_or_errno(written)
         }
-        if let Err(fault) = destination.commit(&out) {
-            return fault.outcome();
-        }
-        DispatchOutcome::returned_len_or_errno(out.len())
     }
 
     pub(crate) fn take_signalfd_bytes(
@@ -3643,6 +3670,28 @@ pub(crate) fn bootstrap_signal_send_as(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn s1_empty_signalfd_skips_owner_preparation() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let tid = context.thread().registry_id();
+        let mut memory = OwnerRefusingMemory::new(0x1000, 128, 0xa5);
+        memory.refuse_next();
+        assert_eq!(
+            dispatcher.read_signalfd(
+                &context,
+                &mut memory,
+                0x1000,
+                128,
+                SigSet::from_raw(1 << 33),
+                tid
+            ),
+            DispatchOutcome::errno(LINUX_EAGAIN)
+        );
+        assert_eq!(memory.prepares, 0);
+    }
+
     #[test]
     fn s1_signal_copyout_refusal_preserves_pending_signal() {
         use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
