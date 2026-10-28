@@ -43,6 +43,33 @@ syscall_table! {
     nr::SYSLOG => syslog,
 }
 
+// A permit bounds one transfer; it must not change which records are selected.
+fn copy_syslog_snapshot(
+    context: &crate::kernel::KernelContext,
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    data: &[u8],
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let count = (data.len() - offset).min(super::copyout::COPYOUT_MAX_BYTES);
+        let Some(destination) = address.checked_add(offset as u64) else {
+            return Ok(Some(DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)));
+        };
+        let output = match super::copyout::prepare(
+            context,
+            memory,
+            [Some(super::copyout::UserSlot::new(destination, count))],
+        ) {
+            Ok(output) => output,
+            Err(refusal) => return Ok(Some(refusal.into_outcome())),
+        };
+        output.commit([&data[offset..offset + count]])?;
+        offset += count;
+    }
+    Ok(None)
+}
+
 impl SyscallDispatcher {
     define_syscall! {
         /// `syslog(2)` / `klogctl(3)`.
@@ -142,21 +169,13 @@ impl SyscallDispatcher {
                         crate::event_ring::rec_syslog(owner_id, action, len, 0);
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    let data =
-                        syslog.read_all((len as usize).min(super::copyout::COPYOUT_MAX_BYTES));
-                    if !data.is_empty() {
-                        let out = match super::copyout::prepare(
-                            cx.kernel,
-                            cx.memory,
-                            [Some(super::copyout::UserSlot::new(buf.0, data.len()))],
-                        ) {
-                            Ok(out) => out,
-                            Err(refusal) => return Ok(refusal.into_outcome()),
-                        };
-                        out.commit([&data])?;
+                    let snapshot = syslog.read_snapshot(len as usize);
+                    if let Some(outcome) = copy_syslog_snapshot(cx.kernel, cx.memory, buf.0, snapshot.bytes())? {
+                        return Ok(outcome);
                     }
-                    crate::event_ring::rec_syslog(owner_id, action, len, data.len() as i32);
-                    Ok(DispatchOutcome::returned_len(data.len())?)
+                    let count = snapshot.bytes().len();
+                    crate::event_ring::rec_syslog(owner_id, action, len, count as i32);
+                    Ok(DispatchOutcome::returned_len(count)?)
                 }
                 SYSLOG_ACTION_READ_CLEAR => {
                     if buf.0 == 0 || len < 0 {
@@ -167,22 +186,14 @@ impl SyscallDispatcher {
                         crate::event_ring::rec_syslog(owner_id, action, len, 0);
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    let data =
-                        syslog.read_all((len as usize).min(super::copyout::COPYOUT_MAX_BYTES));
-                    if !data.is_empty() {
-                        let out = match super::copyout::prepare(
-                            cx.kernel,
-                            cx.memory,
-                            [Some(super::copyout::UserSlot::new(buf.0, data.len()))],
-                        ) {
-                            Ok(out) => out,
-                            Err(refusal) => return Ok(refusal.into_outcome()),
-                        };
-                        out.commit([&data])?;
+                    let snapshot = syslog.read_snapshot(len as usize);
+                    if let Some(outcome) = copy_syslog_snapshot(cx.kernel, cx.memory, buf.0, snapshot.bytes())? {
+                        return Ok(outcome);
                     }
-                    syslog.clear();
-                    crate::event_ring::rec_syslog(owner_id, action, len, data.len() as i32);
-                    Ok(DispatchOutcome::returned_len(data.len())?)
+                    let count = snapshot.bytes().len();
+                    snapshot.clear();
+                    crate::event_ring::rec_syslog(owner_id, action, len, count as i32);
+                    Ok(DispatchOutcome::returned_len(count)?)
                 }
                 SYSLOG_ACTION_CLEAR => {
                     syslog.clear();
@@ -627,5 +638,143 @@ mod tests {
             0,
             "readiness pipe must be drained after all unread data is consumed"
         );
+    }
+}
+
+#[cfg(test)]
+mod s3_review_tests {
+    use super::*;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use carrick_guest_mem::{
+        GuestMemory, GuestWriteRange, MemoryError, MemoryPrepareError, PreparedGuestWrite,
+        UserMemoryVenue,
+    };
+
+    const BASE: u64 = 0x4000;
+    const OUT: u64 = BASE + 0x800;
+
+    fn guest() -> SyscallDispatcher {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        context.task().with_caps(|caps| {
+            caps.effective |= 1u64 << crate::namespace::process::CAP_SYSLOG;
+            caps.permitted |= 1u64 << crate::namespace::process::CAP_SYSLOG;
+        });
+        context.syslog().clear();
+        dispatcher
+    }
+
+    fn call(
+        dispatcher: &mut SyscallDispatcher,
+        memory: &mut impl CurrentMmMemory,
+        action: u64,
+        len: u64,
+    ) -> DispatchOutcome {
+        let context = dispatcher.capture_one_task_context().unwrap();
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    nr::SYSLOG.raw(),
+                    SyscallArgs::from([action, OUT, len, 0, 0, 0]),
+                ),
+                memory,
+                &crate::compat::CompatReporter::default(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn syslog_selects_large_records_by_caller_length() {
+        let mut dispatcher = guest();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut payload = vec![b'x'; 5000];
+        payload.push(b'\n');
+        context.syslog().append(6, 0, 100, payload);
+        let expected = context.syslog().read_all(8192);
+        assert_eq!(expected.len(), 5004);
+        let mut memory = OwnerRefusingMemory::new(BASE, 0x8000, 0xa5);
+        assert_eq!(
+            call(&mut dispatcher, &mut memory, 3, 8192),
+            DispatchOutcome::Returned { value: 5004 }
+        );
+        assert_eq!(memory.read_bytes(OUT, expected.len()).unwrap(), expected);
+        let wait = memory.refuse_next();
+        assert_eq!(
+            call(&mut dispatcher, &mut memory, 4, 8192),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(context.syslog().read_all(8192), expected);
+        assert_eq!(
+            call(&mut dispatcher, &mut memory, 4, 8192),
+            DispatchOutcome::Returned { value: 5004 }
+        );
+        assert_eq!(memory.read_bytes(OUT, expected.len()).unwrap(), expected);
+        assert!(context.syslog().read_all(8192).is_empty());
+    }
+
+    #[test]
+    fn syslog_clear_keeps_undelivered_records_on_fault_or_empty_selection() {
+        let mut dispatcher = guest();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        context.syslog().append(6, 0, 100, vec![b'x'; 5001]);
+        let expected = context.syslog().read_all(8192);
+        let mut memory = OwnerRefusingMemory::new(BASE, 0x8000, 0xa5);
+        assert_eq!(
+            call(&mut dispatcher, &mut memory, 4, 4096),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(context.syslog().read_all(8192), expected);
+        memory.protect_readonly(OUT + 4096, 4096);
+        assert_eq!(
+            call(&mut dispatcher, &mut memory, 4, 8192),
+            DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+        );
+        assert_eq!(context.syslog().read_all(8192), expected);
+    }
+
+    struct AppendDuringPrepare<'a> {
+        memory: OwnerRefusingMemory,
+        service: &'a crate::syslog::SyslogService,
+        appended: bool,
+    }
+    impl GuestMemory for AppendDuringPrepare<'_> {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            if !self.appended {
+                self.service.append(6, 0, 101, b"after\n".to_vec());
+                self.appended = true;
+            }
+            self.memory.prepare_write(ranges)
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.memory.read_bytes_raw(address, length)
+        }
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            self.memory.write_bytes_raw(address, bytes)
+        }
+    }
+    impl CurrentMmMemory for AppendDuringPrepare<'_> {}
+
+    #[test]
+    fn syslog_clear_does_not_clear_a_record_appended_during_copyout() {
+        let mut dispatcher = guest();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        context.syslog().append(6, 0, 100, b"before\n".to_vec());
+        let mut memory = AppendDuringPrepare {
+            memory: OwnerRefusingMemory::new(BASE, 0x8000, 0xa5),
+            service: context.syslog(),
+            appended: false,
+        };
+        assert_eq!(
+            call(&mut dispatcher, &mut memory, 4, 8192),
+            DispatchOutcome::Returned { value: 10 }
+        );
+        assert_eq!(context.syslog().read_all(8192), b"<6>after\n");
     }
 }
