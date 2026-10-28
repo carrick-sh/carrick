@@ -507,19 +507,29 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         match self.perf_event_read_bytes(state, length) {
             Ok(bytes) => {
-                let out = match super::copyout::prepare(
-                    context,
-                    memory,
-                    [Some(super::copyout::UserSlot::new(address, bytes.len()))],
-                ) {
-                    Ok(out) => out,
-                    Err(refusal) => return refusal.into_outcome(),
-                };
-                if out.commit([&bytes]).is_err() {
-                    DispatchOutcome::errno(LINUX_EFAULT)
-                } else {
-                    DispatchOutcome::returned_len_or_errno(bytes.len())
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let chunk_len = (bytes.len() - offset).min(super::copyout::COPYOUT_MAX_BYTES);
+                    let Some(chunk_address) = address.checked_add(offset as u64) else {
+                        return DispatchOutcome::errno(LINUX_EFAULT);
+                    };
+                    let out = match super::copyout::prepare(
+                        context,
+                        memory,
+                        [Some(super::copyout::UserSlot::new(
+                            chunk_address,
+                            chunk_len,
+                        ))],
+                    ) {
+                        Ok(out) => out,
+                        Err(refusal) => return refusal.into_outcome(),
+                    };
+                    if out.commit([&bytes[offset..offset + chunk_len]]).is_err() {
+                        return DispatchOutcome::errno(LINUX_EFAULT);
+                    }
+                    offset += chunk_len;
                 }
+                DispatchOutcome::returned_len_or_errno(bytes.len())
             }
             Err(errno) => DispatchOutcome::errno(errno),
         }
@@ -1349,6 +1359,75 @@ mod tests {
         assert_eq!(
             open_event(&mut dispatcher, &mut memory, &attr, 0, -1, -1, 0),
             DispatchOutcome::Errno { errno: LINUX_EPERM }
+        );
+    }
+}
+
+#[cfg(test)]
+mod copyout_refusal_s3_tests {
+    use super::*;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use carrick_guest_mem::GuestMemory;
+
+    #[test]
+    fn perf_group_copyout_larger_than_one_permit() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let state = Arc::new(PerfEventState::new(
+            PerfSwEvent::Dummy,
+            PerfEventReadFormat::GROUP,
+            PerfOwner {
+                thread: Arc::downgrade(context.thread()),
+            },
+        ));
+        for _ in 0..512 {
+            state.members.lock().push(Arc::new(PerfEventState::new(
+                PerfSwEvent::Dummy,
+                PerfEventReadFormat::empty(),
+                state.owner.clone(),
+            )));
+        }
+        let expected = dispatcher.perf_event_read_bytes(&state, 8192).unwrap();
+        assert!(expected.len() > super::super::copyout::COPYOUT_MAX_BYTES);
+        let mut memory = OwnerRefusingMemory::new(0x10000, 8192, 0xa5);
+        assert_eq!(
+            dispatcher.read_perf_event(&context, &mut memory, 0x10000, 8192, &state),
+            DispatchOutcome::Returned {
+                value: expected.len() as i64
+            }
+        );
+        assert_eq!(
+            memory.read_bytes(0x10000, expected.len()).unwrap(),
+            expected
+        );
+        assert_eq!(memory.prepares, 2);
+    }
+    #[test]
+    fn perf_short_read_and_copyout_refusal_ordering() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let state = Arc::new(PerfEventState::new(
+            PerfSwEvent::Dummy,
+            PerfEventReadFormat::empty(),
+            PerfOwner {
+                thread: Arc::downgrade(context.thread()),
+            },
+        ));
+        let mut memory = OwnerRefusingMemory::new(0x10000, 16, 0xa5);
+        let wait = memory.refuse_next();
+        assert_eq!(
+            dispatcher.read_perf_event(&context, &mut memory, 0x10000, 0, &state),
+            DispatchOutcome::errno(LINUX_ENOSPC)
+        );
+        assert_eq!(memory.prepares, 0);
+        assert_eq!(
+            dispatcher.read_perf_event(&context, &mut memory, 0x10000, 8, &state),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        assert_eq!(memory.read_bytes(0x10000, 8).unwrap(), [0xa5; 8]);
+        assert_eq!(
+            dispatcher.read_perf_event(&context, &mut memory, 0xffff, 8, &state),
+            DispatchOutcome::errno(LINUX_EFAULT)
         );
     }
 }
