@@ -888,3 +888,140 @@ fn times_bootstrap_writes_tms_and_returns_monotonic_clock() {
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
+
+// Integration tests link the production library without cfg(test), so a
+// test-only dispatch-context fallback cannot make these witnesses pass.
+#[test]
+fn s3_production_threaded_pi_futex_copyout() {
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let tid =
+        carrick_kernel::thread::ThreadId::from_guest_supplied_tid(context.thread().key().tid.raw());
+    let registry = carrick_kernel::thread::ThreadRegistry::new(tid);
+    let futex = carrick_kernel::thread::FutexTable::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 64]);
+    assert_eq!(
+        dispatcher
+            .dispatch_threaded(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::FUTEX.raw(),
+                    SyscallArgs::from([0x4000, carrick_abi::LINUX_FUTEX_LOCK_PI, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+                ThreadCtx::new(tid, &registry, &futex),
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_ne!(memory.read_bytes(0x4000, 4).unwrap(), [0; 4]);
+}
+
+#[test]
+fn s3_production_interrupted_sleep_copyout() {
+    use carrick_kernel::kernel::continuation::{
+        ContinuationCompletion, GuestOutputRange, fold_continuation_completion,
+    };
+    let dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0xa5; 64]);
+    let output = GuestOutputRange::new(
+        carrick_guest_mem::GuestVa::new(0x4000),
+        16,
+        context.shared().mm_id(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        fold_continuation_completion(
+            ContinuationCompletion::InterruptedSleep {
+                remaining: Some((output, std::time::Duration::from_millis(750)))
+            },
+            &dispatcher,
+            &context,
+            &mut memory,
+        )
+        .unwrap(),
+        Some(DispatchOutcome::errno(carrick_abi::LINUX_EINTR))
+    );
+    let bytes = memory.read_bytes(0x4000, 16).unwrap();
+    assert_eq!(
+        i64::from_ne_bytes(bytes[8..].try_into().unwrap()),
+        750_000_000
+    );
+}
+
+#[test]
+fn s3_production_ready_retained_timerfd_copyout() {
+    use carrick_kernel::kernel::continuation::{
+        ContinuationCompletion, fold_continuation_completion,
+    };
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 256]);
+    let reporter = CompatReporter::default();
+    let fd = match dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::TIMERFD_CREATE.raw(),
+                SyscallArgs::from([carrick_abi::LINUX_CLOCK_REALTIME as u64, 0, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("timerfd create: {other:?}"),
+    };
+    let mut spec = [0; 32];
+    spec[16..24].copy_from_slice(&3600i64.to_ne_bytes());
+    memory.write_bytes(0x4080, &spec).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::TIMERFD_SETTIME.raw(),
+                    SyscallArgs::from([fd, 0, 0x4080, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let read = match dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::READ.raw(),
+                SyscallArgs::from([fd, 0x4000, 8, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::BlockingTimerFdRead(read) => read,
+        other => panic!("retained timerfd read: {other:?}"),
+    };
+    context
+        .task()
+        .container()
+        .clock()
+        .set_realtime_offset_ns(7_200_000_000_000);
+    assert_eq!(
+        fold_continuation_completion(
+            ContinuationCompletion::TimerFdRead(read),
+            &dispatcher,
+            &context,
+            &mut memory
+        )
+        .unwrap(),
+        Some(DispatchOutcome::Returned { value: 8 })
+    );
+    assert_eq!(memory.read_bytes(0x4000, 8).unwrap(), 1u64.to_ne_bytes());
+}

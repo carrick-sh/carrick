@@ -528,6 +528,7 @@ impl SyscallDispatcher {
                     .and_then(|tid| crate::namespace::pid::kernel_to_ns_for(kernel, tid));
                 let clock = Arc::clone(kernel.task().container().clock());
                 dispatch_threaded_futex(
+                    kernel,
                     &clock,
                     kernel.kernel().shared_futex(),
                     request,

@@ -2919,7 +2919,7 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
                 Some(DispatchOutcome::BlockingOpen(open))
             }
         },
-        ContinuationCompletion::TimerFdRead(read) => match read.complete(memory) {
+        ContinuationCompletion::TimerFdRead(read) => match read.complete(context, memory) {
             crate::dispatch::format_time::TimerFdReadStep::Done(outcome) => Some(outcome),
             crate::dispatch::format_time::TimerFdReadStep::Wait(read) => {
                 Some(DispatchOutcome::BlockingTimerFdRead(read))
@@ -2949,6 +2949,7 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
         }
         ContinuationCompletion::InterruptedSleep { remaining } => {
             Some(crate::dispatch::complete_interrupted_sleep(
+                context,
                 memory,
                 remaining.map(|(range, _)| GuestPtr(range.start().raw())),
                 remaining.map_or(Duration::ZERO, |(_, duration)| duration),

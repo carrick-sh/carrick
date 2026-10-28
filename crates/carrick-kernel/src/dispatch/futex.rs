@@ -23,35 +23,6 @@ use super::{
 };
 use crate::compat::CompatReporter;
 
-fn prepare_futex_copyout<'m, M: CurrentMmMemory, const N: usize>(
-    memory: &'m mut M,
-    slots: [Option<super::copyout::UserSlot>; N],
-) -> Result<super::copyout::PreparedCopyout<'m, M, N>, Option<super::copyout::CopyoutRefusal>> {
-    let memory_ptr: *mut M = memory;
-    if let Some(result) = super::resources::with_active_context(|context| {
-        super::copyout::prepare(context, unsafe { &mut *memory_ptr }, slots)
-    }) {
-        return result.map_err(Some);
-    }
-    #[cfg(test)]
-    {
-        thread_local! {
-            static FALLBACK_CONTEXT: Option<crate::kernel::KernelContext> =
-                super::SyscallDispatcher::new()
-                    .capture_one_task_context()
-                    .ok();
-        }
-        if let Some(result) = FALLBACK_CONTEXT.with(|context| {
-            context
-                .as_ref()
-                .map(|ctx| super::copyout::prepare(ctx, memory, slots))
-        }) {
-            return result.map_err(Some);
-        }
-    }
-    Err(None)
-}
-
 /// Convert an ABSOLUTE futex deadline (FUTEX_WAIT_BITSET) to the remaining
 /// duration from now, on the host monotonic clock (or realtime when
 /// FUTEX_CLOCK_REALTIME is set). Clamps to zero if already past — Linux then
@@ -81,6 +52,7 @@ pub(crate) fn relative_from_absolute_timespec(
 }
 
 pub(crate) fn dispatch_futex_pi(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     address: u64,
     command: u64,
@@ -101,13 +73,13 @@ pub(crate) fn dispatch_futex_pi(
     match command {
         LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI => {
             if owner == 0 {
-                let out = match prepare_futex_copyout(
+                let out = match super::copyout::prepare(
+                    context,
                     memory,
                     [Some(super::copyout::UserSlot::new(address, 4))],
                 ) {
                     Ok(out) => out,
-                    Err(Some(refusal)) => return refusal.into_outcome(),
-                    Err(None) => return DispatchOutcome::errno(LINUX_EFAULT),
+                    Err(refusal) => return refusal.into_outcome(),
                 };
                 return match out.commit([&tid.to_ne_bytes()]) {
                     Ok(()) => DispatchOutcome::Returned { value: 0 },
@@ -127,13 +99,13 @@ pub(crate) fn dispatch_futex_pi(
             if owner != tid {
                 return DispatchOutcome::Errno { errno: LINUX_EPERM };
             }
-            let out = match prepare_futex_copyout(
+            let out = match super::copyout::prepare(
+                context,
                 memory,
                 [Some(super::copyout::UserSlot::new(address, 4))],
             ) {
                 Ok(out) => out,
-                Err(Some(refusal)) => return refusal.into_outcome(),
-                Err(None) => return DispatchOutcome::errno(LINUX_EFAULT),
+                Err(refusal) => return refusal.into_outcome(),
             };
             if let Err(fault) = out.commit([&0u32.to_ne_bytes()]) {
                 return fault.outcome();
@@ -162,6 +134,7 @@ pub(crate) fn dispatch_futex_pi(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_threaded_futex(
+    context: &crate::kernel::KernelContext,
     clock: &crate::kernel::container::ClockDomain,
     shared: &carrick_thread::platform_futex::SharedFutexTable,
     request: SyscallRequest,
@@ -262,6 +235,7 @@ pub(crate) fn dispatch_threaded_futex(
             };
         };
         return dispatch_futex_pi(
+            context,
             memory,
             address,
             command,
@@ -403,13 +377,13 @@ pub(crate) fn dispatch_threaded_futex(
                 // the mirror flag — `mirror` is already the authoritative current
                 // value used for the compare below regardless.
                 if mirror != word && location.is_mirror() {
-                    let out = match prepare_futex_copyout(
+                    let out = match super::copyout::prepare(
+                        context,
                         memory,
                         [Some(super::copyout::UserSlot::new(address, 4))],
                     ) {
                         Ok(out) => out,
-                        Err(Some(refusal)) => return refusal.into_outcome(),
-                        Err(None) => return DispatchOutcome::errno(LINUX_EFAULT),
+                        Err(refusal) => return refusal.into_outcome(),
                     };
                     let _ = out.commit([&mirror.to_ne_bytes()]);
                 }

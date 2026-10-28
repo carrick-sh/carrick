@@ -22,49 +22,14 @@ use super::fd_table::{OpenDescription, OpenDescriptionBase, kernel_file_descript
 use super::fd_table::{TimerFdInner, TimerFdState};
 use super::{DispatchOutcome, GuestPtr, read_kernel_struct, time};
 
-fn prepare_format_time_copyout<'m, M: CurrentMmMemory, const N: usize>(
-    memory: &'m mut M,
-    slots: [Option<super::copyout::UserSlot>; N],
-) -> Result<super::copyout::PreparedCopyout<'m, M, N>, Option<super::copyout::CopyoutRefusal>> {
-    let memory_ptr: *mut M = memory;
-    if let Some(result) = super::resources::with_active_context(|context| {
-        super::copyout::prepare(context, unsafe { &mut *memory_ptr }, slots)
-    }) {
-        return result.map_err(Some);
-    }
-    #[cfg(test)]
-    {
-        thread_local! {
-            static FALLBACK_CONTEXT: Option<crate::kernel::KernelContext> =
-                super::SyscallDispatcher::new()
-                    .capture_one_task_context()
-                    .ok();
-        }
-        if let Some(result) = FALLBACK_CONTEXT.with(|context| {
-            context
-                .as_ref()
-                .map(|ctx| super::copyout::prepare(ctx, memory, slots))
-        }) {
-            return result.map_err(Some);
-        }
-    }
-    Err(None)
-}
-
 fn copyout_format_time_record<T: carrick_abi::KernelAbi>(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     address: u64,
     value: &T,
     success: DispatchOutcome,
 ) -> DispatchOutcome {
-    match prepare_format_time_copyout(memory, [Some(super::copyout::UserSlot::of::<T>(address))]) {
-        Ok(out) => match out.commit([value.abi_bytes()]) {
-            Ok(()) => success,
-            Err(fault) => fault.outcome(),
-        },
-        Err(Some(refusal)) => refusal.into_outcome(),
-        Err(None) => DispatchOutcome::errno(LINUX_EFAULT),
-    }
+    super::copyout::copyout_record(context, memory, address, value, success)
 }
 
 /// Exact timerfd read retained while a blocking read is parked outside the
@@ -151,7 +116,11 @@ impl BlockingTimerFdRead {
         &self.state.clock
     }
 
-    pub fn complete(self, memory: &mut impl CurrentMmMemory) -> TimerFdReadStep {
+    pub fn complete(
+        self,
+        context: &crate::kernel::KernelContext,
+        memory: &mut impl CurrentMmMemory,
+    ) -> TimerFdReadStep {
         let mut timer = self.state.inner.lock();
         if refresh_timerfd_locked(&self.state.clock, &mut timer) == 0 {
             drop(timer);
@@ -160,15 +129,15 @@ impl BlockingTimerFdRead {
         let value = LinuxTimerfdExpirations {
             expirations: timer.expirations,
         };
-        let out = match prepare_format_time_copyout(
+        let out = match super::copyout::prepare(
+            context,
             memory,
             [Some(
                 super::copyout::UserSlot::of::<LinuxTimerfdExpirations>(self.address),
             )],
         ) {
             Ok(out) => out,
-            Err(Some(refusal)) => return TimerFdReadStep::Done(refusal.into_outcome()),
-            Err(None) => return TimerFdReadStep::Done(DispatchOutcome::errno(LINUX_EFAULT)),
+            Err(refusal) => return TimerFdReadStep::Done(refusal.into_outcome()),
         };
         // Linux consumes the ready expiration before attempting the guest
         // copyout: a bad destination returns EFAULT, and a later nonblocking
@@ -280,6 +249,7 @@ fn timerfd_plan(state: &TimerFdState) -> TimerFdReadPlan {
 }
 
 pub(super) fn begin_timerfd_read(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     address: u64,
     length: usize,
@@ -296,7 +266,7 @@ pub(super) fn begin_timerfd_read(
         address,
         deterministic_waiter: None,
     };
-    match read.complete(memory) {
+    match read.complete(context, memory) {
         TimerFdReadStep::Wait(_read) if nonblocking => {
             TimerFdReadStep::Done(DispatchOutcome::errno(LINUX_EAGAIN))
         }
@@ -568,6 +538,7 @@ pub(super) fn linux_timex_time(duration: Duration, status: LinuxTimexStatus) -> 
 }
 
 pub(super) fn adjtimex_bootstrap(
+    context: &crate::kernel::KernelContext,
     clock: &crate::kernel::container::ClockDomain,
     memory: &mut impl CurrentMmMemory,
     address: u64,
@@ -583,6 +554,7 @@ pub(super) fn adjtimex_bootstrap(
     {
         let invalid = LinuxTimex::invalid_mode_error_state();
         return copyout_format_time_record(
+            context,
             memory,
             address,
             &invalid,
@@ -599,6 +571,7 @@ pub(super) fn adjtimex_bootstrap(
         let current = linux_timex_from_state(time, &state);
         let value = linux_time_state_from_status(status);
         return copyout_format_time_record(
+            context,
             memory,
             address,
             &current,
@@ -615,6 +588,7 @@ pub(super) fn adjtimex_bootstrap(
         current.offset = 0;
         let value = linux_time_state_from_status(status);
         return copyout_format_time_record(
+            context,
             memory,
             address,
             &current,
@@ -719,13 +693,13 @@ pub(super) fn adjtimex_bootstrap(
         step_realtime_ns = Some(delta_ns);
     }
 
-    let out = match prepare_format_time_copyout(
+    let out = match super::copyout::prepare(
+        context,
         memory,
         [Some(super::copyout::UserSlot::of::<LinuxTimex>(address))],
     ) {
         Ok(out) => out,
-        Err(Some(refusal)) => return refusal.into_outcome(),
-        Err(None) => return DispatchOutcome::errno(LINUX_EFAULT),
+        Err(refusal) => return refusal.into_outcome(),
     };
 
     if let Some(delta_ns) = step_realtime_ns {
@@ -872,6 +846,7 @@ pub(super) fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec 
 }
 
 pub fn complete_interrupted_sleep(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     remaining: Option<GuestPtr>,
     duration: Duration,
@@ -879,6 +854,7 @@ pub fn complete_interrupted_sleep(
     if let Some(address) = remaining {
         let rem = linux_timespec_from_duration(duration);
         return copyout_format_time_record(
+            context,
             memory,
             address.0,
             &rem,

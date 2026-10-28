@@ -308,7 +308,7 @@ fn complete_timerfd_continuation_after_ready(
         let ContinuationCompletion::TimerFdRead(read) = completion else {
             panic!("timerfd continuation did not retain its read: {completion:?}");
         };
-        match read.complete(memory) {
+        match read.complete(context, memory) {
             crate::dispatch::format_time::TimerFdReadStep::Done(outcome) => return outcome,
             crate::dispatch::format_time::TimerFdReadStep::Wait(read) => {
                 continuation = BlockedContinuation::from_dispatch_outcome(
@@ -535,7 +535,8 @@ fn timerfd_rearm_wakes_retained_read_before_old_deadline() {
     let ContinuationCompletion::TimerFdRead(read) = completion else {
         panic!("retained read")
     };
-    let crate::dispatch::format_time::TimerFdReadStep::Wait(read) = read.complete(&mut memory)
+    let crate::dispatch::format_time::TimerFdReadStep::Wait(read) =
+        read.complete(&context, &mut memory)
     else {
         panic!("new deadline must still be held")
     };

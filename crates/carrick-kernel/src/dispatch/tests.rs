@@ -4473,6 +4473,7 @@ mod overlay_dispatch_tests {
 
         let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
+            &SyscallDispatcher::new().capture_one_task_context().unwrap(),
             &clock,
             &carrick_thread::platform_futex::SharedFutexTable::new(),
             request,
@@ -4511,6 +4512,7 @@ mod overlay_dispatch_tests {
 
         let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
+            &SyscallDispatcher::new().capture_one_task_context().unwrap(),
             &clock,
             &carrick_thread::platform_futex::SharedFutexTable::new(),
             request,
@@ -4580,6 +4582,7 @@ mod overlay_dispatch_tests {
 
         let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
+            &SyscallDispatcher::new().capture_one_task_context().unwrap(),
             &clock,
             &carrick_thread::platform_futex::SharedFutexTable::new(),
             request,
@@ -4638,6 +4641,7 @@ mod overlay_dispatch_tests {
 
         let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
+            &SyscallDispatcher::new().capture_one_task_context().unwrap(),
             &clock,
             &carrick_thread::platform_futex::SharedFutexTable::new(),
             request,
@@ -8777,7 +8781,7 @@ mod container_clock_tests {
             "new timer must remain unready"
         );
 
-        match blocked_read.complete(&mut memory) {
+        match blocked_read.complete(&context, &mut memory) {
             super::format_time::TimerFdReadStep::Done(DispatchOutcome::Returned { value }) => {
                 assert_eq!(value, 8)
             }

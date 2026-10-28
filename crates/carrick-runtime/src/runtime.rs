@@ -2029,6 +2029,7 @@ where
                 };
                 if sleep_interrupt_pending() {
                     return Ok(carrick_kernel::dispatch::complete_interrupted_sleep(
+                        kernel_context,
                         memory,
                         remaining,
                         deadline.saturating_duration_since(Instant::now()),
@@ -2054,6 +2055,7 @@ where
                     }
                     WaitResult::Interrupted => {
                         return Ok(carrick_kernel::dispatch::complete_interrupted_sleep(
+                            kernel_context,
                             memory,
                             remaining,
                             deadline.saturating_duration_since(Instant::now()),
