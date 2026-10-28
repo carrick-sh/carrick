@@ -967,7 +967,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         need_resched: &AtomicBool,
         submission: &mut ExecutorSubmissionContext<'_>,
     ) -> Result<ExecutorExit, TrapError> {
-        if need_resched.load(Ordering::Acquire) {
+        if need_resched.load(Ordering::Acquire)
+            || carrick_hal::vcpu_run::current_shutdown_requested()
+        {
             return Ok(ExecutorExit::Preempted);
         }
         let task = self.task()?;
@@ -1135,7 +1137,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         if let Some(hook) = self.loaded_pre_entry_hook.take() {
             hook(need_resched, &self.idle_kick);
         }
-        if need_resched.load(Ordering::Acquire) {
+        if need_resched.load(Ordering::Acquire)
+            || carrick_hal::vcpu_run::current_shutdown_requested()
+        {
             M::disarm_run_kick(&self.idle_kick);
             return Ok(ExecutorExit::Preempted);
         }

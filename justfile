@@ -1122,6 +1122,11 @@ test-hvf *ARGS:
 test-hvf-trap-engine:
     env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
 
+# Raw one-shot cancellation qualification for #978, including pre-entry WFI.
+# A missing cancellation is killed/reaped by the test's process watchdog.
+test-hvf-shutdown-kick:
+    CARRICK_TEST_TARGET=trap_engine_hvf ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_shutdown_kick_ --ignored --nocapture
+
 # Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
 test-conformance-next *ARGS: build
     env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}

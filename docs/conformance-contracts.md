@@ -2311,3 +2311,27 @@ and drive the completion resume arm through both zone and physical parks.
 The group-exit witness retains two live sibling threads: output must first
 suspend on the owner refusal, then sibling cancellation prevents re-preparation.
 These VM-free witnesses do not replace the director's signed stress acceptance.
+
+### Carrier shutdown at physical entry (#978)
+
+`kernel.vcpu.shutdown-entry` separates sticky carrier shutdown from consumable
+reschedule requests. The owner publishes each physical entry before observing
+shutdown, including backend-internal re-entry; shutdown latches before kicking
+published entrants. Two live executor threads prove independent observations,
+zero pre-entry hardware kicks and one active-peer kick. The loom binding uses
+the shipping gate and retains an edge-only cancellation counterexample.
+
+This candidate **requires pending-entry cancellation from the backend**. The
+model does not manufacture that guarantee for HVF. Run the raw signed WFI
+qualification on macOS with:
+
+`just test-hvf-shutdown-kick`
+
+Both cases run in fresh signed subprocesses. The before-entry case waits for
+the sole kick to complete before running; the in-run case observes the guest's
+entry marker before its sole kick. Only that diagnostic observer polls guest
+memory, with a bound; production shutdown never polls. The parent kills and
+reaps a run that does not return within two seconds of its entry notification,
+without sending a recovery kick. A failed pre-entry qualification leaves this
+candidate pending a backend latch; a passing qualification still requires the
+director's signed `el1_files_exit_group_stress` on the PR artifact.

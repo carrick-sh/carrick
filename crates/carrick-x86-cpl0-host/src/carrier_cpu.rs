@@ -122,11 +122,11 @@ mod sealed {
 /// Physical I/O retained exclusively by the carrier CPU.
 pub trait CarrierCpuIo: CarrierCpuBackend + sealed::Sealed {}
 
-pub struct OwnedCpuIo<B: CarrierCpuBackend>(B);
+pub struct OwnedCpuIo<B: CarrierCpuBackend>(B, Option<B::KickHandle>);
 
 impl<B: CarrierCpuBackend> OwnedCpuIo<B> {
     fn new(backend: B) -> Self {
-        Self(backend)
+        Self(backend, None)
     }
 }
 
@@ -151,13 +151,24 @@ impl<B: CarrierCpuBackend> CarrierCpuBackend for OwnedCpuIo<B> {
         self.0.write_image(image)
     }
     fn run(&mut self) -> Result<VcpuExit, TrapError> {
+        let entry = carrick_hal::vcpu_run::PhysicalRunEntry::current();
+        if entry.shutdown_requested() {
+            // The native run kick is already armed by the physical lane. Its
+            // backend owns the pending-entry cancellation (KVM immediate_exit).
+            let kick = self.1.as_ref().ok_or_else(|| {
+                TrapError::Hypervisor("shutdown entry has no armed physical kick".into())
+            })?;
+            carrick_hal::VcpuKickDyn::kick(kick);
+        }
         self.0.run()
     }
     fn complete_pending_io(&mut self) -> Result<(), TrapError> {
         self.0.complete_pending_io()
     }
     fn arm_run_kick(&mut self, kick: &Self::KickHandle) -> Result<(), TrapError> {
-        self.0.arm_run_kick(kick)
+        self.0.arm_run_kick(kick)?;
+        self.1 = Some(kick.clone());
+        Ok(())
     }
     fn disarm_run_kick(kick: &Self::KickHandle) {
         B::disarm_run_kick(kick)

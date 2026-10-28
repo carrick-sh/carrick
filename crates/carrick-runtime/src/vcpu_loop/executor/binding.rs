@@ -394,6 +394,7 @@ impl<'a, 'lease> HvpatchQuantumControl<'a, 'lease> {
     }
     pub(crate) fn need_resched(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
+            || carrick_hal::vcpu_run::current_shutdown_requested()
     }
 
     pub(crate) fn current_submission_key(

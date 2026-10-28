@@ -871,9 +871,17 @@ mod tests {
             .split(concat!("fn run_to_exit_", "inner("))
             .nth(1)
             .expect("run_to_exit_inner");
-        assert_eq!(inner.matches("*kick_armed = true").count(), 1);
+        // Both a resumed cancellation and observed executor shutdown arm
+        // an interrupt that the outer wrapper must withdraw on every exit.
+        assert_eq!(inner.matches("*kick_armed = true").count(), 2);
         assert_eq!(inner.matches("*kick_armed = false").count(), 1);
-        assert_eq!(inner.matches("crate::gic::arm_kick(vcpu)").count(), 1);
+        assert_eq!(inner.matches("crate::gic::arm_kick(vcpu)").count(), 2);
         assert_eq!(inner.matches("crate::gic::clear_kick(vcpu)").count(), 1);
+        let shutdown = inner
+            .split("if entry.shutdown_requested()")
+            .nth(1)
+            .and_then(|tail| tail.split("crate::probes::vcpu_run_enter").next())
+            .expect("shutdown entry arm path");
+        assert!(shutdown.contains("crate::gic::unmask_el0_irqs(vcpu)?"));
     }
 }

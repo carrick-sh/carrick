@@ -1080,6 +1080,7 @@ impl PersistentExecutor for FakeExecutor {
         need_resched: &AtomicBool,
         submission: &mut super::ExecutorSubmissionContext<'_>,
     ) -> Result<ExecutorExit, TrapError> {
+        let _entry = carrick_hal::vcpu_run::PhysicalRunEntry::current();
         assert_eq!(thread::current().id(), self.owner);
         let (thread, generation, binding) = self.current.as_ref().expect("loaded task");
         self.factory
@@ -8823,4 +8824,93 @@ fn serial_host_shutdown_kick_publishes_host_work_to_a_guest_idle_worker() {
         "a worker not waiting in the guest gets no zone host work"
     );
     drop(region);
+}
+
+#[test]
+fn shutdown_latch_survives_consumed_reschedule_request() {
+    let kick = WorkerKick::new(Arc::new(ReceiptLog::default()));
+    kick.interrupt_for_shutdown();
+    // A reschedule request is consumable; carrier shutdown is not.
+    kick.need_resched.store(false, Ordering::Release);
+    assert!(
+        kick.is_shutdown_interrupted(),
+        "shutdown must remain latched"
+    );
+}
+
+#[test]
+fn shutdown_entry_latch_is_sticky_and_scoped_across_two_live_executors() {
+    struct CountKick(Arc<AtomicUsize>);
+    impl carrick_hal::VcpuKick for CountKick {
+        fn kick(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Clone for CountKick {
+        fn clone(&self) -> Self {
+            Self(Arc::clone(&self.0))
+        }
+    }
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let kick = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+        let count = Arc::new(AtomicUsize::new(0));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (enter_tx, enter_rx) = std::sync::mpsc::channel();
+        let (entry_tx, entry_rx) = std::sync::mpsc::channel();
+        let (leave_tx, leave_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_kick = Arc::clone(&kick);
+        let worker_count = Arc::clone(&count);
+        let worker = thread::spawn(move || {
+            assert!(
+                worker_kick.publish_hardware(
+                    super::ExactHardwareKick::new(
+                        Box::new(CountKick(worker_count)),
+                        1,
+                        super::current_owner_thread_port(),
+                    )
+                    .unwrap()
+                )
+            );
+            let _scope = carrick_hal::vcpu_run::ExecutorRunScope::install(Arc::clone(
+                &worker_kick.run_state,
+            ));
+            ready_tx.send(()).unwrap();
+            enter_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let entry = carrick_hal::vcpu_run::PhysicalRunEntry::current();
+            entry_tx.send(entry.shutdown_requested()).unwrap();
+            leave_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(entry);
+            done_tx.send(worker_kick.is_shutdown_interrupted()).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        workers.push((kick, count, enter_tx, entry_rx, leave_tx, done_rx, worker));
+    }
+    // The first kick is outside physical entry and must not be relied upon.
+    workers[0].0.interrupt_for_shutdown();
+    for worker in &workers {
+        worker.2.send(()).unwrap();
+    }
+    let before = workers[0].3.recv_timeout(Duration::from_secs(2)).unwrap();
+    let peer = workers[1].3.recv_timeout(Duration::from_secs(2)).unwrap();
+    // Both threads are still alive; only the peer has a published active run.
+    workers[1].0.interrupt_for_shutdown();
+    let counts = [
+        workers[0].1.load(Ordering::SeqCst),
+        workers[1].1.load(Ordering::SeqCst),
+    ];
+    for worker in &workers {
+        worker.4.send(()).unwrap();
+    }
+    for worker in workers {
+        assert!(worker.5.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.6.join().unwrap();
+    }
+    assert!(before, "pre-entry shutdown must be observed without a kick");
+    assert!(
+        !peer,
+        "shutdown belongs to its executor, not the carrier thread population"
+    );
+    assert_eq!(counts, [0, 1], "kick only the published physical entry");
 }
