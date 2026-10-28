@@ -742,3 +742,143 @@ fn r2_reader_credentials_reach_only_hosted_compiling_jobs() {
             .ends_with("|| '\"macos-15\"' }}")
     );
 }
+
+/// Every R2 reader starts its server once sccache is installed and the
+/// backend is chosen, before the job's first compile (#961): a lazily started
+/// server fails the first compile when R2 has a transient fault.
+#[test]
+fn r2_jobs_start_the_compiler_cache_after_install_and_selection() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
+    let mut started = 0;
+    for (job, body) in workflow["jobs"].as_hash().unwrap() {
+        let Some(steps) = body["steps"].as_vec() else {
+            continue;
+        };
+        let position = |pred: &dyn Fn(&yaml_rust2::Yaml) -> bool| steps.iter().position(pred);
+        let Some(configure) = position(&|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("scripts/ci/compiler-cache-env.sh "))
+        }) else {
+            continue;
+        };
+        let install = position(&|s| {
+            s["with"]["tool"]
+                .as_str()
+                .is_some_and(|t| t.contains("sccache@"))
+        })
+        .unwrap_or_else(|| panic!("{job:?}: no sccache install"));
+        let starts: Vec<usize> = (0..steps.len())
+            .filter(|&i| steps[i]["run"].as_str() == Some("scripts/ci/compiler-cache-start.sh"))
+            .collect();
+        assert_eq!(starts.len(), 1, "{job:?}: one compiler cache start");
+        let start = starts[0];
+        assert_eq!(
+            steps[start]["if"].as_str(),
+            Some("steps.compiler-cache.outputs.backend == 'r2'"),
+            "{job:?}"
+        );
+        assert!(
+            start > configure && start > install,
+            "{job:?}: starts too early"
+        );
+        for step in &steps[configure.max(install) + 1..start] {
+            assert_eq!(
+                step["if"].as_str(),
+                Some("steps.compiler-cache.outputs.backend == 'gha'"),
+                "{job:?}: only the skipped GitHub cache restore may precede the start"
+            );
+        }
+        started += 1;
+    }
+    assert_eq!(
+        started, 21,
+        "every compiler cache consumer starts its server"
+    );
+}
+
+#[test]
+fn compiler_cache_start_falls_back_only_on_transient_reader_faults() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let script = root.join("scripts/ci/compiler-cache-start.sh");
+    // A stand-in for sccache: `--start-server` answers as STUB_START says and
+    // every call is logged, so no test reaches a real bucket.
+    let stub_dir = tempfile::tempdir().unwrap();
+    let stub = stub_dir.path().join("sccache");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         echo \"$* idle=$SCCACHE_IDLE_TIMEOUT\" >> \"$STUB_LOG\"\n\
+         [ \"$1\" = --start-server ] || exit 0\n\
+         case \"$STUB_START\" in\n\
+         ok) exit 0 ;;\n\
+         denied) echo 'sccache: error: Server startup failed: cache storage failed to read: \
+         PermissionDenied (permanent) at read => S3Error { code: \"AccessDenied\" }' >&2; exit 2 ;;\n\
+         *) echo 'sccache: error: Server startup failed: cache storage failed to read: \
+         Unexpected (temporary) at read => S3Error { code: \"InternalError\" }' >&2; exit 2 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&stub, perms).unwrap();
+    let run = |answer: &str, mode: &str, bin: &std::path::Path| {
+        let temp = tempfile::tempdir().unwrap();
+        let env_file = temp.path().join("env");
+        std::fs::write(&env_file, "").unwrap();
+        let output = std::process::Command::new(&script)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap())
+            .env("GITHUB_ENV", &env_file)
+            .env("SCCACHE_BUCKET", "carrick-sccache")
+            .env("SCCACHE_S3_RW_MODE", mode)
+            .env("CARRICK_SCCACHE_BIN", bin)
+            .env("CARRICK_SCCACHE_RETRY_SECONDS", "0")
+            .env("STUB_LOG", temp.path().join("calls"))
+            .env("STUB_START", answer)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            std::fs::read_to_string(&env_file).unwrap(),
+            std::fs::read_to_string(temp.path().join("calls")).unwrap_or_default(),
+            String::from_utf8(output.stdout).unwrap(),
+        )
+    };
+
+    let (code, env, calls, _) = run("ok", "READ_ONLY", &stub);
+    assert_eq!(code, Some(0));
+    assert!(env.is_empty());
+    assert_eq!(
+        calls, "--start-server idle=0\n",
+        "started once, never idles out"
+    );
+
+    // A transient R2 fault: one retry, then the reader compiles uncached.
+    let (code, env, calls, stdout) = run("transient", "READ_ONLY", &stub);
+    assert_eq!(code, Some(0));
+    assert_eq!(env, "CARRICK_SCCACHE=0\n");
+    assert!(
+        stdout.contains("::warning title=Compiler cache unavailable::"),
+        "{stdout}"
+    );
+    assert_eq!(calls.matches("--start-server").count(), 2, "{calls}");
+
+    // The writer exists to fill the cache; an uncached run is no use to it.
+    let (code, env, _, _) = run("transient", "READ_WRITE", &stub);
+    assert_ne!(code, Some(0));
+    assert!(env.is_empty());
+
+    // Refused credentials fail at once: no retry, no fallback.
+    let (code, env, calls, _) = run("denied", "READ_ONLY", &stub);
+    assert_ne!(code, Some(0));
+    assert!(env.is_empty());
+    assert_eq!(calls, "--start-server idle=0\n");
+
+    // A missing binary is a workflow bug, never an outage to fall back from.
+    let (code, env, _, _) = run("ok", "READ_ONLY", &stub_dir.path().join("absent"));
+    assert_ne!(code, Some(0));
+    assert!(env.is_empty());
+}

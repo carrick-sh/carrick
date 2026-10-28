@@ -73,6 +73,9 @@ jobs:
           restore-keys: |
             sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
             sccache-linux-x64-
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Build lean xtask
         run: just ci-prebuild-xtask
       - name: Compiler cache statistics
@@ -137,6 +140,9 @@ jobs:
           restore-keys: |
             sccache-${{ matrix.family }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
             sccache-${{ matrix.family }}-
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Identify runner image for warm cross toolchains
         id: warm-runner-image
         if: matrix.family == 'linux-x64'
@@ -280,6 +286,9 @@ jobs:
           restore-keys: |
             sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
             sccache-linux-x64-
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Detect changed surfaces
         id: filter
         env:
@@ -329,6 +338,9 @@ jobs:
           restore-keys: |
             sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
             sccache-linux-x64-
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -477,6 +489,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -540,6 +555,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -634,6 +652,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -707,6 +728,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -823,6 +847,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -887,6 +914,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -957,6 +987,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Clippy (no-panic gate)
@@ -1017,6 +1050,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Live host-authority compiler census
@@ -1070,6 +1106,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Workspace build
@@ -1128,6 +1167,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Unit tests shard A (host test lanes)
@@ -1181,6 +1223,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Unit tests shard B (workspace + mm-owner + CLI + host + VFS + kernel + runtime + HVF + EL1)
@@ -1234,6 +1279,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Host integration tests (no HVF)
@@ -1286,6 +1334,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -1377,6 +1428,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Kernel semantics natively on ARM Linux
@@ -1433,6 +1487,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -1553,6 +1610,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -1665,6 +1725,9 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
