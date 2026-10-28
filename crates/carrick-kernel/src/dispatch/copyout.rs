@@ -1065,3 +1065,87 @@ mod tests {
         assert_eq!(legacy.read_bytes(BASE + 0x10, 4).unwrap(), [1, 2, 3, 4]);
     }
 }
+
+// BEGIN S2 value-result output admission.
+/// Addresses of a Linux length-prefixed output pair.
+#[derive(Clone, Copy)]
+pub(crate) struct ValueResultAddresses {
+    pub(crate) value: GuestVa,
+    pub(crate) length: GuestVa,
+}
+
+impl ValueResultAddresses {
+    pub(crate) const fn new(value: GuestVa, length: GuestVa) -> Self {
+        Self { value, length }
+    }
+}
+
+/// Ordinary value-result errors must complete before output admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ValueResultFault {
+    Memory(CopyoutFault),
+    NegativeLength,
+}
+
+impl ValueResultFault {
+    pub(crate) fn outcome(self) -> DispatchOutcome {
+        match self {
+            Self::Memory(fault) => fault.outcome(),
+            Self::NegativeLength => DispatchOutcome::errno(carrick_abi::LINUX_EINVAL),
+        }
+    }
+}
+
+/// Both destinations are secured by one permit before either is published.
+pub(crate) struct PreparedValueResult<'m, M: CurrentMmMemory> {
+    inner: PreparedCopyout<'m, M, 2>,
+}
+
+/// Read the input length before preparing exactly the available value prefix
+/// and its length. An unreadable length is a real fault, distinct from refusal.
+/// `value_len` is a bounded kernel wire size, never the caller's capacity.
+pub(crate) fn prepare_value_result<'m, M: CurrentMmMemory>(
+    context: &KernelContext,
+    memory: &'m mut M,
+    addresses: ValueResultAddresses,
+    value_len: usize,
+) -> Result<Result<PreparedValueResult<'m, M>, ValueResultFault>, CopyoutRefusal> {
+    let capacity = match read_u32_before_effects(memory, addresses.length.raw())? {
+        Ok(capacity) if (capacity as i32) < 0 => return Ok(Err(ValueResultFault::NegativeLength)),
+        Ok(capacity) => (capacity as usize).min(value_len),
+        Err(fault) => return Ok(Err(ValueResultFault::Memory(fault))),
+    };
+    Ok(Ok(PreparedValueResult {
+        inner: prepare(
+            context,
+            memory,
+            [
+                Some(UserSlot::new(addresses.value.raw(), capacity)),
+                Some(UserSlot::new(
+                    addresses.length.raw(),
+                    std::mem::size_of::<u32>(),
+                )),
+            ],
+        )?,
+    }))
+}
+
+impl<M: CurrentMmMemory> PreparedValueResult<'_, M> {
+    pub(crate) fn capacity(&self) -> usize {
+        self.inner.capacity(0)
+    }
+
+    /// Values are published before the length, including overlapping buffers.
+    /// A genuine later fault preserves the valid prefix; a refusal wrote nothing.
+    pub(crate) fn commit(self, value: &[u8], reported_len: u32) -> Result<(), CopyoutFault> {
+        let written = self.capacity().min(value.len());
+        self.inner
+            .commit([&value[..written], &reported_len.to_ne_bytes()])
+    }
+
+    pub(crate) fn commit_clamped(self, value: &[u8]) -> Result<(), CopyoutFault> {
+        let written = self.capacity().min(value.len()) as u32;
+        self.commit(value, written)
+    }
+}
+// END S2 value-result output admission.

@@ -381,6 +381,7 @@ impl PacketSocket {
 
     pub(crate) fn getsockopt<M: CurrentMmMemory>(
         &self,
+        context: &crate::kernel::KernelContext,
         memory: &mut M,
         optname: i32,
         optval_addr: u64,
@@ -389,7 +390,13 @@ impl PacketSocket {
         match optname {
             LINUX_PACKET_VERSION => {
                 let ver = self.version.load(Ordering::SeqCst);
-                write_sockopt_value(memory, optval_addr, optlen_addr, &ver.to_ne_bytes())
+                write_sockopt_value(
+                    context,
+                    memory,
+                    optval_addr,
+                    optlen_addr,
+                    &ver.to_ne_bytes(),
+                )
             }
             _ => Ok(DispatchOutcome::errno(LINUX_ENOPROTOOPT)),
         }

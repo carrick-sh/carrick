@@ -14,3 +14,8 @@ vm_free = "carrick-signal-core::wait::tests::socket_calls_restart_only_when_prov
 [bindings.unresolved]
 embed_structural = "Signed HVF binding belongs to the director gate."
 docker = "Native Linux oracle comparison remains for the director gate."
+
+# S2 adds only name-query tests to lifecycle.rs. Its accept/connect restart
+# paths are unchanged. The existing socket_waits_restart_with_sa_restart_except_timed_calls
+# and socket_timeout_forces_eintr_even_with_restart_action bindings remain
+# the restart-policy evidence; the new name-query fixtures do not exercise signal delivery.

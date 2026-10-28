@@ -4040,3 +4040,85 @@ impl<'a> NetView<'a> {
 
     }
 }
+
+#[cfg(test)]
+mod s2_tests {
+    use super::*;
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    use crate::dispatch::{CompatReporter, SyscallArgs, SyscallRequest, ThreadCtx};
+    use carrick_guest_mem::GuestMemory;
+
+    #[test]
+    fn s2_threaded_name_queries_refuse_without_publishing_and_retry() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(701));
+        let futex = crate::thread::FutexTable::new();
+        let mut memory = OwnerRefusingMemory::new(0x5000, 0x1000, 0xa5);
+        let call = |number, args, memory: &mut OwnerRefusingMemory| {
+            dispatcher
+                .dispatch_threaded(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &CompatReporter::default(),
+                    ThreadCtx::new(registry.main_tid(), &registry, &futex),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            call(
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64,
+                    0,
+                    0x5080,
+                    0,
+                    0
+                ],
+                &mut memory
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let pair = memory.read_bytes(0x5080, 8).unwrap();
+        let fd = i32::from_ne_bytes(pair[..4].try_into().unwrap()) as u64;
+        for number in [204, 205] {
+            for read_refusal in [false, true] {
+                memory.seed(0x5000, &[0xa5; 16]);
+                memory.seed(0x5010, &128u32.to_ne_bytes());
+                let before = memory.prepares;
+                let wait = if read_refusal {
+                    memory.refuse_next_read()
+                } else {
+                    memory.refuse_next()
+                };
+                assert_eq!(
+                    call(number, [fd, 0x5000, 0x5010, 0, 0, 0], &mut memory),
+                    DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+                );
+                assert_eq!(memory.read_bytes(0x5000, 16).unwrap(), [0xa5; 16]);
+                assert_eq!(memory.read_bytes(0x5010, 4).unwrap(), 128u32.to_ne_bytes());
+                assert_eq!(
+                    call(number, [fd, 0x5000, 0x5010, 0, 0, 0], &mut memory),
+                    DispatchOutcome::Returned { value: 0 }
+                );
+                assert_eq!(
+                    memory.read_bytes(0x5000, 2).unwrap(),
+                    (LINUX_AF_UNIX as u16).to_ne_bytes()
+                );
+                assert_eq!(memory.prepares - before, if read_refusal { 1 } else { 2 });
+            }
+            // No address bytes fit, but Linux still reports the full length.
+            memory.seed(0x5010, &0u32.to_ne_bytes());
+            let before = memory.prepares;
+            assert_eq!(
+                call(number, [fd, 0x7000, 0x5010, 0, 0, 0], &mut memory),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            assert_eq!(memory.read_bytes(0x5010, 4).unwrap(), 2u32.to_ne_bytes());
+            assert_eq!(memory.prepares - before, 1);
+        }
+    }
+}

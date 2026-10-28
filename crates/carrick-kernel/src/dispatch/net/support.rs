@@ -1859,8 +1859,8 @@ pub(super) fn host_to_linux_sockaddr(
 /// effect, so an unreadable `*addrlen` is held until the commit like any
 /// other invalid output pointer.
 pub(in crate::dispatch) enum PreparedSockaddr<'m, M: CurrentMmMemory> {
-    Ready(crate::dispatch::copyout::PreparedCopyout<'m, M, 2>),
-    Faulted,
+    Ready(crate::dispatch::copyout::PreparedValueResult<'m, M>),
+    Faulted(crate::dispatch::copyout::ValueResultFault),
 }
 
 pub(in crate::dispatch) fn prepare_linux_sockaddr<'m, M: CurrentMmMemory>(
@@ -1870,33 +1870,31 @@ pub(in crate::dispatch) fn prepare_linux_sockaddr<'m, M: CurrentMmMemory>(
     addrlen_addr: u64,
     actual_len: usize,
 ) -> Result<PreparedSockaddr<'m, M>, crate::dispatch::copyout::CopyoutRefusal> {
-    use crate::dispatch::copyout::{UserSlot, prepare, read_u32_before_effects};
-    let cur = match read_u32_before_effects(memory, addrlen_addr)? {
-        Ok(cur) => cur as usize,
-        Err(_) => return Ok(PreparedSockaddr::Faulted),
-    };
-    let capacity = cur.min(actual_len);
-    Ok(PreparedSockaddr::Ready(prepare(
+    use crate::dispatch::copyout::{ValueResultAddresses, prepare_value_result};
+    match prepare_value_result(
         context,
         memory,
-        [
-            UserSlot::optional(addr, capacity),
-            Some(UserSlot::new(addrlen_addr, 4)),
-        ],
-    )?))
+        ValueResultAddresses::new(
+            carrick_guest_mem::GuestVa::new(addr),
+            carrick_guest_mem::GuestVa::new(addrlen_addr),
+        ),
+        actual_len,
+    )? {
+        Ok(out) => Ok(PreparedSockaddr::Ready(out)),
+        Err(fault) => Ok(PreparedSockaddr::Faulted(fault)),
+    }
 }
 
 impl<M: CurrentMmMemory> PreparedSockaddr<'_, M> {
     pub(in crate::dispatch) fn commit(
         self,
         bytes: &[u8],
-    ) -> Result<(), crate::dispatch::copyout::CopyoutFault> {
+    ) -> Result<(), crate::dispatch::copyout::ValueResultFault> {
         match self {
-            Self::Ready(out) => {
-                let written = out.capacity(0).min(bytes.len());
-                out.commit([&bytes[..written], &(bytes.len() as u32).to_ne_bytes()])
-            }
-            Self::Faulted => Err(crate::dispatch::copyout::CopyoutFault),
+            Self::Ready(out) => out
+                .commit(bytes, bytes.len() as u32)
+                .map_err(crate::dispatch::copyout::ValueResultFault::Memory),
+            Self::Faulted(fault) => Err(fault),
         }
     }
 }
@@ -1944,36 +1942,26 @@ pub(super) fn write_linux_sockaddr(
         .map_err(|_| ())
 }
 
-/// Clamp-and-write a scalar `getsockopt` value back to the guest: read the
-/// guest's `optlen`, write at most that many bytes of `value` to `optval`, and
-/// report the number actually written back in `optlen` (Linux truncation
-/// semantics). The option-value analogue of [`write_linux_sockaddr`] — but it
-/// reports the *clamped* count, not the full length. Returns `LINUX_EFAULT` on
-/// any guest-memory fault, else `Returned { value: 0 }`.
-///
-/// NOT for the generic host passthrough (which reports the host-updated optlen,
-/// not the clamped count) nor the netlink `SO_TYPE` path (which ignores faults).
+/// Publish a bounded socket option and its clamped length through one permit.
 pub(super) fn write_sockopt_value<M: CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
     memory: &mut M,
     optval_addr: u64,
     optlen_addr: u64,
     value: &[u8],
 ) -> Result<DispatchOutcome, DispatchError> {
-    let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
-        Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+    use crate::dispatch::copyout::{ValueResultAddresses, prepare_value_result};
+    use carrick_guest_mem::GuestVa;
+    let addresses = ValueResultAddresses::new(GuestVa::new(optval_addr), GuestVa::new(optlen_addr));
+    let out = match prepare_value_result(context, memory, addresses, value.len()) {
+        Ok(Ok(out)) => out,
+        Ok(Err(fault)) => return Ok(fault.outcome()),
+        Err(refusal) => return Ok(refusal.into_outcome()),
     };
-    let n = (guest_optlen as usize).min(value.len());
-    if optval_addr != 0 && n > 0 && memory.write_bytes(optval_addr, &value[..n]).is_err() {
-        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-    }
-    if memory
-        .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
-        .is_err()
-    {
-        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-    }
-    Ok(DispatchOutcome::Returned { value: 0 })
+    Ok(match out.commit_clamped(value) {
+        Ok(()) => DispatchOutcome::Returned { value: 0 },
+        Err(fault) => fault.outcome(),
+    })
 }
 
 pub(super) fn read_linux_msghdr(
