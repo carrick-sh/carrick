@@ -635,13 +635,67 @@ impl PipeInner {
             .and_then(|_| self.write_poll_fd())
     }
 }
+/// Single-window read: retain the source until its destination is secured.
+/// The vector loop still uses the counted path below until it can retain
+/// progress across a later iovec refusal (#986).
 pub(crate) fn read_pipe<M: CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
     memory: &mut M,
     address: u64,
     length: usize,
     pipe: &PipeRef,
     status_flags: u64,
-    _fd: i32,
+    authority: super::WaitFdAuthority,
+) -> DispatchOutcome {
+    use crate::dispatch::copyout::{COPYOUT_MAX_BYTES, prepare_array};
+    if memory.user_memory_venue() != carrick_guest_mem::UserMemoryVenue::Owner {
+        return read_pipe_unprepared(memory, address, length, pipe, status_flags, authority);
+    }
+    if length == 0 {
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    let bytes = match take_pipe_bytes(pipe, length.min(COPYOUT_MAX_BYTES)) {
+        PipeDrain::Eof => return DispatchOutcome::Returned { value: 0 },
+        PipeDrain::WouldBlock => {
+            return if status_flags & LINUX_O_NONBLOCK != 0 {
+                DispatchOutcome::errno(LINUX_EAGAIN)
+            } else {
+                wait_for_pipe_readable(pipe, authority)
+            };
+        }
+        PipeDrain::Bytes(bytes) => bytes,
+    };
+    let out = match prepare_array(
+        context,
+        memory,
+        carrick_guest_mem::GuestVa::new(address),
+        bytes.len(),
+        1,
+    ) {
+        Ok(out) => out,
+        Err(refusal) => return refusal.into_outcome(),
+    };
+    let count = out.records();
+    if count == 0 {
+        return DispatchOutcome::errno(LINUX_EFAULT);
+    }
+    let (result, effect) = out.commit_retaining(&bytes[..count]);
+    if let Err(fault) = result {
+        return fault.outcome();
+    }
+    bytes.commit(count);
+    drop(effect);
+    DispatchOutcome::returned_len_or_errno(count)
+}
+
+// Counted debt: readv needs a retained source/cursor before a later iovec can
+// suspend. Preserve its existing behavior rather than redispatch a prefix.
+pub(crate) fn read_pipe_unprepared<M: CurrentMmMemory>(
+    memory: &mut M,
+    address: u64,
+    length: usize,
+    pipe: &PipeRef,
+    status_flags: u64,
     authority: super::WaitFdAuthority,
 ) -> DispatchOutcome {
     if length == 0 {

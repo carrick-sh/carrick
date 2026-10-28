@@ -898,7 +898,7 @@ impl<'a> IpcView<'a> {
 
             let deadline = match read_abs_deadline(&*cx.memory, abs_timeout.0) {
                 Ok(d) => d,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                Err(error) => return Ok(error.into_outcome()),
             };
 
             let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
@@ -939,7 +939,7 @@ impl<'a> IpcView<'a> {
             }
             let deadline = match read_abs_deadline(&*cx.memory, abs_timeout.0) {
                 Ok(d) => d,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                Err(error) => return Ok(error.into_outcome()),
             };
 
             let nonblock = LinuxOpenFlags::from_bits_truncate(mq.description.common().status_flags())
@@ -1116,53 +1116,60 @@ impl<'a> IpcView<'a> {
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
 
-            if oldattr.0 != 0 {
-                let state = mq.queue.state.lock();
-                let nonblock = LinuxOpenFlags::from_bits_truncate(
-                    mq.description.common().status_flags(),
-                )
-                .contains(LinuxOpenFlags::NONBLOCK);
-                let out = crate::linux_abi::LinuxMqAttr {
-                    mq_flags: if nonblock {
-                        LINUX_O_NONBLOCK as i64
-                    } else {
-                        0
-                    },
-                    mq_maxmsg: state.max_msg as i64,
-                    mq_msgsize: state.msg_size as i64,
-                    mq_curmsgs: state.messages.len() as i64,
-                    __reserved: [0; 4],
+            // Snapshot input first: Linux permits newattr and oldattr to alias.
+            let new_flags = if newattr.0 == 0 {
+                None
+            } else {
+                let bytes = match cx.memory.read_bytes(
+                    newattr.0, core::mem::size_of::<crate::linux_abi::LinuxMqAttr>(),
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return Ok(match super::copyout::CopyoutRefusal::from_read_error(error) {
+                            Some(refusal) => refusal.into_outcome(),
+                            None => DispatchOutcome::errno(LINUX_EFAULT),
+                        });
+                    }
                 };
-                drop(state);
-                if cx
-                    .memory
-                    .write_bytes(oldattr.0, zerocopy::IntoBytes::as_bytes(&out))
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
+                let flags = u64::from_ne_bytes(
+                    bytes[..8].try_into().map_err(|_| LINUX_EFAULT)?,
+                );
+                Some(LinuxOpenFlags::from_bits_truncate(flags))
+            };
+            let state = mq.queue.state.lock();
+            let out = crate::linux_abi::LinuxMqAttr {
+                mq_flags: (mq.description.common().status_flags() & LINUX_O_NONBLOCK) as i64,
+                mq_maxmsg: state.max_msg as i64,
+                mq_msgsize: state.msg_size as i64,
+                mq_curmsgs: state.messages.len() as i64,
+                __reserved: [0; 4],
+            };
+            drop(state);
+            let prepared = match super::copyout::prepare(
+                cx.kernel, cx.memory,
+                [super::copyout::UserSlot::optional(
+                    oldattr.0, core::mem::size_of::<crate::linux_abi::LinuxMqAttr>(),
+                )],
+            ) {
+                Ok(prepared) => prepared,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            let (result, effect) = prepared.commit_retaining([zerocopy::IntoBytes::as_bytes(&out)]);
+            if let Err(fault) = result {
+                return Ok(fault.outcome());
+            }
+            if let Some(new_flags) = new_flags {
+                let common = mq.description.common();
+                let cur = common.status_flags();
+                let next = if new_flags.contains(LinuxOpenFlags::NONBLOCK) {
+                    cur | LINUX_O_NONBLOCK
+                } else {
+                    cur & !LINUX_O_NONBLOCK
+                };
+                common.set_status_flags(next);
             }
 
-            if newattr.0 != 0 {
-                let new_attr: crate::linux_abi::LinuxMqAttr =
-                    match read_kernel_struct(&*cx.memory, newattr.0) {
-                        Ok(a) => a,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                let want_nonblock =
-                    (new_attr.mq_flags as u64) & LinuxOpenFlags::NONBLOCK.bits() != 0;
-                if let Some(open_file) = this.open_file(mqd as i32) {
-                    let common = open_file.description.common();
-                    let cur = common.status_flags();
-                    let next = if want_nonblock {
-                        cur | LINUX_O_NONBLOCK
-                    } else {
-                        cur & !LINUX_O_NONBLOCK
-                    };
-                    common.set_status_flags(next);
-                }
-            }
-
+            drop(effect);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
     }
@@ -1340,16 +1347,49 @@ fn mq_wait_interrupted(
         || carrick_signal_linux::has_pending_for(tid.raw())
 }
 
+enum MqueueDeadlineError {
+    Refusal(super::copyout::CopyoutRefusal),
+    Fault(LinuxErrno),
+}
+
+impl MqueueDeadlineError {
+    fn into_outcome(self) -> DispatchOutcome {
+        match self {
+            Self::Refusal(refusal) => refusal.into_outcome(),
+            Self::Fault(errno) => DispatchOutcome::errno(errno),
+        }
+    }
+}
+
 fn read_abs_deadline(
     memory: &impl CurrentMmMemory,
     addr: u64,
-) -> Result<Option<(i64, i64)>, LinuxErrno> {
+) -> Result<Option<(i64, i64)>, MqueueDeadlineError> {
     if addr == 0 {
         return Ok(None);
     }
-    let ts = read_timespec(memory, addr)?;
+    let bytes = memory
+        .read_bytes(addr, core::mem::size_of::<carrick_abi::LinuxTimespec>())
+        .map_err(
+            |error| match super::copyout::CopyoutRefusal::from_read_error(error) {
+                Some(refusal) => MqueueDeadlineError::Refusal(refusal),
+                None => MqueueDeadlineError::Fault(LINUX_EFAULT),
+            },
+        )?;
+    let ts = carrick_abi::LinuxTimespec::new(
+        i64::from_ne_bytes(
+            bytes[..8]
+                .try_into()
+                .map_err(|_| MqueueDeadlineError::Fault(LINUX_EFAULT))?,
+        ),
+        i64::from_ne_bytes(
+            bytes[8..]
+                .try_into()
+                .map_err(|_| MqueueDeadlineError::Fault(LINUX_EFAULT))?,
+        ),
+    );
     if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
-        return Err(LINUX_EINVAL);
+        return Err(MqueueDeadlineError::Fault(LINUX_EINVAL));
     }
     Ok(Some((ts.tv_sec, ts.tv_nsec)))
 }
@@ -1509,6 +1549,44 @@ impl BlockingMqueue {
                 BlockingMqueueStep::Done(DispatchOutcome::Returned { value: 0 })
             }
             BlockingMqueueOperation::Receive { buffer, priority } => {
+                // Hold the queue selection stable through destination admission.
+                // Larger messages require retained multi-permit output (#986)
+                // and remain on the counted path below.
+                let message = &state.messages[0];
+                let output_len = message.payload.len() + if priority.is_some() { 4 } else { 0 };
+                if output_len <= super::copyout::COPYOUT_MAX_BYTES {
+                    let out = match super::copyout::prepare(
+                        kernel,
+                        memory,
+                        [
+                            priority.map(|address| super::copyout::UserSlot::new(address, 4)),
+                            Some(super::copyout::UserSlot::new(buffer, message.payload.len())),
+                        ],
+                    ) {
+                        Ok(out) => out,
+                        Err(refusal) => {
+                            if let Some(waiter) = self._receive_waiter.as_ref() {
+                                waiter.settle();
+                            }
+                            return BlockingMqueueStep::Done(refusal.into_outcome());
+                        }
+                    };
+                    if let Some(waiter) = self._receive_waiter.as_ref() {
+                        waiter.settle();
+                    }
+                    // Linux consumes the selected message on a genuine copy
+                    // fault. Only transient admission refusal preserves it.
+                    let message = state.messages.remove(0);
+                    drop(state);
+                    let (result, effect) =
+                        out.commit_retaining([&message.prio.to_le_bytes(), &message.payload]);
+                    self.queue.publish_change();
+                    drop(effect);
+                    return BlockingMqueueStep::Done(match result {
+                        Ok(()) => DispatchOutcome::returned_len_or_errno(message.payload.len()),
+                        Err(fault) => fault.outcome(),
+                    });
+                }
                 if let Some(waiter) = self._receive_waiter.as_ref() {
                     waiter.settle();
                 }
@@ -1589,6 +1667,215 @@ mod tests {
             )
             .expect("mqueue test syscall must be routed")
             .expect("mqueue test syscall must dispatch")
+    }
+
+    #[test]
+    fn s5_mqueue_dispatch_refusal_preserves_message() {
+        s5_mqueue_refusal_preserves_message(false);
+    }
+
+    #[test]
+    fn s5_mqueue_completion_refusal_preserves_message() {
+        s5_mqueue_refusal_preserves_message(true);
+    }
+
+    fn s5_mqueue_refusal_preserves_message(completion: bool) {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x9000, 0xa5);
+        memory.seed(0x1000, b"s5_refused_queue\0");
+        let call = |memory: &mut OwnerRefusingMemory, number: u64, args: [u64; 6]| {
+            dispatcher
+                .dispatch_normalized(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &CompatReporter::default(),
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let mqd = returned_fd(call(
+            &mut memory,
+            180,
+            [
+                0x1000,
+                LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_EXCL,
+                0o600,
+                0,
+                0,
+                0,
+            ],
+        ));
+        {
+            let pending = if completion {
+                let DispatchOutcome::BlockingMqueue(wait) =
+                    call(&mut memory, 183, [mqd as u64, 0x3000, 8192, 0x4000, 0, 0])
+                else {
+                    panic!("empty queue must wait")
+                };
+                Some(wait)
+            } else {
+                None
+            };
+            memory.seed(0x2000, b"retained message");
+            memory.seed(0x3000, &[0xa5; 16]);
+            memory.seed(0x4000, &[0xa5; 4]);
+            assert_eq!(
+                call(&mut memory, 182, [mqd as u64, 0x2000, 16, 23, 0, 0]),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            let stale_pending = pending.clone();
+            let queue = dispatcher.ipc_view().mq_description(mqd).unwrap().queue;
+            if !completion {
+                memory.seed(0x5000, &i64::MAX.to_ne_bytes());
+                memory.seed(0x5008, &0i64.to_ne_bytes());
+                let read_wait = memory.refuse_next_read();
+                assert_eq!(
+                    call(
+                        &mut memory,
+                        183,
+                        [mqd as u64, 0x3000, 8192, 0x4000, 0x5000, 0]
+                    ),
+                    DispatchOutcome::OwnerMemoryWait {
+                        wait: read_wait,
+                        committed: 0
+                    }
+                );
+                assert_eq!(queue.state.lock().messages.len(), 1);
+            }
+            let wait = memory.refuse_next();
+            let outcome = if let Some(pending) = pending {
+                match pending.complete(&dispatcher, &context, &mut memory) {
+                    BlockingMqueueStep::Done(outcome) => outcome,
+                    _ => panic!("ready completion must not wait on queue"),
+                }
+            } else {
+                call(&mut memory, 183, [mqd as u64, 0x3000, 8192, 0x4000, 0, 0])
+            };
+            assert_eq!(
+                outcome,
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(queue.state.lock().messages.len(), 1);
+            assert_eq!(
+                queue.blocked_receivers.load(Ordering::Acquire),
+                0,
+                "a refused completion settles its old waiter even with a stale clone"
+            );
+            drop(stale_pending);
+            assert_eq!(memory.inner.read_bytes(0x3000, 16).unwrap(), vec![0xa5; 16]);
+            assert_eq!(memory.inner.read_bytes(0x4000, 4).unwrap(), vec![0xa5; 4]);
+            assert_eq!(
+                call(&mut memory, 183, [mqd as u64, 0x3000, 8192, 0x4000, 0, 0]),
+                DispatchOutcome::Returned { value: 16 }
+            );
+            assert!(queue.state.lock().messages.is_empty());
+            assert_eq!(memory.read_bytes(0x3000, 16).unwrap(), b"retained message");
+            assert_eq!(memory.read_bytes(0x4000, 4).unwrap(), 23u32.to_le_bytes());
+            assert_eq!(
+                call(&mut memory, 182, [mqd as u64, 0x2000, 16, 23, 0, 0]),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            memory.seed(0x4000, &[0xa5; 4]);
+            assert_eq!(
+                call(&mut memory, 183, [mqd as u64, 0, 8192, 0x4000, 0, 0]),
+                DispatchOutcome::errno(LINUX_EFAULT)
+            );
+            assert!(queue.state.lock().messages.is_empty());
+            assert_eq!(memory.read_bytes(0x4000, 4).unwrap(), 23u32.to_le_bytes());
+            assert_eq!(
+                call(&mut memory, 182, [mqd as u64, 0x2000, 0, 23, 0, 0]),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            let prepares = memory.prepares;
+            let _wait = memory.refuse_next();
+            assert_eq!(
+                call(&mut memory, 183, [mqd as u64, 0, 8192, 0, 0, 0]),
+                DispatchOutcome::Returned { value: 0 }
+            );
+            assert_eq!(
+                memory.prepares, prepares,
+                "zero payload without priority has no output"
+            );
+        }
+    }
+
+    #[test]
+    fn s5_mqueue_attributes_snapshot_input_and_refuse_before_mutation() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x9000, 0xa5);
+        memory.seed(0x1000, b"s5_attributes\0");
+        let call = |memory: &mut OwnerRefusingMemory, number: u64, args: [u64; 6]| {
+            dispatcher
+                .dispatch_normalized(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &CompatReporter::default(),
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let mqd = returned_fd(call(
+            &mut memory,
+            180,
+            [
+                0x1000,
+                LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_EXCL,
+                0o600,
+                0,
+                0,
+                0,
+            ],
+        ));
+        memory.seed(0x2000, &[0; 64]);
+        memory.seed(0x2000, &(LINUX_O_NONBLOCK as i64).to_ne_bytes());
+        let before = memory.read_bytes(0x2000, 64).unwrap();
+        for read in [true, false] {
+            let wait = if read {
+                memory.refuse_next_read()
+            } else {
+                memory.refuse_next()
+            };
+            assert_eq!(
+                call(&mut memory, 185, [mqd as u64, 0x2000, 0x2000, 0, 0, 0]),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            );
+            assert_eq!(memory.read_bytes(0x2000, 64).unwrap(), before);
+            assert_eq!(
+                dispatcher
+                    .ipc_view()
+                    .mq_description(mqd)
+                    .unwrap()
+                    .description
+                    .common()
+                    .status_flags()
+                    & LINUX_O_NONBLOCK,
+                0
+            );
+        }
+        assert_eq!(
+            call(&mut memory, 185, [mqd as u64, 0x2000, 0x2000, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            dispatcher
+                .ipc_view()
+                .mq_description(mqd)
+                .unwrap()
+                .description
+                .common()
+                .status_flags()
+                & LINUX_O_NONBLOCK,
+            LINUX_O_NONBLOCK
+        );
+        assert_eq!(memory.read_bytes(0x2000, 8).unwrap(), 0i64.to_ne_bytes());
     }
 
     fn returned_fd(outcome: DispatchOutcome) -> i32 {
