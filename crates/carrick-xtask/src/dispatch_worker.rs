@@ -1505,6 +1505,18 @@ fn worker_checkpoint(state: &Path, dispatch: &Dispatch) -> Result<Option<Receipt
     Ok(Some(receipt))
 }
 
+/// Re-pair the checkpoint receipt with the tree after publication moved HEAD.
+fn refresh_checkpoint_head(state: &Path, work: &Path) -> Result<(), ScalerError> {
+    use std::io::Write;
+    let path = state.join("receipt.json");
+    let mut receipt: Value = serde_json::from_str(&regular_text(&path)?)?;
+    receipt["head"] = git(work, &["rev-parse", "HEAD"])?.trim().into();
+    let mut next = tempfile::NamedTempFile::new_in(state)?;
+    next.write_all(&serde_json::to_vec(&receipt)?)?;
+    next.persist(&path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// Publish a fully validated candidate, rolling back the tree if receipt commit
 /// fails. The last good pair remains untouched during harvesting and rendering.
 fn install_worker_checkpoint(
@@ -3174,6 +3186,8 @@ fn publish_commits(
     if work.is_dir()
         && (dispatch.resume || git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base)
     {
+        // Keep the commits on any later refusal, even before main is known.
+        *preserve = Some(receipt.base.clone());
         git(
             &work,
             &["merge-base", "--is-ancestor", &receipt.base, "HEAD"],
@@ -3235,11 +3249,25 @@ fn publish_commits(
                     .lines()
                     .collect::<Vec<_>>()
                     .join(", ");
-                git(&work, &["rebase", "--abort"])?;
+                // The abort must not hide why the rebase failed.
+                let aborted = git(&work, &["rebase", "--abort"]);
                 return Err(ScalerError::Usage(format!(
-                    "Rebase onto current main conflicts (main changed workflow files after the run's base); the run's commits are intact. Conflicting files: {conflicts}: {error}"
+                    "Rebase onto current main conflicts (main changed workflow files after the run's base){}; the run's commits are intact. Conflicting files: {conflicts}: {error}",
+                    if aborted.is_err() {
+                        ", and the rebase could not be aborted"
+                    } else {
+                        ""
+                    }
                 )));
             }
+            if git(&work, &["rev-parse", "HEAD"])?.trim() == live_main {
+                return Err(ScalerError::Usage(
+                    "Nothing left to publish: every run commit is already in current main".into(),
+                ));
+            }
+            // The tree and receipt are one pair: a later publish or worker turn
+            // reads the checkpoint and must see the rebased head.
+            refresh_checkpoint_head(&state, &work)?;
             base = live_main.clone();
             *preserve = Some(base.clone());
         }
@@ -4568,6 +4596,11 @@ fi
             )
             .unwrap();
             receipt.pr_body = Some("Publish the owner's change.".into());
+            std::fs::write(
+                state.join("receipt.json"),
+                serde_json::to_vec(&receipt).unwrap(),
+            )
+            .unwrap();
             let result = publish(
                 &work,
                 &dispatch,
@@ -4608,6 +4641,12 @@ fi
                     "worker\n"
                 );
                 assert!(outer.join("push.args").exists());
+                // The rebased tree and its receipt stay one valid checkpoint.
+                let paired = worker_checkpoint(&state, &dispatch).unwrap().unwrap();
+                assert_eq!(
+                    paired.head,
+                    git(&work, &["rev-parse", "HEAD"]).unwrap().trim()
+                );
                 assert_eq!(
                     Applied::load().unwrap().rebased_onto.as_deref(),
                     Some(main.as_str())
