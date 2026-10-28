@@ -399,6 +399,7 @@ pub struct LogicalRecordLockState {
         RecordLockWaitId,
         (LogicalRecordLockOwner, LogicalRecordLockOwner),
     >,
+    pub(in crate::dispatch::fs) suspended_copyouts: Vec<super::SuspendedCopyout>,
 }
 
 impl LogicalRecordLockState {
