@@ -390,7 +390,7 @@ contracts = ["kernel.memory.owner-wait", "kernel.mm.native-code-content", "kerne
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs"
-contracts = ["kernel.mm.native-code-content"]
+contracts = ["kernel.mm.native-code-content", "kernel.el1.anonymous-reservations"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/global_frame/grant_ledger.rs"
@@ -2102,4 +2102,8 @@ contracts = ["kernel.el1.anonymous-reservations"]
 
 [[surfaces]]
 path = "crates/carrick-core/src/mm/reservation/root.rs"
+contracts = ["kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-thread/src/physical_retirement.rs"
 contracts = ["kernel.el1.anonymous-reservations"]

@@ -7,6 +7,7 @@
 
 use super::*;
 pub(crate) use carrick_thread::physical_grant::{PhysicalGrantCompletion, PhysicalGrantWait};
+use carrick_thread::physical_retirement::{PhysicalRetirementCompletion, RetirementPublication};
 
 #[derive(::core::fmt::Debug)]
 pub(crate) struct GlobalFrameIpaAllocator {
@@ -422,6 +423,165 @@ mod allocator_stats_tests {
                 2 * scale * length
             );
         }
+    }
+
+    #[test]
+    fn physical_retirement_enrollment_and_last_pin_use_the_existing_idle_owner() {
+        use carrick_guest_mem::PhysicalMemoryWait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _guard = global_frame_allocator_test_lock().lock();
+        for enroll_after_unpin in [false, true] {
+            let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+            let (base, owner) = grant_owned(&custody);
+            let (peer_base, peer) = grant_owned(&custody);
+            let wait = owner.retirement.wait();
+            let pin = owner.pin().unwrap();
+            let length = owner.length();
+            assert!(matches!(
+                retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    base,
+                    length,
+                    owner.generation(),
+                    &mut |_, _| Ok(())
+                ),
+                GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+            ));
+            let mut pin = Some(pin);
+            if enroll_after_unpin {
+                drop(pin.take());
+            }
+            let count = std::sync::Arc::new(AtomicUsize::new(0));
+            let observed = count.clone();
+            let weak = std::sync::Arc::downgrade(&custody);
+            let (_enrollment, ready) = wait.enroll(std::sync::Arc::new(move || {
+                let custody = weak.upgrade().unwrap();
+                assert!(custody.global_frame_host_owners.try_lock().is_some());
+                assert!(custody.pending_global_frame_owners.try_lock().is_some());
+                assert!(custody.fork_stock.try_lock().is_some());
+                observed.fetch_add(1, Ordering::SeqCst);
+            }));
+            assert!(!ready, "pin drop alone is not terminal stage-2 release");
+            // An unrelated exact record completes without waking this wait.
+            assert!(
+                retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    peer_base,
+                    peer.length(),
+                    peer.generation(),
+                    &mut |_, _| Ok(())
+                )
+                .is_retired()
+            );
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert_eq!(wait.receipt(), None);
+            drop(pin.take());
+            let mut unmaps = 0;
+            let report =
+                retry_pending_global_frame_retirements_at_idle_in_using(&custody, &mut |_, _| {
+                    unmaps += 1;
+                    Ok(())
+                });
+            assert_eq!(report.remaining, 0);
+            assert_eq!(unmaps, 1);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert_eq!(wait.receipt(), Some(owner.record_identity));
+            // Completion proof remains bound to this exact record after reuse.
+            // Rebind the same coordinates explicitly rather than relying on
+            // the allocator's best-fit choice among unrelated free extents.
+            let reused_base = base;
+            let mut lease = GlobalFrameStage2Lease::fixed(reused_base, length);
+            lease.mark_mapped();
+            let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                length as usize,
+                crate::host_mapping::HostMappingKind::FrameCow,
+            )
+            .unwrap();
+            register_global_frame_host_owner_in(&custody, lease, host, 3).unwrap();
+            let successor = std::sync::Arc::clone(
+                custody
+                    .global_frame_host_owners
+                    .lock()
+                    .get(&(reused_base, length))
+                    .unwrap()
+                    .owner(),
+            );
+            assert_ne!(successor.record_identity, owner.record_identity);
+            assert_eq!(successor.retirement.wait().receipt(), None);
+            assert_eq!(wait.receipt(), Some(owner.record_identity));
+            assert!(
+                retire_global_frame_host_owner_if_generation_in_using(
+                    &custody,
+                    reused_base,
+                    successor.length(),
+                    successor.generation(),
+                    &mut |_, _| Ok(())
+                )
+                .is_retired()
+            );
+            let (_late_enrollment, ready) = wait.enroll(std::sync::Arc::new(|| {}));
+            assert!(ready, "one probe observes completion before enrollment");
+            let report =
+                retry_pending_global_frame_retirements_at_idle_in_using(&custody, &mut |_, _| {
+                    panic!("completed retirement must not unmap twice")
+                });
+            assert_eq!(report.remaining, 0);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn physical_retirement_failed_finalization_preserves_pending_completion() {
+        use carrick_guest_mem::PhysicalMemoryWait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _guard = global_frame_allocator_test_lock().lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let (base, owner) = grant_owned(&custody);
+        let wait = owner.retirement.wait();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        let (_enrollment, ready) = wait.enroll(std::sync::Arc::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(!ready);
+        assert_eq!(
+            custody.retire_stage2_record_using(owner.record_identity, |_, _| Ok(())),
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+        assert!(
+            finalize_global_frame_owner_record_using(&custody, &owner, &mut |_, _| {
+                Err(TrapError::Hypervisor(
+                    "injected allocation release failure".into(),
+                ))
+            })
+            .is_err()
+        );
+        assert_eq!(wait.receipt(), None);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        // Retry uses the same owner; terminal readiness is not inferred from
+        // the already-unmapped record or a successful unmap alone.
+        assert!(
+            retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                base,
+                owner.length(),
+                owner.generation(),
+                &mut |_, _| panic!("unmap already completed before failed finalization")
+            )
+            .is_retired()
+        );
+        assert_eq!(wait.receipt(), Some(owner.record_identity));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "foreground owner must not invoke callbacks"
+        );
+        let report =
+            retry_pending_global_frame_retirements_at_idle_in_using(&custody, &mut |_, _| {
+                panic!("terminal notification cannot unmap")
+            });
+        assert_eq!(report.remaining, 0);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1105,6 +1265,8 @@ unsafe impl Sync for GlobalFrameSharedMapping {}
 #[derive(::core::fmt::Debug)]
 pub(crate) struct GlobalFrameHostOwner {
     grant_publication: std::sync::OnceLock<std::sync::Weak<PhysicalGrantWait>>,
+    pub(crate) retirement: PhysicalRetirementCompletion<CarrierStage2RecordIdentity>,
+    retirement_publication: parking_lot::Mutex<Option<RetirementPublication>>,
     pub(crate) mapping: std::sync::Arc<GlobalFrameSharedMapping>,
     pub(crate) custody: std::sync::Weak<CarrierVmCustody>,
     pub(crate) record_identity: CarrierStage2RecordIdentity,
@@ -1134,6 +1296,8 @@ impl GlobalFrameHostOwner {
     ) -> Self {
         Self {
             grant_publication: std::sync::OnceLock::new(),
+            retirement: PhysicalRetirementCompletion::new(record_identity),
+            retirement_publication: parking_lot::Mutex::new(None),
             mapping,
             custody: std::sync::Arc::downgrade(&custody),
             record_identity,
@@ -1250,7 +1414,7 @@ impl GlobalFrameHostOwner {
     }
 
     #[cfg(test)]
-    pub(crate) fn try_retire(&self) -> Result<(), TrapError> {
+    pub(crate) fn try_retire(self: &std::sync::Arc<Self>) -> Result<(), TrapError> {
         let custody = self.custody.upgrade().ok_or_else(|| {
             TrapError::Hypervisor("global owner carrier custody disappeared".to_owned())
         })?;
@@ -2541,7 +2705,7 @@ pub(crate) fn cow_diagnostic_history() -> &'static parking_lot::Mutex<CowDiagnos
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn finalize_global_frame_owner_record(
     custody: &CarrierVmCustody,
-    owner: &GlobalFrameHostOwner,
+    owner: &std::sync::Arc<GlobalFrameHostOwner>,
 ) -> Result<(), TrapError> {
     finalize_global_frame_owner_record_using(custody, owner, &mut release_retired_stage2_ipa)
 }
@@ -2549,7 +2713,7 @@ pub(crate) fn finalize_global_frame_owner_record(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn finalize_global_frame_owner_record_using(
     custody: &CarrierVmCustody,
-    owner: &GlobalFrameHostOwner,
+    owner: &std::sync::Arc<GlobalFrameHostOwner>,
     release_ipa_fn: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
 ) -> Result<(), TrapError> {
     let mut receipt = owner.mapping.el1_grant.lock();
@@ -2562,6 +2726,20 @@ pub(crate) fn finalize_global_frame_owner_record_using(
         )?;
     } else {
         finalize_terminal_stage2_record_using(custody, owner.record_identity, release_ipa_fn)?;
+    }
+    drop(receipt);
+    if let Some(publication) = owner
+        .retirement
+        .complete(owner.record_identity)
+        .map_err(|_| {
+            TrapError::Hypervisor("physical retirement completion identity mismatch".into())
+        })?
+    {
+        // The caller may still hold ForkStock or the global owner directory.
+        // Keep notification effects in this same owner; only the named idle
+        // retirement boundary publishes callbacks after those guards drop.
+        *owner.retirement_publication.lock() = Some(publication);
+        retain_pending_global_frame_owner(custody, std::sync::Arc::clone(owner));
     }
     Ok(())
 }
@@ -2994,14 +3172,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
         .collect::<Vec<_>>();
     for owner in detached {
         let Some(snapshot) = custody.stage2_record_snapshot(owner.record_identity.record_id) else {
-            custody
-                .pending_global_frame_owners
-                .lock()
-                .remove(&owner.record_identity.record_id);
-            custody
-                .pending_global_frame_detached_retries
-                .lock()
-                .complete(owner.record_identity.record_id);
+            finish_pending_global_frame_owner(custody, &owner);
             continue;
         };
         if !snapshot.terminalized_by_vm_destroy || snapshot.pin_count != 0 {
@@ -3009,14 +3180,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             continue;
         }
         finalize_global_frame_owner_record_using(custody, &owner, release_ipa)?;
-        custody
-            .pending_global_frame_owners
-            .lock()
-            .remove(&owner.record_identity.record_id);
-        custody
-            .pending_global_frame_detached_retries
-            .lock()
-            .complete(owner.record_identity.record_id);
+        finish_pending_global_frame_owner(custody, &owner);
         report.retired += 1;
     }
 
@@ -3560,10 +3724,7 @@ pub(crate) fn retry_pending_global_frame_retirements_in_using(
                 | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
         ) && finalize_global_frame_owner_record(custody, &owner).is_ok()
         {
-            custody
-                .pending_global_frame_owners
-                .lock()
-                .remove(&owner.record_identity.record_id);
+            finish_pending_global_frame_owner(custody, &owner);
         }
     }
 
@@ -3693,6 +3854,28 @@ pub(crate) fn retain_pending_global_frame_owner(
     custody.enqueue_detached_global_frame_retirement(record_id);
 }
 
+/// Completed notification effects remain with the existing physical owner
+/// until the idle boundary can publish them without an outer owner guard.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn finish_pending_global_frame_owner(
+    custody: &CarrierVmCustody,
+    owner: &std::sync::Arc<GlobalFrameHostOwner>,
+) {
+    let record_id = owner.record_identity.record_id;
+    if owner.retirement_publication.lock().is_some() {
+        custody.enqueue_detached_global_frame_retirement(record_id);
+        return;
+    }
+    custody
+        .pending_global_frame_owners
+        .lock()
+        .remove(&record_id);
+    custody
+        .pending_global_frame_detached_retries
+        .lock()
+        .complete(record_id);
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PendingGlobalFrameRetirementTurn<'a>(&'a CarrierVmCustody);
 
@@ -3736,6 +3919,7 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
     }
     let _turn = PendingGlobalFrameRetirementTurn(custody);
     let mut report = PendingGlobalFrameRetirementTurnReport::default();
+    let mut publications = Vec::new();
     let directory_attempts = custody
         .pending_global_frame_directory_retries
         .lock()
@@ -3810,6 +3994,15 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
                 .complete(record_id);
             continue;
         };
+        // An earlier foreground turn may have finalized this exact record.
+        // Absence alone never certifies release; only its retained publication
+        // permits this notification-only completion of existing owner work.
+        let publication = owner.retirement_publication.lock().take();
+        if let Some(publication) = publication {
+            publications.push(publication);
+            finish_pending_global_frame_owner(custody, &owner);
+            continue;
+        }
         let outcome = custody.retire_stage2_record_using(owner.record_identity, &mut *unmap);
         let completed = matches!(
             outcome,
@@ -3817,14 +4010,11 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
                 | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
         ) && finalize_global_frame_owner_record(custody, &owner).is_ok();
         if completed {
-            custody
-                .pending_global_frame_owners
-                .lock()
-                .remove(&record_id);
-            custody
-                .pending_global_frame_detached_retries
-                .lock()
-                .complete(record_id);
+            let publication = owner.retirement_publication.lock().take();
+            if let Some(publication) = publication {
+                publications.push(publication);
+            }
+            finish_pending_global_frame_owner(custody, &owner);
         } else {
             custody
                 .pending_global_frame_detached_retries
@@ -3837,6 +4027,9 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
         + custody.pending_global_frame_detached_retries.lock().len();
     if report.remaining != 0 {
         custody.request_global_frame_retirement_retry();
+    }
+    for publication in publications {
+        publication.publish();
     }
     report
 }

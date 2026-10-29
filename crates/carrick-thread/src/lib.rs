@@ -5,6 +5,7 @@
 pub mod completion;
 pub mod fork_quiesce;
 pub mod physical_grant;
+pub mod physical_retirement;
 /// One `PlatformFutex` impl over the shared `FutexTable` + a per-host
 /// `SharedFutexSyscall` shim (replaces the per-backend `KvmFutex`/`BhyveFutex`).
 pub mod platform_futex;
