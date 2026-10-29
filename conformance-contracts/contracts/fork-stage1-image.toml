@@ -1,3 +1,6 @@
+# #992: remove unused FsCrossSubsystem::take_signalfd_bytes from dispatcher.rs
+# when unifying read_signalfd onto dispatch::signal::read_signalfd; no change
+# to fork stage-1 image semantics or structural budgets.
 # #898 diagnostic-only: entry_binding fatals now retain their invariant
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:

@@ -8,6 +8,9 @@ scale_points = [1]
 structural_budgets = []
 rationale = "The EL1 IPC namespace and kernel dispatcher consume one shared permission decision over typed IpcMode bitflags and domain-specific UID/GID types. A task's effective credentials and supplementary groups (including launch-time /etc/group fallback) decide its class exactly once, and CAP_IPC_OWNER (not raw euid 0) grants the privilege bypass."
 
+# #992 removes unused FsCrossSubsystem::take_signalfd_bytes from dispatcher.rs
+# and delegates FsView::read_signalfd to dispatch::signal::read_signalfd; IPC
+# permission selection is unchanged and retains the existing shm_permission_* controls.
 # S5 changes post-permission output admission in sysv.rs. Rerun the existing
 # dispatcher shm_permission controls below; the new s5_sysv witnesses
 # prove owner-memory refusal, not additional permission classes.

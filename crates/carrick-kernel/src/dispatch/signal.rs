@@ -245,6 +245,135 @@ pub(crate) fn signal_authority_for(
     )
 }
 
+const SIGNALFD_SIGINFO_LEN: usize = 128;
+
+/// Choose and dequeue the lowest deliverable pending signal for `tid` with its
+/// owner and siginfo in one transaction. Thread-directed state wins a
+/// same-signum tie.
+fn take_pending_signal_in(
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+    set: SigSet,
+) -> Option<DispatchPendingSignal> {
+    let dequeued = signal_authority_for(context, tid).take_lowest_in(set)?;
+    Some(DispatchPendingSignal {
+        signum: dequeued.pending.signal.raw(),
+        owner: dequeued.owner,
+        siginfo: dequeued.pending.siginfo,
+        job_control_generation: dequeued.job_control_generation,
+    })
+}
+
+fn take_one_signalfd_record(
+    context: &crate::kernel::KernelContext,
+    tid: crate::thread::ThreadId,
+    mask: SigSet,
+) -> Option<[u8; SIGNALFD_SIGINFO_LEN]> {
+    let pending = take_pending_signal_in(context, tid, mask)?;
+    let mut rec = [0u8; SIGNALFD_SIGINFO_LEN];
+    // ssi_signo @0.
+    rec[0..4].copy_from_slice(&(pending.signum as u32).to_le_bytes());
+    // Payload and pending owner were dequeued together.
+    if let Some(info) = pending.siginfo {
+        rec[8..12].copy_from_slice(&info.si_code.to_le_bytes()); // ssi_code @8
+        let pid = (info.si_addr & 0xffff_ffff) as u32;
+        let uid = (info.si_addr >> 32) as u32;
+        rec[12..16].copy_from_slice(&pid.to_le_bytes()); // ssi_pid @12
+        rec[16..20].copy_from_slice(&uid.to_le_bytes()); // ssi_uid @16
+    }
+    Some(rec)
+}
+
+/// Shared `read(2)` implementation for a `signalfd`, reached by both ordinary
+/// descriptor reads (`FsView::read_signalfd`) and the dispatcher wrapper
+/// (`SignalView::read_signalfd` / `SyscallDispatcher::read_signalfd`).
+///
+/// Drains deliverable pending signals matching `mask` for `tid` into 128-byte
+/// `struct signalfd_siginfo` records one permit-sized record step at a time:
+/// - buffers smaller than one record return `EINVAL` without preparing output;
+/// - empty queues return `EAGAIN` without preparing output;
+/// - transient owner-memory refusals suspend (or return already-committed
+///   prefix bytes) without consuming the refused record's signal;
+/// - genuine address faults consume the faulting signal and return `EFAULT`
+///   (or already-committed prefix bytes).
+pub(in crate::dispatch) fn read_signalfd<M: CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
+    memory: &mut M,
+    address: u64,
+    length: usize,
+    mask: SigSet,
+    tid: crate::thread::ThreadId,
+) -> DispatchOutcome {
+    if length < SIGNALFD_SIGINFO_LEN {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    }
+    let max_records = length / SIGNALFD_SIGINFO_LEN;
+    let mut written = 0usize;
+    for _ in 0..max_records {
+        // Peek with the exact deliverability predicate used by `take_lowest_in`
+        // before securing one 128-byte record permit so an empty nonblocking
+        // read neither faults nor waits on an unused destination.
+        if !signal_authority_for(context, tid).has_deliverable_in(mask) {
+            break;
+        }
+        let Some(record_address) = address.checked_add(written as u64) else {
+            if take_pending_signal_in(context, tid, mask).is_none() {
+                break;
+            }
+            return if written == 0 {
+                DispatchOutcome::errno(LINUX_EFAULT)
+            } else {
+                DispatchOutcome::returned_len_or_errno(written)
+            };
+        };
+        let destination = match crate::dispatch::copyout::prepare_array(
+            context,
+            memory,
+            carrick_guest_mem::GuestVa::new(record_address),
+            1,
+            SIGNALFD_SIGINFO_LEN,
+        ) {
+            Ok(out) => out,
+            Err(refusal) => {
+                return if written == 0 {
+                    refusal.into_outcome()
+                } else {
+                    DispatchOutcome::returned_len_or_errno(written)
+                };
+            }
+        };
+        if destination.records() == 0 {
+            // Linux dequeues the signal whose record copy hits a genuine
+            // address fault; only a transient owner refusal above preserves it.
+            if take_pending_signal_in(context, tid, mask).is_none() {
+                break;
+            }
+            return if written == 0 {
+                DispatchOutcome::errno(LINUX_EFAULT)
+            } else {
+                DispatchOutcome::returned_len_or_errno(written)
+            };
+        }
+        let Some(record) = take_one_signalfd_record(context, tid, mask) else {
+            let _ = destination.commit(&[]);
+            break;
+        };
+        if let Err(fault) = destination.commit(&record) {
+            return if written == 0 {
+                fault.outcome()
+            } else {
+                DispatchOutcome::returned_len_or_errno(written)
+            };
+        }
+        written += record.len();
+    }
+    if written == 0 {
+        DispatchOutcome::errno(LINUX_EAGAIN)
+    } else {
+        DispatchOutcome::returned_len_or_errno(written)
+    }
+}
+
 pub(crate) fn any_thread_blocks(threads: &[crate::kernel::ThreadRef], signum: i32) -> bool {
     threads
         .iter()
@@ -1140,23 +1269,13 @@ impl<'a> SignalView<'a> {
         tid: crate::thread::ThreadId,
         set: SigSet,
     ) -> Option<DispatchPendingSignal> {
-        let dequeued = Self::signal_authority_for(context, tid).take_lowest_in(set)?;
-        Some(DispatchPendingSignal {
-            signum: dequeued.pending.signal.raw(),
-            owner: dequeued.owner,
-            siginfo: dequeued.pending.siginfo,
-            job_control_generation: dequeued.job_control_generation,
-        })
+        take_pending_signal_in(context, tid, set)
     }
 
     /// `read(2)` on a signalfd: drain pending signals matching the fd's `mask`
     /// for `tid` into `struct signalfd_siginfo` (128-byte) records, consuming
-    /// them. Each record fills `ssi_signo`, and — when a queued
-    /// `rt_sigqueueinfo` payload exists — `ssi_code`/`ssi_pid`/`ssi_uid`.
-    /// Mirrors the inotify read path: a buffer smaller than one record → EINVAL;
-    /// an empty queue → EAGAIN (signalfd is overwhelmingly used non-blocking +
-    /// epoll; a true blocking wait on the backing readiness is a tracked
-    /// follow-up). (audit H4)
+    /// them.
+    #[inline]
     pub fn read_signalfd<M: CurrentMmMemory>(
         &self,
         context: &crate::kernel::KernelContext,
@@ -1166,99 +1285,7 @@ impl<'a> SignalView<'a> {
         mask: SigSet,
         tid: crate::thread::ThreadId,
     ) -> DispatchOutcome {
-        const SIGINFO_LEN: usize = 128;
-        if length < SIGINFO_LEN {
-            return DispatchOutcome::errno(LINUX_EINVAL);
-        }
-        let mut written = 0;
-        let capacity = length.min(crate::dispatch::copyout::COPYOUT_MAX_BYTES) / SIGINFO_LEN;
-        for _ in 0..capacity {
-            // Peek before securing exactly one record. In particular, an empty
-            // nonblocking read must not fault or wait on an unused destination.
-            if !Self::signal_authority_for(context, tid).has_pending_in(mask) {
-                break;
-            }
-            let Some(record_address) = address.checked_add(written as u64) else {
-                let _ = self.take_pending_in_from(context, tid, mask);
-                return if written == 0 {
-                    DispatchOutcome::errno(LINUX_EFAULT)
-                } else {
-                    DispatchOutcome::returned_len_or_errno(written)
-                };
-            };
-            let destination = match crate::dispatch::copyout::prepare_array(
-                context,
-                memory,
-                carrick_guest_mem::GuestVa::new(record_address),
-                1,
-                SIGINFO_LEN,
-            ) {
-                Ok(out) => out,
-                Err(refusal) => {
-                    return if written == 0 {
-                        refusal.into_outcome()
-                    } else {
-                        DispatchOutcome::returned_len_or_errno(written)
-                    };
-                }
-            };
-            if destination.records() == 0 {
-                // Linux dequeues the signal whose record copy hits a genuine
-                // address fault. Only an owner refusal above preserves it.
-                let _ = self.take_pending_in_from(context, tid, mask);
-                return if written == 0 {
-                    DispatchOutcome::errno(LINUX_EFAULT)
-                } else {
-                    DispatchOutcome::returned_len_or_errno(written)
-                };
-            }
-            let out = self.take_signalfd_bytes(context, tid, mask, 1);
-            if out.is_empty() {
-                break;
-            }
-            if let Err(fault) = destination.commit(&out) {
-                return if written == 0 {
-                    fault.outcome()
-                } else {
-                    DispatchOutcome::returned_len_or_errno(written)
-                };
-            }
-            written += out.len();
-        }
-        if written == 0 {
-            DispatchOutcome::errno(LINUX_EAGAIN)
-        } else {
-            DispatchOutcome::returned_len_or_errno(written)
-        }
-    }
-
-    pub(crate) fn take_signalfd_bytes(
-        &self,
-        context: &crate::kernel::KernelContext,
-        tid: crate::thread::ThreadId,
-        mask: SigSet,
-        max: usize,
-    ) -> Vec<u8> {
-        const SIGINFO_LEN: usize = 128;
-        let mut out = Vec::new();
-        for _ in 0..max {
-            let Some(pending) = self.take_pending_in_from(context, tid, mask) else {
-                break;
-            };
-            let mut rec = [0u8; SIGINFO_LEN];
-            // ssi_signo @0.
-            rec[0..4].copy_from_slice(&(pending.signum as u32).to_le_bytes());
-            // Payload and pending owner were dequeued together.
-            if let Some(info) = pending.siginfo {
-                rec[8..12].copy_from_slice(&info.si_code.to_le_bytes()); // ssi_code @8
-                let pid = (info.si_addr & 0xffff_ffff) as u32;
-                let uid = (info.si_addr >> 32) as u32;
-                rec[12..16].copy_from_slice(&pid.to_le_bytes()); // ssi_pid @12
-                rec[16..20].copy_from_slice(&uid.to_le_bytes()); // ssi_uid @16
-            }
-            out.extend_from_slice(&rec);
-        }
-        out
+        read_signalfd(context, memory, address, length, mask, tid)
     }
 
     /// Record a PROCESS-directed signal in the SHARED pending set (no thread
@@ -3079,18 +3106,6 @@ impl SyscallDispatcher {
     }
 
     #[inline]
-    pub(crate) fn take_signalfd_bytes(
-        &self,
-        context: &crate::kernel::KernelContext,
-        tid: crate::thread::ThreadId,
-        mask: SigSet,
-        max: usize,
-    ) -> Vec<u8> {
-        self.signal_view()
-            .take_signalfd_bytes(context, tid, mask, max)
-    }
-
-    #[inline]
     pub fn mark_process_signal_pending(&self, context: &crate::kernel::KernelContext, signum: i32) {
         self.signal_view()
             .mark_process_signal_pending(context, signum)
@@ -3814,6 +3829,265 @@ mod tests {
                 dispatcher
                     .take_pending_in_from(&context, tid, mask)
                     .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn signalfd_read_entry_points_share_owner_copyout_fault_and_multi_permit_semantics() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        use crate::dispatch::{CompatReporter, SyscallArgs, SyscallDispatcher, SyscallRequest};
+        use crate::linux_abi::LINUX_SI_QUEUE;
+        use carrick_abi::syscall::nr;
+
+        const BASE: u64 = 0x2000_0000;
+        const MASK_ADDR: u64 = BASE;
+        const OUT: u64 = BASE + 0x100;
+        const RO_OUT: u64 = BASE + 0x3000;
+        const FILL: u8 = 0xa5;
+        const RT_SIG: i32 = 34;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Entry {
+            OrdinaryFdRead,
+            DispatcherWrapper,
+        }
+
+        for entry in [Entry::OrdinaryFdRead, Entry::DispatcherWrapper] {
+            let mut dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let tid = context.thread().registry_id();
+            let mask = SigSet::EMPTY.with(RT_SIG);
+            let reporter = CompatReporter::default();
+            let mut memory = OwnerRefusingMemory::new(BASE, 0x4000, FILL);
+            memory.seed(MASK_ADDR, &mask.raw().to_le_bytes());
+            memory.protect_readonly(RO_OUT, 128);
+
+            let sfd = match dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        nr::SIGNALFD4.raw(),
+                        SyscallArgs::from([
+                            (-1i64) as u64,
+                            MASK_ADDR,
+                            8,
+                            carrick_abi::LinuxOpenFlags::NONBLOCK.bits(),
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap()
+            {
+                DispatchOutcome::Returned { value } => value as i32,
+                other => panic!("signalfd4 failed for {entry:?}: {other:?}"),
+            };
+
+            let invoke = |dispatcher: &mut SyscallDispatcher,
+                          memory: &mut OwnerRefusingMemory,
+                          addr: u64,
+                          len: usize| {
+                match entry {
+                    Entry::OrdinaryFdRead => dispatcher
+                        .dispatch(
+                            &context,
+                            SyscallRequest::new(
+                                nr::READ.raw(),
+                                SyscallArgs::from([sfd as u64, addr, len as u64, 0, 0, 0]),
+                            ),
+                            memory,
+                            &reporter,
+                        )
+                        .unwrap(),
+                    Entry::DispatcherWrapper => {
+                        dispatcher.read_signalfd(&context, memory, addr, len, mask, tid)
+                    }
+                }
+            };
+
+            // 1. Short buffer (< 128) returns EINVAL without preparing output,
+            // and an empty read returns EAGAIN without preparing even on a
+            // read-only/refused destination or when an unmasked signal is pending.
+            dispatcher.mark_signal_pending(&context, tid, 35);
+            memory.refuse_next();
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, RO_OUT, 64),
+                DispatchOutcome::errno(LINUX_EINVAL),
+                "{entry:?}: short buffer must return EINVAL before preparation",
+            );
+            assert_eq!(
+                memory.prepares, 0,
+                "{entry:?}: short buffer prepared output"
+            );
+
+            memory.refuse_next();
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, RO_OUT, 128),
+                DispatchOutcome::errno(LINUX_EAGAIN),
+                "{entry:?}: empty read must return EAGAIN without preparing output",
+            );
+            assert_eq!(memory.prepares, 0, "{entry:?}: empty read prepared output");
+            assert!(
+                dispatcher
+                    .take_pending_in_from(&context, tid, SigSet::EMPTY.with(35))
+                    .is_some(),
+                "{entry:?}: unmasked signal must remain intact across empty read",
+            );
+
+            // A shared signal explicitly named for a live, unblocked sibling
+            // thread is not deliverable to `tid`: reading `tid`'s signalfd must
+            // return EAGAIN with zero prepares rather than suspending or
+            // faulting on RO_OUT, and leave the signal queued for the sibling.
+            let sibling_tid = crate::thread::ThreadRegistry::new(tid).register_child(0);
+            let sibling_linux_tid = dispatcher
+                .register_one_task_thread(&context, sibling_tid)
+                .unwrap();
+            let sibling_ref = context.task().thread(sibling_linux_tid).unwrap();
+            context.shared().pending_signals().enqueue_named(
+                crate::kernel::LinuxSignal::for_signal_number(RT_SIG).unwrap(),
+                None,
+                sibling_ref,
+            );
+            memory.refuse_next();
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, RO_OUT, 128),
+                DispatchOutcome::errno(LINUX_EAGAIN),
+                "{entry:?}: sibling-named signal must not suspend on owner refusal",
+            );
+            assert_eq!(
+                memory.prepares, 0,
+                "{entry:?}: sibling-named signal must skip preparation",
+            );
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, RO_OUT, 128),
+                DispatchOutcome::errno(LINUX_EAGAIN),
+                "{entry:?}: sibling-named signal must not fault on RO_OUT",
+            );
+            assert!(
+                dispatcher
+                    .take_pending_in_from(&context, sibling_tid, mask)
+                    .is_some(),
+                "{entry:?}: sibling-named signal must remain deliverable to sibling",
+            );
+
+            // 2. Transient owner refusal preserves the pending signal and its
+            // queued payload; retry delivers the exact 128-byte record.
+            dispatcher.mark_process_signal_pending_with_info(
+                &context,
+                RT_SIG,
+                Some(LinuxSiginfo::rt_queue(RT_SIG, 4242, 1001, 0x1234)),
+            );
+            memory.seed(OUT, &[FILL; 128]);
+            let wait = memory.refuse_next();
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                "{entry:?}: owner refusal must suspend without EFAULT",
+            );
+            assert_eq!(
+                memory.inner.read_bytes(OUT, 128).unwrap(),
+                [FILL; 128],
+                "{entry:?}: refused copyout must not touch destination",
+            );
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                DispatchOutcome::Returned { value: 128 },
+                "{entry:?}: retry after owner refusal must deliver queued signal",
+            );
+            let rec = memory.inner.read_bytes(OUT, 128).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(rec[0..4].try_into().unwrap()),
+                RT_SIG as u32
+            );
+            assert_eq!(
+                i32::from_le_bytes(rec[8..12].try_into().unwrap()),
+                LINUX_SI_QUEUE
+            );
+            assert_eq!(u32::from_le_bytes(rec[12..16].try_into().unwrap()), 4242);
+            assert_eq!(u32::from_le_bytes(rec[16..20].try_into().unwrap()), 1001);
+
+            // 3. Genuine fault on first record returns EFAULT and consumes the
+            // faulting signal; genuine fault on second record returns 128 and
+            // consumes the second faulting signal too.
+            dispatcher.mark_process_signal_pending(&context, RT_SIG);
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, RO_OUT, 128),
+                DispatchOutcome::errno(LINUX_EFAULT),
+                "{entry:?}: genuine fault on first record must return EFAULT",
+            );
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                DispatchOutcome::errno(LINUX_EAGAIN),
+                "{entry:?}: genuine fault on first record must consume signal",
+            );
+
+            dispatcher.mark_process_signal_pending(&context, RT_SIG);
+            dispatcher.mark_process_signal_pending(&context, RT_SIG);
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, RO_OUT - 128, 256),
+                DispatchOutcome::Returned { value: 128 },
+                "{entry:?}: genuine fault on second record must return 128-byte prefix",
+            );
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                DispatchOutcome::errno(LINUX_EAGAIN),
+                "{entry:?}: genuine fault on second record must consume faulting signal",
+            );
+
+            // 4. Multi-permit read past COPYOUT_MAX_BYTES (35 records = 4480 bytes
+            // into an 8192-byte buffer) serves permit-sized 128-byte steps and
+            // preserves unconsumed tail records if a later step hits an owner refusal.
+            for idx in 0..35u32 {
+                dispatcher.mark_process_signal_pending_with_info(
+                    &context,
+                    RT_SIG,
+                    Some(LinuxSiginfo::rt_queue(RT_SIG, (1000 + idx) as i32, 77, 0)),
+                );
+            }
+            memory.prepares = 0;
+            let _ = memory.refuse_after_prepares(33);
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, OUT, 8192),
+                DispatchOutcome::Returned { value: 33 * 128 },
+                "{entry:?}: must serve 33 records (4224 bytes > COPYOUT_MAX_BYTES) before 34th refusal",
+            );
+            assert_eq!(
+                memory.prepares, 34,
+                "{entry:?}: 33 committed records plus 1 refused 34th prepare",
+            );
+
+            memory.prepares = 0;
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, OUT + 33 * 128, 8192),
+                DispatchOutcome::Returned { value: 2 * 128 },
+                "{entry:?}: retry must deliver the 2 preserved tail records",
+            );
+            assert_eq!(
+                memory.prepares, 2,
+                "{entry:?}: exact prepares for remaining 2 records without extra peek prepare",
+            );
+            for idx in 0..35usize {
+                let rec = memory
+                    .inner
+                    .read_bytes(OUT + (idx * 128) as u64, 128)
+                    .unwrap();
+                assert_eq!(
+                    u32::from_le_bytes(rec[0..4].try_into().unwrap()),
+                    RT_SIG as u32
+                );
+                assert_eq!(
+                    u32::from_le_bytes(rec[12..16].try_into().unwrap()),
+                    (1000 + idx) as u32,
+                    "{entry:?}: record {idx} pid mismatch",
+                );
+            }
+            assert_eq!(
+                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                DispatchOutcome::errno(LINUX_EAGAIN),
+                "{entry:?}: all 35 queued signals must be drained",
             );
         }
     }

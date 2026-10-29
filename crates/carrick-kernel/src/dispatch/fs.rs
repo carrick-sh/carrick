@@ -1031,6 +1031,7 @@ impl<'a> FsView<'a> {
         success
     }
 
+    #[inline]
     pub fn read_signalfd<M: CurrentMmMemory>(
         &self,
         context: &crate::kernel::KernelContext,
@@ -1040,67 +1041,7 @@ impl<'a> FsView<'a> {
         mask: carrick_abi::SigSet,
         tid: crate::thread::ThreadId,
     ) -> DispatchOutcome {
-        const SIGINFO_LEN: usize = 128;
-        if length < SIGINFO_LEN {
-            return DispatchOutcome::errno(LINUX_EINVAL);
-        }
-        let max_records = length / SIGINFO_LEN;
-        let mut total_written = 0usize;
-        for _ in 0..max_records {
-            let authority = super::signal::signal_authority_for(context, tid);
-            if authority
-                .thread_pending()
-                .union(authority.task_pending())
-                .intersect(mask)
-                .is_empty()
-            {
-                break;
-            }
-            let Some(rec_addr) = address.checked_add(total_written as u64) else {
-                let _ = self.cross.take_signalfd_bytes(context, tid, mask, 1);
-                return if total_written > 0 {
-                    DispatchOutcome::returned_len_or_errno(total_written)
-                } else {
-                    DispatchOutcome::errno(LINUX_EFAULT)
-                };
-            };
-            let output = match super::copyout::prepare(
-                context,
-                memory,
-                [Some(super::copyout::UserSlot::new(rec_addr, SIGINFO_LEN))],
-            ) {
-                Ok(output) => output,
-                Err(refusal) => {
-                    return if total_written > 0 {
-                        DispatchOutcome::returned_len_or_errno(total_written)
-                    } else {
-                        refusal.into_outcome()
-                    };
-                }
-            };
-            let out = self.cross.take_signalfd_bytes(context, tid, mask, 1);
-            if out.is_empty() {
-                let _ = output.cancel_retaining();
-                break;
-            }
-            match output.commit([&out]) {
-                Ok(()) => {
-                    total_written += out.len();
-                }
-                Err(fault) => {
-                    return if total_written > 0 {
-                        DispatchOutcome::returned_len_or_errno(total_written)
-                    } else {
-                        fault.outcome()
-                    };
-                }
-            }
-        }
-        if total_written == 0 {
-            DispatchOutcome::errno(LINUX_EAGAIN)
-        } else {
-            DispatchOutcome::returned_len_or_errno(total_written)
-        }
+        super::signal::read_signalfd(context, memory, address, length, mask, tid)
     }
 
     pub(super) fn perf_event_state(&self, fd: i32) -> Option<Arc<super::perf::PerfEventState>> {
