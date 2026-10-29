@@ -70,6 +70,11 @@ vm_free = [
   "carrick-el1-linux::dispatch::tests::{production_trap_frame_routes_ppoll_to_the_poll_family,blocking_poll_without_a_wait_venue_does_not_publish_timeout_output}",
   "carrick-el1-linux::ipc::tests::{native_resumed_read_fault_retires_operation_and_endpoint_pin,native_resumed_eventfd_fault_keeps_counter_and_releases_pin,poll_readiness_uses_ipc_objects_and_exact_file_table}",
   "carrick-el1-linux::native_process_runtime::host_test_support::production_trap_frame_ppoll_retains_completed_output_across_owner_wait",
+  "carrick-el1-linux::native_process_runtime::host_test_support::{owner_copyout_never_prepares_under_an_ipc_object_lock,owner_copyout_unavailable_is_not_a_user_memory_fault,ipc_backing_supply_retains_the_exact_operation_and_pin,ipc_backing_refusal_retires_the_operation_and_pin,ipc_already_ready_supply_defers_completion_to_the_checkpoint,ipc_already_ready_refusal_retires_at_the_checkpoint}",
+  "carrick-el1-linux::mm_portal::tests::owner_fork_prepares_copyout_without_publishing_bytes",
+  "carrick-el1-linux::aarch64_process::native_user_write_preserves_nonfault_refusals",
+  "carrick-el1-linux::dispatch::host_owned_poll_copyout_refusal_keeps_the_host_fallback",
+  "carrick-el1-linux::ipc::tests::native_structural_refusals_retire_without_host_handback",
 ]
 
 [bindings.unresolved]

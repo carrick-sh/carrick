@@ -2778,6 +2778,15 @@ fn fork_translate<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWo
 
 #[test]
 fn owner_fork_resident_child_cow_copies_with_production_classifier() {
+    fork_child_write_preparation(false);
+}
+
+#[test]
+fn owner_fork_prepares_copyout_without_publishing_bytes() {
+    fork_child_write_preparation(true);
+}
+
+fn fork_child_write_preparation(prepare_first: bool) {
     use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
     let region = Region::new();
     let spaces = AddressSpaces::new();
@@ -2832,36 +2841,176 @@ fn owner_fork_resident_child_cow_copies_with_production_classifier() {
     )
     .unwrap();
     let residency = residency();
-    let _editor = spaces
-        .try_begin_edit(spaces.find(78).unwrap(), 78, nz(2))
-        .unwrap();
-    let outcome = carrick_el1::cow::resolve_guest_cow(
-        &carrick_el1::cow::GuestCowVenue {
-            words: &words,
-            root: carrick_mmu_core::aarch64::SubstrateGpa(child.base),
-            pool: &pool,
-            residency: &residency,
-            copy_window: carrick_el1::cow::CowCopyWindow::target(
-                &words,
-                carrick_mmu_core::aarch64::SubstrateGpa(child.base),
-            ),
-            publish_executable: None,
-        },
-        receipt.child.mm().raw(),
-        VA,
-        |source, target| {
-            let source = fork_translate(&words, child.base, source) - IPA;
-            let target = fork_translate(&words, child.base, target) - replacement_ipa;
-            replacement.borrow_mut()[target as usize..target as usize + 4096]
-                .copy_from_slice(&original[source as usize..source as usize + 4096]);
-        },
-        || {},
-    );
-    assert!(
-        matches!(outcome, Ok(carrick_el1::cow::GuestCowOutcome::Resolved(_))),
-        "{outcome:?}"
-    );
-    replacement.borrow_mut()[..4].copy_from_slice(b"fork");
+    if prepare_first {
+        use carrick_core::mm::transaction::{SelectionVenues, UserWriteRequest, UserWriteVenue};
+        use carrick_core::mm::transfer::ValidatedChunk;
+        use carrick_el1::fault::{CowResolver, NoopPreparedResolver};
+        struct OwnedOutput<'a, W> {
+            words: &'a W,
+            root: u64,
+            pool: &'a carrick_el1_abi::CowGrantPool,
+            residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+            original: &'a [u8],
+            replacement: &'a core::cell::RefCell<[u8; 16384]>,
+            replacement_ipa: u64,
+        }
+        impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResolver
+            for OwnedOutput<'_, W>
+        {
+            fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
+                panic!("typed COW outcome required")
+            }
+            fn resolve_cow_outcome(
+                &mut self,
+                root: u64,
+                mm: u64,
+                address: u64,
+            ) -> carrick_el1::fault::CowResolution {
+                assert_eq!(mm, 78);
+                assert_eq!(
+                    root & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+                    self.root
+                );
+                let outcome = carrick_el1::cow::resolve_guest_cow(
+                    &carrick_el1::cow::GuestCowVenue {
+                        words: self.words,
+                        root: carrick_mmu_core::aarch64::SubstrateGpa(self.root),
+                        pool: self.pool,
+                        residency: self.residency,
+                        copy_window: carrick_el1::cow::CowCopyWindow::target(
+                            self.words,
+                            carrick_mmu_core::aarch64::SubstrateGpa(self.root),
+                        ),
+                        publish_executable: None,
+                    },
+                    mm,
+                    address,
+                    |source, target| {
+                        let source = fork_translate(self.words, self.root, source) - IPA;
+                        let target =
+                            fork_translate(self.words, self.root, target) - self.replacement_ipa;
+                        self.replacement.borrow_mut()[target as usize..target as usize + 4096]
+                            .copy_from_slice(
+                                &self.original[source as usize..source as usize + 4096],
+                            );
+                    },
+                    || {},
+                );
+                carrick_el1::fault::handle_cow_outcome(outcome, &mut None)
+            }
+        }
+        struct OutputVenue<'a, W> {
+            cow: OwnedOutput<'a, W>,
+            prepared: NoopPreparedResolver,
+            copied: usize,
+        }
+        impl<'a, W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
+            UserWriteVenue<carrick_el1_abi::Aarch64ParkedContext> for OutputVenue<'a, W>
+        {
+            type Prepared = NoopPreparedResolver;
+            type Cow = OwnedOutput<'a, W>;
+            type Error = ();
+            fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
+                let residency = self.cow.residency;
+                SelectionVenues {
+                    prepared: &mut self.prepared,
+                    cow: &mut self.cow,
+                    residency,
+                    slot: 0,
+                }
+            }
+            fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+                Ok(())
+            }
+            fn supply_cow(&mut self, _: carrick_el1_abi::PortalGrantWindow) -> Result<(), ()> {
+                panic!("the exact child grant is already supplied")
+            }
+            fn copy(
+                &mut self,
+                fence: &ValidatedChunk<'_, carrick_el1_abi::Aarch64ParkedContext>,
+                bytes: &[u8],
+            ) -> bool {
+                let selected = fence.selected();
+                assert_eq!(selected.handle().mm().raw(), 78);
+                assert_eq!(selected.ipa, self.cow.replacement_ipa);
+                self.cow.replacement.borrow_mut()[..bytes.len()].copy_from_slice(bytes);
+                self.copied += bytes.len();
+                true
+            }
+        }
+        let mut venue = OutputVenue {
+            cow: OwnedOutput {
+                words: &words,
+                root: child.base,
+                pool: &pool,
+                residency: &residency,
+                original: &original,
+                replacement: &replacement,
+                replacement_ipa,
+            },
+            prepared: NoopPreparedResolver,
+            copied: 0,
+        };
+        let prepared = portal.prepare_user_write(
+            carrick_core::mm::transaction::UserWriteTarget {
+                handle: receipt.child,
+                address: carrick_guest_arch::UserVa::new(VA),
+                len: carrick_guest_arch::GuestLen::new(4),
+                slot: carrick_guest_arch::SlotId::new(0),
+            },
+            &words,
+            &mut venue,
+        );
+        assert_eq!(prepared, Ok(()));
+        assert_eq!(venue.copied, 0, "preparation must not publish output");
+        assert_eq!(&replacement.borrow()[..4], &[0x5a; 4]);
+        let result = portal.write_user_bytes(
+            UserWriteRequest {
+                handle: receipt.child,
+                address: carrick_guest_arch::UserVa::new(VA),
+                bytes: b"fork",
+                slot: carrick_guest_arch::SlotId::new(0),
+            },
+            &words,
+            &mut venue,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            venue.copied, 4,
+            "the shared owner protocol commits the child output once"
+        );
+    } else {
+        let _editor = spaces
+            .try_begin_edit(spaces.find(78).unwrap(), 78, nz(2))
+            .unwrap();
+        let outcome = carrick_el1::cow::resolve_guest_cow(
+            &carrick_el1::cow::GuestCowVenue {
+                words: &words,
+                root: carrick_mmu_core::aarch64::SubstrateGpa(child.base),
+                pool: &pool,
+                residency: &residency,
+                copy_window: carrick_el1::cow::CowCopyWindow::target(
+                    &words,
+                    carrick_mmu_core::aarch64::SubstrateGpa(child.base),
+                ),
+                publish_executable: None,
+            },
+            receipt.child.mm().raw(),
+            VA,
+            |source, target| {
+                let source = fork_translate(&words, child.base, source) - IPA;
+                let target = fork_translate(&words, child.base, target) - replacement_ipa;
+                replacement.borrow_mut()[target as usize..target as usize + 4096]
+                    .copy_from_slice(&original[source as usize..source as usize + 4096]);
+            },
+            || {},
+        );
+        assert!(
+            matches!(outcome, Ok(carrick_el1::cow::GuestCowOutcome::Resolved(_))),
+            "{outcome:?}"
+        );
+        replacement.borrow_mut()[..4].copy_from_slice(b"fork");
+    }
     assert_eq!(original, [0x5a; 8192]);
     assert_eq!(fork_translate(&words, ROOT, VA), IPA);
     assert_eq!(fork_translate(&words, child.base, VA), replacement_ipa);
@@ -5521,4 +5670,87 @@ mod native_child_tid_cow {
             }
         }
     }
+}
+
+#[test]
+fn untouched_copyout_selects_backing_supply_without_copying() {
+    use carrick_core::mm::transaction::{
+        SelectionVenues, UserWriteError, UserWriteRequest, UserWriteTarget, UserWriteVenue,
+    };
+    struct SupplyVenue<'a> {
+        prepared: NoopPreparedResolver,
+        cow: NoopCowResolver,
+        residency: &'a FrameGrantResidencyTable,
+        window: Option<carrick_el1_abi::PortalGrantWindow>,
+    }
+    impl UserWriteVenue<carrick_el1_abi::Aarch64ParkedContext> for SupplyVenue<'_> {
+        type Prepared = NoopPreparedResolver;
+        type Cow = NoopCowResolver;
+        type Error = ();
+        fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
+            SelectionVenues {
+                prepared: &mut self.prepared,
+                cow: &mut self.cow,
+                residency: self.residency,
+                slot: 0,
+            }
+        }
+        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+            Ok(())
+        }
+        fn supply_cow(&mut self, _: carrick_el1_abi::PortalGrantWindow) -> Result<(), ()> {
+            panic!("not COW")
+        }
+        fn supply_backing(
+            &mut self,
+            window: carrick_el1_abi::PortalGrantWindow,
+        ) -> Option<Result<(), ()>> {
+            assert!(
+                self.window.replace(window).is_none(),
+                "one selection, one physical request"
+            );
+            Some(Err(()))
+        }
+        fn copy(
+            &mut self,
+            _: &carrick_core::mm::transfer::ValidatedChunk<
+                '_,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >,
+            _: &[u8],
+        ) -> bool {
+            panic!("preparation cannot publish guest output")
+        }
+    }
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 0);
+    let residency = residency();
+    let mut venue = SupplyVenue {
+        prepared: NoopPreparedResolver,
+        cow: NoopCowResolver,
+        residency: &residency,
+        window: None,
+    };
+    let result = portal.prepare_user_write(
+        UserWriteTarget {
+            handle: portal.admitted_handle(mm, 0).unwrap(),
+            address: carrick_guest_arch::UserVa::new(VA),
+            len: carrick_guest_arch::GuestLen::new(8),
+            slot: carrick_guest_arch::SlotId::new(0),
+        },
+        &tables.live(&CallerInvalidatesAsid),
+        &mut venue,
+    );
+    assert_eq!(
+        result,
+        Err(UserWriteError::Mechanics(())),
+        "untouched memory needs physical supply, never EFAULT"
+    );
+    let window = venue.window.unwrap();
+    assert_eq!(window.operation.mm, mm);
+    assert_eq!(window.fault_page, VA);
 }
