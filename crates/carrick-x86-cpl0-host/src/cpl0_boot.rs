@@ -2432,7 +2432,7 @@ impl<M: CarrierMemoryIo> Drop for Cpl0HostCustody<M> {
         if self.initial_rollback_fault.failed() {
             carrick_el1_linux::dispatch::invalid_completion(
                 carrick_el1_linux::dispatch::NativeInvariant::PhysicalCustody(
-                    "unexposed physical inventory rollback failed",
+                    carrick_el1_linux::dispatch::PhysicalCustodyInvariant::InventoryRollbackFailed,
                 ),
             );
         }

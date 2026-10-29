@@ -1,3 +1,7 @@
+# #1028: type physical custody diagnostic reasons; no change to this
+# contract's semantics or work budgets. The host dispatch test
+# physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
+# reason codes and unchanged text; retain the existing execution controls.
 schema_version = 1
 id = "kernel.x86.file-region"
 title = "CPL0 file records belong to one retained carrier region"

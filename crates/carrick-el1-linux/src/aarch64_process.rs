@@ -464,7 +464,7 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         .is_err()
         {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::PhysicalCustody(
-                "root exit crossing refused",
+                super::dispatch::PhysicalCustodyInvariant::RootExitRefused,
             ));
         }
     }
@@ -2037,7 +2037,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     fn quarantine_born(&mut self, born: Self::Born) {
         core::mem::forget(born);
         super::dispatch::invalid_completion(super::dispatch::NativeInvariant::PhysicalCustody(
-            "admitted fork custody commit refused",
+            super::dispatch::PhysicalCustodyInvariant::ForkCustodyRefused,
         ));
     }
 
