@@ -151,6 +151,9 @@ impl GuestDispatchFrame for TrapFrame {
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64
     }
+    fn may_serve_poll(&self) -> bool {
+        self.x[8] == carrick_syscall_abi::nr::PPOLL.raw()
+    }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
         Some(self)
     }
@@ -1976,11 +1979,16 @@ impl<
         };
         if nfds == 0 {
             let mut empty = [];
-            return FamilyCompletion::Complete(
-                self.frame
-                    .query_host_readiness(&mut empty, timeout_ms, sig_mask)
-                    .unwrap_or(0),
-            );
+            return match self
+                .frame
+                .query_host_readiness(&mut empty, timeout_ms, sig_mask)
+            {
+                Some(result) => FamilyCompletion::Complete(result),
+                None if timeout_ms == 0 && matches!(sig_mask, PollSignalMask::Inherit) => {
+                    FamilyCompletion::Complete(0)
+                }
+                None => FamilyCompletion::Forward,
+            };
         }
         if nfds > 1024 {
             return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
@@ -2012,6 +2020,7 @@ impl<
             self.open_table,
             file_table,
             &pollfds,
+            self.ipc,
         );
         if let Some(mut entries) = host_entries {
             let already_ready = super::file_table::resolve_poll_with_host_readiness(
@@ -2023,6 +2032,9 @@ impl<
                 &mut pollfds,
                 Some(&entries),
             );
+            let Some(already_ready) = already_ready else {
+                return FamilyCompletion::Forward;
+            };
             let host_timeout = if already_ready > 0 { 0 } else { timeout_ms };
             if let Some(result) =
                 self.frame
@@ -2040,6 +2052,9 @@ impl<
                     &mut pollfds,
                     Some(&entries),
                 );
+                let Some(ready) = ready else {
+                    return FamilyCompletion::Forward;
+                };
                 let out_bytes = unsafe {
                     core::slice::from_raw_parts(
                         pollfds.as_ptr() as *const u8,
@@ -2058,6 +2073,9 @@ impl<
                 );
             }
         }
+        if !matches!(sig_mask, PollSignalMask::Inherit) {
+            return FamilyCompletion::Forward;
+        }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Forward;
         };
@@ -2069,30 +2087,28 @@ impl<
             file_table,
             &mut pollfds,
         );
+        let Some(ready) = ready else {
+            return FamilyCompletion::Forward;
+        };
         let out_bytes = unsafe {
             core::slice::from_raw_parts(
                 pollfds.as_ptr() as *const u8,
                 nfds * core::mem::size_of::<super::file_table::PollFd>(),
             )
         };
-        let completion = complete_poll_copyout(
-            self.process.as_deref_mut(),
-            task,
-            carrick_guest_arch::UserVa::new(fds_ptr),
-            out_bytes,
-            SyscallResult::new(ready as i64),
-        );
-        if ready > 0 || timeout_ms == 0 || !matches!(completion, FamilyCompletion::Complete(_)) {
-            completion
+        if ready > 0 || timeout_ms == 0 {
+            complete_poll_copyout(
+                self.process.as_deref_mut(),
+                task,
+                carrick_guest_arch::UserVa::new(fds_ptr),
+                out_bytes,
+                SyscallResult::new(ready as i64),
+            )
         } else {
-            let slot = self.frame.slot();
-            let mut continuation = super::file_table::PollContinuation::new(
-                file_table, pollfds, timeout_ms, fds_ptr, slot,
-            );
-            if let (Some(zone), Some(_)) = (self.zone.as_ref(), slot) {
-                continuation.release_capacity(zone.tables);
-            }
-            FamilyCompletion::Complete(ready as i64)
+            // This venue has no retained readiness wait. Leave the call
+            // unrouted before output; clearing a slot and dropping a local
+            // continuation cannot authorize a timeout result.
+            FamilyCompletion::Forward
         }
     }
     fn descriptor(&mut self) -> FamilyCompletion {
@@ -3478,6 +3494,84 @@ mod tests {
     use super::super::native_process_runtime::NativeThreadGroupOwner;
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn blocking_poll_without_a_wait_venue_does_not_publish_timeout_output() {
+        let tasks = [CurrentTask::new()];
+        let counters = Counters::default();
+        let mut polls = [super::super::file_table::PollFd {
+            fd: -1,
+            events: 1,
+            revents: 0x1234,
+        }];
+        let timeout = [1i64, 0];
+        let mut frame = TrapFrame::default();
+        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+        frame.x[0] = polls.as_mut_ptr() as u64;
+        frame.x[1] = 1;
+        frame.x[2] = timeout.as_ptr() as u64;
+        let mut pending = El1PendingFamilies {
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame,
+            counters: &counters,
+            current_tasks: &tasks,
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &InotifyNameCache::new(),
+            zone: None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+            ipc: None,
+            lifecycle: None,
+            process: None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative>,
+            source: None,
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            PendingFamilies::poll(&mut pending),
+            FamilyCompletion::Forward
+        );
+        assert_eq!(
+            polls[0].revents, 0x1234,
+            "an incomplete readiness decision owns no output"
+        );
+    }
+
+    #[test]
+    fn production_trap_frame_routes_ppoll_to_the_poll_family() {
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            5,
+        );
+        tasks[0].mm.thread_generation.store(1, Ordering::Relaxed);
+        let counters = Counters::default();
+        let mut frame = TrapFrame::default();
+        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+        frame.x[1] = 1025; // EINVAL is owned by poll, before touching a user pointer.
+        let action = dispatch_syscall_with_lifecycle(
+            &mut frame,
+            &counters,
+            &tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &InotifyNameCache::new(),
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0] as i64, -22);
+        assert_eq!(counters.served[73].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.refused[73].load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn physical_custody_reasons_preserve_fatal_codes_and_debug_text() {

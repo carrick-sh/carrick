@@ -417,6 +417,19 @@ impl Frames {
                     + write,
             ),
             (
+                "ring poll readiness",
+                native
+                    + self.qualified("El1PendingFamilies", "::poll::")
+                    + self.sum(&[
+                        "::resolve_poll::",
+                        "::resolve_poll_with_host_readiness::",
+                        "::epoll_zone_only_ready_count::",
+                        "::epoll_ready_count::",
+                        "::member_level::",
+                    ])
+                    + self.maximum("::lock_epoll::"),
+            ),
+            (
                 "ring pipe copyout",
                 native
                     + self.sum(&[
@@ -652,6 +665,16 @@ mod tests {
         let error = frames.check(16384, 288).unwrap_err();
         assert!(error.contains("ring completed copyout"));
         assert!(error.contains("ring pipe copyout"));
+    }
+
+    #[test]
+    fn ring_poll_readiness_chain_is_bounded() {
+        let mut frames = small_frames();
+        frames
+            .0
+            .insert("x::epoll_ready_count::h0".to_owned(), 11500);
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("ring poll readiness"));
     }
 
     #[test]

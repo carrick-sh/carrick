@@ -3481,7 +3481,21 @@ fn native_exec_successor_reaps_its_fork_child() {
 }
 
 #[cfg(test)]
-fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool) {
+fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, production_frame: bool) {
+    #[repr(C, align(4096))]
+    struct PollPages([crate::file_table::PollFd; 1024]);
+    // Aligned host input lets the real TrapFrame path read its pollfd array;
+    // physical output still goes through this fixture's native service.
+    let pages = production_frame.then(|| unsafe {
+        let ptr =
+            std::alloc::alloc_zeroed(std::alloc::Layout::new::<PollPages>()).cast::<PollPages>();
+        assert!(!ptr.is_null());
+        Box::from_raw(ptr)
+    });
+    let address = pages
+        .as_ref()
+        .map_or(0x10000, |pages| pages.0.as_ptr() as u64);
+    let expected_result = if production_frame { 1024 } else { 37 };
     let fixture = native_exec_fixture();
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -3506,8 +3520,9 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool) {
     let observed =
         notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    let output_address = address;
     service.on_copy_complete = Some(Box::new(move |address| {
-        if address.raw() == 0x10000 {
+        if address.raw() == output_address {
             access.raise(space.index());
             if during_enrollment {
                 fixture
@@ -3527,8 +3542,25 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool) {
         )
     };
     service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
-    service.child_copy_error_at = Some(0x11000);
-    let bytes: Vec<u8> = (0..8192).map(|n| (n % 251) as u8).collect();
+    service.child_copy_error_at = Some(address + 4096);
+    let bytes: Vec<u8> = if production_frame {
+        (0..1024)
+            .flat_map(|_| {
+                [
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    carrick_syscall_abi::LINUX_POLLNVAL as u8,
+                    0,
+                ]
+            })
+            .collect()
+    } else {
+        (0..8192).map(|n| (n % 251) as u8).collect()
+    };
     take_signal_copies();
     {
         let mut entry = fixture
@@ -3542,21 +3574,61 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool) {
                 &mut service,
             )
             .unwrap();
-        assert!(
-            matches!(
-                entry.complete_copyout(UserVa::new(0x10000), bytes.clone(), SyscallResult::new(37)),
-                LifecycleOutcome::Transferred {
-                    progress: carrick_core::Served::Idle,
-                    ..
-                }
-            ),
-            "completed poll output must retain its result and cursor on an owner wait"
-        );
-        assert!(entry.take_handoff_receipt().is_some());
+        if production_frame {
+            let mut frame = carrick_el1_abi::TrapFrame::default();
+            frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+            frame.x[0] = address;
+            frame.x[1] = 1024;
+            let counters = carrick_el1_abi::Counters::default();
+            let route = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &carrick_el1_abi::InotifyNameCache::new(),
+                None::<
+                    crate::dispatch::Zone<
+                        '_,
+                        crate::sched::FakeCpu,
+                        crate::sched::HardwareUserWord,
+                    >,
+                >,
+                None,
+                None,
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            assert_eq!(
+                route,
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            );
+            assert_eq!(counters.refused[73].load(Ordering::Relaxed), 0);
+        } else {
+            assert!(
+                matches!(
+                    entry.complete_copyout(
+                        UserVa::new(address),
+                        bytes.clone(),
+                        SyscallResult::new(expected_result)
+                    ),
+                    LifecycleOutcome::Transferred {
+                        progress: carrick_core::Served::Idle,
+                        ..
+                    }
+                ),
+                "completed poll output must retain its result and cursor on an owner wait"
+            );
+            assert!(entry.take_handoff_receipt().is_some());
+        }
     }
     assert_eq!(
         take_signal_copies(),
-        [(UserVa::new(0x10000), bytes[..4096].to_vec())]
+        [(UserVa::new(address), bytes[..4096].to_vec())]
     );
     if during_enrollment {
         assert!(take_signal_copies().is_empty());
@@ -3623,10 +3695,12 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool) {
             "fatal cancellation cannot publish another output chunk"
         );
     } else {
-        assert!(matches!(resumed, NativeResume::Returned(result) if result.raw() == 37));
+        assert!(
+            matches!(resumed, NativeResume::Returned(result) if result.raw() == expected_result)
+        );
         assert_eq!(
             take_signal_copies(),
-            [(UserVa::new(0x11000), bytes[4096..].to_vec())]
+            [(UserVa::new(address + 4096), bytes[4096..].to_vec())]
         );
     }
 }
@@ -3634,17 +3708,23 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool) {
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_retains_result_and_next_byte_across_owner_wait() {
-    retained_poll_output_owner_wait(false, false);
+    retained_poll_output_owner_wait(false, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_cancellation_commits_no_more_bytes() {
-    retained_poll_output_owner_wait(true, false);
+    retained_poll_output_owner_wait(true, false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_cancellation_during_enrollment_never_returns_an_errno() {
-    retained_poll_output_owner_wait(true, true);
+    retained_poll_output_owner_wait(true, true, false);
+}
+
+#[cfg(test)]
+#[test]
+fn production_trap_frame_ppoll_retains_completed_output_across_owner_wait() {
+    retained_poll_output_owner_wait(false, false, true);
 }
