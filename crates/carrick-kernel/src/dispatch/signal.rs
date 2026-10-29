@@ -317,6 +317,21 @@ pub(in crate::dispatch) fn read_signalfd<M: CurrentMmMemory>(
             break;
         }
         let Some(record_address) = address.checked_add(written as u64) else {
+            let _effect = if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
+            {
+                match crate::dispatch::copyout::admit_effect(context) {
+                    Ok(effect) => Some(effect),
+                    Err(refusal) => {
+                        return if written == 0 {
+                            refusal.into_outcome()
+                        } else {
+                            DispatchOutcome::returned_len_or_errno(written)
+                        };
+                    }
+                }
+            } else {
+                None
+            };
             if take_pending_signal_in(context, tid, mask).is_none() {
                 break;
             }
@@ -3853,7 +3868,9 @@ mod tests {
             DispatcherWrapper,
         }
 
+        let mut traces = Vec::new();
         for entry in [Entry::OrdinaryFdRead, Entry::DispatcherWrapper] {
+            let mut outcomes = Vec::new();
             let mut dispatcher = SyscallDispatcher::new();
             let context = dispatcher.capture_one_task_context().unwrap();
             let tid = context.thread().registry_id();
@@ -3913,22 +3930,26 @@ mod tests {
             // read-only/refused destination or when an unmasked signal is pending.
             dispatcher.mark_signal_pending(&context, tid, 35);
             memory.refuse_next();
+            let out = invoke(&mut dispatcher, &mut memory, RO_OUT, 64);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, RO_OUT, 64),
+                out,
                 DispatchOutcome::errno(LINUX_EINVAL),
                 "{entry:?}: short buffer must return EINVAL before preparation",
             );
+            outcomes.push(out);
             assert_eq!(
                 memory.prepares, 0,
                 "{entry:?}: short buffer prepared output"
             );
 
             memory.refuse_next();
+            let out = invoke(&mut dispatcher, &mut memory, RO_OUT, 128);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, RO_OUT, 128),
+                out,
                 DispatchOutcome::errno(LINUX_EAGAIN),
                 "{entry:?}: empty read must return EAGAIN without preparing output",
             );
+            outcomes.push(out);
             assert_eq!(memory.prepares, 0, "{entry:?}: empty read prepared output");
             assert!(
                 dispatcher
@@ -3952,20 +3973,24 @@ mod tests {
                 sibling_ref,
             );
             memory.refuse_next();
+            let out = invoke(&mut dispatcher, &mut memory, RO_OUT, 128);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, RO_OUT, 128),
+                out,
                 DispatchOutcome::errno(LINUX_EAGAIN),
                 "{entry:?}: sibling-named signal must not suspend on owner refusal",
             );
+            outcomes.push(out);
             assert_eq!(
                 memory.prepares, 0,
                 "{entry:?}: sibling-named signal must skip preparation",
             );
+            let out = invoke(&mut dispatcher, &mut memory, RO_OUT, 128);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, RO_OUT, 128),
+                out,
                 DispatchOutcome::errno(LINUX_EAGAIN),
                 "{entry:?}: sibling-named signal must not fault on RO_OUT",
             );
+            outcomes.push(out);
             assert!(
                 dispatcher
                     .take_pending_in_from(&context, sibling_tid, mask)
@@ -3982,21 +4007,25 @@ mod tests {
             );
             memory.seed(OUT, &[FILL; 128]);
             let wait = memory.refuse_next();
+            let out = invoke(&mut dispatcher, &mut memory, OUT, 128);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                out,
                 DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
                 "{entry:?}: owner refusal must suspend without EFAULT",
             );
+            outcomes.push(out);
             assert_eq!(
                 memory.inner.read_bytes(OUT, 128).unwrap(),
                 [FILL; 128],
                 "{entry:?}: refused copyout must not touch destination",
             );
+            let out = invoke(&mut dispatcher, &mut memory, OUT, 128);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                out,
                 DispatchOutcome::Returned { value: 128 },
                 "{entry:?}: retry after owner refusal must deliver queued signal",
             );
+            outcomes.push(out);
             let rec = memory.inner.read_bytes(OUT, 128).unwrap();
             assert_eq!(
                 u32::from_le_bytes(rec[0..4].try_into().unwrap()),
@@ -4013,29 +4042,37 @@ mod tests {
             // faulting signal; genuine fault on second record returns 128 and
             // consumes the second faulting signal too.
             dispatcher.mark_process_signal_pending(&context, RT_SIG);
+            let out = invoke(&mut dispatcher, &mut memory, RO_OUT, 128);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, RO_OUT, 128),
+                out,
                 DispatchOutcome::errno(LINUX_EFAULT),
                 "{entry:?}: genuine fault on first record must return EFAULT",
             );
+            outcomes.push(out);
+            let out = invoke(&mut dispatcher, &mut memory, OUT, 128);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                out,
                 DispatchOutcome::errno(LINUX_EAGAIN),
                 "{entry:?}: genuine fault on first record must consume signal",
             );
+            outcomes.push(out);
 
             dispatcher.mark_process_signal_pending(&context, RT_SIG);
             dispatcher.mark_process_signal_pending(&context, RT_SIG);
+            let out = invoke(&mut dispatcher, &mut memory, RO_OUT - 128, 256);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, RO_OUT - 128, 256),
+                out,
                 DispatchOutcome::Returned { value: 128 },
                 "{entry:?}: genuine fault on second record must return 128-byte prefix",
             );
+            outcomes.push(out);
+            let out = invoke(&mut dispatcher, &mut memory, OUT, 128);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                out,
                 DispatchOutcome::errno(LINUX_EAGAIN),
                 "{entry:?}: genuine fault on second record must consume faulting signal",
             );
+            outcomes.push(out);
 
             // 4. Multi-permit read past COPYOUT_MAX_BYTES (35 records = 4480 bytes
             // into an 8192-byte buffer) serves permit-sized 128-byte steps and
@@ -4049,22 +4086,26 @@ mod tests {
             }
             memory.prepares = 0;
             let _ = memory.refuse_after_prepares(33);
+            let out = invoke(&mut dispatcher, &mut memory, OUT, 8192);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, OUT, 8192),
+                out,
                 DispatchOutcome::Returned { value: 33 * 128 },
                 "{entry:?}: must serve 33 records (4224 bytes > COPYOUT_MAX_BYTES) before 34th refusal",
             );
+            outcomes.push(out);
             assert_eq!(
                 memory.prepares, 34,
                 "{entry:?}: 33 committed records plus 1 refused 34th prepare",
             );
 
             memory.prepares = 0;
+            let out = invoke(&mut dispatcher, &mut memory, OUT + 33 * 128, 8192);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, OUT + 33 * 128, 8192),
+                out,
                 DispatchOutcome::Returned { value: 2 * 128 },
                 "{entry:?}: retry must deliver the 2 preserved tail records",
             );
+            outcomes.push(out);
             assert_eq!(
                 memory.prepares, 2,
                 "{entry:?}: exact prepares for remaining 2 records without extra peek prepare",
@@ -4084,12 +4125,82 @@ mod tests {
                     "{entry:?}: record {idx} pid mismatch",
                 );
             }
+            let out = invoke(&mut dispatcher, &mut memory, OUT, 128);
             assert_eq!(
-                invoke(&mut dispatcher, &mut memory, OUT, 128),
+                out,
                 DispatchOutcome::errno(LINUX_EAGAIN),
                 "{entry:?}: all 35 queued signals must be drained",
             );
+            outcomes.push(out);
+
+            // 5. Legacy-venue mapping boundary (1.5 records = 192 bytes): whole-record
+            // preparation validates the full 128-byte slot before commit, so the first
+            // record commits, the second signal is consumed on the unmapped tail without
+            // writing into the partial 64-byte trailing window, and 128 is returned.
+            dispatcher.mark_process_signal_pending(&context, RT_SIG);
+            dispatcher.mark_process_signal_pending(&context, RT_SIG);
+            let mut legacy = crate::dispatch::LinearMemory::new(0x1000, vec![FILL; 192]);
+            let legacy_out = match entry {
+                Entry::OrdinaryFdRead => dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(
+                            nr::READ.raw(),
+                            SyscallArgs::from([sfd as u64, 0x1000, 256, 0, 0, 0]),
+                        ),
+                        &mut legacy,
+                        &reporter,
+                    )
+                    .unwrap(),
+                Entry::DispatcherWrapper => {
+                    dispatcher.read_signalfd(&context, &mut legacy, 0x1000, 256, mask, tid)
+                }
+            };
+            assert_eq!(
+                legacy_out,
+                DispatchOutcome::Returned { value: 128 },
+                "{entry:?}: half-mapped second record on Legacy venue must return 128",
+            );
+            outcomes.push(legacy_out);
+            assert_eq!(
+                legacy.read_bytes(0x1080, 64).unwrap(),
+                [FILL; 64],
+                "{entry:?}: partial trailing 64-byte window must remain untouched",
+            );
+            let legacy_empty = match entry {
+                Entry::OrdinaryFdRead => dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(
+                            nr::READ.raw(),
+                            SyscallArgs::from([sfd as u64, 0x1000, 128, 0, 0, 0]),
+                        ),
+                        &mut legacy,
+                        &reporter,
+                    )
+                    .unwrap(),
+                Entry::DispatcherWrapper => {
+                    dispatcher.read_signalfd(&context, &mut legacy, 0x1000, 128, mask, tid)
+                }
+            };
+            assert_eq!(
+                legacy_empty,
+                DispatchOutcome::errno(LINUX_EAGAIN),
+                "{entry:?}: faulting second signal on Legacy venue must be consumed",
+            );
+            outcomes.push(legacy_empty);
+
+            traces.push((
+                outcomes,
+                memory.inner.read_bytes(OUT, 35 * 128).unwrap(),
+                legacy.read_bytes(0x1000, 192).unwrap(),
+            ));
         }
+
+        assert_eq!(
+            traces[0], traces[1],
+            "ordinary fd read and dispatcher wrapper produced different signalfd traces",
+        );
     }
 
     use super::*;
