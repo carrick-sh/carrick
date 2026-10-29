@@ -1,5 +1,9 @@
 //! Concrete probe-slot custody and masked residency in the shared table.
-use super::*;
+use super::{
+    FrameGrantResidencyIdentity, FrameGrantResidencyTable, GRANT_EMPTY, GRANT_LIVE,
+    GRANT_PAGE_SIZE, GRANT_PROBES, GRANT_RESERVED, GRANT_RETIRED, GRANT_STATE_MASK, GRANT_WRITING,
+    Ordering, TRANSFER_PIN_RETIRED, TRANSFER_PIN_RETIRING,
+};
 use alloc::vec::Vec;
 use carrick_guest_arch::{ContextGeneration, MmGeneration, UserVa};
 
