@@ -1,23 +1,14 @@
-//! Per-carrier retirement queues for closed address-space entries, shared by
-//! every guest ISA's native process service.
+//! One retirement queue for fork children's address-space entries, shared
+//! by every guest ISA's native process service.
 //!
-//! A fork child's final exit (or an `exec` predecessor switch) closes its
-//! space gate and releases its slot. When no slot still has the MM installed
-//! and its reservation root has no active borrows, the space retires
-//! immediately; otherwise its closed `AddressSpaces` entry and reservation
-//! root are queued under that exact `(carrier, zone, roots)` scope and retried
-//! by later drains in the same scope.
-//!
-//! Two scopes never share a queue or lock, so concurrent carriers or host-test
-//! fixtures cannot detach or delay each other's spaces. Within one scope, each
-//! drain compacts in place under that scope's lock so a concurrent drain on
-//! another vCPU never observes a transiently empty queue while a retirement is
-//! still in flight.
+//! A fork child's final exit closes its space gate, crosses to the carrier
+//! (child retire), leaves its root and releases its slot. Its closed
+//! `AddressSpaces` entry and reservation root are then queued here and
+//! retired once no zone slot still has the MM installed. A failed retirement
+//! never drops a queued entry: it and every entry after it stay queued.
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use carrick_core::mm::reservation::{ReservationGeometry, ReservationPolicy};
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue};
@@ -26,41 +17,13 @@ use carrick_el1_abi::{PinnedMetadataExtent, ReservationMm};
 use carrick_mmu_core::owner_mmu::OwnerMmu;
 use carrick_sched_core::{SlotId, ZoneTables};
 use core::num::NonZeroU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::native_process_runtime::NativeProcessError;
 use carrick_el1::lock::SpinLock;
 
-/// The exact `(carrier, zone, reservation-table)` authority that owns a
-/// queued space's indices.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct RetiredScope {
-    pub carrier: NonZeroU64,
-    pub zone: usize,
-    pub roots: usize,
-}
-
-impl RetiredScope {
-    pub fn for_portal<
-        P: PinnedMetadataExtent,
-        Policy: ReservationPolicy,
-        Geometry: ReservationGeometry,
-        Venue: OwnerVenue<Context>,
-        B: OwnerMmu,
-        Context: Copy + Send + Sync + zerocopy::FromZeros,
-    >(
-        owner: &MmPortal<'_, P, Policy, Geometry, Venue, B, Context>,
-        zone: &ZoneTables<Context>,
-    ) -> Self {
-        Self {
-            carrier: owner.carrier,
-            zone: core::ptr::from_ref(zone).addr(),
-            roots: core::ptr::from_ref(owner.roots).addr(),
-        }
-    }
-}
-
-/// A closed space awaiting retirement, keyed by the exact carrier, zone and
-/// reservation table it was published in.
+/// A closed child space awaiting retirement, keyed by the exact carrier,
+/// zone and reservation table it was published in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetiredSpace {
     pub carrier: NonZeroU64,
@@ -69,147 +32,163 @@ pub struct RetiredSpace {
     pub mm: ReservationMm,
 }
 
-impl RetiredSpace {
-    pub const fn scope(&self) -> RetiredScope {
-        RetiredScope {
-            carrier: self.carrier,
-            zone: self.zone,
-            roots: self.roots,
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QueuedSpace {
+    id: u64,
+    space: RetiredSpace,
+    in_flight: bool,
 }
 
-struct ScopeQueue {
-    pending: SpinLock<Vec<ReservationMm>>,
-}
-
-impl ScopeQueue {
-    const fn new() -> Self {
-        Self {
-            pending: SpinLock::new(Vec::new()),
-        }
-    }
-}
-
-/// Scope-partitioned pending queues. Each ISA owns one static instance.
+/// The pending queue. Each ISA owns one static instance.
 pub struct RetiredSpaces {
-    scopes: SpinLock<BTreeMap<RetiredScope, Arc<ScopeQueue>>>,
+    next_id: AtomicU64,
+    pending: SpinLock<Vec<QueuedSpace>>,
+}
+
+struct InFlightGuard<'a> {
+    queue: &'a RetiredSpaces,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut pending = self.queue.pending.lock();
+            if let Some(entry) = pending.iter_mut().find(|entry| entry.id == self.id) {
+                entry.in_flight = false;
+            }
+        }
+    }
 }
 
 impl RetiredSpaces {
     pub const fn new() -> Self {
         Self {
-            scopes: SpinLock::new(BTreeMap::new()),
+            next_id: AtomicU64::new(0),
+            pending: SpinLock::new(Vec::new()),
         }
     }
 
     pub fn push(&self, space: RetiredSpace) {
-        let queue = {
-            let mut scopes = self.scopes.lock();
-            Arc::clone(
-                scopes
-                    .entry(space.scope())
-                    .or_insert_with(|| Arc::new(ScopeQueue::new())),
-            )
-        };
-        let mut pending = queue.pending.lock();
-        if !pending.contains(&space.mm) {
-            pending.push(space.mm);
+        let mut pending = self.pending.lock();
+        if pending.iter().any(|entry| entry.space == space) {
+            return;
         }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        pending.push(QueuedSpace {
+            id,
+            space,
+            in_flight: false,
+        });
     }
 
     pub fn len(&self) -> usize {
-        let queues: Vec<Arc<ScopeQueue>> = self.scopes.lock().values().cloned().collect();
-        queues.iter().map(|queue| queue.pending.lock().len()).sum()
+        self.pending.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    fn prune_if_empty(&self, scope: RetiredScope) {
-        let mut scopes = self.scopes.lock();
-        let removable = scopes
-            .get_mut(&scope)
-            .and_then(Arc::get_mut)
-            .is_some_and(|exclusive| exclusive.pending.lock().is_empty());
-        if removable {
-            scopes.remove(&scope);
+    fn has_portal_in_flight(&self, carrier: NonZeroU64, zone: usize, roots: usize) -> bool {
+        let pending = self.pending.lock();
+        pending.iter().any(|entry| {
+            entry.in_flight
+                && entry.space.carrier == carrier
+                && entry.space.zone == zone
+                && entry.space.roots == roots
+        })
+    }
+
+    fn wait_portal_in_flight(&self, carrier: NonZeroU64, zone: usize, roots: usize) {
+        while self.has_portal_in_flight(carrier, zone, roots) {
+            core::hint::spin_loop();
         }
     }
 
-    /// Retire every queued space in `scope` that `ready` admits; keep the rest
-    /// queued in `scope` without touching any other scope.
+    fn next_candidate(&self, next_min_id: u64) -> Option<(u64, RetiredSpace)> {
+        let pending = self.pending.lock();
+        pending
+            .iter()
+            .find(|entry| entry.id >= next_min_id && !entry.in_flight)
+            .map(|entry| (entry.id, entry.space))
+    }
+
+    /// Retire every queued space `ready` admits; keep the rest queued.
     ///
-    /// When `retire` returns `NativeProcessError::Busy`, that space and all
-    /// remaining spaces in `scope` stay queued in FIFO order for the next
-    /// drain. Stale or unretireable entries are dropped so they cannot block
-    /// the queue head forever.
-    pub fn drain_scope(
-        &self,
-        scope: RetiredScope,
-        mut ready: impl FnMut(&RetiredSpace) -> bool,
-        mut retire: impl FnMut(&RetiredSpace) -> Result<(), NativeProcessError>,
-    ) -> Result<(), NativeProcessError> {
-        let Some(queue) = self.scopes.lock().get(&scope).cloned() else {
-            return Ok(());
-        };
-        let (result, empty) = {
-            let mut pending = queue.pending.lock();
-            let result = drain_vec(scope, &mut pending, &mut ready, &mut retire);
-            (result, pending.is_empty())
-        };
-        drop(queue);
-        if empty {
-            self.prune_if_empty(scope);
-        }
-        result
-    }
-
-    /// Retire every queued space across all scopes that `ready` admits; keep
-    /// the rest queued.
+    /// Entries remain in `self.pending` until their retirement completes, so a
+    /// concurrent caller never observes a temporarily emptied queue. The queue
+    /// spin lock is held only for short slice lookups/removals and is never
+    /// held across `ready` or `retire`.
+    ///
+    /// When `retire` returns `NativeProcessError::Busy`, that space is
+    /// kept to retry at the next drain, and remaining entries stay queued.
+    /// Stale or unretireable entries are dropped/diagnosed so they do not
+    /// block the queue head forever, allowing subsequent entries to drain.
     pub fn drain(
         &self,
         mut ready: impl FnMut(&RetiredSpace) -> bool,
         mut retire: impl FnMut(&RetiredSpace) -> Result<(), NativeProcessError>,
     ) -> Result<(), NativeProcessError> {
-        let scopes: Vec<(RetiredScope, Arc<ScopeQueue>)> = self
-            .scopes
-            .lock()
-            .iter()
-            .map(|(scope, queue)| (*scope, Arc::clone(queue)))
-            .collect();
+        let mut next_min_id = 0u64;
         let mut result = Ok(());
-        let mut empty_scopes = Vec::new();
-        for (scope, queue) in scopes {
-            let (scope_result, empty) = {
-                let mut pending = queue.pending.lock();
-                let outcome = drain_vec(scope, &mut pending, &mut ready, &mut retire);
-                (outcome, pending.is_empty())
-            };
-            drop(queue);
-            if empty {
-                empty_scopes.push(scope);
+        while let Some((id, space)) = self.next_candidate(next_min_id) {
+            next_min_id = id.saturating_add(1);
+            if !ready(&space) {
+                continue;
             }
-            match scope_result {
-                Ok(()) => {}
+            let claimed = {
+                let mut pending = self.pending.lock();
+                if let Some(entry) = pending
+                    .iter_mut()
+                    .find(|entry| entry.id == id && !entry.in_flight)
+                {
+                    entry.in_flight = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !claimed {
+                continue;
+            }
+            let mut guard = InFlightGuard {
+                queue: self,
+                id,
+                armed: true,
+            };
+            let outcome = retire(&space);
+            guard.armed = false;
+            let mut pending = self.pending.lock();
+            match outcome {
+                Ok(()) => {
+                    if let Some(pos) = pending.iter().position(|entry| entry.id == id) {
+                        pending.remove(pos);
+                    }
+                }
                 Err(NativeProcessError::Busy) => {
-                    result = Err(NativeProcessError::Busy);
-                    break;
+                    if let Some(entry) = pending.iter_mut().find(|entry| entry.id == id) {
+                        entry.in_flight = false;
+                    }
+                    return Err(NativeProcessError::Busy);
                 }
                 Err(error) => {
+                    // Stale or unretireable entries are dropped from the queue
+                    // so they do not block the queue head forever.
+                    if let Some(pos) = pending.iter().position(|entry| entry.id == id) {
+                        pending.remove(pos);
+                    }
                     result = Err(error);
                 }
             }
         }
-        for scope in empty_scopes {
-            self.prune_if_empty(scope);
-        }
         result
     }
 
-    /// Drain queued spaces belonging to this exact `(owner, zone)` scope whose
-    /// MM is no longer installed on any of the zone's first `slots` slots.
+    /// The production drain for one ISA's portal and zone: entries from
+    /// another carrier, zone or table, and MMs still installed on a slot of
+    /// the zone's first `slots` slots, stay queued.
     pub fn drain_portal<
         P: PinnedMetadataExtent,
         Policy: ReservationPolicy,
@@ -224,18 +203,25 @@ impl RetiredSpaces {
         slots: usize,
         worker: u32,
     ) -> Result<(), NativeProcessError> {
-        let scope = RetiredScope::for_portal(owner, zone);
-        self.drain_scope(
-            scope,
-            |space| !space_has_resident_slot(zone, slots, space.mm),
+        let zone_address = core::ptr::from_ref(zone).addr();
+        let roots_address = core::ptr::from_ref(owner.roots).addr();
+        let result = self.drain(
+            |space| {
+                space.carrier == owner.carrier
+                    && space.zone == zone_address
+                    && space.roots == roots_address
+                    && !space_has_resident_slot(zone, slots, space.mm)
+            },
             |space| retire_closed_space(owner, space.mm, worker),
-        )
+        );
+        self.wait_portal_in_flight(owner.carrier, zone_address, roots_address);
+        result
     }
 
-    /// Retire `mm` now when no slot in `zone` has it installed, queuing `mm`
-    /// in this portal's scope only if a slot still holds `mm` or its root is
-    /// `Busy`. Earlier queued spaces in the same scope are drained best-effort
-    /// without letting an unrelated space's error mask `mm`'s outcome.
+    /// Retire `mm` synchronously when no zone slot has it installed and its
+    /// root is free, after opportunistically draining any older entries for
+    /// this portal. If `mm` still has a resident slot or its root is busy,
+    /// queue it so a later drain completes retirement.
     pub fn retire_or_queue_portal<
         P: PinnedMetadataExtent,
         Policy: ReservationPolicy,
@@ -251,81 +237,40 @@ impl RetiredSpaces {
         worker: u32,
         mm: ReservationMm,
     ) -> Result<(), NativeProcessError> {
-        let scope = RetiredScope::for_portal(owner, zone);
-        let _earlier_drain = self.drain_portal(owner, zone, slots, worker);
-        if space_has_resident_slot(zone, slots, mm) {
-            self.push(RetiredSpace {
-                carrier: scope.carrier,
-                zone: scope.zone,
-                roots: scope.roots,
-                mm,
-            });
-            let _recheck = self.drain_portal(owner, zone, slots, worker);
-            return if owner.spaces.find(mm.raw()).is_none() {
-                Ok(())
-            } else {
-                Err(NativeProcessError::Busy)
-            };
-        }
-        match retire_closed_space(owner, mm, worker) {
-            Ok(()) => Ok(()),
-            Err(NativeProcessError::Busy) => {
-                self.push(RetiredSpace {
-                    carrier: scope.carrier,
-                    zone: scope.zone,
-                    roots: scope.roots,
-                    mm,
-                });
-                let _recheck = self.drain_portal(owner, zone, slots, worker);
-                if owner.spaces.find(mm.raw()).is_none() {
-                    Ok(())
-                } else {
-                    Err(NativeProcessError::Busy)
+        let _ = self.drain_portal(owner, zone, slots, worker);
+        if !space_has_resident_slot(zone, slots, mm) {
+            match retire_closed_space(owner, mm, worker) {
+                Ok(()) => return Ok(()),
+                Err(NativeProcessError::Busy) => {}
+                Err(error) => {
+                    return if owner.spaces.find(mm.raw()).is_none() {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    };
                 }
             }
-            Err(error) => Err(error),
         }
-    }
-}
-
-fn drain_vec(
-    scope: RetiredScope,
-    pending: &mut Vec<ReservationMm>,
-    ready: &mut impl FnMut(&RetiredSpace) -> bool,
-    retire: &mut impl FnMut(&RetiredSpace) -> Result<(), NativeProcessError>,
-) -> Result<(), NativeProcessError> {
-    let mut result = Ok(());
-    let mut write = 0;
-    for read in 0..pending.len() {
-        let mm = pending[read];
-        let space = RetiredSpace {
-            carrier: scope.carrier,
-            zone: scope.zone,
-            roots: scope.roots,
+        let zone_address = core::ptr::from_ref(zone).addr();
+        let roots_address = core::ptr::from_ref(owner.roots).addr();
+        let target = RetiredSpace {
+            carrier: owner.carrier,
+            zone: zone_address,
+            roots: roots_address,
             mm,
         };
-        if !ready(&space) {
-            pending[write] = mm;
-            write += 1;
-            continue;
-        }
-        match retire(&space) {
-            Ok(()) => {}
-            Err(NativeProcessError::Busy) => {
-                pending.copy_within(read.., write);
-                write += pending.len() - read;
-                result = Err(NativeProcessError::Busy);
-                break;
-            }
-            Err(error) => {
-                // Stale or unretireable entries are dropped from the queue
-                // so they do not block the queue head forever.
-                result = Err(error);
-            }
+        self.push(target);
+        let _ = self.drain(
+            |space| *space == target && !space_has_resident_slot(zone, slots, space.mm),
+            |space| retire_closed_space(owner, space.mm, worker),
+        );
+        self.wait_portal_in_flight(owner.carrier, zone_address, roots_address);
+        if owner.spaces.find(mm.raw()).is_none() {
+            Ok(())
+        } else {
+            Err(NativeProcessError::Busy)
         }
     }
-    pending.truncate(write);
-    result
 }
 
 impl Default for RetiredSpaces {
@@ -368,7 +313,11 @@ pub fn retire_closed_space<
     owner.spaces.close(index);
     owner
         .root_any(mm, worker)
-        .map_err(|_| NativeProcessError::Stale)?
+        .map_err(|error| match error {
+            carrick_core::mm::transaction::MmError::Busy
+            | carrick_core::mm::transaction::MmError::Wait(_) => NativeProcessError::Busy,
+            _ => NativeProcessError::Stale,
+        })?
         .retire_final()
         .map_err(|_| NativeProcessError::Busy)?;
     owner.spaces.free(index);
@@ -449,140 +398,117 @@ mod tests {
         assert!(queue.is_empty());
     }
 
-    #[test]
-    fn foreign_scope_drain_does_not_steal_or_block_other_scopes() {
-        use std::sync::{Barrier, mpsc};
-        use std::time::Duration;
+    struct BoundedBarrier {
+        parties: usize,
+        state: std::sync::Mutex<(usize, u64)>,
+        cvar: std::sync::Condvar,
+    }
 
-        let queue = RetiredSpaces::new();
-        // Order `scope_b < scope_a` so `BTreeMap` order cannot hide blocking.
-        let scope_b = RetiredScope {
-            carrier: NonZeroU64::new(1).unwrap(),
-            zone: 10,
-            roots: 20,
-        };
-        let scope_a = RetiredScope {
-            carrier: NonZeroU64::new(2).unwrap(),
-            zone: 30,
-            roots: 40,
-        };
-        queue.push(RetiredSpace {
-            carrier: scope_b.carrier,
-            zone: scope_b.zone,
-            roots: scope_b.roots,
-            mm: ReservationMm::new(20).unwrap(),
-        });
-        queue.push(RetiredSpace {
-            carrier: scope_a.carrier,
-            zone: scope_a.zone,
-            roots: scope_a.roots,
-            mm: ReservationMm::new(10).unwrap(),
-        });
+    impl BoundedBarrier {
+        fn new(parties: usize) -> Self {
+            Self {
+                parties,
+                state: std::sync::Mutex::new((0, 0)),
+                cvar: std::sync::Condvar::new(),
+            }
+        }
 
-        let entered = Barrier::new(2);
-        let (release_tx, release_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-
-        let early = std::thread::scope(|s| {
-            let worker_b = s.spawn(|| {
-                queue.drain_scope(
-                    scope_b,
-                    |_| true,
-                    |_| {
-                        entered.wait();
-                        release_rx.recv().unwrap();
-                        Ok(())
-                    },
-                )
-            });
-
-            entered.wait();
-
-            let worker_a = s.spawn(|| {
-                let mut retired_a = Vec::new();
-                let outcome = queue.drain_scope(
-                    scope_a,
-                    |_| true,
-                    |space| {
-                        retired_a.push(space.mm.raw());
-                        Ok(())
-                    },
+        fn wait(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut state = self.state.lock().unwrap();
+            let generation = state.1;
+            state.0 += 1;
+            if state.0 == self.parties {
+                state.0 = 0;
+                state.1 += 1;
+                self.cvar.notify_all();
+                return;
+            }
+            while state.1 == generation {
+                let now = std::time::Instant::now();
+                assert!(now < deadline, "bounded barrier timed out after 5s");
+                let (next, result) = self.cvar.wait_timeout(state, deadline - now).unwrap();
+                state = next;
+                assert!(
+                    !result.timed_out() || state.1 != generation,
+                    "bounded barrier timed out after 5s"
                 );
-                done_tx.send((outcome, retired_a)).unwrap();
-            });
-
-            let early = done_rx.recv_timeout(Duration::from_millis(200));
-            release_tx.send(()).unwrap();
-            assert_eq!(worker_b.join().unwrap(), Ok(()));
-            worker_a.join().unwrap();
-            early
-        });
-
-        let (outcome_a, retired_a) =
-            early.expect("scope A drain must complete without waiting on scope B");
-        assert_eq!(outcome_a, Ok(()));
-        assert_eq!(
-            retired_a,
-            vec![10],
-            "foreign scope B drain must not steal scope A's queued space"
-        );
-        assert!(queue.is_empty());
+            }
+        }
     }
 
     #[test]
-    fn same_scope_concurrent_drain_waits_for_inflight_retirement() {
-        use std::sync::{Barrier, Mutex, mpsc};
-        use std::time::Duration;
-
+    fn concurrent_drain_does_not_hide_second_callers_space() {
         let queue = RetiredSpaces::new();
-        queue.push(space(10));
+        let first_carrier = NonZeroU64::new(1).unwrap();
+        let second_carrier = NonZeroU64::new(2).unwrap();
+        let first_space = RetiredSpace {
+            carrier: first_carrier,
+            zone: 10,
+            roots: 20,
+            mm: ReservationMm::new(10).unwrap(),
+        };
+        let second_space = RetiredSpace {
+            carrier: second_carrier,
+            zone: 30,
+            roots: 40,
+            mm: ReservationMm::new(20).unwrap(),
+        };
+        queue.push(first_space);
 
-        let retired = Mutex::new(Vec::new());
-        let entered = Barrier::new(2);
-        let (release_tx, release_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
+        let pushed = BoundedBarrier::new(2);
+        let in_first_retire = BoundedBarrier::new(2);
+        let second_finished = BoundedBarrier::new(2);
 
-        let premature = std::thread::scope(|s| {
-            let worker_1 = s.spawn(|| {
-                queue.drain(
-                    |_| true,
-                    |space| {
-                        entered.wait();
-                        release_rx.recv().unwrap();
-                        retired.lock().unwrap().push(space.mm.raw());
-                        Ok(())
-                    },
-                )
-            });
-
-            entered.wait();
-
-            let worker_2 = s.spawn(|| {
+        let (second_outcome, second_retired, visible_to_second) = std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                pushed.wait();
+                let mut retired = Vec::new();
                 let outcome = queue.drain(
-                    |_| true,
+                    |space| space.carrier == first_carrier,
                     |space| {
-                        retired.lock().unwrap().push(space.mm.raw());
+                        in_first_retire.wait();
+                        second_finished.wait();
+                        retired.push(space.mm.raw());
                         Ok(())
                     },
                 );
-                let snapshot = retired.lock().unwrap().clone();
-                done_tx.send((outcome, snapshot)).unwrap();
+                assert_eq!(outcome, Ok(()));
+                assert_eq!(retired, vec![10]);
             });
 
-            let premature = done_rx.recv_timeout(Duration::from_millis(50));
-            release_tx.send(()).unwrap();
-            assert_eq!(worker_1.join().unwrap(), Ok(()));
-            worker_2.join().unwrap();
-            premature
+            let second = s.spawn(|| {
+                queue.push(second_space);
+                pushed.wait();
+                in_first_retire.wait();
+
+                let mut retired = Vec::new();
+                let outcome = queue.drain(
+                    |space| space.carrier == second_carrier,
+                    |space| {
+                        retired.push(space.mm.raw());
+                        Ok(())
+                    },
+                );
+                let visible = !queue.is_empty();
+                second_finished.wait();
+                (outcome, retired, visible)
+            });
+
+            first.join().unwrap();
+            second.join().unwrap()
         });
 
+        assert_eq!(second_outcome, Ok(()));
         assert!(
-            premature.is_err(),
-            "same-scope concurrent drain returned before in-flight retirement finished: {premature:?}"
+            !second_retired.is_empty() || visible_to_second,
+            "second caller's space was neither retired nor visible in queue"
         );
-        let (outcome_2, snapshot_at_return) = done_rx.recv().unwrap();
-        assert_eq!(outcome_2, Ok(()));
-        assert_eq!(snapshot_at_return, vec![10]);
+        assert_eq!(
+            second_retired,
+            vec![20],
+            "second caller's ready space must retire during its own drain"
+        );
         assert!(queue.is_empty());
     }
 }
