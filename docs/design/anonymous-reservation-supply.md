@@ -425,3 +425,35 @@ required future-hole run `[0x200000, 0x300000)`, failing the assertion with exit
 101. The green witness selects through `private_stock_plan`; it also explicitly
 asserts that `transfer_fault_plan` retains that original narrower range and
 rejects widening its ordinary grant to the stock selection.
+
+### Slice 1 review correction: preserve host selection
+
+Review found an extraction regression: the new 256-observation limit refused
+a valid host grant in a 300-node fragmented 2 MiB window. The host previously
+had no observation cap. The correction uses ONE shared planner with typed
+`StockPolicy::HostUnbounded` and `NativeBounded` inputs. It does not copy the
+eligibility algorithm. Expected correction size: 100–170 implementation lines,
+150–250 test lines and 35–60 documentation/binding lines, below the slice cap.
+
+The existing host adapter selects HostUnbounded. It keeps the old uncapped
+observations, ignores fork-pending and pending-request destination/source as
+before, accepts anonymous nodes without adding PRIVATE/host-backing checks,
+and excludes heap nodes by containment rather than overlap. It still excludes
+owed returns and authenticated occupancy. NativeBounded retains the proposed
+strict policy and bounded observations; it is unused in production until a
+later native supply layer. The host and native variants share selection,
+clipping, root-owned observations and plan representation.
+
+The protection recheck matches the old host behavior. The exact fault-node
+incarnation recheck is intentional new stale-observation hardening, not a
+restoration of old behavior: a same-protection replacement now declines the
+stale observation. The earlier review fix did not establish behavioral parity.
+
+Immediate revalidation under the same root lock is removed from the host
+adapter; future native publication must revalidate across its actual supply
+lock gap. Speculative planner refusals return no host plan, rather than a new
+fatal broken-root path. Empty clipped host pieces are ignored as before;
+nonempty malformed observation spans decline planning. The original Slice 1
+red-first planner witness compared distinct policy capabilities, not an
+extraction regression. The new fragmented-host and fork-pending witnesses pin
+the previously existing answers; bounded-native tests retain strict refusal.

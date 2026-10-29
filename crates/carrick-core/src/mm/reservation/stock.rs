@@ -1,4 +1,4 @@
-//! Bounded anonymous stock selection. This is policy, not a publication permit.
+//! Typed anonymous stock selection. This is policy, not a publication permit.
 //! Backend occupancy is evidence only; the locked root owns revalidation.
 use super::{DeferredReturn, Reservations};
 use alloc::vec::Vec;
@@ -8,13 +8,45 @@ use carrick_core_abi::{
     ReservationRange, ReservationRequest, ReservationSequence, UserVa,
 };
 
+/// One selection implementation, with the existing host alias policy kept
+/// distinct from future native physical publication admission. NativeBounded
+/// is not used by a production adapter until native supply is integrated.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum StockPolicy {
+    HostUnbounded,
+    #[default]
+    NativeBounded,
+}
+impl StockPolicy {
+    fn eligible(self, mapping: Mapping, heap: ReservationRange) -> bool {
+        let heap_node = match self {
+            Self::HostUnbounded => {
+                heap.start() <= mapping.range.start() && mapping.range.end() <= heap.end()
+            }
+            Self::NativeBounded => overlaps(mapping.range, heap),
+        };
+        mapping.anonymous
+            && !heap_node
+            && (self == Self::HostUnbounded
+                || mapping.flags.contains(ReservationNodeFlags::PRIVATE)
+                    && mapping.host_backing.is_none())
+    }
+}
+
 /// Maximum observations in each policy input and selected-node snapshot.
-/// Fragmentation beyond this bound refuses speculative planning, without edits.
+/// Only NativeBounded refuses fragmentation beyond this bound.
 pub const STOCK_OBSERVATIONS: usize = 256;
 
 /// Descriptor/residency occupancy and host-only observations, bounded before
-/// entering the owner. Pending edits and owed returns are read from the root,
-/// never accepted as backend assertions.
+/// entering the owner. Owed returns, and NativeBounded pending edits, are
+/// read from the root, never accepted as backend assertions.
 #[derive(
     ::core::clone::Clone,
     ::core::fmt::Debug,
@@ -23,12 +55,16 @@ pub const STOCK_OBSERVATIONS: usize = 256;
     ::core::cmp::Eq,
 )]
 pub struct StockExclusions {
+    policy: StockPolicy,
     occupied: Vec<ReservationRange>,
     host_only: Vec<ReservationRange>,
 }
 impl StockExclusions {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(policy: StockPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
     }
     pub fn exclude_occupied(&mut self, range: ReservationRange) -> Result<(), Refusal> {
         self.push(range, false)
@@ -37,7 +73,9 @@ impl StockExclusions {
         self.push(range, true)
     }
     fn push(&mut self, range: ReservationRange, host: bool) -> Result<(), Refusal> {
-        if self.occupied.len() + self.host_only.len() == STOCK_OBSERVATIONS {
+        if self.policy == StockPolicy::NativeBounded
+            && self.occupied.len() + self.host_only.len() == STOCK_OBSERVATIONS
+        {
             return Err(Refusal::MetadataRequired);
         }
         if host {
@@ -55,6 +93,7 @@ impl StockExclusions {
 /// No physical ownership, descriptor access or publication is conferred here.
 #[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct PrivateStockPlan {
+    policy: StockPolicy,
     mm: ReservationMm,
     root_incarnation: ReservationGeneration,
     mapping_incarnation: ReservationIncarnation,
@@ -88,17 +127,22 @@ impl<P: ReservationPolicy, G: ReservationGeometry, C: Copy + Send + Sync + zeroc
 {
     /// Select the maximal eligible run around the fault within its bulk
     /// window. Nodes retain the old same-protection anonymous policy; future
-    /// holes stay within the mmap arena's half window. Heap is never stock.
+    /// holes stay within the mmap arena's half window. Heap and node eligibility
+    /// follow the typed policy; both variants use this one selection algorithm.
     pub fn private_stock_plan(
         &mut self,
+        policy: StockPolicy,
         address: UserVa,
         max_len: GuestLen,
         exclusions: &StockExclusions,
     ) -> Result<PrivateStockPlan, Refusal> {
+        if policy != exclusions.policy {
+            return Err(Refusal::Invalid);
+        }
         if !self.is_admitted() {
             return Err(Refusal::Stale);
         }
-        if self.fork_pending() {
+        if policy == StockPolicy::NativeBounded && self.fork_pending() {
             return Err(Refusal::Busy);
         }
         let max = max_len.raw();
@@ -108,11 +152,7 @@ impl<P: ReservationPolicy, G: ReservationGeometry, C: Copy + Send + Sync + zeroc
         let page = address.raw() & !4095;
         let (mapping, mapping_incarnation) = self.node(page).ok_or(Refusal::Hole)?;
         let layout = self.state().layout;
-        if !mapping.anonymous
-            || !mapping.flags.contains(ReservationNodeFlags::PRIVATE)
-            || mapping.host_backing.is_some()
-            || overlaps(mapping.range, layout.heap)
-        {
+        if !policy.eligible(mapping, layout.heap) {
             return Err(Refusal::ForeignMapping);
         }
         if mapping.protection == ReservationProtection::NONE {
@@ -134,7 +174,7 @@ impl<P: ReservationPolicy, G: ReservationGeometry, C: Copy + Send + Sync + zeroc
             if node.start >= window.end() {
                 break;
             }
-            if nodes.len() == STOCK_OBSERVATIONS {
+            if policy == StockPolicy::NativeBounded && nodes.len() == STOCK_OBSERVATIONS {
                 return Err(Refusal::MetadataRequired);
             }
             let incarnation =
@@ -156,12 +196,7 @@ impl<P: ReservationPolicy, G: ReservationGeometry, C: Copy + Send + Sync + zeroc
                 hole(&mut eligible, cursor, start);
             }
             cursor = cursor.max(end);
-            if node.anonymous
-                && node.flags.contains(ReservationNodeFlags::PRIVATE)
-                && node.host_backing.is_none()
-                && node.protection == mapping.protection
-                && !overlaps(node.range, layout.heap)
-            {
+            if policy.eligible(*node, layout.heap) && node.protection == mapping.protection {
                 eligible.push(ReservationRange::new(start, end).ok_or(Refusal::Invalid)?);
             }
         }
@@ -193,6 +228,7 @@ impl<P: ReservationPolicy, G: ReservationGeometry, C: Copy + Send + Sync + zeroc
         // can suppress these exclusions or authorize a pending destination.
         let pending_ranges = pending
             .into_iter()
+            .filter(|_| policy == StockPolicy::NativeBounded)
             .flat_map(|request| [Some(request.range), request.source])
             .flatten();
         for blocked in exclusions
@@ -217,6 +253,7 @@ impl<P: ReservationPolicy, G: ReservationGeometry, C: Copy + Send + Sync + zeroc
         }
         let range = ReservationRange::new(start, end).ok_or(Refusal::Invalid)?;
         Ok(PrivateStockPlan {
+            policy,
             mm: self.mm,
             root_incarnation: self.incarnation(),
             mapping_incarnation,
@@ -245,7 +282,8 @@ impl<P: ReservationPolicy, G: ReservationGeometry, C: Copy + Send + Sync + zeroc
         if plan.mm != self.mm || plan.root_incarnation != self.incarnation() {
             return Err(Refusal::Stale);
         }
-        let current = self.private_stock_plan(plan.fault_page, plan.max_len, exclusions)?;
+        let current =
+            self.private_stock_plan(plan.policy, plan.fault_page, plan.max_len, exclusions)?;
         if current != *plan {
             return Err(Refusal::Stale);
         }
