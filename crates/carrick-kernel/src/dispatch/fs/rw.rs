@@ -2260,14 +2260,13 @@ impl<'a> FsView<'a> {
                                 notification: Some(PipeWriteNotification::new(
                                     this.captured_file_table().epoll_wake_handle(),
                                     Arc::clone(cx.kernel.kernel()),
-                                    fd,
                                 )),
                             },
                         );
                         if let DispatchOutcome::Returned { value } = outcome {
                             if value > 0 {
                                 this.notify_inmem_epoll();
-                                this.fasync_notify_after_write(cx.kernel, fd, &open_file, value);
+                                this.fasync_notify_after_write(cx.kernel, &open_file, value);
                             }
                         }
                         return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
@@ -2391,7 +2390,7 @@ impl<'a> FsView<'a> {
                             _ => 0,
                         };
                         drop(open);
-                        this.fasync_notify_after_write(cx.kernel, fd, &open_file, written);
+                        this.fasync_notify_after_write(cx.kernel, &open_file, written);
                         return Ok(this.raise_sigpipe_on_epipe(cx, out));
                     }
                     OpenDescription::HostSocket { host_fd, type_, .. } => {
@@ -2436,7 +2435,7 @@ impl<'a> FsView<'a> {
                             _ => 0,
                         };
                         drop(open);
-                        this.fasync_notify_after_write(cx.kernel, fd, &open_file, written);
+                        this.fasync_notify_after_write(cx.kernel, &open_file, written);
                         return Ok(out);
                     }
                     OpenDescription::InMemorySocket { socket, .. } => {
@@ -5241,7 +5240,6 @@ impl<'a> FsView<'a> {
                                     notification: Some(PipeWriteNotification::new(
                                         self.captured_file_table().epoll_wake_handle(),
                                         Arc::clone(cx.kernel.kernel()),
-                                        target.fd,
                                     )),
                                 },
                             );

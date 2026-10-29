@@ -831,6 +831,9 @@ pub struct DescriptionCommon {
     lease: AtomicI32,
     /// `F_SETSIG`: the signal delivered on async I/O (0 = the default SIGIO).
     async_sig: AtomicI32,
+    /// Descriptor number recorded when `O_ASYNC` was last enabled (Linux
+    /// `fa_fd`); [`Self::NO_ASYNC_FD`] while signal-driven I/O is off.
+    async_fd: AtomicI32,
     /// True for a `memfd_secret(2)` description.
     secretmem: AtomicBool,
     /// True if this open file description materialized a new file (`F_CREATED_QUERY`).
@@ -861,6 +864,7 @@ impl DescriptionCommon {
             physical: Arc::new(DescriptionPhysicalLifetime::default()),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
+            async_fd: AtomicI32::new(Self::NO_ASYNC_FD),
             secretmem: AtomicBool::new(false),
             created: AtomicBool::new(false),
             owner: Mutex::new(CapturedAsyncIoOwner::default()),
@@ -884,6 +888,7 @@ impl DescriptionCommon {
             physical: Arc::new(DescriptionPhysicalLifetime::default()),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
+            async_fd: AtomicI32::new(Self::NO_ASYNC_FD),
             secretmem: AtomicBool::new(false),
             created: AtomicBool::new(false),
             owner: Mutex::new(CapturedAsyncIoOwner::default()),
@@ -999,6 +1004,26 @@ impl DescriptionCommon {
 
     pub(crate) fn set_async_sig(&self, sig: i32) {
         self.async_sig.store(sig, Ordering::Relaxed);
+    }
+
+    /// Guest descriptor numbers are never negative once `fcntl` has resolved
+    /// them, so a negative value cannot collide with a recorded `fa_fd`.
+    const NO_ASYNC_FD: i32 = -1;
+
+    /// The descriptor number recorded when `O_ASYNC` was enabled, if any.
+    pub(crate) fn async_fd(&self) -> Option<carrick_signal_linux::fasync::FasyncFd> {
+        let fd = self.async_fd.load(Ordering::Relaxed);
+        (fd != Self::NO_ASYNC_FD).then(|| carrick_signal_linux::fasync::FasyncFd::new(fd))
+    }
+
+    /// Record `fa_fd` on the `O_ASYNC` 0 -> 1 transition (Linux `fasync_helper`).
+    pub(crate) fn record_async_fd(&self, fd: carrick_signal_linux::fasync::FasyncFd) {
+        self.async_fd.store(fd.get(), Ordering::Relaxed);
+    }
+
+    /// Forget the recorded `fa_fd` when `O_ASYNC` is cleared.
+    pub(crate) fn clear_async_fd(&self) {
+        self.async_fd.store(Self::NO_ASYNC_FD, Ordering::Relaxed);
     }
 
     pub(crate) fn secretmem(&self) -> bool {
