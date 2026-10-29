@@ -511,3 +511,27 @@ fn stock_adoption_quarantine_latch_blocks_even_a_damaged_pin_claim() {
     assert_eq!(visited, 0);
     assert_eq!(table.stock_record_count(), 1);
 }
+
+#[test]
+fn stock_adoption_settles_once_and_keeps_the_existing_wire_budget() {
+    assert_eq!(core::mem::size_of::<FrameGrantResidencyRecord>(), 192);
+    assert_eq!(FrameGrantResidencyRecord::STOCK_MAPPINGS_OFFSET, 160);
+    let table = table();
+    let who = owner(7, 1);
+    let id = publish(&table, who);
+    let mut pending = stage(
+        &table,
+        who,
+        id,
+        [Some(page(1, ReservationProtection::READ)), None, None, None],
+    );
+    let after = pending.commit().unwrap();
+    assert_eq!(
+        pending.rollback(),
+        Err(StockAdoptionRefusal::AlreadySettled)
+    );
+    assert_eq!(pending.commit(), Err(StockAdoptionRefusal::AlreadySettled));
+    drop(pending);
+    assert_eq!(table.stock_adoptions(who, id), Some(after));
+    assert!(!table.stock_adoption_quarantined(who, id));
+}
