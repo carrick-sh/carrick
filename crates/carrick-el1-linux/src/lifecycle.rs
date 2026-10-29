@@ -109,7 +109,7 @@ impl<
                 .process_venue()
                 .and_then(|venue| venue.copy_out_owned(dst, src))
         {
-            return result;
+            return result.is_ok();
         }
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;

@@ -31,6 +31,8 @@ pub struct Physical<'a, C: ProcessContext = ParkedContextWords> {
     pub tid_wakes: usize,
     pub tid_writes: Vec<(u64, u64, u32)>,
     pub child_copy_error: Option<NativeProcessError>,
+    pub child_copy_error_at: Option<u64>,
+    pub on_copy_complete: Option<Box<dyn FnMut(UserVa) + 'a>>,
     pub refuse_copy: bool,
     pub on_signal_clock: Option<Box<dyn FnMut() + 'a>>,
 }
@@ -280,7 +282,11 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         if address.raw() == 1 {
             return Err(NativeProcessError::Fault);
         }
-        if let Some(error) = self.child_copy_error {
+        if let Some(error) = self.child_copy_error
+            && self
+                .child_copy_error_at
+                .is_none_or(|at| address.raw() == at)
+        {
             return Err(error);
         }
         if bytes.len() == core::mem::size_of::<u32>() {
@@ -293,6 +299,9 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
                 .push((mm.mm.raw().get(), address.raw(), *word));
         } else {
             SIGNAL_COPIES.with(|copies| copies.borrow_mut().push((address, bytes.to_vec())));
+        }
+        if let Some(hook) = &mut self.on_copy_complete {
+            hook(address);
         }
         Ok(())
     }
@@ -516,6 +525,8 @@ impl NativeSignalFixture {
             tid_wakes: 0,
             tid_writes: Vec::new(),
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             refuse_copy: false,
             on_signal_clock: None,
         }
@@ -1052,6 +1063,8 @@ impl NativeOwnerSignalFixture {
             tid_wakes: 0,
             tid_writes: Vec::new(),
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             refuse_copy: false,
             on_signal_clock: None,
         }
@@ -3728,4 +3741,148 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
             .take_deliverable(sibling.record, SigBlockMask::NONE)
             .is_some()
     );
+}
+
+#[cfg(test)]
+fn retained_poll_output_owner_wait(cancel: bool) {
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let handle = service.service_mm_handle(&fixture.address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.defer_handbacks();
+            },
+        )
+        .unwrap();
+    let notifications = space.notifications(handle.incarnation()).unwrap();
+    let observed =
+        notifications.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Gate);
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    service.on_copy_complete = Some(Box::new(move |address| {
+        if address.raw() == 0x10000 {
+            access.raise(space.index());
+        }
+    }));
+    // SAFETY: this owner retains the live source; the copy hook closes its
+    // gate after the first page and before the injected second-page refusal.
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Gate,
+            observed.revision(),
+        )
+    };
+    service.child_copy_error = Some(NativeProcessError::OwnerWait(wait));
+    service.child_copy_error_at = Some(0x11000);
+    let bytes: Vec<u8> = (0..8192).map(|n| (n % 251) as u8).collect();
+    take_signal_copies();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                entry.complete_copyout(UserVa::new(0x10000), bytes.clone(), SyscallResult::new(37)),
+                LifecycleOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    ..
+                }
+            ),
+            "completed poll output must retain its result and cursor on an owner wait"
+        );
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    assert_eq!(
+        take_signal_copies(),
+        [(UserVa::new(0x10000), bytes[..4096].to_vec())]
+    );
+    // A nonfatal service interrupt cannot discard completed readiness or spin
+    // through re-enrollment while the gate is still closed.
+    fixture
+        .runtime
+        .cancel_service(fixture.record, fixture.slot, &mut service)
+        .unwrap();
+    assert!(
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .service_wait(&fixture.record)
+            .is_some()
+    );
+    if cancel {
+        fixture
+            .page
+            .process_exit_custody()
+            .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
+        fixture
+            .runtime
+            .cancel_service(fixture.record, fixture.slot, &mut service)
+            .unwrap();
+    }
+    // Make the destination ready even for the fatal case: cancellation must
+    // win before any re-preparation, not merely rely on a still-closed gate.
+    service.child_copy_error = None;
+    access.lower(space.index());
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    let resumed = entry.resume_checkpoint().unwrap();
+    if cancel {
+        assert!(!matches!(resumed, NativeResume::Returned(_)));
+        assert!(
+            take_signal_copies().is_empty(),
+            "fatal cancellation cannot publish another output chunk"
+        );
+    } else {
+        assert!(matches!(resumed, NativeResume::Returned(result) if result.raw() == 37));
+        assert_eq!(
+            take_signal_copies(),
+            [(UserVa::new(0x11000), bytes[4096..].to_vec())]
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn completed_ppoll_output_retains_result_and_next_byte_across_owner_wait() {
+    retained_poll_output_owner_wait(false);
+}
+
+#[cfg(test)]
+#[test]
+fn completed_ppoll_output_cancellation_commits_no_more_bytes() {
+    retained_poll_output_owner_wait(true);
 }

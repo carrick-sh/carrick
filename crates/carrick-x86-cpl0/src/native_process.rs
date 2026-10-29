@@ -613,6 +613,18 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
         self.copy_user_bytes(mm, address, bytes)
+            .map_err(|error| match error {
+                NativeProcessError::OwnerWait(_) => NativeProcessError::Busy,
+                other => other,
+            })
+    }
+    fn copy_owned_bytes(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        self.copy_user_bytes(mm, address, bytes)
     }
     fn quarantine_prepared(&mut self, p: Prepared) {
         core::mem::forget(p);
