@@ -255,12 +255,20 @@ fn accept_start(listener: &UnixListener) -> io::Result<UnixStream> {
 }
 
 fn leader_exited(child: &Child) -> io::Result<bool> {
+    // id_t varies by host; widening first keeps this conversion checked even
+    // where id_t and Child::id() currently have the same representation.
+    let id = libc::id_t::try_from(u64::from(child.id())).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("child PID {} does not fit waitid id_t: {error}", child.id()),
+        )
+    })?;
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
     // SAFETY: valid output storage; WNOWAIT preserves our child's PID custody.
     let result = unsafe {
         libc::waitid(
             libc::P_PID,
-            child.id(),
+            id,
             info.as_mut_ptr(),
             libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
         )
