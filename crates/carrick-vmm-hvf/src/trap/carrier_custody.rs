@@ -1603,10 +1603,15 @@ impl CarrierVmCustody {
             }
             outcome
         };
-        if let RecordPinRelease::ReadyToRetire { ipa } = outcome
-            && self.is_active_root_slot_pool_ipa(ipa)
-        {
-            let _ = super::retire_carrier_stage2_record_at_safe_point(self, identity);
+        if let RecordPinRelease::ReadyToRetire { ipa } = outcome {
+            if self.is_active_root_slot_pool_ipa(ipa) {
+                let _ = super::retire_carrier_stage2_record_at_safe_point(self, identity);
+            } else {
+                // A global owner already retained its exact pending retirement.
+                // Last-unpin requests that existing idle turn; it neither unmaps
+                // here nor runs a supply continuation under the pin venue.
+                self.request_global_frame_retirement_retry();
+            }
         }
     }
 }

@@ -11186,14 +11186,14 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
     let observed_live_retire = Arc::new(std::sync::atomic::AtomicBool::new(false));
     lease_retire.drop_backing_audit = Some((host_addr_retire, Arc::clone(&observed_live_retire)));
 
-    let owner_retire = GlobalFrameHostOwner::new(
+    let owner_retire = Arc::new(GlobalFrameHostOwner::new(
         lease_retire,
         mapping_retire,
         7,
         1,
         ipa_retire,
         size_retire as u64,
-    );
+    ));
     assert!(
         ScopedStage2MapTestStub::is_mapped(ipa_retire, size_retire),
         "owner extent must be mapped before retirement"
