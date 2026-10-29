@@ -3527,6 +3527,50 @@ mod physical_projection_tests {
     }
 
     #[test]
+    fn acknowledged_backing_replies_do_not_exhaust_distinct_heap_lanes() {
+        use carrick_hal::physical_grants::{NativePhysicalGrants, StagedPhysicalGrants};
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
+        // Keep every allocation live so the heap cannot recycle reply addresses.
+        let replies: Vec<_> = (0..carrick_el1_abi::FRAME_GRANT_RESIDENCY_SLOTS + 17)
+            .map(|_| Box::new(carrick_el1_abi::PortalGrantSlot::new()))
+            .collect();
+        let mut grants = NativePhysicalGrants::new(owner);
+        for (index, reply) in replies.iter().enumerate() {
+            let staged = StagedPhysicalGrants::stage(
+                Arc::default(),
+                source.clone(),
+                [carrick_guest_arch::FrameGpa::new(0x10000)],
+                0,
+                16384,
+                owner,
+            )
+            .unwrap();
+            let (mut window, mut txn) = refused_backing_candidate(owner, staged.grants()[0]);
+            window.operation.sequence = NonZeroU64::new(index as u64 + 1).unwrap();
+            txn.id.generation = window.operation.sequence;
+            assert!(
+                grants.backing_reply_available(reply, window),
+                "acknowledged reply addresses exhausted admission at fault {index}"
+            );
+            grants
+                .stage_backing_reply(reply, window, txn, staged.with_backing(()), |_| Ok(()))
+                .unwrap();
+            assert!(grants.offer_backing_reply(reply, &txn));
+            grants
+                .settle_backing_reply(reply, &txn, |_| Ok(()))
+                .unwrap();
+            grants.acknowledge_backing_reply(reply, &txn).unwrap();
+            assert!(inventory.snapshot().mappings.is_empty());
+        }
+        assert!(!grants.failed());
+    }
+
+    #[test]
     fn backing_reply_withdrawal_restores_inventory_before_allocation_release() {
         use carrick_hal::physical_grants::{NativePhysicalGrants, StagedPhysicalGrants};
         let inventory = Arc::new(FrameInventoryAuthority::new());
@@ -3815,8 +3859,8 @@ mod physical_projection_tests {
                     }
                     if !matches!(boundary, 6 | 10) {
                         assert!(
-                            !grants.backing_reply_available(&slot, window),
-                            "same request cannot reuse ACK tombstone"
+                            grants.backing_reply_available(&slot, window),
+                            "ACK must release the completed reply lane"
                         );
                         let mut successor = window;
                         successor.operation.sequence = NonZeroU64::new(2).unwrap();

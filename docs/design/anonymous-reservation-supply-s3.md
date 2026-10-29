@@ -60,10 +60,9 @@ use the same physical owner before stock can reuse returned pages.
 
 The private physical owner retains each transaction under its authenticated
 reply-lane address, exact transaction (including root), owner incarnation and
-inventory identity. A completed tombstone stays through synchronous settlement
-and is replaced only by a newer authenticated request on that same lane. The
-journal population is bounded by the existing residency-slot population and
-checked before native allocation; speculative stock capacity leases remain a
+inventory identity. ACK removes the completed journal; historical heap reply
+addresses consume no capacity. The outstanding journal population is bounded
+by the existing residency-slot population and checked before native allocation; speculative stock capacity leases remain a
 later layer. This is not a speculative-capacity admission claim.
 
 The ring's existing `apply_grant` journals descriptors and residency and publishes

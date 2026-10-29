@@ -355,7 +355,6 @@ pub struct PrivateSupplyTransaction<R> {
     window: carrick_el1_abi::PortalGrantWindow,
     physical: Option<NativeGrant<R>>,
     settlement: Option<BackingReplySettlement>,
-    acknowledged: bool,
     offered: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,9 +391,8 @@ impl<R> NativePhysicalGrants<R> {
     pub fn failed(&self) -> bool {
         self.failed
     }
-    /// A new request on the same authenticated reply lane proves the previous
-    /// synchronous settlement returned to the ring. Keep its tombstone until
-    /// then. Bound concurrent journals independently of allocation size.
+    /// Bound outstanding journals, not historical heap addresses. The service
+    /// ticket authenticates each request; completed lanes leave no tombstone.
     pub fn backing_reply_available(
         &self,
         slot: &carrick_el1_abi::PortalGrantSlot,
@@ -403,13 +401,8 @@ impl<R> NativePhysicalGrants<R> {
         !self.failed
             && window.operation.mm.raw() == self.owner.native_mm.raw().get()
             && window.operation.incarnation == self.owner.root_generation.raw()
-            && self.replies.get(&Self::reply_key(slot)).map_or(
-                self.replies.len() < carrick_el1_abi::FRAME_GRANT_RESIDENCY_SLOTS,
-                |prior| {
-                    prior.acknowledged
-                        && window.operation.sequence > prior.window.operation.sequence
-                },
-            )
+            && self.replies.len() < carrick_el1_abi::FRAME_GRANT_RESIDENCY_SLOTS
+            && !self.replies.contains_key(&Self::reply_key(slot))
     }
     fn reply_key(slot: &carrick_el1_abi::PortalGrantSlot) -> usize {
         core::ptr::from_ref(slot).addr()
@@ -476,7 +469,6 @@ impl<R> NativePhysicalGrants<R> {
                     published: None,
                 }),
                 settlement: None,
-                acknowledged: false,
                 offered: false,
             },
         );
@@ -495,7 +487,7 @@ impl<R> NativePhysicalGrants<R> {
         let Some(pending) = self.replies.get_mut(&Self::reply_key(slot)) else {
             return false;
         };
-        if pending.txn != *txn || pending.offered || pending.acknowledged {
+        if pending.txn != *txn || pending.offered {
             return false;
         }
         pending.offered = slot.submit(pending.window, txn);
@@ -507,7 +499,7 @@ impl<R> NativePhysicalGrants<R> {
         generation: NonZeroU64,
     ) -> Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn> {
         let pending = self.replies.get(&Self::reply_key(slot))?;
-        (pending.txn.id.generation == generation && !pending.acknowledged).then_some(pending.txn)
+        (pending.txn.id.generation == generation).then_some(pending.txn)
     }
     /// Settle physical custody, retaining the exact receipt through table
     /// settlement and ACK. The release adapter must return Ok ONLY after exact
@@ -529,7 +521,7 @@ impl<R> NativePhysicalGrants<R> {
                 .replies
                 .get_mut(&Self::reply_key(slot))
                 .ok_or_else(Self::reply_failure)?;
-            if pending.txn != *txn || pending.acknowledged {
+            if pending.txn != *txn {
                 return Err(Self::reply_failure());
             }
             if let Some(settled) = pending.settlement {
@@ -574,8 +566,8 @@ impl<R> NativePhysicalGrants<R> {
         }
         result
     }
-    /// Called only after the table owner has settled the SAME outcome. Keep a
-    /// tombstone until a later authenticated request reuses this reply lane.
+    /// Called only after the table owner has settled the SAME outcome. Remove
+    /// the completed journal so distinct reply allocations cannot exhaust it.
     /// No current-leaf query can overturn an earlier authenticated apply.
     pub fn acknowledge_backing_reply(
         &mut self,
@@ -590,7 +582,7 @@ impl<R> NativePhysicalGrants<R> {
                 .replies
                 .get_mut(&Self::reply_key(slot))
                 .ok_or_else(Self::reply_failure)?;
-            if pending.txn != *txn || pending.acknowledged {
+            if pending.txn != *txn {
                 return Err(Self::reply_failure());
             }
             let outcome = pending.settlement.ok_or_else(Self::reply_failure)?;
@@ -608,7 +600,7 @@ impl<R> NativePhysicalGrants<R> {
             }
             // Refused physical custody drops only AFTER verified explicit
             // release, and after table settlement. Offered/unknown never drops.
-            pending.acknowledged = true;
+            self.replies.remove(&Self::reply_key(slot));
             Ok(())
         })();
         if result.is_err() {
