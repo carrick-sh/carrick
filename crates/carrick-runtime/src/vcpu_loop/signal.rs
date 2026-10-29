@@ -844,7 +844,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     fault_kind: Option<carrick_mmu_core::aarch64::Stage1FaultKind>,
     tid: carrick_kernel::kernel::LinuxTid,
     mutation: &mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
-) -> Result<bool, TrapError> {
+) -> Result<Result<bool, carrick_kernel::dispatch::mem::ReservationBusy>, TrapError> {
     use carrick_observability::probes::HvpatchFirstTouchDeliverReason as DeliverReason;
     let notify_first_touch_deliver = |reason: DeliverReason| {
         crate::probes::hvpatch_first_touch_deliver(address, reason, tid.raw());
@@ -869,7 +869,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         address,
     ) {
         cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
-        return Ok(true);
+        return Ok(Ok(true));
     }
     if dispatcher.el1_returns_owed() {
         let context = dispatcher.capture_kernel_context(tid).map_err(|error| {
@@ -917,12 +917,25 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         );
         match claim {
             FrameGrantClaim::None => {}
-            FrameGrantClaim::ResponsePending => return Ok(true),
+            FrameGrantClaim::ResponsePending => return Ok(Ok(true)),
             FrameGrantClaim::Accepted(request) => {
                 let permit = mutation.host_alias_permit();
-                let Some(plan) =
-                    dispatcher.resident_frame_grant_plan(&permit, address, request.requested_len)
-                else {
+                let planned = match dispatcher.resident_frame_grant_plan(
+                    &permit,
+                    address,
+                    request.requested_len,
+                ) {
+                    Ok(planned) => planned,
+                    Err(busy) => {
+                        if !mailbox.abandon_unstarted_request(request) {
+                            return Err(TrapError::UnexpectedExit {
+                                reason: "busy root lost its unstarted frame request".into(),
+                            });
+                        }
+                        return Ok(Err(busy));
+                    }
+                };
+                let Some(plan) = planned else {
                     ring::rec_el1_frame_grant_decision(
                         ring_tid,
                         request.request_generation,
@@ -937,7 +950,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         request,
                         carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
                     );
-                    return Ok(true);
+                    return Ok(Ok(true));
                 };
                 if !frame_grant_root_matches(request, plan.root_incarnation()) {
                     publish_frame_grant_refusal(
@@ -945,7 +958,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         request,
                         carrick_el1_abi::FRAME_GRANT_ERR_STALE,
                     );
-                    return Ok(true);
+                    return Ok(Ok(true));
                 }
                 let prot = plan.prot();
                 crate::probes::hvpatch_el1_frame_grant_plan(
@@ -979,7 +992,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         request,
                         carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
                     );
-                    return Ok(true);
+                    return Ok(Ok(true));
                 }
                 // A root-owned span's provenance is the root's: publish it
                 // for exactly this span before its backing is prepared.
@@ -1005,7 +1018,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         request,
                         carrick_el1_abi::FRAME_GRANT_ERR_DENIED,
                     );
-                    return Ok(true);
+                    return Ok(Ok(true));
                 };
                 let ready = prepared.ready();
                 let fault_page = plan.fault_page();
@@ -1159,7 +1172,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     );
                 }
                 drop(prepared);
-                return Ok(true);
+                return Ok(Ok(true));
             }
         }
     }
@@ -1174,7 +1187,10 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     };
     {
         let permit = mutation.host_alias_permit();
-        let plan = dispatcher.resident_fault_plan(&permit, address);
+        let plan = match dispatcher.resident_fault_plan(&permit, address) {
+            Ok(plan) => plan,
+            Err(busy) => return Ok(Err(busy)),
+        };
         if let Some(plan) = plan {
             let page = plan.page();
             let prot = plan.prot();
@@ -1199,13 +1215,13 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 Some(true) => {
                     first_touch.resident = FirstTouchResident::Committed;
                     ring::rec_first_touch(&first_touch);
-                    return Ok(true);
+                    return Ok(Ok(true));
                 }
                 Some(false) => {
                     notify_first_touch_deliver(DeliverReason::ArmingDenies);
                     first_touch.resident = FirstTouchResident::ArmingDenied;
                     ring::rec_first_touch(&first_touch);
-                    return Ok(false);
+                    return Ok(Ok(false));
                 }
                 None => {
                     notify_first_touch_deliver(DeliverReason::BackendRefused);
@@ -1231,7 +1247,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         dispatcher.commit_mmap_growdown(plan);
                         first_touch.growdown = FirstTouchGrowdown::Committed;
                         ring::rec_first_touch(&first_touch);
-                        return Ok(true);
+                        return Ok(Ok(true));
                     }
                     Err(error) => {
                         let access_code = access.map_or(3, |a| a as u32);
@@ -1250,7 +1266,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     let (Some(access), Some(fault_kind)) = (access, fault_kind) else {
         first_touch.stale = FirstTouchStale::AccessUnknown;
         ring::rec_first_touch(&first_touch);
-        return Ok(false);
+        return Ok(Ok(false));
     };
     let retried = engine.resolve_stale_stage1_fault(address, access, fault_kind)?;
     if retried {
@@ -1261,7 +1277,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         first_touch.stale = FirstTouchStale::NotRetried;
     }
     ring::rec_first_touch(&first_touch);
-    Ok(retried)
+    Ok(Ok(retried))
 }
 
 /// Adopt only guest-marked pages whose current hardware-visible leaf still
@@ -2334,6 +2350,44 @@ mod first_touch_access_tests {
         );
         assert!(!frame_grant_root_matches(request, None));
         assert!(frame_grant_root_matches(request, Some(old)));
+    }
+
+    #[test]
+    fn busy_root_releases_unstarted_slot_without_refusing_or_clearing_a_successor() {
+        let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+        let request = carrick_el1_abi::FrameGrantRequest {
+            mm_key: 7,
+            reservation_incarnation: carrick_el1_abi::ReservationIncarnation::new(1).unwrap(),
+            requested_len: 4096,
+            request_generation: 11,
+            fault_va: 0x4000_3000,
+            access: crate::linux_abi::LINUX_PROT_WRITE,
+        };
+        assert!(mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+        assert!(mailbox.abandon_unstarted_request(request));
+        assert!(
+            !mailbox.abandon_unstarted_request(request),
+            "release is idempotent"
+        );
+        // A resumed task uses the mailbox of its new executor. The original
+        // slot must already be available to an unrelated task while it waits.
+        let resumed_slot = carrick_el1_abi::FrameGrantMailbox::new();
+        let resumed = carrick_el1_abi::FrameGrantRequest {
+            request_generation: 40,
+            ..request
+        };
+        assert!(resumed_slot.try_publish_request(resumed));
+        assert_eq!(resumed_slot.claim_request(), Some(resumed));
+        assert!(resumed_slot.abandon_unstarted_request(resumed));
+        let next = carrick_el1_abi::FrameGrantRequest {
+            request_generation: 12,
+            ..request
+        };
+        assert!(mailbox.try_publish_request(next));
+        assert_eq!(mailbox.claim_request(), Some(next));
+        assert!(!mailbox.abandon_unstarted_request(request));
+        assert!(mailbox.abandon_unstarted_request(next));
     }
 
     #[test]
