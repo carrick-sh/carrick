@@ -671,26 +671,19 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 
 fn upsert_truncated(
     truncated: &mut Vec<super::post_mortem::Truncated>,
+    initial_truncated: &[super::post_mortem::Truncated],
     section: &str,
     reason: String,
 ) {
+    let reason = match initial_truncated
+        .iter()
+        .find(|entry| entry.section == section)
+    {
+        Some(initial) if initial.reason != reason => format!("{}; {reason}", initial.reason),
+        _ => reason,
+    };
     if let Some(existing) = truncated.iter_mut().find(|entry| entry.section == section) {
-        if existing.reason == reason {
-            return;
-        }
-        if reason.contains("response cap") {
-            if let Some((original, tail)) = existing.reason.rsplit_once("; ")
-                && tail.contains("response cap")
-            {
-                existing.reason = format!("{original}; {reason}");
-                return;
-            }
-            if existing.reason.contains("response cap") {
-                existing.reason = reason;
-                return;
-            }
-        }
-        existing.reason = format!("{}; {reason}", existing.reason);
+        existing.reason = reason;
     } else {
         truncated.push(super::post_mortem::Truncated {
             section: section.to_owned(),
@@ -741,19 +734,11 @@ fn bound_capture_response(
     mut encoded: Vec<u8>,
     cap: usize,
 ) -> Result<Vec<u8>, WireError> {
+    let initial_truncated = capture.truncated.clone();
     let initial_aux_counts =
         CaptureAuxSection::ALL.map(|section| capture_section_initial_count(capture, section));
     let mut aux_bytes =
         CaptureAuxSection::ALL.map(|section| capture_section_reducible_bytes(capture, section));
-    let mut kernel_non_aux_bytes = capture.kernel.as_ref().map_or(0, |snapshot| {
-        let kernel_aux_bytes = aux_bytes[CaptureAuxSection::KernelExecutorReceipts.index()]
-            .saturating_add(aux_bytes[CaptureAuxSection::KernelRunQueue.index()])
-            .saturating_add(aux_bytes[CaptureAuxSection::KernelExecutors.index()])
-            .saturating_add(aux_bytes[CaptureAuxSection::KernelSchedulerAux.index()]);
-        encode_canonical(snapshot)
-            .map_or(0, |bytes| bytes.len())
-            .saturating_sub(kernel_aux_bytes)
-    });
     let initial_findings_count = capture.findings.len();
     let mut initial_degraded_tasks = capture
         .degraded_kernel
@@ -772,12 +757,11 @@ fn bound_capture_response(
             .max_by(|(a_sec, a_bytes), (b_sec, b_bytes)| {
                 a_bytes.cmp(b_bytes).then_with(|| b_sec.cmp(a_sec))
             });
-        let largest_aux_bytes = largest.map_or(0, |(_, bytes)| bytes);
-        let should_degrade_kernel = capture.kernel.is_some()
-            && (kernel_non_aux_bytes > cap || kernel_non_aux_bytes >= largest_aux_bytes);
+        let total_aux_bytes: usize = aux_bytes.iter().sum();
+        let should_degrade_kernel =
+            capture.kernel.is_some() && encoded.len().saturating_sub(total_aux_bytes) > cap;
 
         if should_degrade_kernel && let Some(snapshot) = capture.kernel.take() {
-            kernel_non_aux_bytes = 0;
             aux_bytes[CaptureAuxSection::KernelExecutorReceipts.index()] = 0;
             aux_bytes[CaptureAuxSection::KernelRunQueue.index()] = 0;
             aux_bytes[CaptureAuxSection::KernelExecutors.index()] = 0;
@@ -797,7 +781,7 @@ fn bound_capture_response(
                     reason.clone(),
                 );
             }
-            upsert_truncated(&mut capture.truncated, "kernel", reason);
+            upsert_truncated(&mut capture.truncated, &initial_truncated, "kernel", reason);
             encoded = encode_canonical(capture)?;
             continue;
         }
@@ -807,6 +791,7 @@ fn bound_capture_response(
             let initial_total = initial_aux_counts[section.index()];
             truncate_capture_aux_section(
                 capture,
+                &initial_truncated,
                 section,
                 initial_total,
                 target_bytes,
@@ -829,6 +814,7 @@ fn bound_capture_response(
         {
             upsert_truncated(
                 &mut capture.truncated,
+                &initial_truncated,
                 "degraded_kernel",
                 format!("degraded_kernel truncated to fit {cap}-byte response cap"),
             );
@@ -842,6 +828,7 @@ fn bound_capture_response(
             let kept = truncate_prefix_vec(&mut capture.findings, target_bytes, findings_bytes);
             upsert_truncated(
                 &mut capture.truncated,
+                &initial_truncated,
                 "findings",
                 format!(
                     "retained {kept} of {initial_findings_count} findings to fit {cap}-byte response cap"
@@ -854,6 +841,7 @@ fn bound_capture_response(
         if capture.physical.take().is_some() {
             upsert_truncated(
                 &mut capture.truncated,
+                &initial_truncated,
                 "physical",
                 format!("physical capture omitted to fit {cap}-byte response cap"),
             );
@@ -864,6 +852,7 @@ fn bound_capture_response(
         if capture.scheduler_aux.take().is_some() {
             upsert_truncated(
                 &mut capture.truncated,
+                &initial_truncated,
                 "scheduler_aux",
                 format!("scheduler_aux omitted to fit {cap}-byte response cap"),
             );
@@ -874,6 +863,7 @@ fn bound_capture_response(
         if capture.degraded_kernel.take().is_some() {
             upsert_truncated(
                 &mut capture.truncated,
+                &initial_truncated,
                 "degraded_kernel",
                 format!("degraded_kernel omitted to fit {cap}-byte response cap"),
             );
@@ -884,6 +874,7 @@ fn bound_capture_response(
         if capture.zone_census.take().is_some() {
             upsert_truncated(
                 &mut capture.truncated,
+                &initial_truncated,
                 "zone_census",
                 format!("zone_census omitted to fit {cap}-byte response cap"),
             );
@@ -914,6 +905,7 @@ fn bound_capture_response(
 
 fn truncate_capture_aux_section(
     capture: &mut PostMortem,
+    initial_truncated: &[super::post_mortem::Truncated],
     section: CaptureAuxSection,
     initial_total: usize,
     target_bytes: usize,
@@ -929,6 +921,7 @@ fn truncate_capture_aux_section(
             );
             upsert_truncated(
                 &mut capture.truncated,
+                initial_truncated,
                 "event_ring_high_rate",
                 format!(
                     "retained {kept} of {initial_total} records to fit {cap}-byte response cap"
@@ -939,6 +932,7 @@ fn truncate_capture_aux_section(
             let kept = truncate_tail_vec(&mut capture.event_ring, target_bytes, section_bytes);
             upsert_truncated(
                 &mut capture.truncated,
+                initial_truncated,
                 "event_ring",
                 format!(
                     "retained {kept} of {initial_total} records to fit {cap}-byte response cap"
@@ -957,7 +951,12 @@ fn truncate_capture_aux_section(
                     "host_threads truncated",
                     reason.clone(),
                 );
-                upsert_truncated(&mut capture.truncated, "physical.host_threads", reason);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    initial_truncated,
+                    "physical.host_threads",
+                    reason,
+                );
             }
         }
         CaptureAuxSection::PhysicalZoneCensus => {
@@ -976,7 +975,12 @@ fn truncate_capture_aux_section(
                     "zone_census truncated",
                     reason.clone(),
                 );
-                upsert_truncated(&mut capture.truncated, "physical.zone_census", reason);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    initial_truncated,
+                    "physical.zone_census",
+                    reason,
+                );
             }
         }
         CaptureAuxSection::PhysicalVcpus => {
@@ -986,7 +990,12 @@ fn truncate_capture_aux_section(
                     "vcpus truncated (retained {kept} of {initial_total} entries to fit {cap}-byte response cap)"
                 );
                 upsert_prefixed_note(&mut physical.unavailable, "vcpus truncated", reason.clone());
-                upsert_truncated(&mut capture.truncated, "physical.vcpus", reason);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    initial_truncated,
+                    "physical.vcpus",
+                    reason,
+                );
             }
         }
         CaptureAuxSection::ZoneCensus => {
@@ -1003,6 +1012,7 @@ fn truncate_capture_aux_section(
                 }
                 upsert_truncated(
                     &mut capture.truncated,
+                    initial_truncated,
                     "zone_census",
                     format!(
                         "retained {keep} of {initial_total} bytes to fit {cap}-byte response cap"
@@ -1017,6 +1027,7 @@ fn truncate_capture_aux_section(
                 update_receipt_summary(&mut aux.executor_receipt_summary, initial_total, kept, cap);
                 upsert_truncated(
                     &mut capture.truncated,
+                    initial_truncated,
                     "executor_receipts",
                     format!(
                         "retained {kept} of {initial_total} rows to fit {cap}-byte response cap"
@@ -1029,6 +1040,7 @@ fn truncate_capture_aux_section(
                 let kept = truncate_prefix_vec(&mut aux.run_queue, target_bytes, section_bytes);
                 upsert_truncated(
                     &mut capture.truncated,
+                    initial_truncated,
                     "run_queue",
                     format!(
                         "retained {kept} of {initial_total} rows to fit {cap}-byte response cap"
@@ -1041,6 +1053,7 @@ fn truncate_capture_aux_section(
                 let kept = truncate_prefix_vec(&mut aux.executors, target_bytes, section_bytes);
                 upsert_truncated(
                     &mut capture.truncated,
+                    initial_truncated,
                     "executors",
                     format!(
                         "retained {kept} of {initial_total} rows to fit {cap}-byte response cap"
@@ -1053,6 +1066,7 @@ fn truncate_capture_aux_section(
                 let kept = truncate_prefix_vec(&mut aux.scheduler, target_bytes, section_bytes);
                 upsert_truncated(
                     &mut capture.truncated,
+                    initial_truncated,
                     "scheduler",
                     format!(
                         "retained {kept} of {initial_total} rows to fit {cap}-byte response cap"
@@ -1079,7 +1093,12 @@ fn truncate_capture_aux_section(
                     "executor_receipts truncated:",
                     note.clone(),
                 );
-                upsert_truncated(&mut capture.truncated, "kernel.executor_receipts", note);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    initial_truncated,
+                    "kernel.executor_receipts",
+                    note,
+                );
             }
         }
         CaptureAuxSection::KernelRunQueue => {
@@ -1091,7 +1110,12 @@ fn truncate_capture_aux_section(
                     "run_queue truncated: retained {kept} of {initial_total} rows to fit {cap}-byte response cap"
                 );
                 upsert_prefixed_note(&mut kernel.findings, "run_queue truncated:", note.clone());
-                upsert_truncated(&mut capture.truncated, "kernel.run_queue", note);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    initial_truncated,
+                    "kernel.run_queue",
+                    note,
+                );
             }
         }
         CaptureAuxSection::KernelExecutors => {
@@ -1103,7 +1127,12 @@ fn truncate_capture_aux_section(
                     "executors truncated: retained {kept} of {initial_total} rows to fit {cap}-byte response cap"
                 );
                 upsert_prefixed_note(&mut kernel.findings, "executors truncated:", note.clone());
-                upsert_truncated(&mut capture.truncated, "kernel.executors", note);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    initial_truncated,
+                    "kernel.executors",
+                    note,
+                );
             }
         }
         CaptureAuxSection::KernelSchedulerAux => {
@@ -1122,7 +1151,12 @@ fn truncate_capture_aux_section(
                     "scheduler auxiliary censuses omitted",
                     note.clone(),
                 );
-                upsert_truncated(&mut capture.truncated, "kernel.scheduler", note);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    initial_truncated,
+                    "kernel.scheduler",
+                    note,
+                );
             }
         }
     }
@@ -1193,16 +1227,15 @@ fn bound_snapshot_response(
     mut encoded: Vec<u8>,
     cap: usize,
 ) -> Result<Vec<u8>, WireError> {
-    let (initial_counts, mut aux_bytes, kernel_non_aux_bytes) = match response {
+    let (initial_counts, mut aux_bytes) = match response {
         ServerResponse::Snapshot(snapshot) => {
             let counts = SnapshotAuxSection::ALL
                 .map(|section| snapshot_section_initial_count(snapshot, section));
             let aux = SnapshotAuxSection::ALL
                 .map(|section| snapshot_section_reducible_bytes(snapshot, section));
-            let aux_total: usize = aux.iter().sum();
-            (counts, aux, encoded.len().saturating_sub(aux_total))
+            (counts, aux)
         }
-        _ => ([0; 4], [0; 4], 0),
+        _ => ([0; 4], [0; 4]),
     };
 
     while encoded.len() > cap {
@@ -1216,9 +1249,8 @@ fn bound_snapshot_response(
             .max_by(|(a_sec, a_bytes), (b_sec, b_bytes)| {
                 a_bytes.cmp(b_bytes).then_with(|| b_sec.cmp(a_sec))
             });
-        let largest_aux_bytes = largest.map_or(0, |(_, bytes)| bytes);
-        let should_degrade_kernel =
-            kernel_non_aux_bytes > cap || kernel_non_aux_bytes >= largest_aux_bytes;
+        let total_aux_bytes: usize = aux_bytes.iter().sum();
+        let should_degrade_kernel = encoded.len().saturating_sub(total_aux_bytes) > cap;
 
         if !should_degrade_kernel && let Some((section, section_bytes)) = largest {
             let target_bytes = target_section_budget(encoded.len(), cap, section_bytes);
@@ -1288,10 +1320,10 @@ fn bound_snapshot_response(
             continue;
         }
 
-        // Core coherent tables account for the excess (or exceed the largest
-        // auxiliary section); degrade to the per-task summary view rather than
-        // failing with FrameTooLarge or emptying smaller auxiliary sections
-        // first.
+        // Trimming every auxiliary section still cannot fit the response under
+        // the wire cap; degrade to the per-task summary view rather than failing
+        // with FrameTooLarge or emptying auxiliary sections that cannot save the
+        // coherent snapshot.
         let mut degraded = Box::new(degrade_oversized_snapshot(snapshot, cap));
         let degraded_encoded = encode_canonical(&*degraded)?;
         let bounded = bound_degraded_response(&mut degraded, degraded_encoded, cap)?;
@@ -2197,5 +2229,245 @@ mod tests {
         }));
 
         server.shutdown();
+    }
+
+    #[derive(Debug)]
+    struct ModerateVmaBackend;
+
+    impl MmBackend for ModerateVmaBackend {
+        fn snapshot(&self, _deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
+            let root =
+                crate::kernel::Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(0x1000))
+                    .expect("aligned stage-1 root");
+            let asid = Asid::from_registry_allocation(
+                std::num::NonZeroU16::new(1).expect("nonzero test ASID"),
+            );
+            let vmas = (0..800_u64)
+                .map(|index| {
+                    let start = 0x1000_0000 + index * 0x2000;
+                    crate::kernel::VmaSummary {
+                        start: carrick_guest_mem::GuestVa::new(start),
+                        end: carrick_guest_mem::GuestVa::new(start + 0x1000),
+                        access: crate::kernel::VmaAccess {
+                            readable: true,
+                            writable: true,
+                            executable: false,
+                            kernel_visible: true,
+                        },
+                    }
+                })
+                .collect();
+            Ok(MmBackendSnapshot {
+                revision: 1,
+                binding: crate::kernel::MmBinding {
+                    asid,
+                    stage1_root: root,
+                    ttbr0: crate::kernel::Ttbr0::for_aarch64(asid, root),
+                },
+                vmas,
+                vma_revision: None,
+                mapping_ids: Vec::new(),
+                frame_inventory_revision: None,
+            })
+        }
+
+        fn revision(&self) -> u64 {
+            1
+        }
+    }
+
+    struct ModerateReceiptAuxProvider;
+
+    impl super::super::dto::KernelDebugAuxProvider for ModerateReceiptAuxProvider {
+        fn scheduler_rows(&self) -> Vec<super::super::dto::DebugSchedulerRow> {
+            Vec::new()
+        }
+
+        fn run_queue_rows(&self) -> Vec<super::super::dto::DebugRunQueueRow> {
+            Vec::new()
+        }
+
+        fn executor_rows(&self) -> Vec<super::super::dto::DebugExecutorRow> {
+            Vec::new()
+        }
+
+        fn executor_receipt_rows(
+            &self,
+        ) -> (
+            Vec<super::super::dto::DebugExecutorReceiptRow>,
+            Option<super::super::dto::DebugExecutorReceiptSummary>,
+        ) {
+            let reason = "r".repeat(256);
+            let total = 25;
+            let rows = (0..total)
+                .map(|seq| super::super::dto::DebugExecutorReceiptRow {
+                    sequence: (seq + 1) as u64,
+                    executor: 1,
+                    event: "Dispatched".to_owned(),
+                    thread: None,
+                    generation: Some(1),
+                    observed_state: Some("runnable".to_owned()),
+                    reason: Some(reason.clone()),
+                })
+                .collect();
+            (
+                rows,
+                Some(super::super::dto::DebugExecutorReceiptSummary {
+                    total,
+                    returned: total,
+                    message: format!("showing last {total} of {total} receipts"),
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn core_under_cap_with_smaller_auxiliary_overflow_trims_auxiliary_without_degrading_kernel() {
+        let bootstrap = RootBootstrap::with_mm_backend(
+            4403,
+            carrick_hal::ThreadId::synthetic_for_tests(4403),
+            Arc::new(ModerateVmaBackend),
+            "core-under-cap-root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
+        .expect("bootstrap");
+        let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
+        let aux: Arc<dyn super::super::dto::KernelDebugAuxProvider> =
+            Arc::new(ModerateReceiptAuxProvider);
+        kernel
+            .register_debug_aux_provider(&aux)
+            .expect("register aux provider");
+
+        // 1. Snapshot response: core kernel tables (~35 KiB) are larger than the
+        //    auxiliary `executor_receipts` section (~10 KiB), yet the core fits
+        //    comfortably under `snapshot_cap` and trimming auxiliary receipts makes
+        //    the response fit without degrading the coherent kernel snapshot.
+        let snapshot_request = KernelDebugRequest::for_tables(None);
+        let mut snapshot_response = build_response(
+            &snapshot_request,
+            &kernel,
+            None,
+            "core-under-cap",
+            Instant::now(),
+        );
+        let full_snapshot_bytes =
+            encode_canonical(&snapshot_response).expect("encode full snapshot");
+        let ServerResponse::Snapshot(ref snapshot_box) = snapshot_response else {
+            panic!("expected Snapshot response");
+        };
+        let receipt_aux_bytes =
+            snapshot_section_reducible_bytes(snapshot_box, SnapshotAuxSection::ExecutorReceipts);
+        let snapshot_non_aux_bytes = full_snapshot_bytes.len().saturating_sub(receipt_aux_bytes);
+        assert!(
+            snapshot_non_aux_bytes > receipt_aux_bytes,
+            "test precondition: core snapshot ({snapshot_non_aux_bytes} B) must exceed largest aux section ({receipt_aux_bytes} B)"
+        );
+        let snapshot_cap = snapshot_non_aux_bytes + receipt_aux_bytes / 2;
+        assert!(snapshot_cap < full_snapshot_bytes.len());
+
+        let bounded_snapshot_bytes =
+            encode_bounded_response(&mut snapshot_response, snapshot_cap).expect("bound snapshot");
+        assert!(bounded_snapshot_bytes.len() <= snapshot_cap);
+        let ServerResponse::Snapshot(bounded_snapshot) = snapshot_response else {
+            panic!(
+                "coherent snapshot must not degrade when trimming auxiliary sections fits the cap: {snapshot_response:?}"
+            );
+        };
+        assert_eq!(
+            bounded_snapshot.vmas.as_ref().map(Vec::len),
+            Some(800),
+            "core VMA table must remain intact in coherent snapshot"
+        );
+        let kept_receipts = bounded_snapshot
+            .executor_receipts
+            .as_ref()
+            .expect("executor_receipts present");
+        assert!(kept_receipts.len() < 25);
+        assert!(!kept_receipts.is_empty());
+
+        // 2. Capture response: core kernel snapshot (~35 KiB) is larger than every
+        //    individual auxiliary section, yet trimming auxiliary sections fits the
+        //    cap without degrading `capture.kernel` to `degraded_kernel`.
+        let capture_request = KernelDebugRequest::capture("core-under-cap");
+        let mut capture_response = build_response(
+            &capture_request,
+            &kernel,
+            Some(&UnderLimitPhysicalCaptureProvider),
+            "core-under-cap",
+            Instant::now(),
+        );
+        let ServerResponse::Capture(ref mut capture_box) = capture_response else {
+            panic!("expected Capture response");
+        };
+        capture_box.event_ring = (0..80_u64)
+            .map(|idx| super::super::post_mortem::EventRingRecord {
+                logical_index: idx,
+                kind: Some(1),
+                a: Some(10),
+                b: Some(20),
+                c: Some(30),
+                unreadable: None,
+            })
+            .collect();
+        capture_box.event_ring_high_rate = (0..80_u64)
+            .map(|idx| super::super::post_mortem::EventRingRecord {
+                logical_index: idx,
+                kind: Some(2),
+                a: Some(1),
+                b: Some(2),
+                c: Some(3),
+                unreadable: None,
+            })
+            .collect();
+        let full_capture_bytes = encode_canonical(&capture_response).expect("encode full capture");
+        let ServerResponse::Capture(ref capture_box) = capture_response else {
+            panic!("expected Capture response");
+        };
+        let capture_aux = CaptureAuxSection::ALL
+            .map(|section| capture_section_reducible_bytes(capture_box, section));
+        let largest_capture_aux = capture_aux.into_iter().max().unwrap_or(0);
+        let total_capture_aux: usize = capture_aux.iter().sum();
+        let capture_non_aux_bytes = full_capture_bytes.len().saturating_sub(total_capture_aux);
+        assert!(
+            capture_non_aux_bytes > largest_capture_aux,
+            "test precondition: non-aux capture ({capture_non_aux_bytes} B) must exceed largest aux section ({largest_capture_aux} B)"
+        );
+        let capture_cap = capture_non_aux_bytes + total_capture_aux / 2;
+        assert!(capture_cap < full_capture_bytes.len());
+
+        let bounded_capture_bytes =
+            encode_bounded_response(&mut capture_response, capture_cap).expect("bound capture");
+        assert!(bounded_capture_bytes.len() <= capture_cap);
+        let decoded_capture: PostMortem =
+            wire::decode_exact(&bounded_capture_bytes).expect("decode bounded capture");
+        assert!(
+            decoded_capture.kernel.is_some(),
+            "capture.kernel must survive intact when trimming auxiliary sections fits the cap"
+        );
+        assert!(
+            decoded_capture.degraded_kernel.is_none(),
+            "capture must not populate degraded_kernel when core kernel fits under cap"
+        );
+        assert_eq!(
+            decoded_capture
+                .kernel
+                .as_ref()
+                .and_then(|k| k.vmas.as_ref())
+                .map(Vec::len),
+            Some(800),
+            "core VMA table in capture.kernel must survive intact"
+        );
+        assert!(
+            !decoded_capture
+                .truncated
+                .iter()
+                .any(|entry| entry.section == "kernel"),
+            "kernel must not be marked truncated: {:?}",
+            decoded_capture.truncated
+        );
+        assert!(
+            !decoded_capture.truncated.is_empty(),
+            "auxiliary truncation must be recorded in capture.truncated"
+        );
     }
 }
