@@ -25,12 +25,16 @@ and tolerate a stale wake. Dropping an enrollment before completion removes its
 callback; dropping the producer never manufactures a successful completion.
 
 This changes production physical-owner finalization and pin-to-idle mechanics,
-so the full signed gate applies. No native supply consumer is enabled here:
+so the full signed gate applies: per-test `el1_sched` against main,
+`el1_files` and signed smoke. No native supply consumer is enabled here:
 there is no new successful supply ACK, speculative allocation or adoption.
 Portable tests cover enrollment timing, unrelated identities, reuse,
 cancellation and callback reentry after unlocking. The macOS adapter tests
 cover real retained pins, finalization failure, idle completion and IPA reuse;
-they cannot execute on the Linux worker.
+they cannot execute on the Linux worker. Both pin-drop schedules assert the
+retry request immediately at last-unpin; the unrelated-record control must
+leave that request unchanged. The neutral witness also distinguishes an earlier
+pin from the final pin when only IPA return remains outstanding.
 
 S3 must consume this completion in the same `PrivateSupplyTransaction`, retain
 inventory undo exactly once, and implement an owned Pending ring continuation.

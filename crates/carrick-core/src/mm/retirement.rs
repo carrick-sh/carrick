@@ -912,6 +912,19 @@ mod nonce_tests {
             release_record_pin_outcome(&mut backend_mapped, identity),
             RecordPinRelease::ReadyToRetry
         );
+        let mut awaiting_ipa = base_record;
+        awaiting_ipa.snapshot.release_ipa = true;
+        assert_eq!(
+            release_record_pin_outcome(&mut awaiting_ipa, identity),
+            RecordPinRelease::StillHeld
+        );
+        assert_eq!(
+            release_record_pin_outcome(&mut awaiting_ipa, identity),
+            RecordPinRelease::ReadyToRetry
+        );
+        assert_eq!(awaiting_ipa.snapshot.pin_count, 0);
+        assert!(awaiting_ipa.snapshot.retry_eligible);
+
         let mut not_requested = base_record;
         not_requested.snapshot.pin_count = 1;
         not_requested.snapshot.retirement_requested = false;

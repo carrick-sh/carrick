@@ -451,6 +451,12 @@ mod allocator_stats_tests {
             let mut pin = Some(pin);
             if enroll_after_unpin {
                 drop(pin.take());
+                assert!(
+                    custody
+                        .pending_global_frame_retirement_retry
+                        .load(Ordering::Acquire),
+                    "last-unpin before enrollment must request the existing idle owner"
+                );
             }
             let count = std::sync::Arc::new(AtomicUsize::new(0));
             let observed = count.clone();
@@ -476,13 +482,22 @@ mod allocator_stats_tests {
             );
             assert_eq!(count.load(Ordering::SeqCst), 0);
             assert_eq!(wait.receipt(), None);
-            drop(pin.take());
-            assert!(
+            assert_eq!(
                 custody
                     .pending_global_frame_retirement_retry
                     .load(Ordering::Acquire),
-                "last-unpin must arm a fresh idle request after the initial request was consumed"
+                enroll_after_unpin,
+                "the unrelated record must not change this retirement's request"
             );
+            if !enroll_after_unpin {
+                drop(pin.take());
+                assert!(
+                    custody
+                        .pending_global_frame_retirement_retry
+                        .load(Ordering::Acquire),
+                    "last-unpin after enrollment must request the existing idle owner"
+                );
+            }
             let mut unmaps = 0;
             let report =
                 retry_pending_global_frame_retirements_at_idle_in_using(&custody, &mut |_, _| {
