@@ -80,6 +80,31 @@ pub fn arm_debugger_hold(secs: u32) {
     DEBUGGER_HOLD_SECS.store(secs, Ordering::Release);
 }
 
+/// Arm the diagnostic fatal hold from `CARRICK_FATAL_HOLD_SECS`.
+/// Unset, zero, malformed or overflowing values leave the hold unchanged.
+pub fn arm_debugger_hold_from_env() {
+    if let Some(secs) =
+        debugger_hold_seconds(std::env::var("CARRICK_FATAL_HOLD_SECS").ok().as_deref())
+    {
+        arm_debugger_hold(secs);
+    }
+}
+
+fn debugger_hold_seconds(value: Option<&str>) -> Option<u32> {
+    value?.trim().parse::<u32>().ok().filter(|secs| *secs > 0)
+}
+
+/// Parse the fatal hold announcement into the positive host PID to attach to.
+pub fn parse_debugger_hold_pid(line: &str) -> Option<libc::pid_t> {
+    let rest = line.trim().strip_prefix("carrick fatal: holding ")?;
+    let (seconds, pid) = rest.split_once(" s for a debugger (pid ")?;
+    debugger_hold_seconds(Some(seconds))?;
+    pid.strip_suffix(')')?
+        .parse::<libc::pid_t>()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
 /// Format the hold line without heap allocation and sleep for the armed hold.
 fn hold_for_debugger() {
     let secs = DEBUGGER_HOLD_SECS.load(Ordering::Acquire);
@@ -429,5 +454,95 @@ mod tests {
         assert!(!output_hook.status.success());
         let stdout_hook = String::from_utf8_lossy(&output_hook.stdout);
         assert!(stdout_hook.contains("HOOK_OK\n"));
+    }
+}
+
+#[cfg(test)]
+mod serial_host {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    #[test]
+    fn hold_notice_requires_valid_seconds_and_host_pid() {
+        assert_eq!(
+            super::parse_debugger_hold_pid(
+                "carrick fatal: holding 60 s for a debugger (pid 123)\n"
+            ),
+            Some(123)
+        );
+        for line in [
+            "carrick fatal: holding 0 s for a debugger (pid 123)",
+            "carrick fatal: holding 60 s for a debugger (pid -1)",
+            "carrick fatal: holding 60 s for a debugger (pid 0)",
+            "carrick fatal: holding 60 s for a debugger (pid 99999999999999)",
+        ] {
+            assert_eq!(super::parse_debugger_hold_pid(line), None);
+        }
+    }
+
+    #[test]
+    fn harness_reads_hold_environment() {
+        if std::env::var_os("CARRICK_FATAL_HOLD_TEST_CHILD").is_some() {
+            super::arm_debugger_hold_from_env();
+            let armed = super::DEBUGGER_HOLD_SECS.load(core::sync::atomic::Ordering::Acquire);
+            let expected = std::env::var("CARRICK_FATAL_HOLD_TEST_EXPECTED")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok());
+            assert_eq!(armed, expected.unwrap_or(0));
+            return;
+        }
+        for value in [None, Some("60")] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("harness_reads_hold_environment")
+                .arg("--nocapture")
+                .env("CARRICK_FATAL_HOLD_TEST_CHILD", "1")
+                .env_remove("CARRICK_FATAL_HOLD_SECS")
+                .env_remove("CARRICK_FATAL_HOLD_TEST_EXPECTED");
+            if let Some(value) = value {
+                command
+                    .env("CARRICK_FATAL_HOLD_SECS", value)
+                    .env("CARRICK_FATAL_HOLD_TEST_EXPECTED", value);
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let reap_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    while std::time::Instant::now() < reap_deadline {
+                        if child.try_wait().unwrap().is_some() {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    panic!("environment test child exceeded deadline");
+                }
+                // External child status observation, no guest coordination.
+                const CHILD_OBSERVATION: std::time::Duration = std::time::Duration::from_millis(10);
+                std::thread::sleep(CHILD_OBSERVATION);
+            }
+        }
+    }
+
+    #[test]
+    fn harness_arms_hold_only_with_positive_env_value() {
+        for (value, expected) in [
+            (None, None),
+            (Some("0"), None),
+            (Some("invalid"), None),
+            (Some("-1"), None),
+            (Some("4294967296"), None),
+            (Some(" 60 "), Some(60)),
+        ] {
+            assert_eq!(
+                super::debugger_hold_seconds(value),
+                expected,
+                "CARRICK_FATAL_HOLD_SECS={value:?}"
+            );
+        }
     }
 }
