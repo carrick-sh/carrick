@@ -47,8 +47,8 @@ impl Policy {
             || p.reads > 2
             || p.response_bytes < 1024
             || p.response_bytes > 64 * 1024
-            || p.wall_minutes > 45
-            || p.worker_minutes > 35
+            || p.wall_minutes > 70
+            || p.worker_minutes > 60
             || p.worker_minutes == 0
             || p.worker_minutes > p.wall_minutes
             || p.harvest_seconds == 0
@@ -2543,7 +2543,7 @@ fn loop_windows(
     now: u64,
 ) -> (Duration, Duration) {
     let final_window =
-        Duration::from_secs(step_started.saturating_add(47 * 60).saturating_sub(now))
+        Duration::from_secs(step_started.saturating_add(72 * 60).saturating_sub(now))
             .min(job.saturating_add(Duration::from_secs(300)));
     let work = policy
         .min(job)
@@ -2582,7 +2582,7 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         ))?;
     let (limit, final_limit) = loop_windows(
         Duration::from_secs(policy.wall_minutes * 60),
-        crate::agent_runner::job_remaining(55)?,
+        crate::agent_runner::job_remaining(80)?,
         step_started,
         now,
     );
@@ -5383,17 +5383,17 @@ exec /usr/bin/git "$@"
     #[test]
     fn review_lease_wait_leaves_final_reserve() {
         let (work, final_window) = loop_windows(
-            Duration::from_secs(42 * 60),
-            Duration::from_secs(50 * 60),
+            Duration::from_secs(67 * 60),
+            Duration::from_secs(75 * 60),
             1000,
             1000 + 10 * 60,
         );
         assert_eq!(
             work.as_secs(),
-            32 * 60,
+            57 * 60,
             "lease wait was added to the step budget"
         );
-        assert_eq!(final_window.as_secs(), 37 * 60);
+        assert_eq!(final_window.as_secs(), 62 * 60);
         assert_eq!(final_window - work, Duration::from_secs(300));
     }
     struct SlowCapacity;

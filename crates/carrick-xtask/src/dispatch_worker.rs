@@ -590,7 +590,7 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         &mut isolated,
         remaining
             .min(limit)
-            .min(crate::agent_runner::job_remaining(58)?),
+            .min(crate::agent_runner::job_remaining(83)?),
     );
     let _harvest = dispatch.harvest_deadline.map(CommandWindow::until);
     retire_agent()?;

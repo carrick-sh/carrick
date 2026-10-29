@@ -105,7 +105,7 @@ jobs:
       SCCACHE_SERVER_UDS: ''
       SCCACHE_SERVER_PORT: '0'
       SCCACHE_DIR: ''
-    timeout-minutes: 60
+    timeout-minutes: 85
     steps:
       - name: Reject a pre-existing runner compiler-cache server
         run: |
@@ -165,7 +165,7 @@ jobs:
       - name: Run owner dispatch through the policy tool server
         id: loop
         if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
-        timeout-minutes: 47
+        timeout-minutes: 72
         # Publish and board App tokens are minted on demand by the ctb
         # controller through the runner state directory (#1012).
         env:

@@ -18,7 +18,7 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
         assert!(!text.contains(removed), "retained {removed}");
     }
     let worker = &workflow["jobs"]["worker"];
-    assert_eq!(worker["timeout-minutes"].as_i64(), Some(60));
+    assert_eq!(worker["timeout-minutes"].as_i64(), Some(85));
     assert_eq!(worker["runs-on"][0].as_str(), Some("carrick-agent"));
     let permissions = worker["permissions"].as_hash().unwrap();
     assert_eq!(permissions.len(), 4);
@@ -251,7 +251,7 @@ fn review_workflow_pins_main_and_orders_the_loop() {
         w["on"]["pull_request_review"]["types"][0].as_str(),
         Some("submitted")
     );
-    assert_eq!(w["jobs"]["worker"]["timeout-minutes"].as_i64(), Some(60));
+    assert_eq!(w["jobs"]["worker"]["timeout-minutes"].as_i64(), Some(85));
     assert_eq!(
         w["jobs"]["guard"]["outputs"]["base"].as_str(),
         Some("${{ steps.validate.outputs.base }}")
