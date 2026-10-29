@@ -188,6 +188,36 @@ impl<'a> NativeLifecycleResources<'a> {
         self.controls.get(entry.index().checked_add(1)?)
     }
 }
+/// Select the execution venue for an EL1 exit through [`carrick_el1::substrate::sched::NativeEntryVenue`].
+/// Both `OwnerEntry::Syscall` and `OwnerEntry::Exception` service parks belong
+/// only to `NativeEntryVenue::NativeProcess(_)`; a host-loaded `SignalOwner`
+/// keeps its host executor for forwarded syscalls, IRQ host work and first-touch
+/// supply, and delivers declined permission faults in-ring.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn native_entry_owned(
+    source: BornInZoneSource<'_, carrick_el1_abi::Aarch64ParkedContext>,
+    current: &CurrentTask,
+    page: &ThreadLifecyclePage,
+    control: &ThreadControlSlot,
+    entry: OwnerEntry,
+) -> bool {
+    let venue = carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
+        source.zone,
+        source.slot,
+        current,
+        page,
+        control,
+    );
+    match entry {
+        OwnerEntry::Syscall | OwnerEntry::Exception => {
+            matches!(
+                venue,
+                carrick_el1::substrate::sched::NativeEntryVenue::NativeProcess(_)
+            )
+        }
+    }
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -1681,10 +1711,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .owner
             .tasks()
             .get(&execution.id)
-            .filter(|row| {
-                core::ptr::from_ref(row.native().resources().control).addr() as u64
-                    == current.metadata.control_slot.load(Ordering::Acquire)
-            })
+            .filter(|row| current.owns_control_slot(row.native().resources().control))
             .map(|row| row.key())
             .ok_or(NativeProcessError::Stale)?;
         let owned = runtime
@@ -1786,8 +1813,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             || resources.address != address
             || (control.entry().is_none()
                 && core::ptr::eq(resources.control, control) != (process.id == key.task.id()))
-            || current.metadata.lifecycle_page.load(Ordering::Acquire) != page as *const _ as u64
-            || current.metadata.control_slot.load(Ordering::Acquire) != control as *const _ as u64
+            || !current.owns_lifecycle_page(page)
+            || !current.owns_control_slot(control)
         {
             return Err(NativeProcessError::Stale);
         }
@@ -1882,6 +1909,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         resources.members[member_index].record = reference;
         resources.members[member_index].thread = key.task;
         resources.members[member_index].expected_host = host_identity;
+        control.bind_zone_record(reference);
         state.members.remove(&old_key);
         state
             .records

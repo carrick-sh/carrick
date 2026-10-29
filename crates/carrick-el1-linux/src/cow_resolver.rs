@@ -189,10 +189,8 @@ pub(crate) fn admitted_fault_mm_handle(
     slot: carrick_sched_core::SlotId,
     task: &carrick_el1_abi::CurrentTask,
 ) -> Option<carrick_el1_abi::El1MmHandle> {
-    if let Some(record) = zone
-        .slot(slot)
-        .current()
-        .filter(|record| zone.record(*record).is_native_owned())
+    if let carrick_el1::substrate::sched::NativeEntryVenue::NativeProcess(record) =
+        carrick_el1::substrate::sched::NativeEntryVenue::select(zone, slot, task)
         && let Some((_, control)) = task.lifecycle_refs()
         && let Ok(handle) = control.service.bound_mm(
             zone.record_ref(record),
@@ -205,6 +203,31 @@ pub(crate) fn admitted_fault_mm_handle(
     crate::aarch64_process::Portal::for_zone(carrier, roots, zone)
         .admitted_handle(mm, u32::from(slot.raw()))
         .ok()
+}
+
+/// Settle a forward fault verdict against the selected [`carrick_el1::substrate::sched::NativeEntryVenue`].
+/// A permission fault declined by an admitted anonymous reservation on an
+/// untraced `SignalOwner` thread is delivered through the native signal owner;
+/// all other non-`NativeProcess` faults retain their host forwarding path.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn settle_declined_owner_fault(
+    venue: carrick_el1::substrate::sched::NativeEntryVenue,
+    task: &carrick_el1_abi::CurrentTask,
+    action: Action,
+    outcome: carrick_el1::fault::OwnerFaultSupplyOutcome,
+    deliver: impl FnOnce() -> Action,
+) -> Action {
+    if action == Action::Forward
+        && outcome == carrick_el1::fault::OwnerFaultSupplyOutcome::PolicyDeclined
+        && matches!(
+            venue,
+            carrick_el1::substrate::sched::NativeEntryVenue::SignalOwner
+        )
+        && !task.ptrace_traced()
+    {
+        return deliver();
+    }
+    action
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -288,10 +311,11 @@ pub fn dispatch_fault(
         let roots = carrick_el1::memory::reservations::shared_guest();
         let slot = carrick_sched_core::SlotId::new(frame.slot as u8);
         let task = &current_tasks[frame.slot as usize];
-        let native = zone
-            .slot(slot)
-            .current()
-            .is_some_and(|record| zone.record(record).is_native_owned());
+        let venue = carrick_el1::substrate::sched::NativeEntryVenue::select(zone, slot, task);
+        let native = matches!(
+            venue,
+            carrick_el1::substrate::sched::NativeEntryVenue::NativeProcess(_)
+        );
         let handle = portal
             .carrier()
             .and_then(|carrier| admitted_fault_mm_handle(zone, roots, carrier, slot, task));
@@ -345,7 +369,9 @@ pub fn dispatch_fault(
                 }
                 continue;
             }
-            return action;
+            return settle_declined_owner_fault(venue, task, action, supply.outcome(), || {
+                crate::dispatch::arm_deliver_declined_fault_signal(frame)
+            });
         }
     }
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]

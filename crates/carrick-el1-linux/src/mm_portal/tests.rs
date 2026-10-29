@@ -8,6 +8,266 @@ use carrick_el1_abi::{
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
+
+#[test]
+fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
+    use carrick_core::mm::transaction::{SelectionVenues, UserWriteRequest, UserWriteVenue};
+    use carrick_core::mm::transfer::ValidatedChunk;
+    use carrick_el1_abi::{Aarch64ParkedContext, PortalGrantWindow};
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, GuestPermissionEdit, LeafAccess};
+    use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerMmu};
+
+    struct StackCopy {
+        prepared: NoopPreparedResolver,
+        cow: NoopCowResolver,
+        residency: Box<FrameGrantResidencyTable>,
+        bytes: Vec<u8>,
+        copies: usize,
+    }
+    impl UserWriteVenue<Aarch64ParkedContext> for StackCopy {
+        type Prepared = NoopPreparedResolver;
+        type Cow = NoopCowResolver;
+        type Error = ();
+        fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
+            SelectionVenues {
+                prepared: &mut self.prepared,
+                cow: &mut self.cow,
+                residency: &self.residency,
+                slot: 0,
+            }
+        }
+        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+            Ok(())
+        }
+        fn supply_cow(&mut self, _: PortalGrantWindow) -> Result<(), ()> {
+            panic!("permission edits must not allocate frames")
+        }
+        fn copy(&mut self, fence: &ValidatedChunk<'_, Aarch64ParkedContext>, bytes: &[u8]) -> bool {
+            let chunk = fence.selected();
+            assert_eq!(chunk.ipa, IPA + chunk.va.raw() - VA);
+            let offset = (chunk.ipa - IPA) as usize;
+            self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+            self.copies += 1;
+            true
+        }
+    }
+
+    const PAGES: usize = 256;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, PAGES + 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, PAGES + 2);
+    // Publish the real private-leaf tags rather than manufacturing COW bits.
+    for word in &tables.words[1536..1536 + PAGES] {
+        word.store(0, Ordering::Relaxed);
+    }
+    {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
+            execute_descriptor_op,
+        };
+        let one = NonZeroU64::MIN;
+        assert!(matches!(
+            execute_descriptor_op(
+                &tables.live(&CallerInvalidatesAsid),
+                carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
+                DescriptorOp::Prepare {
+                    publication: GuestLeafPublication {
+                        va: VA,
+                        ipa: IPA,
+                        len: PAGES as u64 * 4096,
+                        writable: true,
+                        executable: false
+                    },
+                    resident: PageSpan::new(VA, PAGES as u64 * 4096),
+                    backing: BackingIdentity {
+                        frame_id: one,
+                        mapping_id: one,
+                        owner_generation: one,
+                        inventory_revision: one
+                    },
+                },
+                &TableGrants::NONE,
+                &mut InlineJournal::new()
+            ),
+            DescriptorOutcome::Applied(_)
+        ));
+    }
+    let stack = VA + PAGES as u64 * 4096;
+    {
+        let mut root = portal.root(mm, 0).unwrap();
+        let range = ReservationRange::new(stack, stack + 8192).unwrap();
+        root.retire_opaque(range).unwrap();
+        root.insert_opaque(
+            range,
+            ReservationProtection::READ_WRITE,
+            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::GROWSDOWN),
+        )
+        .unwrap();
+    }
+    let mut copy = StackCopy {
+        prepared: NoopPreparedResolver,
+        cow: NoopCowResolver,
+        residency: residency(),
+        bytes: vec![0; (PAGES + 2) * 4096],
+        copies: 0,
+    };
+    let mut expected: Vec<u64> = (0..PAGES)
+        .map(|page| 0xC411_5045_524D_0000u64 ^ page as u64)
+        .collect();
+    for page in 0..PAGES {
+        copy.bytes[page * 4096..page * 4096 + 8]
+            .copy_from_slice(&(0xC411_5045_524D_0000u64 ^ page as u64).to_ne_bytes());
+    }
+    let words = tables.live(&CallerInvalidatesAsid);
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let verify = |copy: &StackCopy, expected: &[u64]| {
+        for (page, value) in expected.iter().enumerate() {
+            let translation = Aarch64Mmu::translate(
+                &words,
+                Aarch64Mmu::root(ROOT).unwrap(),
+                carrick_guest_arch::UserVa::new(VA + page as u64 * 4096),
+                LeafAccess::Read,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            let offset = (translation.output.raw() - IPA) as usize;
+            assert_eq!(&copy.bytes[offset..offset + 8], &value.to_ne_bytes());
+        }
+    };
+    let frame =
+        vec![0x5a; core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()];
+    for round in 0..4 {
+        for (bits, page, access) in [
+            (1, round, LeafAccess::Write),
+            (0, (round * 17 + 1) % PAGES, LeafAccess::Read),
+        ] {
+            let range = ReservationRange::new(VA, stack).unwrap();
+            let decision = portal
+                .root(mm, 0)
+                .unwrap()
+                .mprotect(range, ReservationProtection::from_bits(bits).unwrap())
+                .unwrap();
+            let carrick_el1::memory::reservations::Decision::Work(request) = decision else {
+                panic!("protection edit must publish owner work")
+            };
+            unsafe {
+                carrick_mmu_core::aarch64::protect_existing_el1_private_pages(
+                    tables.words.as_ptr().cast_mut(),
+                    ROOT,
+                    tables.words.len() * 8,
+                    None,
+                    GuestPermissionEdit {
+                        va: VA,
+                        len: stack - VA,
+                        readable: bits != 0,
+                        writable: false,
+                        executable: false,
+                    },
+                )
+            }
+            .unwrap();
+            let receipt = unsafe {
+                carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+                    request,
+                    carrick_el1_abi::ReservationBackingReceipt {
+                        receipt: request.sequence.raw(),
+                        granted_bytes: 0,
+                        returned_bytes: 0,
+                    },
+                )
+            }
+            .unwrap();
+            portal.root(mm, 0).unwrap().complete(receipt).unwrap();
+            if bits == 1 {
+                verify(&copy, &expected);
+            }
+            assert!(
+                Aarch64Mmu::translate(
+                    &words,
+                    Aarch64Mmu::root(ROOT).unwrap(),
+                    carrick_guest_arch::UserVa::new(VA + page as u64 * 4096),
+                    access,
+                    true
+                )
+                .is_err()
+            );
+            // The deliberate denied access needs a multi-page signal-frame write
+            // into a different, host-imported stack in this exact MM.
+            portal
+                .write_user_bytes(
+                    UserWriteRequest {
+                        handle,
+                        address: carrick_guest_arch::UserVa::new(stack + 8192 - frame.len() as u64),
+                        bytes: &frame,
+                        slot: carrick_guest_arch::SlotId::new(0),
+                    },
+                    &words,
+                    &mut copy,
+                )
+                .unwrap();
+            let decision = portal
+                .root(mm, 0)
+                .unwrap()
+                .mprotect(range, ReservationProtection::READ_WRITE)
+                .unwrap();
+            let carrick_el1::memory::reservations::Decision::Work(request) = decision else {
+                panic!("restore work")
+            };
+            unsafe {
+                carrick_mmu_core::aarch64::protect_existing_el1_private_pages(
+                    tables.words.as_ptr().cast_mut(),
+                    ROOT,
+                    tables.words.len() * 8,
+                    None,
+                    GuestPermissionEdit {
+                        va: VA,
+                        len: stack - VA,
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                    },
+                )
+            }
+            .unwrap();
+            let receipt = unsafe {
+                carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+                    request,
+                    carrick_el1_abi::ReservationBackingReceipt {
+                        receipt: request.sequence.raw(),
+                        granted_bytes: 0,
+                        returned_bytes: 0,
+                    },
+                )
+            }
+            .unwrap();
+            portal.root(mm, 0).unwrap().complete(receipt).unwrap();
+            if bits == 1 {
+                // Retry the denied store after the handler's RW restoration.
+                let translation = Aarch64Mmu::translate(
+                    &words,
+                    Aarch64Mmu::root(ROOT).unwrap(),
+                    carrick_guest_arch::UserVa::new(VA + page as u64 * 4096),
+                    LeafAccess::Write,
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+                expected[page] = 0xC411_5752_4954_0000u64 ^ round as u64;
+                let offset = (translation.output.raw() - IPA) as usize;
+                copy.bytes[offset..offset + 8].copy_from_slice(&expected[page].to_ne_bytes());
+            }
+            verify(&copy, &expected);
+        }
+    }
+    assert_eq!(
+        copy.copies, 16,
+        "two page-bounded copies per frame, eight frames"
+    );
+}
 #[test]
 fn transfer_fence_bounds_remap_to_one_chunk() {
     let region = Region::new();

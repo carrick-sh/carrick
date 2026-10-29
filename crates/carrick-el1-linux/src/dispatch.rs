@@ -1011,12 +1011,21 @@ fn arm_native_service_exit(
     let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
     let slot = SlotId::from_index(frame.slot as usize)?;
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
-    let lane = zone.slot(slot);
-    let record = lane.current().or_else(|| lane.host_record())?;
-    if !zone.record(record).is_native_owned() {
+    let (page, control) = task.lifecycle_refs()?;
+    let entry = if (frame.esr >> 26) & 0x3f == 0x15 {
+        carrick_sched_core::object_wait::OwnerEntry::Syscall
+    } else {
+        carrick_sched_core::object_wait::OwnerEntry::Exception
+    };
+    if !super::native_process_runtime::native_entry_owned(
+        carrick_el1_abi::BornInZoneSource { zone, slot },
+        task,
+        page,
+        control,
+        entry,
+    ) {
         return None;
     }
-    let (page, control) = task.lifecycle_refs()?;
     // Only a fork child's execve is staged for the native exec service; a
     // root's exec keeps the host route and its live cwd, credentials,
     // executable and descriptor table (execveat is never claimed).
@@ -1259,6 +1268,50 @@ pub(super) fn native_service_idle(
     Action::Idle
 }
 
+/// Deliver a synchronous `SIGSEGV` (`SEGV_ACCERR`) in-ring when an admitted
+/// anonymous reservation declines a permission fault on a `SignalOwner` thread.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(never)]
+pub(crate) fn arm_deliver_declined_fault_signal(frame: &mut TrapFrame) -> Action {
+    let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
+        unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
+    let Some(task) = current_tasks.get(frame.slot as usize) else {
+        return Action::Forward;
+    };
+    let Some((page, control)) = task.lifecycle_refs() else {
+        return Action::Forward;
+    };
+    let Some(slot) = SlotId::from_index(frame.slot as usize) else {
+        return Action::Forward;
+    };
+    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    if !matches!(
+        carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
+            zone, slot, task, page, control
+        ),
+        carrick_el1::substrate::sched::NativeEntryVenue::SignalOwner
+    ) {
+        return Action::Forward;
+    }
+    let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+    let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
+    let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
+        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    super::aarch64_process::deliver_declined_fault_signal_with(
+        carrick_el1_abi::BornInZoneSource { zone, slot },
+        task,
+        &saved.native,
+        ttbr0,
+        page,
+        control,
+        &mut service,
+        frame.far,
+        |process| super::arm_signal::deliver_on_user_return(task, process, frame),
+    )
+    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding))
+}
+
 /// The one native signal checkpoint at the actual EL0 return boundary. The
 /// syscall work ledger and scheduler resume result have already settled here;
 /// IRQ, fault and SVC returns all pass through the same owner.
@@ -1287,7 +1340,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
             invalid_completion(NativeInvariant::EntryBinding)
         }
         return Action::Served;
-    }
+    };
     let Some(slot) = SlotId::from_index(frame.slot as usize) else {
         invalid_completion(NativeInvariant::EntryBinding)
     };

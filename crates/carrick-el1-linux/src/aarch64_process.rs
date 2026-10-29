@@ -469,9 +469,7 @@ fn init_process_record(
         *source.zone.record(record).ctx_mut() = Aarch64ParkedContext::from_parts(*native, address);
     }
     // Only the task's own published control slot names this home record.
-    if task.metadata.control_slot.load(Ordering::Acquire)
-        == core::ptr::from_ref(control).addr() as u64
-    {
+    if task.owns_control_slot(control) {
         control.bind_zone_record(source.zone.record_ref(record));
     }
     Ok(record)
@@ -655,6 +653,103 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         }
     }
     Ok(result)
+}
+
+/// Deliver a synchronous `SIGSEGV` (`SEGV_ACCERR`) for a permission fault
+/// declined by an admitted anonymous reservation on a `SignalOwner` thread.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_declined_fault_signal_with<X: ForkStockCrossing, F>(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+    service: &mut Aarch64NativeProcessService<'static, X>,
+    far: u64,
+    deliver: F,
+) -> Result<carrick_el1_abi::Action, NativeProcessError>
+where
+    F: FnOnce(
+        &mut super::native_process_runtime::NativeProcessEntry<
+            '_,
+            'static,
+            Mm,
+            Aarch64ParkedContext,
+            Aarch64NativeProcessService<'static, X>,
+        >,
+    ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
+{
+    let delivered = with_process_entry(
+        source,
+        task,
+        native,
+        ttbr0,
+        page,
+        control,
+        service,
+        |process| {
+            process
+                .force_sigsegv_info(
+                    carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                        carrick_signal_core::SignalSet::from_bits(control.blocked().0),
+                    ),
+                    carrick_syscall_abi::LinuxSiginfo {
+                        si_signo: carrick_syscall_abi::LINUX_SIGSEGV,
+                        si_code: carrick_syscall_abi::LINUX_SEGV_ACCERR,
+                        si_addr: far,
+                        ..carrick_syscall_abi::LinuxSiginfo::empty()
+                    },
+                )
+                .map_err(|_| NativeProcessError::Fault)?;
+            Ok(deliver(process))
+        },
+    )??;
+    match delivered {
+        None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => {
+            Ok(carrick_el1_abi::Action::Served)
+        }
+        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => {
+            Ok(carrick_el1_abi::Action::Idle)
+        }
+        Some(_) => Err(NativeProcessError::Quarantined),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_declined_fault_signal<X: ForkStockCrossing, A>(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+    service: &mut Aarch64NativeProcessService<'static, X>,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    fpstate: &[u8],
+    machine: &mut A,
+) -> Result<carrick_el1_abi::Action, NativeProcessError>
+where
+    A: super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>,
+    A::Backend: carrick_guest_arch::ArchTypes<NativeFrame = carrick_el1_abi::TrapFrame>,
+{
+    deliver_declined_fault_signal_with(
+        source,
+        task,
+        native,
+        ttbr0,
+        page,
+        control,
+        service,
+        frame.far,
+        |process| {
+            super::signal_delivery::deliver_signal_with_control(
+                task, control, process, frame, fpstate, machine,
+            )
+        },
+    )
 }
 
 /// Read the MM's root incarnation from the parked execution context. The
