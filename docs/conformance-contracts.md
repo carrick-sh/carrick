@@ -2366,6 +2366,20 @@ real ABI birth, retires that member natively, and then retires its host graph.
 The core binding also checks this ownership while native page commit is pending.
 The cleanup token pins the member control and snapshots its entry incarnation.
 
+Host graph retirement commits that same terminal intent before removing a thread
+can drop its kernel-owned Zone wait. A queued claim can acquire the still-Runnable
+execution state after this cancellation frees the record. The binding
+`serial_host_retirement_cancels_zone_wait_before_queued_claim` drives this actual
+cancellation through Kernel, then exercises DirectLoad and clean pool shutdown
+without a manual record free or synthetic host retirement receipt. Host intent
+has permanent provenance distinct from native-reserved membership, including on
+a refused ABI transition. Once committed, its token cannot refund live membership.
+Ordinary host continuation consumption requires the exact executor lease; it
+cannot overlap another valid claim of that generation and grants no terminal
+intent. Generic cancellation and failure cleanup also grant no such authority.
+The signed captures identify DirectLoad but do not yet join each missing record
+to its physical release; the director's signed A/B remains the acceptance gate.
+
 ### Interrupted-sleep remainder publication (#986 Slice 1)
 
 `kernel.memory.owner-wait` includes the frozen remainder from an interrupted

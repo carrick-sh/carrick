@@ -595,6 +595,10 @@ impl Kernel {
                 .map_err(|_| KernelOperationError::RetiredThreadCapacity(1))?;
         }
 
+        // Every fallible reservation is complete. Commit exact terminal intent
+        // before graph removal can drop a kernel-owned ZoneWait and free the
+        // continuation an already queued executor is about to restore.
+        live_membership = live_membership.map(|membership| membership.commit_zone_retirement());
         let thread = context
             .task
             .retire_thread(context.thread.key())

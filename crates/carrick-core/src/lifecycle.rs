@@ -75,7 +75,8 @@ const HOST_RETIRING: u32 = 8;
 const GRAPH_REGISTERED: u32 = 16;
 const NATIVE_SIGNAL_OWNER: u32 = 32;
 const ZONE_TERMINAL: u32 = 64;
-const GRAPH_REFERENCE: u32 = 128;
+const ZONE_HOST_TERMINAL: u32 = 128;
+const GRAPH_REFERENCE: u32 = 256;
 const RESETTING: u32 = 1 << 31;
 const REFERENCES: u32 = RESETTING - GRAPH_REFERENCE;
 
@@ -107,6 +108,16 @@ impl MemberExitCustody {
     }
     pub(crate) fn zone_terminal(&self) -> bool {
         self.word.load(Ordering::Acquire) & ZONE_TERMINAL != 0
+    }
+    pub(crate) fn commit_host_zone_terminal(&self) {
+        self.word.fetch_or(
+            ZONE_TERMINAL | ZONE_HOST_TERMINAL | HOST_RETIRING,
+            Ordering::Release,
+        );
+    }
+    pub(crate) fn native_zone_terminal(&self) -> bool {
+        let word = self.word.load(Ordering::Acquire);
+        word & (ZONE_TERMINAL | ZONE_HOST_TERMINAL) == ZONE_TERMINAL
     }
     pub fn referenced(&self) -> bool {
         self.word.load(Ordering::Acquire) & REFERENCES != 0
@@ -897,6 +908,12 @@ impl ReservedLiveUnit {
 }
 
 impl NonfinalExitMembership<'_> {
+    /// The exact terminal owner crossed its irreversible publication point.
+    /// Dropping this token can no longer restore a terminated member's unit.
+    pub(crate) fn commit_irrevocable(&mut self) {
+        self.reserved.take();
+    }
+
     /// The graph's exact-thread retirement and ledger publication completed.
     pub fn publish(mut self) {
         self.reserved.take();
@@ -1073,5 +1090,44 @@ mod membership_tests {
         page.close();
         drop(page.reserve_cancelled_member_exit().unwrap());
         assert_eq!(page.live(), 3);
+    }
+    #[test]
+    fn refused_host_page_transition_preserves_host_zone_provenance() {
+        struct Member {
+            custody: MemberExitCustody,
+            entry: EntryRef,
+        }
+        impl MemberControl for Member {
+            fn member_entry(&self) -> Option<EntryRef> {
+                Some(self.entry)
+            }
+            fn exit_custody(&self) -> &MemberExitCustody {
+                &self.custody
+            }
+            fn host_retirement(&self) -> Option<crate::terminal::HostThreadRetirementReceipt> {
+                None
+            }
+        }
+        let page = Page {
+            terminal: crate::terminal::ProcessExitCustody::new(),
+            gate: AtomicU32::new(GateState::Open as u32),
+            live: AtomicU32::new(2),
+        };
+        let member = Member {
+            custody: MemberExitCustody::new(),
+            entry: EntryRef::new(0, 1),
+        };
+        let mut membership = page.reserve_nonfinal_exit().unwrap();
+        member.custody.commit_host_zone_terminal();
+        membership.commit_irrevocable();
+        // The real page transition refuses its absent entry and rolls back
+        // HOST_RETIRING. Its permanent provenance must still remain host-owned.
+        assert_eq!(
+            retire_host_member(&page, member.entry, &member, membership),
+            Err(TransitionError::NoSuchEntry)
+        );
+        assert!(member.custody.zone_terminal());
+        assert!(!member.custody.native_zone_terminal());
+        assert_eq!(page.live(), 1);
     }
 }
