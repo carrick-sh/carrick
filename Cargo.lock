@@ -1339,6 +1339,7 @@ dependencies = [
  "libc",
  "proc-macro2",
  "quote",
+ "regex",
  "ring",
  "serde",
  "serde_json",
