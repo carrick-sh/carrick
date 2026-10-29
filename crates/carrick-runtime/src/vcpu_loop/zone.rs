@@ -973,7 +973,11 @@ where
         } else {
             previous.or(reserved)
         };
-        self.state.continuation_restart = None;
+        // Internal completion-output waits retain the completed syscall's
+        // restart decision. A fresh interruption still owns its own outcome.
+        if interruption.is_some() || !matches!(&resume, OwnedSyscallResume::Completion(_)) {
+            self.state.continuation_restart = None;
+        }
         let outcome = match interruption {
             Some(outcome) => outcome,
             None => self.state.resume_owned_syscall(

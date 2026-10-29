@@ -24,8 +24,8 @@ use crate::dispatch::fd_wait::BlockingFdWait;
 use crate::dispatch::format_time::{BlockingTimerFdRead, TimerFdPollSource};
 use crate::dispatch::{BlockingMqueue, BlockingSemop};
 use crate::dispatch::{
-    BlockingRecordLock, BlockingWrite, DispatchOutcome, FdWaitCompletion, GuestPtr,
-    SyscallDispatcher, SyscallRequest, WaitFdAuthority, WaitFds,
+    BlockingRecordLock, BlockingWrite, DispatchOutcome, FdWaitCompletion, SyscallDispatcher,
+    SyscallRequest, WaitFdAuthority, WaitFds,
 };
 use crate::kernel::objects::{ExecutionGeneration, ThreadKey};
 use crate::kernel::{Kernel, KernelContext, MmId, Task, TaskKey, TaskRevision, VforkParentWait};
@@ -2863,12 +2863,19 @@ pub fn raise_sigpipe_for_blocking_write(
     outcome
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CompletionOutputSource {
+    Zeroes,
+    Record(Vec<u8>),
+}
+
 /// A completed wait owns its remaining output, never the original syscall.
 /// Re-dispatching select or sleep here would start a second wait. Progress is
 /// advanced only after secured copyout, with no permit retained while parked.
 #[derive(Debug, PartialEq, Eq)]
 struct CompletionCopyout {
     result: Result<i64, LinuxErrno>,
+    source: CompletionOutputSource,
     writes: std::collections::VecDeque<GuestOutputRange>,
     offset: usize,
     thread: ThreadKey,
@@ -2893,6 +2900,8 @@ pub enum CompletionFoldError {
     AddressSpace,
     #[error("completed output lost its exact execution authority")]
     ExecutionAuthority,
+    #[error("completed output range does not match its retained ABI record")]
+    OutputLength,
 }
 
 impl CompletionCopyout {
@@ -2923,6 +2932,7 @@ impl CompletionCopyout {
         }
         Ok(Self {
             result,
+            source: CompletionOutputSource::Zeroes,
             writes: writes.into(),
             offset: 0,
             thread: context.thread().key(),
@@ -2977,7 +2987,11 @@ impl CompletionCopyout {
                     ));
                 }
             };
-            if let Err(fault) = output.commit([&ZEROES[..len]]) {
+            let bytes = match &self.source {
+                CompletionOutputSource::Zeroes => &ZEROES[..len],
+                CompletionOutputSource::Record(bytes) => &bytes[self.offset..self.offset + len],
+            };
+            if let Err(fault) = output.commit([bytes]) {
                 return fault.outcome();
             }
             self.offset += len;
@@ -3103,12 +3117,24 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
             }
         }
         ContinuationCompletion::InterruptedSleep { remaining } => {
-            Some(crate::dispatch::complete_interrupted_sleep(
-                context,
-                memory,
-                remaining.map(|(range, _)| GuestPtr(range.start().raw())),
-                remaining.map_or(Duration::ZERO, |(_, duration)| duration),
-            ))
+            let Some((range, duration)) = remaining else {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EINTR)));
+            };
+            // Authenticate the captured destination before encoding or preparing
+            // memory. The frozen duration belongs to this completed sleep.
+            let mut operation =
+                CompletionCopyout::new(Err(LINUX_EINTR), vec![range], context, current_mm)?;
+            use carrick_abi::KernelAbi;
+            let record = carrick_abi::LinuxTimespec::new(
+                duration.as_secs() as i64,
+                i64::from(duration.subsec_nanos()),
+            );
+            let bytes = record.abi_bytes();
+            if range.len() != bytes.len() {
+                return Err(CompletionFoldError::OutputLength);
+            }
+            operation.source = CompletionOutputSource::Record(bytes.to_vec());
+            Some(operation.resume(context, memory, current_mm)?)
         }
     })
 }

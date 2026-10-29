@@ -2357,3 +2357,29 @@ entries, whose normal settlement remains responsible for their obligations.
 The VM-free binding primes actual thread pools with runtime adoption
 reservations containing real process-birth submissions. Two live tasks then
 exit during close; unused capacity must retire before executor joins.
+
+### Interrupted-sleep remainder publication (#986 Slice 1)
+
+`kernel.memory.owner-wait` includes the frozen remainder from an interrupted
+relative sleep and terminal errno 4 (`EINTR`). Linux nanosleep does not restart
+with `SA_RESTART`. Completion output owns the original range identity and
+encoded bytes; owner, supply and physical waits resume publication without
+admitting another sleep or redispatching its syscall. Zero-filled timeout
+output keeps its existing bounded cursor and does not allocate a byte buffer.
+
+The kernel binding `interrupted_sleep_completion_retains_bytes_across_refusals`
+requires cumulative preparation/commit counts of 1/0, 2/0 and 3/1 for a
+page-contained 16-byte destination. Page crossing adds one committed window.
+Physical custody must be released before the final preparation. Group exit or
+fatal cancellation after either refusal permits no further preparation or
+commit. Range authentication, genuine errno 14 (`EFAULT`) and null remainder
+are covered separately. Existing zero-output identity and legacy fatal-timeout
+bindings remain applicable.
+
+The runtime binding
+`serial_host_interrupted_sleep_completion_retains_remainder_and_eintr`
+drives persistent sleep interruption and the existing owner resume routes,
+including signal delivery after publishing errno 4 with no restart despite
+`SA_RESTART`. These VM-free schedules do not prove real guest instruction or
+signal-frame execution. Signed HVF acceptance and the applicable Linux oracle
+remain director-owned; neither is available on ctb-w4.

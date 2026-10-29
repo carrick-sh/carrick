@@ -3658,6 +3658,7 @@ pub(crate) mod tests {
         pub(crate) prepared_write_context: Option<carrick_kernel::kernel::KernelContext>,
         pub(crate) prepared_cancels: usize,
         pub(crate) prepared_commits: usize,
+        pub(crate) prepared_attempts: usize,
         pub(crate) copyout_owner_probe: Option<CopyoutOwnerProbe>,
         // Frame result, result already completed when injected, restart flag.
         pub(crate) injected_signals: Vec<(Option<i64>, Option<i64>, bool)>,
@@ -3731,6 +3732,7 @@ pub(crate) mod tests {
             Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
             carrick_guest_mem::MemoryPrepareError,
         > {
+            self.prepared_attempts += 1;
             if let Some(wait) = &self.prepare_dependency
                 && !wait.0.is_ready()
             {
@@ -4542,7 +4544,25 @@ pub(crate) mod tests {
                 false,
                 physical,
                 true,
+                None,
             );
+        }
+    }
+
+    #[test]
+    fn serial_host_interrupted_sleep_completion_retains_remainder_and_eintr() {
+        for immediate in [false, true] {
+            for physical in [false, true] {
+                exercise_owner_wait_completion(
+                    carrick_abi::syscall::nr::NANOSLEEP,
+                    None,
+                    false,
+                    false,
+                    physical,
+                    true,
+                    Some(immediate),
+                );
+            }
         }
     }
 
@@ -4553,7 +4573,7 @@ pub(crate) mod tests {
         release_wins: bool,
         physical: bool,
     ) {
-        exercise_owner_wait_completion(nr, signum, native, release_wins, physical, false);
+        exercise_owner_wait_completion(nr, signum, native, release_wins, physical, false, None);
     }
 
     fn exercise_owner_wait_completion(
@@ -4563,9 +4583,15 @@ pub(crate) mod tests {
         release_wins: bool,
         physical: bool,
         completion_copyout: bool,
+        interrupted_sleep: Option<bool>,
     ) {
+        let immediate = interrupted_sleep.unwrap_or(false);
+        let interrupted_sleep = interrupted_sleep.is_some();
+        let physical_after_owner = interrupted_sleep && physical;
+        let physical = physical && !interrupted_sleep;
         struct UnreadyBacking {
             ready: std::sync::atomic::AtomicBool,
+            ready_on_enroll: bool,
             wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
         }
         impl std::fmt::Debug for UnreadyBacking {
@@ -4582,6 +4608,9 @@ pub(crate) mod tests {
                 wake: Arc<dyn Fn() + Send + Sync>,
             ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
                 *self.wake.lock() = Some(wake);
+                if self.ready_on_enroll {
+                    self.ready.store(true, std::sync::atomic::Ordering::Release);
+                }
                 (Box::new(()), self.is_ready())
             }
         }
@@ -4851,6 +4880,7 @@ pub(crate) mod tests {
 
         let physical_backing = Arc::new(UnreadyBacking {
             ready: std::sync::atomic::AtomicBool::new(false),
+            ready_on_enroll: physical_after_owner && immediate,
             wake: Mutex::new(None),
         });
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
@@ -4858,6 +4888,24 @@ pub(crate) mod tests {
         let mut engine = CrashCaptureTestEngine {
             native_owner: native_owner.clone(),
             ..Default::default()
+        };
+
+        // Admit once before the sibling takes its editor; output waits must
+        // never re-enter this dispatcher or read the sleep request again.
+        let mut admitted_sleep = if interrupted_sleep {
+            use carrick_abi::KernelAbi;
+            engine.guest_memory.insert(
+                0x71_1000,
+                carrick_abi::LinuxTimespec::new(30, 0).abi_bytes().to_vec(),
+            );
+            engine.read_tracker = Some(Arc::new(Mutex::new(Vec::new())));
+            let outcome = state
+                .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                .unwrap();
+            assert!(matches!(outcome, DispatchOutcome::WaitOnSleep { .. }));
+            Some(outcome)
+        } else {
+            None
         };
 
         let handback_scheduler = Arc::downgrade(&scheduler);
@@ -4926,6 +4974,9 @@ pub(crate) mod tests {
                         engine.prepare_dependency =
                             Some(carrick_guest_mem::OwnedMemoryWait(physical_backing.clone()));
                     }
+                    let registration = scheduler
+                        .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                        .unwrap();
                     let (first, resume) = if let Some((owner, object, _, raw)) = &ipc {
                         use carrick_kernel::kernel::continuation::ipc as host_ipc;
                         let request = SyscallRequest::new(
@@ -4975,45 +5026,120 @@ pub(crate) mod tests {
                         // Retain a real prepared nanosleep completion token, as
                         // the trapped timeout path does before folding output.
                         let request = SyscallRequest::from_raw(frame);
-                        let prepared = kernel
-                            .dispatcher
-                            .prepare_syscall(&root, request, &kernel.reporter)
+                        if !interrupted_sleep {
+                            let prepared = kernel
+                                .dispatcher
+                                .prepare_syscall(&root, request, &kernel.reporter)
+                                .unwrap();
+                            let syscall = match prepared {
+                                PreparedDispatch::Invoke(syscall)
+                                | PreparedDispatch::Complete { syscall, .. } => syscall,
+                            };
+                            state.service_kernel_context = Some(root.retain_exact());
+                            state.syscall_completion =
+                                SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
+                                    syscall,
+                                    root.retain_exact(),
+                                    kernel.dispatcher.observers().cloned(),
+                                ));
+                        }
+                        let first = if interrupted_sleep {
+                            use carrick_kernel::kernel::continuation::{
+                                BlockedContinuation, CarrierWaitService, ContinuationCapture,
+                                RestartClass,
+                            };
+                            let mut sleeping = scheduler
+                                .try_take(&registration)
+                                .unwrap()
+                                .expect("initial sleep executor claim");
+                            assert_eq!(sleeping.thread_key(), root.thread().key());
+                            let capture = ContinuationCapture::from_lease(
+                                &root,
+                                sleeping.lease(),
+                                request,
+                                RestartClass::Never,
+                            )
                             .unwrap();
-                        let syscall = match prepared {
-                            PreparedDispatch::Invoke(syscall)
-                            | PreparedDispatch::Complete { syscall, .. } => syscall,
+                            let continuation = BlockedContinuation::from_dispatch_outcome(
+                                admitted_sleep.take().unwrap(),
+                                capture,
+                            )
+                            .unwrap();
+                            let service = CarrierWaitService::new(Arc::clone(&scheduler));
+                            let mut wait_registration = service.prepare_registration(&continuation);
+                            service.enroll(&mut wait_registration).unwrap();
+                            scheduler
+                                .settle_blocked_continuation(
+                                    sleeping,
+                                    continuation,
+                                    wait_registration,
+                                )
+                                .unwrap();
+                            let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                                carrick_abi::LINUX_SIGUSR1,
+                            )
+                            .unwrap();
+                            let mut action = carrick_abi::LinuxSigaction::empty();
+                            action.sa_handler = 0x5000;
+                            action.sa_flags = carrick_abi::LINUX_SA_RESTART;
+                            root.signal_authority().install_action(signal, action);
+                            let carrick_kernel::kernel::ExactSignalTargetAuthorization::Allowed(
+                                target,
+                            ) = root.kernel().authorize_signal_target_exact(
+                                &root,
+                                root.task().key(),
+                                Some(root.thread().key()),
+                                Some(signal),
+                            )
+                            else {
+                                panic!("exact sleep signal target")
+                            };
+                            root.kernel().post_guest_thread_signal_to_authorized_target(
+                                &target, signal, None,
+                            );
+                            service.publish_signal_for_thread(root.thread().key());
+                            sleeping = scheduler.try_take(&registration).unwrap().unwrap();
+                            let mut sleep_lease = sleeping.take_lease();
+                            let outcome = state
+                                .resume_persistent_continuation(
+                                    &kernel,
+                                    &mut engine,
+                                    &mut sleep_lease,
+                                )
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(state.continuation_restart,
+                                Some(carrick_kernel::kernel::continuation::RestartDecision::NoRestart));
+                            assert!(sleep_lease.blocked_continuation().is_none());
+                            sleeping.restore_lease(sleep_lease).unwrap();
+                            scheduler.settle_runnable_successor(sleeping).unwrap();
+                            outcome
+                        } else {
+                            fold_continuation_completion(
+                                ContinuationCompletion::ReturnWithGuestWrites(
+                                    0,
+                                    vec![
+                                        GuestOutputRange::new(
+                                            carrick_guest_mem::GuestVa::new(0x71_1020),
+                                            16,
+                                            root.shared().mm().id(),
+                                            process.asid_generation(),
+                                        )
+                                        .unwrap(),
+                                    ],
+                                ),
+                                &kernel.dispatcher,
+                                &root,
+                                &mut engine,
+                                (root.shared().mm().id(), process.asid_generation()),
+                            )
+                            .unwrap()
+                            .unwrap()
                         };
-                        state.service_kernel_context = Some(root.retain_exact());
-                        state.syscall_completion =
-                            SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
-                                syscall,
-                                root.retain_exact(),
-                                kernel.dispatcher.observers().cloned(),
-                            ));
-                        let first = fold_continuation_completion(
-                            ContinuationCompletion::ReturnWithGuestWrites(
-                                0,
-                                vec![
-                                    GuestOutputRange::new(
-                                        carrick_guest_mem::GuestVa::new(0x71_1020),
-                                        16,
-                                        root.shared().mm().id(),
-                                        process.asid_generation(),
-                                    )
-                                    .unwrap(),
-                                ],
-                            ),
-                            &kernel.dispatcher,
-                            &root,
-                            &mut engine,
-                            (root.shared().mm().id(), process.asid_generation()),
-                        )
-                        .unwrap()
-                        .unwrap();
-                        assert!(matches!(
-                            &first,
-                            DispatchOutcome::CompletionCopyoutSuspended(_)
-                        ));
+                        assert!(
+                            matches!(&first, DispatchOutcome::CompletionCopyoutSuspended(_)),
+                            "interrupted remainder must suspend, retaining errno 4: {first:?}"
+                        );
                         let (first, resume) = binding::owner_copyin_route(first);
                         (first, resume.unwrap())
                     } else {
@@ -5082,15 +5208,24 @@ pub(crate) mod tests {
                         HvpatchProductionPhase::Resident,
                         None,
                     );
-                    let registration = scheduler
-                        .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
-                        .unwrap();
-                    let mut running = scheduler.take(&registration).unwrap();
+                    let mut running = if interrupted_sleep {
+                        scheduler
+                            .try_take(&registration)
+                            .unwrap()
+                            .expect("completed sleep remains claimable")
+                    } else {
+                        scheduler.take(&registration).unwrap()
+                    };
+                    if interrupted_sleep {
+                        assert_eq!(running.thread_key(), root.thread().key());
+                    }
                     if running.thread_key() != root.thread().key() {
                         scheduler.settle_runnable_successor(running).unwrap();
                         running = scheduler.take(&registration).unwrap();
                     }
-                    assert_eq!(running.generation(), generation);
+                    if !interrupted_sleep {
+                        assert_eq!(running.generation(), generation);
+                    }
                     let lease = running.take_lease();
                     let owner_context = job.state.service_kernel_context.as_ref().unwrap();
                     assert!(owner_context.exact_thread_is_live());
@@ -5338,7 +5473,11 @@ pub(crate) mod tests {
                         &mut resumed_submission,
                     );
                     resumed_control.binding = Some(&binding);
-                    let completed = if physical {
+                    if physical_after_owner {
+                        engine.prepare_dependency =
+                            Some(carrick_guest_mem::OwnedMemoryWait(physical_backing.clone()));
+                    }
+                    let mut completed = if physical {
                         job.poll_with_engine(&mut engine, &mut resumed_control)
                             .unwrap()
                     } else {
@@ -5356,6 +5495,52 @@ pub(crate) mod tests {
                         )
                         .unwrap()
                     };
+                    if physical_after_owner && !immediate {
+                        assert!(matches!(completed, executor::ExecutorExit::Blocked(_)));
+                        assert_eq!(engine.prepared_attempts, 2);
+                        assert_eq!(engine.prepared_commits, 0);
+                        assert_eq!(
+                            job.state.continuation_restart,
+                            Some(carrick_kernel::kernel::continuation::RestartDecision::NoRestart)
+                        );
+                        // Settle the same retained completion through a second
+                        // park, then publish its physical readiness.
+                        resumed
+                            .restore_lease(resumed_submission.take_execution_lease().unwrap())
+                            .unwrap();
+                        scheduler
+                            .settle_blocked(
+                                resumed,
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            )
+                            .unwrap();
+                        physical_backing
+                            .ready
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        physical_backing.wake.lock().take().unwrap()();
+                        resumed = scheduler.try_take(&registration).unwrap().unwrap();
+                        resumed_submission.authority =
+                            executor::ExecutionLeaseAuthoritySlot::new(Some(resumed.take_lease()));
+                        job.state.guest_execution = Some(
+                            kernel
+                                .dispatcher
+                                .enter_mm_executor_for_thread(
+                                    Some(Arc::clone(root.thread())),
+                                    Arc::clone(&job.state.kicker),
+                                    job.state.this_tid,
+                                    test_execution_slot(),
+                                )
+                                .unwrap(),
+                        );
+                        let mut physical_control = executor::HvpatchQuantumControl::for_test(
+                            &need_resched,
+                            &mut resumed_submission,
+                        );
+                        physical_control.binding = Some(&binding);
+                        completed = job
+                            .poll_with_engine(&mut engine, &mut physical_control)
+                            .unwrap();
+                    }
                     if release_wins {
                         assert!(
                             matches!(completed, executor::ExecutorExit::Syscall),
@@ -5406,6 +5591,8 @@ pub(crate) mod tests {
                         assert!(matches!(completed, executor::ExecutorExit::Syscall));
                         let result = if ipc_read {
                             6
+                        } else if interrupted_sleep {
+                            -4
                         } else if nr == nr::WAIT4 {
                             -10
                         } else {
@@ -5479,7 +5666,21 @@ pub(crate) mod tests {
                             engine.prepared_commits,
                             usize::from(completion_copyout || (nr != nr::WAIT4 && !sleep))
                         );
-                        if completion_copyout {
+                        if interrupted_sleep {
+                            let bytes = &engine.guest_memory[&0x71_1020];
+                            assert_eq!(bytes.len(), 16);
+                            assert_ne!(bytes, &vec![0; 16]);
+                            assert_eq!(engine.injected_signals, [(Some(-4), Some(-4), false)]);
+                            assert_eq!(
+                                *engine.read_tracker.as_ref().unwrap().lock(),
+                                [(0x71_1000, 16)],
+                                "one sleep admission, no syscall redispatch or second input read"
+                            );
+                            assert_eq!(
+                                engine.prepared_attempts,
+                                if physical_after_owner { 3 } else { 2 }
+                            );
+                        } else if completion_copyout {
                             assert_eq!(engine.guest_memory[&0x71_1020], vec![0; 16]);
                         }
                         if nr == nr::PIPE2 {
