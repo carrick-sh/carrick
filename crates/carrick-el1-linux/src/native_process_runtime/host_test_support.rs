@@ -3744,7 +3744,7 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
 }
 
 #[cfg(test)]
-fn retained_poll_output_owner_wait(cancel: bool) {
+fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool) {
     let fixture = native_exec_fixture();
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -3772,6 +3772,12 @@ fn retained_poll_output_owner_wait(cancel: bool) {
     service.on_copy_complete = Some(Box::new(move |address| {
         if address.raw() == 0x10000 {
             access.raise(space.index());
+            if during_enrollment {
+                fixture
+                    .page
+                    .process_exit_custody()
+                    .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
+            }
         }
     }));
     // SAFETY: this owner retains the live source; the copy hook closes its
@@ -3815,6 +3821,19 @@ fn retained_poll_output_owner_wait(cancel: bool) {
         take_signal_copies(),
         [(UserVa::new(0x10000), bytes[..4096].to_vec())]
     );
+    if during_enrollment {
+        assert!(take_signal_copies().is_empty());
+        assert!(
+            fixture
+                .runtime
+                .graph
+                .lock()
+                .service_wait(&fixture.record)
+                .is_none()
+        );
+        return;
+    }
+
     // A nonfatal service interrupt cannot discard completed readiness or spin
     // through re-enrollment while the gate is still closed.
     fixture
@@ -3878,11 +3897,17 @@ fn retained_poll_output_owner_wait(cancel: bool) {
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_retains_result_and_next_byte_across_owner_wait() {
-    retained_poll_output_owner_wait(false);
+    retained_poll_output_owner_wait(false, false);
 }
 
 #[cfg(test)]
 #[test]
 fn completed_ppoll_output_cancellation_commits_no_more_bytes() {
-    retained_poll_output_owner_wait(true);
+    retained_poll_output_owner_wait(true, false);
+}
+
+#[cfg(test)]
+#[test]
+fn completed_ppoll_output_cancellation_during_enrollment_never_returns_an_errno() {
+    retained_poll_output_owner_wait(true, true);
 }

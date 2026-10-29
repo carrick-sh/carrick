@@ -535,7 +535,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Stale);
             }
             (_, ServicePayload::None) => (None, None),
-            (_, ServicePayload::Copyout(_)) => unreachable!(),
+            (_, ServicePayload::Copyout(_)) => return Err(NativeProcessError::Stale),
         };
         let (page, control, mm) = {
             let graph = self.runtime.graph.lock();
@@ -895,15 +895,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let key =
                     ObjectWaitKey::native_service(self.record).ok_or(ObjectWaitError::Stale)?;
                 let _queue = zone.object_wait(key, &carrick_sched_core::ShortLockSpin)?;
-                let interruptible = self
-                    .runtime
-                    .graph
-                    .lock()
-                    .service_wait(&self.record)
-                    .is_none_or(|pending| {
-                        pending.copyout.is_none() || pending.claim.cancellation().is_some()
-                    });
-                if (interruptible && self.signal_interrupts_current())
+                let (interruptible, output_cancelled) =
+                    self.runtime.graph.lock().service_wait(&self.record).map_or(
+                        (true, false),
+                        |pending| {
+                            (
+                                pending.copyout.is_none(),
+                                pending.copyout.is_some() && pending.claim.cancellation().is_some(),
+                            )
+                        },
+                    );
+                if output_cancelled
+                    || (interruptible && self.signal_interrupts_current())
                     || self.runtime.graph.lock().pending.has_exit(&self.key)
                 {
                     self.control

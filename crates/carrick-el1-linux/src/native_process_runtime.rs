@@ -5414,6 +5414,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(())
                 | Err(
                     NativeProcessError::Fault
+                    | NativeProcessError::OwnerWait(_)
                     | NativeProcessError::Busy
                     | NativeProcessError::Stale,
                 ) => {}
@@ -7080,7 +7081,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                 progress: carrick_core::Served::Idle,
                 result: SyscallResult::new(0),
             },
-            Ok(_) => self.fail(NativeProcessError::Quarantined),
+            Ok(NativeResume::NoPending) => {
+                // A cancellation can win before park publishes. The service
+                // has dropped output and returned terminal custody; it has
+                // not completed this syscall with an errno.
+                if let Some(outcome) = self.resume_pending_lifecycle() {
+                    return outcome;
+                }
+                match self.cancel_owner_wait() {
+                    Ok(outcome) => outcome,
+                    Err(error) => self.run_failed(error.run_failure_reason()),
+                }
+            }
+            Ok(_) => self.run_failed(NativeProcessError::Quarantined.run_failure_reason()),
             Err(error) => self.fail(error),
         }
     }

@@ -215,9 +215,13 @@ selection, not VMM supply. The two-live-process pipe binding
 `two_live_process_pipe_owner_wait_retains_exact_bytes_and_cursor` uses a real
 owner selector, Gate producer and scheduler continuation with simulated user
 bytes; it requires exactly 8192 delivered bytes, a 4096-byte retained cursor,
-and no writes into the peer MM. The ppoll completion bindings inject the
+and no writes into the peer MM. If the peer drains the source while output
+waits, the binding requires the delivered prefix without another readiness
+park. The ppoll completion bindings inject the
 second-page refusal at the physical-service boundary and check disjoint output,
-the original result and zero further output after fatal cancellation.
+the original result and zero further output after fatal cancellation. Fatal
+publication during enrollment transfers terminal custody without sleeping or
+returning an ordinary errno.
 
 The work bound is one owner transfer per page-aligned copy piece, with no
 replayed prefix on resume and no additional poll readiness query after its
