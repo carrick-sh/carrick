@@ -934,7 +934,7 @@ fn truncate_capture_aux_section(
                 let before = physical.zone_census.len();
                 let keep = floor_char_boundary(
                     &physical.zone_census,
-                    (target_bytes / 2).min(before.saturating_sub(1)),
+                    proportional_keep_count(before, target_bytes, section_bytes),
                 );
                 physical.zone_census.truncate(keep);
                 let reason = format!(
@@ -961,8 +961,10 @@ fn truncate_capture_aux_section(
         CaptureAuxSection::ZoneCensus => {
             if let Some(census) = &mut capture.zone_census {
                 let before = census.len();
-                let keep =
-                    floor_char_boundary(census, (target_bytes / 2).min(before.saturating_sub(1)));
+                let keep = floor_char_boundary(
+                    census,
+                    proportional_keep_count(before, target_bytes, section_bytes),
+                );
                 if keep == 0 {
                     capture.zone_census = None;
                 } else {
