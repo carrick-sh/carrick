@@ -174,6 +174,40 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
     unsafe { pwrite64_with(zf, cache_base, buf_va, count, offset, &mut user) }
 }
 
+/// Bind ring output to the existing exact-MM native write protocol. Input
+/// remains guarded copy; a refused output carries its producer observation.
+pub(crate) struct OwnerCopy<'a, 'p, U, C: carrick_core_abi::EntryContext> {
+    pub inner: U,
+    pub owner: Option<&'a mut (dyn carrick_personality_linux::lifecycle::ProcessNative<C> + 'p)>,
+    pub wait: Option<carrick_core_abi::PortalOwnerWait>,
+}
+impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, '_, U, C> {
+    fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
+        self.inner.copy_in(dst, address)
+    }
+    fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
+        if let Some(result) = self
+            .owner
+            .as_deref_mut()
+            .and_then(|owner| owner.copy_out_owned(carrick_guest_arch::UserVa::new(address), bytes))
+        {
+            match result {
+                Ok(()) => true,
+                Err(carrick_personality_linux::lifecycle::OwnedCopyError::Wait(wait)) => {
+                    self.wait = Some(wait);
+                    false
+                }
+                Err(carrick_personality_linux::lifecycle::OwnedCopyError::Fault) => false,
+            }
+        } else {
+            self.inner.copy_out(address, bytes)
+        }
+    }
+    fn take_owner_wait(&mut self) -> Option<carrick_core_abi::PortalOwnerWait> {
+        self.wait.take()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
@@ -882,39 +916,5 @@ mod tests {
         assert_eq!(n, 64);
         assert_eq!(file.zero_filled_mask.load(Ordering::Relaxed), (1 << 0));
         assert_eq!(file.dirty_mask.load(Ordering::Relaxed), (1 << 1) | (1 << 2));
-    }
-}
-
-/// Bind ring output to the existing exact-MM native write protocol. Input
-/// remains guarded copy; a refused output carries its producer observation.
-pub(crate) struct OwnerCopy<'a, 'p, U, C: carrick_core_abi::EntryContext> {
-    pub inner: U,
-    pub owner: Option<&'a mut (dyn carrick_personality_linux::lifecycle::ProcessNative<C> + 'p)>,
-    pub wait: Option<carrick_core_abi::PortalOwnerWait>,
-}
-impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, '_, U, C> {
-    fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
-        self.inner.copy_in(dst, address)
-    }
-    fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
-        if let Some(result) = self
-            .owner
-            .as_deref_mut()
-            .and_then(|owner| owner.copy_out_owned(carrick_guest_arch::UserVa::new(address), bytes))
-        {
-            match result {
-                Ok(()) => true,
-                Err(carrick_personality_linux::lifecycle::OwnedCopyError::Wait(wait)) => {
-                    self.wait = Some(wait);
-                    false
-                }
-                Err(carrick_personality_linux::lifecycle::OwnedCopyError::Fault) => false,
-            }
-        } else {
-            self.inner.copy_out(address, bytes)
-        }
-    }
-    fn take_owner_wait(&mut self) -> Option<carrick_core_abi::PortalOwnerWait> {
-        self.wait.take()
     }
 }

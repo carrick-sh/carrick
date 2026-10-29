@@ -2140,7 +2140,7 @@ mod tests {
             PortalOwnerWait, ReservationMm, ReservationProtection, ReservationRange,
         };
         use core::num::NonZeroU64;
-        let mut w = world_with_zone(TestZone::Carrier(Box::new(Region::new())));
+        let mut w = world_with_zone(TestZone::Carrier(Box::<Region>::default()));
         let a = w.table(w.a_tid);
         let (read, write, object) = w.pipe(a, BLOCK);
         let (sleep_read, _, _) = w.pipe(a, BLOCK);
@@ -2177,7 +2177,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let view = nodes(&region);
+        let view = nodes(region);
         {
             let mut root = region
                 .table()
@@ -2297,7 +2297,6 @@ mod tests {
                 "an owner refusal after a delivered page must park with its cursor"
             );
         }
-        drop(portal);
         drop(view);
         assert_eq!(w.mem.read(MM, VA, 4096), pattern[..4096]);
         assert_eq!(

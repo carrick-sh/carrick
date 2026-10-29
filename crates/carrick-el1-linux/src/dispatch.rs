@@ -1030,7 +1030,7 @@ fn arm_native_service_exit(
         return Some(arm_signal_user_return(frame));
     }
     let mut service_wait = wait;
-    let (operation, exec_payload, host_file, retry_exec_stage) = loop {
+    let (operation, exec_payload, host_file, retry_exec_stage) = {
         let staged = match native_exec_stage(frame, task) {
             Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
             Some(NativeExecStage::Failed(errno)) => {
@@ -1114,10 +1114,8 @@ fn arm_native_service_exit(
             },
         };
         match staged {
-            NativeServiceStage::Exec(payload) => break (None, Some(payload), None, false),
-            NativeServiceStage::HostFile(staged) => {
-                break (None, None, Some(staged), false);
-            }
+            NativeServiceStage::Exec(payload) => (None, Some(payload), None, false),
+            NativeServiceStage::HostFile(staged) => (None, None, Some(staged), false),
             NativeServiceStage::Return(result) => {
                 frame.x[0] = result as u64;
                 return Some(arm_signal_user_return(frame));
@@ -1141,26 +1139,24 @@ fn arm_native_service_exit(
                     }
                     Action::Forward | Action::ServedWithWork => {
                         service_wait = fault_wait;
-                        break (
+                        (
                             Some(carrick_core_abi::service::ServiceOperation::Fault(fault)),
                             None,
                             None,
                             true,
-                        );
+                        )
                     }
                     Action::Idle | Action::HostCustody => {
                         invalid_completion(NativeInvariant::EntryBinding)
                     }
                 }
             }
-            NativeServiceStage::Operation => {
-                break (
-                    Some(native_service_operation(frame, &task.linux, action)?),
-                    None,
-                    None,
-                    false,
-                );
-            }
+            NativeServiceStage::Operation => (
+                Some(native_service_operation(frame, &task.linux, action)?),
+                None,
+                None,
+                false,
+            ),
         }
     };
     // This CPU still exclusively owns its portal slot. Bind its selection
