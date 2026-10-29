@@ -2682,3 +2682,276 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
     assert_eq!(tid_words[0].load(Ordering::Acquire), child_visible_tid);
     assert_eq!(tid_words[1].load(Ordering::Acquire), child_visible_tid);
 }
+
+/// #898: interleave reservation admission and first touch, as the signed
+/// fixture does. Count published physical-supply selections, not mmap calls
+/// or synthetic reservation-tree visits. Every selection is settled through
+/// the production grant authenticator and descriptor executor before continuing.
+#[test]
+fn anonymous_reservation_first_touch_service_budget() {
+    let observations = [64, 256, 1024].map(|count| (count, reservation_supply_requests(count)));
+    for &(count, requests) in &observations {
+        eprintln!("anonymous-reservations count={count} backing_requests={requests}");
+    }
+    for pair in observations.windows(2) {
+        let added = pair[1].0 - pair[0].0;
+        let requests = pair[1].1.saturating_sub(pair[0].1);
+        // Each supply requires at least one host exit. This is a necessary
+        // lower-layer consequence of the signed <0.125 host-exit slope,
+        // not a replacement for that full exit-population assertion.
+        assert!(
+            requests * 8 < added,
+            "physical supply grows per reservation: {:?}; delta={requests}/{added}, required <1/8",
+            observations,
+        );
+    }
+}
+
+// This venue also supports the existing prepared-stock adoption mechanism,
+// so a repaired supplier can spend earlier stock without changing the witness.
+struct ReservationSupplyMemory<'a> {
+    tables: &'a crate::mm_portal::test_support::Tables,
+    residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+}
+impl carrick_el1::memory::AnonymousBackingProbe for ReservationSupplyMemory<'_> {
+    fn backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> carrick_el1::memory::Stage1Backing {
+        let maintenance = CallerInvalidatesAsid;
+        FixtureMapping {
+            words: &self.tables.live(&maintenance),
+            residency: self.residency,
+        }
+        .backing(root, va, len)
+    }
+    fn stock_span(
+        &mut self,
+        mm: ReservationMm,
+        va: UserVa,
+    ) -> Option<carrick_guest_arch::UserRange> {
+        let page = self.residency.lookup(mm.raw(), va.raw())?;
+        carrick_guest_arch::UserRange::checked(
+            UserVa::new(page.identity.semantic_base),
+            carrick_guest_arch::GuestLen::new(page.identity.len),
+        )
+    }
+}
+impl carrick_el1::memory::AnonymousPermissionEditor for ReservationSupplyMemory<'_> {
+    fn protect_and_invalidate(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        assert_eq!(root.raw() & AARCH64_ROOT_ADDRESS_MASK, self.tables.base);
+        // SAFETY: retained aligned atomic table arena, under the production
+        // anonymous owner's exclusive editor. No hardware TLB exists here.
+        unsafe {
+            carrick_mmu_core::aarch64::protect_existing_el1_private_pages(
+                self.tables.words.as_ptr().cast_mut(),
+                self.tables.base,
+                self.tables.words.len() * 8,
+                None,
+                edit,
+            )
+        }
+        .map(|_| ())
+    }
+}
+impl carrick_el1::memory::AnonymousRetirementEditor for ReservationSupplyMemory<'_> {
+    fn retire_and_invalidate(
+        &mut self,
+        mm: ReservationMm,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
+        let maintenance = CallerInvalidatesAsid;
+        FixtureMapping {
+            words: &self.tables.live(&maintenance),
+            residency: self.residency,
+        }
+        .retire_and_invalidate(mm, root, va, len)
+    }
+}
+impl carrick_el1::fault::PreparedPageResolver for ReservationSupplyMemory<'_> {
+    fn select_backing_window(
+        &mut self,
+        root: u64,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<
+        carrick_el1_abi::PortalGrantWindow,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        let maintenance = CallerInvalidatesAsid;
+        SelectionWords(&self.tables.live(&maintenance)).select_backing_window(root, window)
+    }
+    fn commit_prepared(
+        &mut self,
+        root: u64,
+        va: u64,
+        ipa: u64,
+        access: carrick_mmu_core::aarch64::LeafAccess,
+    ) -> Result<
+        carrick_mmu_core::aarch64::GuestPreparedCommit,
+        carrick_mmu_core::aarch64::GuestPreparedCommitError,
+    > {
+        assert_eq!(root & AARCH64_ROOT_ADDRESS_MASK, self.tables.base);
+        // SAFETY: retained aligned atomic table arena, under the production
+        // fault owner's exclusive editor. No hardware TLB exists here.
+        unsafe {
+            carrick_mmu_core::aarch64::commit_existing_el1_prepared_page(
+                self.tables.words.as_ptr().cast_mut(),
+                self.tables.base,
+                self.tables.words.len() * 8,
+                None,
+                va,
+                ipa,
+                access,
+            )
+        }
+    }
+}
+
+fn reservation_supply_requests(count: usize) -> usize {
+    use crate::mm_portal::test_support::{IPA, ROOT, Region, Tables, admit, nodes, residency};
+    use carrick_el1::fault::{NoopCowResolver, PreparedFaultPath};
+    use carrick_el1_abi::{CurrentTask, FrameGrantMailbox, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
+        TableGrants,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+    let region = Region::new();
+    let spaces = carrick_sched_core::AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let access =
+        carrick_sched_core::spaces::notification::SpaceAccess::<Aarch64ParkedContext>::source_free_with_context(&spaces);
+    let task = CurrentTask::new();
+    task.execution.task.store(1, Ordering::Release);
+    task.mm.thread_generation.store(1, Ordering::Release);
+    task.mm.key.store(mm.raw(), Ordering::Release);
+    let view = nodes(&region);
+    let owner = crate::mm_portal::MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view);
+    let slots = region.portal_slots();
+    assert!(slots.bind_carrier(NonZeroU64::MIN));
+    let tables = Tables::new(ROOT, IPA, 0);
+    // Supply table storage ahead of time so this witness isolates backing
+    // demand. 1024 mappings of 1/2/3/4 pages occupy five L3 tables.
+    for index in 0..6 {
+        tables.words[1024 + index].store((ROOT + (3 + index as u64) * 4096) | 3, Ordering::Release);
+    }
+    let maintenance = CallerInvalidatesAsid;
+    let words = tables.live(&maintenance);
+    let residency = residency();
+    let counters = carrick_el1_abi::Counters::default();
+    let mailbox = FrameGrantMailbox::new();
+    let mut requests = 0;
+    let mut mappings = Vec::new();
+    for index in 0..count {
+        let len = ((index % 4) + 1) as u64 * 4096;
+        let mut frame = TrapFrame::default();
+        frame.x[8] = 222;
+        frame.x[..6].copy_from_slice(&[0, len, 3, 0x22, u64::MAX, 0]);
+        assert_eq!(
+            carrick_el1::memory::serve_delegated_anonymous(
+                &mut frame,
+                &counters,
+                &task,
+                access,
+                region.table(),
+                &mut ReservationSupplyMemory {
+                    tables: &tables,
+                    residency: &residency
+                },
+                None,
+            ),
+            carrick_el1::memory::DelegatedAnonymous::Served,
+            "mmap index={index} counters={counters:?}",
+        );
+        let va = frame.x[0];
+        assert_eq!(va % 4096, 0);
+        assert!(va < crate::mm_portal::test_support::VA + 6 * 512 * 4096);
+        frame.esr = 0x92000046; // EL0 write translation fault.
+        frame.far = va;
+        let supply = OwnerFaultSupply::new(slots);
+        let action = carrick_el1::fault::dispatch_fault_with_prepared(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&task),
+            access,
+            crate::cow_resolver::native_fault_supply(
+                true,
+                carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                &supply,
+            ),
+            Some(PreparedFaultPath {
+                residency: &residency,
+                resolver: &mut ReservationSupplyMemory {
+                    tables: &tables,
+                    residency: &residency,
+                },
+                roots: Some(region.table()),
+                file_slots: Some(slots),
+            }),
+            &mut NoopCowResolver,
+        );
+        if action == carrick_el1_abi::Action::Forward {
+            assert_eq!(supply.outcome(), OwnerFaultSupplyOutcome::Selected);
+            let slot = slots.grant(0).unwrap();
+            let (_, window) = slot.pending_fault_selection(mm.raw(), va).unwrap();
+            requests += 1;
+            let id = NonZeroU64::new(index as u64 + 1).unwrap();
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: NonZeroU64::new(mm.raw()).unwrap(),
+                    generation: window.operation.sequence,
+                },
+                root: SubstrateGpa(ROOT),
+                op: DescriptorOp::Prepare {
+                    publication: GuestLeafPublication {
+                        va: window.range.start(),
+                        ipa: IPA + index as u64 * 0x200000,
+                        len: window.range.len(),
+                        writable: true,
+                        executable: false,
+                    },
+                    resident: PageSpan::new(va, 4096),
+                    backing: BackingIdentity {
+                        frame_id: id,
+                        mapping_id: id,
+                        owner_generation: id,
+                        inventory_revision: id,
+                    },
+                },
+                tables: TableGrants::NONE,
+            };
+            assert!(slot.submit(window, &txn));
+            let receipt =
+                carrick_core::mm::frames::serve_grant(&owner, slot, &words, &residency, 0, || {})
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
+                "{receipt:?}"
+            );
+            assert!(slot.take_receipt(window, &txn).is_some());
+        } else {
+            assert_eq!(action, carrick_el1_abi::Action::Served);
+        }
+        assert!(residency.is_guest_committed(mm.raw(), va));
+        let descriptor = leaf(&words, ROOT, va);
+        assert_ne!(descriptor & 1, 0);
+        mappings.push((va, descriptor));
+    }
+    // Later grants cannot replace or alias an earlier reservation's private
+    // frame. Real bytes/VM execution remain the signed fixture's obligation.
+    let mut physical = std::collections::BTreeSet::new();
+    for (va, descriptor) in mappings {
+        assert_eq!(leaf(&words, ROOT, va), descriptor);
+        assert!(physical.insert(descriptor & AARCH64_ROOT_ADDRESS_MASK));
+    }
+    requests
+}
