@@ -266,8 +266,8 @@ fn handle_connection(
     authenticate(stream)?;
     let payload = socket_rpc::read_frame(stream, MAX_REQUEST_BYTES)?;
     let request: KernelDebugRequest = wire::decode_exact(&payload)?;
-    let response = build_response(&request, kernel, physical, carrier_scope, Instant::now());
-    let encoded = encode_canonical(&response)?;
+    let mut response = build_response(&request, kernel, physical, carrier_scope, Instant::now());
+    let encoded = encode_bounded_response(&mut response, MAX_RESPONSE_BYTES)?;
     socket_rpc::write_frame(stream, &encoded, MAX_RESPONSE_BYTES)?;
     Ok(())
 }
@@ -425,6 +425,738 @@ pub enum ServerResponse {
 /// the CLI agree on the default without duplicating the list.
 pub fn default_tables() -> Vec<KernelDebugTable> {
     KernelDebugTable::ALL.to_vec()
+}
+
+/// Headroom reserved when computing a target section budget so the added
+/// truncation metadata (`truncated`, `unavailable`, `findings`) fits inside
+/// the same pass.
+const TRUNCATION_METADATA_MARGIN: usize = 1024;
+
+/// Serialize `response` to canonical JSON within `cap` bytes, deterministically
+/// bounding or truncating the largest ring/auxiliary payloads and recording the
+/// truncation in `truncated` / `unavailable` / degraded metadata instead of
+/// failing the frame writer with [`WireError::FrameTooLarge`].
+fn encode_bounded_response(
+    response: &mut ServerResponse,
+    cap: usize,
+) -> Result<Vec<u8>, WireError> {
+    let encoded = encode_canonical(response)?;
+    if encoded.len() <= cap {
+        return Ok(encoded);
+    }
+    match response {
+        ServerResponse::Capture(capture) => bound_capture_response(capture, encoded, cap),
+        ServerResponse::Snapshot(_) => bound_snapshot_response(response, encoded, cap),
+        ServerResponse::Degraded(degraded) => bound_degraded_response(degraded, encoded, cap),
+        ServerResponse::Aborting { .. } | ServerResponse::Error { .. } => Ok(encoded),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureAuxSection {
+    EventRingHighRate,
+    EventRing,
+    PhysicalHostThreads,
+    PhysicalZoneCensus,
+    PhysicalVcpus,
+    ZoneCensus,
+    SchedulerAuxExecutorReceipts,
+    SchedulerAuxRunQueue,
+    SchedulerAuxExecutors,
+    SchedulerAuxScheduler,
+    KernelExecutorReceipts,
+    KernelRunQueue,
+    KernelExecutors,
+    KernelSchedulerAux,
+}
+
+impl CaptureAuxSection {
+    const ALL: [Self; 14] = [
+        Self::EventRingHighRate,
+        Self::EventRing,
+        Self::PhysicalHostThreads,
+        Self::PhysicalZoneCensus,
+        Self::PhysicalVcpus,
+        Self::ZoneCensus,
+        Self::SchedulerAuxExecutorReceipts,
+        Self::SchedulerAuxRunQueue,
+        Self::SchedulerAuxExecutors,
+        Self::SchedulerAuxScheduler,
+        Self::KernelExecutorReceipts,
+        Self::KernelRunQueue,
+        Self::KernelExecutors,
+        Self::KernelSchedulerAux,
+    ];
+}
+
+fn reducible_vec_bytes<T: serde::Serialize>(rows: &[T]) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    encode_canonical(&rows).map_or(0, |bytes| bytes.len().saturating_sub(2))
+}
+
+fn reducible_str_bytes(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    encode_canonical(&text).map_or(0, |bytes| bytes.len().saturating_sub(2))
+}
+
+fn reducible_scheduler_aux_bytes(rows: &[super::dto::DebugSchedulerRow]) -> usize {
+    let mut total = 0_usize;
+    for row in rows {
+        if let Some(residencies) = &row.residencies {
+            total = total.saturating_add(encode_canonical(residencies).map_or(0, |b| b.len()));
+        }
+        if let Some(zone_held) = &row.zone_held {
+            total = total.saturating_add(encode_canonical(zone_held).map_or(0, |b| b.len()));
+        }
+        if let Some(host_wait) = &row.host_wait {
+            total = total.saturating_add(encode_canonical(host_wait).map_or(0, |b| b.len()));
+        }
+    }
+    total
+}
+
+fn capture_section_reducible_bytes(capture: &PostMortem, section: CaptureAuxSection) -> usize {
+    match section {
+        CaptureAuxSection::EventRingHighRate => reducible_vec_bytes(&capture.event_ring_high_rate),
+        CaptureAuxSection::EventRing => reducible_vec_bytes(&capture.event_ring),
+        CaptureAuxSection::PhysicalHostThreads => capture
+            .physical
+            .as_ref()
+            .map_or(0, |p| reducible_vec_bytes(&p.host_threads)),
+        CaptureAuxSection::PhysicalZoneCensus => capture
+            .physical
+            .as_ref()
+            .map_or(0, |p| reducible_str_bytes(&p.zone_census)),
+        CaptureAuxSection::PhysicalVcpus => capture
+            .physical
+            .as_ref()
+            .map_or(0, |p| reducible_vec_bytes(&p.vcpus)),
+        CaptureAuxSection::ZoneCensus => capture
+            .zone_census
+            .as_deref()
+            .map_or(0, reducible_str_bytes),
+        CaptureAuxSection::SchedulerAuxExecutorReceipts => capture
+            .scheduler_aux
+            .as_ref()
+            .map_or(0, |s| reducible_vec_bytes(&s.executor_receipts)),
+        CaptureAuxSection::SchedulerAuxRunQueue => capture
+            .scheduler_aux
+            .as_ref()
+            .map_or(0, |s| reducible_vec_bytes(&s.run_queue)),
+        CaptureAuxSection::SchedulerAuxExecutors => capture
+            .scheduler_aux
+            .as_ref()
+            .map_or(0, |s| reducible_vec_bytes(&s.executors)),
+        CaptureAuxSection::SchedulerAuxScheduler => capture
+            .scheduler_aux
+            .as_ref()
+            .map_or(0, |s| reducible_vec_bytes(&s.scheduler)),
+        CaptureAuxSection::KernelExecutorReceipts => capture
+            .kernel
+            .as_ref()
+            .and_then(|k| k.executor_receipts.as_deref())
+            .map_or(0, reducible_vec_bytes),
+        CaptureAuxSection::KernelRunQueue => capture
+            .kernel
+            .as_ref()
+            .and_then(|k| k.run_queue.as_deref())
+            .map_or(0, reducible_vec_bytes),
+        CaptureAuxSection::KernelExecutors => capture
+            .kernel
+            .as_ref()
+            .and_then(|k| k.executors.as_deref())
+            .map_or(0, reducible_vec_bytes),
+        CaptureAuxSection::KernelSchedulerAux => capture
+            .kernel
+            .as_ref()
+            .and_then(|k| k.scheduler.as_deref())
+            .map_or(0, reducible_scheduler_aux_bytes),
+    }
+}
+
+fn target_section_budget(current_encoded_len: usize, cap: usize, section_bytes: usize) -> usize {
+    let excess = current_encoded_len.saturating_sub(cap);
+    let needed = excess.saturating_add(TRUNCATION_METADATA_MARGIN);
+    if section_bytes > needed {
+        (section_bytes - needed).min(section_bytes / 2)
+    } else {
+        0
+    }
+}
+
+fn proportional_keep_count(len: usize, target_bytes: usize, section_bytes: usize) -> usize {
+    if len <= 1 || target_bytes == 0 || section_bytes == 0 {
+        return 0;
+    }
+    let scaled = (len as u128).saturating_mul(target_bytes as u128) / (section_bytes as u128);
+    usize::try_from(scaled)
+        .unwrap_or(0)
+        .min(len.saturating_sub(1))
+}
+
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut boundary = index;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+fn upsert_truncated(
+    truncated: &mut Vec<super::post_mortem::Truncated>,
+    section: &str,
+    reason: String,
+) {
+    if let Some(existing) = truncated.iter_mut().find(|entry| entry.section == section) {
+        existing.reason = reason;
+    } else {
+        truncated.push(super::post_mortem::Truncated {
+            section: section.to_owned(),
+            reason,
+        });
+    }
+}
+
+fn upsert_prefixed_note(notes: &mut Vec<String>, prefix: &str, note: String) {
+    if let Some(existing) = notes.iter_mut().find(|entry| entry.starts_with(prefix)) {
+        *existing = note;
+    } else {
+        notes.push(note);
+    }
+}
+
+fn truncate_tail_vec<T>(
+    rows: &mut Vec<T>,
+    target_bytes: usize,
+    section_bytes: usize,
+) -> (usize, usize) {
+    let before = rows.len();
+    let keep = proportional_keep_count(before, target_bytes, section_bytes);
+    rows.drain(..before.saturating_sub(keep));
+    (before, rows.len())
+}
+
+fn truncate_prefix_vec<T>(
+    rows: &mut Vec<T>,
+    target_bytes: usize,
+    section_bytes: usize,
+) -> (usize, usize) {
+    let before = rows.len();
+    let keep = proportional_keep_count(before, target_bytes, section_bytes);
+    rows.truncate(keep);
+    (before, rows.len())
+}
+
+fn update_receipt_summary(
+    summary: &mut Option<super::dto::DebugExecutorReceiptSummary>,
+    before: usize,
+    kept: usize,
+    cap: usize,
+) -> usize {
+    let total = summary.as_ref().map_or(before, |s| s.total);
+    *summary = Some(super::dto::DebugExecutorReceiptSummary {
+        total,
+        returned: kept,
+        message: format!(
+            "showing last {kept} of {total} receipts (truncated to fit {cap}-byte response cap)"
+        ),
+    });
+    total
+}
+
+fn bound_capture_response(
+    capture: &mut PostMortem,
+    mut encoded: Vec<u8>,
+    cap: usize,
+) -> Result<Vec<u8>, WireError> {
+    while encoded.len() > cap {
+        let largest = CaptureAuxSection::ALL
+            .into_iter()
+            .map(|section| (section, capture_section_reducible_bytes(capture, section)))
+            .max_by_key(|(_, bytes)| *bytes)
+            .filter(|(_, bytes)| *bytes > 0);
+
+        if let Some((section, section_bytes)) = largest {
+            let target_bytes = target_section_budget(encoded.len(), cap, section_bytes);
+            truncate_capture_aux_section(capture, section, target_bytes, section_bytes, cap);
+            encoded = encode_canonical(capture)?;
+            continue;
+        }
+
+        if let Some(snapshot) = capture.kernel.take() {
+            let reason = format!(
+                "kernel snapshot exceeded {cap}-byte wire response cap; degraded to task summary"
+            );
+            if capture.degraded_kernel.is_none() {
+                capture.degraded_kernel = Some(degrade_oversized_snapshot(&snapshot, cap));
+            } else if let Some(degraded) = &mut capture.degraded_kernel {
+                upsert_prefixed_note(
+                    &mut degraded.unreadable,
+                    "kernel snapshot exceeded",
+                    reason.clone(),
+                );
+            }
+            upsert_truncated(&mut capture.truncated, "kernel", reason);
+            encoded = encode_canonical(capture)?;
+            continue;
+        }
+
+        if let Some(degraded) = &mut capture.degraded_kernel
+            && truncate_degraded_step(degraded, encoded.len(), cap)
+        {
+            upsert_truncated(
+                &mut capture.truncated,
+                "degraded_kernel",
+                format!("degraded_kernel truncated to fit {cap}-byte response cap"),
+            );
+            encoded = encode_canonical(capture)?;
+            continue;
+        }
+
+        let findings_bytes = reducible_vec_bytes(&capture.findings);
+        if findings_bytes > 0 {
+            let target_bytes = target_section_budget(encoded.len(), cap, findings_bytes);
+            let (before, kept) =
+                truncate_prefix_vec(&mut capture.findings, target_bytes, findings_bytes);
+            upsert_truncated(
+                &mut capture.truncated,
+                "findings",
+                format!("retained {kept} of {before} findings to fit {cap}-byte response cap"),
+            );
+            encoded = encode_canonical(capture)?;
+            continue;
+        }
+
+        break;
+    }
+    Ok(encoded)
+}
+
+fn truncate_capture_aux_section(
+    capture: &mut PostMortem,
+    section: CaptureAuxSection,
+    target_bytes: usize,
+    section_bytes: usize,
+    cap: usize,
+) {
+    match section {
+        CaptureAuxSection::EventRingHighRate => {
+            let (before, kept) = truncate_tail_vec(
+                &mut capture.event_ring_high_rate,
+                target_bytes,
+                section_bytes,
+            );
+            upsert_truncated(
+                &mut capture.truncated,
+                "event_ring_high_rate",
+                format!("retained {kept} of {before} records to fit {cap}-byte response cap"),
+            );
+        }
+        CaptureAuxSection::EventRing => {
+            let (before, kept) =
+                truncate_tail_vec(&mut capture.event_ring, target_bytes, section_bytes);
+            upsert_truncated(
+                &mut capture.truncated,
+                "event_ring",
+                format!("retained {kept} of {before} records to fit {cap}-byte response cap"),
+            );
+        }
+        CaptureAuxSection::PhysicalHostThreads => {
+            if let Some(physical) = &mut capture.physical {
+                let (before, kept) =
+                    truncate_prefix_vec(&mut physical.host_threads, target_bytes, section_bytes);
+                let reason = format!(
+                    "host_threads truncated (retained {kept} of {before} entries to fit {cap}-byte response cap)"
+                );
+                upsert_prefixed_note(
+                    &mut physical.unavailable,
+                    "host_threads truncated",
+                    reason.clone(),
+                );
+                upsert_truncated(&mut capture.truncated, "physical.host_threads", reason);
+            }
+        }
+        CaptureAuxSection::PhysicalZoneCensus => {
+            if let Some(physical) = &mut capture.physical {
+                let before = physical.zone_census.len();
+                let keep = floor_char_boundary(
+                    &physical.zone_census,
+                    (target_bytes / 2).min(before.saturating_sub(1)),
+                );
+                physical.zone_census.truncate(keep);
+                let reason = format!(
+                    "zone_census truncated (retained {keep} of {before} bytes to fit {cap}-byte response cap)"
+                );
+                upsert_prefixed_note(
+                    &mut physical.unavailable,
+                    "zone_census truncated",
+                    reason.clone(),
+                );
+                upsert_truncated(&mut capture.truncated, "physical.zone_census", reason);
+            }
+        }
+        CaptureAuxSection::PhysicalVcpus => {
+            if let Some(physical) = &mut capture.physical {
+                let (before, kept) =
+                    truncate_prefix_vec(&mut physical.vcpus, target_bytes, section_bytes);
+                let reason = format!(
+                    "vcpus truncated (retained {kept} of {before} entries to fit {cap}-byte response cap)"
+                );
+                upsert_prefixed_note(&mut physical.unavailable, "vcpus truncated", reason.clone());
+                upsert_truncated(&mut capture.truncated, "physical.vcpus", reason);
+            }
+        }
+        CaptureAuxSection::ZoneCensus => {
+            if let Some(census) = &mut capture.zone_census {
+                let before = census.len();
+                let keep =
+                    floor_char_boundary(census, (target_bytes / 2).min(before.saturating_sub(1)));
+                if keep == 0 {
+                    capture.zone_census = None;
+                } else {
+                    census.truncate(keep);
+                }
+                upsert_truncated(
+                    &mut capture.truncated,
+                    "zone_census",
+                    format!("retained {keep} of {before} bytes to fit {cap}-byte response cap"),
+                );
+            }
+        }
+        CaptureAuxSection::SchedulerAuxExecutorReceipts => {
+            if let Some(aux) = &mut capture.scheduler_aux {
+                let (before, kept) =
+                    truncate_tail_vec(&mut aux.executor_receipts, target_bytes, section_bytes);
+                let total =
+                    update_receipt_summary(&mut aux.executor_receipt_summary, before, kept, cap);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    "executor_receipts",
+                    format!("retained {kept} of {total} rows to fit {cap}-byte response cap"),
+                );
+            }
+        }
+        CaptureAuxSection::SchedulerAuxRunQueue => {
+            if let Some(aux) = &mut capture.scheduler_aux {
+                let (before, kept) =
+                    truncate_prefix_vec(&mut aux.run_queue, target_bytes, section_bytes);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    "run_queue",
+                    format!("retained {kept} of {before} rows to fit {cap}-byte response cap"),
+                );
+            }
+        }
+        CaptureAuxSection::SchedulerAuxExecutors => {
+            if let Some(aux) = &mut capture.scheduler_aux {
+                let (before, kept) =
+                    truncate_prefix_vec(&mut aux.executors, target_bytes, section_bytes);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    "executors",
+                    format!("retained {kept} of {before} rows to fit {cap}-byte response cap"),
+                );
+            }
+        }
+        CaptureAuxSection::SchedulerAuxScheduler => {
+            if let Some(aux) = &mut capture.scheduler_aux {
+                let (before, kept) =
+                    truncate_prefix_vec(&mut aux.scheduler, target_bytes, section_bytes);
+                upsert_truncated(
+                    &mut capture.truncated,
+                    "scheduler",
+                    format!("retained {kept} of {before} rows to fit {cap}-byte response cap"),
+                );
+            }
+        }
+        CaptureAuxSection::KernelExecutorReceipts => {
+            if let Some(kernel) = &mut capture.kernel
+                && let Some(rows) = &mut kernel.executor_receipts
+            {
+                let (before, kept) = truncate_tail_vec(rows, target_bytes, section_bytes);
+                let total =
+                    update_receipt_summary(&mut kernel.executor_receipt_summary, before, kept, cap);
+                let note = format!(
+                    "executor_receipts truncated: retained {kept} of {total} rows to fit {cap}-byte response cap"
+                );
+                upsert_prefixed_note(
+                    &mut kernel.findings,
+                    "executor_receipts truncated:",
+                    note.clone(),
+                );
+                upsert_truncated(&mut capture.truncated, "kernel.executor_receipts", note);
+            }
+        }
+        CaptureAuxSection::KernelRunQueue => {
+            if let Some(kernel) = &mut capture.kernel
+                && let Some(rows) = &mut kernel.run_queue
+            {
+                let (before, kept) = truncate_prefix_vec(rows, target_bytes, section_bytes);
+                let note = format!(
+                    "run_queue truncated: retained {kept} of {before} rows to fit {cap}-byte response cap"
+                );
+                upsert_prefixed_note(&mut kernel.findings, "run_queue truncated:", note.clone());
+                upsert_truncated(&mut capture.truncated, "kernel.run_queue", note);
+            }
+        }
+        CaptureAuxSection::KernelExecutors => {
+            if let Some(kernel) = &mut capture.kernel
+                && let Some(rows) = &mut kernel.executors
+            {
+                let (before, kept) = truncate_prefix_vec(rows, target_bytes, section_bytes);
+                let note = format!(
+                    "executors truncated: retained {kept} of {before} rows to fit {cap}-byte response cap"
+                );
+                upsert_prefixed_note(&mut kernel.findings, "executors truncated:", note.clone());
+                upsert_truncated(&mut capture.truncated, "kernel.executors", note);
+            }
+        }
+        CaptureAuxSection::KernelSchedulerAux => {
+            if let Some(kernel) = &mut capture.kernel
+                && let Some(rows) = &mut kernel.scheduler
+            {
+                for row in rows {
+                    row.residencies = None;
+                    row.zone_held = None;
+                    row.host_wait = None;
+                }
+                let note =
+                    format!("scheduler auxiliary censuses omitted to fit {cap}-byte response cap");
+                upsert_prefixed_note(
+                    &mut kernel.findings,
+                    "scheduler auxiliary censuses omitted",
+                    note.clone(),
+                );
+                upsert_truncated(&mut capture.truncated, "kernel.scheduler", note);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotAuxSection {
+    ExecutorReceipts,
+    RunQueue,
+    Executors,
+    SchedulerAux,
+}
+
+impl SnapshotAuxSection {
+    const ALL: [Self; 4] = [
+        Self::ExecutorReceipts,
+        Self::RunQueue,
+        Self::Executors,
+        Self::SchedulerAux,
+    ];
+}
+
+fn snapshot_section_reducible_bytes(
+    snapshot: &KernelDebugSnapshot,
+    section: SnapshotAuxSection,
+) -> usize {
+    match section {
+        SnapshotAuxSection::ExecutorReceipts => snapshot
+            .executor_receipts
+            .as_deref()
+            .map_or(0, reducible_vec_bytes),
+        SnapshotAuxSection::RunQueue => {
+            snapshot.run_queue.as_deref().map_or(0, reducible_vec_bytes)
+        }
+        SnapshotAuxSection::Executors => {
+            snapshot.executors.as_deref().map_or(0, reducible_vec_bytes)
+        }
+        SnapshotAuxSection::SchedulerAux => snapshot
+            .scheduler
+            .as_deref()
+            .map_or(0, reducible_scheduler_aux_bytes),
+    }
+}
+
+fn bound_snapshot_response(
+    response: &mut ServerResponse,
+    mut encoded: Vec<u8>,
+    cap: usize,
+) -> Result<Vec<u8>, WireError> {
+    while encoded.len() > cap {
+        let ServerResponse::Snapshot(snapshot) = response else {
+            break;
+        };
+        let largest = SnapshotAuxSection::ALL
+            .into_iter()
+            .map(|section| (section, snapshot_section_reducible_bytes(snapshot, section)))
+            .max_by_key(|(_, bytes)| *bytes)
+            .filter(|(_, bytes)| *bytes > 0);
+
+        if let Some((section, section_bytes)) = largest {
+            let target_bytes = target_section_budget(encoded.len(), cap, section_bytes);
+            match section {
+                SnapshotAuxSection::ExecutorReceipts => {
+                    if let Some(rows) = &mut snapshot.executor_receipts {
+                        let (before, kept) = truncate_tail_vec(rows, target_bytes, section_bytes);
+                        let total = update_receipt_summary(
+                            &mut snapshot.executor_receipt_summary,
+                            before,
+                            kept,
+                            cap,
+                        );
+                        upsert_prefixed_note(
+                            &mut snapshot.findings,
+                            "executor_receipts truncated:",
+                            format!(
+                                "executor_receipts truncated: retained {kept} of {total} rows to fit {cap}-byte response cap"
+                            ),
+                        );
+                    }
+                }
+                SnapshotAuxSection::RunQueue => {
+                    if let Some(rows) = &mut snapshot.run_queue {
+                        let (before, kept) = truncate_prefix_vec(rows, target_bytes, section_bytes);
+                        upsert_prefixed_note(
+                            &mut snapshot.findings,
+                            "run_queue truncated:",
+                            format!(
+                                "run_queue truncated: retained {kept} of {before} rows to fit {cap}-byte response cap"
+                            ),
+                        );
+                    }
+                }
+                SnapshotAuxSection::Executors => {
+                    if let Some(rows) = &mut snapshot.executors {
+                        let (before, kept) = truncate_prefix_vec(rows, target_bytes, section_bytes);
+                        upsert_prefixed_note(
+                            &mut snapshot.findings,
+                            "executors truncated:",
+                            format!(
+                                "executors truncated: retained {kept} of {before} rows to fit {cap}-byte response cap"
+                            ),
+                        );
+                    }
+                }
+                SnapshotAuxSection::SchedulerAux => {
+                    if let Some(rows) = &mut snapshot.scheduler {
+                        for row in rows {
+                            row.residencies = None;
+                            row.zone_held = None;
+                            row.host_wait = None;
+                        }
+                        upsert_prefixed_note(
+                            &mut snapshot.findings,
+                            "scheduler auxiliary censuses omitted",
+                            format!(
+                                "scheduler auxiliary censuses omitted to fit {cap}-byte response cap"
+                            ),
+                        );
+                    }
+                }
+            }
+            encoded = encode_canonical(&**snapshot)?;
+            continue;
+        }
+
+        // Core coherent tables alone exceed the wire response cap; degrade to
+        // the per-task summary view rather than failing with FrameTooLarge or
+        // emitting a partial snapshot that violates referential joins.
+        let mut degraded = Box::new(degrade_oversized_snapshot(snapshot, cap));
+        let degraded_encoded = encode_canonical(&*degraded)?;
+        let bounded = bound_degraded_response(&mut degraded, degraded_encoded, cap)?;
+        *response = ServerResponse::Degraded(degraded);
+        return Ok(bounded);
+    }
+    Ok(encoded)
+}
+
+fn degrade_oversized_snapshot(snapshot: &KernelDebugSnapshot, cap: usize) -> KernelDebugDegraded {
+    let reason = format!(
+        "coherent kernel snapshot exceeded {cap}-byte wire response cap; degraded to task summary"
+    );
+    let tasks = snapshot
+        .tasks
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|task| {
+            let threads = snapshot.threads.as_ref().map(|all_threads| {
+                all_threads
+                    .iter()
+                    .filter(|thread| thread.task == task.key)
+                    .map(|thread| super::dto::DegradedThreadDto {
+                        key: thread.key,
+                        execution: Some(thread.execution.clone()),
+                    })
+                    .collect()
+            });
+            super::dto::DegradedTaskDto {
+                key: task.key,
+                diagnostic_name: task.diagnostic_name.clone().unwrap_or_default(),
+                lifecycle: Some(task.lifecycle.clone()),
+                mm: task.mm,
+                threads,
+            }
+        })
+        .collect();
+    KernelDebugDegraded {
+        schema: super::dto::KERNEL_DEBUG_DEGRADED_SCHEMA.to_owned(),
+        strict_error: reason.clone(),
+        tasks,
+        mm_coordinators: Vec::new(),
+        unreadable: vec![reason],
+    }
+}
+
+fn truncate_degraded_step(
+    degraded: &mut KernelDebugDegraded,
+    current_encoded_len: usize,
+    cap: usize,
+) -> bool {
+    let tasks_bytes = reducible_vec_bytes(&degraded.tasks);
+    let mm_bytes = reducible_vec_bytes(&degraded.mm_coordinators);
+    if tasks_bytes == 0 && mm_bytes == 0 {
+        return false;
+    }
+    if tasks_bytes >= mm_bytes {
+        let target_bytes = target_section_budget(current_encoded_len, cap, tasks_bytes);
+        let (before, kept) = truncate_prefix_vec(&mut degraded.tasks, target_bytes, tasks_bytes);
+        upsert_prefixed_note(
+            &mut degraded.unreadable,
+            "tasks truncated",
+            format!(
+                "tasks truncated (retained {kept} of {before} rows to fit {cap}-byte response cap)"
+            ),
+        );
+    } else {
+        let target_bytes = target_section_budget(current_encoded_len, cap, mm_bytes);
+        let (before, kept) =
+            truncate_prefix_vec(&mut degraded.mm_coordinators, target_bytes, mm_bytes);
+        upsert_prefixed_note(
+            &mut degraded.unreadable,
+            "mm_coordinators truncated",
+            format!(
+                "mm_coordinators truncated (retained {kept} of {before} rows to fit {cap}-byte response cap)"
+            ),
+        );
+    }
+    true
+}
+
+fn bound_degraded_response(
+    degraded: &mut KernelDebugDegraded,
+    mut encoded: Vec<u8>,
+    cap: usize,
+) -> Result<Vec<u8>, WireError> {
+    while encoded.len() > cap {
+        if !truncate_degraded_step(degraded, encoded.len(), cap) {
+            break;
+        }
+        encoded = encode_canonical(degraded)?;
+    }
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -652,5 +1384,331 @@ mod tests {
                 .any(|task| task.diagnostic_name.as_deref() == Some("invariant-root"))),
             "the graph itself must remain usable alongside the finding"
         );
+    }
+
+    struct OversizedPhysicalCaptureProvider;
+
+    impl PhysicalCaptureProvider for OversizedPhysicalCaptureProvider {
+        fn capture(&self) -> super::super::post_mortem::PhysicalCapture {
+            // 18 MiB across 36 host thread stack entries (> MAX_RESPONSE_BYTES = 16 MiB),
+            // while vcpus and zone_census stay small and should be preserved when
+            // the largest section (host_threads) is truncated.
+            let chunk = "k".repeat(512 * 1024);
+            super::super::post_mortem::PhysicalCapture {
+                zone_census: "cpl0-zone: cpu0=idle cpu1=parked".to_owned(),
+                vcpus: vec![
+                    "vcpu0 rip=0xffffffff81000000".to_owned(),
+                    "vcpu1 rip=0xffffffff81000010".to_owned(),
+                ],
+                host_threads: (0..36)
+                    .map(|index| format!("tid={index} stack={chunk}"))
+                    .collect(),
+                unavailable: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_live_capture_truncates_largest_auxiliary_payload_instead_of_failing_frame_too_large()
+     {
+        let (_temp, endpoint) =
+            super::super::endpoint::tests::scoped_endpoint("debug-oversized-capture");
+        let bootstrap = RootBootstrap::with_mm_backend(
+            4400,
+            carrick_hal::ThreadId::synthetic_for_tests(4400),
+            Arc::new(DanglingMappingBackend),
+            "oversized-capture-root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
+        .expect("bootstrap");
+        let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
+        let physical: Arc<dyn PhysicalCaptureProvider> = Arc::new(OversizedPhysicalCaptureProvider);
+        let mut server = KernelDebugServer::start_at(kernel, endpoint.clone(), Some(physical))
+            .expect("debug server");
+
+        let capture = super::super::client::capture_at_with_wait(
+            &endpoint,
+            "debug-oversized-capture",
+            super::super::client::ResponseWait::Completion,
+        )
+        .expect("oversized capture must degrade cleanly instead of failing FrameTooLarge");
+
+        let encoded = encode_canonical(&capture).expect("re-encode capture");
+        assert!(
+            encoded.len() <= MAX_RESPONSE_BYTES,
+            "encoded capture {} exceeds MAX_RESPONSE_BYTES {}",
+            encoded.len(),
+            MAX_RESPONSE_BYTES
+        );
+        assert!(
+            capture
+                .truncated
+                .iter()
+                .any(|entry| entry.section == "physical.host_threads"),
+            "truncation must be recorded in post_mortem.truncated: {:?}",
+            capture.truncated
+        );
+        let physical = capture.physical.expect("physical capture retained");
+        assert!(
+            physical.host_threads.len() < 36,
+            "largest payload (host_threads) must be truncated"
+        );
+        assert!(
+            physical
+                .unavailable
+                .iter()
+                .any(|reason| reason.contains("host_threads")),
+            "truncation must be recorded in physical.unavailable: {:?}",
+            physical.unavailable
+        );
+        // Smaller sibling sections must survive intact.
+        assert_eq!(physical.vcpus.len(), 2);
+        assert_eq!(physical.zone_census, "cpl0-zone: cpu0=idle cpu1=parked");
+        assert!(
+            capture.kernel.is_some(),
+            "kernel snapshot must survive when truncating physical.host_threads fits the cap"
+        );
+
+        server.shutdown();
+    }
+
+    struct OversizedReceiptAuxProvider;
+
+    impl super::super::dto::KernelDebugAuxProvider for OversizedReceiptAuxProvider {
+        fn scheduler_rows(&self) -> Vec<super::super::dto::DebugSchedulerRow> {
+            vec![super::super::dto::DebugSchedulerRow {
+                host_wait: None,
+                lifecycle: "open".to_owned(),
+                queued_len: 0,
+                claimed: 0,
+                waiters: Some(0),
+                run_queue_locked: false,
+                control_epoch: 1,
+                need_resched: false,
+                snapshot_count: 1,
+                residencies: None,
+                host_queued: Some(0),
+                zone_held: None,
+            }]
+        }
+
+        fn run_queue_rows(&self) -> Vec<super::super::dto::DebugRunQueueRow> {
+            Vec::new()
+        }
+
+        fn executor_rows(&self) -> Vec<super::super::dto::DebugExecutorRow> {
+            Vec::new()
+        }
+
+        fn executor_receipt_rows(
+            &self,
+        ) -> (
+            Vec<super::super::dto::DebugExecutorReceiptRow>,
+            Option<super::super::dto::DebugExecutorReceiptSummary>,
+        ) {
+            let reason = "r".repeat(64 * 1024);
+            let total = 300;
+            let rows = (0..total)
+                .map(|seq| super::super::dto::DebugExecutorReceiptRow {
+                    sequence: (seq + 1) as u64,
+                    executor: 1,
+                    event: "Dispatched".to_owned(),
+                    thread: None,
+                    generation: Some(1),
+                    observed_state: Some("runnable".to_owned()),
+                    reason: Some(reason.clone()),
+                })
+                .collect();
+            (
+                rows,
+                Some(super::super::dto::DebugExecutorReceiptSummary {
+                    total,
+                    returned: total,
+                    message: format!("showing last {total} of {total} receipts"),
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn oversized_snapshot_truncates_auxiliary_receipts_and_remains_valid() {
+        let (_temp, endpoint) =
+            super::super::endpoint::tests::scoped_endpoint("debug-oversized-snapshot");
+        let bootstrap = RootBootstrap::with_mm_backend(
+            4401,
+            carrick_hal::ThreadId::synthetic_for_tests(4401),
+            Arc::new(DanglingMappingBackend),
+            "oversized-snapshot-root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
+        .expect("bootstrap");
+        let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
+        let aux: Arc<dyn super::super::dto::KernelDebugAuxProvider> =
+            Arc::new(OversizedReceiptAuxProvider);
+        kernel
+            .register_debug_aux_provider(&aux)
+            .expect("register aux provider");
+        let mut server =
+            KernelDebugServer::start_at(kernel, endpoint.clone(), None).expect("debug server");
+
+        let snapshot = super::super::client::fetch_at_with_wait(
+            &endpoint,
+            None,
+            super::super::client::ResponseWait::Completion,
+        )
+        .expect("oversized snapshot must truncate auxiliary receipts and remain valid");
+
+        let encoded = encode_canonical(&snapshot).expect("re-encode snapshot");
+        assert!(
+            encoded.len() <= MAX_RESPONSE_BYTES,
+            "encoded snapshot {} exceeds MAX_RESPONSE_BYTES {}",
+            encoded.len(),
+            MAX_RESPONSE_BYTES
+        );
+        let receipts = snapshot
+            .executor_receipts
+            .as_ref()
+            .expect("receipts table present");
+        assert!(receipts.len() < 300, "receipts must be truncated");
+        assert_eq!(
+            receipts.last().map(|row| row.sequence),
+            Some(300),
+            "newest receipts must be retained"
+        );
+        let summary = snapshot
+            .executor_receipt_summary
+            .as_ref()
+            .expect("summary present");
+        assert_eq!(summary.total, 300);
+        assert_eq!(summary.returned, receipts.len());
+        assert!(
+            snapshot
+                .findings
+                .iter()
+                .any(|finding| finding.contains("executor_receipts")),
+            "findings must record the truncation: {:?}",
+            snapshot.findings
+        );
+
+        server.shutdown();
+    }
+
+    #[derive(Debug)]
+    struct OversizedVmaBackend;
+
+    impl MmBackend for OversizedVmaBackend {
+        fn snapshot(&self, _deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
+            let root =
+                crate::kernel::Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(0x1000))
+                    .expect("aligned stage-1 root");
+            let asid = Asid::from_registry_allocation(
+                std::num::NonZeroU16::new(1).expect("nonzero test ASID"),
+            );
+            let vmas = (0..420_000_u64)
+                .map(|index| {
+                    let start = 0x1000_0000 + index * 0x2000;
+                    crate::kernel::VmaSummary {
+                        start: carrick_guest_mem::GuestVa::new(start),
+                        end: carrick_guest_mem::GuestVa::new(start + 0x1000),
+                        access: crate::kernel::VmaAccess {
+                            readable: true,
+                            writable: true,
+                            executable: false,
+                            kernel_visible: true,
+                        },
+                    }
+                })
+                .collect();
+            Ok(MmBackendSnapshot {
+                revision: 1,
+                binding: crate::kernel::MmBinding {
+                    asid,
+                    stage1_root: root,
+                    ttbr0: crate::kernel::Ttbr0::for_aarch64(asid, root),
+                },
+                vmas,
+                vma_revision: None,
+                mapping_ids: Vec::new(),
+                frame_inventory_revision: None,
+            })
+        }
+
+        fn revision(&self) -> u64 {
+            1
+        }
+    }
+
+    #[test]
+    fn oversized_core_snapshot_degrades_with_metadata_instead_of_failing_frame_too_large() {
+        let (_temp, endpoint) =
+            super::super::endpoint::tests::scoped_endpoint("debug-oversized-core");
+        let bootstrap = RootBootstrap::with_mm_backend(
+            4402,
+            carrick_hal::ThreadId::synthetic_for_tests(4402),
+            Arc::new(OversizedVmaBackend),
+            "oversized-vma-root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
+        .expect("bootstrap");
+        let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
+        let mut server =
+            KernelDebugServer::start_at(kernel, endpoint.clone(), None).expect("debug server");
+
+        let degraded = match super::super::client::fetch_at_with_wait(
+            &endpoint,
+            None,
+            super::super::client::ResponseWait::Completion,
+        ) {
+            Err(super::super::client::ClientError::Degraded(degraded)) => *degraded,
+            other => {
+                panic!("expected degraded snapshot when core tables exceed cap, got {other:?}")
+            }
+        };
+        let encoded = encode_canonical(&degraded).expect("re-encode degraded");
+        assert!(encoded.len() <= MAX_RESPONSE_BYTES);
+        assert!(
+            degraded.strict_error.contains("response cap"),
+            "strict_error: {}",
+            degraded.strict_error
+        );
+        assert!(
+            degraded
+                .unreadable
+                .iter()
+                .any(|entry| entry.contains("response cap")),
+            "unreadable: {:?}",
+            degraded.unreadable
+        );
+        assert!(
+            degraded
+                .tasks
+                .iter()
+                .any(|task| task.diagnostic_name == "oversized-vma-root"),
+            "tasks: {:?}",
+            degraded.tasks
+        );
+
+        let capture = super::super::client::capture_at_with_wait(
+            &endpoint,
+            "debug-oversized-core",
+            super::super::client::ResponseWait::Completion,
+        )
+        .expect("capture with oversized core snapshot must degrade kernel section cleanly");
+        assert!(capture.kernel.is_none());
+        assert!(
+            capture
+                .truncated
+                .iter()
+                .any(|entry| entry.section == "kernel"),
+            "truncated: {:?}",
+            capture.truncated
+        );
+        assert!(capture.degraded_kernel.as_ref().is_some_and(|view| {
+            view.tasks
+                .iter()
+                .any(|t| t.diagnostic_name == "oversized-vma-root")
+        }));
+
+        server.shutdown();
     }
 }
