@@ -5329,6 +5329,153 @@ fn final_pipe_description_close_disarms_fasync_registration() {
     rig.close(write_fd);
 }
 
+/// Real-time signal used by the `si_fd` tests so `take_lowest_in` isolates the
+/// FASYNC delivery from any other pending process signal.
+const FASYNC_FD_TEST_SIGNAL: i32 = 34;
+
+impl SpliceTestRig {
+    const SYS_DUP: u64 = 23;
+    const SYS_GETPID: u64 = 172;
+
+    fn dup(&mut self, fd: u64) -> u64 {
+        match self.run(Self::SYS_DUP, [fd, 0, 0, 0, 0, 0]) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("dup {fd} failed: {other:?}"),
+        }
+    }
+
+    fn fcntl_ok(&mut self, fd: u64, cmd: u64, arg: u64) {
+        assert_eq!(
+            self.run(Self::SYS_FCNTL, [fd, cmd, arg, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+            "fcntl({fd}, {cmd}, {arg})"
+        );
+    }
+
+    fn write_byte(&mut self, fd: u64) {
+        self.memory.write_bytes(0x4300, b"x").unwrap();
+        assert_eq!(
+            self.run(Self::SYS_WRITE, [fd, 0x4300, 1, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 1 }
+        );
+    }
+
+    /// Own the pipe's FASYNC registration from this process, signalling
+    /// [`FASYNC_FD_TEST_SIGNAL`]; `owner_fd` is the descriptor number
+    /// `F_SETFL(O_ASYNC)` runs through (the number Linux records as `fa_fd`).
+    fn arm_fasync_via(&mut self, owner_fd: u64) {
+        let pid = match self.run(Self::SYS_GETPID, [0; 6]) {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("getpid failed: {other:?}"),
+        };
+        self.fcntl_ok(owner_fd, LINUX_F_SETSIG, FASYNC_FD_TEST_SIGNAL as u64);
+        self.fcntl_ok(owner_fd, LINUX_F_SETOWN, pid);
+        self.fcntl_ok(owner_fd, LINUX_F_SETFL, LINUX_O_ASYNC);
+    }
+
+    fn take_fasync_si_fd(&self) -> i32 {
+        let context = self.dispatcher.capture_one_task_context().unwrap();
+        take_process_sigpoll_fd(&context, FASYNC_FD_TEST_SIGNAL)
+    }
+
+    fn assert_no_fasync_signal_pending(&self) {
+        let context = self.dispatcher.capture_one_task_context().unwrap();
+        assert!(
+            context
+                .shared()
+                .pending_signals()
+                .take_lowest_in(carrick_abi::SigSet::EMPTY.with(FASYNC_FD_TEST_SIGNAL))
+                .is_none(),
+            "no FASYNC signal should be pending",
+        );
+    }
+}
+
+/// Linux `fasync_helper` records `fa_fd` when `O_ASYNC` is enabled and
+/// `kill_fasync` delivers that value in `si_fd`; the writer's descriptor
+/// number — including a `dup` of the writer end — never appears.
+#[test]
+fn fasync_si_fd_is_the_registered_fd_not_the_writers_fd() {
+    carrick_signal_linux::fasync::fasync_init();
+    let mut rig = SpliceTestRig::new(0x10000);
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+    let write_alias = rig.dup(write_fd);
+    // Make the three descriptor numbers distinct from each other and from any
+    // low-numbered stdio coincidence.
+    assert_ne!(read_fd, write_fd);
+    assert_ne!(write_fd, write_alias);
+    assert_ne!(read_fd, write_alias);
+    rig.arm_fasync_via(read_fd);
+
+    rig.write_byte(write_fd);
+    assert_eq!(rig.take_fasync_si_fd(), read_fd as i32);
+    rig.write_byte(write_alias);
+    assert_eq!(
+        rig.take_fasync_si_fd(),
+        read_fd as i32,
+        "a write through a dup'd writer number reports the registered fd",
+    );
+    rig.assert_no_fasync_signal_pending();
+
+    rig.close(write_alias);
+    rig.close(write_fd);
+    rig.close(read_fd);
+}
+
+/// `kill_fasync` reads the recorded `fa_fd`, not the live fd table: the number
+/// stays in `si_fd` after the registering descriptor is closed while another
+/// description reference (a `dup`) keeps the registration alive.
+#[test]
+fn fasync_si_fd_survives_close_of_the_registering_fd_number() {
+    carrick_signal_linux::fasync::fasync_init();
+    let mut rig = SpliceTestRig::new(0x10000);
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+    let read_alias = rig.dup(read_fd);
+    rig.arm_fasync_via(read_fd);
+    rig.close(read_fd);
+
+    rig.write_byte(write_fd);
+    assert_eq!(
+        rig.take_fasync_si_fd(),
+        read_fd as i32,
+        "the recorded fa_fd is stale-but-reported after its number is closed",
+    );
+
+    rig.close(read_alias);
+    rig.close(write_fd);
+}
+
+/// Linux records `fa_fd` only on the `FASYNC` 0 -> 1 transition. `F_SETOWN` /
+/// `F_SETSIG` through another descriptor number must not move it; clearing and
+/// re-enabling `O_ASYNC` through that number records the new one.
+#[test]
+fn fasync_si_fd_changes_only_when_o_async_is_re_enabled() {
+    carrick_signal_linux::fasync::fasync_init();
+    let mut rig = SpliceTestRig::new(0x10000);
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+    let read_alias = rig.dup(read_fd);
+    rig.arm_fasync_via(read_fd);
+
+    // Re-targeting through the alias does not re-register.
+    rig.fcntl_ok(read_alias, LINUX_F_SETSIG, FASYNC_FD_TEST_SIGNAL as u64);
+    rig.fcntl_ok(read_alias, LINUX_F_SETFL, LINUX_O_ASYNC);
+    rig.write_byte(write_fd);
+    assert_eq!(rig.take_fasync_si_fd(), read_fd as i32);
+
+    // Clearing O_ASYNC disarms; setting it again through the alias records
+    // the alias number.
+    rig.fcntl_ok(read_alias, LINUX_F_SETFL, 0);
+    rig.write_byte(write_fd);
+    rig.assert_no_fasync_signal_pending();
+    rig.fcntl_ok(read_alias, LINUX_F_SETFL, LINUX_O_ASYNC);
+    rig.write_byte(write_fd);
+    assert_eq!(rig.take_fasync_si_fd(), read_alias as i32);
+
+    rig.close(read_alias);
+    rig.close(read_fd);
+    rig.close(write_fd);
+}
+
 /// Splicing FROM readable synthetic character devices into a pipe write end:
 /// - /dev/zero and /dev/full yield requested zero bytes (LTP splice08).
 /// - /dev/null yields EOF (returns 0).

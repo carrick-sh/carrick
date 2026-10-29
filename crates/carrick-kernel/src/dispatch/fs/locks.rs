@@ -1346,10 +1346,19 @@ impl<'a> FsView<'a> {
         let owner = common.captured_owner();
         let (owner_type, owner_pid) = (owner.visible.owner_type, owner.visible.owner_pid);
         let sig = common.async_sig();
+        // `F_SETOWN`/`F_SETSIG` refresh must not move `fa_fd`. A description that
+        // is armed without a recorded transition (status flags it was created
+        // with) records the number it is first synchronised through.
+        let fa_fd = common.async_fd().unwrap_or_else(|| {
+            let fa_fd = carrick_signal_linux::fasync::FasyncFd::new(fd);
+            common.record_async_fd(fa_fd);
+            fa_fd
+        });
         carrick_signal_linux::fasync::arm(
             pipe_id,
             carrick_signal_linux::fasync::FasyncOwner {
                 registration_id: open_file.description.id().raw(),
+                fa_fd,
                 owner_pid,
                 owner_type,
                 sig,
@@ -1391,11 +1400,12 @@ impl<'a> FsView<'a> {
     /// This is the readiness EDGE the writer can observe: a write that
     /// added bytes transitions the reader's fd to readable, which is exactly when
     /// Linux raises the owner's I/O signal. (`written <= 0` — a short/blocked
-    /// write that added nothing — is not an edge and delivers nothing.)
+    /// write that added nothing — is not an edge and delivers nothing.) The
+    /// signal's `si_fd` is the registration's recorded `fa_fd`, never the
+    /// writer's own descriptor number.
     pub(in crate::dispatch) fn fasync_notify_after_write(
         &self,
         context: &crate::kernel::KernelContext,
-        fd: i32,
         open_file: &OpenFile,
         written: i64,
     ) {
@@ -1410,16 +1420,16 @@ impl<'a> FsView<'a> {
         let Some(pipe_id) = self.fasync_pipe_id_for_open_file(open_file) else {
             return;
         };
-        fasync_notify_pipe_write(context.kernel(), pipe_id, fd, written as usize);
+        fasync_notify_pipe_write(context.kernel(), pipe_id, written as usize);
     }
 }
 
 /// Publish a pipe readiness edge from retained operation identity. This never
-/// resolves a numeric guest fd after the operation has been prepared or parked.
+/// resolves a numeric guest fd after the operation has been prepared or parked:
+/// `si_fd` comes from the registration's recorded `fa_fd`.
 pub(in crate::dispatch) fn fasync_notify_pipe_write(
     kernel: &Arc<crate::kernel::Kernel>,
     pipe_id: u64,
-    fd: i32,
     written: usize,
 ) {
     if written == 0 || !carrick_signal_linux::fasync::any_armed() {
@@ -1429,6 +1439,7 @@ pub(in crate::dispatch) fn fasync_notify_pipe_write(
         return;
     };
     let sig = owner.sig;
+    let fa_fd = owner.fa_fd.get();
     let owner = crate::kernel::objects::CapturedAsyncIoOwner {
         visible: crate::kernel::objects::AsyncIoOwner {
             owner_pid: owner.owner_pid,
@@ -1449,7 +1460,7 @@ pub(in crate::dispatch) fn fasync_notify_pipe_write(
     let Ok(signal) = crate::kernel::LinuxSignal::for_signal_number(signum) else {
         return;
     };
-    let info = carrick_abi::LinuxSiginfo::sigpoll(signum, carrick_abi::LINUX_POLL_MSG, 0, fd);
+    let info = carrick_abi::LinuxSiginfo::sigpoll(signum, carrick_abi::LINUX_POLL_MSG, 0, fa_fd);
     let _ = owner.post_kernel_signal(kernel, signal, Some(info));
 }
 
@@ -1857,7 +1868,17 @@ impl<'a> FsView<'a> {
                         }
                         _ => {}
                     }
-                    open_file.description.common().set_status_flags(next_flags);
+                    let common = open_file.description.common();
+                    // Linux `setfl` calls `fasync_helper` only when FASYNC
+                    // changes, and `fasync_helper` records `fa_fd` then: the
+                    // number this fcntl ran through, kept until FASYNC clears.
+                    let was_async = common.status_flags() & LINUX_O_ASYNC != 0;
+                    if next_flags & LINUX_O_ASYNC == 0 {
+                        common.clear_async_fd();
+                    } else if !was_async {
+                        common.record_async_fd(carrick_signal_linux::fasync::FasyncFd::new(fd.0));
+                    }
+                    common.set_status_flags(next_flags);
                     drop(open);
                     // Reflect the new O_ASYNC state into the fork-coherent FASYNC
                     // registry so a WRITER in another guest process can deliver the

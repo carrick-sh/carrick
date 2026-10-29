@@ -1,6 +1,6 @@
 //! Host allocation and invariant reporting for the neutral fasync table.
-pub use carrick_signal_core::fasync::FasyncOwner;
 use carrick_signal_core::fasync::{self, FasyncTable};
+pub use carrick_signal_core::fasync::{FasyncFd, FasyncOwner};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 #[cfg(test)]

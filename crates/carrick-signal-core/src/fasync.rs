@@ -33,6 +33,9 @@ struct FasyncSlot {
     /// Exact Carrick open-file-description generation that owns this arm.
     /// Closing a different description for the same pipe must not disarm it.
     registration_id: AtomicU64,
+    /// Descriptor number recorded when the registration was created (Linux
+    /// `fasync_struct.fa_fd`); published verbatim in readiness notifications.
+    fa_fd: AtomicU32,
     /// Guest-visible `F_SETOWN`/`F_SETOWN_EX` value, retained for GETOWN.
     owner_pid: AtomicU32,
     /// Opaque caller-defined owner kind.
@@ -76,6 +79,7 @@ impl FasyncTable {
                     sequence: AtomicU64::new(0),
                     pipe_id: AtomicU64::new(0),
                     registration_id: AtomicU64::new(0),
+                    fa_fd: AtomicU32::new(0),
                     owner_pid: AtomicU32::new(0),
                     owner_type: AtomicU32::new(0),
                     sig: AtomicU32::new(0),
@@ -90,11 +94,32 @@ impl FasyncTable {
     }
 }
 
+/// Descriptor number captured when a registration was created or re-enabled
+/// (Linux `fasync_struct.fa_fd`). It is an opaque label: nothing here resolves
+/// it against a live descriptor table, so it stays reportable after that
+/// number is closed or reused, exactly like Linux's recorded `fa_fd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FasyncFd(i32);
+
+impl FasyncFd {
+    /// Capture `fd` as the registration's recorded descriptor number.
+    pub const fn new(fd: i32) -> Self {
+        Self(fd)
+    }
+
+    /// The recorded descriptor number, as delivered in `si_fd`.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
 /// An armed FASYNC registration, returned by [`lookup`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FasyncOwner {
     /// Exact Carrick open-file-description id that owns the registration.
     pub registration_id: u64,
+    /// Descriptor number recorded when the registration was enabled.
+    pub fa_fd: FasyncFd,
     /// `F_SETOWN` target pid (or pgrp id for `F_OWNER_PGRP`).
     pub owner_pid: i32,
     /// Opaque caller-defined owner kind.
@@ -224,6 +249,8 @@ fn publish_slot(slot: &FasyncSlot, pipe_id: u64, owner: FasyncOwner, fatal: Inva
     slot.pipe_id.store(pipe_id, Ordering::Relaxed);
     slot.registration_id
         .store(owner.registration_id, Ordering::Relaxed);
+    slot.fa_fd
+        .store(owner.fa_fd.get() as u32, Ordering::Relaxed);
     slot.owner_pid
         .store(owner.owner_pid as u32, Ordering::Relaxed);
     slot.owner_type
@@ -307,6 +334,7 @@ pub fn lookup(t: &FasyncTable, pipe_id: u64) -> Option<FasyncOwner> {
         }
         let owner = FasyncOwner {
             registration_id: slot.registration_id.load(Ordering::Relaxed),
+            fa_fd: FasyncFd::new(slot.fa_fd.load(Ordering::Relaxed) as i32),
             owner_pid: slot.owner_pid.load(Ordering::Relaxed) as i32,
             owner_type: slot.owner_type.load(Ordering::Relaxed) as i32,
             sig: slot.sig.load(Ordering::Relaxed) as i32,
@@ -393,6 +421,7 @@ mod tests {
             42,
             FasyncOwner {
                 registration_id: 41,
+                fa_fd: FasyncFd::new(9),
                 owner_pid: 1234,
                 owner_type: 1,
                 sig: 10,
@@ -407,6 +436,7 @@ mod tests {
             lookup(42),
             Some(FasyncOwner {
                 registration_id: 41,
+                fa_fd: FasyncFd::new(9),
                 owner_pid: 1234,
                 owner_type: 1,
                 sig: 10,
@@ -430,6 +460,7 @@ mod tests {
             1,
             FasyncOwner {
                 registration_id: 51,
+                fa_fd: FasyncFd::new(5),
                 owner_pid: 100,
                 owner_type: 1,
                 sig: 0,
@@ -445,6 +476,7 @@ mod tests {
             1,
             FasyncOwner {
                 registration_id: 52,
+                fa_fd: FasyncFd::new(6),
                 owner_pid: 200,
                 owner_type: 2,
                 sig: 12,
@@ -459,6 +491,7 @@ mod tests {
             lookup(1),
             Some(FasyncOwner {
                 registration_id: 52,
+                fa_fd: FasyncFd::new(6),
                 owner_pid: 200,
                 owner_type: 2,
                 sig: 12,
@@ -491,6 +524,7 @@ mod tests {
         reset();
         let first = FasyncOwner {
             registration_id: 61,
+            fa_fd: FasyncFd::new(8),
             owner_pid: 101,
             owner_type: 1,
             sig: 10,
@@ -502,6 +536,7 @@ mod tests {
         };
         let second = FasyncOwner {
             registration_id: 62,
+            fa_fd: FasyncFd::new(9),
             owner_pid: 102,
             owner_type: 2,
             sig: 12,
@@ -562,6 +597,7 @@ mod tests {
             6,
             FasyncOwner {
                 registration_id: 66,
+                fa_fd: FasyncFd::new(6),
                 owner_pid: 9,
                 owner_type: 1,
                 sig: 29,
