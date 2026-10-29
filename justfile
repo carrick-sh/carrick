@@ -132,13 +132,14 @@ build-cache:
     @if [ -n "$CARRICK_SCCACHE_RESOLVED" ]; then "$CARRICK_SCCACHE_RESOLVED" --show-stats; fi
 
 # Run the Carrick xtask maintenance tool.
+[positional-arguments]
 xtask *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ {{quote(ARGS)}} =~ ^impact($|\ ) ]]; then
-        exec {{_admit}} {{_cargo}} run --locked -p carrick-xtask --features impact -- {{ARGS}}
+    if [[ "${1:-}" == impact ]]; then
+        exec {{_admit}} {{_cargo}} run --locked -p carrick-xtask --features impact -- "$@"
     fi
-    exec {{_admit}} {{_xtask}} {{ARGS}}
+    exec {{_admit}} {{_xtask}} "$@"
 
 # Local machine/VM host lease (flock).
 # Cancels on runner death or TERM/INT/HUP; cleanup failure releases with error.

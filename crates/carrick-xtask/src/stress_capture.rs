@@ -774,19 +774,24 @@ fn capture(
     }
 }
 
-fn trace(args: &Args, guard: &RunGuard<'_>) -> Result<Option<Child>, Error> {
-    if args.probe.is_empty() {
-        return Ok(None);
-    }
+fn trace_program(args: &Args, pid: u32) -> String {
     let mut program =
         String::from("#pragma D option quiet\nBEGIN { printf(\"STRESS_TRACE_READY\\n\"); }\n");
     for probe in &args.probe {
-        program.push_str(&format!("{probe} /pid == {} || progenyof({})/ {{ printf(\"probe=%s pid=%d arg0=%llu arg1=%llu arg2=%llu\\n\", probename, pid, arg0, arg1, arg2); }}\n", guard.child.id(), guard.child.id()));
+        program.push_str(&format!("{probe} /pid == {} || progenyof({})/ {{ printf(\"probe=%s pid=%d arg0=%lld arg1=%lld arg2=%lld\\n\", probename, pid, arg0, arg1, arg2); }}\n", pid, pid));
     }
     program.push_str(&format!(
         "tick-1s {{ seconds++; }} tick-1s /seconds >= {}/ {{ exit(0); }}\n",
         args.trace_seconds
     ));
+    program
+}
+
+fn trace(args: &Args, guard: &RunGuard<'_>) -> Result<Option<Child>, Error> {
+    if args.probe.is_empty() {
+        return Ok(None);
+    }
+    let program = trace_program(args, guard.child.id());
     let script = guard.dir.join("probes.d");
     fs::write(
         guard.dir.join("probes.sha256"),
@@ -847,9 +852,11 @@ fn wait_trace_ready(trace: &mut TraceGuard) -> Result<(), Error> {
             return Ok(());
         }
         if trace.child.try_wait()?.is_some() || start.elapsed() >= Duration::from_secs(10) {
-            return Err(Error::Invalid(
-                "DTrace did not arm before test startup; see dtrace.log".into(),
-            ));
+            return Err(Error::Invalid(format!(
+                "DTrace did not arm before test startup; see {}: {}",
+                trace.dir.join("dtrace.log").display(),
+                String::from_utf8_lossy(&tail.overlap)
+            )));
         }
         std::thread::sleep(OBSERVATION_INTERVAL);
     }
@@ -1234,6 +1241,31 @@ mod serial_host {
     #![allow(clippy::expect_used)]
     use super::*;
     use std::io::{Seek, SeekFrom};
+
+    #[test]
+    fn trace_arguments_use_macos_d_signed_formats() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from([
+            "xtask",
+            "stress-capture",
+            "--executable",
+            "/test",
+            "--test",
+            "test",
+            "--output",
+            "/output",
+            "--probe",
+            "carrick*:::test",
+        ])
+        .expect("CLI");
+        let crate::cli::Commands::StressCapture(args) = cli.command else {
+            unreachable!()
+        };
+        let script = trace_program(&args, 123);
+        assert!(script.contains(r#"printf("probe=%s pid=%d arg0=%lld arg1=%lld arg2=%lld\n", probename, pid, arg0, arg1, arg2);"#));
+        assert!(!script.contains("%llu"));
+        assert!(script.contains("pid == 123 || progenyof(123)"));
+    }
     struct TestChild(Child);
     impl Drop for TestChild {
         fn drop(&mut self) {
