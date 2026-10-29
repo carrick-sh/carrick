@@ -7058,7 +7058,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .unwrap_or_else(|| {
                 crate::dispatch::invalid_completion(
                     crate::dispatch::NativeInvariant::PhysicalCustody(
-                        "affinity carrier topology missing after venue admission",
+                        crate::dispatch::PhysicalCustodyInvariant::AffinityTopologyMissing,
                     ),
                 )
             })]);

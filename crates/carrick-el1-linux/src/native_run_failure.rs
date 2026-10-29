@@ -23,7 +23,7 @@ pub fn complete_native_run_failure(binding: ExecutionBinding, reason: NativeRunF
     {
         let _ = binding;
         crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::PhysicalCustody(
-            reason.as_str(),
+            crate::dispatch::PhysicalCustodyInvariant::NativeRunFailure(reason),
         ))
     }
 }

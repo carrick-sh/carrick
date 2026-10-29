@@ -1615,12 +1615,37 @@ where
     route
 }
 
+/// Closed set of physical custody failures at the native completion boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalCustodyInvariant {
+    RootExitRefused,
+    ForkCustodyRefused,
+    AffinityTopologyMissing,
+    InventoryRollbackFailed,
+    NativeRunFailure(carrick_core_abi::NativeRunFailureReason),
+}
+
+impl PhysicalCustodyInvariant {
+    /// Preserve the host fatal diagnostic text without using it as identity.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RootExitRefused => "root exit crossing refused",
+            Self::ForkCustodyRefused => "admitted fork custody commit refused",
+            Self::AffinityTopologyMissing => {
+                "affinity carrier topology missing after venue admission"
+            }
+            Self::InventoryRollbackFailed => "unexposed physical inventory rollback failed",
+            Self::NativeRunFailure(reason) => reason.as_str(),
+        }
+    }
+}
+
 /// Native preparation, scheduling and completion retain an exact execution
 /// binding. Missing frames and failed completion authentication share this
 /// fail-stop transport; a completed effect must never be replayed by forwarding.
 pub enum NativeInvariant {
     EntryBinding,
-    PhysicalCustody(&'static str),
+    PhysicalCustody(PhysicalCustodyInvariant),
     MissingNativeFrame,
     RevisionCredit,
     SignalNumber,
@@ -1631,9 +1656,10 @@ impl core::fmt::Debug for NativeInvariant {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::EntryBinding => f.write_str("EntryBinding"),
-            Self::PhysicalCustody(reason) => {
-                f.debug_tuple("PhysicalCustody").field(reason).finish()
-            }
+            Self::PhysicalCustody(reason) => f
+                .debug_tuple("PhysicalCustody")
+                .field(&reason.as_str())
+                .finish(),
             Self::MissingNativeFrame => f.write_str("MissingNativeFrame"),
             Self::RevisionCredit => f.write_str("RevisionCredit"),
             Self::SignalNumber => f.write_str("SignalNumber"),
@@ -1644,20 +1670,19 @@ impl core::fmt::Debug for NativeInvariant {
     }
 }
 
-#[track_caller]
-pub fn invalid_completion(reason: NativeInvariant) -> ! {
-    #[cfg(target_os = "none")]
-    {
+impl NativeInvariant {
+    /// Target-independent mapping keeps fatal reason selection exhaustive and
+    /// testable without entering the terminal transport.
+    pub fn fatal_reason(&self) -> carrick_el1_abi::EntryBindingFatalReason {
         use carrick_el1_abi::EntryBindingFatalReason as Fatal;
-        let reason = match reason {
+        match self {
             NativeInvariant::EntryBinding => Fatal::EntryBinding,
             NativeInvariant::PhysicalCustody(reason) => match reason {
-                "root exit crossing refused" => Fatal::RootExitRefused,
-                "admitted fork custody commit refused" => Fatal::ForkCustodyRefused,
-                "affinity carrier topology missing after venue admission" => {
-                    Fatal::AffinityTopologyMissing
-                }
-                _ => Fatal::PhysicalCustody,
+                PhysicalCustodyInvariant::RootExitRefused => Fatal::RootExitRefused,
+                PhysicalCustodyInvariant::ForkCustodyRefused => Fatal::ForkCustodyRefused,
+                PhysicalCustodyInvariant::AffinityTopologyMissing => Fatal::AffinityTopologyMissing,
+                PhysicalCustodyInvariant::InventoryRollbackFailed
+                | PhysicalCustodyInvariant::NativeRunFailure(_) => Fatal::PhysicalCustody,
             },
             NativeInvariant::MissingNativeFrame => Fatal::MissingNativeFrame,
             NativeInvariant::RevisionCredit => Fatal::RevisionCredit,
@@ -1682,9 +1707,14 @@ pub fn invalid_completion(reason: NativeInvariant) -> ! {
                     },
                 }
             }
-        };
-        carrick_el1::substrate::sched::hw::fatal_entry_binding(reason);
+        }
     }
+}
+
+#[track_caller]
+pub fn invalid_completion(reason: NativeInvariant) -> ! {
+    #[cfg(target_os = "none")]
+    carrick_el1::substrate::sched::hw::fatal_entry_binding(reason.fatal_reason());
     #[cfg(not(target_os = "none"))]
     carrick_fatal::carrick_fatal!(
         "el1::entry_completion",
@@ -3418,6 +3448,66 @@ mod tests {
     use super::super::native_process_runtime::NativeThreadGroupOwner;
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn physical_custody_reasons_preserve_fatal_codes_and_debug_text() {
+        use PhysicalCustodyInvariant as Custody;
+        use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+        let cases = [
+            (
+                Custody::RootExitRefused,
+                Fatal::RootExitRefused,
+                "root exit crossing refused",
+            ),
+            (
+                Custody::ForkCustodyRefused,
+                Fatal::ForkCustodyRefused,
+                "admitted fork custody commit refused",
+            ),
+            (
+                Custody::AffinityTopologyMissing,
+                Fatal::AffinityTopologyMissing,
+                "affinity carrier topology missing after venue admission",
+            ),
+            (
+                Custody::InventoryRollbackFailed,
+                Fatal::PhysicalCustody,
+                "unexposed physical inventory rollback failed",
+            ),
+        ];
+        for (reason, expected, text) in cases {
+            let invariant = NativeInvariant::PhysicalCustody(reason);
+            assert_eq!(invariant.fatal_reason(), expected);
+            assert_eq!(reason.as_str(), text);
+            assert_eq!(
+                std::format!("{invariant:?}"),
+                std::format!("PhysicalCustody({text:?})")
+            );
+        }
+        use carrick_core_abi::NativeRunFailureReason as Run;
+        for reason in [
+            Run::X86GroupExitCustody,
+            Run::NativeInvalid,
+            Run::NativeStale,
+            Run::NativeExhausted,
+            Run::NativeFault,
+            Run::NativeUnsupported,
+            Run::NativeBusy,
+            Run::NativeQuarantined,
+            Run::NativeNoChild,
+            Run::BirthSettlement,
+            Run::ClaimRollback,
+        ] {
+            let custody = Custody::NativeRunFailure(reason);
+            let invariant = NativeInvariant::PhysicalCustody(custody);
+            assert_eq!(invariant.fatal_reason(), Fatal::PhysicalCustody);
+            assert_eq!(custody.as_str(), reason.as_str());
+            assert_eq!(
+                std::format!("{invariant:?}"),
+                std::format!("PhysicalCustody({:?})", reason.as_str())
+            );
+        }
+    }
 
     #[test]
     fn native_exec_capture_stages_before_releasing_the_ring_lane() {
