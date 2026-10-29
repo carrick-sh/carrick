@@ -72,7 +72,15 @@ impl Region {
 }
 impl Drop for Region {
     fn drop(&mut self) {
+        let leftover =
+            crate::aarch64_process::drain_and_clear_retired_scope(self.zone(), self.table());
         unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+        if !std::thread::panicking() {
+            assert_eq!(
+                leftover, 0,
+                "Region dropped with {leftover} unretired space(s) still queued in RETIRED_SPACES"
+            );
+        }
     }
 }
 pub struct Bank {

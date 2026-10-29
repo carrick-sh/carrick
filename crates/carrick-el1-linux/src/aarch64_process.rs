@@ -1018,6 +1018,34 @@ impl ForkStockCrossing for HvcForkStockCrossing {
 static RETIRED_SPACES: super::retired_spaces::RetiredSpaces =
     super::retired_spaces::RetiredSpaces::new();
 
+/// Drain ready retired spaces belonging to `(zone, roots)` and purge any
+/// remaining entries for that scope, returning how many could not retire.
+///
+/// Host fixtures share `RETIRED_SPACES` across tests while reusing
+/// `NonZeroU64::MIN`, small `ReservationMm` values, and heap-allocated
+/// `(zone, roots)` addresses. Tearing down a fixture scope before freeing its
+/// region prevents an earlier test's queued entry from matching a later
+/// incarnation at the same addresses.
+#[cfg(any(test, feature = "host-test"))]
+pub(crate) fn drain_and_clear_retired_scope(
+    zone: &ZoneTables<Aarch64ParkedContext>,
+    roots: &SharedReservations,
+) -> usize {
+    let zone_address = core::ptr::from_ref(zone).addr();
+    let roots_address = core::ptr::from_ref(roots).addr();
+    for carrier in RETIRED_SPACES.carriers_in_scope(zone_address, roots_address) {
+        let owner: Portal<'_> =
+            carrick_core::mm::transaction::MmPortal::for_zone(carrier, roots, zone);
+        let _ = RETIRED_SPACES.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
+    }
+    RETIRED_SPACES.purge_scope(zone_address, roots_address)
+}
+
+#[cfg(test)]
+pub(crate) fn push_retired_space_for_test(space: super::retired_spaces::RetiredSpace) {
+    RETIRED_SPACES.push(space);
+}
+
 pub struct Aarch64Venue;
 
 impl OwnerVenue<Aarch64ParkedContext> for Aarch64Venue {
