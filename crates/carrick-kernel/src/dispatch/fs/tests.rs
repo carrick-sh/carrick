@@ -11546,6 +11546,25 @@ fn fs_view_direct_construction_and_operations() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert!(!view.fd_table_contains(new_fd3));
+
+    // 6. Read a pending signal directly through standalone FsView (no SyscallDispatcher)
+    let sig_mask = carrick_abi::SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGUSR1);
+    let tid = crate::thread::ThreadId::from_wire_key(context.thread().key().tid.raw() as i32);
+    context.shared().pending_signals().enqueue_standard(
+        crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGUSR1).unwrap(),
+        None,
+    );
+    let mut sfd_mem = crate::dispatch::LinearMemory::new(0x1000, vec![0u8; 128]);
+    assert_eq!(
+        view.read_signalfd(&context, &mut sfd_mem, 0x1000, 128, sig_mask, tid),
+        DispatchOutcome::Returned { value: 128 },
+    );
+    let ssi_signo = u32::from_le_bytes(sfd_mem.read_bytes(0x1000, 4).unwrap().try_into().unwrap());
+    assert_eq!(ssi_signo, crate::linux_abi::LINUX_SIGUSR1 as u32);
+    assert_eq!(
+        view.read_signalfd(&context, &mut sfd_mem, 0x1000, 128, sig_mask, tid),
+        DispatchOutcome::errno(LINUX_EAGAIN),
+    );
 }
 
 #[test]

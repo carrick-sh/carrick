@@ -966,15 +966,6 @@ pub(in crate::dispatch) trait FsCrossSubsystem: Send + Sync {
     ) -> bool {
         false
     }
-    fn take_signalfd_bytes(
-        &self,
-        _context: &crate::kernel::KernelContext,
-        _tid: crate::thread::ThreadId,
-        _mask: carrick_abi::SigSet,
-        _max: usize,
-    ) -> Vec<u8> {
-        Vec::new()
-    }
     fn perf_event_read_bytes(
         &self,
         _state: &Arc<crate::dispatch::perf::PerfEventState>,
@@ -1120,15 +1111,6 @@ impl FsCrossSubsystem for SyscallDispatcher {
         sig_mask: carrick_abi::WaitSigMask,
     ) -> bool {
         self.has_deliverable_dispatch_pending_for_wait(context, tid, sig_mask)
-    }
-    fn take_signalfd_bytes(
-        &self,
-        context: &crate::kernel::KernelContext,
-        tid: crate::thread::ThreadId,
-        mask: carrick_abi::SigSet,
-        max: usize,
-    ) -> Vec<u8> {
-        self.take_signalfd_bytes(context, tid, mask, max)
     }
     fn perf_event_read_bytes(
         &self,
