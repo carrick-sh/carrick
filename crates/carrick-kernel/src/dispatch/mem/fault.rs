@@ -552,7 +552,7 @@ impl MemState {
     /// covers a resident page, another node (heap, host-owned, other
     /// protection), an owed return the host has not reconciled, or backing
     /// an earlier grant of this MM already prepared.
-    fn try_root_grant_for_page(
+    pub(in crate::dispatch::mem) fn try_root_grant_for_page(
         &self,
         mapping: &Mapping,
         incarnation: ReservationIncarnation,
@@ -576,6 +576,14 @@ impl MemState {
             return Ok(None);
         };
         root.with_root(|model| {
+            // The owner read precedes this root lock. A replacement must
+            // not let its plan authenticate the earlier mapping observation.
+            if model
+                .node(page)
+                .is_none_or(|(_, current)| current != incarnation)
+            {
+                return Ok(None);
+            }
             let mut exclusions = carrick_core::mm::reservation::StockExclusions::new();
             let mut failure = None;
             // Host residency is incarnation-qualified. Eligibility of the
@@ -667,6 +675,9 @@ impl MemState {
                 }
                 Err(error) => return Err(error),
             };
+            if plan.protection() != mapping.protection {
+                return Ok(None);
+            }
             model.revalidate_private_stock_plan(&plan, &exclusions)?;
             let range = carrick_vfs::GuestMemoryRange::new(
                 GuestVa::new(plan.range().start()),
