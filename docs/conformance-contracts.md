@@ -1161,7 +1161,7 @@ preserving legal guest EL0 flags in `AARCH64_EL0_USER_PSTATE_MASK`
 (`arm_signal_delivery_masks_internal_daif_and_preserves_el0_user_pstate_flags`,
 `arm_public_return_restores_internal_daif_and_preserves_el0_user_flags`,
 `arm_signal_delivery_separates_interrupted_sp_from_altstack_placement`, and
-`production_deliver_signal_with_control_preserves_interrupted_sp_and_masks_daif`).
+`production_deliver_signal_on_syscall_return_preserves_interrupted_sp_and_masks_daif`).
 
 The ARM `sigaltstack` setup case of `kernel.el1.signal-delivery-owner`
 uses the VM-free `sigaltstack_serves_off_the_alternate_stack` witness. Native

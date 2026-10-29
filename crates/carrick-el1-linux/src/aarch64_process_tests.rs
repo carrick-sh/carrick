@@ -2251,7 +2251,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
                 frame.x[0] = carrick_syscall_abi::LinuxErrno::new(32).guest_retval() as u64;
                 let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
                 assert_eq!(
-                    super::signal_delivery::deliver_signal_with_control(
+                    super::signal_delivery::deliver_signal_on_syscall_return(
                         &child_task,
                         child_control,
                         &mut child_entry,
@@ -4809,7 +4809,13 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     );
     assert_eq!(
         crate::cow_resolver::settle_declined_owner_fault(
-            NativeEntryVenue::SignalOwner,
+            NativeEntryVenue::select_with_lifecycle(
+                fixture.zone,
+                fixture.slot,
+                &fixture.task,
+                fixture.page,
+                fixture.control,
+            ),
             &fixture.task,
             unmapped_action,
             unmapped_supply.outcome(),
@@ -4853,7 +4859,13 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     fixture.task.publish_ptrace_traced(true);
     assert_eq!(
         crate::cow_resolver::settle_declined_owner_fault(
-            NativeEntryVenue::SignalOwner,
+            NativeEntryVenue::select_with_lifecycle(
+                fixture.zone,
+                fixture.slot,
+                &fixture.task,
+                fixture.page,
+                fixture.control,
+            ),
             &fixture.task,
             fault_action,
             supply.outcome(),
@@ -4873,12 +4885,18 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
         backend: ArmWaitSignalBackend,
     };
     let settled = crate::cow_resolver::settle_declined_owner_fault(
-        NativeEntryVenue::SignalOwner,
+        NativeEntryVenue::select_with_lifecycle(
+            fixture.zone,
+            fixture.slot,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+        ),
         &fixture.task,
         fault_action,
         supply.outcome(),
         || {
-            super::aarch64_process::deliver_declined_fault_signal(
+            super::dispatch::arm_deliver_declined_fault_signal_with(
                 source,
                 &fixture.task,
                 &ThreadCtx::ZERO,
@@ -4887,8 +4905,16 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
                 fixture.control,
                 &mut service,
                 &mut frame,
-                fp.as_bytes(),
-                &mut machine,
+                |process, frame| {
+                    super::arm_signal::deliver_on_user_return_with(
+                        &fixture.task,
+                        fixture.control,
+                        process,
+                        frame,
+                        fp.as_bytes(),
+                        &mut machine,
+                    )
+                },
             )
             .unwrap()
         },
@@ -4902,160 +4928,6 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
         frame.elr, 0x40_0100,
         "installed handler must run instead of default termination"
     );
-    let offset = frame.x[1] as usize - stack.0.as_ptr() as usize;
-    let signal = carrick_personality_linux::signal::arm::SignalFrame::ref_from_bytes(
-        &stack.0[offset
-            ..offset + core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()],
-    )
-    .unwrap();
-    let info = signal.rt.siginfo;
-    let (signum, code, address) = (info.si_signo, info.si_code, info.si_addr);
-    assert_eq!(
-        (signum, code, address),
-        (11, 2, crate::mm_portal::test_support::VA)
-    );
-}
-
-#[test]
-fn arm_rehomed_exception_service_refusal_builds_handler_frame() {
-    use super::native_process_runtime::NativeResume;
-    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
-    use carrick_sched_core::object_wait::ObjectWaitKey;
-    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
-    use zerocopy::{FromBytes, IntoBytes};
-
-    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let mut service = fixture.process_service();
-    let action = Action {
-        disposition: Disposition::Handler(HandlerAddress(0x40_0100)),
-        ..Default::default()
-    };
-    fixture
-        .enter(
-            fixture.control,
-            fixture_ttbr0(fixture),
-            &mut service,
-            |process| {
-                process
-                    .signal_venue()
-                    .unwrap()
-                    .rt_sigaction(Signal::SEGV, Some(action))
-                    .unwrap();
-            },
-        )
-        .unwrap();
-    let source = BornInZoneSource {
-        zone: fixture.zone,
-        slot: fixture.slot,
-    };
-    assert!(fixture.zone.slot(fixture.slot).current().is_none());
-
-    // Enter a native Fault service operation after AdmissionHome::drop (which
-    // rehomes onto a fresh record whose native_owned hint is false, exercising
-    // has_native_execution_owner() + control.bind_zone_record(reference)).
-    let fault = carrick_guest_arch::FaultInfo {
-        address: UserVa::new(crate::mm_portal::test_support::VA),
-        access: carrick_guest_arch::Access::Write,
-        present: true,
-    };
-    assert!(matches!(
-        with_process_entry(
-            source,
-            &fixture.task,
-            &ThreadCtx::ZERO,
-            fixture_ttbr0(fixture),
-            fixture.page,
-            fixture.control,
-            &mut service,
-            |process| {
-                let result = process
-                    .begin_service(ServiceOperation::Fault(fault), None)
-                    .unwrap();
-                assert!(process.take_handoff_receipt().is_some());
-                result
-            },
-        )
-        .unwrap(),
-        NativeResume::Left(None)
-    ));
-    let selector = fixture.task.service_notice.take().unwrap().unwrap();
-    assert_eq!(
-        fixture.control.zone_record(),
-        Some(selector.record),
-        "rehome_entry must bind the new RecordRef onto the member control slot"
-    );
-    let key = ObjectWaitKey::native_service(selector.record).unwrap();
-    {
-        let queue = fixture
-            .zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
-            .unwrap();
-        let member = queue
-            .native_service_member(selector.record)
-            .expect("rehomed exception owner must be observable via has_native_execution_owner");
-        let ticket = unsafe {
-            ServiceCell::claim_notice(&fixture.control.service, selector, NonZeroU64::MIN, member)
-        }
-        .ok()
-        .unwrap();
-        assert!(ticket.complete(false).is_ok());
-        queue
-            .notify_object(fixture.slot, &mut Default::default())
-            .unwrap();
-    }
-    let switched = fixture.zone.switch_in(fixture.slot).unwrap();
-    assert_eq!(switched, selector.record.id);
-    let runtime = registry()
-        .for_entry(source, &fixture.task, fixture.address)
-        .unwrap();
-    let resumed = super::aarch64_process::resume_selected(
-        &runtime,
-        registry(),
-        source,
-        &fixture.task,
-        switched,
-        &mut service,
-    );
-    assert!(matches!(
-        super::aarch64_process::map_resume(resumed, &mut service, &fixture.task, fixture.slot),
-        crate::sched::ResumeAction::NoPending
-    ));
-    let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
-    let sp = UserVa::new(stack.0.as_mut_ptr() as u64 + stack.0.len() as u64);
-    let mut frame = carrick_el1_abi::TrapFrame {
-        elr: 0x40_0200,
-        spsr: 0x3c0,
-        ..Default::default()
-    };
-    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
-    let mut machine = ArmWaitSignalMachine {
-        user_sp: sp,
-        backend: ArmWaitSignalBackend,
-    };
-    with_process_entry(
-        source,
-        &fixture.task,
-        &ThreadCtx::ZERO,
-        fixture_ttbr0(fixture),
-        fixture.page,
-        fixture.control,
-        &mut service,
-        |process| {
-            assert_eq!(
-                crate::signal_delivery::deliver_signal_with_control(
-                    &fixture.task,
-                    fixture.control,
-                    process,
-                    &mut frame,
-                    fp.as_bytes(),
-                    &mut machine,
-                ),
-                None
-            );
-        },
-    )
-    .unwrap();
-    assert_eq!(frame.elr, 0x40_0100);
     let offset = frame.x[1] as usize - stack.0.as_ptr() as usize;
     let signal = carrick_personality_linux::signal::arm::SignalFrame::ref_from_bytes(
         &stack.0[offset
@@ -5113,7 +4985,7 @@ fn arm_permission_fault_sig_dfl_terminates_through_native_owner() {
         backend: ArmWaitSignalBackend,
     };
     assert_eq!(
-        super::aarch64_process::deliver_declined_fault_signal(
+        super::dispatch::arm_deliver_declined_fault_signal_with(
             source,
             &fixture.task,
             &ThreadCtx::ZERO,
@@ -5122,8 +4994,14 @@ fn arm_permission_fault_sig_dfl_terminates_through_native_owner() {
             fixture.control,
             &mut service,
             &mut frame,
-            fp.as_bytes(),
-            &mut machine,
+            |process, frame| super::arm_signal::deliver_on_user_return_with(
+                &fixture.task,
+                fixture.control,
+                process,
+                frame,
+                fp.as_bytes(),
+                &mut machine,
+            ),
         )
         .unwrap(),
         carrick_el1_abi::Action::Idle,
@@ -5184,7 +5062,7 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
         backend: ArmWaitSignalBackend,
     };
     assert_eq!(
-        super::aarch64_process::deliver_declined_fault_signal(
+        super::dispatch::arm_deliver_declined_fault_signal_with(
             source,
             &fixture.task,
             &ThreadCtx::ZERO,
@@ -5193,8 +5071,14 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
             fixture.control,
             &mut service,
             &mut frame,
-            fp.as_bytes(),
-            &mut machine,
+            |process, frame| super::arm_signal::deliver_on_user_return_with(
+                &fixture.task,
+                fixture.control,
+                process,
+                frame,
+                fp.as_bytes(),
+                &mut machine,
+            ),
         )
         .unwrap(),
         carrick_el1_abi::Action::Served,
@@ -5219,7 +5103,7 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
         )
         .unwrap();
     assert_eq!(
-        super::aarch64_process::deliver_declined_fault_signal(
+        super::dispatch::arm_deliver_declined_fault_signal_with(
             source,
             &fixture.task,
             &ThreadCtx::ZERO,
@@ -5228,8 +5112,14 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
             fixture.control,
             &mut service,
             &mut frame,
-            fp.as_bytes(),
-            &mut machine,
+            |process, frame| super::arm_signal::deliver_on_user_return_with(
+                &fixture.task,
+                fixture.control,
+                process,
+                frame,
+                fp.as_bytes(),
+                &mut machine,
+            ),
         )
         .unwrap(),
         carrick_el1_abi::Action::Idle,
@@ -9008,7 +8898,7 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
             fixture.task.metadata.control_slot.load(Ordering::Acquire),
             fixture.control as *const _ as u64,
         );
-        super::signal_delivery::deliver_signal_with_control(
+        super::signal_delivery::deliver_signal_on_syscall_return(
             &fixture.task,
             fixture.control,
             &mut process,
@@ -9081,7 +8971,7 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
         "handler delivery must consume restart custody exactly once, with or without SA_RESTART"
     );
     assert_eq!(
-        super::signal_delivery::deliver_signal_with_control(
+        super::signal_delivery::deliver_signal_on_syscall_return(
             &fixture.task,
             fixture.control,
             &mut later_entry,
@@ -10816,4 +10706,71 @@ fn tgkill_during_futex_enrollment_returns_eintr() {
     assert_eq!(fixture.zone.record(waiter.id).deadline(), None);
     assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 0);
     owner_registry.unregister_root_for_test(&runtime);
+}
+
+#[test]
+fn native_process_venue_survives_host_only_and_closed_admission() {
+    use carrick_el1::substrate::sched::NativeEntryVenue;
+    use carrick_el1_abi::Lifecycle;
+    for closed in [false, true] {
+        let fixture = Fixture::new(0x10000, asid(1));
+        let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
+        assert!(fixture.zone.mark_native_owned(record));
+        if closed {
+            fixture.page.close();
+        } else {
+            fixture.page.decline_to_host();
+        }
+        assert_eq!(
+            NativeEntryVenue::select_with_lifecycle(
+                fixture.zone,
+                fixture.slot,
+                &fixture.task,
+                fixture.page,
+                fixture.control,
+            ),
+            NativeEntryVenue::NativeProcess(record)
+        );
+        assert_eq!(
+            NativeEntryVenue::select(fixture.zone, fixture.slot, &fixture.task),
+            NativeEntryVenue::NativeProcess(record)
+        );
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        for entry in [
+            carrick_sched_core::object_wait::OwnerEntry::Syscall,
+            carrick_sched_core::object_wait::OwnerEntry::Exception,
+        ] {
+            assert!(super::native_process_runtime::native_entry_owned(
+                source,
+                &fixture.task,
+                fixture.page,
+                fixture.control,
+                entry,
+            ));
+        }
+        fixture.task.linux.mark_pending_host_work();
+        let counters = carrick_el1_abi::Counters::new();
+        let mut cpu = crate::sched::FakeCpu {
+            host_work_once: Some(carrick_el1_abi::Action::Idle),
+            ..Default::default()
+        };
+        let action = crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        }
+        .finish_interrupt_for_test(
+            &mut carrick_el1_abi::TrapFrame::default(),
+            carrick_el1_abi::Action::Served,
+        );
+        assert_eq!(action, carrick_el1_abi::Action::Idle);
+        assert_eq!(cpu.host_work_boundaries, [record]);
+    }
 }

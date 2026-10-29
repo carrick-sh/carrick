@@ -711,7 +711,7 @@ impl NativeSignalFixture {
         let mut machine = HostArmSignalMachine {
             backend: HostArmBackend,
         };
-        let route = crate::signal_delivery::deliver_signal_with_control(
+        let route = crate::signal_delivery::deliver_signal_on_syscall_return(
             self.task,
             self.control,
             &mut entry,

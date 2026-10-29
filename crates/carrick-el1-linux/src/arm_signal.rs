@@ -117,8 +117,10 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     fp.fpsr = saved.native.fpsr as u32;
     fp.fpcr = saved.native.fpcr as u32;
     let sp = unsafe { carrick_el1::isa::aarch64::signal_stack() };
-    super::signal_delivery::deliver_signal_on_syscall_return(
+    let (_, control) = task.lifecycle_refs()?;
+    deliver_on_user_return_with(
         task,
+        control,
         process,
         frame,
         fp.as_bytes(),
@@ -126,6 +128,32 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
             backend: LinuxAarch64Backend,
             user_sp: sp,
         },
+    )
+}
+
+/// Native user-return policy shared by the hardware adapter and VM-free witnesses.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn deliver_on_user_return_with<X, A>(
+    task: &carrick_el1_abi::CurrentTask,
+    control: &carrick_el1_abi::ThreadControlSlot,
+    process: &mut super::native_process_runtime::NativeProcessEntry<
+        '_,
+        'static,
+        super::aarch64_process::Mm,
+        carrick_sched_core::Aarch64ParkedContext,
+        super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    >,
+    frame: &mut TrapFrame,
+    fpstate: &[u8],
+    machine: &mut A,
+) -> Option<carrick_personality_linux::dispatch::CompletionRoute>
+where
+    X: super::aarch64_process::ForkStockCrossing,
+    A: super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>,
+    A::Backend: carrick_guest_arch::ArchTypes<NativeFrame = TrapFrame>,
+{
+    super::signal_delivery::deliver_signal_on_syscall_return(
+        task, control, process, frame, fpstate, machine,
     )
 }
 
@@ -886,7 +914,7 @@ mod tests {
         use carrick_signal_core::policy::{SigBlockMask, Signal};
 
         // Reproduces the exact delivery_stack -> SignalFrameParams -> setup_arm_signal_frame
-        // pipeline from signal_delivery::deliver_signal_with_control.
+        // pipeline from signal_delivery::deliver_signal_on_syscall_return.
         let deliver_case = |altstack: AltStack, on_stack: bool, interrupted_sp_raw: u64| {
             let interrupted_sp = UserVa::new(interrupted_sp_raw);
             let (sp, stack) = delivery_stack(altstack, interrupted_sp, on_stack)

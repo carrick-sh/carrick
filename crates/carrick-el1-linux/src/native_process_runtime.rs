@@ -1909,7 +1909,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         resources.members[member_index].record = reference;
         resources.members[member_index].thread = key.task;
         resources.members[member_index].expected_host = host_identity;
-        control.bind_zone_record(reference);
         state.members.remove(&old_key);
         state
             .records

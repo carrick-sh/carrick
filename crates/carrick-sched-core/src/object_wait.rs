@@ -907,9 +907,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
             return None;
         }
         let member = self.zone.live(record)?;
-        member
-            .has_native_execution_owner()
-            .then(|| member.identity())
+        member.is_native_owned().then(|| member.identity())
     }
 
     fn release_with(&self, mut before_unlock: impl FnMut()) {
