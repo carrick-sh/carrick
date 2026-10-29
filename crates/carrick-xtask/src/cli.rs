@@ -398,7 +398,9 @@ where
     };
     if std::env::var_os("CARRICK_HOST_LEASE_SOCKET").is_none() {
         let mode = match &cli.command {
-            Commands::StressCapture(_) => Some((crate::host_lease::HostLeaseMode::Carrick, true)),
+            Commands::StressCapture(_) if cfg!(target_os = "macos") => {
+                Some((crate::host_lease::HostLeaseMode::Carrick, true))
+            }
             Commands::Accept(_) => Some((crate::host_lease::HostLeaseMode::Gate, true)),
             Commands::Fixtures(args) => match &args.action {
                 crate::fixtures::FixturesAction::Restore { .. }

@@ -20,6 +20,7 @@ default = []
 impact = ["dep:carrick-conformance"]
 
 [dependencies]
+carrick-fatal = { path = "../carrick-fatal" }
 clap.workspace = true
 regex.workspace = true
 serde.workspace = true

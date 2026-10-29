@@ -5,8 +5,6 @@
 //! `CARRICK_RUN_ID`, and runs it under `RUST_TEST_THREADS=1`.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod fatal_hold;
-
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
@@ -82,7 +80,7 @@ static GUEST_LOCK: Mutex<()> = Mutex::new(());
 /// process, and the Inherit case redirects the process's own fd 1. The recipe
 /// sets `RUST_TEST_THREADS=1`; this is the in-file belt for a filtered run.
 pub fn guest_lock() -> MutexGuard<'static, ()> {
-    fatal_hold::arm_from_env(carrick_fatal::arm_debugger_hold);
+    carrick_fatal::arm_debugger_hold_from_env();
     GUEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

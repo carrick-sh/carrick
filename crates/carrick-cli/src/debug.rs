@@ -463,15 +463,7 @@ impl GuestLogTail {
     }
 }
 
-/// Parse `carrick fatal: holding <n> s for a debugger (pid <pid>)` -- the line
-/// `carrick_fatal::arm_debugger_hold` writes before sleeping -- into the host
-/// pid to attach to.
-fn parse_fatal_hold_pid(line: &str) -> Option<libc::pid_t> {
-    let rest = line.trim().strip_prefix("carrick fatal: holding ")?;
-    let (_, pid_part) = rest.split_once(" s for a debugger (pid ")?;
-    let digits = pid_part.strip_suffix(')')?;
-    digits.parse::<libc::pid_t>().ok()
-}
+use carrick_fatal::parse_debugger_hold_pid as parse_fatal_hold_pid;
 
 fn find_run_name(args: &[String]) -> anyhow::Result<Option<String>> {
     let mut iter = args.iter().peekable();

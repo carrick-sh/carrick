@@ -1333,6 +1333,7 @@ dependencies = [
  "base64 0.22.1",
  "carrick-conformance",
  "carrick-el1-abi",
+ "carrick-fatal",
  "carrick-guest-arch",
  "carrick-portable",
  "clap",

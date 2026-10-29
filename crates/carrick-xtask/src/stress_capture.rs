@@ -185,6 +185,7 @@ struct Record {
     signal: Option<i32>,
     elapsed_ms: u128,
     trace_events: Option<bool>,
+    fatal_pid: Option<u32>,
     artifacts: Vec<PathBuf>,
     errors: Vec<String>,
 }
@@ -253,13 +254,49 @@ fn accept_start(listener: &UnixListener) -> io::Result<UnixStream> {
     }
 }
 
+fn leader_exited(child: &Child) -> io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: valid output storage; WNOWAIT preserves our child's PID custody.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: waitid initialized the structure, including si_pid=0 if running.
+    Ok(unsafe { info.assume_init().si_pid() } != 0)
+}
+
 fn kill_group(child: &Child) -> io::Result<()> {
     let pid = i32::try_from(child.id()).map_err(io::Error::other)?;
-    // SAFETY: group is created by setsid in this owned child before exec.
+    // SAFETY: group is created by setsid in this owned, unreaped child.
     if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
+        if error.raw_os_error() == Some(libc::ESRCH)
+            || (error.raw_os_error() == Some(libc::EPERM) && leader_exited(child)?)
+        {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn term_leader(child: &mut Child) -> io::Result<()> {
+    // try_wait caches an exit status, preventing signals to a reused PID.
+    if child.try_wait()?.is_none() {
+        let pid = i32::try_from(child.id()).map_err(io::Error::other)?;
+        // SAFETY: the live or unreaped child still reserves this PID.
+        if unsafe { libc::kill(pid, libc::SIGTERM) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
         }
     }
     Ok(())
@@ -283,7 +320,16 @@ fn bounded(command: &mut Command, log: &Path, seconds: u64) -> Result<(), Error>
     command.stdout(output.try_clone()?).stderr(output);
     detached(command);
     let mut child = command.spawn()?;
-    let status = wait_bounded(&mut child, Duration::from_secs(seconds))?;
+    let observed = wait_bounded(&mut child, Duration::from_secs(seconds));
+    let status = match observed {
+        Ok(status) => status,
+        Err(error) => {
+            let cleanup = stop_local(&mut child);
+            return Err(Error::Invalid(format!(
+                "tool wait: {error}; cleanup: {cleanup:?}"
+            )));
+        }
+    };
     if let Some(status) = status {
         if status.success() {
             return Ok(());
@@ -293,31 +339,133 @@ fn bounded(command: &mut Command, log: &Path, seconds: u64) -> Result<(), Error>
             log.display()
         )));
     }
-    if let Err(error) = kill_group(&child) {
-        if error.raw_os_error() != Some(libc::EPERM) {
-            return Err(error.into());
-        }
-        let group = format!("-{}", child.id());
-        let mut kill = Command::new("sudo");
-        kill.args(["-n", "/bin/kill", "-KILL", "--", &group])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        detached(&mut kill);
-        let mut killer = kill.spawn()?;
-        if !wait_bounded(&mut killer, Duration::from_secs(5))?
-            .is_some_and(|status| status.success())
-        {
-            let _ = kill_group(&killer);
-            let _ = wait_bounded(&mut killer, Duration::from_secs(5));
-            return Err(Error::Invalid("privileged tool cleanup failed".into()));
-        }
-    }
-    let _ = wait_bounded(&mut child, Duration::from_secs(5))?;
+    stop_local(&mut child)?;
     Err(Error::Invalid(format!(
         "command exceeded {seconds}s; see {}",
         log.display()
     )))
+}
+
+fn stop_local(child: &mut Child) -> Result<(), Error> {
+    term_leader(child)?;
+    if wait_bounded(child, Duration::from_secs(5))?.is_none() {
+        kill_group(child)?;
+        if wait_bounded(child, Duration::from_secs(5))?.is_none() {
+            return Err(Error::Invalid("tool launcher did not reap".into()));
+        }
+    }
+    Ok(())
+}
+
+fn scoped_argv(command: &str, dir: &Path) -> bool {
+    let scope = dir.to_string_lossy();
+    command.match_indices(scope.as_ref()).any(|(pos, _)| {
+        command
+            .as_bytes()
+            .get(pos + scope.len())
+            .is_none_or(|next| b"/ \t\"'".contains(next))
+    })
+}
+
+fn tool_pids(dir: &Path) -> Result<Vec<u32>, Error> {
+    let log = dir.join("tool-processes.log");
+    bounded(
+        Command::new("ps").args(["-axww", "-o", "pid=,comm=,command="]),
+        &log,
+        5,
+    )?;
+    Ok(fs::read_to_string(log)?
+        .lines()
+        .filter_map(|line| {
+            let pid = line.split_whitespace().next()?.parse().ok()?;
+            // No helper exclusion here: this scan runs outside the escalation
+            // helper and must report even an orphaned helper as a survivor.
+            scoped_argv(line, dir).then_some(pid)
+        })
+        .collect())
+}
+
+fn stop_tool(root: &Path, child: &mut Child, dir: &Path) -> Result<(), Error> {
+    // Signal sudo itself: sudo relays TERM and gives DTrace its END flush.
+    // Killing its group/leader with KILL first can orphan the privileged tool.
+    let mut errors = Vec::new();
+    if let Err(error) = term_leader(child) {
+        errors.push(error.to_string());
+    }
+    if let Err(error) = wait_bounded(child, Duration::from_secs(5)) {
+        errors.push(error.to_string());
+    }
+    let needs_reap = match tool_pids(dir) {
+        Ok(pids) => !pids.is_empty(),
+        Err(error) => {
+            errors.push(error.to_string());
+            true
+        }
+    };
+    if needs_reap
+        && let Err(error) = bounded(
+            Command::new("sudo")
+                .arg("-n")
+                .arg(root.join("scripts/sudo/kill-capture.sh"))
+                .arg(dir),
+            &dir.join("tool-kill.log"),
+            15,
+        )
+    {
+        errors.push(error.to_string());
+    }
+    if let Err(error) = stop_local(child) {
+        errors.push(error.to_string());
+    }
+    match tool_pids(dir) {
+        Ok(pids) if pids.is_empty() => {}
+        Ok(_) => errors.push("processes with the run directory in argv survived cleanup".into()),
+        Err(error) => errors.push(error.to_string()),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(errors.join("; ")))
+    }
+}
+
+fn privileged_bounded(
+    root: &Path,
+    command: &mut Command,
+    log: &Path,
+    dir: &Path,
+    bound: Duration,
+) -> Result<(), Error> {
+    let output = File::create(log)?;
+    command.stdout(output.try_clone()?).stderr(output);
+    detached(command);
+    let mut child = command.spawn()?;
+    let observed = wait_bounded(&mut child, bound);
+    // Verify the scoped argv even when sudo exits before its root child.
+    let cleanup = stop_tool(root, &mut child, dir);
+    match (observed, cleanup) {
+        (Ok(Some(status)), Ok(())) if status.success() => Ok(()),
+        (status, cleanup) => Err(Error::Invalid(format!(
+            "privileged tool result {status:?}; cleanup {cleanup:?}; see {}",
+            log.display()
+        ))),
+    }
+}
+
+fn persist_cleanup_error(dir: &Path, error: &Error) {
+    let written = (|| -> io::Result<()> {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("cleanup-error.txt"))?;
+        writeln!(log, "{error}")
+    })();
+    if let Err(write_error) = written {
+        let _ = writeln!(
+            io::stderr(),
+            "stress-capture cleanup: {error}; cannot persist: {write_error}"
+        );
+    }
 }
 
 /// Owns cleanup even if monitoring or capture returns an error.
@@ -334,7 +482,12 @@ impl RunGuard<'_> {
         // scoped reap. Never signal a group after its leader was reaped and
         // its numeric identity could have been reused by another host lane.
         let group_owned = matches!(self.child.try_wait(), Ok(None));
-        // Mark only after attempting both cleanup paths.
+        let group = if group_owned {
+            kill_group(&self.child)
+        } else {
+            Ok(())
+        };
+        // Always attempt the scoped reap, even if killing the group failed.
         let scoped = bounded(
             Command::new("sudo")
                 .arg("-n")
@@ -343,25 +496,33 @@ impl RunGuard<'_> {
             &self.dir.join("cleanup.log"),
             15,
         );
-        let group = if group_owned {
-            kill_group(&self.child)
-        } else {
-            Ok(())
-        };
         let waited = wait_bounded(&mut self.child, Duration::from_secs(5));
         self.cleaned = true;
-        scoped?;
-        group?;
-        if waited?.is_none() {
-            return Err(Error::Invalid("test process did not reap within 5s".into()));
+        let mut errors = Vec::new();
+        if let Err(error) = scoped {
+            errors.push(error.to_string());
         }
-        Ok(())
+        if let Err(error) = group {
+            errors.push(error.to_string());
+        }
+        match waited {
+            Ok(Some(_)) => {}
+            Ok(None) => errors.push("test process did not reap within 5s".into()),
+            Err(error) => errors.push(error.to_string()),
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Invalid(errors.join("; ")))
+        }
     }
 }
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
-        if !self.cleaned {
-            let _ = self.cleanup();
+        if !self.cleaned
+            && let Err(error) = self.cleanup()
+        {
+            persist_cleanup_error(&self.dir, &error);
         }
     }
 }
@@ -381,14 +542,17 @@ impl StderrTail {
                 return Ok(false);
             }
             self.overlap.extend_from_slice(&buffer[..size]);
-            if patterns
+            let matched = patterns
                 .iter()
-                .any(|pattern| pattern.is_match(&self.overlap))
-            {
+                .any(|pattern| pattern.is_match(&self.overlap));
+            // Keep two chunks so a complete short hold notice remains available
+            // to the PID parser even when it straddles a read. Trim matches too:
+            // a pending fatal must not retain unlimited subsequent stderr.
+            let keep = self.overlap.len().saturating_sub(2 * 65536);
+            self.overlap.drain(..keep);
+            if matched {
                 return Ok(true);
             }
-            let keep = self.overlap.len().saturating_sub(65536);
-            self.overlap.drain(..keep);
         }
         Ok(false)
     }
@@ -402,7 +566,7 @@ fn monitor(
     stop: &AtomicBool,
     codes: &[i32],
     mut tracer: Option<&mut TraceGuard>,
-) -> Result<(Outcome, Option<ExitStatus>), Error> {
+) -> Result<(Outcome, Option<ExitStatus>, Option<u32>), Error> {
     let start = Instant::now();
     let mut tail = StderrTail {
         file: File::open(stderr)?,
@@ -415,7 +579,7 @@ fn monitor(
     watched.push(hold_notice.clone());
     let mut pending = false;
     let mut fatal = false;
-    let mut holding = false;
+    let mut holding = None;
     loop {
         if let Some(trace) = tracer.as_deref_mut() {
             trace.enforce_deadline()?;
@@ -426,12 +590,23 @@ fn monitor(
             .overlap
             .windows(b"carrick fatal".len())
             .any(|bytes| bytes == b"carrick fatal");
-        holding |= hold_notice.is_match(&tail.overlap);
+        if holding.is_none() && hold_notice.is_match(&tail.overlap) {
+            holding = tail
+                .overlap
+                .split_inclusive(|byte| *byte == b'\n')
+                .filter(|line| line.ends_with(b"\n"))
+                .find_map(|line| {
+                    std::str::from_utf8(line)
+                        .ok()
+                        .and_then(carrick_fatal::parse_debugger_hold_pid)
+                        .and_then(|pid| u32::try_from(pid).ok())
+                });
+        }
         // The fatal line precedes the hold and may arrive in a separate write.
         // Wait for the hold announcement before stopping the process in LLDB;
         // an exited process still reports its matched stderr normally.
-        let matched =
-            holding || (pending && (!fatal || status.is_some() || start.elapsed() >= deadline));
+        let matched = holding.is_some()
+            || (pending && (!fatal || status.is_some() || start.elapsed() >= deadline));
         // A fast failing child can leave more than one bounded read's worth
         // of stderr. Drain its recorded output before classifying the exit.
         if status.is_some()
@@ -453,7 +628,7 @@ fn monitor(
             stop.load(Ordering::Relaxed),
             codes,
         ) {
-            return Ok((outcome, status));
+            return Ok((outcome, status, holding));
         }
         std::thread::sleep(OBSERVATION_INTERVAL);
     }
@@ -468,7 +643,13 @@ fn quote(path: &Path) -> String {
     )
 }
 
-fn capture(root: &Path, args: &Args, guard: &RunGuard<'_>, record: &mut Record) {
+fn capture(
+    root: &Path,
+    args: &Args,
+    guard: &RunGuard<'_>,
+    record: &mut Record,
+    capture_started: Instant,
+) {
     // Root libtest can own the VM itself; renamed descendants own carrier VMs.
     // Snapshot all exact run-id matches, never assume CLI parent owns the ring.
     let ps_path = guard.dir.join("processes.txt");
@@ -505,7 +686,22 @@ fn capture(root: &Path, args: &Args, guard: &RunGuard<'_>, record: &mut Record) 
     }
     pids.sort_unstable();
     pids.dedup();
+    if let Some(pid) = record.fatal_pid {
+        if let Some(position) = pids.iter().position(|candidate| *candidate == pid) {
+            pids.swap(0, position);
+        } else {
+            record.errors.push(format!(
+                "fatal hold pid {pid} is outside the scoped process census"
+            ));
+        }
+    }
     for pid in pids {
+        if capture_started.elapsed() >= Duration::from_secs(args.capture_seconds) {
+            record
+                .errors
+                .push("shared capture deadline exhausted".into());
+            break;
+        }
         let identity_log = guard.dir.join(format!("{pid}.identity.txt"));
         let checked = bounded(
             Command::new("ps").args(["-ww", "-p", &pid.to_string(), "-o", "pid=,lstart=,command="]),
@@ -527,38 +723,46 @@ fn capture(root: &Path, args: &Args, guard: &RunGuard<'_>, record: &mut Record) 
         }
         let log = guard.dir.join(format!("{pid}.lldb.txt"));
         let core = guard.dir.join(format!("{pid}.core"));
-        let mut command = Command::new("sudo");
-        command.args(["-n", "/usr/bin/lldb"]);
-        command
-            .args(["--batch", "-o"])
-            .arg(format!("target create {}", quote(&args.executable)))
-            .arg("-o")
-            .arg(format!(
-                "command script import {}",
-                quote(&root.join("scripts/carrick_lldb.py"))
-            ))
-            .arg("-o")
-            .arg(format!("process attach --pid {pid}"));
+        let commands = guard.dir.join(format!("{pid}.lldb.commands"));
+        let mut script = format!(
+            "target create {}\ncommand script import {}\nprocess attach --pid {pid}\n",
+            quote(&args.executable),
+            quote(&root.join("scripts/carrick_lldb.py"))
+        );
         if args.capture.contains(&Capture::Bt) {
-            command.args(["-o", "thread backtrace all"]);
+            script.push_str("thread backtrace all\n");
         }
         if args.capture.contains(&Capture::Ring) {
-            command
-                .arg("-o")
-                .arg(format!("carrick eventring {}", args.ring_records));
-            command.arg("-o").arg(format!(
-                "carrick eventring --high-rate {}",
-                args.ring_records
+            script.push_str(&format!(
+                "carrick eventring {}\ncarrick eventring --high-rate {}\n",
+                args.ring_records, args.ring_records
             ));
         }
         if args.capture.contains(&Capture::Core) {
-            command.arg("-o").arg(format!(
-                "process save-core --style modified-memory {}",
+            script.push_str(&format!(
+                "process save-core --style modified-memory {}\n",
                 quote(&core)
             ));
         }
-        command.args(["-o", "detach"]);
-        if let Err(error) = bounded(&mut command, &log, args.capture_seconds) {
+        script.push_str("detach\n");
+        if let Err(error) = fs::write(&commands, script) {
+            record.errors.push(error.to_string());
+            continue;
+        }
+        record.artifacts.push(commands.clone());
+        let mut command = Command::new("sudo");
+        command
+            .args(["-n", "/usr/bin/lldb", "--batch", "--source"])
+            .arg(commands);
+        let remaining =
+            Duration::from_secs(args.capture_seconds).saturating_sub(capture_started.elapsed());
+        if remaining.is_zero() {
+            record
+                .errors
+                .push("shared capture deadline exhausted".into());
+            break;
+        }
+        if let Err(error) = privileged_bounded(root, &mut command, &log, &guard.dir, remaining) {
             record.errors.push(error.to_string());
         }
         record.artifacts.push(log);
@@ -601,6 +805,7 @@ fn trace(args: &Args, guard: &RunGuard<'_>) -> Result<Option<Child>, Error> {
 }
 
 struct TraceGuard {
+    root: PathBuf,
     child: Child,
     dir: PathBuf,
     started: Instant,
@@ -615,15 +820,17 @@ impl TraceGuard {
         Ok(())
     }
     fn stop(&mut self) -> Result<(), Error> {
-        stop_trace(&mut self.child, &self.dir)?;
+        stop_tool(&self.root, &mut self.child, &self.dir)?;
         self.stopped = true;
         Ok(())
     }
 }
 impl Drop for TraceGuard {
     fn drop(&mut self) {
-        if !self.stopped {
-            let _ = self.stop();
+        if !self.stopped
+            && let Err(error) = self.stop()
+        {
+            persist_cleanup_error(&self.dir, &error);
         }
     }
 }
@@ -646,53 +853,6 @@ fn wait_trace_ready(trace: &mut TraceGuard) -> Result<(), Error> {
         }
         std::thread::sleep(OBSERVATION_INTERVAL);
     }
-}
-
-// Match literal artifact paths rather than regexes or a global dtrace reap.
-fn trace_pids(dir: &Path) -> Result<Vec<u32>, Error> {
-    let log = dir.join("dtrace-processes.log");
-    bounded(
-        Command::new("ps").args(["-axww", "-o", "pid=,command="]),
-        &log,
-        5,
-    )?;
-    let script = dir.join("probes.d");
-    let needle = script.to_string_lossy();
-    Ok(fs::read_to_string(log)?
-        .lines()
-        .filter(|line| line.contains("/usr/sbin/dtrace") && line.contains(needle.as_ref()))
-        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
-        .collect())
-}
-fn stop_trace(child: &mut Child, dir: &Path) -> Result<(), Error> {
-    let mut signal_error = None;
-    for (signal, log) in [("-INT", "dtrace-stop.log"), ("-KILL", "dtrace-kill.log")] {
-        let pids = trace_pids(dir)?;
-        if pids.is_empty() {
-            break;
-        }
-        let mut command = Command::new("sudo");
-        command.args(["-n", "/bin/kill", signal, "--"]);
-        for pid in pids {
-            command.arg(pid.to_string());
-        }
-        // Still escalate when interrupting is denied or a process exits mid-scan.
-        if let Err(error) = bounded(&mut command, &dir.join(log), 5) {
-            signal_error = Some(error);
-        }
-        let _ = wait_bounded(child, Duration::from_secs(5))?;
-    }
-    if !trace_pids(dir)?.is_empty() {
-        return Err(signal_error
-            .unwrap_or_else(|| Error::Invalid("scoped dtrace processes survived cleanup".into())));
-    }
-    if wait_bounded(child, Duration::from_secs(5))?.is_none() {
-        kill_group(child)?;
-        if wait_bounded(child, Duration::from_secs(5))?.is_none() {
-            return Err(Error::Invalid("trace launcher failed to reap".into()));
-        }
-    }
-    Ok(())
 }
 
 struct SignalGuard(Vec<signal_hook::SigId>);
@@ -742,7 +902,7 @@ pub fn run(root: &Path, mut args: Args) -> Result<(), Error> {
         .collect::<Result<Vec<_>, _>>()?;
     let root = root.canonicalize()?;
     args.executable = args.executable.canonicalize()?;
-    for path in [&root, &args.executable] {
+    for path in [&root, &args.executable, &args.output] {
         if path
             .to_str()
             .is_none_or(|value| value.chars().any(char::is_control))
@@ -756,6 +916,15 @@ pub fn run(root: &Path, mut args: Args) -> Result<(), Error> {
     let load = crate::host_load::check()?;
     fs::create_dir(&args.output)?;
     args.output = args.output.canonicalize()?;
+    if args
+        .output
+        .to_str()
+        .is_none_or(|value| value.chars().any(char::is_control))
+    {
+        return Err(Error::Invalid(
+            "output path requires UTF-8 without control characters".into(),
+        ));
+    }
     bounded(
         Command::new("codesign")
             .args(["--verify", "--strict"])
@@ -827,125 +996,7 @@ pub fn run(root: &Path, mut args: Args) -> Result<(), Error> {
             std::process::id()
         );
         let dir = args.output.join(&id);
-        fs::create_dir(&dir)?;
-        let stdout = dir.join("stdout.log");
-        let stderr = dir.join("stderr.log");
-        // Darwin AF_UNIX paths are short; do not derive a socket name from
-        // an arbitrarily deep artifact directory. TempDir owns its removal.
-        let gate_dir = tempfile::Builder::new()
-            .prefix("carrick-stress-")
-            .tempdir_in("/tmp")?;
-        let gate = gate_dir.path().join("start.sock");
-        let listener = UnixListener::bind(&gate)?;
-        listener.set_nonblocking(true)?;
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .arg("stress-capture-child")
-            .arg("--executable")
-            .arg(&args.executable)
-            .arg("--test")
-            .arg(&args.test)
-            .arg("--gate")
-            .arg(&gate)
-            .env("CARRICK_RUN_ID", &id)
-            .env(
-                "CARRICK_FATAL_HOLD_SECS",
-                args.capture_seconds
-                    .saturating_add(10)
-                    .min(u64::from(u32::MAX))
-                    .to_string(),
-            )
-            .stdout(File::create(&stdout)?)
-            .stderr(File::create(&stderr)?);
-        lease.configure_command(&mut command)?;
-        detached(&mut command);
-        let start = Instant::now();
-        let child = command.spawn()?;
-        let mut guard = RunGuard {
-            root: &root,
-            id: id.clone(),
-            dir: dir.clone(),
-            child,
-            cleaned: false,
-        };
-        let mut startup = accept_start(&listener)?;
-        let trace_result = trace(&args, &guard);
-        let trace_error = trace_result.as_ref().err().map(ToString::to_string);
-        let mut trace_child = trace_result.unwrap_or(None).map(|child| TraceGuard {
-            child,
-            dir: dir.clone(),
-            started: Instant::now(),
-            bound: Duration::from_secs(args.trace_seconds.saturating_add(5)),
-            stopped: false,
-        });
-        let ready = if let Some(error) = trace_error {
-            Err(Error::Invalid(error))
-        } else if let Some(ref mut tracer) = trace_child {
-            wait_trace_ready(tracer)
-        } else {
-            Ok(())
-        };
-        if ready.is_ok() {
-            startup.write_all(&[1])?;
-        }
-        let observed = ready.and_then(|()| {
-            monitor(
-                &mut guard.child,
-                &stderr,
-                &patterns,
-                Duration::from_secs(args.hang_seconds.unwrap_or(args.timeout_seconds)),
-                &stop,
-                &args.exit_codes,
-                trace_child.as_mut(),
-            )
-        });
-        let mut record = Record {
-            run_id: id.clone(),
-            outcome: Outcome::Error,
-            exit_code: None,
-            signal: None,
-            elapsed_ms: start.elapsed().as_millis(),
-            trace_events: None,
-            artifacts: vec![stdout, stderr, dir.join("cleanup.log")],
-            errors: Vec::new(),
-        };
-        if let Some(ref mut tracer) = trace_child {
-            if let Err(error) = tracer.stop() {
-                record.errors.push(error.to_string());
-            }
-            record.artifacts.extend([
-                dir.join("dtrace.log"),
-                dir.join("probes.d"),
-                dir.join("probes.sha256"),
-                dir.join("dtrace-processes.log"),
-            ]);
-            let mut tail = StderrTail {
-                file: File::open(dir.join("dtrace.log"))?,
-                overlap: Vec::new(),
-            };
-            let event = Regex::new("probe=").map_err(|e| Error::Invalid(e.to_string()))?;
-            let fired = tail.matches(std::slice::from_ref(&event))?;
-            record.trace_events = Some(fired);
-        }
-        match observed {
-            Ok((outcome, status)) => {
-                record.outcome = outcome;
-                record.exit_code = status.and_then(|s| s.code());
-                record.signal = status.and_then(|s| s.signal());
-                if matches!(outcome, Outcome::Hang | Outcome::Stderr) && status.is_none() {
-                    capture(&root, &args, &guard, &mut record);
-                }
-            }
-            Err(error) => record.errors.push(error.to_string()),
-        }
-        if selected(record.outcome) && record.trace_events == Some(false) {
-            record
-                .errors
-                .push("DTrace recorded zero scoped probe events; trace is inconclusive".into());
-        }
-        if let Err(error) = guard.cleanup() {
-            record.errors.push(error.to_string());
-        }
+        let record = run_iteration(&root, &args, &lease, &patterns, &stop, id.clone(), dir);
         let halted = selected(record.outcome) || !record.errors.is_empty();
         *summary
             .counts
@@ -978,6 +1029,160 @@ pub fn run(root: &Path, mut args: Args) -> Result<(), Error> {
     }
     Ok(())
 }
+// One iteration always returns a record, including failures before spawn,
+// startup admission failures, trace-read errors and explicit cleanup errors.
+fn run_iteration(
+    root: &Path,
+    args: &Args,
+    lease: &crate::host_lease::HostLease,
+    patterns: &[Regex],
+    stop: &AtomicBool,
+    id: String,
+    dir: PathBuf,
+) -> Record {
+    let start = Instant::now();
+    let stdout = dir.join("stdout.log");
+    let stderr = dir.join("stderr.log");
+    let mut record = Record {
+        run_id: id.clone(),
+        outcome: Outcome::Error,
+        exit_code: None,
+        signal: None,
+        elapsed_ms: 0,
+        trace_events: None,
+        fatal_pid: None,
+        artifacts: vec![
+            stdout.clone(),
+            stderr.clone(),
+            dir.join("cleanup.log"),
+            dir.join("cleanup-error.txt"),
+            dir.join("tool-processes.log"),
+        ],
+        errors: Vec::new(),
+    };
+    let mut guard = None;
+    let mut tracer = None;
+    let observed = (|| -> Result<_, Error> {
+        fs::create_dir(&dir)?;
+        fs::write(dir.join(".stress-capture-run"), &id)?;
+        // Darwin AF_UNIX paths are short; TempDir owns the startup socket.
+        let gate_dir = tempfile::Builder::new()
+            .prefix("carrick-stress-")
+            .tempdir_in("/tmp")?;
+        let gate = gate_dir.path().join("start.sock");
+        let listener = UnixListener::bind(&gate)?;
+        listener.set_nonblocking(true)?;
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .arg("stress-capture-child")
+            .arg("--executable")
+            .arg(&args.executable)
+            .arg("--test")
+            .arg(&args.test)
+            .arg("--gate")
+            .arg(&gate)
+            .env("CARRICK_RUN_ID", &id)
+            .env(
+                "CARRICK_FATAL_HOLD_SECS",
+                args.capture_seconds
+                    .saturating_add(10)
+                    .min(u64::from(u32::MAX))
+                    .to_string(),
+            )
+            .stdout(File::create(&stdout)?)
+            .stderr(File::create(&stderr)?);
+        lease.configure_command(&mut command)?;
+        detached(&mut command);
+        guard = Some(RunGuard {
+            root,
+            id: id.clone(),
+            dir: dir.clone(),
+            child: command.spawn()?,
+            cleaned: false,
+        });
+        let active = guard
+            .as_mut()
+            .ok_or_else(|| Error::Invalid("missing run custody".into()))?;
+        let mut startup = accept_start(&listener)?;
+        tracer = trace(args, active)?.map(|child| TraceGuard {
+            root: root.to_owned(),
+            child,
+            dir: dir.clone(),
+            started: Instant::now(),
+            bound: Duration::from_secs(args.trace_seconds.saturating_add(5)),
+            stopped: false,
+        });
+        if let Some(trace) = tracer.as_mut() {
+            wait_trace_ready(trace)?;
+        }
+        startup.write_all(&[1])?;
+        monitor(
+            &mut active.child,
+            &stderr,
+            patterns,
+            Duration::from_secs(args.hang_seconds.unwrap_or(args.timeout_seconds)),
+            stop,
+            &args.exit_codes,
+            tracer.as_mut(),
+        )
+    })();
+    // This budget starts at observation, so stopping a tracer cannot consume
+    // the fatal hold and then silently start a fresh capture budget per PID.
+    let capture_started = Instant::now();
+    if let Some(trace) = tracer.as_mut() {
+        if let Err(error) = trace.stop() {
+            persist_cleanup_error(&dir, &error);
+            record.errors.push(error.to_string());
+        }
+        record.artifacts.extend([
+            dir.join("dtrace.log"),
+            dir.join("probes.d"),
+            dir.join("probes.sha256"),
+            dir.join("tool-kill.log"),
+        ]);
+        let events = (|| -> Result<bool, Error> {
+            let mut tail = StderrTail {
+                file: File::open(dir.join("dtrace.log"))?,
+                overlap: Vec::new(),
+            };
+            let event = Regex::new("probe=").map_err(|error| Error::Invalid(error.to_string()))?;
+            Ok(tail.matches(std::slice::from_ref(&event))?)
+        })();
+        match events {
+            Ok(fired) => record.trace_events = Some(fired),
+            Err(error) => record.errors.push(error.to_string()),
+        }
+    }
+    match observed {
+        Ok((outcome, status, fatal_pid)) => {
+            record.outcome = outcome;
+            record.exit_code = status.and_then(|status| status.code());
+            record.signal = status.and_then(|status| status.signal());
+            record.fatal_pid = fatal_pid;
+            if matches!(outcome, Outcome::Hang | Outcome::Stderr)
+                && status.is_none()
+                && let Some(active) = guard.as_ref()
+            {
+                capture(root, args, active, &mut record, capture_started);
+            }
+        }
+        Err(error) => record.errors.push(error.to_string()),
+    }
+    if selected(record.outcome) && record.trace_events == Some(false) {
+        record
+            .errors
+            .push("DTrace recorded zero scoped probe events; trace is inconclusive".into());
+    }
+    if let Some(active) = guard.as_mut()
+        && let Err(error) = active.cleanup()
+    {
+        persist_cleanup_error(&dir, &error);
+        record.errors.push(error.to_string());
+    }
+    record.elapsed_ms = start.elapsed().as_millis();
+    record
+}
+
 // The production loop and fake-child tests share first-stop and iteration limits.
 fn run_iterations(
     mut count: u32,
@@ -1024,15 +1229,189 @@ fn render(summary: &Summary) -> String {
 }
 
 #[cfg(test)]
-#[path = "../../carrick-embed/tests/common/fatal_hold.rs"]
-mod embed_fatal_hold;
-
-#[cfg(test)]
 mod serial_host {
     // Fixture setup failures should identify the failed prerequisite.
     #![allow(clippy::expect_used)]
     use super::*;
     use std::io::{Seek, SeekFrom};
+    struct TestChild(Child);
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = kill_group(&self.0);
+                let _ = wait_bounded(&mut self.0, Duration::from_secs(2));
+            }
+        }
+    }
+
+    #[test]
+    fn serial_host_scoped_helper_reaps_tools_and_preserves_sibling_prefix() {
+        use std::os::unix::fs::symlink;
+        let base = tempfile::tempdir().expect("directory");
+        let run = base.path().join("run [1]\\t");
+        let sibling = base.path().join("run [1]\\t-other");
+        let spawn = |dir: &Path| {
+            fs::create_dir(dir).expect("run dir");
+            fs::write(dir.join(".stress-capture-run"), "test").expect("marker");
+            let program = dir.join("tool");
+            symlink("/bin/sleep", &program).expect("tool path");
+            let mut command = Command::new(program);
+            command
+                .arg("60")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            detached(&mut command);
+            TestChild(command.spawn().expect("fake tool"))
+        };
+        let mut target = spawn(&run);
+        let mut survivor = spawn(&sibling);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        bounded(
+            Command::new(root.join("scripts/sudo/kill-capture.sh")).arg(&run),
+            &base.path().join("helper.log"),
+            10,
+        )
+        .expect("scoped helper");
+        assert!(
+            wait_bounded(&mut target.0, Duration::from_secs(5))
+                .expect("reap")
+                .is_some()
+        );
+        assert!(survivor.0.try_wait().expect("sibling status").is_none());
+        assert!(tool_pids(&run).expect("scope verification").is_empty());
+        assert!(!scoped_argv(&sibling.join("tool").to_string_lossy(), &run));
+        assert!(scoped_argv(
+            &run.join("commands with spaces").to_string_lossy(),
+            &run
+        ));
+    }
+
+    #[test]
+    fn serial_host_tool_term_reaps_and_preserves_end_output() {
+        let dir = tempfile::tempdir().expect("directory");
+        let stderr = dir.path().join("tool.log");
+        let (reader, _writer) = UnixStream::pair().expect("notification stream");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "trap 'echo END; exit 0' TERM; echo READY; read line"])
+            .stdout(File::create(&stderr).expect("log"))
+            .stderr(Stdio::null());
+        detached(&mut command);
+        command.stdin(Stdio::from(std::os::fd::OwnedFd::from(reader)));
+        let mut child = TestChild(command.spawn().expect("tool"));
+        let mut tail = StderrTail {
+            file: File::open(&stderr).expect("log"),
+            overlap: Vec::new(),
+        };
+        let ready_pattern = Regex::new("READY").expect("pattern");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !tail
+            .matches(std::slice::from_ref(&ready_pattern))
+            .expect("read")
+        {
+            assert!(Instant::now() < deadline, "tool did not arm");
+            std::thread::sleep(OBSERVATION_INTERVAL);
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        stop_tool(&root, &mut child.0, dir.path()).expect("TERM cleanup");
+        assert!(
+            fs::read_to_string(&stderr)
+                .expect("END output")
+                .contains("END")
+        );
+    }
+
+    #[test]
+    fn serial_host_privileged_tool_timeout_reaps_scoped_argv() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("directory");
+        fs::write(dir.path().join(".stress-capture-run"), "test").expect("marker");
+        let program = dir.path().join("fake-lldb");
+        symlink("/bin/sleep", &program).expect("tool path");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let error = privileged_bounded(
+            &root,
+            Command::new(program).arg("60"),
+            &dir.path().join("capture.log"),
+            dir.path(),
+            Duration::from_millis(10),
+        )
+        .expect_err("capture deadline");
+        assert!(error.to_string().contains("Ok(None)"));
+        assert!(
+            tool_pids(dir.path())
+                .expect("scoped verification")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn serial_host_waitid_observes_exit_without_reaping_pid_custody() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detached(&mut command);
+        let mut child = TestChild(command.spawn().expect("child"));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !leader_exited(&child.0).expect("WNOWAIT") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(OBSERVATION_INTERVAL);
+        }
+        assert!(leader_exited(&child.0).expect("WNOWAIT remains observable"));
+        kill_group(&child.0).expect("zombie group cleanup");
+        assert!(child.0.try_wait().expect("reap").expect("status").success());
+    }
+
+    #[test]
+    fn serial_host_setup_error_still_returns_a_serializable_run_record() {
+        use clap::Parser;
+        let base = tempfile::tempdir().expect("directory");
+        let cli = crate::cli::Cli::try_parse_from([
+            "xtask",
+            "stress-capture",
+            "--executable",
+            "/not/a/test",
+            "--test",
+            "test",
+            "--output",
+            "/not/output",
+        ])
+        .expect("CLI");
+        let crate::cli::Commands::StressCapture(args) = cli.command else {
+            unreachable!()
+        };
+        let lease = crate::host_lease::HostLease::acquire_path(
+            &base.path().join("lease"),
+            crate::host_lease::HostLeaseMode::Carrick,
+        )
+        .expect("isolated lease");
+        let dir = base.path().join("already-exists");
+        fs::create_dir(&dir).expect("inject create_dir failure");
+        let record = run_iteration(
+            base.path(),
+            &args,
+            &lease,
+            &[],
+            &AtomicBool::new(false),
+            "setup-error".into(),
+            dir.clone(),
+        );
+        assert_eq!(record.outcome, Outcome::Error);
+        assert!(!record.errors.is_empty());
+        let json = serde_json::to_value(&record).expect("JSON record");
+        assert_eq!(json["run_id"], "setup-error");
+        assert_eq!(json["outcome"], "error");
+        for message in ["trace cleanup denied", "guest cleanup denied"] {
+            persist_cleanup_error(&dir, &Error::Invalid(message.into()));
+        }
+        let cleanup =
+            fs::read_to_string(dir.join("cleanup-error.txt")).expect("durable cleanup errors");
+        assert!(cleanup.contains("trace cleanup denied"));
+        assert!(cleanup.contains("guest cleanup denied"));
+    }
+
     #[test]
     fn classify_exit_signal_pattern_and_deadline() {
         assert_eq!(
@@ -1080,8 +1459,8 @@ mod serial_host {
                 Outcome::Stderr,
             ),
             ("echo 'carrick fatal' >&2; exit 134", Outcome::Stderr),
-            ("echo 'carrick fatal' >&2; sleep 5", Outcome::Stderr),
-            ("sleep 5", Outcome::Hang),
+            ("echo 'carrick fatal' >&2; sleep 60", Outcome::Stderr),
+            ("sleep 60", Outcome::Hang),
             ("kill -KILL $$", Outcome::Signal),
         ] {
             let stderr = dir.path().join("stderr");
@@ -1092,18 +1471,22 @@ mod serial_host {
             detached(&mut cmd);
             let mut child = cmd.spawn().expect("fake child");
             let observed_from = Instant::now();
-            let (outcome, _) = monitor(
+            let (outcome, _, _) = monitor(
                 &mut child,
                 &stderr,
                 &patterns,
-                Duration::from_millis(200),
+                if script == "sleep 60" || script == "echo 'carrick fatal' >&2; sleep 60" {
+                    Duration::from_millis(200)
+                } else {
+                    Duration::from_secs(30)
+                },
                 &AtomicBool::new(false),
                 &[134, 139],
                 None,
             )
             .expect("monitor");
             assert_eq!(outcome, expected);
-            if script == "echo 'carrick fatal' >&2; sleep 5" {
+            if script == "echo 'carrick fatal' >&2; sleep 60" {
                 assert!(observed_from.elapsed() >= Duration::from_millis(200));
             }
             if outcome == Outcome::Hang {
@@ -1112,7 +1495,9 @@ mod serial_host {
                 assert_eq!(unsafe { libc::getsid(pid) }, pid);
                 assert_eq!(unsafe { libc::getpgid(pid) }, pid);
             }
-            kill_group(&child).expect("kill");
+            if child.try_wait().expect("status").is_none() {
+                kill_group(&child).expect("kill");
+            }
             assert!(
                 wait_bounded(&mut child, Duration::from_secs(2))
                     .expect("reap")
@@ -1141,16 +1526,18 @@ mod serial_host {
                     .stderr(File::create(&stderr)?);
                 detached(&mut command);
                 let mut child = command.spawn()?;
-                let (outcome, _) = monitor(
+                let (outcome, _, _) = monitor(
                     &mut child,
                     &stderr,
                     &[],
-                    Duration::from_secs(2),
+                    Duration::from_secs(30),
                     &AtomicBool::new(false),
                     &[139],
                     None,
                 )?;
-                kill_group(&child)?;
+                if child.try_wait()?.is_none() {
+                    kill_group(&child)?;
+                }
                 observed.push(outcome);
                 Ok(selected(outcome))
             })
