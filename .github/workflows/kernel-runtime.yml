@@ -239,6 +239,7 @@ jobs:
       # main push cannot prevent the per-SHA baseline receipt from being
       # produced and uploaded for `hvf-gate` (while the job itself still ends red).
       - name: Signed acceptance receipt
+        id: signed-receipt
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
@@ -252,6 +253,11 @@ jobs:
           status=0
           just accept --phase signed --receipt target/ci-receipts/receipt.json || status=$?
           echo "xtask accept exited $status"
+          # A FAIL receipt is intentionally published without failing this
+          # step; retain its evidence even if the later signed tests pass.
+          if [ "$status" -ne 0 ]; then
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+          fi
           test -s target/ci-receipts/receipt.json
 
       # Lane jobs only produce and upload receipts; they never wait for a
@@ -296,6 +302,17 @@ jobs:
             RUST_TEST_THREADS=1 just test-embed
             RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes
           ' signed-fixtures "${bundles[0]}"
+
+      - name: Upload signed failure evidence
+        if: ${{ failure() || steps.signed-receipt.outputs.failed == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hvf-failure-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/el1-gate/${{ github.sha }}/*.log
+            target/embed-post-mortem/**
+            target/embed-logs/**
+          if-no-files-found: warn
 
   # The focused job above is not suite closure. This separate baseline-free
   # gate is intentionally expensive, trusted-event-only, and dormant until the

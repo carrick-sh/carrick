@@ -5,6 +5,8 @@
 //! `CARRICK_RUN_ID`, and runs it under `RUST_TEST_THREADS=1`.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod diagnostics;
+
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
@@ -80,6 +82,7 @@ static GUEST_LOCK: Mutex<()> = Mutex::new(());
 /// process, and the Inherit case redirects the process's own fd 1. The recipe
 /// sets `RUST_TEST_THREADS=1`; this is the in-file belt for a filtered run.
 pub fn guest_lock() -> MutexGuard<'static, ()> {
+    diagnostics::install(&repo_root(), &run_id());
     carrick_fatal::arm_debugger_hold_from_env();
     GUEST_LOCK
         .lock()
@@ -224,6 +227,7 @@ pub fn el1_sched_vfs() -> InMemoryFileVfs {
 /// loud failure: HV_DENIED is never a skip, and a prior carrier still retiring
 /// is waited for, bounded.
 pub fn carrier_or_fail() -> Carrier {
+    diagnostics::install(&repo_root(), &run_id());
     for _ in 0..50 {
         match Carrier::new() {
             Ok(carrier) => return carrier,
@@ -279,6 +283,7 @@ pub struct Watchdog {
 
 impl Watchdog {
     pub fn start(timeout: std::time::Duration) -> Self {
+        diagnostics::install(&repo_root(), &run_id());
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_clone = done.clone();
         let run_id = run_id();
@@ -294,33 +299,9 @@ impl Watchdog {
                 eprintln!(
                     "WATCHDOG: timeout ({timeout:?}) exceeded for CARRICK_RUN_ID={run_id}; reaping with scripts/sudo/kill.sh"
                 );
-                // The in-guest scheduler's state is the post-mortem of a
-                // wedge in a carrier that schedules threads at EL1.
-                if let Some(zone) = carrick_el1_abi::zone_tables() {
-                    let mut census = String::new();
-                    let _ = zone.write_census(&mut census);
-                    // The object each parked record waits on, and its state:
-                    // a lost write leaves the object empty; a lost wake
-                    // leaves it readable with the waiter still linked.
-                    if let Some(region) =
-                        carrick_el1_abi::ipc_window_host().and_then(|window| window.attach().ok())
-                    {
-                        let _ =
-                            carrick_el1_abi::ipc::write_ipc_wait_census(zone, &region, &mut census);
-                        // Host-side waiters hold no zone record: the objects
-                        // they subscribe to, what each is owed, and the owed
-                        // index a host boundary would drain.
-                        let _ = region.write_host_wake_census(&mut census);
-                    }
-                    // The flags through which EL1 announces owed host work.
-                    let _ = carrick_el1_abi::write_current_task_census(&mut census);
-                    eprintln!("WATCHDOG zone census:\n{census}");
-                }
-                // The abort's post-mortem names every blocked thread's
-                // continuation and whether the wait service still holds it
-                // (never woken) or published its wake (woken, never run).
-                // Persist it for every watchdog wedge, not only when an
-                // operator remembered CARRICK_POSTMORTEM_DIR.
+                diagnostics::replay();
+                // Merely installing a destination does not write anything:
+                // the runner may be stuck before its abort boundary.
                 let post_mortem_dir = carrick_kernel::kernel::debug::PostMortem::configured_dir()
                     .unwrap_or_else(|| {
                         let dir = repo_root().join("target/embed-post-mortem").join(&run_id);
@@ -331,9 +312,11 @@ impl Watchdog {
                     "WATCHDOG post-mortem directory: {}",
                     post_mortem_dir.display()
                 );
-                // The kernel graph's view of the wedge: the runner answers a
-                // latched abort with a post-mortem (written under
-                // CARRICK_POSTMORTEM_DIR when set) before the reap.
+                match diagnostics::persist_watchdog(&run_id, &post_mortem_dir) {
+                    Ok(path) => eprintln!("WATCHDOG post-mortem written: {}", path.display()),
+                    Err(error) => eprintln!("WATCHDOG post-mortem write failed: {error}"),
+                }
+                // Evidence is durable BEFORE asking the runner to abort.
                 carrick_kernel::kernel::debug::request_abort(
                     carrick_kernel::kernel::debug::AbortReason::DebugRequest {
                         run_id: run_id.clone(),
