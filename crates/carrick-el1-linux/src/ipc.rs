@@ -2463,6 +2463,7 @@ mod tests {
         let a = w.table(w.a_tid);
         let (read, write, _) = w.pipe(a, BLOCK);
         let event = w.eventfd(a, 5, EventMode::Counter, BLOCK);
+        let (epoll, _) = zone_epoll(&w, a, event, 7);
         let b = w.fork_table(a, 202);
         let mut fds = [
             PollFd {
@@ -2481,6 +2482,11 @@ mod tests {
                 revents: -1,
             },
             PollFd {
+                fd: epoll,
+                events: crate::file_table::LINUX_POLLRDNORM,
+                revents: -1,
+            },
+            PollFd {
                 fd: 60,
                 events: 0,
                 revents: -1,
@@ -2489,23 +2495,29 @@ mod tests {
         let table = w.task.linux.file_table.load(Ordering::Acquire);
         assert_eq!(
             resolve_poll(&[], &[], &[], Some(&w.venue()), table, &mut fds),
-            Some(2)
+            Some(3)
         );
         assert_eq!(
             fds.map(|fd| fd.revents),
-            [0, LINUX_POLLIN | LINUX_POLLOUT, 0, LINUX_POLLNVAL]
+            [
+                0,
+                LINUX_POLLIN | LINUX_POLLOUT,
+                0,
+                crate::file_table::LINUX_POLLRDNORM,
+                LINUX_POLLNVAL
+            ]
         );
         w.host_close(a, write);
         w.host_close(b, write);
         fds[0].events = 0;
         assert_eq!(
             resolve_poll(&[], &[], &[], Some(&w.venue()), table, &mut fds),
-            Some(3)
+            Some(4)
         );
         assert_eq!(fds[0].revents, LINUX_POLLHUP);
         assert_eq!(
             resolve_poll(&[], &[], &[], Some(&w.venue()), 9999, &mut fds),
-            Some(3)
+            Some(4)
         );
         assert_eq!(
             fds[0].revents, LINUX_POLLNVAL,
