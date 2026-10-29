@@ -2363,6 +2363,7 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
             );
 
             run_as(fixture, 42, 12, 102, waiter_control);
+            let live_before_resume = fixture.page.live();
             let mut resume_frame = carrick_el1_abi::TrapFrame::default();
             let mut handoff = None;
             let mut waiter_service = Aarch64NativeProcessService::with_crossing(
@@ -2493,11 +2494,28 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
             assert_eq!(fixture.zone.slot(waiter_slot).queued(), 0);
             fixture.zone.release_space(waiter_slot);
 
-            fixture
-                .page
-                .reserve_cancelled_member_exit()
-                .unwrap()
-                .publish();
+            assert!(live_before_resume >= 1, "the waiter retains a live unit");
+            assert_eq!(
+                fixture.page.live(),
+                if matches!(mode, CancelMode::QueuedProductionResume) {
+                    live_before_resume - 1
+                } else {
+                    live_before_resume
+                },
+                "only production resume consumes the waiter's unit in the zone"
+            );
+            carrick_core::terminal::reserve_host_thread_exit_membership(
+                fixture.page,
+                waiter_control,
+            )
+            .unwrap()
+            .commit_zone_retirement()
+            .publish();
+            assert_eq!(
+                fixture.page.live(),
+                live_before_resume - 1,
+                "native resume and host retirement together consume exactly one unit"
+            );
             fixture
                 .page
                 .publish_exact_host_retirement(waiter_control, birth.retirement());
