@@ -88,6 +88,7 @@ pub(in crate::dispatch) struct DelegatedRoot {
 
 impl DelegatedRoot {
     pub(in crate::dispatch) fn provision_metadata(&self) -> Result<(), Refusal> {
+        let _host = self.host_serial.lock();
         self.provider.provision_metadata(self.mm)
     }
     /// One host-venue step on the exact admitted root. The root guard lives
@@ -237,5 +238,68 @@ impl SyscallDispatcher {
         provider: Arc<dyn HostReservationProvider>,
     ) -> Result<(), Refusal> {
         self.mm_authority().install_reservation_provider(provider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn metadata_provisioning_joins_the_same_host_queue_as_root_observation() {
+        struct Provisioner {
+            inner: Arc<dyn HostReservationProvider>,
+            serial: Arc<parking_lot::Mutex<()>>,
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl HostReservationProvider for Provisioner {
+            fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
+                self.inner.prepare()
+            }
+            fn provision_metadata(&self, mm: ReservationMm) -> Result<(), Refusal> {
+                assert!(
+                    self.serial.is_locked(),
+                    "metadata provisioning bypassed host serialization"
+                );
+                let view = self.prepare()?;
+                let held = view.lock(mm)?;
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                drop(held);
+                Ok(())
+            }
+        }
+        let dispatcher = SyscallDispatcher::new();
+        let _fixture = crate::dispatch::mem::delegated_tests::Root::admit(&dispatcher);
+        let mut root = dispatcher.mem().lock().delegated_root().cloned().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        root.provider = Arc::new(Provisioner {
+            inner: Arc::clone(&root.provider),
+            serial: Arc::clone(&root.host_serial),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        std::thread::scope(|scope| {
+            let provisioner = root.clone();
+            let provision = scope.spawn(move || provisioner.provision_metadata());
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let observer = root.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+            let observe = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                observer.with_root(|model| Ok(model.mm()))
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            release_tx.send(()).unwrap();
+            assert_eq!(provision.join().unwrap(), Ok(()));
+            assert_eq!(observe.join().unwrap(), Ok(root.mm()));
+        });
     }
 }
