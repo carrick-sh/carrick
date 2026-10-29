@@ -71,7 +71,9 @@ mod native_successor;
 pub use self::native_successor::NativeSuccessorImage;
 mod host_backing;
 mod host_first_touch;
-pub use host_first_touch::{HostFirstTouchDescriptorReceipt, HostFirstTouchIntent};
+pub use host_first_touch::{
+    HostFirstTouchDescriptorReceipt, HostFirstTouchError, HostFirstTouchIntent,
+};
 pub mod fault;
 pub(crate) use self::fault::*;
 pub(crate) use madvise::MadviseCoveredSegment;
@@ -2601,7 +2603,7 @@ impl SyscallDispatcher {
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
         address: u64,
-    ) -> Option<ResidentFaultPlan<'permit>> {
+    ) -> Result<Option<ResidentFaultPlan<'permit>>, ReservationBusy> {
         self.mem_view().resident_fault_plan(permit, address)
     }
 
@@ -2611,7 +2613,7 @@ impl SyscallDispatcher {
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
         address: u64,
         max_len: u64,
-    ) -> Option<ResidentFrameGrantPlan<'permit>> {
+    ) -> Result<Option<ResidentFrameGrantPlan<'permit>>, ReservationBusy> {
         self.mem_view()
             .resident_frame_grant_plan(permit, address, max_len)
     }

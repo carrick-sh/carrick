@@ -346,11 +346,22 @@ impl FrameGrantMailbox {
         true
     }
 
+    /// Abandon an exact claim before preparing or publishing any backing.
+    /// A root-owner wait releases the vCPU slot; a later fault on its current
+    /// slot creates a fresh request rather than retaining this slot across park.
+    pub fn abandon_unstarted_request(&self, request: FrameGrantRequest) -> bool {
+        self.release_claim(request)
+    }
+
     /// Finish a claimed owner file fault after its descriptor transaction
     /// committed. The faulting page is live, so EL1 will not fault again to
     /// consume a refusal; leaving RESPONSE would strand every later page on
     /// this vCPU's single-flight mailbox.
     pub fn complete_resolved_owner_fault(&self, request: FrameGrantRequest) -> bool {
+        self.release_claim(request)
+    }
+
+    fn release_claim(&self, request: FrameGrantRequest) -> bool {
         if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING
             || self.load_request() != Some(request)
         {

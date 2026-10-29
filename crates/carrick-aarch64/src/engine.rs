@@ -3039,8 +3039,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                             len,
                             &mut crate::descriptor_drain::EngineGrantVenue(&mut *engine),
                         )
-                        .map_err(|error| {
-                            MemoryError::HostMap(format!("host copyout grant: {error}"))
+                        .map_err(|error| match error.downcast::<MemoryError>() {
+                            Ok(error) => *error,
+                            Err(error) => {
+                                MemoryError::HostMap(format!("host copyout grant: {error}"))
+                            }
                         })
                 },
             )?;
@@ -3102,7 +3105,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                             .map_err(|error| error.to_string())
                     })
                 }
-                .map_err(|error| MemoryError::HostMap(format!("host first touch: {error}")))?;
+                .map_err(|error| match error.downcast::<MemoryError>() {
+                    Ok(error) => *error,
+                    Err(error) => MemoryError::HostMap(format!("host first touch: {error}")),
+                })?;
                 // Another executor may have committed this leaf after our
                 // read-only walk. Its completed publication needs no second
                 // plan; an unchanged prepared leaf still does.

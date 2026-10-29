@@ -1316,35 +1316,43 @@ impl<'a> MemView<'a> {
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
         address: u64,
-    ) -> Option<ResidentFaultPlan<'permit>> {
+    ) -> Result<Option<ResidentFaultPlan<'permit>>, ReservationBusy> {
         let exclusion = self.begin_host_alias_dispatch(permit);
         let page = page_floor(address, self.linux_page_size());
         let mem_authority_32 = self.mem();
         let mem = mem_authority_32.lock();
         match mem.try_root_owes_backing_at(page) {
-            Ok(true) | Err(RootAccessRefusal::Busy(_)) => return None,
+            Ok(true) => return Ok(None),
+            Err(RootAccessRefusal::Busy(busy)) => return Err(busy),
             Ok(false) => {}
             Err(refusal) => broken_root("a resident fault predecessor observation", refusal),
         }
         let prot = match mem.try_first_touch_owner(page) {
             Ok(FirstTouchOwner::Host) => {
                 if bus_fault_contains(&mem.bus_fault_ranges, page) {
-                    return None;
+                    return Ok(None);
                 }
-                mem.resident_fault_ranges.prot_for_page(page)?
+                match mem.resident_fault_ranges.prot_for_page(page) {
+                    Some(prot) => prot,
+                    None => return Ok(None),
+                }
             }
             Ok(FirstTouchOwner::Root(mapping, incarnation)) => {
-                mem.root_armed_prot(&mapping, incarnation, page)?
+                match mem.root_armed_prot(&mapping, incarnation, page) {
+                    Some(prot) => prot,
+                    None => return Ok(None),
+                }
             }
-            Ok(FirstTouchOwner::Unmapped) | Err(RootAccessRefusal::Busy(_)) => return None,
+            Ok(FirstTouchOwner::Unmapped) => return Ok(None),
+            Err(RootAccessRefusal::Busy(busy)) => return Err(busy),
             Err(refusal) => broken_root("a first-touch observation", refusal),
         }
         .bits();
-        Some(ResidentFaultPlan {
+        Ok(Some(ResidentFaultPlan {
             page,
             prot,
             exclusion,
-        })
+        }))
     }
 
     pub(crate) fn resident_frame_grant_plan<'permit>(
@@ -1352,10 +1360,10 @@ impl<'a> MemView<'a> {
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
         address: u64,
         max_len: u64,
-    ) -> Option<ResidentFrameGrantPlan<'permit>> {
+    ) -> Result<Option<ResidentFrameGrantPlan<'permit>>, ReservationBusy> {
         let page_size = self.linux_page_size();
         if max_len == 0 || !max_len.is_multiple_of(page_size) {
-            return None;
+            return Ok(None);
         }
         let exclusion = self.begin_host_alias_dispatch(permit);
         let page = page_floor(address, page_size);
@@ -1363,7 +1371,10 @@ impl<'a> MemView<'a> {
         let mem = mem_authority.lock();
         let (grant, owner_span, root_incarnation) = match mem.try_first_touch_owner(page) {
             Ok(FirstTouchOwner::Host) => (
-                mem.resident_fault_ranges.grant_for_page(page, max_len)?,
+                match mem.resident_fault_ranges.grant_for_page(page, max_len) {
+                    Some(grant) => grant,
+                    None => return Ok(None),
+                },
                 None,
                 None,
             ),
@@ -1371,12 +1382,14 @@ impl<'a> MemView<'a> {
                 let grant = match mem.try_root_grant_for_page(&mapping, incarnation, page, max_len)
                 {
                     Ok(Some(grant)) => grant,
-                    Ok(None) | Err(RootAccessRefusal::Busy(_)) => return None,
+                    Ok(None) => return Ok(None),
+                    Err(RootAccessRefusal::Busy(busy)) => return Err(busy),
                     Err(refusal) => broken_root("a first-touch grant plan", refusal),
                 };
                 (grant, Some(mapping.range), Some(incarnation))
             }
-            Ok(FirstTouchOwner::Unmapped) | Err(RootAccessRefusal::Busy(_)) => return None,
+            Ok(FirstTouchOwner::Unmapped) => return Ok(None),
+            Err(RootAccessRefusal::Busy(busy)) => return Err(busy),
             Err(refusal) => broken_root("a first-touch observation", refusal),
         };
         let root_owned = owner_span.is_some();
@@ -1387,7 +1400,9 @@ impl<'a> MemView<'a> {
         // containing the faulting page; otherwise publication tags the BUS
         // page as live EL1-private backing before signal classification.
         for &(bus_start, bus_len) in &mem.bus_fault_ranges {
-            let bus_end = bus_start.checked_add(bus_len)?;
+            let Some(bus_end) = bus_start.checked_add(bus_len) else {
+                return Ok(None);
+            };
             // The live root incarnation supersedes the host file's BUS
             // tail. Keep any part outside that node as an obstacle.
             for (piece_start, piece_end) in
@@ -1402,7 +1417,7 @@ impl<'a> MemView<'a> {
                     continue;
                 }
                 if piece_start <= page && page < piece_end {
-                    return None;
+                    return Ok(None);
                 }
                 if piece_end <= page {
                     start = start.max(piece_end);
@@ -1412,16 +1427,24 @@ impl<'a> MemView<'a> {
             }
         }
         if start >= end {
-            return None;
+            return Ok(None);
         }
-        let stock = root_owned
-            && mem.delegated_root().is_some_and(|root| {
-                ReservationRange::new(start, end).is_some_and(|span| {
-                    root.with_root(|model| root_holes(model, span))
-                        .is_ok_and(|holes| !holes.is_empty())
-                })
-            });
-        Some(ResidentFrameGrantPlan {
+        let stock = if root_owned {
+            if let (Some(root), Some(span)) =
+                (mem.delegated_root(), ReservationRange::new(start, end))
+            {
+                match root.with_root(|model| root_holes(model, span)) {
+                    Ok(holes) => !holes.is_empty(),
+                    Err(RootAccessRefusal::Busy(busy)) => return Err(busy),
+                    Err(refusal) => broken_root("a first-touch stock plan", refusal),
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        Ok(Some(ResidentFrameGrantPlan {
             root_owned,
             root_incarnation,
             stock,
@@ -1430,7 +1453,7 @@ impl<'a> MemView<'a> {
             len: end - start,
             prot: grant.prot.bits(),
             exclusion,
-        })
+        }))
     }
 
     pub(crate) fn published_frame_grant_plan<'permit>(
@@ -1632,7 +1655,9 @@ impl<'a> MemView<'a> {
         use_plan: impl FnOnce(ResidentFaultPlan<'_>) -> T,
     ) -> Option<T> {
         super::mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
-            self.resident_fault_plan(permit, addr).map(use_plan)
+            self.resident_fault_plan(permit, addr)
+                .expect("test root must be available")
+                .map(use_plan)
         })
     }
 
@@ -1645,6 +1670,7 @@ impl<'a> MemView<'a> {
     ) -> Option<T> {
         super::mm_mutation::test_support::with_permit(self.mm_mutation_coordinator(), |permit| {
             self.resident_frame_grant_plan(permit, addr, max_len)
+                .expect("test root must be available")
                 .map(use_plan)
         })
     }
