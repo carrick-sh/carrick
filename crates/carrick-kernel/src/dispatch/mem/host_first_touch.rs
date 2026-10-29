@@ -7,7 +7,7 @@ use crate::kernel::MmId;
 use carrick_el1_abi::ReservationRange;
 
 /// Preparation can suspend before descriptor publication without losing its owner.
-#[derive(Debug, PartialEq, Eq, ::thiserror::Error)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq, ::thiserror::Error)]
 pub enum HostFirstTouchError {
     #[error("reservation preparation waits for {0:?}")]
     Busy(#[from] ReservationBusy),
