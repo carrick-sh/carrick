@@ -291,14 +291,18 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
         self.wakes += 1;
         true
     }
-    fn release_current(&mut self, record: RecordRef) -> bool {
+    fn release_current(
+        &mut self,
+        record: RecordRef,
+        retirement: carrick_core::terminal::ZoneRetirement<'_, '_>,
+    ) -> bool {
         assert_eq!(self.current, Some(record));
         assert_eq!(self.words[1], 0, "clear before retirement");
         if std::mem::take(&mut self.fail_release) {
             // A host claim requeued the record (`CurrentRelease::Requeued`).
             return false;
         }
-        self.handoff = carrick_core::entry::retire_current(
+        self.handoff = retirement.retire_current(
             self.binding,
             BornInZoneSource {
                 zone: &self.process.zone,
@@ -306,6 +310,16 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
             },
             record.id,
         );
+        if self.handoff.is_some() {
+            let slot = self.thread().unwrap().slot;
+            let cleanup = carrick_core::terminal::reserve_host_thread_exit_membership(
+                &self.process.page,
+                slot,
+            )
+            .expect("released record must retain exact native terminal membership");
+            cleanup.publish();
+            assert_eq!(self.process.page.live(), 1);
+        }
         self.handoff.is_some()
     }
     fn run_next(&mut self, _: SyscallResult) -> (carrick_core::Served, SyscallResult) {

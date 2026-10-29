@@ -3628,6 +3628,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Retire the exact unpublished record retained for this running host lane.
     /// Published or switched records must use their existing current owner.
     pub fn release_host_home(&self, slot: SlotId, record: RecordId) -> bool {
+        self.release_host_home_with(slot, record, || true)
+    }
+
+    /// Commit terminal ownership after every refusal check, before release.
+    pub fn release_host_home_with(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        commit: impl FnOnce() -> bool,
+    ) -> bool {
         let lane = self.slot(slot);
         let owned = self.record(record);
         if lane.current().is_some()
@@ -3636,6 +3646,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             || owned.home.load(Ordering::Acquire) != slot.plus_one()
             || owned.has_object_operation()
         {
+            return false;
+        }
+        if !commit() {
             return false;
         }
         self.discard_unpublished(slot, record);
@@ -4117,6 +4130,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         record: RecordId,
         wait: &impl LockWait<C>,
     ) -> CurrentRelease {
+        self.release_current_with(slot, record, wait, || true)
+            .unwrap_or(CurrentRelease::Requeued)
+    }
+
+    /// A terminal owner commits only after the requeue alternative is excluded.
+    /// A refused commit retains the current record and its membership.
+    pub fn release_current_with(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        wait: &impl LockWait<C>,
+        commit: impl FnOnce() -> bool,
+    ) -> Option<CurrentRelease> {
         let s = self.slot(slot);
         let rec = self.record(record);
         let owned = matches!(rec.claim(), Claim::OnCpu { slot: owner, .. } | Claim::OnCpuRequested { slot: owner, .. } if owner == slot);
@@ -4124,7 +4150,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             rec.retire_cancelled_metadata_operation();
         }
         if owned && rec.has_object_operation() && self.unswitch_with(slot, record, wait) {
-            return CurrentRelease::Requeued;
+            return Some(CurrentRelease::Requeued);
+        }
+        if owned && !commit() {
+            return None;
         }
         s.current.store(NIL, Ordering::Release);
         if s.host_record.load(Ordering::Acquire) == record.raw() {
@@ -4133,7 +4162,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if owned {
             self.free_record(record);
         }
-        CurrentRelease::Released
+        Some(CurrentRelease::Released)
     }
 
     /// The host publishes the affinity of the thread it runs on `slot`

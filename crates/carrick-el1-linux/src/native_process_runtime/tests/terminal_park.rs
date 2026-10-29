@@ -241,3 +241,260 @@ fn run_failed_never_mints_terminal_load_authority() {
         "run_failed cleanup must never mint ordinary terminal authority"
     );
 }
+
+#[cfg(test)]
+#[test]
+fn losing_entryless_exit_group_publishes_terminal_before_record_release() {
+    use super::super::PendingCloseOperation;
+    use carrick_sched_core::object_wait::OwnerEntry;
+    let fixture = native_exec_fixture();
+    let sibling = add_service_sibling(&fixture, None);
+    assert_eq!(fixture.page.live(), 2);
+    assert!(fixture.control.entry().is_none());
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, fixture.record.id);
+    assert_eq!(
+        fixture.zone.switch_in(fixture.slot),
+        Some(fixture.record.id)
+    );
+    let saved = words(fixture.address);
+    let mut sibling_service = fixture.service();
+    let mut owner = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    owner
+        .begin_closing(PendingCloseOperation::Exit {
+            status: LinuxWaitStatus::exited(0),
+            entry: OwnerEntry::Syscall,
+        })
+        .unwrap();
+    let mut service = fixture.service();
+    let mut loser = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    let (page, channel) = loser
+        .begin_closing(PendingCloseOperation::Exit {
+            status: LinuxWaitStatus::exited(9),
+            entry: OwnerEntry::Exception,
+        })
+        .unwrap();
+    assert!(matches!(
+        fixture.zone.claim_for_host(
+            fixture.record,
+            None,
+            carrick_sched_core::Handback::Control,
+            &carrick_sched_core::ShortLockSpin
+        ),
+        carrick_sched_core::HostClaim::El1Held { .. }
+    ));
+    assert!(
+        loser
+            .park_pending_exit(page, &channel, OwnerEntry::Exception)
+            .unwrap()
+            .is_some()
+    );
+    assert!(fixture.zone.live(fixture.record).is_none());
+    let birth = fixture.control.host_birth_identity().unwrap();
+    assert_eq!(
+        carrick_core::terminal::missing_zone_continuation(
+            fixture.control,
+            birth,
+            Some(birth),
+            fixture.record,
+            fixture.control.zone_record(),
+        ),
+        carrick_core::terminal::MissingContinuationVerdict::Terminal,
+        "losing entry-less caller released its saved continuation without terminal custody"
+    );
+    assert_eq!(
+        fixture.page.live(),
+        0,
+        "each of the two callers owns one live unit"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn losing_pool_exit_group_does_not_reserve_membership_twice() {
+    use super::super::PendingCloseOperation;
+    use carrick_sched_core::object_wait::OwnerEntry;
+    let fixture = native_exec_fixture();
+    let sibling = add_service_sibling(&fixture, None);
+    assert_eq!(fixture.page.live(), 2);
+    fixture
+        .zone
+        .requeue_preempted(sibling.slot, sibling.record.id);
+    assert_eq!(
+        fixture.zone.switch_in(sibling.slot),
+        Some(sibling.record.id)
+    );
+    assert!(fixture.zone.live(sibling.record).is_some());
+    let saved = words(fixture.address);
+    let mut service = fixture.service();
+    let mut owner = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    owner
+        .begin_closing(PendingCloseOperation::Exit {
+            status: LinuxWaitStatus::exited(0),
+            entry: OwnerEntry::Syscall,
+        })
+        .unwrap();
+    let mut sibling_service = fixture.service();
+    let mut loser = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    let (page, channel) = loser
+        .begin_closing(PendingCloseOperation::Exit {
+            status: LinuxWaitStatus::exited(9),
+            entry: OwnerEntry::Syscall,
+        })
+        .unwrap();
+    assert_eq!(page.live(), 0);
+    assert!(
+        loser
+            .park_pending_exit(page, &channel, OwnerEntry::Syscall)
+            .unwrap()
+            .is_some()
+    );
+    assert!(fixture.zone.live(sibling.record).is_none());
+    let graph_cleanup =
+        carrick_core::terminal::reserve_host_thread_exit_membership(page, sibling.control)
+            .expect("losing caller already consumed its exact membership");
+    graph_cleanup
+        .retire_published(sibling.control.entry().unwrap(), sibling.control)
+        .unwrap();
+    assert_eq!(page.live(), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
+    use super::super::PendingCloseOperation;
+    use carrick_sched_core::object_wait::OwnerEntry;
+    let fixture = native_exec_fixture();
+    let sibling = add_service_sibling(&fixture, None);
+    assert_eq!(fixture.page.live(), 2);
+    fixture
+        .zone
+        .requeue_preempted(sibling.slot, sibling.record.id);
+    assert_eq!(
+        fixture.zone.switch_in(sibling.slot),
+        Some(sibling.record.id)
+    );
+    assert!(fixture.zone.live(sibling.record).is_some());
+    let saved = words(fixture.address);
+    let mut service = fixture.service();
+    let mut owner = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    owner
+        .begin_closing(PendingCloseOperation::Exit {
+            status: LinuxWaitStatus::exited(0),
+            entry: OwnerEntry::Syscall,
+        })
+        .unwrap();
+    let host =
+        carrick_core::terminal::reserve_host_thread_exit_membership(fixture.page, sibling.control)
+            .unwrap();
+    assert_eq!(fixture.page.live(), 0);
+    let mut sibling_service = fixture.service();
+    let mut loser = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: sibling.slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    let (page, channel) = loser
+        .begin_closing(PendingCloseOperation::Exit {
+            status: LinuxWaitStatus::exited(9),
+            entry: OwnerEntry::Exception,
+        })
+        .unwrap();
+    assert!(matches!(
+        loser
+            .park_pending_exit(page, &channel, OwnerEntry::Exception)
+            .unwrap(),
+        Some(LifecycleOutcome::HostCustody)
+    ));
+    assert!(fixture.zone.live(sibling.record).is_some());
+    assert_eq!(page.live(), 0);
+    assert!(
+        host.commit_zone_retirement()
+            .retire_published(sibling.control.entry().unwrap(), sibling.control)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        loser
+            .park_pending_exit(page, &channel, OwnerEntry::Exception)
+            .unwrap(),
+        Some(LifecycleOutcome::Transferred { .. })
+    ));
+    assert!(fixture.zone.live(sibling.record).is_none());
+    assert_eq!(page.live(), 0);
+}

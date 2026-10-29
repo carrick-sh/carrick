@@ -5096,11 +5096,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             return Ok(LifecycleOutcome::HostCustody);
         };
-        let (custody, membership) = custody
-            .reserve_nonfinal(page)
-            .map_err(|_| NativeProcessError::Quarantined)?;
+        let (custody, mut membership) = match custody.reserve_member(page, self.control) {
+            Ok(owned) => owned,
+            Err((
+                custody,
+                carrick_core::lifecycle::MemberMembershipError::AlreadyTerminal
+                | carrick_core::lifecycle::MemberMembershipError::InFlight,
+            )) => {
+                if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
+                    return Err(NativeProcessError::Stale);
+                }
+                return Ok(LifecycleOutcome::HostCustody);
+            }
+            Err(_) => return Err(NativeProcessError::Quarantined),
+        };
         let receipt = custody
-            .retire_zone_current(self.control, self.binding, self.source, self.record.id)
+            .retire_zone_current(
+                self.control,
+                &mut membership,
+                self.binding,
+                self.source,
+                self.record.id,
+            )
             .ok_or(NativeProcessError::Quarantined)?;
         carrick_core::lifecycle::retire_cancelled_pool_member(
             page,
@@ -5249,19 +5266,31 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let ready = pending.is_some_and(|pending| pending.ready_or_record(page, is_owner));
             (is_owner, ready)
         };
-        if ready {
-            if is_owner {
-                return Ok(None);
-            }
+        if !is_owner {
             drop(guard);
-            self.retire_thread_identity(self.calling_tid);
-            let receipt = carrick_core::entry::retire_current(self.binding, self.source, record)
-                .ok_or(NativeProcessError::Quarantined)?;
-            self.handoff = Some(receipt);
-            return Ok(Some(LifecycleOutcome::Transferred {
-                progress: carrick_core::Served::Idle,
-                result: SyscallResult::new(0),
-            }));
+            match carrick_core::terminal::settle_losing_zone_current(
+                self.control,
+                self.binding,
+                self.source,
+                record,
+            )
+            .ok_or(NativeProcessError::Quarantined)?
+            {
+                carrick_core::terminal::LosingMemberSettlement::HostCustody => {
+                    return Ok(Some(LifecycleOutcome::HostCustody));
+                }
+                carrick_core::terminal::LosingMemberSettlement::Released(receipt) => {
+                    self.retire_thread_identity(self.calling_tid);
+                    self.handoff = Some(receipt);
+                    return Ok(Some(LifecycleOutcome::Transferred {
+                        progress: carrick_core::Served::Idle,
+                        result: SyscallResult::new(0),
+                    }));
+                }
+            }
+        }
+        if ready {
+            return Ok(None);
         }
         let sequence = zone.next_seq(record);
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
@@ -5272,34 +5301,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             zone.record(record).publish_owner_continuation(entry);
         }
         let sequence = carrick_el1_abi::EntryRecordGeneration(sequence);
-        // Only the process owner owes a retained close continuation. A losing
-        // caller already published its member receipt and retires below.
-        let receipt = if is_owner {
-            carrick_core::terminal::park_process_exit(start, &guard, sequence)
-        } else {
-            carrick_core::entry::publish_handoff_park(start, &guard, sequence)
-        };
-        let Some(receipt) = receipt else {
-            if !is_owner {
-                // SAFETY: the park CAS was refused while this slot still owns
-                // `record`; consume the continuation and retire the losing
-                // exit_group caller's record.
-                unsafe {
-                    zone.record(record).consume_owner_continuation();
-                }
-                drop(guard);
-                self.retire_thread_identity(self.calling_tid);
-                let receipt =
-                    carrick_core::entry::retire_current(self.binding, self.source, record)
-                        .ok_or(NativeProcessError::Quarantined)?;
-                self.handoff = Some(receipt);
-                return Ok(Some(LifecycleOutcome::Transferred {
-                    progress: carrick_core::Served::Idle,
-                    result: SyscallResult::new(0),
-                }));
-            }
-            return Err(NativeProcessError::Quarantined);
-        };
+        let receipt = carrick_core::terminal::park_process_exit(start, &guard, sequence)
+            .ok_or(NativeProcessError::Quarantined)?;
         drop(guard);
         zone.clear_current(self.source.slot);
         self.handoff = Some(receipt);
@@ -5360,6 +5363,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         let mut adopted = Vec::new();
         let mut member_notification = None;
+        let mut member_host_fallback = None;
         let mut cancelled_exec = None;
         let mut refused_exec = None;
         let (page, channel, first_close) = {
@@ -5655,17 +5659,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Err(NativeProcessError::Quarantined);
                 };
                 refused_exec = Some(Box::new(exec));
-            } else if !is_owner
-                && let Some(entry) = self.control.entry()
-                && carrick_el1_abi::Lifecycle::expected_exit_receipt(
-                    page,
-                    self.control,
-                    Some(entry),
-                ) == carrick_core::lifecycle::ExpectedExitReceipt::Pool
-            {
+            } else if !is_owner {
+                let entry = self.control.entry();
                 let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
                     self.binding,
-                    Some(entry),
+                    entry,
                     member_status,
                 )
                 .ok_or(NativeProcessError::Quarantined)?;
@@ -5674,20 +5672,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     carrick_core::terminal::Live,
                 >::admitted(identity)
                 .begin();
-                let (custody, membership) = custody
-                    .reserve_nonfinal(page)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
-                let _ = page.publish(entry);
-                let host_receipt = member_host_identity(page, self.control)?;
-                page.retire_published_host_member(entry, self.control, membership)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
-                page.publish_exact_host_retirement(self.control, host_receipt.retirement());
-                if let carrick_core::terminal::RetirementVerdict::RetireThread {
-                    notification,
-                    ..
-                } = custody.into_verdict(page)
-                {
-                    member_notification = notification;
+                match custody.reserve_member(page, self.control) {
+                    Err((
+                        _,
+                        carrick_core::lifecycle::MemberMembershipError::AlreadyTerminal
+                        | carrick_core::lifecycle::MemberMembershipError::InFlight,
+                    )) => {
+                        member_host_fallback = Some(identity);
+                    }
+                    Err(_) => return Err(NativeProcessError::Quarantined),
+                    Ok((custody, mut membership)) => {
+                        let host_receipt = member_host_identity(page, self.control)?;
+                        custody
+                            .commit_zone_membership(self.control, &mut membership)
+                            .ok_or(NativeProcessError::Quarantined)?;
+                        if let Some(entry) = entry {
+                            let _ = page.publish(entry);
+                            carrick_core::lifecycle::retire_cancelled_pool_member(
+                                page,
+                                entry,
+                                self.control,
+                                membership,
+                            )
+                            .map_err(|_| NativeProcessError::Quarantined)?;
+                        } else {
+                            membership.publish();
+                        }
+                        page.publish_exact_host_retirement(self.control, host_receipt.retirement());
+                        if let carrick_core::terminal::RetirementVerdict::RetireThread {
+                            notification,
+                            ..
+                        } = custody.into_verdict(page)
+                        {
+                            member_notification = notification;
+                        }
+                    }
                 }
             }
             (
@@ -5702,6 +5721,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         };
         drop(registry_state);
+        if let Some(identity) = member_host_fallback {
+            let custody = carrick_core::terminal::TerminalCustody::<
+                carrick_core::terminal::Thread,
+                carrick_core::terminal::Live,
+            >::admitted(identity)
+            .begin();
+            if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
+                return Err(NativeProcessError::Stale);
+            }
+        }
+
         if let Some(exec) = cancelled_exec {
             let cancelled = self.service.cancel_exec_successor(exec.receipt);
             let released = self.release_service_claim(exec.pending.claim);
@@ -5826,7 +5856,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     None => Err(custody),
                 };
                 match result {
-                    Ok(settled) => Some(settled),
+                    Ok(settled) => Some(Box::new(settled)),
                     Err(closing) => {
                         pending.custody = Some(closing);
                         None
@@ -5839,7 +5869,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // A host retirement can claim its birth slot after the ready
             // check. Re-enrol on the channel and recheck under its lock.
         };
-        let _identity = settled.identity();
         let clear_child_tid = self.control.clear_child_tid();
         if clear_child_tid != 0 {
             let mm = self
@@ -5951,7 +5980,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current()
             .or_else(|| self.source.zone.slot(self.source.slot).host_record())
             .ok_or(NativeProcessError::Quarantined)?;
-        self.handoff = carrick_core::entry::retire_current(self.binding, self.source, record);
+        self.handoff =
+            settled.retire_caller_zone_current(self.control, self.binding, self.source, record);
         if self.handoff.is_none() {
             return Err(NativeProcessError::Quarantined);
         }
@@ -11435,7 +11465,7 @@ mod tests {
                     carrick_core::terminal::Live,
                 >::admitted(identity)
                 .begin()
-                .reserve_nonfinal(&*page)
+                .reserve_nonfinal_for_test(&*page)
                 .unwrap_or_else(|_| panic!("last sibling must retire during close"));
                 membership.publish();
                 entry.retire_thread_identity(42);

@@ -1506,7 +1506,11 @@ mod ring_first_tests {
         ) -> bool {
             false
         }
-        fn release_current(&mut self, _: carrick_sched_core::RecordRef) -> bool {
+        fn release_current(
+            &mut self,
+            _: carrick_sched_core::RecordRef,
+            _: carrick_core::terminal::ZoneRetirement<'_, '_>,
+        ) -> bool {
             false
         }
         fn run_next(&mut self, _: SyscallResult) -> (carrick_core_abi::Served, SyscallResult) {

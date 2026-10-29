@@ -7008,7 +7008,7 @@ fn arm_exit_group_waits_for_losing_host_fork_backend_rollback() {
 }
 
 #[test]
-fn arm_concurrent_exit_group_callers_wake_all_and_settle_owner() {
+fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
     use carrick_el1_abi::Lifecycle;
 
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -7142,8 +7142,8 @@ fn arm_concurrent_exit_group_callers_wake_all_and_settle_owner() {
                     // 2. Sibling 2 (tid 42), still OnCpu on slot2, concurrently
                     //    calls exit_group(9) right after pending_exit is published
                     //    and registry_state dropped, before leader's cancel_members
-                    //    and park_pending_exit. Sibling 2 therefore parks FIRST at
-                    //    the head of the exit-wait channel.
+                    //    and park_pending_exit. Its committed member custody
+                    //    releases its record without joining the owner's wait.
                     let fixture = unsafe { &*(fixture_address as *const Fixture) };
                     let service2 = unsafe {
                         &mut *(service2_address
@@ -7158,13 +7158,15 @@ fn arm_concurrent_exit_group_callers_wake_all_and_settle_owner() {
                         carrick_personality_linux::dispatch::CompletionRoute::Suspended
                     );
                     assert_eq!(fixture.zone.counters.el1_wakes.load(Ordering::Acquire), 0);
+                    assert!(fixture.zone.live(record2).is_none());
+                    assert_eq!(service2.crossing.root_exits.load(Ordering::Acquire), 0);
                     run_as_leader(fixture);
                 }));
             }));
 
             // 1. Leader (tid 41) calls exit_group(7) on slot 0, becomes the closing
-            //    owner, and parks on the exit-wait channel BEHIND sibling 2
-            //    ([sibling 2, leader]) while sibling 3 is still uncommitted.
+            //    owner, and parks on the exit-wait channel while sibling 3's
+            //    admitted raw exit is still uncommitted.
             let mut leader_exit_frame = carrick_el1_abi::TrapFrame::default();
             leader_exit_frame.x[0] = 7;
             leader_exit_frame.x[8] = 94;
@@ -7179,8 +7181,8 @@ fn arm_concurrent_exit_group_callers_wake_all_and_settle_owner() {
     );
 
     // 3. Sibling 3 (tid 43) commits raw SYS_exit(0). Its terminal notification
-    //    must bump wake_generation to 1 and wake ALL waiters (both sibling 2
-    //    at the head of the channel and leader behind it).
+    //    must wake the retained process owner. The losing caller has already
+    //    retired and cannot absorb the terminal notification.
     let mut raw_exit_frame = carrick_el1_abi::TrapFrame::default();
     raw_exit_frame.x[8] = 93;
     let counters = Box::new(carrick_el1_abi::Counters::new());
@@ -7212,7 +7214,7 @@ fn arm_concurrent_exit_group_callers_wake_all_and_settle_owner() {
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
             | carrick_personality_linux::dispatch::CompletionRoute::Served
     ));
-    assert_eq!(fixture.zone.counters.el1_wakes.load(Ordering::Acquire), 2);
+    assert_eq!(fixture.zone.counters.el1_wakes.load(Ordering::Acquire), 1);
 
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -7223,52 +7225,24 @@ fn arm_concurrent_exit_group_callers_wake_all_and_settle_owner() {
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
 
-    // Sibling 2 was at the head of the channel; sibling 3's SYS_exit(0)
-    // run_next switched it into fixture.slot. Resuming it must retire its
-    // record via Left(None) (never NoPending) without settling root exit.
-    let first_woken = fixture
+    // Raw exit switched in the owner that it woke. The losing caller's
+    // retired continuation must never be scheduled or reserve membership again.
+    let owner_record = fixture
         .zone
         .slot(fixture.slot)
         .current()
-        .expect("sibling 2 woken from channel head");
-    assert_eq!(first_woken, record2.id);
-    run_as(fixture, 42, 12, 102, control2);
-    let resumed_sibling2 = super::aarch64_process::resume_selected(
-        &runtime,
-        registry(),
-        source,
-        &fixture.task,
-        first_woken,
-        service,
-    );
-    assert!(
-        matches!(
-            resumed_sibling2,
-            super::native_process_runtime::NativeResume::Left(None)
-        ),
-        "second exit_group caller must retire via Left(None)"
-    );
-    assert!(matches!(
-        super::aarch64_process::map_resume(resumed_sibling2, service, &fixture.task, fixture.slot,),
-        crate::sched::ResumeAction::Left
-    ));
+        .expect("terminal notification must select the process owner");
+    assert_ne!(owner_record, record2.id);
+    assert!(fixture.zone.live(record2).is_none());
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
     assert_eq!(service2.crossing.root_exits.load(Ordering::Acquire), 0);
-
-    // Leader was behind sibling 2 on the channel; it must ALSO have been woken
-    // by u32::MAX and must now settle group exit with leader's status 7.
-    let second_woken = fixture
-        .zone
-        .switch_in_full(fixture.slot)
-        .expect("owner must not stay parked while second caller absorbs wake")
-        .record;
     run_as_leader(fixture);
     let resumed_leader = super::aarch64_process::resume_selected(
         &runtime,
         registry(),
         source,
         &fixture.task,
-        second_woken,
+        owner_record,
         service,
     );
     assert!(matches!(
