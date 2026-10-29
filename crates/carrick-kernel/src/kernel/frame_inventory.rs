@@ -3509,6 +3509,178 @@ mod physical_projection_tests {
     use super::*;
     use std::sync::Arc;
 
+    struct AllocationDropProbe(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for AllocationDropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    struct InventoryReleaseProbe {
+        inventory: Arc<FrameInventoryAuthority>,
+        observed: Arc<Mutex<Option<FrameInventorySnapshot>>>,
+    }
+    impl Drop for InventoryReleaseProbe {
+        fn drop(&mut self) {
+            *self.observed.lock() = Some(self.inventory.snapshot());
+        }
+    }
+
+    #[test]
+    fn unpublished_backing_refusal_restores_two_live_mm_inventory_before_release() {
+        use carrick_hal::physical_grants::{NativePhysicalGrants, StagedPhysicalGrants};
+        // Two live MMs, and numeric-MM reuse with a distinct root incarnation.
+        // Neither may redirect the other's inventory rollback or backing.
+        for peer_mm in [41, 42] {
+            for first in [0, 1] {
+                let inventory = Arc::new(FrameInventoryAuthority::new());
+                let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+                let owner = |mm, incarnation| carrick_hal::GuestFrameOwner {
+                    native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+                    root_generation: carrick_guest_arch::ContextGeneration::new(
+                        NonZeroU64::new(incarnation).unwrap(),
+                    ),
+                };
+                let owners = [owner(41, 1), owner(peer_mm, 2)];
+                let rollback =
+                    Arc::new(carrick_hal::physical_grants::PhysicalGrantRollback::default());
+                let before = inventory.snapshot();
+                let stage = |index: usize| {
+                    StagedPhysicalGrants::stage(
+                        Arc::clone(&rollback),
+                        source.clone(),
+                        [carrick_guest_arch::FrameGpa::new(
+                            0x10000 + index as u64 * 0x10000,
+                        )],
+                        0,
+                        16384,
+                        owners[index],
+                    )
+                    .unwrap()
+                };
+                let first_staged = stage(first);
+                let survivor = inventory.snapshot();
+                let second_staged = stage(1 - first);
+                let survivor_mapping =
+                    MappingId::from_kernel_allocation(first_staged.grants()[0].identity.mapping_id);
+                let observed = Arc::new(Mutex::new(None));
+                let mut wrong_owner = NativePhysicalGrants::new(owners[first]);
+                assert!(
+                    wrong_owner
+                        .retain_backing(second_staged.with_backing(InventoryReleaseProbe {
+                            inventory: Arc::clone(&inventory),
+                            observed: Arc::clone(&observed),
+                        }))
+                        .is_err()
+                );
+                let released_snapshot = observed.lock().take().unwrap();
+                // Revisions are monotone; exact live rows and frame counts
+                // restore the preimage, including the simultaneously live peer.
+                assert_eq!(released_snapshot.frames, survivor.frames);
+                assert_eq!(released_snapshot.mappings, survivor.mappings);
+                assert!(
+                    source
+                        .bind(owners[first])
+                        .live_mapping_row(survivor_mapping)
+                        .is_some()
+                );
+                assert!(!rollback.failed());
+                let final_observed = Arc::new(Mutex::new(None));
+                first_staged
+                    .with_backing(InventoryReleaseProbe {
+                        inventory: Arc::clone(&inventory),
+                        observed: Arc::clone(&final_observed),
+                    })
+                    .abort_inventory()
+                    .unwrap();
+                let final_snapshot = final_observed.lock().take().unwrap();
+                assert_eq!(final_snapshot.frames, before.frames);
+                assert_eq!(final_snapshot.mappings, before.mappings);
+            }
+        }
+    }
+
+    #[test]
+    fn unpublished_backing_drop_rolls_back_and_retains_indeterminate_custody() {
+        use carrick_hal::physical_grants::StagedPhysicalGrants;
+        for indeterminate in [false, true] {
+            let inventory = Arc::new(FrameInventoryAuthority::new());
+            let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+            let owner = carrick_hal::GuestFrameOwner {
+                native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()),
+                root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+            };
+            let rollback = Arc::new(carrick_hal::physical_grants::PhysicalGrantRollback::default());
+            let staged = StagedPhysicalGrants::stage(
+                Arc::clone(&rollback),
+                source,
+                [carrick_guest_arch::FrameGpa::new(0x10000)],
+                0,
+                16384,
+                owner,
+            )
+            .unwrap();
+            let mapping = MappingId::from_kernel_allocation(staged.grants()[0].identity.mapping_id);
+            if indeterminate {
+                inventory.state.lock().mappings.remove(&mapping).unwrap();
+            }
+            let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            drop(staged.with_backing(AllocationDropProbe(Arc::clone(&released))));
+            assert_eq!(rollback.failed(), indeterminate);
+            assert_eq!(
+                released.load(std::sync::atomic::Ordering::Acquire),
+                !indeterminate
+            );
+            if !indeterminate {
+                assert!(inventory.snapshot().mappings.is_empty());
+                assert!(inventory.snapshot().frames.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn unpublished_backing_refusal_keeps_allocation_on_indeterminate_rollback() {
+        use carrick_hal::physical_grants::{NativePhysicalGrants, StagedPhysicalGrants};
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let peer = carrick_hal::GuestFrameOwner {
+            root_generation: carrick_guest_arch::ContextGeneration::new(
+                NonZeroU64::new(2).unwrap(),
+            ),
+            ..owner
+        };
+        let rollback = Arc::new(carrick_hal::physical_grants::PhysicalGrantRollback::default());
+        let staged = StagedPhysicalGrants::stage(
+            Arc::clone(&rollback),
+            source.clone(),
+            [carrick_guest_arch::FrameGpa::new(0x10000)],
+            0,
+            16384,
+            owner,
+        )
+        .unwrap();
+        let mapping = MappingId::from_kernel_allocation(staged.grants()[0].identity.mapping_id);
+        // Inject an indeterminate rollback at the actual inventory boundary.
+        // The receipt can no longer prove its complete preimage. Custody must
+        // remain even when some individual rows appear absent.
+        inventory.state.lock().mappings.remove(&mapping).unwrap();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut peer_grants = NativePhysicalGrants::new(peer);
+        let error = peer_grants
+            .retain_backing(staged.with_backing(AllocationDropProbe(Arc::clone(&released))))
+            .unwrap_err();
+        assert!(error.to_string().contains("rollback indeterminate"));
+        assert!(rollback.failed());
+        assert!(
+            !released.load(std::sync::atomic::Ordering::Acquire),
+            "failed inventory undo must retain the exact allocation lease"
+        );
+    }
+
     #[test]
     fn empty_receipt_refuses_equal_number_foreign_owner_and_reincarnated_root() {
         let inventory = Arc::new(FrameInventoryAuthority::new());

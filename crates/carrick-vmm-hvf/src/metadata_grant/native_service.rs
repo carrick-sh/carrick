@@ -773,7 +773,7 @@ impl NativeService {
                         owner,
                         carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
                     )?;
-                grants.publish_cow(staged, retained, pool, exclusion.proof())?;
+                grants.publish_cow(staged.with_backing(retained), pool, exclusion.proof())?;
             }
         }
         let supplied = pool.ready(window.operation.mm.raw()).next().is_some();
@@ -913,8 +913,8 @@ impl NativeService {
                 exec: executable,
             },
         )?;
-        let rows = grants.retain_backing(staged, retained)?;
-        let data = rows.first().ok_or_else(|| stale())?;
+        let unpublished = staged.with_backing(retained);
+        let data = *unpublished.grants().first().ok_or_else(|| stale())?;
         let table_reservation = match stock.owner.reserve_native_descriptor_tables(
             &mut crate::fork_stock::fork_table_accounting(&custody),
             handle,
@@ -923,6 +923,7 @@ impl NativeService {
         ) {
             Ok(reservation) => reservation,
             Err(_) => {
+                unpublished.abort_inventory()?;
                 drop(stock);
                 return self.refuse();
             }
@@ -957,9 +958,21 @@ impl NativeService {
             )
             .is_err()
         {
+            unpublished.abort_inventory()?;
             drop(stock);
             return self.refuse();
         }
+        // Keep the inventory rollback receipt and allocation coupled through
+        // all pre-offer table admission. Only now transfer publication custody;
+        // submit may make the reply consumable immediately.
+        stock
+            .owner
+            .child_physical_mut(handle.mm(), root)
+            .ok_or_else(|| stale())?
+            .supplied
+            .as_mut()
+            .ok_or_else(|| stale())?
+            .retain_backing(unpublished)?;
         // SAFETY: intake pinned and authenticated the request-owned reply. The
         // ring retains it through ACK, then revalidates and executes this slot.
         let submitted = unsafe { reply.as_ref() }.submit(window, &txn);

@@ -760,7 +760,7 @@ fn composed_native_supply(
             physical_generation,
         );
         physical_grants
-            .publish_cow(staged, retained, pool, exclusion.proof())
+            .publish_cow(staged.with_backing(retained), pool, exclusion.proof())
             .unwrap();
     }
     assert_eq!(pool.ready(identity.mm).count(), 2, "bounded first refill");
@@ -1060,7 +1060,7 @@ fn composed_native_supply(
             .supplied
             .as_mut()
             .unwrap()
-            .retain_backing(staged, retained)
+            .retain_backing(staged.with_backing(retained))
             .unwrap()
     };
     use carrick_mmu_core::aarch64::descriptor_txn::{
