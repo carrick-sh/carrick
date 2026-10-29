@@ -9,14 +9,27 @@ use carrick_el1::memory::reservations::{NoRootWait, RootHolder, RootWait};
 
 /// A refused root probe, retaining the exact release producer and the holder
 /// from that same failed acquisition. It owns no lock or execution capacity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::thiserror::Error,
+)]
 #[error("reservation root held by {holder:?}")]
 pub struct ReservationBusy {
     pub wait: carrick_el1_abi::PortalOwnerWait,
     pub holder: RootHolder,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum RootAccessRefusal {
     Busy(ReservationBusy),
     Refused(Refusal),
