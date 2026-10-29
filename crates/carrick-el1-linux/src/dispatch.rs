@@ -1133,7 +1133,11 @@ fn arm_native_service_exit(
                 match super::cow_resolver::dispatch_fault(&mut synthetic, counters, &mut fault_wait)
                 {
                     Action::Served => {
-                        continue;
+                        // Staging made no descriptor/IPC effect. Re-enter the
+                        // ring at the same SVC rather than staging InRing into
+                        // ENOSYS after the owner resolved its destination.
+                        frame.elr = frame.elr.wrapping_sub(4);
+                        return Some(Action::Served);
                     }
                     Action::Forward | Action::ServedWithWork => {
                         service_wait = fault_wait;
@@ -1722,6 +1726,31 @@ pub fn invalid_completion(reason: NativeInvariant) -> ! {
     )
 }
 
+fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
+    process: Option<&mut (dyn lifecycle::ProcessNative<C> + 'p)>,
+    task: &CurrentTask,
+    address: carrick_guest_arch::UserVa,
+    bytes: &[u8],
+    result: SyscallResult,
+) -> FamilyCompletion {
+    if let Some(process) = process {
+        return carrick_personality_linux::lifecycle::lifecycle_effect(&process.complete_copyout(
+            address,
+            bytes.to_vec(),
+            result,
+        ));
+    }
+    let mut copy = file::ValidatedCopy {
+        task,
+        validator: &file::HardwareValidator,
+    };
+    FamilyCompletion::Complete(if copy.copy_out(address.raw(), bytes) {
+        result.raw()
+    } else {
+        carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+    })
+}
+
 pub struct El1PendingFamilies<
     'a,
     F,
@@ -1886,7 +1915,7 @@ impl<
         self.ipc_transfer()
     }
     fn poll(&mut self) -> FamilyCompletion {
-        let Some(task) = self.task() else {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Forward;
         };
         let fds_ptr = self.frame.argument(0).unwrap_or(0);
@@ -2021,27 +2050,20 @@ impl<
                         nfds * core::mem::size_of::<super::file_table::PollFd>(),
                     )
                 };
-                let Some(task) = self.task() else {
+                let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
                     return FamilyCompletion::Forward;
                 };
-                let mut user = file::ValidatedCopy {
+                return complete_poll_copyout(
+                    self.process.as_deref_mut(),
                     task,
-                    validator: &file::HardwareValidator,
-                };
-                if !user.copy_out(fds_ptr, out_bytes) {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    );
-                }
-                return FamilyCompletion::Complete(ready as i64);
+                    carrick_guest_arch::UserVa::new(fds_ptr),
+                    out_bytes,
+                    SyscallResult::new(ready as i64),
+                );
             }
         }
-        let Some(task) = self.task() else {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Forward;
-        };
-        let mut user = file::ValidatedCopy {
-            task,
-            validator: &file::HardwareValidator,
         };
         let ready = super::file_table::resolve_poll(
             self.fd_map,
@@ -2057,11 +2079,15 @@ impl<
                 nfds * core::mem::size_of::<super::file_table::PollFd>(),
             )
         };
-        if !user.copy_out(fds_ptr, out_bytes) {
-            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
-        }
-        if ready > 0 || timeout_ms == 0 {
-            FamilyCompletion::Complete(ready as i64)
+        let completion = complete_poll_copyout(
+            self.process.as_deref_mut(),
+            task,
+            carrick_guest_arch::UserVa::new(fds_ptr),
+            out_bytes,
+            SyscallResult::new(ready as i64),
+        );
+        if ready > 0 || timeout_ms == 0 || !matches!(completion, FamilyCompletion::Complete(_)) {
+            completion
         } else {
             let slot = self.frame.slot();
             let mut continuation = super::file_table::PollContinuation::new(
@@ -3027,9 +3053,13 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         {
             let orig_x0 = frame.x[0];
             let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-            let mut user = file::ValidatedCopy {
-                task,
-                validator: &file::HardwareValidator,
+            let mut user = file::OwnerCopy {
+                inner: file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                },
+                owner: self.process.as_deref_mut(),
+                wait: None,
             };
             let (disposition, sigpipe_owed) =
                 ipc::serve_ipc_with_sigpipe(&mut sched, frame, venue, &mut user, native_sigpipe);

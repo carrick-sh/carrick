@@ -243,6 +243,7 @@ impl Frames {
         let delivery = self.required("::arm_signal::deliver_on_user_return::")?
             + 2 * self.required("::signal_delivery::deliver_signal_on_syscall_return::")?
             + self.maximum("::signal_delivery::force_delivery_fault::");
+        let _copyout = self.required("::finish_copyout::")?;
         let service = (entry
             + self.required("::dispatch::arm_native_service_exit::")?
             + self.required("::aarch64_process::with_process_entry::")?
@@ -397,6 +398,39 @@ impl Frames {
                     + self.required("::apply_fault_reply::")?
                     + (self.sum(&["::grant_target::", "::root_for::"]) + root)
                         .max(self.maximum("::apply_grant::") + descriptors),
+            ),
+            // Completed output is re-driven only after the service stack has
+            // unwound. Charging `service + write` here would describe exactly
+            // the forbidden nested completion/copy chain.
+            (
+                "ring completed copyout",
+                native.max(resume)
+                    + self.sum(&[
+                        "::drain_copyout::",
+                        "::finish_copyout::",
+                        "::copy_owner_frame::",
+                        "::copy_owned_bytes::",
+                    ])
+                    + self.maximum("::complete_copyout::")
+                    + self.qualified("El1PendingFamilies", "::poll::")
+                    + self.maximum("::complete_poll_copyout::")
+                    + write,
+            ),
+            (
+                "ring pipe copyout",
+                native
+                    + self.sum(&[
+                        "::ipc_transfer::",
+                        "::ipc::serve_ipc_with_sigpipe::",
+                        "::ipc::run::",
+                        "::substrate::ipc::transfer::",
+                        "::copy_out_owned::",
+                        "::copy_owner_frame::",
+                        "::copy_owned_bytes::",
+                    ])
+                    + self.qualified("PrefixCopy", "::copy_out::")
+                    + self.qualified("OwnerCopy", "::copy_out::")
+                    + write,
             ),
             (
                 "native wait copy",
@@ -583,6 +617,7 @@ mod tests {
             "x::dispatch::arm_signal_user_return::h0",
             "x::aarch64_process::with_process_entry::h0",
             "x::copy_signal_bytes::h0",
+            "x::finish_copyout::h0",
             "x::write_user_bytes::h0",
             "x::arm_signal::deliver_on_user_return::h0",
             "x::signal_delivery::deliver_signal_on_syscall_return::h0",
@@ -608,6 +643,15 @@ mod tests {
             values.insert(name.to_owned(), 128);
         }
         Frames(values)
+    }
+
+    #[test]
+    fn retained_ring_copyout_chains_are_bounded() {
+        let mut frames = small_frames();
+        frames.0.insert("x::copy_owner_frame::h0".to_owned(), 11500);
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("ring completed copyout"));
+        assert!(error.contains("ring pipe copyout"));
     }
 
     #[test]

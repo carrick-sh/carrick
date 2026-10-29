@@ -303,6 +303,12 @@ impl MemoryValidator for HardwareValidator {
 /// `false` means the copy cannot be done exactly here, and the caller takes its
 /// fallback path (EL1 forwards to the host; the host recalls the object).
 pub trait UserCopy {
+    /// Consume a typed owner refusal from the last output attempt. No byte
+    /// from the refused piece was committed; the operation must retain custody.
+    fn take_owner_wait(&mut self) -> Option<carrick_core_abi::PortalOwnerWait> {
+        None
+    }
+
     /// Copy `src` to the user buffer at `dst_va`.
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool;
     /// Fill `dst` from the user buffer at `src_va`.

@@ -2534,3 +2534,34 @@ Signed HVF execution, Docker differential, paired runtime ratios and exact
 artifact promotion remain director-owned and unavailable on ctb-w4. Existing
 fixture/oracle inputs are unchanged; these VM-free checks do not discharge
 those higher-layer obligations.
+
+### Retained in-ring read and ppoll copyout (#1035 / #898)
+
+`kernel.memory.owner-wait` covers the currently routed read and ppoll outputs.
+The ring uses the shared native `MmPortal::write_user_bytes` protocol to break
+inherited COW and hold an exact-MM fence through each page-sized output piece.
+An owner refusal retains the IPC description pin and delivered-byte cursor on
+the owner's existing scheduler queue. Only delivered pipe bytes are consumed;
+resumption takes that same operation before looking up a numeric descriptor.
+A completed ppoll answer retains its bytes, original ready count and next
+unwritten byte in the existing native service owner. Handled signals do not
+cancel that internal memory wait; fatal cancellation discards remaining output.
+No copy permit, editor or object lock survives a park.
+
+The real-fork binding
+`fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms` was red
+on main at `Some(InRing)` and is now enabled. It proves owner-preparation
+selection, not VMM supply. The two-live-process pipe binding
+`two_live_process_pipe_owner_wait_retains_exact_bytes_and_cursor` uses a real
+owner selector, Gate producer and scheduler continuation with simulated user
+bytes; it requires exactly 8192 delivered bytes, a 4096-byte retained cursor,
+and no writes into the peer MM. The ppoll completion bindings inject the
+second-page refusal at the physical-service boundary and check disjoint output,
+the original result and zero further output after fatal cancellation.
+
+The work bound is one owner transfer per page-aligned copy piece, with no
+replayed prefix on resume and no additional poll readiness query after its
+answer has completed. The existing transfer and IPC work bounds remain intact.
+Signed IPC and `el1_sched` binding, COW supply integration, runtime ratios and
+artifact promotion remain director-owned. Readv/pselect6 routing and x86 IPC
+binding remain the separately authorized work in #1040; no route changes here.

@@ -689,11 +689,49 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
         for e in effects.into_iter().chain(epoll_effects).flatten() {
             sched.finish_object_wake(e);
         }
+        if let Some(wait) = copy.user.take_owner_wait() {
+            if wait.handle().mm().raw() != mm_key(sched.task).0 {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+            }
+            let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
+                sched.zone,
+                wait.handle(),
+                wait,
+            )
+            .unwrap_or_else(|_| {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+            });
+            match park_key(
+                sched,
+                frame,
+                region,
+                token,
+                op,
+                enrollment.key(),
+                enrollment.observed_snapshot(),
+                None,
+            ) {
+                Parked::Done(served) => return (served, false),
+                Parked::Retry(t) => {
+                    token = t;
+                    continue;
+                }
+                Parked::Refused(_) => crate::dispatch::invalid_completion(
+                    crate::dispatch::NativeInvariant::EntryBinding,
+                ),
+            }
+        }
         let written = op.progress.written;
         let result = match status {
             StepStatus::Complete => written as i64,
-            StepStatus::EndOfFile => 0,
+            StepStatus::EndOfFile => written as i64,
             StepStatus::Invalid => linux::EINVAL,
+            // A reader may have committed a prefix before an owner wait.
+            // If a peer drained the rest meanwhile, Linux returns that prefix
+            // rather than parking again (and EOF must preserve it too).
+            StepStatus::Blocked(_) if op.kind == IpcOpKind::PipeRead && written > 0 => {
+                written as i64
+            }
             StepStatus::Blocked(_) if nonblock => {
                 if written > 0 {
                     written as i64
@@ -885,10 +923,24 @@ fn park<C: ThreadCpu, U: UserWord>(
     snap: ObjectWaitSnapshot,
     deadline: Option<u64>,
 ) -> Parked {
-    let (Some(key), Some(resume)) = (
-        wait_key(object, lane),
-        OperationResumePc::new(frame.elr.wrapping_sub(linux::SVC_LEN)),
-    ) else {
+    let Some(key) = wait_key(object, lane) else {
+        return Parked::Refused(token);
+    };
+    park_key(sched, frame, region, token, op, key, snap, deadline)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn park_key<C: ThreadCpu, U: UserWord>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut TrapFrame,
+    region: &IpcRegion<'_>,
+    token: IpcOpToken,
+    op: IpcOperation,
+    key: carrick_sched_core::object_wait::ObjectWaitKey,
+    snap: ObjectWaitSnapshot,
+    deadline: Option<u64>,
+) -> Parked {
+    let Some(resume) = OperationResumePc::new(frame.elr.wrapping_sub(linux::SVC_LEN)) else {
         return Parked::Refused(token);
     };
     if region.update_operation(&token, op).is_err() {
@@ -1150,12 +1202,26 @@ mod tests {
     }
 
     // ---- the world: region (host-initialized), zone, one slot, task A ----
+    enum TestZone {
+        Standalone(Box<ZoneTables>),
+        Carrier(Box<crate::mm_portal::test_support::Region>),
+    }
+    impl core::ops::Deref for TestZone {
+        type Target = ZoneTables;
+        fn deref(&self) -> &ZoneTables {
+            match self {
+                Self::Standalone(zone) => zone,
+                Self::Carrier(region) => region.zone(),
+            }
+        }
+    }
+
     struct World {
         region: &'static IpcRegion<'static>,
         /// Next free byte of the pool's ring area and descriptor area.
         next: Cell<u64>,
         next_descriptor: Cell<u64>,
-        zone: Box<ZoneTables>,
+        zone: TestZone,
         task: CurrentTask,
         cpu: FakeCpu,
         counters: &'static Counters,
@@ -1180,6 +1246,12 @@ mod tests {
     }
 
     fn world() -> World {
+        let zone =
+            unsafe { Box::from_raw(std::alloc::alloc_zeroed(Layout::new::<ZoneTables>()).cast()) };
+        world_with_zone(TestZone::Standalone(zone))
+    }
+
+    fn world_with_zone(zone: TestZone) -> World {
         let dir = unsafe {
             std::alloc::alloc_zeroed(
                 Layout::from_size_align(carrick_el1_abi::ipc::IPC_DIRECTORY_BYTES, 4096).unwrap(),
@@ -1199,8 +1271,6 @@ mod tests {
             )
         }
         .unwrap();
-        let zone: Box<ZoneTables> =
-            unsafe { Box::from_raw(std::alloc::alloc_zeroed(Layout::new::<ZoneTables>()).cast()) };
         zone.spaces.set_idle_ttbr(IDLE_TTBR);
         for (mm, ttbr) in [(MM, TTBR_MM), (OTHER_MM, TTBR_OTHER)] {
             let index = zone.spaces.publish_closed(mm, ttbr, ttbr).unwrap();
@@ -2050,6 +2120,225 @@ mod tests {
         assert_eq!(
             w.counters.ipc_leaves[IpcLeave::ObjectBusyHost as usize].load(Ordering::Relaxed),
             1
+        );
+    }
+
+    #[test]
+    fn two_live_process_pipe_owner_wait_retains_exact_bytes_and_cursor() {
+        pipe_owner_wait_with_peer(false);
+    }
+
+    #[test]
+    fn two_live_process_pipe_owner_wait_returns_delivered_prefix_if_peer_drains() {
+        pipe_owner_wait_with_peer(true);
+    }
+
+    fn pipe_owner_wait_with_peer(peer_drains: bool) {
+        use crate::mm_portal::test_support::{IPA, Region, Tables, VA, nodes, residency};
+        use crate::mm_portal::{GuestVa, MmError, MmPortal, TransferIntent};
+        use carrick_core_abi::{
+            PortalOwnerWait, ReservationMm, ReservationProtection, ReservationRange,
+        };
+        use core::num::NonZeroU64;
+        let mut w = world_with_zone(TestZone::Carrier(Box::new(Region::new())));
+        let a = w.table(w.a_tid);
+        let (read, write, object) = w.pipe(a, BLOCK);
+        let (sleep_read, _, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let pattern: Vec<u8> = (0..8192).map(|n| (n % 251) as u8).collect();
+        w.mem.write(MM, 0x10000, &pattern);
+        let mut send = syscall(SYS_WRITE, write, 0x10000, 8192, A_SVC);
+        assert_eq!((w.call(&mut send), send.x[0]), (RETURNED, 8192));
+        w.mem.map(MM, VA, 8192);
+        w.mem.write(OTHER_MM, VA, &[0x99; 8192]);
+        let other = syscall(SYS_READ, sleep_read, 0x10000, 1, B_SVC);
+        w.queue(202, OTHER_MM, &other, B_SVC);
+
+        // Attach a real reservation root to the already running MM, then use
+        // its production transfer selector and real Gate notification source.
+        let TestZone::Carrier(region) = &w.zone else {
+            unreachable!()
+        };
+        let mm = ReservationMm::new(MM).unwrap();
+        let index = w.zone.spaces.find(MM).unwrap();
+        region
+            .table()
+            .publish(
+                index.index(),
+                mm,
+                carrick_el1::memory::reservations::Layout {
+                    heap: ReservationRange::new(4096, VA).unwrap(),
+                    arena: ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
+                    brk: 4096,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .unwrap();
+        let view = nodes(&region);
+        {
+            let mut root = region
+                .table()
+                .lock_el1_resolved(index.index(), mm, &view, 0)
+                .unwrap();
+            root.import(
+                ReservationRange::new(VA, VA + 8192).unwrap(),
+                ReservationProtection::READ_WRITE,
+                true,
+            )
+            .unwrap();
+            root.finish_import().unwrap();
+        }
+        let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &w.zone.spaces, &view);
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        w.zone
+            .space_entry(NonZeroU64::new(MM).unwrap())
+            .unwrap()
+            .admit_notifications(handle.incarnation(), &HostWait, &|effects| {
+                let _ = effects.defer_handbacks();
+            })
+            .unwrap();
+        let portal = portal.with_zone(&w.zone).unwrap();
+        let tables = Tables::new(
+            TTBR_MM & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+            IPA,
+            2,
+        );
+        let physical = residency();
+        let mut raised = false;
+        struct GatedUser<'a> {
+            inner: User<'a>,
+            check: &'a mut dyn FnMut(u64, usize) -> Result<(), PortalOwnerWait>,
+            wait: Option<PortalOwnerWait>,
+        }
+        impl UserCopy for GatedUser<'_> {
+            fn copy_in(&mut self, bytes: &mut [u8], at: u64) -> bool {
+                self.inner.copy_in(bytes, at)
+            }
+            fn copy_out(&mut self, at: u64, bytes: &[u8]) -> bool {
+                match (self.check)(at, bytes.len()) {
+                    Ok(()) => self.inner.copy_out(at, bytes),
+                    Err(wait) => {
+                        self.wait = Some(wait);
+                        false
+                    }
+                }
+            }
+            fn take_owner_wait(&mut self) -> Option<PortalOwnerWait> {
+                self.wait.take()
+            }
+        }
+        let mut frame = syscall(SYS_READ, read, VA, 8192, A_SVC);
+        {
+            let mut check = |at, len| {
+                if at == VA + 4096 && !raised {
+                    carrick_el1::substrate::sched::object_wait::space_access(&w.zone, SLOT)
+                        .raise(index);
+                    raised = true;
+                }
+                let mut phase = "begin";
+                let result = portal
+                    .begin(
+                        handle,
+                        GuestVa::new(at),
+                        len as u64,
+                        TransferIntent::UserWrite,
+                        u32::from(SLOT.raw()),
+                    )
+                    .and_then(|transfer| {
+                        phase = "select";
+                        portal.select(
+                            &transfer,
+                            &tables.live(
+                                &carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid,
+                            ),
+                            carrick_core::mm::transaction::SelectionVenues {
+                                prepared: &mut carrick_el1::fault::NoopPreparedResolver,
+                                cow: &mut carrick_el1::fault::NoopCowResolver,
+                                residency: &physical,
+                                slot: u32::from(SLOT.raw()),
+                            },
+                        )
+                    });
+                match result {
+                    Ok(carrick_core::mm::transaction::TransferStep::Selected(_)) => Ok(()),
+                    Err(MmError::Wait(wait)) => Err(wait),
+                    other => panic!(
+                        "{phase} at {at:#x}: expected selected bytes or exact owner dependency: {other:?}"
+                    ),
+                }
+            };
+            let mut user = GatedUser {
+                inner: User {
+                    task: &w.task,
+                    mem: &w.mem,
+                },
+                check: &mut check,
+                wait: None,
+            };
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut w.cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            let venue = IpcVenue {
+                region: *w.region,
+                tables: &w.tables,
+            };
+            assert_eq!(
+                serve_ipc(&mut sched, &mut frame, &venue, &mut user),
+                SWITCHED,
+                "an owner refusal after a delivered page must park with its cursor"
+            );
+        }
+        drop(portal);
+        drop(view);
+        assert_eq!(w.mem.read(MM, VA, 4096), pattern[..4096]);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .unread_bytes(),
+            4096
+        );
+        // The second live process releases the MM dependency; its own mapping
+        // at the same VA must remain untouched. It then parks so A can resume.
+        if peer_drains {
+            w.mem.map(OTHER_MM, 0x12000, 4096);
+            let mut peer_read = syscall(SYS_READ, read, 0x12000, 4096, B_SVC);
+            assert_eq!((w.call(&mut peer_read), peer_read.x[0]), (RETURNED, 4096));
+            assert_eq!(w.mem.read(OTHER_MM, 0x12000, 4096), pattern[4096..]);
+        }
+        carrick_el1::substrate::sched::object_wait::space_access(&w.zone, SLOT).lower(index);
+        frame = other;
+        assert_eq!(w.call(&mut frame), SWITCHED);
+        reenter(&mut frame, A_SVC);
+        let delivered = if peer_drains { 4096 } else { 8192 };
+        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, delivered));
+        assert_eq!(
+            w.mem.read(MM, VA, delivered as usize),
+            pattern[..delivered as usize]
+        );
+        if peer_drains {
+            assert_eq!(w.mem.read(MM, VA + 4096, 4096), [0; 4096]);
+        }
+        assert_eq!(w.mem.read(OTHER_MM, VA, 8192), [0x99; 8192]);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .unread_bytes(),
+            0
         );
     }
 

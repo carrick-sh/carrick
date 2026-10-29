@@ -764,7 +764,18 @@ fn stage_call(
             )
         }
         HostFileCall::Read { fd, buf, count } => match staging.descriptor(fd)? {
-            NativeDescriptor::InZone(_) => HostFileStage::InRing,
+            NativeDescriptor::InZone(_) => {
+                let len = chunk(count);
+                let writable = user.writable(buf, len);
+                if writable < len {
+                    HostFileStage::Fault {
+                        address: buf.saturating_add(writable as u64),
+                        access: Access::Write,
+                    }
+                } else {
+                    HostFileStage::InRing
+                }
+            }
             NativeDescriptor::Absent => errno(carrick_syscall_abi::LINUX_EBADF),
             NativeDescriptor::HostBacked { access } if !access.readable() => {
                 errno(carrick_syscall_abi::LINUX_EBADF)
