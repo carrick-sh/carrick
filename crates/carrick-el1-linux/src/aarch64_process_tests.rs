@@ -752,6 +752,144 @@ fn asid(raw: u16) -> carrick_guest_arch::Asid {
     carrick_guest_arch::Asid::from_registry_allocation(core::num::NonZeroU16::new(raw).unwrap())
 }
 
+#[test]
+fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() {
+    use carrick_core::terminal::{MissingContinuationVerdict, missing_zone_continuation};
+    use carrick_el1_abi::Lifecycle;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Owner {
+        Native,
+        HostPreparing,
+        HostCommitted,
+        Final,
+    }
+    for owner in [
+        Owner::Native,
+        Owner::HostPreparing,
+        Owner::HostCommitted,
+        Owner::Final,
+    ] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        // A second live member owns the same lifecycle page and another slot;
+        // neither has been registered with the native process owner yet.
+        let sibling = (owner != Owner::Final).then(|| {
+            fixture.page.thread_born().unwrap();
+            let sibling_control = Box::leak(Box::new(ThreadControlSlot::new()));
+            let sibling_slot = SlotId::new(1);
+            fixture.zone.drive(sibling_slot, 1);
+            fixture.zone.publish_slot(sibling_slot, 1, Some(1), 1);
+            fixture.zone.enter_guest(sibling_slot);
+            fixture.zone.install_space(sibling_slot, 1).unwrap();
+            let sibling_record = fixture
+                .zone
+                .current_or_new(
+                    sibling_slot,
+                    ThreadIdentity {
+                        tid: 42,
+                        serial: 102,
+                        control_slot: sibling_control as *const _ as u64,
+                        ..fixture.leader
+                    },
+                )
+                .unwrap();
+            fixture.zone.requeue_preempted(sibling_slot, sibling_record);
+            assert_eq!(fixture.zone.switch_in(sibling_slot), Some(sibling_record));
+            fixture.zone.record_ref(sibling_record)
+        });
+        let record = fixture
+            .zone
+            .current_or_new(fixture.slot, fixture.leader)
+            .unwrap();
+        fixture.zone.requeue_preempted(fixture.slot, record);
+        assert_eq!(fixture.zone.switch_in(fixture.slot), Some(record));
+        let reference = fixture.zone.record_ref(record);
+        fixture.control.bind_zone_record(reference);
+        let birth = fixture.control.host_birth_identity().unwrap();
+        let host = (owner == Owner::HostPreparing || owner == Owner::HostCommitted).then(|| {
+            carrick_core::terminal::reserve_host_thread_exit_membership(
+                fixture.page,
+                fixture.control,
+            )
+            .unwrap()
+        });
+        let host = if owner == Owner::HostCommitted {
+            host.unwrap().commit_zone_retirement().publish();
+            None
+        } else {
+            host
+        };
+        fixture.control.request_host_exit();
+        if owner != Owner::HostCommitted {
+            assert_eq!(
+                missing_zone_continuation(
+                    fixture.control,
+                    birth,
+                    Some(birth),
+                    reference,
+                    fixture.control.zone_record()
+                ),
+                MissingContinuationVerdict::InvariantViolation
+            );
+        }
+        let mut service = fixture.process_service();
+        assert_eq!(
+            crate::aarch64_process::resume_production_with_service(
+                fixture.zone,
+                &fixture.task,
+                fixture.slot,
+                record,
+                &mut service,
+            ),
+            crate::sched::ResumeAction::Left
+        );
+        if owner == Owner::HostPreparing || owner == Owner::Final {
+            assert!(
+                fixture.zone.live(reference).is_some(),
+                "{owner:?} must retain its record"
+            );
+            assert_eq!(
+                fixture.zone.take_service_head(fixture.slot),
+                Some(reference)
+            );
+            assert_eq!(fixture.page.live(), 1);
+            assert_eq!(
+                missing_zone_continuation(
+                    fixture.control,
+                    birth,
+                    Some(birth),
+                    reference,
+                    fixture.control.zone_record()
+                ),
+                MissingContinuationVerdict::InvariantViolation
+            );
+            drop(host);
+            assert_eq!(
+                fixture.page.live(),
+                if owner == Owner::Final { 1 } else { 2 }
+            );
+            continue;
+        }
+        assert!(fixture.zone.live(reference).is_none());
+        assert_eq!(
+            missing_zone_continuation(
+                fixture.control,
+                birth,
+                Some(birth),
+                reference,
+                fixture.control.zone_record()
+            ),
+            MissingContinuationVerdict::Terminal,
+            "host cancellation must publish terminal intent before freeing its record"
+        );
+        assert_eq!(
+            fixture.page.live(),
+            1,
+            "native release consumes exactly one live unit"
+        );
+        assert!(fixture.zone.live(sibling.unwrap()).is_some());
+    }
+}
+
 impl Fixture {
     #[cfg(test)]
     fn new(root_gpa: u64, asid: carrick_guest_arch::Asid) -> Self {

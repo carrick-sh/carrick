@@ -270,7 +270,67 @@ fn resume_production_with(
             rec.consume_metadata_operation();
         }
         if cancelled_on_slot {
-            let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
+            let (page, control) = lifecycle.unwrap_or_else(|| fatal());
+            let binding = common_entry::execution_binding(task);
+            let source = BornInZoneSource { zone, slot };
+            let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+                binding,
+                control.entry(),
+                carrick_sched_core::process::TerminationStatus::SUCCESS,
+            )
+            .unwrap_or_else(|| fatal());
+            let custody = carrick_core::terminal::TerminalCustody::<
+                carrick_core::terminal::Thread,
+                carrick_core::terminal::Live,
+            >::admitted(identity)
+            .begin();
+            match custody.reserve_member(page, control) {
+                Ok((custody, mut membership)) => {
+                    // The neutral owner commits exact terminal intent at the
+                    // physical release seam, before a queued DirectLoad can
+                    // observe the saved record's absence.
+                    custody
+                        .retire_zone_current(control, &mut membership, binding, source, record)
+                        .unwrap_or_else(|| fatal());
+                    if let Some(entry) = control.entry() {
+                        carrick_core::lifecycle::retire_cancelled_pool_member(
+                            page, entry, control, membership,
+                        )
+                        .unwrap_or_else(|_| fatal());
+                    } else {
+                        membership.publish();
+                    }
+                }
+                Err((_, error)) => {
+                    use carrick_core::lifecycle::MemberMembershipError;
+                    use carrick_core::terminal::LosingMemberSettlement;
+                    match error {
+                        MemberMembershipError::AlreadyTerminal => {
+                            match carrick_core::terminal::settle_losing_zone_current(
+                                control, binding, source, record,
+                            )
+                            .unwrap_or_else(|| fatal())
+                            {
+                                LosingMemberSettlement::Released(_) => {}
+                                LosingMemberSettlement::HostCustody => {
+                                    carrick_core::entry::yield_current_to_host(
+                                        binding, source, record,
+                                    )
+                                    .unwrap_or_else(|| fatal());
+                                }
+                            }
+                        }
+                        // A preparing host owner or final process member owns
+                        // the next transition. Preserve its record for host
+                        // service rather than releasing without terminal proof.
+                        MemberMembershipError::InFlight | MemberMembershipError::Floor => {
+                            carrick_core::entry::yield_current_to_host(binding, source, record)
+                                .unwrap_or_else(|| fatal());
+                        }
+                        MemberMembershipError::InvalidMember => fatal(),
+                    }
+                }
+            }
             task.linux.mark_pending_host_work();
             return crate::sched::ResumeAction::Left;
         }
