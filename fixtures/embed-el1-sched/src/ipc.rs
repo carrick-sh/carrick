@@ -2,6 +2,23 @@
 //! operations only; EL1 execution and parks are measured by the embed runner.
 use std::sync::{Arc, Barrier};
 
+// Capture errno before assertion formatting can make another libc call.
+macro_rules! assert_io {
+    ($call:expr, $expected:expr, $operation:literal) => {{
+        let returned = $call;
+        let errno = if returned < 0 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        assert_eq!(
+            returned, $expected,
+            "{} returned={} errno={}",
+            $operation, returned, errno
+        );
+    }};
+}
+
 struct Channel {
     read: i32,
     write: i32,
@@ -22,7 +39,7 @@ impl Channel {
     }
     fn send(&self, value: u64) {
         let bytes = value.to_ne_bytes();
-        assert_eq!(
+        assert_io!(
             unsafe { libc::write(self.write, bytes.as_ptr().cast(), bytes.len()) },
             8,
             "send"
@@ -30,7 +47,7 @@ impl Channel {
     }
     fn receive(&self) -> u64 {
         let mut bytes = [0u8; 8];
-        assert_eq!(
+        assert_io!(
             unsafe { libc::read(self.read, bytes.as_mut_ptr().cast(), bytes.len()) },
             8,
             "receive"
@@ -43,7 +60,7 @@ impl Channel {
             iov_base: bytes.as_mut_ptr().cast(),
             iov_len: 8,
         };
-        assert_eq!(unsafe { libc::writev(self.write, &iov, 1) }, 8, "writev");
+        assert_io!(unsafe { libc::writev(self.write, &iov, 1) }, 8, "writev");
     }
     fn receive_vector(&self) -> u64 {
         let mut bytes = [0u8; 8];
@@ -51,7 +68,7 @@ impl Channel {
             iov_base: bytes.as_mut_ptr().cast(),
             iov_len: 8,
         };
-        assert_eq!(unsafe { libc::readv(self.read, &iov, 1) }, 8, "readv");
+        assert_io!(unsafe { libc::readv(self.read, &iov, 1) }, 8, "readv");
         u64::from_ne_bytes(bytes)
     }
 }
@@ -158,7 +175,7 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
         unsafe { libc::_exit(0) }
     }
     let mut status = 0;
-    assert_eq!(
+    assert_io!(
         unsafe { libc::waitpid(pid, &mut status, 0) },
         pid,
         "wait child"
@@ -187,7 +204,7 @@ pub fn lifetime() -> i32 {
             response.send(round ^ 0x1000);
         }
         let mut byte = 0u8;
-        assert_eq!(
+        assert_io!(
             unsafe { libc::read(request.read, (&mut byte as *mut u8).cast(), 1) },
             0,
             "final writer close must produce EOF"
@@ -219,7 +236,11 @@ pub fn lifetime() -> i32 {
     request.write = -1;
     assert_eq!(response.receive(), 0xeeee, "child observed EOF");
     let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert_io!(
+        unsafe { libc::waitpid(pid, &mut status, 0) },
+        pid,
+        "wait child"
+    );
     assert!(libc::WIFEXITED(status));
     assert_eq!(libc::WEXITSTATUS(status), 0);
     println!("ipc-lifetime completed=128 reused=1 eof=1 child_exit=0");
