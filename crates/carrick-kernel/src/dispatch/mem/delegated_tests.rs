@@ -29,12 +29,14 @@ const FILE_FD: i32 = 40;
 /// The carrier's reservation table and its published roots, slot by slot
 /// (the zone's `AddressSpaces` index of each MM key).
 type BusyHook = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+type BeforeLockHook = Arc<std::sync::Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>>>;
 
 #[derive(Clone)]
 struct Carrier {
     table: Arc<CarrierRegion>,
     slots: Arc<std::sync::Mutex<Vec<(ReservationMm, usize)>>>,
     busy_hook: BusyHook,
+    before_lock: BeforeLockHook,
 }
 
 impl Carrier {
@@ -45,6 +47,7 @@ impl Carrier {
             table,
             slots: Arc::default(),
             busy_hook: Arc::default(),
+            before_lock: Arc::default(),
         }
     }
 
@@ -199,6 +202,20 @@ impl PreparedHostReservations for View {
         mm: ReservationMm,
         wait: &dyn carrick_el1::memory::reservations::RootWait,
     ) -> Result<Reservations<'_>, Refusal> {
+        let hook = {
+            let mut before = self.0.before_lock.lock().unwrap();
+            match before.as_mut() {
+                Some((0, _)) => before.take().map(|(_, hook)| hook),
+                Some((remaining, _)) => {
+                    *remaining -= 1;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
         let result = self.0.table.venue().lock(self.0.slot(mm)?, mm, wait);
         if matches!(result, Err(Refusal::Busy)) {
             let hook = self.0.busy_hook.lock().unwrap().take();
@@ -5411,7 +5428,7 @@ fn copyout_grant(
     address: u64,
     len: u64,
     venue: &mut CopyoutVenue,
-) -> Result<bool, String> {
+) -> Result<bool, HostFirstTouchError> {
     let context = dispatcher.capture_one_task_context().unwrap();
     let mut guard = crate::dispatch::mm_quiesce::acquire_host_write_mutation_quiesce(
         &dispatcher.pt_quiesce(),
@@ -5818,6 +5835,7 @@ fn delegated_guest_grant_reuses_fault_plan_alias_exclusion() {
                     assert!(!already_ready, "waiter enrolled before first touch");
                     let plan = dispatcher
                         .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                        .expect("uncontended root")
                         .expect("root first-touch plan");
                     let nz = |value| std::num::NonZeroU64::new(value).unwrap();
                     let grant = carrick_el1_abi::FrameGrantResidencyIdentity {
@@ -6248,10 +6266,10 @@ fn delegated_replacement_with_owed_backing_cannot_revalidate_old_output() {
 }
 
 /// A first-touch observation during a held root (e.g. peer holding Root.locked
-/// or concurrent EL1 critical section) returns no plan / forwards instead of
-/// turning transient contention into a broken_root carrier fatal.
+/// or concurrent EL1 critical section) retains the producer wait rather than
+/// letting the mutating fault deliver SIGSEGV for a missing plan.
 #[test]
-fn delegated_first_touch_observation_under_held_root_returns_no_plan_without_aborting() {
+fn delegated_first_touch_observation_under_held_root_retains_owner_wait() {
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
     let base = LINUX_MMAP_BASE + STOCK_WINDOW;
@@ -6283,19 +6301,20 @@ fn delegated_first_touch_observation_under_held_root_returns_no_plan_without_abo
     // Lock the root to simulate concurrent contention / peer hold:
     let held = root.lock();
 
-    // With the root held, first-touch observation must not abort with broken_root;
-    // it must return None so the fault forwards to the mutation path.
-    assert!(
-        dispatcher
-            .with_resident_fault_plan_for_test(base, |_| ())
-            .is_none(),
-        "resident fault plan under held root must return None rather than aborting"
-    );
-    assert!(
-        dispatcher
-            .with_resident_frame_grant_plan_for_test(base, PAGE, |_| ())
-            .is_none(),
-        "resident frame grant plan under held root must return None rather than aborting"
+    super::super::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| {
+            assert!(
+                dispatcher.resident_fault_plan(permit, base).is_err(),
+                "mutating fault lost the held root instead of retaining its owner wait"
+            );
+            assert!(
+                dispatcher
+                    .resident_frame_grant_plan(permit, base, PAGE)
+                    .is_err(),
+                "frame grant lost the held root instead of retaining its owner wait"
+            );
+        },
     );
     assert!(
         dispatcher.first_touch_is_root_owned(base),
@@ -6893,4 +6912,134 @@ fn busy_root_reports_the_exact_holder_and_preprobe_owner_wait() {
     assert_eq!(enrollment.revision(), busy.wait.revision());
     assert!(enrollment.is_live());
     assert!(delegated.with_root(|_| Ok(())).is_ok());
+}
+
+#[test]
+fn delegated_mutating_fault_wait_names_target_mm_when_peer_el1_slot_holds_root() {
+    use carrick_el1::memory::reservations::RootHolder;
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let peer = fork_child(&dispatcher);
+    let peer_mm = root.carrier.publish(&peer);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        let root = &root;
+        scope.spawn(move || {
+            let held = root
+                .carrier
+                .table
+                .lock_el1(root.carrier.slot(root.mm).unwrap(), root.mm, 9)
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            drop(held);
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        super::super::mm_mutation::test_support::with_permit(
+            dispatcher.mm_mutation_coordinator(),
+            |permit| {
+                let fault = dispatcher
+                    .resident_fault_plan(permit, base)
+                    .err()
+                    .expect("fault must retain Busy");
+                let stock = dispatcher
+                    .resident_frame_grant_plan(permit, base, STOCK_WINDOW)
+                    .err()
+                    .expect("stock must retain Busy");
+                for busy in [fault, stock] {
+                    assert_eq!(busy.holder, RootHolder::El1Slot(9));
+                    assert_eq!(busy.wait.handle().mm(), root.mm);
+                    assert_ne!(busy.wait.handle().mm(), peer_mm);
+                }
+            },
+        );
+        release_tx.send(()).unwrap();
+    });
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(base, |_| ())
+            .is_some()
+    );
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(base, STOCK_WINDOW, |_| ())
+            .is_some()
+    );
+}
+
+#[test]
+fn delegated_frame_grant_stock_probe_retains_busy_instead_of_losing_stock() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let (hold_tx, hold_rx) = std::sync::mpsc::sync_channel(1);
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
+    // Owner classification and grant protection succeed; only the third,
+    // stock observation encounters the peer's real root guard.
+    *root.carrier.before_lock.lock().unwrap() = Some((
+        2,
+        Box::new(move || {
+            hold_tx.send(()).unwrap();
+            held_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }),
+    ));
+    *root.carrier.busy_hook.lock().unwrap() = Some(Box::new(move || {
+        release_tx.send(()).unwrap();
+        released_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+    }));
+    std::thread::scope(|scope| {
+        let root = &root;
+        scope.spawn(move || {
+            hold_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let held = root.lock();
+            held_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            drop(held);
+            released_tx.send(()).unwrap();
+        });
+        super::super::mm_mutation::test_support::with_permit(
+            dispatcher.mm_mutation_coordinator(),
+            |permit| {
+                assert!(
+                    dispatcher
+                        .resident_frame_grant_plan(permit, base, STOCK_WINDOW)
+                        .is_err(),
+                    "stock contention must retain the owner wait"
+                );
+            },
+        );
+    });
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(base, STOCK_WINDOW, |plan| plan.stock)
+            .unwrap()
+    );
 }

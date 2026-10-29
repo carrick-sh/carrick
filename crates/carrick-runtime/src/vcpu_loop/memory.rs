@@ -296,7 +296,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         })?;
         dispatcher
             .commit_guest_host_first_touch(&mut guard, address, publish)
-            .map_err(|error| Box::new(std::io::Error::other(error)) as _)
+            .map_err(|error| Box::new(error.into_memory_error()) as _)
     }
 
     fn commit_host_first_touch(
@@ -320,7 +320,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         .map_err(|error| std::io::Error::other(format!("host first-touch quiesce: {error:?}")))?;
         dispatcher
             .commit_host_first_touch(&mut guard, address, protect)
-            .map_err(|error| Box::new(std::io::Error::other(error)) as _)
+            .map_err(|error| Box::new(error.into_memory_error()) as _)
     }
 
     fn grant_for_host_copyout(
@@ -348,7 +348,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         .map_err(|error| std::io::Error::other(format!("host copyout grant quiesce: {error:?}")))?;
         dispatcher
             .grant_for_host_copyout(&mut guard, address, len, venue)
-            .map_err(|error| Box::new(std::io::Error::other(error)) as _)
+            .map_err(|error| Box::new(error.into_memory_error()) as _)
     }
 
     fn host_untouched_page_permits(

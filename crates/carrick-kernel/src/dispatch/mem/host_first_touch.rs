@@ -6,6 +6,30 @@ use crate::dispatch::mm_quiesce::FrameCowExactMmGuard;
 use crate::kernel::MmId;
 use carrick_el1_abi::ReservationRange;
 
+/// Preparation can suspend before descriptor publication without losing its owner.
+#[derive(Debug, PartialEq, Eq, ::thiserror::Error)]
+pub enum HostFirstTouchError {
+    #[error("reservation preparation waits for {0:?}")]
+    Busy(#[from] ReservationBusy),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+impl From<String> for HostFirstTouchError {
+    fn from(reason: String) -> Self {
+        Self::Invalid(reason)
+    }
+}
+
+impl HostFirstTouchError {
+    pub fn into_memory_error(self) -> carrick_guest_mem::MemoryError {
+        match self {
+            Self::Busy(busy) => carrick_guest_mem::MemoryError::OwnerWait(busy.wait),
+            Self::Invalid(reason) => carrick_guest_mem::MemoryError::HostMap(reason),
+        }
+    }
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -66,7 +90,7 @@ impl SyscallDispatcher {
             carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
             String,
         >,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, HostFirstTouchError> {
         use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp;
         let Some(intent) = self.plan_host_first_touch(authority, address)? else {
             return Ok(false);
@@ -79,7 +103,9 @@ impl SyscallDispatcher {
                 ..
             }
         ) {
-            return Err("host copyout requires a guest write-publication receipt".to_owned());
+            return Err("host copyout requires a guest write-publication receipt"
+                .to_owned()
+                .into());
         }
         let span = receipt.resident();
         let resident = span
@@ -101,15 +127,20 @@ impl SyscallDispatcher {
         &self,
         permit: &'permit HostAliasPermit<'_>,
         address: u64,
-    ) -> Result<Option<(HostFirstTouchIntent, ResidentFaultPlan<'permit>)>, String> {
+    ) -> Result<Option<(HostFirstTouchIntent, ResidentFaultPlan<'permit>)>, HostFirstTouchError>
+    {
         if self.mem_view().mm_authority().mm_id != permit.mm() {
-            return Err("host first-touch authority names another MM".to_owned());
+            return Err("host first-touch authority names another MM"
+                .to_owned()
+                .into());
         }
-        let Some(plan) = self.resident_fault_plan(permit, address) else {
+        let Some(plan) = self.resident_fault_plan(permit, address)? else {
             return Ok(None);
         };
         if plan.prot() & carrick_abi::LINUX_PROT_WRITE == 0 {
-            return Err("armed host write page lacks Linux write permission".to_owned());
+            return Err("armed host write page lacks Linux write permission"
+                .to_owned()
+                .into());
         }
         let intent = HostFirstTouchIntent {
             mm: permit.mm(),
@@ -129,10 +160,12 @@ impl SyscallDispatcher {
         &self,
         authority: &mut FrameCowExactMmGuard,
         address: u64,
-    ) -> Result<Option<HostFirstTouchIntent>, String> {
+    ) -> Result<Option<HostFirstTouchIntent>, HostFirstTouchError> {
         let mutation = super::super::mm_mutation::from_frame_cow(authority);
         if self.mem_view().mm_authority().mm_id != mutation.mm_id() {
-            return Err("host first-touch authority names another MM".to_owned());
+            return Err("host first-touch authority names another MM"
+                .to_owned()
+                .into());
         }
         if self.first_touch_guest_committed(&mutation, address) {
             return Ok(None);
@@ -148,21 +181,29 @@ impl SyscallDispatcher {
         mutation: &MmMutationGuard<'_>,
         intent: HostFirstTouchIntent,
         receipt: &impl HostFirstTouchDescriptorReceipt,
-    ) -> Result<(), String> {
+    ) -> Result<(), HostFirstTouchError> {
         if mutation.mm_id() != intent.mm
             || receipt.mm() != intent.mm
             || receipt.resident().start() != intent.page
             || intent.page.checked_add(4096) != Some(receipt.resident().end())
             || receipt.protection() != intent.prot
         {
-            return Err("host first-touch receipt does not match the exact intent".to_owned());
+            return Err("host first-touch receipt does not match the exact intent"
+                .to_owned()
+                .into());
         }
         let permit = mutation.host_alias_permit();
         let Some((current, plan)) = self.first_touch_plan(&permit, intent.page)? else {
-            return Err("host first-touch intent is no longer armed".to_owned());
+            return Err("host first-touch intent is no longer armed"
+                .to_owned()
+                .into());
         };
         if current != intent {
-            return Err("host first-touch arming changed before descriptor completion".to_owned());
+            return Err(
+                "host first-touch arming changed before descriptor completion"
+                    .to_owned()
+                    .into(),
+            );
         }
         self.commit_resident_fault(plan);
         Ok(())
@@ -175,10 +216,12 @@ impl SyscallDispatcher {
         authority: &mut FrameCowExactMmGuard,
         address: u64,
         protect: &mut dyn FnMut(u64, u64) -> Result<(), String>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, HostFirstTouchError> {
         let mutation = super::super::mm_mutation::from_frame_cow(authority);
         if self.mem_view().mm_authority().mm_id != mutation.mm_id() {
-            return Err("host first-touch authority names another MM".to_owned());
+            return Err("host first-touch authority names another MM"
+                .to_owned()
+                .into());
         }
         if self.first_touch_guest_committed(&mutation, address) {
             return Ok(false);
@@ -269,10 +312,12 @@ impl SyscallDispatcher {
         address: u64,
         len: u64,
         venue: &mut dyn carrick_hal::threaded::El1FrameGrantVenue,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, HostFirstTouchError> {
         let mutation = super::super::mm_mutation::from_frame_cow(authority);
         if self.mem_view().mm_authority().mm_id != mutation.mm_id() {
-            return Err("host copyout grant authority names another MM".to_owned());
+            return Err("host copyout grant authority names another MM"
+                .to_owned()
+                .into());
         }
         let page_size = self.linux_page_size();
         let mm_key = mutation.mm_id().raw();
@@ -298,10 +343,10 @@ impl SyscallDispatcher {
 
     /// Route an unsettled physical grant to the one residency settlement
     /// owner. It fails stopped before the caller's readiness token drops.
-    fn unsettled_copyout_grant(&self, reason: String) -> String {
+    fn unsettled_copyout_grant(&self, reason: String) -> HostFirstTouchError {
         self.mem_view()
             .commit_published_frame_grant(Err(reason.clone()));
-        reason
+        reason.into()
     }
 
     /// One aligned piece of a copyout run: plan it from the root within
@@ -315,11 +360,11 @@ impl SyscallDispatcher {
         cursor: u64,
         piece: u64,
         venue: &mut dyn carrick_hal::threaded::El1FrameGrantVenue,
-    ) -> Result<Option<u64>, String> {
+    ) -> Result<Option<u64>, HostFirstTouchError> {
         use carrick_hal::threaded::{
             El1FrameGrantPublication, El1FrameGrantPublished, El1FrameGrantRollback,
         };
-        let Some(plan) = self.resident_frame_grant_plan(permit, cursor, piece) else {
+        let Some(plan) = self.resident_frame_grant_plan(permit, cursor, piece)? else {
             carrick_observability::probes::guest_internal_write_fault(
                 cursor,
                 piece,

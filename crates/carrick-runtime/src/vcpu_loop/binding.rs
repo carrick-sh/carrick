@@ -341,6 +341,7 @@ pub(super) enum HvpatchProductionPhase {
         resume: OwnedSyscallResume,
         origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
     },
+    ResumeFaultOwner,
     ResumeRetainedOwner {
         action: Box<RetainedMemoryAction>,
     },
@@ -526,6 +527,7 @@ impl HvpatchProductionPhase {
             Self::ResumeRetainedPhysical { .. } => 20,
             Self::RetainedMemoryRetry { .. } => 21,
             Self::ResumeFaultPhysical { .. } => 22,
+            Self::ResumeFaultOwner => 23,
         }
     }
 }
@@ -3375,6 +3377,53 @@ where
         }
     }
 
+    pub(super) fn resume_fault_owner_ready(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        cancellation: Option<carrick_kernel::kernel::continuation::OwnerWaitCancellation>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let context =
+            self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration("fault owner resume lost context".into())
+            })?;
+        use carrick_kernel::kernel::continuation::OwnerWaitCancellation;
+        match super::owner_wait::OwnerWait::new((), ()).settle(
+            || {
+                cancellation.or_else(|| {
+                    carrick_kernel::kernel::continuation::owner_wait_cancellation(context)
+                })
+            },
+            |()| true,
+        ) {
+            super::owner_wait::Settlement::Resume(()) => {
+                self.phase = HvpatchProductionPhase::Resident;
+                Ok(executor::ExecutorExit::Syscall)
+            }
+            super::owner_wait::Settlement::Cancelled(OwnerWaitCancellation::GroupExit) => {
+                self.drive_thread_exit(engine, control, 0)
+            }
+            super::owner_wait::Settlement::Cancelled(OwnerWaitCancellation::NativeFatal) => {
+                let origin = self.state.owner_wait_origin()?;
+                self.cancel_native_owner_wait(engine, origin)
+            }
+            super::owner_wait::Settlement::Cancelled(OwnerWaitCancellation::Carrier) => {
+                let result = assemble_run_result(
+                    &self.kernel,
+                    128 + 9,
+                    Some(carrick_abi::LINUX_SIGKILL),
+                    self.traps,
+                    false,
+                );
+                Ok(self.enter_terminal_with_outcome(
+                    engine,
+                    VcpuLoopOutcome::ProcessExit(Box::new(result)),
+                ))
+            }
+            super::owner_wait::Settlement::Waiting(_) => unreachable!("fault release is ready"),
+        }
+    }
+
     pub(super) fn resume_owner_ready(
         &mut self,
         engine: &mut E,
@@ -4671,6 +4720,24 @@ where
                 HvpatchProductionPhase::ResumeOwnerPhysical(pending) => {
                     return self.resume_owner_physical(engine, control, pending, false);
                 }
+                HvpatchProductionPhase::ResumeFaultOwner => {
+                    let result = self.consume_owner_zone(control)?;
+                    use carrick_kernel::kernel::continuation::{
+                        ContinuationCompletion, OwnerWaitCancellation,
+                    };
+                    let cancellation = match result.completion {
+                        ContinuationCompletion::OwnerCancelled(cancellation) => Some(cancellation),
+                        _ if result.reserved_signal().is_some_and(|signal| {
+                            signal.signum() == carrick_abi::LINUX_SIGKILL
+                        }) =>
+                        {
+                            Some(OwnerWaitCancellation::Carrier)
+                        }
+                        _ => None,
+                    };
+                    drop(result);
+                    return self.resume_fault_owner_ready(engine, control, cancellation);
+                }
                 HvpatchProductionPhase::ResumeFaultPhysical {
                     wait,
                     _subscription,
@@ -5471,9 +5538,8 @@ where
                 let faulting_tid = self.state.linux_tid;
                 let requires_mm_mutation =
                     self.kernel.dispatcher.fault_requires_mm_mutation(si_addr);
-                if owner_file_fault.is_none()
-                    && requires_mm_mutation
-                    && self
+                if owner_file_fault.is_none() && requires_mm_mutation {
+                    let resolved = self
                         .state
                         .with_mm_mutation_authority(&self.kernel, |mutation| {
                             signal::resolve_mutating_fault(
@@ -5486,9 +5552,19 @@ where
                                 mutation,
                             )
                         })?
-                        .map_err(RuntimeError::Trap)?
-                {
-                    return Ok(executor::ExecutorExit::Syscall);
+                        .map_err(RuntimeError::Trap)?;
+                    match resolved {
+                        Ok(true) => return Ok(executor::ExecutorExit::Syscall),
+                        Ok(false) => {}
+                        Err(busy) => {
+                            return self.park_owner_memory_action(
+                                engine,
+                                control,
+                                super::zone::OwnerMemoryAction::Fault,
+                                busy.wait,
+                            );
+                        }
+                    }
                 }
                 if let Some(mm_key) = self.state.zone_mm {
                     signal::cancel_frame_grant_request(
@@ -5572,13 +5648,10 @@ where
                     .kernel
                     .dispatcher
                     .fault_requires_mm_mutation(fault_addr);
-                if requires_mm_mutation
-                    && self
+                if requires_mm_mutation {
+                    let resolved = self
                         .state
                         .with_mm_mutation_authority(&self.kernel, |mutation| {
-                            // The ISA-neutral triple carries no syndrome, so
-                            // the access class is unknown here: a stale fault
-                            // on this arm is delivered rather than retried.
                             signal::resolve_mutating_fault(
                                 &self.kernel.dispatcher,
                                 engine,
@@ -5589,9 +5662,19 @@ where
                                 mutation,
                             )
                         })?
-                        .map_err(RuntimeError::Trap)?
-                {
-                    return Ok(executor::ExecutorExit::Syscall);
+                        .map_err(RuntimeError::Trap)?;
+                    match resolved {
+                        Ok(true) => return Ok(executor::ExecutorExit::Syscall),
+                        Ok(false) => {}
+                        Err(busy) => {
+                            return self.park_owner_memory_action(
+                                engine,
+                                control,
+                                super::zone::OwnerMemoryAction::Fault,
+                                busy.wait,
+                            );
+                        }
+                    }
                 }
                 // Same hoist as the aarch64 arm above: only the delivered
                 // path needs the captured kernel context.

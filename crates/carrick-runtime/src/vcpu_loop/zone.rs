@@ -35,6 +35,7 @@ pub(super) enum OwnerMemoryAction {
         resume: OwnedSyscallResume,
     },
     Retained,
+    Fault,
 }
 
 enum ZoneWaitPolicy {
@@ -781,7 +782,7 @@ where
                 let ctx = zone_ctx_from_state(&state, exit)?;
                 Some((state, ctx, request))
             }
-            OwnerMemoryAction::Retained => None,
+            OwnerMemoryAction::Retained | OwnerMemoryAction::Fault => None,
         };
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("owner wait lost its Kernel context".to_owned())
@@ -876,6 +877,27 @@ where
                             },
                         ))
                     }
+                    (OwnerMemoryAction::Fault, None) => {
+                        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
+                            zone.record_ref(record),
+                            seq,
+                        );
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_retained_memory_zone_park(
+                            context,
+                            control.execution_lease_mut().map_err(RuntimeError::Trap)?,
+                            wait,
+                        ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                        // The CPU snapshot owns the uncompleted fault. No MM,
+                        // root, descriptor editor or vCPU-slot claim survives.
+                        self.phase = HvpatchProductionPhase::ResumeFaultOwner;
+                        Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::BlockedContinuation {
+                                continuation: Box::new(continuation),
+                                vfork_activation: None,
+                            },
+                        ))
+                    }
                     _ => {
                         carrick_kernel::el1_zone::cancel(zone.record_ref(record));
                         Err(RuntimeError::Configuration(
@@ -894,6 +916,9 @@ where
                     OwnerMemoryAction::Retained => {
                         let action = self.take_retained_memory_action()?;
                         self.drive_retained_memory(engine, control, action)
+                    }
+                    OwnerMemoryAction::Fault => {
+                        self.resume_fault_owner_ready(engine, control, None)
                     }
                 }
             }
