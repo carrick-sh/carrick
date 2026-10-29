@@ -18,9 +18,12 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[path = "root_prepared.rs"]
 mod prepared;
+#[path = "stock.rs"]
+mod stock;
 #[path = "root_storage.rs"]
 mod storage;
 pub use prepared::ClaimedPreparedCopy;
+pub use stock::{PrivateStockPlan, STOCK_OBSERVATIONS, StockExclusions};
 pub use storage::ResolvedReservationNodes;
 
 /// One prepared image mapping. The caller retains every referenced backing
@@ -3595,6 +3598,307 @@ mod tests {
         .unwrap();
         guard.complete(receipt).unwrap()
     }
+    #[test]
+    fn private_stock_plan_future_holes_are_exact_mm_and_revalidated() {
+        let table = table();
+        let (first, peer) = (
+            ReservationMm::new(898).unwrap(),
+            ReservationMm::new(899).unwrap(),
+        );
+        for (slot, mm) in [(0, first), (1, peer)] {
+            table.publish(slot, mm, layout()).unwrap();
+            let mut root = table.lock(slot, mm).unwrap();
+            root.import(
+                range(0x202000, 0x203000),
+                ReservationProtection::READ_WRITE,
+                true,
+            )
+            .unwrap();
+            root.finish_import().unwrap();
+        }
+        // Both roots remain live at identical VAs throughout peer validation
+        // and the first root's intervening replacement and pending edit.
+        let mut root = table.lock(0, first).unwrap();
+        let mut other = table.lock(1, peer).unwrap();
+        let empty = StockExclusions::new();
+        let plan = root
+            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .unwrap();
+        assert_eq!(
+            plan.range(),
+            range(0x200000, 0x300000),
+            "small nodes must select future arena holes"
+        );
+        root.revalidate_private_stock_plan(&plan, &empty).unwrap();
+        assert_eq!(
+            other.revalidate_private_stock_plan(&plan, &empty),
+            Err(Refusal::Stale)
+        );
+        let peer_plan = other
+            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .unwrap();
+        // A hole cannot fault merely because it was included in stock policy.
+        assert_eq!(
+            root.private_stock_plan(UserVa::new(0x204000), GuestLen::new(0x200000), &empty),
+            Err(Refusal::Hole)
+        );
+        // Mapping-bound authentication stays exact and cannot borrow holes.
+        let ordinary = root
+            .transfer_fault_plan(0x202000, 0x200000, ReservationProtection::WRITE)
+            .unwrap();
+        assert_eq!(ordinary.range, range(0x202000, 0x203000));
+        assert!(root.authenticate_fault(ordinary));
+        assert!(!root.authenticate_fault(ReservationFaultPlan {
+            range: plan.range(),
+            ..ordinary
+        }));
+        assert!(!other.authenticate_fault(ordinary));
+        // Replacing an intervening hole with a same-protection node changes
+        // the owned facts even though the fault node itself is unchanged.
+        let decision = root
+            .mmap(
+                Placement::Fixed(0x208000),
+                4096,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap();
+        complete(&mut root, decision);
+        let before = root.generation();
+        assert_eq!(
+            root.revalidate_private_stock_plan(&plan, &empty),
+            Err(Refusal::Stale)
+        );
+        assert_eq!(root.generation(), before, "refusal cannot mutate the root");
+        other
+            .revalidate_private_stock_plan(&peer_plan, &empty)
+            .unwrap();
+        let plan = root
+            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .unwrap();
+        let previous_neighbor = root.node(0x208000).unwrap().1;
+        let replacement = root
+            .mmap(
+                Placement::Fixed(0x208000),
+                4096,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap();
+        complete(&mut root, replacement);
+        assert_ne!(root.node(0x208000).unwrap().1, previous_neighbor);
+        assert_eq!(root.node(0x202000).unwrap().1, ordinary.mapping_incarnation);
+        assert_eq!(
+            root.revalidate_private_stock_plan(&plan, &empty),
+            Err(Refusal::Stale)
+        );
+        let plan = root
+            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .unwrap();
+        let Decision::Work(request) = root
+            .mmap(
+                Placement::Fixed(0x206000),
+                4096,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap()
+        else {
+            panic!("pending proposal");
+        };
+        assert_eq!(
+            root.revalidate_private_stock_plan(&plan, &empty),
+            Err(Refusal::Stale)
+        );
+        let clipped = root
+            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .unwrap();
+        assert_eq!(clipped.range().end(), 0x206000);
+        root.refuse(request).unwrap();
+        assert_eq!(
+            root.revalidate_private_stock_plan(&clipped, &empty),
+            Err(Refusal::Stale)
+        );
+        // An outstanding return is an owner exclusion, even when no node
+        // remains there. Completing its retirement cannot authorize old stock.
+        let plan = root
+            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .unwrap();
+        let Decision::Work(request) = root.munmap(range(0x208000, 0x209000)).unwrap() else {
+            panic!("return proposal");
+        };
+        let slot = root.reserve_return(request.range).unwrap();
+        // SAFETY: this VM-free owner test models completed descriptor retirement.
+        let receipt = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        root.complete_deferring_return(receipt, slot).unwrap();
+        assert_eq!(
+            root.revalidate_private_stock_plan(&plan, &empty),
+            Err(Refusal::Stale)
+        );
+        let owed_plan = root
+            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .unwrap();
+        assert_eq!(owed_plan.range().end(), 0x208000);
+        root.acknowledge_deferred_returns(request.sequence).unwrap();
+        assert_eq!(
+            root.revalidate_private_stock_plan(&owed_plan, &empty),
+            Err(Refusal::Stale)
+        );
+        other
+            .revalidate_private_stock_plan(&peer_plan, &empty)
+            .unwrap();
+        // Reusing the same numeric MM and root slot cannot revive a plan.
+        root.retire().unwrap();
+        table.publish(0, first, layout()).unwrap();
+        let mut successor = table.lock(0, first).unwrap();
+        successor
+            .import(
+                range(0x202000, 0x203000),
+                ReservationProtection::READ_WRITE,
+                true,
+            )
+            .unwrap();
+        successor.finish_import().unwrap();
+        assert_eq!(
+            successor.revalidate_private_stock_plan(&plan, &empty),
+            Err(Refusal::Stale)
+        );
+        other
+            .revalidate_private_stock_plan(&peer_plan, &empty)
+            .unwrap();
+    }
+
+    #[test]
+    fn private_stock_plan_excludes_occupancy_and_bounds_fragmented_inputs() {
+        let table = table();
+        let mm = ReservationMm::new(900).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut root = table.lock(0, mm).unwrap();
+        root.import(
+            range(0x202000, 0x204000),
+            ReservationProtection::READ_WRITE,
+            true,
+        )
+        .unwrap();
+        root.import(range(0x208000, 0x209000), ReservationProtection::READ, true)
+            .unwrap();
+        root.finish_import().unwrap();
+        let mut exclusions = StockExclusions::new();
+        exclusions
+            .exclude_host_only(range(0x200000, 0x201000))
+            .unwrap();
+        exclusions
+            .exclude_occupied(range(0x203000, 0x204000))
+            .unwrap();
+        let plan = root
+            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &exclusions)
+            .unwrap();
+        assert_eq!(plan.range(), range(0x201000, 0x203000));
+        root.revalidate_private_stock_plan(&plan, &exclusions)
+            .unwrap();
+        exclusions
+            .exclude_occupied(range(0x202000, 0x203000))
+            .unwrap();
+        assert_eq!(
+            root.revalidate_private_stock_plan(&plan, &exclusions),
+            Err(Refusal::Busy)
+        );
+        // Incompatible nodes split the run, independent of host assertions.
+        let plan = root
+            .private_stock_plan(
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &StockExclusions::new(),
+            )
+            .unwrap();
+        assert_eq!(plan.range().end(), 0x208000);
+        let mut fragmented = StockExclusions::new();
+        for index in 0..STOCK_OBSERVATIONS {
+            let start = 0x210000 + index as u64 * 8192;
+            fragmented
+                .exclude_occupied(range(start, start + 4096))
+                .unwrap();
+        }
+        assert_eq!(
+            fragmented.exclude_host_only(range(0x201000, 0x202000)),
+            Err(Refusal::MetadataRequired)
+        );
+        let plan = root
+            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &fragmented)
+            .unwrap();
+        root.revalidate_private_stock_plan(&plan, &fragmented)
+            .unwrap();
+        // Root fragmentation is bounded independently of backend input size.
+        for index in 0..STOCK_OBSERVATIONS {
+            let decision = root
+                .mmap(
+                    Placement::Fixed(0x210000 + index as u64 * 4096),
+                    4096,
+                    if index % 2 == 0 {
+                        ReservationProtection::READ_WRITE
+                    } else {
+                        ReservationProtection::READ
+                    },
+                )
+                .unwrap();
+            complete(&mut root, decision);
+        }
+        assert_eq!(
+            root.private_stock_plan(
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &StockExclusions::new()
+            ),
+            Err(Refusal::MetadataRequired)
+        );
+    }
+
+    #[test]
+    fn private_stock_plan_rejects_nonprivate_file_heap_and_inaccessible_nodes() {
+        assert_eq!(STOCK_OBSERVATIONS, 256);
+        let table = table();
+        let mm = ReservationMm::new(901).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut root = table.lock(0, mm).unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        root.import_with(
+            range(0x202000, 0x203000),
+            rw,
+            ReservationNodeFlags::ANONYMOUS,
+        )
+        .unwrap();
+        root.import(range(0x204000, 0x205000), rw, false).unwrap();
+        root.import(range(0x2000, 0x3000), rw, true).unwrap();
+        root.import(range(0x206000, 0x207000), ReservationProtection::NONE, true)
+            .unwrap();
+        root.finish_import().unwrap();
+        for page in [0x202000, 0x204000, 0x2000] {
+            assert_eq!(
+                root.private_stock_plan(
+                    UserVa::new(page),
+                    GuestLen::new(0x200000),
+                    &StockExclusions::new()
+                ),
+                Err(Refusal::ForeignMapping)
+            );
+        }
+        assert_eq!(
+            root.private_stock_plan(
+                UserVa::new(0x206000),
+                GuestLen::new(0x200000),
+                &StockExclusions::new()
+            ),
+            Err(Refusal::Limit)
+        );
+    }
+
     #[test]
     fn reused_root_slot_advances_its_ring_owned_incarnation() {
         let table = table();

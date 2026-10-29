@@ -4647,6 +4647,49 @@ fn delegated_first_touch_stock_covers_the_roots_holes_in_the_window() {
     assert_eq!(stock_span(&dispatcher, base + 5 * PAGE), None);
 }
 
+/// The host adapter uses the shared policy without mixing occupancy between
+/// two simultaneously admitted roots at identical VAs.
+#[test]
+fn delegated_private_stock_policy_keeps_two_live_mms_independent() {
+    let first = SyscallDispatcher::new();
+    let peer = SyscallDispatcher::new();
+    let first_root = Root::admit(&first);
+    let peer_root = Root::admit(&peer);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    for root in [&first_root, &peer_root] {
+        root.guest_mmap(
+            Placement::Fixed(base + 2 * PAGE),
+            PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        stock_span(&first, base + 2 * PAGE),
+        Some((base, STOCK_WINDOW / 2, true))
+    );
+    first.with_resident_fault_plan_for_test(base + 2 * PAGE, |plan| {
+        first.commit_resident_fault(plan)
+    });
+    assert_eq!(stock_span(&first, base + 2 * PAGE), None);
+    assert_eq!(
+        stock_span(&peer, base + 2 * PAGE),
+        Some((base, STOCK_WINDOW / 2, true))
+    );
+    peer_root
+        .guest_mmap(Placement::Fixed(base + 4 * PAGE), PAGE, READ)
+        .unwrap();
+    assert_eq!(
+        stock_span(&peer, base + 2 * PAGE),
+        Some((base, 4 * PAGE, true))
+    );
+    assert_eq!(
+        stock_span(&first, base + 4 * PAGE),
+        None,
+        "a peer mapping never authorizes a hole"
+    );
+}
+
 /// First-touch stock never covers another node (other protection), a
 /// resident page, or an owed return the host has not reconciled.
 #[test]
