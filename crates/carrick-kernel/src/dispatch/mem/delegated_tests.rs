@@ -6370,3 +6370,72 @@ fn remap_file_pages_on_shared_mapping_wait_for_owner_refused_copyout_leaving_pri
     );
     assert_eq!(memory.read_bytes(BASE, 6).unwrap(), b"slot-1");
 }
+
+/// Extraction must retain the host adapter's pre-#1039 answer even when
+/// unrelated nodes in the same window exceed the native snapshot budget.
+#[test]
+fn delegated_host_stock_keeps_fragmented_window_first_touch() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let window = 512 * PAGE;
+    let base = LINUX_MMAP_BASE + window;
+    for index in 0..300 {
+        root.guest_mmap(
+            Placement::Fixed(base + index * PAGE),
+            PAGE,
+            if index % 2 == 0 {
+                ReservationProtection::READ_WRITE
+            } else {
+                ReservationProtection::READ
+            },
+        )
+        .unwrap();
+    }
+    for index in [0, 128, 298] {
+        let fault = base + index * PAGE;
+        let answer = dispatcher.with_resident_frame_grant_plan_for_test(fault, window, |plan| {
+            (plan.start(), plan.len(), plan.root_owned())
+        });
+        assert_eq!(
+            answer,
+            Some((fault, PAGE, true)),
+            "fragmentation must not disable an otherwise valid mapping-bound host grant"
+        );
+    }
+}
+
+/// Host alias supply already has host mutation admission; extraction must
+/// not add the future native publication freeze to its selection policy.
+#[test]
+fn delegated_host_stock_keeps_planning_during_fork_pending() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + STOCK_WINDOW;
+    root.guest_mmap(
+        Placement::Fixed(base + 2 * PAGE),
+        PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let before = stock_span(&dispatcher, base + 2 * PAGE).unwrap();
+    {
+        let mut model = root.lock();
+        let nz = |value| std::num::NonZeroU64::new(value).unwrap();
+        let request = carrick_el1_abi::PortalForkRequest {
+            operation: carrick_el1_abi::PortalOperation {
+                carrier: nz(1),
+                mm: model.mm(),
+                incarnation: nz(model.incarnation().raw()),
+                sequence: model.next_transfer_sequence().unwrap(),
+            },
+            parent_generation: model.generation(),
+            child_mm: ReservationMm::new(root.mm.raw() + 1).unwrap(),
+            child_tables: carrick_el1_abi::PortalForkTableArena::new(0x800000, 0x200000).unwrap(),
+            parent_tables: carrick_el1_abi::PortalForkTableArena::new(0xa00000, 0x200000).unwrap(),
+            kernel_control_ipa: 0xc00000,
+        };
+        model.publish_fork_parent(request).unwrap();
+        assert!(model.fork_pending());
+    }
+    assert_eq!(stock_span(&dispatcher, base + 2 * PAGE), Some(before));
+}

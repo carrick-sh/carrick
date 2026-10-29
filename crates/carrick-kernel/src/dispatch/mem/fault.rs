@@ -584,7 +584,8 @@ impl MemState {
             {
                 return Ok(None);
             }
-            let mut exclusions = carrick_core::mm::reservation::StockExclusions::new();
+            let policy = carrick_core::mm::reservation::StockPolicy::HostUnbounded;
+            let mut exclusions = carrick_core::mm::reservation::StockExclusions::new(policy);
             let mut failure = None;
             // Host residency is incarnation-qualified. Eligibility of the
             // nodes and holes themselves belongs solely to the shared owner.
@@ -594,25 +595,35 @@ impl MemState {
                     node.range.end().min(window_end),
                     ResidencyOwner::Root(node_incarnation),
                 ) {
-                    if let Some(range) = ReservationRange::new(start, end)
-                        && let Err(error) = exclusions.exclude_occupied(range)
-                    {
-                        failure = Some(error);
+                    if start < end {
+                        match ReservationRange::new(start, end) {
+                            Some(range) => {
+                                if let Err(error) = exclusions.exclude_occupied(range) {
+                                    failure = Some(error);
+                                }
+                            }
+                            None => failure = Some(Refusal::Invalid),
+                        }
                     }
                 }
             })?;
             // MAP_FIXED can supersede old host facts within the fault node.
             // Keep this host observation rule in the adapter; it cannot
-            // suppress root-owned pending edits or unsettled returns.
+            // suppress unsettled returns. Pending edits retain the old host policy.
             let mut block_old_host = |start: u64, end: u64| {
                 for (start, end) in [
                     (start, end.min(mapping.range.start())),
                     (start.max(mapping.range.end()), end),
                 ] {
-                    if let Some(range) = ReservationRange::new(start, end)
-                        && let Err(error) = exclusions.exclude_host_only(range)
-                    {
-                        failure = Some(error);
+                    if start < end {
+                        match ReservationRange::new(start, end) {
+                            Some(range) => {
+                                if let Err(error) = exclusions.exclude_host_only(range) {
+                                    failure = Some(error);
+                                }
+                            }
+                            None => failure = Some(Refusal::Invalid),
+                        }
                     }
                 }
             };
@@ -645,45 +656,41 @@ impl MemState {
                     window_start,
                     max_len,
                     |start, end| {
-                        if let Some(range) = ReservationRange::new(start, end)
-                            && let Err(error) = exclusions.exclude_occupied(range)
-                        {
-                            failure = Some(error);
+                        if start < end {
+                            match ReservationRange::new(start, end) {
+                                Some(range) => {
+                                    if let Err(error) = exclusions.exclude_occupied(range) {
+                                        failure = Some(error);
+                                    }
+                                }
+                                None => failure = Some(Refusal::Invalid),
+                            }
                         }
                     },
                 );
             }
             if failure.is_some() {
-                // Excessive speculative observations do not authorize a
-                // partial plan. Existing caller fallback stays unchanged.
+                // A malformed observation cannot authorize a host plan.
                 return Ok(None);
             }
             let plan = match model.private_stock_plan(
+                policy,
                 carrick_core_abi::UserVa::new(page),
                 carrick_core_abi::GuestLen::new(max_len),
                 &exclusions,
             ) {
                 Ok(plan) => plan,
-                Err(
-                    Refusal::Busy
-                    | Refusal::Hole
-                    | Refusal::Limit
-                    | Refusal::MetadataRequired
-                    | Refusal::ForeignMapping,
-                ) => {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
+                Err(_) => return Ok(None),
             };
             if plan.protection() != mapping.protection {
                 return Ok(None);
             }
-            model.revalidate_private_stock_plan(&plan, &exclusions)?;
-            let range = carrick_vfs::GuestMemoryRange::new(
+            let Some(range) = carrick_vfs::GuestMemoryRange::new(
                 GuestVa::new(plan.range().start()),
                 GuestVa::new(plan.range().end()),
-            )
-            .ok_or(Refusal::Invalid)?;
+            ) else {
+                return Ok(None);
+            };
             Ok(Some(ResidentFaultRange { range, prot }))
         })
     }

@@ -23,7 +23,7 @@ mod stock;
 #[path = "root_storage.rs"]
 mod storage;
 pub use prepared::ClaimedPreparedCopy;
-pub use stock::{PrivateStockPlan, STOCK_OBSERVATIONS, StockExclusions};
+pub use stock::{PrivateStockPlan, STOCK_OBSERVATIONS, StockExclusions, StockPolicy};
 pub use storage::ResolvedReservationNodes;
 
 /// One prepared image mapping. The caller retains every referenced backing
@@ -3620,9 +3620,14 @@ mod tests {
         // and the first root's intervening replacement and pending edit.
         let mut root = table.lock(0, first).unwrap();
         let mut other = table.lock(1, peer).unwrap();
-        let empty = StockExclusions::new();
+        let empty = StockExclusions::new(StockPolicy::NativeBounded);
         let plan = root
-            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &empty,
+            )
             .unwrap();
         assert_eq!(
             plan.range(),
@@ -3635,11 +3640,21 @@ mod tests {
             Err(Refusal::Stale)
         );
         let peer_plan = other
-            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &empty,
+            )
             .unwrap();
         // A hole cannot fault merely because it was included in stock policy.
         assert_eq!(
-            root.private_stock_plan(UserVa::new(0x204000), GuestLen::new(0x200000), &empty),
+            root.private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x204000),
+                GuestLen::new(0x200000),
+                &empty
+            ),
             Err(Refusal::Hole)
         );
         // Mapping-bound authentication stays exact and cannot borrow holes.
@@ -3673,7 +3688,12 @@ mod tests {
             .revalidate_private_stock_plan(&peer_plan, &empty)
             .unwrap();
         let plan = root
-            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &empty,
+            )
             .unwrap();
         let previous_neighbor = root.node(0x208000).unwrap().1;
         let replacement = root
@@ -3691,7 +3711,12 @@ mod tests {
             Err(Refusal::Stale)
         );
         let plan = root
-            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &empty,
+            )
             .unwrap();
         let Decision::Work(request) = root
             .mmap(
@@ -3708,7 +3733,12 @@ mod tests {
             Err(Refusal::Stale)
         );
         let clipped = root
-            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &empty,
+            )
             .unwrap();
         assert_eq!(clipped.range().end(), 0x206000);
         root.refuse(request).unwrap();
@@ -3719,7 +3749,12 @@ mod tests {
         // An outstanding return is an owner exclusion, even when no node
         // remains there. Completing its retirement cannot authorize old stock.
         let plan = root
-            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &empty,
+            )
             .unwrap();
         let Decision::Work(request) = root.munmap(range(0x208000, 0x209000)).unwrap() else {
             panic!("return proposal");
@@ -3743,7 +3778,12 @@ mod tests {
             Err(Refusal::Stale)
         );
         let owed_plan = root
-            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &empty)
+            .private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &empty,
+            )
             .unwrap();
         assert_eq!(owed_plan.range().end(), 0x208000);
         root.acknowledge_deferred_returns(request.sequence).unwrap();
@@ -3790,7 +3830,7 @@ mod tests {
         root.import(range(0x208000, 0x209000), ReservationProtection::READ, true)
             .unwrap();
         root.finish_import().unwrap();
-        let mut exclusions = StockExclusions::new();
+        let mut exclusions = StockExclusions::new(StockPolicy::NativeBounded);
         exclusions
             .exclude_host_only(range(0x200000, 0x201000))
             .unwrap();
@@ -3798,7 +3838,12 @@ mod tests {
             .exclude_occupied(range(0x203000, 0x204000))
             .unwrap();
         let plan = root
-            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &exclusions)
+            .private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &exclusions,
+            )
             .unwrap();
         assert_eq!(plan.range(), range(0x201000, 0x203000));
         root.revalidate_private_stock_plan(&plan, &exclusions)
@@ -3813,13 +3858,14 @@ mod tests {
         // Incompatible nodes split the run, independent of host assertions.
         let plan = root
             .private_stock_plan(
+                StockPolicy::NativeBounded,
                 UserVa::new(0x202000),
                 GuestLen::new(0x200000),
-                &StockExclusions::new(),
+                &StockExclusions::new(StockPolicy::NativeBounded),
             )
             .unwrap();
         assert_eq!(plan.range().end(), 0x208000);
-        let mut fragmented = StockExclusions::new();
+        let mut fragmented = StockExclusions::new(StockPolicy::NativeBounded);
         for index in 0..STOCK_OBSERVATIONS {
             let start = 0x210000 + index as u64 * 8192;
             fragmented
@@ -3831,7 +3877,12 @@ mod tests {
             Err(Refusal::MetadataRequired)
         );
         let plan = root
-            .private_stock_plan(UserVa::new(0x202000), GuestLen::new(0x200000), &fragmented)
+            .private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &fragmented,
+            )
             .unwrap();
         root.revalidate_private_stock_plan(&plan, &fragmented)
             .unwrap();
@@ -3852,9 +3903,10 @@ mod tests {
         }
         assert_eq!(
             root.private_stock_plan(
+                StockPolicy::NativeBounded,
                 UserVa::new(0x202000),
                 GuestLen::new(0x200000),
-                &StockExclusions::new()
+                &StockExclusions::new(StockPolicy::NativeBounded)
             ),
             Err(Refusal::MetadataRequired)
         );
@@ -3882,20 +3934,149 @@ mod tests {
         for page in [0x202000, 0x204000, 0x2000] {
             assert_eq!(
                 root.private_stock_plan(
+                    StockPolicy::NativeBounded,
                     UserVa::new(page),
                     GuestLen::new(0x200000),
-                    &StockExclusions::new()
+                    &StockExclusions::new(StockPolicy::NativeBounded)
                 ),
                 Err(Refusal::ForeignMapping)
             );
         }
         assert_eq!(
             root.private_stock_plan(
+                StockPolicy::NativeBounded,
                 UserVa::new(0x206000),
                 GuestLen::new(0x200000),
-                &StockExclusions::new()
+                &StockExclusions::new(StockPolicy::NativeBounded)
             ),
             Err(Refusal::Limit)
+        );
+    }
+
+    #[test]
+    fn stock_policy_host_preserves_pending_fork_and_eligibility_rules() {
+        let table = table();
+        let mm = ReservationMm::new(902).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut root = table.lock(0, mm).unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        // Both were eligible for host grants before extraction: no PRIVATE
+        // flag, and a node crossing the heap boundary rather than inside it.
+        root.import_with(
+            range(0x202000, 0x203000),
+            rw,
+            ReservationNodeFlags::ANONYMOUS,
+        )
+        .unwrap();
+        root.import(range(0xff000, 0x101000), rw, true).unwrap();
+        root.import(range(0x208000, 0x209000), rw, true).unwrap();
+        root.finish_import().unwrap();
+        let host = StockPolicy::HostUnbounded;
+        let native = StockPolicy::NativeBounded;
+        let host_exclusions = StockExclusions::new(host);
+        let native_exclusions = StockExclusions::new(native);
+        for page in [0x202000, 0x100000] {
+            assert!(
+                root.private_stock_plan(
+                    host,
+                    UserVa::new(page),
+                    GuestLen::new(0x200000),
+                    &host_exclusions
+                )
+                .is_ok()
+            );
+            assert_eq!(
+                root.private_stock_plan(
+                    native,
+                    UserVa::new(page),
+                    GuestLen::new(0x200000),
+                    &native_exclusions
+                ),
+                Err(Refusal::ForeignMapping)
+            );
+        }
+        let fault = UserVa::new(0x208000);
+        let before = root
+            .private_stock_plan(host, fault, GuestLen::new(0x200000), &host_exclusions)
+            .unwrap()
+            .range();
+        let Decision::Work(request) = root
+            .mprotect(range(0x208000, 0x209000), ReservationProtection::READ)
+            .unwrap()
+        else {
+            panic!("pending permission request");
+        };
+        assert_eq!(
+            root.private_stock_plan(host, fault, GuestLen::new(0x200000), &host_exclusions)
+                .unwrap()
+                .range(),
+            before
+        );
+        assert_eq!(
+            root.private_stock_plan(native, fault, GuestLen::new(0x200000), &native_exclusions),
+            Err(Refusal::Busy)
+        );
+        root.refuse(request).unwrap();
+        root.state_mut().fork_pending = true;
+        assert_eq!(
+            root.private_stock_plan(host, fault, GuestLen::new(0x200000), &host_exclusions)
+                .unwrap()
+                .range(),
+            before
+        );
+        assert_eq!(
+            root.private_stock_plan(native, fault, GuestLen::new(0x200000), &native_exclusions),
+            Err(Refusal::Busy)
+        );
+        root.state_mut().fork_pending = false;
+    }
+
+    #[test]
+    fn stock_policy_host_observations_are_uncapped_and_native_remains_bounded() {
+        let table = table();
+        let mm = ReservationMm::new(903).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut root = table.lock(0, mm).unwrap();
+        root.import(
+            range(0x202000, 0x203000),
+            ReservationProtection::READ_WRITE,
+            true,
+        )
+        .unwrap();
+        root.finish_import().unwrap();
+        let mut host = StockExclusions::new(StockPolicy::HostUnbounded);
+        let mut native = StockExclusions::new(StockPolicy::NativeBounded);
+        for index in 0..600 {
+            let span = range(0x300000 + index * 4096, 0x301000 + index * 4096);
+            host.exclude_occupied(span).unwrap();
+            assert_eq!(
+                native.exclude_occupied(span),
+                if index < STOCK_OBSERVATIONS as u64 {
+                    Ok(())
+                } else {
+                    Err(Refusal::MetadataRequired)
+                }
+            );
+        }
+        assert!(
+            root.private_stock_plan(
+                StockPolicy::HostUnbounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &host
+            )
+            .is_ok()
+        );
+        // Selecting the native rules cannot accidentally consume host-only
+        // unbounded input. The input and planner must name the same policy.
+        assert_eq!(
+            root.private_stock_plan(
+                StockPolicy::NativeBounded,
+                UserVa::new(0x202000),
+                GuestLen::new(0x200000),
+                &host
+            ),
+            Err(Refusal::Invalid)
         );
     }
 
