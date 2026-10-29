@@ -414,7 +414,7 @@ impl MemState {
     pub(in crate::dispatch::mem) fn try_first_touch_owner(
         &self,
         page: u64,
-    ) -> Result<FirstTouchOwner, Refusal> {
+    ) -> Result<FirstTouchOwner, RootAccessRefusal> {
         let Some(root) = self.delegated_root() else {
             return Ok(FirstTouchOwner::Host);
         };
@@ -479,7 +479,7 @@ impl MemState {
         &self,
         start: u64,
         end: u64,
-    ) -> Result<Vec<RootPiece>, Refusal> {
+    ) -> Result<Vec<RootPiece>, RootAccessRefusal> {
         let Some(root) = self.delegated_root() else {
             return Ok(Vec::new());
         };
@@ -509,11 +509,15 @@ impl MemState {
         Ok(pieces)
     }
 
-    fn try_root_owes_backing_at(&self, page: u64) -> Result<bool, Refusal> {
+    fn try_root_owes_backing_at(&self, page: u64) -> Result<bool, RootAccessRefusal> {
         self.try_root_owes_backing_within(page, page.saturating_add(1))
     }
 
-    fn try_root_owes_backing_within(&self, start: u64, end: u64) -> Result<bool, Refusal> {
+    fn try_root_owes_backing_within(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<bool, RootAccessRefusal> {
         let Some(root) = self.delegated_root() else {
             return Ok(false);
         };
@@ -558,7 +562,7 @@ impl MemState {
         incarnation: ReservationIncarnation,
         page: u64,
         max_len: u64,
-    ) -> Result<Option<ResidentFaultRange>, Refusal> {
+    ) -> Result<Option<ResidentFaultRange>, RootAccessRefusal> {
         if max_len == 0 {
             return Ok(None);
         }
@@ -1118,7 +1122,7 @@ impl<'a> MemView<'a> {
             // This classifier runs before editor exclusion. Route contention
             // to the exact-MM mutation authority, which excludes EL1 edits
             // before asking the live owner again. No mapping is inferred here.
-            Err(Refusal::Busy) => true,
+            Err(RootAccessRefusal::Busy(_)) => true,
             Err(refusal) => broken_root("a first-touch observation", refusal),
         } || mem
             .growdown_ranges
@@ -1318,7 +1322,7 @@ impl<'a> MemView<'a> {
         let mem_authority_32 = self.mem();
         let mem = mem_authority_32.lock();
         match mem.try_root_owes_backing_at(page) {
-            Ok(true) | Err(Refusal::Busy) => return None,
+            Ok(true) | Err(RootAccessRefusal::Busy(_)) => return None,
             Ok(false) => {}
             Err(refusal) => broken_root("a resident fault predecessor observation", refusal),
         }
@@ -1332,7 +1336,7 @@ impl<'a> MemView<'a> {
             Ok(FirstTouchOwner::Root(mapping, incarnation)) => {
                 mem.root_armed_prot(&mapping, incarnation, page)?
             }
-            Ok(FirstTouchOwner::Unmapped) | Err(Refusal::Busy) => return None,
+            Ok(FirstTouchOwner::Unmapped) | Err(RootAccessRefusal::Busy(_)) => return None,
             Err(refusal) => broken_root("a first-touch observation", refusal),
         }
         .bits();
@@ -1367,12 +1371,12 @@ impl<'a> MemView<'a> {
                 let grant = match mem.try_root_grant_for_page(&mapping, incarnation, page, max_len)
                 {
                     Ok(Some(grant)) => grant,
-                    Ok(None) | Err(Refusal::Busy) => return None,
+                    Ok(None) | Err(RootAccessRefusal::Busy(_)) => return None,
                     Err(refusal) => broken_root("a first-touch grant plan", refusal),
                 };
                 (grant, Some(mapping.range), Some(incarnation))
             }
-            Ok(FirstTouchOwner::Unmapped) | Err(Refusal::Busy) => return None,
+            Ok(FirstTouchOwner::Unmapped) | Err(RootAccessRefusal::Busy(_)) => return None,
             Err(refusal) => broken_root("a first-touch observation", refusal),
         };
         let root_owned = owner_span.is_some();

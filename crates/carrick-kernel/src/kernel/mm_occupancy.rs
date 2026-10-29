@@ -982,7 +982,7 @@ impl UnpublishedExecAddressSpace {
             match &self.0.reservation_provider {
                 Some(provider) => {
                     let view = provider.prepare()?;
-                    seal(&mut view.lock(mm)?)
+                    seal(&mut view.lock(mm, &carrick_el1::memory::reservations::NoRootWait)?)
                 }
                 None => {
                     let venue = RootReleaseVenue::new(
@@ -1640,9 +1640,10 @@ fn retire_reservation_root(
     // The space is closed and drained: EL1 journals no return again, and
     // the owed extents' frames retire with the MM's own inventory.
     let settled = match provider {
-        Some(provider) => provider
-            .prepare()
-            .and_then(|view| view.lock(key)?.retire_final()),
+        Some(provider) => provider.prepare().and_then(|view| {
+            view.lock(key, &carrick_el1::memory::reservations::NoRootWait)?
+                .retire_final()
+        }),
         None => tables
             .release_venue()
             .ok_or(Refusal::Stale)

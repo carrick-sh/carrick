@@ -286,14 +286,16 @@ fn admit_fork(
     if parent.host_venue_open() {
         return Err(Refusal::Busy);
     }
-    parent_root.with_root(|model| {
-        if model.incarnation().raw() != request.operation.incarnation.get()
-            || model.generation() != completion.parent_generation
-        {
-            return Err(Refusal::Stale);
-        }
-        Ok(())
-    })?;
+    parent_root
+        .with_root(|model| {
+            if model.incarnation().raw() != request.operation.incarnation.get()
+                || model.generation() != completion.parent_generation
+            {
+                return Err(Refusal::Stale);
+            }
+            Ok(())
+        })
+        .map_err(RootAccessRefusal::refusal)?;
     // The owner supplied both the tree and the table graph. Host attachment
     // authenticates that origin; it never clones or projects either graph.
     root.with_root(|child| {
@@ -304,7 +306,8 @@ fn admit_fork(
         }
         child.set_limits(address_limit, data_limit);
         Ok(())
-    })?;
+    })
+    .map_err(RootAccessRefusal::refusal)?;
     mem.host_backing_leases
         .retain(|identity, _| sources.contains(identity));
     mem.seal_delegated(root, &[]);
@@ -810,12 +813,13 @@ mod tests {
             mm: ReservationMm,
         }
         impl PreparedHostReservations for View {
-            fn lock(&self, _mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-                self.table.lock_waiting_with_context(
-                    self.index,
-                    self.mm,
-                    &carrick_el1::memory::reservations::NoRootWait,
-                )
+            fn lock(
+                &self,
+                _mm: ReservationMm,
+                wait: &dyn carrick_el1::memory::reservations::RootWait,
+            ) -> Result<Reservations<'_>, Refusal> {
+                self.table
+                    .lock_waiting_with_context(self.index, self.mm, wait)
             }
         }
         let table: Arc<SharedReservations> = Arc::from(shared());
@@ -1189,7 +1193,10 @@ pub use projection::{NonAnonymousVmas, ReservationProcMaps};
 #[path = "el1_reservations/provider.rs"]
 mod provider;
 pub(in crate::dispatch) use provider::{DelegatedRoot, ReservationProviderSlot};
-pub use provider::{HostReservationProvider, PreparedHostReservations, PreparedReservationSession};
+pub use provider::{
+    HostReservationProvider, PreparedHostReservations, PreparedReservationSession, ReservationBusy,
+    RootAccessRefusal,
+};
 
 #[path = "el1_reservations/returns.rs"]
 mod returns;
