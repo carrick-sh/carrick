@@ -1073,7 +1073,9 @@ impl NativeService {
             Err((reason, ticket, ())) => {
                 // No offer occurred. Keep the ticket pinned through complete
                 // verified rollback, including any cleanup failure.
-                settle_backing_and_tables(&custody, &mut stock, handle, root, reply, txn)?;
+                if !settle_backing_and_tables(&custody, &mut stock, handle, root, reply, txn)? {
+                    return Err(stale());
+                }
                 if !matches!(
                     reason,
                     carrick_core_abi::service::PreparedDeliveryError::Cancelled
@@ -1497,34 +1499,44 @@ pub(super) fn settle_native_descriptor_reply(
     execution: carrick_hal::fork_stock::GrantExecution,
     settlement: &mut carrick_el1_abi::NativeDescriptorSettlement,
 ) -> Result<bool, TrapError> {
-    let accepted = (|| -> Result<(), TrapError> {
-        let (owner, generation, reply_address) = settlement.request().ok_or_else(stale)?;
+    let accepted = (|| -> Result<bool, TrapError> {
+        let Some((owner, generation, reply_address)) = settlement.request() else {
+            return Ok(false);
+        };
         if execution.binding.mm.raw() != owner.mm().raw() {
-            return Err(stale());
+            return Ok(false);
         }
-        let (reply, _pin) =
+        let Ok((reply, _pin)) =
             retain_reply::<carrick_el1_abi::PortalGrantSlot>(custody, region, reply_address)
-                .map_err(|_| stale())?;
+        else {
+            return Ok(false);
+        };
         // SAFETY: retain_reply pins the complete aligned slot until settlement.
         let reply = unsafe { reply.as_ref() };
-        let window = reply.window().ok_or_else(stale)?;
+        let Some(window) = reply.window() else {
+            return Ok(false);
+        };
         if window.operation.carrier != owner.carrier()
             || window.operation.mm != owner.mm()
             || window.operation.incarnation != owner.incarnation()
             || window.operation.sequence != generation
         {
-            return Err(stale());
+            return Ok(false);
         }
         let mut stock = custody.fork_stock.lock();
         if stock.owner.child_owner(owner.mm()) != Some(owner)
             || stock.owner.child_root(owner.mm()) != Some(execution.context.root)
         {
-            return Err(stale());
+            return Ok(false);
         }
-        let txn = stock
+        let Some(txn) = stock
             .owner
-            .pending_native_descriptor_transaction(owner, execution.context.root, generation)
-            .ok_or_else(stale)?;
+            .child_physical_mut(owner.mm(), execution.context.root)
+            .and_then(|physical| physical.supplied.as_ref())
+            .and_then(|grants| grants.pending_backing_reply(reply, generation))
+        else {
+            return Ok(false);
+        };
         settle_backing_and_tables(
             custody,
             &mut stock,
@@ -1532,11 +1544,14 @@ pub(super) fn settle_native_descriptor_reply(
             execution.context.root,
             reply,
             &txn,
-        )?;
-        Ok(())
+        )
     })();
     match accepted {
-        Ok(()) => Ok(settlement.accept()),
+        Ok(true) => Ok(settlement.accept()),
+        Ok(false) => {
+            settlement.refuse();
+            Ok(false)
+        }
         Err(error) => {
             settlement.refuse();
             Err(error)
@@ -1553,7 +1568,7 @@ fn settle_backing_and_tables(
     root: carrick_guest_arch::RootGpa,
     reply: &carrick_el1_abi::PortalGrantSlot,
     txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-) -> Result<(), TrapError> {
+) -> Result<bool, TrapError> {
     stock.owner.settle_native_backing_reply(
         &mut crate::fork_stock::fork_table_accounting(custody),
         owner,

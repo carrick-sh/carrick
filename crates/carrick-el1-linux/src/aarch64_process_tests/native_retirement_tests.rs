@@ -324,16 +324,18 @@ impl PhysicalStock {
             .as_mut()
             .unwrap();
         let txn = grants.pending_backing_reply(slot, generation).unwrap();
-        self.owner
-            .settle_native_backing_reply(
-                &mut NoTableLedger,
-                owner,
-                root,
-                slot,
-                &txn,
-                SupplyBacking::release_unused,
-            )
-            .unwrap();
+        assert!(
+            self.owner
+                .settle_native_backing_reply(
+                    &mut NoTableLedger,
+                    owner,
+                    root,
+                    slot,
+                    &txn,
+                    SupplyBacking::release_unused,
+                )
+                .unwrap()
+        );
     }
     pub fn retire(
         &mut self,

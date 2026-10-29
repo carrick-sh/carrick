@@ -1196,8 +1196,10 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Ok(())
     }
 
-    /// One neutral physical/table/transport settlement owner. Any uncertainty
-    /// retains the remaining journal and permanently closes this exact MM.
+    /// One neutral physical/table/transport settlement owner. Guest candidates
+    /// without an exact retained transaction return `Ok(false)` unchanged.
+    /// Uncertain undo of an authenticated transaction retains the remaining
+    /// journal and permanently closes this exact MM.
     pub fn settle_native_backing_reply(
         &mut self,
         ledger: &mut impl ForkTableLedger,
@@ -1208,7 +1210,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         release: impl FnOnce(
             &<C as crate::physical_grants::NativeSupplyCustody>::Backing,
         ) -> Result<(), crate::TrapError>,
-    ) -> Result<(), crate::TrapError>
+    ) -> Result<bool, crate::TrapError>
     where
         C: crate::physical_grants::NativeSupplyCustody,
     {
@@ -1218,7 +1220,18 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         // A stale predecessor cannot quarantine or mutate its live successor.
         if self.child_owner(owner.mm()) != Some(owner) || self.child_root(owner.mm()) != Some(root)
         {
-            return Err(invalid());
+            return Ok(false);
+        }
+        // Guest candidates carry no settlement authority. Authenticate the
+        // retained physical transaction before interpreting a missing table
+        // journal as an internal custody failure.
+        if self
+            .child_physical_mut(owner.mm(), root)
+            .and_then(NativeSupplyCustody::supplied)
+            .and_then(|grants| grants.pending_backing_reply(reply, txn.id.generation))
+            != Some(*txn)
+        {
+            return Ok(false);
         }
         let result = (|| {
             // Validate table custody before any physical undo can release
@@ -1249,7 +1262,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             self.child_physical_mut(owner.mm(), root)
                 .and_then(NativeSupplyCustody::supplied)
                 .ok_or_else(invalid)?
-                .acknowledge_backing_reply(reply, txn)
+                .acknowledge_backing_reply(reply, txn)?;
+            Ok(true)
         })();
         if result.is_err() {
             if let Some(grants) = self
