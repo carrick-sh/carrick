@@ -519,6 +519,26 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         self.copy_signal_bytes(mm, address, bytes)
     }
+    fn prepare_owned_write(
+        &mut self,
+        _mm: &Self::Mm,
+        _request: carrick_core::mm::transaction::CopyoutRequest,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
+    fn copyout_fault(
+        &self,
+        _address: UserVa,
+    ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
+        None
+    }
+    fn retire_adapter_operation(
+        &mut self,
+        _binding: ExecutionBinding,
+        _operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> Result<usize, NativeProcessError> {
+        Err(NativeProcessError::Quarantined)
+    }
     /// Copy a completed syscall's output to the caller's user memory on the
     /// selected record's live address space, with EL0 permissions. The
     /// staging step already made the range writable (fault supply first), so
@@ -3322,6 +3342,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             slot,
             owner_continuation,
             copyout_ready: None,
+            adapter_ready: None,
         })
     }
     /// Enter through the exact process registry. A non-leader thread retains
@@ -3365,6 +3386,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             slot: Some(member_control),
             owner_continuation,
             copyout_ready: None,
+            adapter_ready: None,
         }))
     }
 
@@ -3610,6 +3632,7 @@ pub struct NativeProcessEntry<
     // syscall dispatch does not acquire another graph lock for this checkpoint.
     owner_continuation: bool,
     copyout_ready: Option<Box<service::OwnedCopyout>>,
+    adapter_ready: Option<Box<service::AdapterPreparation>>,
 }
 
 impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
@@ -4357,6 +4380,51 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 NativeProcessError::OwnerWait(_) => NativeProcessError::Fault,
                 other => other,
             })
+    }
+    #[inline(never)]
+    fn suspend_adapter_operation(
+        &mut self,
+        operation: carrick_sched_core::object_wait::OperationToken,
+        service: carrick_core_abi::service::ServiceOperation,
+        sequence: Option<NonZeroU64>,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        use carrick_core::mm::transaction::CopyoutPreparation;
+        let identity = operation.identity();
+        carrick_core::wait::restore_object_operation(
+            self.source.zone,
+            self.source.slot,
+            self.source.zone.record(self.record.id).identity(),
+            operation,
+        )
+        .unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
+        if self.adapter_ready.is_some() {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+        }
+        self.adapter_ready = Some(Box::new(service::AdapterPreparation {
+            service,
+            sequence,
+            identity,
+        }));
+        CopyoutPreparation::Suspended
+    }
+    fn prepare_owner_output(
+        &mut self,
+        request: carrick_core::mm::transaction::CopyoutRequest,
+    ) -> Result<(), NativeProcessError> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        self.service.prepare_owned_write(&mm, request)
     }
     fn copy_owner_frame(
         &mut self,
@@ -6852,8 +6920,50 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             self.copy_owner_frame(dst, bytes)
                 .map_err(|error| match error {
                     NativeProcessError::OwnerWait(wait) => OwnedCopyError::Wait(wait),
-                    _ => OwnedCopyError::Fault,
+                    NativeProcessError::Fault => OwnedCopyError::Fault,
+                    _ => OwnedCopyError::Unavailable,
                 }),
+        )
+    }
+    fn prepare_owned_copyout(
+        &mut self,
+        request: carrick_core::mm::transaction::CopyoutRequest,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        use carrick_core::mm::transaction::CopyoutPreparation;
+        match self.prepare_owner_output(request) {
+            Ok(()) => return CopyoutPreparation::Ready(operation),
+            Err(NativeProcessError::OwnerWait(wait)) => {
+                return CopyoutPreparation::Wait { operation, wait };
+            }
+            Err(NativeProcessError::Fault) => return CopyoutPreparation::Fault(operation),
+            Err(NativeProcessError::Unsupported) => {}
+            Err(_) => {
+                // A stale execution or a suspended transfer is not EFAULT.
+                // Such a refusal must not manufacture a successful prefix.
+                return CopyoutPreparation::Unrouted(operation);
+            }
+        }
+        let Some((fault, sequence)) = self.service.copyout_fault(request.address) else {
+            return CopyoutPreparation::Unrouted(operation);
+        };
+        self.suspend_adapter_operation(
+            operation,
+            carrick_core_abi::service::ServiceOperation::Fault(fault),
+            Some(sequence),
+        )
+    }
+    fn yield_owned_operation(
+        &mut self,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        self.current.linux.mark_pending_host_work();
+        self.suspend_adapter_operation(
+            operation,
+            carrick_core_abi::service::ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Syscall,
+            },
+            None,
         )
     }
     fn complete_copyout(
@@ -6928,6 +7038,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .namespace_key(self.key, pid)
             .ok()
             .map(|key| key.is_some())
+    }
+    fn drain_owned_preparation(&mut self) {
+        let Some(preparation) = self.adapter_ready.take() else {
+            return;
+        };
+        match self.begin_adapter_service(
+            preparation.service,
+            preparation.sequence,
+            preparation.identity,
+        ) {
+            Ok(NativeResume::Left(None)) => {}
+            Ok(NativeResume::NoPending) => {
+                if self.resume_pending_lifecycle().is_none() {
+                    self.cancel_owner_wait().unwrap_or_else(|_| {
+                        crate::dispatch::invalid_completion(
+                            crate::dispatch::NativeInvariant::EntryBinding,
+                        )
+                    });
+                }
+            }
+            _ => {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+            }
+        }
     }
     fn take_handoff_receipt(&mut self) -> Option<EntryHandoffReceipt<C>> {
         self.handoff.take()
@@ -9104,6 +9238,7 @@ mod tests {
                 child_copy_error,
                 child_copy_error_at: None,
                 on_copy_complete: None,
+                native_ipc: None,
                 on_signal_clock: None,
             };
             let mut parent = runtime
@@ -9363,6 +9498,7 @@ mod tests {
                     child_copy_error: None,
                     child_copy_error_at: None,
                     on_copy_complete: None,
+                    native_ipc: None,
                     on_signal_clock: None,
                 };
                 let mut entry = runtimes[index]
@@ -9483,6 +9619,7 @@ mod tests {
                 child_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
+                native_ipc: None,
                 on_signal_clock: None,
             },
             Physical {
@@ -9497,6 +9634,7 @@ mod tests {
                 child_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
+                native_ipc: None,
                 on_signal_clock: None,
             },
         ];
@@ -9878,6 +10016,7 @@ mod tests {
                         child_copy_error: None,
                         child_copy_error_at: None,
                         on_copy_complete: None,
+                        native_ipc: None,
                         on_signal_clock: None,
                     };
                     let mut entry = runtime
@@ -9940,6 +10079,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -10089,6 +10229,7 @@ mod tests {
                 child_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
+                native_ipc: None,
                 on_signal_clock: None,
             };
             let mut entry = runtime
@@ -10322,6 +10463,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let observed = crate::common_entry::execution_binding(&thread);
@@ -10640,6 +10782,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut process = runtime
@@ -10869,6 +11012,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         use carrick_personality_linux::signal::{ProcessSignals, SignalWaitOutcome};
@@ -11217,6 +11361,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -11335,6 +11480,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -11483,6 +11629,7 @@ mod tests {
                 child_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
+                native_ipc: None,
                 on_signal_clock: None,
             };
             assert!(zone.slot(slot).current().is_none());
@@ -11762,6 +11909,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -11994,6 +12142,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let parent = TaskKey {
@@ -12635,6 +12784,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         use carrick_personality_linux::signal::ProcessSignals;
@@ -12739,6 +12889,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut parent_entry = runtime
@@ -12832,6 +12983,7 @@ mod tests {
                         child_copy_error: None,
                         child_copy_error_at: None,
                         on_copy_complete: None,
+                        native_ipc: None,
                         on_signal_clock: None,
                     };
                     let mut entry = runtime
@@ -12881,6 +13033,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -13058,6 +13211,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let parent = TaskKey {
@@ -13257,6 +13411,7 @@ mod tests {
                 child_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
+                native_ipc: None,
                 on_signal_clock: None,
             };
             let root = TaskKey {
@@ -13491,6 +13646,7 @@ mod tests {
                 child_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
+                native_ipc: None,
                 on_signal_clock: None,
             };
             let parent = TaskKey {
@@ -13766,6 +13922,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14010,6 +14167,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14119,6 +14277,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14258,6 +14417,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14363,6 +14523,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14522,6 +14683,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14970,6 +15132,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -15168,6 +15331,7 @@ mod tests {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             on_signal_clock: None,
         };
         use carrick_personality_linux::ipc::{IpcOutcome, ProcessIpcVenue};

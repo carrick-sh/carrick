@@ -237,6 +237,8 @@ pub struct MapSourceTake {
 pub enum OwnedCopyError {
     Fault,
     Wait(carrick_core_abi::PortalOwnerWait),
+    /// The execution or preparation venue cannot authorize a copy here.
+    Unavailable,
 }
 
 /// Native process custody supplied by the execution lane. Registry decisions
@@ -247,6 +249,8 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
         None
     }
+    /// Finish deferred physical enrollment after the operation frames unwind.
+    fn drain_owned_preparation(&mut self) {}
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }
@@ -261,6 +265,19 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
         _bytes: &[u8],
     ) -> Option<Result<(), OwnedCopyError>> {
         None
+    }
+    fn yield_owned_operation(
+        &mut self,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation)
+    }
+    fn prepare_owned_copyout(
+        &mut self,
+        _request: carrick_core::mm::transaction::CopyoutRequest,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation)
     }
     /// Retain a completed answer while its destination waits for its owner.
     fn complete_copyout(

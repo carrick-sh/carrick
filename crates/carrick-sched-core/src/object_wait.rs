@@ -247,7 +247,27 @@ pub struct OperationToken {
     generation: u64,
 }
 
+/// Authentication of an operation held by a scheduler record; not ownership.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct OperationIdentity {
+    index: u64,
+    generation: u64,
+}
+
 impl OperationToken {
+    pub const fn identity(&self) -> OperationIdentity {
+        OperationIdentity {
+            index: self.index,
+            generation: self.generation,
+        }
+    }
+
     pub const fn new(index: u64, generation: u64) -> Option<Self> {
         if index == 0 || index == u64::MAX || generation == 0 {
             None
@@ -1540,6 +1560,27 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
             .operation
             .compare_exchange(u64::MAX, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    /// Return adapter custody to the exclusively executing record before a
+    /// physical preparation wait. No queue or second owner may already exist.
+    /// # Safety
+    /// Caller owns this exact executing record (or its unqueued host-loaded
+    /// record) and has authenticated its installed MM through the entry owner.
+    pub unsafe fn restore_object_operation(
+        &self,
+        operation: OperationToken,
+    ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        if self.object.queue.load(Ordering::Acquire) != 0 || self.has_object_operation() {
+            return Err((ObjectWaitError::Occupied, operation));
+        }
+        self.object
+            .operation_generation
+            .store(operation.generation(), Ordering::Relaxed);
+        self.object
+            .operation
+            .store(operation.index(), Ordering::Release);
+        Ok(())
     }
 
     /// Transfer a pending operation to its adapter exactly once.

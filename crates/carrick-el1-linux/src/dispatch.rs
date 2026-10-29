@@ -1743,11 +1743,28 @@ fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
         task,
         validator: &file::HardwareValidator,
     };
-    FamilyCompletion::Complete(if copy.copy_out(address.raw(), bytes) {
-        result.raw()
+    if copy.copy_out(address.raw(), bytes) {
+        FamilyCompletion::Complete(result.raw())
     } else {
-        carrick_syscall_abi::LINUX_EFAULT.guest_retval()
-    })
+        // Host-owned legacy callers retain their existing owner-memory path.
+        FamilyCompletion::Forward
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn host_owned_poll_copyout_refusal_keeps_the_host_fallback() {
+    let task = CurrentTask::new();
+    assert!(matches!(
+        complete_poll_copyout::<carrick_sched_core::ThreadCtx>(
+            None,
+            &task,
+            carrick_guest_arch::UserVa::new(carrick_guest_arch::USER_CEILING),
+            &[0; 8],
+            SyscallResult::new(1),
+        ),
+        FamilyCompletion::Forward
+    ));
 }
 
 pub struct El1PendingFamilies<
@@ -1854,7 +1871,10 @@ impl<
     fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt<Context>> {
         self.process
             .as_deref_mut()
-            .and_then(|process| process.take_handoff_receipt())
+            .and_then(|process| {
+                process.drain_owned_preparation();
+                process.take_handoff_receipt()
+            })
             .or_else(|| self.handoff.take().and_then(Context::arm_receipt))
     }
     fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {
@@ -3070,11 +3090,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     task,
                     validator: &file::HardwareValidator,
                 },
-                owner: if frame.x[8] as usize == ipc::SYS_READ {
-                    self.process.as_deref_mut()
-                } else {
-                    None
-                },
+                owner: self.process.as_deref_mut(),
                 wait: None,
             };
             let (disposition, sigpipe_owed) =

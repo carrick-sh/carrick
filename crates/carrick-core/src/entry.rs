@@ -216,7 +216,7 @@ fn execution_scope<C: EntryContext>(
         record,
     })
 }
-fn record_binding<C: EntryContext>(
+pub(crate) fn record_binding<C: EntryContext>(
     binding: ExecutionBinding,
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,

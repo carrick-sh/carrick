@@ -19,6 +19,35 @@ pub struct UserWriteRequest<'a> {
     pub slot: SlotId,
 }
 
+/// Mapping preparation never writes guest bytes or consumes an I/O source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CopyoutRequest {
+    pub address: UserVa,
+    pub len: carrick_guest_arch::GuestLen,
+}
+
+/// One endpoint/cursor token changes wait source, never completion owner.
+#[derive(Debug)]
+pub enum CopyoutPreparation {
+    Ready(carrick_sched_core::object_wait::OperationToken),
+    Wait {
+        operation: carrick_sched_core::object_wait::OperationToken,
+        wait: carrick_core_abi::PortalOwnerWait,
+    },
+    Fault(carrick_sched_core::object_wait::OperationToken),
+    Unrouted(carrick_sched_core::object_wait::OperationToken),
+    Complete(i64),
+    Suspended,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UserWriteTarget {
+    pub handle: El1MmHandle,
+    pub address: UserVa,
+    pub len: carrick_guest_arch::GuestLen,
+    pub slot: SlotId,
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -56,6 +85,13 @@ pub trait UserWriteVenue<Context: Copy + Send + Sync + zerocopy::FromZeros> {
     fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow>;
     fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error>;
     fn supply_cow(&mut self, window: PortalGrantWindow) -> Result<(), Self::Error>;
+    fn supply_backing(&mut self, _window: PortalGrantWindow) -> Option<Result<(), Self::Error>> {
+        None
+    }
+    fn settle_preparation(&mut self, _target: &UserWriteTarget) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Copy only while the exact owner fence is live; the bytes are the
     /// selected slice of the original kernel source, never a replayed prefix.
     fn copy(&mut self, fence: &ValidatedChunk<'_, Context>, bytes: &[u8]) -> bool;
@@ -79,11 +115,36 @@ impl<
         words: &W,
         venue: &mut V,
     ) -> Result<(), UserWriteError<V::Error>> {
-        let slot = u32::from(request.slot.raw());
+        let target = UserWriteTarget {
+            handle: request.handle,
+            address: request.address,
+            len: carrick_guest_arch::GuestLen::new(request.bytes.len() as u64),
+            slot: request.slot,
+        };
+        self.write_user_target(target, Some(request), words, venue)
+    }
+
+    pub fn prepare_user_write<W: LiveDescriptorWords + ?Sized, V: UserWriteVenue<Context>>(
+        &self,
+        target: UserWriteTarget,
+        words: &W,
+        venue: &mut V,
+    ) -> Result<(), UserWriteError<V::Error>> {
+        self.write_user_target(target, None, words, venue)
+    }
+
+    fn write_user_target<W: LiveDescriptorWords + ?Sized, V: UserWriteVenue<Context>>(
+        &self,
+        target: UserWriteTarget,
+        request: Option<UserWriteRequest<'_>>,
+        words: &W,
+        venue: &mut V,
+    ) -> Result<(), UserWriteError<V::Error>> {
+        let slot = u32::from(target.slot.raw());
         let mut continuation = self.begin(
-            request.handle,
-            GuestVa::new(request.address.raw()),
-            u64::try_from(request.bytes.len()).map_err(|_| MmError::Invalid)?,
+            target.handle,
+            GuestVa::new(target.address.raw()),
+            target.len.raw(),
             PortalTransferIntent::UserWrite,
             slot,
         )?;
@@ -97,9 +158,11 @@ impl<
                 return Err(MmError::Stale.into());
             }
             let step = self.select(&continuation, words, venues)?;
-            venue
-                .settle_completions(&request)
-                .map_err(UserWriteError::Mechanics)?;
+            match request.as_ref() {
+                Some(request) => venue.settle_completions(request),
+                None => venue.settle_preparation(&target),
+            }
+            .map_err(UserWriteError::Mechanics)?;
             match step {
                 TransferStep::CowSupply(window) => {
                     if awaiting_supply_progress {
@@ -114,24 +177,35 @@ impl<
                     let fence = self
                         .revalidate(&continuation, selected, words, slot)?
                         .ok_or(UserWriteError::Busy)?;
-                    let offset = usize::try_from(continuation.offset())
-                        .map_err(|_| UserWriteError::InvalidSource)?;
-                    let count =
-                        usize::try_from(selected.len).map_err(|_| UserWriteError::InvalidSource)?;
-                    let end = offset
-                        .checked_add(count)
-                        .ok_or(UserWriteError::InvalidSource)?;
-                    let bytes = request
-                        .bytes
-                        .get(offset..end)
-                        .ok_or(UserWriteError::InvalidSource)?;
-                    if !venue.copy(&fence, bytes) {
-                        return Err(UserWriteError::Fault);
+                    if let Some(request) = request.as_ref() {
+                        let offset = usize::try_from(continuation.offset())
+                            .map_err(|_| UserWriteError::InvalidSource)?;
+                        let count = usize::try_from(selected.len)
+                            .map_err(|_| UserWriteError::InvalidSource)?;
+                        let end = offset
+                            .checked_add(count)
+                            .ok_or(UserWriteError::InvalidSource)?;
+                        let bytes = request
+                            .bytes
+                            .get(offset..end)
+                            .ok_or(UserWriteError::InvalidSource)?;
+                        if !venue.copy(&fence, bytes) {
+                            return Err(UserWriteError::Fault);
+                        }
                     }
                     fence.complete(&mut continuation)?;
                     awaiting_supply_progress = false;
                 }
-                TransferStep::Supply(_) => return Err(UserWriteError::UnsupportedSupply),
+                TransferStep::Supply(window) => {
+                    if awaiting_supply_progress {
+                        return Err(UserWriteError::Busy);
+                    }
+                    match venue.supply_backing(window) {
+                        Some(result) => result.map_err(UserWriteError::Mechanics)?,
+                        None => return Err(UserWriteError::UnsupportedSupply),
+                    }
+                    awaiting_supply_progress = true;
+                }
                 TransferStep::Suspended => return Err(UserWriteError::Busy),
                 TransferStep::Complete => break,
             }

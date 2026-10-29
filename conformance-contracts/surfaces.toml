@@ -1962,7 +1962,7 @@ contracts = ["kernel.fs.directory-copyout"]
 
 [[surfaces]]
 path = "crates/carrick-core-abi/src/service.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.exec.custody"]
+contracts = ["kernel.scheduler.runnable-progress", "process.exec.custody", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/exec_stage.rs"
@@ -2103,3 +2103,7 @@ contracts = ["kernel.el1.anonymous-reservations"]
 [[surfaces]]
 path = "crates/carrick-core/src/mm/reservation/root.rs"
 contracts = ["kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/object_wait.rs"
+contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress"]

@@ -9,9 +9,7 @@ use alloc::vec::Vec;
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
 use carrick_core::mm::transaction::OwnerVenue;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-use carrick_core::mm::transaction::{
-    SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue,
-};
+use carrick_core::mm::transaction::{SelectionVenues, UserWriteRequest, UserWriteVenue};
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, ForkStockExchange, ForkStockLoan, ForkStockRequest,
     ForkStockSettlement, PortalForkCustody, PortalOperation, ReservationMm, ReservationRange,
@@ -45,6 +43,43 @@ use carrick_el1::memory::reservations;
 use carrick_el1::memory::reservations::{NativeReservationGeometry, SharedReservations};
 
 pub type Mm = AddressContext<RootGpa>;
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_user_write_error(
+    failure: carrick_core::mm::transaction::UserWriteError<NativeProcessError>,
+) -> NativeProcessError {
+    use carrick_core::mm::transaction::{MmError, UserWriteError};
+    match failure {
+        UserWriteError::Owner(MmError::Wait(wait)) => NativeProcessError::OwnerWait(wait),
+        UserWriteError::Owner(MmError::Busy) | UserWriteError::Busy => NativeProcessError::Busy,
+        UserWriteError::Owner(MmError::Stale) => NativeProcessError::Stale,
+        UserWriteError::Owner(MmError::UnsupportedExecutableCow)
+        | UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
+        UserWriteError::Owner(_) | UserWriteError::Fault => NativeProcessError::Fault,
+        UserWriteError::Mechanics(error) => error,
+        UserWriteError::InvalidSource => NativeProcessError::Invalid,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn native_user_write_preserves_nonfault_refusals() {
+    use carrick_core::mm::transaction::{MmError, UserWriteError};
+    for (error, expected) in [
+        (MmError::Busy, NativeProcessError::Busy),
+        (MmError::Stale, NativeProcessError::Stale),
+        (
+            MmError::UnsupportedExecutableCow,
+            NativeProcessError::Unsupported,
+        ),
+        (MmError::Fault, NativeProcessError::Fault),
+    ] {
+        assert_eq!(
+            native_user_write_error(UserWriteError::Owner(error)),
+            expected
+        );
+    }
+}
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct CurrentMmMaintenance;
@@ -1196,6 +1231,7 @@ impl Drop for Aarch64ExecSuccessorSlot<'_> {
 /// ARM mechanics for the shared exact-MM native user-write continuation.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct NativeWriteVenue<'a, X> {
+    allow_backing: bool,
     task: &'a CurrentTask,
     slot: SlotId,
     crossing: &'a X,
@@ -1238,6 +1274,27 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
         }
         self.crossing
             .cross_cow_supply(UserVa::new(window.fault_page), u64::from(self.slot.raw()))
+    }
+
+    fn supply_backing(
+        &mut self,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Option<Result<(), Self::Error>> {
+        if !self.allow_backing {
+            return None;
+        }
+        let Some(slot) = self.slots.grant(usize::from(self.slot.raw())) else {
+            return Some(Err(NativeProcessError::Stale));
+        };
+        Some(
+            if slot.publish_fault_selection(window.operation.sequence.get(), window) {
+                // The existing native fault service owns physical supply. The
+                // caller retains its operation while that service releases CPU.
+                Err(NativeProcessError::Unsupported)
+            } else {
+                Err(NativeProcessError::Busy)
+            },
+        )
     }
 
     fn copy(
@@ -1283,6 +1340,107 @@ impl<'a> Aarch64NativeProcessService<'a, HvcForkStockCrossing> {
 }
 
 impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
+    #[inline(never)]
+    fn access_user_target(
+        &mut self,
+        mm: &Mm,
+        address: UserVa,
+        len: carrick_guest_arch::GuestLen,
+        bytes: Option<&[u8]>,
+    ) -> Result<(), NativeProcessError> {
+        if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get() {
+            return Err(NativeProcessError::Stale);
+        }
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
+            if ttbr0 & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() {
+                return Err(NativeProcessError::Stale);
+            }
+            let owner = self.portal()?;
+            let mm_key = ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
+            let handle = owner
+                .admitted_handle(mm_key, self.worker())
+                .map_err(|_| NativeProcessError::Stale)?;
+            let live = if let Some(words) = self.words {
+                PreparedWords::Borrowed(words)
+            } else {
+                PreparedWords::Owned(Box::new(
+                    super::mm_portal::production::current_mm_words(
+                        ttbr0,
+                        ttbr0,
+                        &CURRENT_MM_MAINTENANCE,
+                    )
+                    .map_err(|_| NativeProcessError::Stale)?,
+                ))
+            };
+            // SAFETY: the running carrier retains the fixed atomic portal
+            // slots until this native checkpoint finishes.
+            let slots = unsafe {
+                &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+            };
+            let mut venue = NativeWriteVenue {
+                allow_backing: bytes.is_none(),
+                task: self.task,
+                slot: self.slot,
+                crossing: &self.crossing,
+                slots,
+                prepared: carrick_el1::fault::HardwarePreparedResolver,
+                cow: crate::cow_resolver::HardwareCowResolver {
+                    service_slot: Some(carrick_el1_abi::SlotId::new(self.slot.raw())),
+                    completion: None,
+                    publication: None,
+                },
+            };
+            let result = if let Some(bytes) = bytes {
+                owner.write_user_bytes(
+                    UserWriteRequest {
+                        handle,
+                        address,
+                        bytes,
+                        slot: self.slot,
+                    },
+                    &*live,
+                    &mut venue,
+                )
+            } else {
+                owner.prepare_user_write(
+                    carrick_core::mm::transaction::UserWriteTarget {
+                        handle,
+                        address,
+                        len,
+                        slot: self.slot,
+                    },
+                    &*live,
+                    &mut venue,
+                )
+            };
+            result.map_err(native_user_write_error)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let mut copy = crate::lifecycle::LinuxUserCopy(crate::file::ValidatedCopy {
+                task: self.task,
+                validator: &crate::file::HardwareValidator,
+            });
+            if let Some(bytes) = bytes {
+                if !carrick_personality_linux::lifecycle::UserCopy::copy_out(
+                    &mut copy, address, bytes,
+                ) {
+                    return Err(NativeProcessError::Fault);
+                }
+            } else if crate::file::MemoryValidator::writable_bytes(
+                &crate::file::HardwareValidator,
+                address.raw(),
+                len.raw() as usize,
+            ) != len.raw() as usize
+            {
+                return Err(NativeProcessError::Fault);
+            }
+            Ok(())
+        }
+    }
+
     pub fn with_crossing(
         task: &'a CurrentTask,
         slot: SlotId,
@@ -2227,90 +2385,66 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .cross_wait_channel_wake(channel, u64::from(self.worker()))
     }
 
+    #[inline(never)]
     fn copy_signal_bytes(
         &mut self,
         mm: &Self::Mm,
         address: UserVa,
         bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
-        if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get() {
-            return Err(NativeProcessError::Stale);
-        }
+        self.access_user_target(
+            mm,
+            address,
+            carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+            Some(bytes),
+        )
+    }
+    fn prepare_owned_write(
+        &mut self,
+        mm: &Self::Mm,
+        request: carrick_core::mm::transaction::CopyoutRequest,
+    ) -> Result<(), NativeProcessError> {
+        self.access_user_target(mm, request.address, request.len, None)
+    }
+    fn copyout_fault(
+        &self,
+        address: UserVa,
+    ) -> Option<(carrick_guest_arch::FaultInfo, NonZeroU64)> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
-            if ttbr0 & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() {
-                return Err(NativeProcessError::Stale);
-            }
-            let owner = self.portal()?;
-            let mm_key = ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
-            let handle = owner
-                .admitted_handle(mm_key, self.worker())
-                .map_err(|_| NativeProcessError::Stale)?;
-            let live = if let Some(words) = self.words {
-                PreparedWords::Borrowed(words)
-            } else {
-                PreparedWords::Owned(Box::new(
-                    super::mm_portal::production::current_mm_words(
-                        ttbr0,
-                        ttbr0,
-                        &CURRENT_MM_MAINTENANCE,
-                    )
-                    .map_err(|_| NativeProcessError::Stale)?,
-                ))
-            };
-            // SAFETY: the running carrier retains the fixed atomic portal
-            // slots until this native checkpoint finishes.
             let slots = unsafe {
                 &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
             };
-            let mut venue = NativeWriteVenue {
-                task: self.task,
-                slot: self.slot,
-                crossing: &self.crossing,
-                slots,
-                prepared: carrick_el1::fault::HardwarePreparedResolver,
-                cow: crate::cow_resolver::HardwareCowResolver {
-                    service_slot: Some(carrick_el1_abi::SlotId::new(self.slot.raw())),
-                    completion: None,
-                    publication: None,
+            let slot = slots.grant(usize::from(self.slot.raw()))?;
+            let mm = self.task.mm.key.load(Ordering::Acquire);
+            let (sequence, _) = slot.pending_fault_selection(mm, address.raw())?;
+            Some((
+                carrick_guest_arch::FaultInfo {
+                    address,
+                    access: carrick_guest_arch::Access::Write,
+                    present: false,
                 },
-            };
-            owner
-                .write_user_bytes(
-                    UserWriteRequest {
-                        handle,
-                        address,
-                        bytes,
-                        slot: self.slot,
-                    },
-                    &*live,
-                    &mut venue,
-                )
-                .map_err(|failure| match failure {
-                    UserWriteError::Owner(carrick_core::mm::transaction::MmError::Wait(wait)) => {
-                        NativeProcessError::OwnerWait(wait)
-                    }
-                    UserWriteError::Owner(_) => NativeProcessError::Fault,
-                    UserWriteError::Mechanics(error) => error,
-                    UserWriteError::Busy => NativeProcessError::Busy,
-                    UserWriteError::InvalidSource => NativeProcessError::Invalid,
-                    UserWriteError::Fault => NativeProcessError::Fault,
-                    UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
-                })
+                NonZeroU64::new(sequence)?,
+            ))
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
-            let mut copy = crate::lifecycle::LinuxUserCopy(crate::file::ValidatedCopy {
-                task: self.task,
-                validator: &crate::file::HardwareValidator,
-            });
-            if !carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, address, bytes)
-            {
-                return Err(NativeProcessError::Fault);
-            }
-            Ok(())
+            let _ = address;
+            None
         }
+    }
+    fn retire_adapter_operation(
+        &mut self,
+        binding: carrick_el1_abi::ExecutionBinding,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> Result<usize, NativeProcessError> {
+        let (region, _) = self
+            .crossing
+            .ipc_binding()
+            .ok_or(NativeProcessError::Stale)?;
+        crate::ipc::retire_native_operation(
+            &region, self.zone, self.slot, self.task, binding, operation,
+        )
     }
     fn copy_syscall_output(
         &mut self,
