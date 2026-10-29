@@ -33,6 +33,7 @@ pub struct Physical<'a, C: ProcessContext = ParkedContextWords> {
     pub child_copy_error: Option<NativeProcessError>,
     pub child_copy_error_at: Option<u64>,
     pub on_copy_complete: Option<Box<dyn FnMut(UserVa) + 'a>>,
+    pub native_ipc: Option<carrick_el1_abi::ipc::IpcRegion<'a>>,
     pub refuse_copy: bool,
     pub on_signal_clock: Option<Box<dyn FnMut() + 'a>>,
 }
@@ -305,6 +306,43 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         }
         Ok(())
     }
+    fn prepare_owned_write(
+        &mut self,
+        _: &Self::Mm,
+        request: carrick_core::mm::transaction::CopyoutRequest,
+    ) -> Result<(), NativeProcessError> {
+        if let Some(error) = self.child_copy_error
+            && self
+                .child_copy_error_at
+                .is_none_or(|at| request.address.raw() == at)
+        {
+            return Err(error);
+        }
+        if let Some(hook) = &mut self.on_copy_complete {
+            hook(request.address);
+        }
+        Ok(())
+    }
+    fn retire_adapter_operation(
+        &mut self,
+        binding: ExecutionBinding,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> Result<usize, NativeProcessError> {
+        let region = self
+            .native_ipc
+            .as_ref()
+            .ok_or(NativeProcessError::Unsupported)?;
+        // This fixture's slot owns the same admitted root throughout the wait.
+        let task = CurrentTask::new();
+        crate::ipc::retire_native_operation(
+            region,
+            self.zone,
+            SlotId::from_index(0).unwrap(),
+            &task,
+            binding,
+            operation,
+        )
+    }
     fn signal_deadline(
         &mut self,
         nanos: u64,
@@ -527,6 +565,7 @@ impl NativeSignalFixture {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             refuse_copy: false,
             on_signal_clock: None,
         }
@@ -1065,6 +1104,7 @@ impl NativeOwnerSignalFixture {
             child_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
+            native_ipc: None,
             refuse_copy: false,
             on_signal_clock: None,
         }
@@ -3990,4 +4030,350 @@ fn completed_ppoll_output_cancellation_during_enrollment_never_returns_an_errno(
 #[test]
 fn production_trap_frame_ppoll_retains_completed_output_across_owner_wait() {
     retained_poll_output_owner_wait(false, false, true);
+}
+
+#[cfg(test)]
+#[test]
+fn owner_copyout_never_prepares_under_an_ipc_object_lock() {
+    use crate::file::UserCopy;
+    use carrick_el1::substrate::ipc::{PrefixCopy, StepStatus, transfer};
+    use carrick_el1_abi::ipc::{IpcOpKind, IpcOperation, IpcUserVa, pipe::WriteProgress};
+    let fixture = native_exec_fixture();
+    let shared = std::sync::Arc::new(
+        carrick_kernel::el1_ipc::HostIpc::with_limits(
+            1 << 20,
+            carrick_kernel::el1_ipc::IpcLimits::ZONE,
+        )
+        .unwrap(),
+    );
+    let region = shared.region();
+    let wait = carrick_sched_core::ShortLockSpin;
+    let object = region
+        .create_eventfd(7, carrick_el1_abi::ipc::EventMode::Counter, &wait)
+        .unwrap();
+    let mut service = fixture.service();
+    let retained = std::sync::Arc::clone(&shared);
+    service.on_copy_complete = Some(Box::new(move |_| {
+        assert!(
+            retained.region().lock_holder(object).is_none(),
+            "owner graph/MM preparation must run after the IPC object unlocks"
+        );
+    }));
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    struct Refuses;
+    impl UserCopy for Refuses {
+        fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+            false
+        }
+        fn copy_out(&mut self, _: u64, _: &[u8]) -> bool {
+            false
+        }
+    }
+    let mut user = crate::file::OwnerCopy {
+        inner: Refuses,
+        owner: Some(&mut *entry),
+        wait: None,
+    };
+    let mut guard = region.lock(object, &wait).unwrap();
+    let mut op = IpcOperation {
+        kind: IpcOpKind::EventFdRead,
+        buf: IpcUserVa(0x10000),
+        progress: WriteProgress::new(8),
+        ..IpcOperation::EMPTY
+    };
+    let result = transfer(&mut guard, &mut op, &mut PrefixCopy::new(&mut user)).unwrap();
+    assert_eq!(result.0, StepStatus::Fault);
+    assert_eq!(
+        guard.eventfd().unwrap().value(),
+        7,
+        "the refused bytes stay at their source"
+    );
+    let request = user.take_copyout_refusal().unwrap();
+    drop(guard);
+    let prepared = user.prepare_copyout(
+        request,
+        carrick_sched_core::object_wait::OperationToken::new(7, 1).unwrap(),
+    );
+    assert!(matches!(
+        prepared,
+        carrick_core::mm::transaction::CopyoutPreparation::Ready(_)
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn owner_copyout_unavailable_is_not_a_user_memory_fault() {
+    use carrick_personality_linux::lifecycle::OwnedCopyError;
+    let fixture = native_exec_fixture();
+    for error in [
+        NativeProcessError::Busy,
+        NativeProcessError::Unsupported,
+        NativeProcessError::Stale,
+        NativeProcessError::Fault,
+    ] {
+        let mut service = fixture.service();
+        service.child_copy_error = Some(error);
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert_eq!(
+            entry.copy_out_owned(UserVa::new(0x10000), &[1]),
+            Some(Err(if error == NativeProcessError::Fault {
+                OwnedCopyError::Fault
+            } else {
+                OwnedCopyError::Unavailable
+            }))
+        );
+    }
+}
+
+#[cfg(test)]
+fn retained_ipc_supply(supplied: bool, already_ready: bool) {
+    use carrick_core::mm::transaction::CopyoutPreparation;
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
+    use carrick_el1_abi::ipc::{
+        IpcBacking, IpcMmKey, IpcOpKind, IpcOperation, IpcTaskKey, IpcUserVa, OfdPin, WriteProgress,
+    };
+    let fixture = native_exec_fixture();
+    let shared = Box::leak(Box::new(std::sync::Arc::new(
+        carrick_kernel::el1_ipc::HostIpc::with_limits(
+            1 << 20,
+            carrick_kernel::el1_ipc::IpcLimits::ZONE,
+        )
+        .unwrap(),
+    )));
+    let object = shared
+        .create_eventfd(7, carrick_el1_abi::ipc::EventMode::Counter)
+        .unwrap();
+    let table = shared.create_table(64, 64).unwrap();
+    let description = shared
+        .admit_description(Description::new(
+            IpcBacking::EventFd { object }.encode(),
+            AccessMode::ReadOnly,
+            StatusFlags::default(),
+        ))
+        .unwrap();
+    description.install(table, Fd(0), false).unwrap();
+    drop(description);
+    let region = shared.region();
+    let (pin, _) = region
+        .fd(carrick_sched_core::ShortLockSpin)
+        .pin(table, Fd(0))
+        .unwrap();
+    let binding = crate::common_entry::execution_binding(fixture.task);
+    let op = IpcOperation {
+        kind: IpcOpKind::EventFdRead,
+        pin: pin.into_raw(),
+        object: object.to_raw(),
+        task: IpcTaskKey(binding.task.raw()),
+        mm: IpcMmKey(binding.mm.raw()),
+        buf: IpcUserVa(0x10000),
+        progress: WriteProgress::new(8),
+        ..IpcOperation::EMPTY
+    };
+    let token = region.begin_operation(op).unwrap();
+    let token = carrick_el1::substrate::ipc::to_sched_token(token).unwrap();
+    let identity = token.identity();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    service.native_ipc = Some(shared.region());
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.suspend_adapter_operation(
+                token,
+                ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+                    address: UserVa::new(0x10000),
+                    access: carrick_guest_arch::Access::Write,
+                    present: true
+                }),
+                None
+            ),
+            CopyoutPreparation::Suspended
+        ));
+        assert!(
+            fixture.task.service_notice.take().unwrap().is_none(),
+            "IPC frames must unwind before physical enrollment"
+        );
+        entry.drain_owned_preparation();
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    // SAFETY: the fixture retains this exact member and authenticates the notice under its service queue.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(fixture.record.id).identity(),
+        )
+    }
+    .unwrap();
+    let request = ticket.request();
+    assert!(ticket.complete(supplied).is_ok());
+    queue
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    // Closing the numeric fd cannot revoke the retained operation's pin.
+    assert!(
+        region
+            .fd(carrick_sched_core::ShortLockSpin)
+            .close(table, Fd(0))
+            .unwrap()
+            .is_none()
+    );
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    if already_ready {
+        assert!(
+            matches!(
+                entry.park_service(&request, true).unwrap(),
+                NativeResume::Left(None)
+            ),
+            "an acknowledged supply is requeued instead of nested under IPC"
+        );
+        assert!(entry.take_handoff_receipt().is_some());
+        drop(entry);
+        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        assert_eq!(selected.record, fixture.record.id);
+        let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+            .unwrap()
+            .words;
+        entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+    }
+    let resumed = entry.resume_checkpoint().unwrap();
+    if supplied {
+        assert!(matches!(resumed, NativeResume::RetrySyscall));
+        let token = carrick_core::wait::take_object_operation(
+            fixture.zone,
+            fixture.slot,
+            fixture.zone.record(fixture.record.id).identity(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(token.identity(), identity);
+        let token = carrick_el1::substrate::ipc::from_sched_token(token).unwrap();
+        assert_eq!(region.operation(&token).unwrap(), op);
+        let op = region.finish_operation(token).unwrap();
+        let release = region
+            .fd(carrick_sched_core::ShortLockSpin)
+            .unpin_filtered(
+                OfdPin::from_raw(op.pin),
+                crate::ipc::is_zone_releasable_backing,
+            )
+            .unwrap();
+        crate::ipc::settle_native_release(
+            &region,
+            release,
+            Some((fixture.zone, fixture.slot)),
+            fixture.task,
+        )
+        .unwrap();
+    } else {
+        assert!(matches!(resumed, NativeResume::Returned(result) if result.raw() == -14));
+        assert!(
+            !fixture
+                .zone
+                .record(fixture.record.id)
+                .has_object_operation()
+        );
+    }
+    assert!(
+        region
+            .lock(object, &carrick_sched_core::ShortLockSpin)
+            .is_err(),
+        "the final description pin was released"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn ipc_backing_supply_retains_the_exact_operation_and_pin() {
+    retained_ipc_supply(true, false);
+}
+#[cfg(test)]
+#[test]
+fn ipc_backing_refusal_retires_the_operation_and_pin() {
+    retained_ipc_supply(false, false);
+}
+#[cfg(test)]
+#[test]
+fn ipc_already_ready_supply_defers_completion_to_the_checkpoint() {
+    retained_ipc_supply(true, true);
+}
+#[cfg(test)]
+#[test]
+fn ipc_already_ready_refusal_retires_at_the_checkpoint() {
+    retained_ipc_supply(false, true);
 }

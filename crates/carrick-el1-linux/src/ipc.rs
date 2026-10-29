@@ -390,6 +390,12 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 );
             };
             if op.task != task_key(sched.task) || op.mm != mm_key(sched.task) {
+                if native_sigpipe {
+                    retain_native_operation(sched, token);
+                    crate::dispatch::invalid_completion(
+                        crate::dispatch::NativeInvariant::EntryBinding,
+                    );
+                }
                 let served = handback(frame, token, op, IpcHandback::Continue, 0, venue);
                 return (leave(sched, IpcLeave::ForeignOperation, served), false);
             }
@@ -455,6 +461,10 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
             Admission::Forward => return (IpcServed::Forward, false),
             Admission::Restart(token, op) => {
+                if native_sigpipe {
+                    finish_native(sched, token, &venue.region);
+                    return (IpcServed::Forward, false);
+                }
                 let served = handback(frame, token, op, IpcHandback::Restart, 0, venue);
                 return (leave(sched, IpcLeave::Restart, served), false);
             }
@@ -671,7 +681,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 Ok(nonblock) => nonblock,
                 Err(_) => {
                     return (
-                        bail(
+                        match bail(
                             sched,
                             frame,
                             token,
@@ -679,7 +689,15 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                             resumed,
                             venue,
                             IpcLeave::FlagsRefused,
-                        ),
+                            copy.user,
+                            native_sigpipe,
+                        ) {
+                            Ok(served) => served,
+                            Err(retry) => {
+                                token = retry;
+                                continue;
+                            }
+                        },
                         false,
                     );
                 }
@@ -699,7 +717,26 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     Some(IpcLockHolder::El1 { .. }) => IpcLeave::ObjectBusyEl1,
                     None => IpcLeave::ObjectBusy,
                 };
-                return (bail(sched, frame, token, op, resumed, venue, why), false);
+                return (
+                    match bail(
+                        sched,
+                        frame,
+                        token,
+                        op,
+                        resumed,
+                        venue,
+                        why,
+                        copy.user,
+                        native_sigpipe,
+                    ) {
+                        Ok(served) => served,
+                        Err(retry) => {
+                            token = retry;
+                            continue;
+                        }
+                    },
+                    false,
+                );
             }
         };
         let (status, wake) = match transfer(&mut guard, &mut op, &mut copy) {
@@ -707,7 +744,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             Err(_) => {
                 drop(guard);
                 return (
-                    bail(
+                    match bail(
                         sched,
                         frame,
                         token,
@@ -715,7 +752,15 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         resumed,
                         venue,
                         IpcLeave::TransferRefused,
-                    ),
+                        copy.user,
+                        native_sigpipe,
+                    ) {
+                        Ok(served) => served,
+                        Err(retry) => {
+                            token = retry;
+                            continue;
+                        }
+                    },
                     false,
                 );
             }
@@ -741,7 +786,75 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
         for e in effects.into_iter().chain(epoll_effects).flatten() {
             sched.finish_object_wake(e);
         }
-        if let Some(wait) = copy.user.take_owner_wait() {
+        let mut owner_wait = copy.user.take_owner_wait();
+        if let Some(request) = copy.user.take_copyout_refusal() {
+            use carrick_core::mm::transaction::CopyoutPreparation;
+            region.update_operation(&token, op).unwrap_or_else(|_| {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+            });
+            let operation = to_sched_token(token).unwrap_or_else(|_| {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+            });
+            let preparation = copy.user.prepare_copyout(request, operation);
+            let operation = match preparation {
+                CopyoutPreparation::Ready(operation) => {
+                    token = from_sched_token(operation).unwrap_or_else(|| {
+                        crate::dispatch::invalid_completion(
+                            crate::dispatch::NativeInvariant::EntryBinding,
+                        )
+                    });
+                    continue;
+                }
+                CopyoutPreparation::Wait { operation, wait } => {
+                    owner_wait = Some(wait);
+                    operation
+                }
+                CopyoutPreparation::Fault(operation) => operation,
+                CopyoutPreparation::Unrouted(operation) => {
+                    let restored = from_sched_token(operation).unwrap_or_else(|| {
+                        crate::dispatch::invalid_completion(
+                            crate::dispatch::NativeInvariant::EntryBinding,
+                        )
+                    });
+                    // Unsupported memory venues have no errno authority. A
+                    // native owner refuses the call without a host handback.
+                    if native_sigpipe {
+                        finish_native(sched, restored, region);
+                        frame.x[0] = carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64;
+                        return (IpcServed::Returned { switched: false }, false);
+                    }
+                    return (
+                        match bail(
+                            sched,
+                            frame,
+                            restored,
+                            op,
+                            resumed,
+                            venue,
+                            IpcLeave::FaultFirst,
+                            copy.user,
+                            native_sigpipe,
+                        ) {
+                            Ok(served) => served,
+                            Err(retry) => {
+                                token = retry;
+                                continue;
+                            }
+                        },
+                        false,
+                    );
+                }
+                CopyoutPreparation::Complete(result) => {
+                    frame.x[0] = result as u64;
+                    return (IpcServed::Returned { switched: false }, false);
+                }
+                CopyoutPreparation::Suspended => return (IpcServed::Idle, false),
+            };
+            token = from_sched_token(operation).unwrap_or_else(|| {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+            });
+        }
+        if let Some(wait) = owner_wait {
             if wait.handle().mm().raw() != mm_key(sched.task).0 {
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
             }
@@ -794,7 +907,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             StepStatus::Blocked(lane) => {
                 let Some((_, Some(snap))) = parking else {
                     return (
-                        bail(
+                        match bail(
                             sched,
                             frame,
                             token,
@@ -802,7 +915,15 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                             resumed,
                             venue,
                             IpcLeave::ParkRefused,
-                        ),
+                            copy.user,
+                            native_sigpipe,
+                        ) {
+                            Ok(served) => served,
+                            Err(retry) => {
+                                token = retry;
+                                continue;
+                            }
+                        },
                         false,
                     );
                 };
@@ -816,7 +937,23 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     }
                     Parked::Refused(t) => {
                         return (
-                            bail(sched, frame, t, op, resumed, venue, IpcLeave::ParkRefused),
+                            match bail(
+                                sched,
+                                frame,
+                                t,
+                                op,
+                                resumed,
+                                venue,
+                                IpcLeave::ParkRefused,
+                                copy.user,
+                                native_sigpipe,
+                            ) {
+                                Ok(served) => served,
+                                Err(retry) => {
+                                    token = retry;
+                                    continue;
+                                }
+                            },
                             false,
                         );
                     }
@@ -873,7 +1010,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             StepStatus::Fault if op.kind == IpcOpKind::PipeRead && written > 0 => written as i64,
             StepStatus::Fault => {
                 return (
-                    bail(
+                    match bail(
                         sched,
                         frame,
                         token,
@@ -881,7 +1018,15 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         resumed,
                         venue,
                         IpcLeave::FaultFirst,
-                    ),
+                        copy.user,
+                        native_sigpipe,
+                    ) {
+                        Ok(served) => served,
+                        Err(retry) => {
+                            token = retry;
+                            continue;
+                        }
+                    },
                     false,
                 );
             }
@@ -1057,6 +1202,36 @@ fn finish<C: ThreadCpu, U: UserWord>(
     }
 }
 
+/// Retire the same IPC operation after refused backing preparation. The
+/// scheduler record authenticates its token; the arena authenticates its MM.
+pub(crate) fn retire_native_operation<C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    zone: &carrick_sched_core::ZoneTables<C>,
+    slot: carrick_el1_abi::SlotId,
+    task: &CurrentTask,
+    binding: carrick_el1_abi::ExecutionBinding,
+    operation: carrick_sched_core::object_wait::OperationToken,
+) -> Result<usize, crate::native_process_runtime::NativeProcessError> {
+    use crate::native_process_runtime::NativeProcessError;
+    let token = from_sched_token(operation).ok_or(NativeProcessError::Quarantined)?;
+    let op = region
+        .operation(&token)
+        .map_err(|_| NativeProcessError::Stale)?;
+    if op.task.0 != binding.task.raw() || op.mm.0 != binding.mm.raw() {
+        return Err(NativeProcessError::Quarantined);
+    }
+    let op = region
+        .finish_operation(token)
+        .map_err(|_| NativeProcessError::Stale)?;
+    let release = region
+        .fd(EL1_WAIT)
+        .unpin_filtered(OfdPin::from_raw(op.pin), is_zone_releasable_backing)
+        .map_err(|_| NativeProcessError::Quarantined)?;
+    settle_native_release(region, release, Some((zone, slot)), task)
+        .map_err(|_| NativeProcessError::Quarantined)?;
+    usize::try_from(op.progress.written).map_err(|_| NativeProcessError::Quarantined)
+}
+
 /// Count why a call leaves for the host (`Counters::ipc_leaves`).
 fn note<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) {
     sched.counters.ipc_leaves[why as usize].fetch_add(1, Ordering::Relaxed);
@@ -1079,7 +1254,7 @@ fn refuse<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, why: IpcLeave) -> 
 /// The call cannot continue in EL1: before any effect of a never-parked
 /// call, forward it unchanged; otherwise hand the owned operation back.
 #[allow(clippy::too_many_arguments)]
-fn bail<C: ThreadCpu, U: UserWord>(
+fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
     sched: &mut Sched<'_, C, U>,
     frame: &mut TrapFrame,
     token: IpcOpToken,
@@ -1087,13 +1262,104 @@ fn bail<C: ThreadCpu, U: UserWord>(
     resumed: bool,
     venue: &IpcVenue<'_>,
     why: IpcLeave,
-) -> IpcServed {
+    user: &mut M,
+    native: bool,
+) -> Result<IpcServed, IpcOpToken> {
     note(sched, why);
+    if native {
+        if matches!(why, IpcLeave::ObjectBusyHost) {
+            // The host holder can be waiting for this vCPU to leave. Yield
+            // through the existing carrier boundary with the same operation.
+            venue
+                .region
+                .update_operation(&token, op)
+                .unwrap_or_else(|_| {
+                    crate::dispatch::invalid_completion(
+                        crate::dispatch::NativeInvariant::EntryBinding,
+                    )
+                });
+            let operation = to_sched_token(token).unwrap_or_else(|_| {
+                crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+            });
+            use carrick_core::mm::transaction::CopyoutPreparation;
+            return match user.yield_owned_operation(operation) {
+                CopyoutPreparation::Ready(operation) => Err(from_sched_token(operation)
+                    .unwrap_or_else(|| {
+                        crate::dispatch::invalid_completion(
+                            crate::dispatch::NativeInvariant::EntryBinding,
+                        )
+                    })),
+                CopyoutPreparation::Suspended => Ok(IpcServed::Idle),
+                CopyoutPreparation::Complete(result) => {
+                    frame.x[0] = result as u64;
+                    Ok(IpcServed::Returned { switched: false })
+                }
+                _ => crate::dispatch::invalid_completion(
+                    crate::dispatch::NativeInvariant::EntryBinding,
+                ),
+            };
+        }
+        if op.progress.written > 0 && !matches!(why, IpcLeave::FaultFirst) {
+            // A structural refusal has no authority to complete a partial
+            // write. Preserve custody for terminal cleanup and fail the run.
+            retain_native_operation(sched, token);
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding);
+        }
+        finish_native(sched, token, &venue.region);
+        frame.x[0] = if matches!(why, IpcLeave::FaultFirst) {
+            if op.progress.written == 0 {
+                carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64
+            } else {
+                op.progress.written
+            }
+        } else {
+            carrick_syscall_abi::LINUX_ENOSYS.guest_retval() as u64
+        };
+        return Ok(IpcServed::Returned { switched: false });
+    }
     if op.progress.written == 0 && !resumed {
         finish(sched, token, &venue.region);
-        return IpcServed::Forward;
+        return Ok(IpcServed::Forward);
     }
-    handback(frame, token, op, IpcHandback::Continue, 0, venue)
+    Ok(handback(frame, token, op, IpcHandback::Continue, 0, venue))
+}
+
+fn retain_native_operation<C: ThreadCpu, U: UserWord>(sched: &Sched<'_, C, U>, token: IpcOpToken) {
+    let operation = to_sched_token(token).unwrap_or_else(|_| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    });
+    let record = sched.zone.slot(sched.slot).current().unwrap_or_else(|| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    });
+    carrick_core::wait::restore_object_operation(
+        sched.zone,
+        sched.slot,
+        sched.zone.record(record).identity(),
+        operation,
+    )
+    .unwrap_or_else(|_| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    });
+}
+
+fn finish_native<C: ThreadCpu, U: UserWord>(
+    sched: &mut Sched<'_, C, U>,
+    token: IpcOpToken,
+    region: &IpcRegion<'_>,
+) {
+    let op = region.finish_operation(token).unwrap_or_else(|_| {
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+    });
+    let release = region
+        .fd(EL1_WAIT)
+        .unpin_filtered(OfdPin::from_raw(op.pin), is_zone_releasable_backing)
+        .unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
+    settle_native_release(region, release, Some((sched.zone, sched.slot)), sched.task)
+        .unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
 }
 
 /// Hand the owned operation to the host: the record says what to do; the
@@ -2564,6 +2830,61 @@ mod tests {
             w.region.lock(object, &HostWait).is_err(),
             "no operation pin retains the closed eventfd"
         );
+    }
+
+    #[test]
+    fn native_structural_refusals_retire_without_host_handback() {
+        for why in [
+            IpcLeave::FlagsRefused,
+            IpcLeave::TransferRefused,
+            IpcLeave::ObjectBusy,
+            IpcLeave::ParkRefused,
+        ] {
+            let mut w = world();
+            let table = w.table(w.a_tid);
+            let fd = w.eventfd(table, 7, EventMode::Counter, BLOCK);
+            let backing = w.host().get(table, Fd(fd)).unwrap().backing;
+            let Some(IpcBacking::EventFd { object }) = IpcBacking::decode(backing) else {
+                unreachable!()
+            };
+            let mut frame = syscall(SYS_READ, fd, 0x10000, 8, A_SVC);
+            let venue = IpcVenue {
+                region: *w.region,
+                tables: &w.tables,
+            };
+            {
+                let mut sched = Sched {
+                    handoff: None,
+                    zone: &w.zone,
+                    slot: SLOT,
+                    task: &w.task,
+                    cpu: &mut w.cpu,
+                    user: &HardwareUserWord,
+                    counters: w.counters,
+                };
+                let mut user = User {
+                    task: &w.task,
+                    mem: &w.mem,
+                };
+                let Admission::Admitted(token, op) = admit(&mut sched, &frame, &venue, &mut user)
+                else {
+                    panic!("the eventfd read must own an operation")
+                };
+                assert!(matches!(
+                    bail(
+                        &mut sched, &mut frame, token, op, true, &venue, why, &mut user, true
+                    ),
+                    Ok(RETURNED)
+                ));
+                assert_eq!(frame.x[8], SYS_READ as u64);
+                assert_eq!(frame.x[0] as i64, -38);
+            }
+            w.host_close(table, fd);
+            assert!(
+                w.region.lock(object, &HostWait).is_err(),
+                "the operation pin leaked"
+            );
+        }
     }
 
     #[test]

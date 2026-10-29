@@ -1329,6 +1329,19 @@ impl ServiceCell {
         Ok(())
     }
 
+    /// Observe an acknowledged exact request without consuming completion.
+    /// The owner uses this while enrolling under its service wait queue, so
+    /// an already-ready supply can be requeued to its scheduler checkpoint.
+    pub fn completion_ready(&self, identity: ServiceIdentity) -> Result<bool, ServiceError> {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, COMPLETED | CANCELLED) {
+            return Ok(false);
+        }
+        self.lock_exact(state, identity)?;
+        self.state.store(state, Ordering::Release);
+        Ok(true)
+    }
+
     /// The ring consumes exactly one acknowledged operation before releasing
     /// its retained MM/member capabilities or deciding a guest-visible result.
     pub fn consume(&self, identity: ServiceIdentity) -> Result<ServiceResult, ServiceError> {

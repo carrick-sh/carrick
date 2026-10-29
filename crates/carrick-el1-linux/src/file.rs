@@ -179,32 +179,45 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
 pub(crate) struct OwnerCopy<'a, 'p, U, C: carrick_core_abi::EntryContext> {
     pub inner: U,
     pub owner: Option<&'a mut (dyn carrick_personality_linux::lifecycle::ProcessNative<C> + 'p)>,
-    pub wait: Option<carrick_core_abi::PortalOwnerWait>,
+    pub wait: Option<carrick_core::mm::transaction::CopyoutRequest>,
 }
 impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, '_, U, C> {
     fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
         self.inner.copy_in(dst, address)
     }
     fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
-        if let Some(result) = self
-            .owner
-            .as_deref_mut()
-            .and_then(|owner| owner.copy_out_owned(carrick_guest_arch::UserVa::new(address), bytes))
-        {
-            match result {
-                Ok(()) => true,
-                Err(carrick_personality_linux::lifecycle::OwnedCopyError::Wait(wait)) => {
-                    self.wait = Some(wait);
-                    false
-                }
-                Err(carrick_personality_linux::lifecycle::OwnedCopyError::Fault) => false,
-            }
-        } else {
-            self.inner.copy_out(address, bytes)
+        if self.inner.copy_out(address, bytes) {
+            return true;
+        }
+        if self.owner.is_some() {
+            self.wait = Some(carrick_core::mm::transaction::CopyoutRequest {
+                address: carrick_guest_arch::UserVa::new(address),
+                len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+            });
+        }
+        false
+    }
+    fn take_copyout_refusal(&mut self) -> Option<carrick_core::mm::transaction::CopyoutRequest> {
+        self.wait.take()
+    }
+    fn yield_owned_operation(
+        &mut self,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        match self.owner.as_deref_mut() {
+            Some(owner) => owner.yield_owned_operation(operation),
+            None => carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation),
         }
     }
-    fn take_owner_wait(&mut self) -> Option<carrick_core_abi::PortalOwnerWait> {
-        self.wait.take()
+    fn prepare_copyout(
+        &mut self,
+        request: carrick_core::mm::transaction::CopyoutRequest,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        match self.owner.as_deref_mut() {
+            Some(owner) => owner.prepare_owned_copyout(request, operation),
+            None => carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation),
+        }
     }
 }
 

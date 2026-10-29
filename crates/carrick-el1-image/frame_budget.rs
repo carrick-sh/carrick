@@ -235,7 +235,11 @@ impl Frames {
             + self.qualified("descriptor_txn::InlineJournal", "::reserve::")
             + allocation;
         let write = self.required("::copy_signal_bytes::")?
-            + self.required("::write_user_bytes::")?
+            + self.required("::access_user_target::")?
+            + self
+                .maximum("::write_user_bytes::")
+                .max(self.maximum("::prepare_user_write::"))
+            + self.maximum("::write_user_target::")
             + self.sum(&["::authorize::", "::root_for::"])
             + root;
         // A failed caught signal can force SIGSEGV once; a failed SIGSEGV
@@ -253,7 +257,25 @@ impl Frames {
             + self
                 .required("::park_service::")?
                 .max(self.required("::park_owner_wait::")? + self.maximum("::finish_owner_wait::"))
-            + self.maximum("::finish_service::");
+            + self
+                .maximum("::finish_service::")
+                .max(self.maximum("::take_preparation_operation::"))
+                .max(self.maximum("::restore_preparation_operation::"));
+        // IPC dispatch returns before physical enrollment; the handoff
+        // boundary drains one captured request. Ready replies requeue to the
+        // scheduler checkpoint rather than nesting physical application here.
+        let adapter_stage = native
+            + self.sum(&[
+                "::take_handoff_receipt::",
+                "::drain_owned_preparation::",
+                "::begin_adapter_service::",
+                "::begin_service_inner::",
+                "::park_service::",
+            ])
+            + self
+                .maximum("::yield_service_checkpoint::")
+                .max(self.maximum("::take_preparation_operation::"))
+            + allocation;
         // FD inheritance is distinct from the page-table descriptor executor.
         // Optional helpers can inline into their caller in one feature closure
         // and remain emitted in another; charge both when both retain frames.
@@ -449,14 +471,15 @@ impl Frames {
                         "::ipc::serve_ipc_with_sigpipe::",
                         "::ipc::run::",
                         "::substrate::ipc::transfer::",
-                        "::copy_out_owned::",
-                        "::copy_owner_frame::",
-                        "::copy_owned_bytes::",
+                        "::prepare_copyout::",
+                        "::prepare_owned_copyout::",
+                        "::prepare_owned_write::",
                     ])
                     + self.qualified("PrefixCopy", "::copy_out::")
                     + self.qualified("OwnerCopy", "::copy_out::")
                     + write,
             ),
+            ("ring pipe backing preparation", adapter_stage),
             (
                 "native wait copy",
                 native.max(resume)
@@ -672,6 +695,7 @@ mod tests {
             "x::copy_signal_bytes::h0",
             "x::finish_copyout::h0",
             "x::write_user_bytes::h0",
+            "x::access_user_target::h0",
             "x::arm_signal::deliver_on_user_return::h0",
             "x::signal_delivery::deliver_signal_on_syscall_return::h0",
             "x::admit_entry_runtime::h0",
@@ -702,6 +726,9 @@ mod tests {
     fn retained_ring_copyout_chains_are_bounded() {
         let mut frames = small_frames();
         frames.0.insert("x::copy_owner_frame::h0".to_owned(), 11500);
+        frames
+            .0
+            .insert("x::prepare_owned_copyout::h0".to_owned(), 11500);
         let error = frames.check(16384, 288).unwrap_err();
         assert!(error.contains("ring completed copyout"));
         assert!(error.contains("ring pipe copyout"));

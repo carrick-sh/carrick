@@ -8,7 +8,7 @@ use carrick_sched_core::object_wait::{
 };
 use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
 use carrick_sched_core::{
-    Claim, RecordId, ShortLockSpin, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
+    RecordId, ShortLockSpin, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
 };
 use core::sync::atomic::Ordering;
 
@@ -131,20 +131,66 @@ pub fn take_object_operation<C: carrick_core_abi::EntryContext>(
     slot: SlotId,
     expected: ThreadIdentity,
 ) -> Result<Option<OperationToken>, ObjectWaitError> {
-    let Some(record): Option<RecordId> = zone.slot(slot).current() else {
+    let Some(record): Option<RecordId> = zone
+        .slot(slot)
+        .current()
+        .or_else(|| zone.slot(slot).host_record())
+    else {
         return Ok(None);
     };
     let rec = zone.record(record);
-    let id = rec.identity();
-    if !matches!(rec.claim(), Claim::OnCpu { slot: s, .. } if s == slot)
-        || id != expected
-        || zone.installed_space(slot) != id.mm
-    {
+    if !owns_operation_record(zone, slot, record, expected) {
         return Err(ObjectWaitError::Stale);
     }
-    // SAFETY: this slot owns the OnCpu record, load restored its exact
-    // MM/task, and the waker detached its registration before queueing.
+    // SAFETY: the common entry owner authenticated this executing or host-loaded
+    // record and exact MM; a waker detached any prior queue registration.
     Ok(unsafe { rec.take_object_operation() })
+}
+
+/// Restore an owned adapter token while the execution lane exclusively owns
+/// this exact record and installed MM. A preparation may change its wait key,
+/// but never its endpoint or cursor owner.
+pub fn restore_object_operation<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
+    slot: SlotId,
+    expected: ThreadIdentity,
+    operation: OperationToken,
+) -> Result<(), (ObjectWaitError, OperationToken)> {
+    let Some(record) = zone
+        .slot(slot)
+        .current()
+        .or_else(|| zone.slot(slot).host_record())
+    else {
+        return Err((ObjectWaitError::Stale, operation));
+    };
+    let rec = zone.record(record);
+    if !owns_operation_record(zone, slot, record, expected) {
+        return Err((ObjectWaitError::Stale, operation));
+    }
+    // SAFETY: the lane's exact record/MM custody was checked above.
+    unsafe { rec.restore_object_operation(operation) }
+}
+
+fn owns_operation_record<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
+    slot: SlotId,
+    record: RecordId,
+    expected: ThreadIdentity,
+) -> bool {
+    let id = zone.record(record).identity();
+    let binding = carrick_core_abi::ExecutionBinding {
+        task: carrick_core_abi::EntryTaskKey::from_raw(id.tid),
+        generation: carrick_core_abi::SnapshotGeneration::from_raw(id.generation),
+        mm: carrick_core_abi::EntryMmKey::from_raw(id.mm),
+        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(id.serial),
+    };
+    id == expected
+        && crate::entry::record_binding(
+            binding,
+            carrick_core_abi::BornInZoneSource { zone, slot },
+            record,
+        )
+        .is_some()
 }
 
 /// Notify under the caller's object lock.
