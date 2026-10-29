@@ -3527,6 +3527,374 @@ mod physical_projection_tests {
     }
 
     #[test]
+    fn backing_reply_withdrawal_restores_inventory_before_allocation_release() {
+        use carrick_hal::physical_grants::{NativePhysicalGrants, StagedPhysicalGrants};
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let before = inventory.snapshot();
+        let staged = StagedPhysicalGrants::stage(
+            Arc::default(),
+            source,
+            [carrick_guest_arch::FrameGpa::new(0x10000)],
+            0,
+            16384,
+            owner,
+        )
+        .unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let mut grants = NativePhysicalGrants::new(owner);
+        let data = staged.grants()[0];
+        let window = carrick_el1_abi::PortalGrantWindow::decode([
+            1, 41, 1, 1, 1, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0,
+        ])
+        .unwrap();
+        use carrick_mmu_core::aarch64::descriptor_txn::*;
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(41).unwrap(),
+                generation: NonZeroU64::MIN,
+            },
+            root: carrick_mmu_core::aarch64::SubstrateGpa(0x20000),
+            op: DescriptorOp::Prepare {
+                publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                    va: 0x4000,
+                    ipa: data.gpa.raw(),
+                    len: 4096,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(0x4000, 4096),
+                backing: data.identity,
+            },
+            tables: TableGrants::new(&[]).unwrap(),
+        };
+        let slot = carrick_el1_abi::PortalGrantSlot::new();
+        grants
+            .stage_backing_reply(
+                &slot,
+                window,
+                txn,
+                staged.with_backing(InventoryReleaseProbe {
+                    inventory: inventory.clone(),
+                    observed: observed.clone(),
+                }),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(grants.offer_backing_reply(&slot, &txn));
+        grants
+            .settle_backing_reply(&slot, &txn, |_| {
+                assert_eq!(inventory.snapshot().mappings, before.mappings);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            observed.lock().is_none(),
+            "custody survives until table settlement and ACK"
+        );
+        grants.acknowledge_backing_reply(&slot, &txn).unwrap();
+        assert_eq!(
+            inventory.snapshot().mappings,
+            before.mappings,
+            "withdrawn backing reply must restore physical inventory"
+        );
+        assert!(
+            observed.lock().is_some(),
+            "explicit rollback must release allocation"
+        );
+    }
+
+    #[test]
+    fn backing_reply_two_live_owners_restore_preimage_or_retain_failed_custody() {
+        use carrick_hal::physical_grants::{NativePhysicalGrants, StagedPhysicalGrants};
+        use carrick_mmu_core::aarch64::descriptor_txn::*;
+        // Breaks caught: freeing an offered/applying reply, ignoring either
+        // undo failure, consuming a receipt before ACK, or touching a peer MM.
+        for same_number in [false, true] {
+            for boundary in 0..12 {
+                let inventory = Arc::new(FrameInventoryAuthority::new());
+                let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+                let owner = |mm, root| carrick_hal::GuestFrameOwner {
+                    native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+                    root_generation: carrick_guest_arch::ContextGeneration::new(
+                        NonZeroU64::new(root).unwrap(),
+                    ),
+                };
+                let owners = [owner(41, 1), owner(if same_number { 41 } else { 42 }, 2)];
+                let stage = |index: usize| {
+                    StagedPhysicalGrants::stage(
+                        Arc::default(),
+                        source.clone(),
+                        [carrick_guest_arch::FrameGpa::new(
+                            0x10000 + index as u64 * 0x10000,
+                        )],
+                        0,
+                        16384,
+                        owners[index],
+                    )
+                    .unwrap()
+                };
+                let peer = stage(1);
+                let before = inventory.snapshot();
+                let staged = stage(0);
+                let data = staged.grants()[0];
+                let window = carrick_el1_abi::PortalGrantWindow::decode([
+                    1, 41, 1, 1, 1, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0,
+                ])
+                .unwrap();
+                let txn = DescriptorTxn {
+                    id: DescriptorTxnId {
+                        mm_key: NonZeroU64::new(41).unwrap(),
+                        generation: NonZeroU64::MIN,
+                    },
+                    root: carrick_mmu_core::aarch64::SubstrateGpa(0x30000),
+                    op: DescriptorOp::Prepare {
+                        publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                            va: 0x4000,
+                            ipa: data.gpa.raw(),
+                            len: 4096,
+                            writable: true,
+                            executable: false,
+                        },
+                        resident: PageSpan::new(0x4000, 4096),
+                        backing: data.identity,
+                    },
+                    tables: TableGrants::new(&[]).unwrap(),
+                };
+                let slot = carrick_el1_abi::PortalGrantSlot::new();
+                // A busy transport refuses this submission before visibility.
+                if boundary == 8 {
+                    assert!(slot.submit(window, &txn));
+                }
+                let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut grants = NativePhysicalGrants::new(owners[0]);
+                grants
+                    .stage_backing_reply(
+                        &slot,
+                        window,
+                        txn,
+                        staged.with_backing(AllocationDropProbe(dropped.clone())),
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                let delivery_cell = carrick_core_abi::service::ServiceCell::new();
+                let mut cancelled_ticket = None;
+                if boundary == 11 {
+                    use carrick_core_abi::service::*;
+                    let birth = ServiceBirth {
+                        process: carrick_sched_core::process::TaskKey {
+                            id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                                core::num::NonZeroI32::new(1).unwrap(),
+                            ),
+                            serial:
+                                carrick_sched_core::process::TaskSerial::from_registry_allocation(
+                                    NonZeroU64::MIN,
+                                ),
+                        },
+                        thread: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+                        record: carrick_sched_core::RecordRef {
+                            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+                            incarnation: 1,
+                        },
+                        // SAFETY: this fixture retains the exact inventory MM above.
+                        mm: unsafe {
+                            carrick_core_abi::El1MmHandle::from_admitted_owner(
+                                NonZeroU64::MIN,
+                                window.operation.mm,
+                                NonZeroU64::MIN,
+                            )
+                        },
+                    };
+                    delivery_cell.bind(birth).unwrap();
+                    let request = delivery_cell
+                        .publish(
+                            birth,
+                            carrick_core_abi::SnapshotGeneration::INITIAL,
+                            ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+                                address: carrick_guest_arch::UserVa::new(0x4000),
+                                access: carrick_guest_arch::Access::Write,
+                                present: false,
+                            }),
+                            None,
+                        )
+                        .unwrap();
+                    let ticket = delivery_cell.claim(request).unwrap();
+                    assert!(!delivery_cell.cancel(request.identity).unwrap());
+                    let Err((PreparedDeliveryError::Cancelled, ticket, ())) = ticket
+                        .publish_prepared((), |()| {
+                            if grants.offer_backing_reply(&slot, &txn) {
+                                Ok(())
+                            } else {
+                                Err(())
+                            }
+                        })
+                    else {
+                        panic!("cancelled reply became consumable");
+                    };
+                    assert!(slot.window().is_none());
+                    assert_eq!(
+                        delivery_cell.consume(request.identity),
+                        Err(ServiceError::Busy)
+                    );
+                    cancelled_ticket = Some((ticket, request));
+                }
+                let submitted = boundary != 11 && grants.offer_backing_reply(&slot, &txn);
+                assert_eq!(submitted, !matches!(boundary, 8 | 11));
+                let mut _held_claim = None;
+                if matches!(boundary, 1 | 2 | 3 | 6 | 7 | 10) {
+                    let outcome = match boundary {
+                        2 => DescriptorOutcome::RolledBack(DescriptorRefusal::Occupied),
+                        3 => DescriptorOutcome::Indeterminate(DescriptorRefusal::Occupied),
+                        _ => DescriptorOutcome::Refused(DescriptorRefusal::Occupied),
+                    };
+                    slot.descriptor()
+                        .claim_for_mm(41)
+                        .unwrap()
+                        .complete(outcome, || {});
+                } else if boundary == 9 {
+                    _held_claim = slot.descriptor().claim_for_mm(41);
+                }
+                if boundary == 4 {
+                    inventory
+                        .state
+                        .lock()
+                        .mappings
+                        .remove(&MappingId::from_kernel_allocation(data.identity.mapping_id))
+                        .unwrap();
+                }
+                let mut settle_txn = txn;
+                if boundary == 7 {
+                    settle_txn.root = carrick_mmu_core::aarch64::SubstrateGpa(0x40000);
+                }
+                let mut releases = 0;
+                let settled = grants.settle_backing_reply(&slot, &settle_txn, |_| {
+                    releases += 1;
+                    assert_eq!(inventory.snapshot().frames, before.frames);
+                    assert_eq!(inventory.snapshot().mappings, before.mappings);
+                    if boundary == 5 {
+                        Err(carrick_hal::TrapError::Hypervisor(
+                            "injected exact generation pin/unmap failure".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                let fails = matches!(boundary, 3 | 4 | 5 | 7 | 9);
+                assert_eq!(settled.is_err(), fails, "boundary {boundary}");
+                assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+                if !fails {
+                    // Replayed settlement before ACK performs no second undo.
+                    assert_eq!(
+                        grants
+                            .settle_backing_reply(&slot, &txn, |_| panic!("duplicate release"))
+                            .unwrap(),
+                        settled.unwrap()
+                    );
+                    if boundary == 6 {
+                        slot.take_receipt(window, &txn).unwrap(); // lost/corrupt ACK boundary
+                    }
+                    if boundary == 10 {
+                        grants.fail_backing_reply();
+                    } // table settlement failed
+                    let ack = grants.acknowledge_backing_reply(&slot, &txn);
+                    assert_eq!(ack.is_err(), matches!(boundary, 6 | 10));
+                    assert_eq!(
+                        dropped.load(std::sync::atomic::Ordering::Acquire),
+                        !matches!(boundary, 6 | 10)
+                    );
+                    if let Some((ticket, request)) = cancelled_ticket.take() {
+                        assert!(ticket.complete(false).is_ok());
+                        assert_eq!(
+                            delivery_cell.consume(request.identity),
+                            Ok(carrick_core_abi::service::ServiceResult::Cancelled)
+                        );
+                    }
+                    if !matches!(boundary, 6 | 10) {
+                        assert!(
+                            !grants.backing_reply_available(&slot, window),
+                            "same request cannot reuse ACK tombstone"
+                        );
+                        let mut successor = window;
+                        successor.operation.sequence = NonZeroU64::new(2).unwrap();
+                        assert!(grants.backing_reply_available(&slot, successor));
+                    }
+                }
+                assert_eq!(grants.failed(), fails || matches!(boundary, 6 | 10));
+                assert_eq!(releases, usize::from(!matches!(boundary, 3 | 4 | 7 | 9)));
+                if matches!(boundary, 3 | 7 | 10) {
+                    assert!(
+                        slot.inspect_receipt(window, &txn).is_some(),
+                        "unknown settlement must not ACK ring receipt"
+                    );
+                }
+                // Both exact owners remain live throughout the decision.
+                let peer_mapping =
+                    MappingId::from_kernel_allocation(peer.grants()[0].identity.mapping_id);
+                assert!(
+                    source
+                        .bind(owners[1])
+                        .live_mapping_row(peer_mapping)
+                        .is_some()
+                );
+                // Failed journals intentionally remain in owner custody. Test
+                // teardown drops the owner only after inspecting that custody.
+                drop(grants);
+                peer.with_backing(()).abort_inventory().unwrap();
+            }
+        }
+    }
+
+    fn refused_backing_candidate(
+        owner: carrick_hal::GuestFrameOwner,
+        data: carrick_hal::physical_grants::PhysicalFrameGrant,
+    ) -> (
+        carrick_el1_abi::PortalGrantWindow,
+        carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) {
+        use carrick_mmu_core::aarch64::descriptor_txn::*;
+        let window = carrick_el1_abi::PortalGrantWindow::decode([
+            1,
+            owner.native_mm.raw().get(),
+            owner.root_generation.raw().get(),
+            1,
+            1,
+            0x4000,
+            0x5000,
+            3,
+            0x4000,
+            0,
+            0,
+            0,
+            0,
+        ])
+        .unwrap();
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: owner.native_mm.raw(),
+                generation: NonZeroU64::MIN,
+            },
+            root: carrick_mmu_core::aarch64::SubstrateGpa(0x30000),
+            op: DescriptorOp::Prepare {
+                publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                    va: 0x4000,
+                    ipa: data.gpa.raw(),
+                    len: 4096,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(0x4000, 4096),
+                backing: data.identity,
+            },
+            tables: TableGrants::new(&[]).unwrap(),
+        };
+        (window, txn)
+    }
+
+    #[test]
     fn unpublished_backing_refusal_restores_two_live_mm_inventory_before_release() {
         use carrick_hal::physical_grants::{NativePhysicalGrants, StagedPhysicalGrants};
         // Two live MMs, and numeric-MM reuse with a distinct root incarnation.
@@ -3565,12 +3933,20 @@ mod physical_projection_tests {
                     MappingId::from_kernel_allocation(first_staged.grants()[0].identity.mapping_id);
                 let observed = Arc::new(Mutex::new(None));
                 let mut wrong_owner = NativePhysicalGrants::new(owners[first]);
+                let (window, txn) =
+                    refused_backing_candidate(owners[1 - first], second_staged.grants()[0]);
                 assert!(
                     wrong_owner
-                        .retain_backing(second_staged.with_backing(InventoryReleaseProbe {
-                            inventory: Arc::clone(&inventory),
-                            observed: Arc::clone(&observed),
-                        }))
+                        .stage_backing_reply(
+                            &carrick_el1_abi::PortalGrantSlot::new(),
+                            window,
+                            txn,
+                            second_staged.with_backing(InventoryReleaseProbe {
+                                inventory: Arc::clone(&inventory),
+                                observed: Arc::clone(&observed),
+                            }),
+                            |_| Ok(())
+                        )
                         .is_err()
                 );
                 let released_snapshot = observed.lock().take().unwrap();
@@ -3670,8 +4046,15 @@ mod physical_projection_tests {
         inventory.state.lock().mappings.remove(&mapping).unwrap();
         let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut peer_grants = NativePhysicalGrants::new(peer);
+        let (window, txn) = refused_backing_candidate(owner, staged.grants()[0]);
         let error = peer_grants
-            .retain_backing(staged.with_backing(AllocationDropProbe(Arc::clone(&released))))
+            .stage_backing_reply(
+                &carrick_el1_abi::PortalGrantSlot::new(),
+                window,
+                txn,
+                staged.with_backing(AllocationDropProbe(Arc::clone(&released))),
+                |_| Ok(()),
+            )
             .unwrap_err();
         assert!(error.to_string().contains("rollback indeterminate"));
         assert!(rollback.failed());

@@ -163,7 +163,7 @@ impl CowResolver for FaultResolver<'_> {
 
 #[test]
 fn native_child_empty_supply_resumes_cow_without_changing_parent() {
-    composed_native_supply(false, None, false);
+    composed_native_supply(false, None, false, SupplyEnd::Resume);
 }
 
 #[test]
@@ -204,31 +204,53 @@ fn native_fault_reply_stale_owner_window_retries_instruction() {
     // instruction. A replaced owner must retry the fault under the current
     // mapping instead of turning the stale reply into SIGSEGV.
     assert_eq!(
-        NativeProcessService::apply_fault_reply(&mut service, &slot),
+        NativeProcessService::apply_fault_reply(
+            &mut service,
+            &slot,
+            crate::native_process_runtime::FaultReplyDisposition::Apply
+        ),
         Ok(())
     );
 }
 
 #[test]
 fn native_backing_reply_observes_a_competing_valid_publication() {
-    composed_native_supply(true, None, false);
+    composed_native_supply(true, None, false, SupplyEnd::Resume);
 }
 #[test]
 fn native_child_backing_selection_excludes_inherited_live_neighbor() {
-    composed_native_supply(false, Some(1), false);
+    composed_native_supply(false, Some(1), false, SupplyEnd::Resume);
 }
 #[test]
 fn native_child_backing_selection_excludes_inherited_live_suffix() {
-    composed_native_supply(false, Some(0), false);
+    composed_native_supply(false, Some(0), false, SupplyEnd::Resume);
 }
 #[test]
 fn native_child_fixed_over_cow_preserves_parent_bytes_and_retires() {
-    composed_native_supply(false, None, true);
+    composed_native_supply(false, None, true, SupplyEnd::Resume);
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SupplyEnd {
+    Resume,
+    Cancel,
+    FailTables,
+}
+
+#[test]
+fn native_backing_cancel_after_delivery_restores_private_supply() {
+    composed_native_supply(false, None, false, SupplyEnd::Cancel);
+}
+
+#[test]
+fn native_backing_table_failure_retains_applied_receipt_without_ack() {
+    composed_native_supply(false, None, false, SupplyEnd::FailTables);
+}
+
 fn composed_native_supply(
     competing_publication: bool,
     absent_page: Option<usize>,
     replace_cow: bool,
+    end: SupplyEnd,
 ) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     if let Some(absent_page) = absent_page {
@@ -1050,19 +1072,7 @@ fn composed_native_supply(
         physical_owner,
     )
     .unwrap();
-    let rows = {
-        let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
-        let retained = stock.backing(&staged, backing_len, NonZeroU64::new(7).unwrap());
-        stock
-            .owner
-            .child_physical_mut(handle.mm(), child_physical_root)
-            .unwrap()
-            .supplied
-            .as_mut()
-            .unwrap()
-            .retain_backing(staged.with_backing(retained))
-            .unwrap()
-    };
+    let rows = staged.grants().to_vec();
     use carrick_mmu_core::aarch64::descriptor_txn::{
         DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
     };
@@ -1091,19 +1101,86 @@ fn composed_native_supply(
     };
     assert_eq!(window.range.start(), fresh);
     assert_eq!(window.range.len(), replacement_len);
-    // SAFETY: the native pending request owns this aligned reply through ACK.
-    assert!(
-        unsafe { &*(reply.raw() as *const carrick_el1_abi::PortalGrantSlot) }.submit(window, &txn)
-    );
+    // SAFETY: the retained native ticket owns this exact reply through ACK.
+    let reply_slot = unsafe { &*(reply.raw() as *const carrick_el1_abi::PortalGrantSlot) };
+    {
+        let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
+        let retained = stock.backing(&staged, backing_len, NonZeroU64::new(7).unwrap());
+        stock.track_backing_tables(handle, child_physical_root, txn);
+        let grants = stock
+            .owner
+            .child_physical_mut(handle.mm(), child_physical_root)
+            .unwrap()
+            .supplied
+            .as_mut()
+            .unwrap();
+        grants
+            .stage_backing_reply(
+                reply_slot,
+                window,
+                txn,
+                staged.with_backing(retained),
+                super::native_retirement_tests::SupplyBacking::release_unused,
+            )
+            .unwrap();
+        assert!(grants.offer_backing_reply(reply_slot, &txn));
+    }
     if competing_publication {
         let competing = carrick_el1_abi::PortalGrantSlot::new();
-        assert!(competing.submit(window, &txn));
+        // A competing producer owns different bytes and an independent
+        // request. Reusing the refused reply's bytes would hide early release.
+        let mut competing_window = window;
+        competing_window.operation.sequence =
+            NonZeroU64::new(window.operation.sequence.get() + 1).unwrap();
+        let competitor = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+            std::sync::Arc::default(),
+            physical.clone(),
+            [FrameGpa::new(0xb0020000)],
+            0,
+            backing_len,
+            physical_owner,
+        )
+        .unwrap();
+        let data = competitor.grants()[0];
+        let mut competing_txn = txn;
+        competing_txn.id.generation = competing_window.operation.sequence;
+        if let DescriptorOp::Prepare {
+            publication,
+            backing,
+            ..
+        } = &mut competing_txn.op
+        {
+            publication.ipa = data.gpa.raw();
+            *backing = data.identity;
+        }
+        {
+            let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
+            let retained = stock.backing(&competitor, backing_len, NonZeroU64::new(8).unwrap());
+            stock.track_backing_tables(handle, child_physical_root, competing_txn);
+            let grants = stock
+                .owner
+                .child_physical_mut(handle.mm(), child_physical_root)
+                .unwrap()
+                .supplied
+                .as_mut()
+                .unwrap();
+            grants
+                .stage_backing_reply(
+                    &competing,
+                    competing_window,
+                    competing_txn,
+                    competitor.with_backing(retained),
+                    super::native_retirement_tests::SupplyBacking::release_unused,
+                )
+                .unwrap();
+            assert!(grants.offer_backing_reply(&competing, &competing_txn));
+        }
         let mm = crate::aarch64_process::Portal::for_zone(
             NonZeroU64::MIN,
             fixture.region.table(),
             fixture.zone,
         );
-        let target = carrick_core::mm::frames::grant_target(&mm, window, 0).unwrap();
+        let target = carrick_core::mm::frames::grant_target(&mm, competing_window, 0).unwrap();
         let receipt = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
             &competing,
             words,
@@ -1116,14 +1193,92 @@ fn composed_native_supply(
             receipt.outcome,
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
         ));
-        assert!(competing.take_receipt(window, &txn).is_some());
+        crossing
+            .physical
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .settle_backing_reply(handle, competing_window.operation.sequence, &competing);
     }
+    if end == SupplyEnd::FailTables {
+        // Apply through the real ring owner, then inject loss of the pending
+        // table journal between physical application and combined settlement.
+        let portal = crate::aarch64_process::Portal::for_zone(
+            NonZeroU64::MIN,
+            fixture.region.table(),
+            fixture.zone,
+        );
+        let target = carrick_core::mm::frames::grant_target(&portal, window, 0).unwrap();
+        let receipt = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
+            reply_slot,
+            words,
+            residency,
+            target,
+            || {},
+        )
+        .unwrap();
+        assert!(matches!(
+            receipt.outcome,
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+        ));
+        let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
+        stock
+            .owner
+            .cancel_submitted_native_descriptor_tables(
+                &mut carrick_hal::fork_stock::NoTableLedger,
+                handle,
+                child_physical_root,
+                txn.id.generation,
+            )
+            .unwrap();
+        assert!(
+            stock
+                .owner
+                .settle_native_backing_reply(
+                    &mut carrick_hal::fork_stock::NoTableLedger,
+                    handle,
+                    child_physical_root,
+                    reply_slot,
+                    &txn,
+                    super::native_retirement_tests::SupplyBacking::release_unused
+                )
+                .is_err()
+        );
+        assert!(stock.owner.is_quarantined(handle.mm()));
+        assert!(
+            stock
+                .owner
+                .child_physical_mut(handle.mm(), child_physical_root)
+                .unwrap()
+                .supplied
+                .as_mut()
+                .unwrap()
+                .failed()
+        );
+        assert_eq!(reply_slot.inspect_receipt(window, &txn), Some(receipt));
+        assert_eq!(
+            leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK,
+            rows[0].gpa.raw()
+        );
+        assert_eq!(
+            control.service.consume(ticket.request().identity),
+            Err(carrick_core_abi::service::ServiceError::Busy)
+        );
+        // The leaked carrier fixture retains the failed journal and both live
+        // MMs; no retirement/ACK is manufactured to make this failure pass.
+        return;
+    }
+    let delivered_request = ticket.request();
     {
         let queue = fixture
             .zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin)
             .unwrap();
         assert!(ticket.complete(true).is_ok());
+        if end == SupplyEnd::Cancel {
+            assert!(control.service.cancel(delivered_request.identity).unwrap());
+        }
         queue
             .notify_object(fixture.slot, &mut Default::default())
             .unwrap();
@@ -1163,7 +1318,13 @@ fn composed_native_supply(
     );
     assert_eq!(
         leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK,
-        rows[0].gpa.raw()
+        if end == SupplyEnd::Cancel {
+            0
+        } else if competing_publication {
+            0xb0020000
+        } else {
+            rows[0].gpa.raw()
+        }
     );
     if !replace_cow {
         assert_eq!(

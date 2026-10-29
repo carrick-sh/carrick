@@ -740,7 +740,7 @@ impl NativeService {
         let grants = physical
             .supplied
             .get_or_insert_with(|| carrick_hal::physical_grants::NativePhysicalGrants::new(owner));
-        if grants.owner() != owner || physical.rollback.failed() {
+        if grants.owner() != owner || grants.failed() || physical.rollback.failed() {
             return Err(stale());
         }
         grants.settle(pool, exclusion.proof())?;
@@ -866,8 +866,14 @@ impl NativeService {
         let grants = physical
             .supplied
             .get_or_insert_with(|| carrick_hal::physical_grants::NativePhysicalGrants::new(owner));
-        if grants.owner() != owner || physical.rollback.failed() {
+        if grants.owner() != owner || grants.failed() || physical.rollback.failed() {
             return Err(stale());
+        }
+        // SAFETY: intake retains this authenticated request-owned reply.
+        let reply_slot = unsafe { reply.as_ref() };
+        if !grants.backing_reply_available(reply_slot, window) {
+            drop(stock);
+            return self.refuse();
         }
         let data_len = publication_len.next_multiple_of(carrick_el1_abi::COW_GRANT_SIZE);
         let executable = window
@@ -898,21 +904,48 @@ impl NativeService {
         if executable {
             crate::trap::invalidate_instruction_cache(host, data_len);
         }
-        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
-            Arc::clone(&physical.rollback),
-            inventory,
-            [carrick_guest_arch::FrameGpa::new(ipa)],
-            0,
-            data_len,
-            owner,
-            carrick_hal::MemPerms {
-                read: true,
-                write: window
-                    .protection
-                    .permits(carrick_el1_abi::ReservationProtection::WRITE),
-                exec: executable,
-            },
-        )?;
+        let staged_result =
+            carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
+                Arc::clone(&physical.rollback),
+                inventory,
+                [carrick_guest_arch::FrameGpa::new(ipa)],
+                0,
+                data_len,
+                owner,
+                carrick_hal::MemPerms {
+                    read: true,
+                    write: window
+                        .protection
+                        .permits(carrick_el1_abi::ReservationProtection::WRITE),
+                    exec: executable,
+                },
+            );
+        let staged = match staged_result {
+            Ok(staged) => staged,
+            Err(error) => {
+                // Staging can fail after applying inventory. Its guard then
+                // attempts undo; an unknown undo already retained the receipt.
+                // Couple this allocation to that failure custody before any
+                // backend release can discard its bytes.
+                if physical.rollback.failed() {
+                    physical.rollback.retain_allocation(retained);
+                    stock
+                        .owner
+                        .quarantine_native_supply(handle, root)
+                        .map_err(|_| stale())?;
+                    return Err(error);
+                }
+                if let Err(release_error) = retained.release_unused() {
+                    physical.rollback.retain_allocation(retained);
+                    stock
+                        .owner
+                        .quarantine_native_supply(handle, root)
+                        .map_err(|_| stale())?;
+                    return Err(release_error);
+                }
+                return Err(error);
+            }
+        };
         let unpublished = staged.with_backing(retained);
         let data = *unpublished.grants().first().ok_or_else(|| stale())?;
         let table_reservation = match stock.owner.reserve_native_descriptor_tables(
@@ -923,7 +956,15 @@ impl NativeService {
         ) {
             Ok(reservation) => reservation,
             Err(_) => {
-                unpublished.abort_inventory()?;
+                if let Err(error) =
+                    unpublished.abort_with_release(|backing| backing.release_unused())
+                {
+                    stock
+                        .owner
+                        .quarantine_native_supply(handle, root)
+                        .map_err(|_| stale())?;
+                    return Err(error);
+                }
                 drop(stock);
                 return self.refuse();
             }
@@ -958,37 +999,108 @@ impl NativeService {
             )
             .is_err()
         {
-            unpublished.abort_inventory()?;
+            if let Err(error) = unpublished.abort_with_release(|backing| backing.release_unused()) {
+                stock
+                    .owner
+                    .quarantine_native_supply(handle, root)
+                    .map_err(|_| stale())?;
+                return Err(error);
+            }
             drop(stock);
             return self.refuse();
         }
-        // Keep the inventory rollback receipt and allocation coupled through
-        // all pre-offer table admission. Only now transfer publication custody;
-        // submit may make the reply consumable immediately.
-        stock
+        let staged = stock
             .owner
             .child_physical_mut(handle.mm(), root)
             .ok_or_else(|| stale())?
             .supplied
             .as_mut()
             .ok_or_else(|| stale())?
-            .retain_backing(unpublished)?;
-        // SAFETY: intake pinned and authenticated the request-owned reply. The
-        // ring retains it through ACK, then revalidates and executes this slot.
-        let submitted = unsafe { reply.as_ref() }.submit(window, &txn);
-        if !submitted {
+            .stage_backing_reply(reply_slot, window, txn, unpublished, |backing| {
+                backing.release_unused()
+            });
+        if let Err(error) = staged {
             stock
                 .owner
-                .cancel_submitted_native_descriptor_tables(
-                    &mut crate::fork_stock::fork_table_accounting(&custody),
-                    handle,
-                    root,
-                    txn.id.generation,
-                )
+                .quarantine_native_supply(handle, root)
                 .map_err(|_| stale())?;
+            return Err(error);
         }
         drop(stock);
-        self.complete(submitted)
+        self.finish_backing_supply(handle, root, reply_slot, &txn)
+    }
+    /// Reserve delivery against cancellation before making the physical reply
+    /// consumable. Cancellation before delivery rolls back while retaining the
+    /// ticket; cancellation after delivery belongs to the ring continuation.
+    fn finish_backing_supply(
+        self,
+        handle: carrick_el1_abi::El1MmHandle,
+        root: carrick_guest_arch::RootGpa,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let custody = Arc::clone(&self.custody);
+        let request = self.request();
+        let region = retained_abi_region(&custody).ok_or_else(stale)?;
+        let (_, zone) = stopped_records(
+            region,
+            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+        )
+        .ok_or_else(stale)?;
+        let key = ObjectWaitKey::native_service(request.identity.birth.record).ok_or_else(stale)?;
+        let queue = zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| stale())?;
+        let mut stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()) != Some(handle)
+            || stock.owner.child_root(handle.mm()) != Some(root)
+            || stock.owner.is_quarantined(handle.mm())
+        {
+            return Err(stale());
+        }
+        let grants = stock
+            .owner
+            .child_physical_mut(handle.mm(), root)
+            .and_then(|physical| physical.supplied.as_mut())
+            .ok_or_else(stale)?;
+        let mut offered = false;
+        let delivery = self.ticket.publish_prepared((), |()| {
+            offered = grants.offer_backing_reply(reply, txn);
+            if offered { Ok(()) } else { Err(()) }
+        });
+        match delivery {
+            Ok(()) => {}
+            Err((reason, ticket, ())) => {
+                // No offer occurred. Keep the ticket pinned through complete
+                // verified rollback, including any cleanup failure.
+                settle_backing_and_tables(&custody, &mut stock, handle, root, reply, txn)?;
+                if !matches!(
+                    reason,
+                    carrick_core_abi::service::PreparedDeliveryError::Cancelled
+                        | carrick_core_abi::service::PreparedDeliveryError::Refused
+                ) {
+                    return Err(stale());
+                }
+                ticket.complete(false).map_err(|_| stale())?;
+            }
+        }
+        drop(stock);
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        queue
+            .notify_object(self.slot, &mut effects)
+            .map_err(|_| stale())?;
+        carrick_observability::probes::hvpatch_native_fault_supply(
+            handle.mm().raw(),
+            request.identity.sequence.get(),
+            if offered {
+                carrick_observability::probes::HvpatchNativeFaultPhase::Supplied
+            } else {
+                carrick_observability::probes::HvpatchNativeFaultPhase::Refused
+            },
+            0,
+            0,
+        );
+        Ok(effects)
     }
     fn complete_wait(
         self,
@@ -1384,67 +1496,72 @@ pub(super) fn settle_native_descriptor_reply(
     region: RetainedAbiRegion<'_>,
     execution: carrick_hal::fork_stock::GrantExecution,
     settlement: &mut carrick_el1_abi::NativeDescriptorSettlement,
-) -> bool {
-    let accepted = (|| -> Result<(), ()> {
-        let (owner, generation, reply_address) = settlement.request().ok_or(())?;
+) -> Result<bool, TrapError> {
+    let accepted = (|| -> Result<(), TrapError> {
+        let (owner, generation, reply_address) = settlement.request().ok_or_else(stale)?;
         if execution.binding.mm.raw() != owner.mm().raw() {
-            return Err(());
+            return Err(stale());
         }
         let (reply, _pin) =
             retain_reply::<carrick_el1_abi::PortalGrantSlot>(custody, region, reply_address)
-                .map_err(|_| ())?;
+                .map_err(|_| stale())?;
         // SAFETY: retain_reply pins the complete aligned slot until settlement.
         let reply = unsafe { reply.as_ref() };
-        let window = reply.window().ok_or(())?;
+        let window = reply.window().ok_or_else(stale)?;
         if window.operation.carrier != owner.carrier()
             || window.operation.mm != owner.mm()
             || window.operation.incarnation != owner.incarnation()
             || window.operation.sequence != generation
         {
-            return Err(());
+            return Err(stale());
         }
         let mut stock = custody.fork_stock.lock();
         if stock.owner.child_owner(owner.mm()) != Some(owner)
             || stock.owner.child_root(owner.mm()) != Some(execution.context.root)
         {
-            return Err(());
+            return Err(stale());
         }
         let txn = stock
             .owner
             .pending_native_descriptor_transaction(owner, execution.context.root, generation)
-            .ok_or(())?;
-        let mut ledger = crate::fork_stock::fork_table_accounting(custody);
-        if let Some(receipt) = reply.take_receipt(window, &txn) {
-            stock
-                .owner
-                .settle_native_descriptor_tables(
-                    &mut ledger,
-                    owner,
-                    execution.context.root,
-                    &receipt,
-                )
-                .map_err(|_| ())?;
-        } else if reply.withdraw(window, &txn) {
-            stock
-                .owner
-                .cancel_submitted_native_descriptor_tables(
-                    &mut ledger,
-                    owner,
-                    execution.context.root,
-                    generation,
-                )
-                .map_err(|_| ())?;
-        } else {
-            return Err(());
-        }
+            .ok_or_else(stale)?;
+        settle_backing_and_tables(
+            custody,
+            &mut stock,
+            owner,
+            execution.context.root,
+            reply,
+            &txn,
+        )?;
         Ok(())
-    })()
-    .is_ok();
-    if accepted {
-        settlement.accept()
-    } else {
-        settlement.refuse()
+    })();
+    match accepted {
+        Ok(()) => Ok(settlement.accept()),
+        Err(error) => {
+            settlement.refuse();
+            Err(error)
+        }
     }
+}
+
+/// The shared physical owner authenticates the outcome and owns rollback.
+/// Tables settle from that SAME outcome before the reply is acknowledged.
+fn settle_backing_and_tables(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    stock: &mut crate::fork_stock::ForkStockHostCustody,
+    owner: carrick_el1_abi::El1MmHandle,
+    root: carrick_guest_arch::RootGpa,
+    reply: &carrick_el1_abi::PortalGrantSlot,
+    txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+) -> Result<(), TrapError> {
+    stock.owner.settle_native_backing_reply(
+        &mut crate::fork_stock::fork_table_accounting(custody),
+        owner,
+        root,
+        reply,
+        txn,
+        |backing| backing.release_unused(),
+    )
 }
 
 pub(super) fn retain_reply<T>(

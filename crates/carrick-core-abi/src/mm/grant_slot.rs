@@ -257,6 +257,16 @@ impl PortalGrantSlot {
         self.state.store(0, Ordering::Release);
         true
     }
+    /// Inspect an exact receipt without returning the transport to IDLE.
+    /// The serialized native publication owner settles physical and table
+    /// custody before calling take_receipt to acknowledge it.
+    pub fn inspect_receipt(
+        &self,
+        window: PortalGrantWindow,
+        txn: &DescriptorTxn,
+    ) -> Option<DescriptorReceipt> {
+        (self.window() == Some(window)).then(|| self.descriptor.inspect_receipt(txn.id))?
+    }
     pub fn take_receipt(
         &self,
         window: PortalGrantWindow,

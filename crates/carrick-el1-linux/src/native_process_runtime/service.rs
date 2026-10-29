@@ -1407,7 +1407,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(NativeProcessError::Quarantined);
         }
         let retry_syscall_after_supply = pending.retry_syscall_after_supply;
-        if self.runtime.graph.lock().pending.has_exit(&self.key) {
+        let exiting = self.runtime.graph.lock().pending.has_exit(&self.key);
+        if (exiting || result == ServiceResult::Cancelled)
+            && let Some(PendingServiceReply::Fault(reply)) = &pending.reply
+        {
+            self.service
+                .apply_fault_reply(reply, super::FaultReplyDisposition::Cancel)
+                .map_err(|_| NativeProcessError::Quarantined)?;
+        }
+        if exiting {
             if let (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(receipt)) =
                 (request.operation, result)
             {
@@ -1439,7 +1447,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if result == ServiceResult::Supplied
             && let Some(PendingServiceReply::Fault(reply)) = &pending.reply
         {
-            match self.service.apply_fault_reply(reply) {
+            match self
+                .service
+                .apply_fault_reply(reply, super::FaultReplyDisposition::Apply)
+            {
                 Ok(()) => {}
                 Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
                     let key = ObjectWaitKey::native_service(self.record)
