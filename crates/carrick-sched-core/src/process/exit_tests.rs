@@ -442,7 +442,9 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
     let release = owner.release_task_set(&permit).unwrap();
     let ready = effects.after_release(release).unwrap();
     let mut cancelled = alloc::vec::Vec::new();
-    let parent_permit = ready.cancel_members(|member| cancelled.push(member));
+    let parent_permit = ready
+        .cancel_members(|member| cancelled.push(member))
+        .unwrap();
     assert_eq!(cancelled, alloc::vec![task]);
     assert_eq!(parent_permit.parent(), Some(parent));
     let notification = owner.select_exit_parent(&parent_permit).unwrap().prepare();
@@ -706,7 +708,8 @@ fn exit_effect_work_visits_only_own_members_at_all_scales() {
             .cancel_members(|member| {
                 assert_eq!(member.0, task);
                 cancelled += 1;
-            });
+            })
+            .unwrap();
         assert_eq!(parent.parent(), None);
         assert_eq!(cancelled, n);
         assert_eq!(owner.tasks[&task.id].member_reads.get(), n);
@@ -915,7 +918,8 @@ fn prepared_exit_effects_reject_stale_membership_snapshot() {
             .cancel_members(|member| {
                 assert_eq!(member.0, task);
                 cancelled.push(member.1);
-            });
+            })
+            .unwrap();
         assert_eq!(parent.parent(), None);
         assert_eq!(cancelled, [0, 1]);
         assert_eq!(owner.tasks[&task.id].member_reads.get(), 3 * n + 1);

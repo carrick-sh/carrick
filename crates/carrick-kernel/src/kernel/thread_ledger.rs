@@ -630,27 +630,19 @@ impl ThreadLedger {
             .lock()
             .push(PendingNativeAbiReap { ticket, control });
     }
-    fn settle_native_reaps(&self) {
+    fn settle_native_reaps(&self) -> Result<(), carrick_core::terminal::NativeAbiReapError> {
         let mut pending = self.native_reaps.lock();
         let mut index = 0;
         while index < pending.len() {
             let reap = &pending[index];
             let page = reap.control.lifecycle();
-            if reap
-                .ticket
-                .settle(&*page, &*reap.control)
-                .unwrap_or_else(|error| {
-                    carrick_fatal::carrick_fatal!(
-                        "thread::ledger",
-                        "native ABI reap lost exact custody: {error:?}"
-                    )
-                })
-            {
+            if reap.ticket.settle(&*page, &*reap.control)? {
                 pending.swap_remove(index);
             } else {
                 index += 1;
             }
         }
+        Ok(())
     }
 
     pub(crate) fn for_root(page: &super::objects::ThreadLifecycleLease) -> Self {
@@ -705,6 +697,9 @@ impl ThreadLedger {
         if self.activity.pending() == 0 {
             return;
         }
+        let ledger_failed = |reason: core::fmt::Arguments<'_>| -> ! {
+            carrick_fatal::carrick_fatal!("thread::ledger", "{reason}")
+        };
         let settling = self.settling.lock();
         let births = std::mem::take(&mut *self.births.lock());
         let count = births.len();
@@ -713,7 +708,11 @@ impl ThreadLedger {
         let mut exited = Vec::new();
         {
             let mut state = lock.write();
-            self.settle_native_reaps();
+            self.settle_native_reaps().unwrap_or_else(|error| {
+                ledger_failed(format_args!(
+                    "native ABI reap lost exact custody: {error:?}"
+                ))
+            });
             for birth in births {
                 // A birth whose task left the live set before settlement is
                 // dropped, which cancels it; there is nothing to publish into.
@@ -726,12 +725,7 @@ impl ThreadLedger {
                 .kernel
                 .get()
                 .and_then(Weak::upgrade)
-                .unwrap_or_else(|| {
-                    carrick_fatal::carrick_fatal!(
-                        "thread::ledger",
-                        "pending ledger lost kernel owner"
-                    )
-                });
+                .unwrap_or_else(|| ledger_failed(format_args!("pending ledger lost kernel owner")));
             let tasks: Vec<_> = state.tasks.keys().copied().collect();
             for task_id in tasks {
                 let Some(record) = state.tasks.get(&task_id) else {

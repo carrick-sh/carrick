@@ -375,9 +375,9 @@ fn two_children_exit_before_wait_consume_once_and_keep_claims_owned() {
     birth(&mut owner, parent, first, first_releases.clone());
     birth(&mut owner, parent, second, second_releases.clone());
     let done = exit(&mut owner, first, None);
-    done.effects.cancel_members(Member::cancel);
+    done.effects.cancel_members(Member::cancel).unwrap();
     let done = exit(&mut owner, second, None);
-    done.effects.cancel_members(Member::cancel);
+    done.effects.cancel_members(Member::cancel).unwrap();
     assert_eq!(first_releases.get(), 0);
     assert!(matches!(
         owner.precheck_wait(parent, query(WaitTarget::Any)).unwrap(),
@@ -431,7 +431,7 @@ fn recycled_numeric_child_does_not_authorize_stale_caller_or_wait() {
     let old = key(2, 2);
     birth(&mut owner, parent, old, Rc::new(Cell::new(0)));
     let done = exit(&mut owner, old, None);
-    done.effects.cancel_members(Member::cancel);
+    done.effects.cancel_members(Member::cancel).unwrap();
     drop(owner.consume_wait(parent, query(WaitTarget::Any)).unwrap());
     let current = key(2, 99);
     birth(&mut owner, parent, current, Rc::new(Cell::new(0)));
@@ -462,7 +462,7 @@ fn released_exact_members_cancel_before_parent_signal_snapshot() {
     let done = exit(&mut owner, key(2, 2), None);
     assert!(owner.registry.reservations.is_empty());
     assert!(order.borrow().is_empty());
-    let permit = done.effects.cancel_members(Member::cancel);
+    let permit = done.effects.cancel_members(Member::cancel).unwrap();
     assert_eq!(&*order.borrow(), &["cancel", "cancel"]);
     let target = owner.select_exit_parent(&permit).unwrap();
     let notification = target.prepare();
@@ -481,9 +481,9 @@ fn exiting_parent_reparents_live_and_zombie_children_through_shared_topology() {
     birth(&mut owner, parent, live_child, Rc::new(Cell::new(0)));
     birth(&mut owner, parent, dead_child, Rc::new(Cell::new(0)));
     let done = exit(&mut owner, dead_child, None);
-    done.effects.cancel_members(Member::cancel);
+    done.effects.cancel_members(Member::cancel).unwrap();
     let done = exit(&mut owner, parent, None);
-    done.effects.cancel_members(Member::cancel);
+    done.effects.cancel_members(Member::cancel).unwrap();
     assert_eq!(owner.task(live_child).unwrap().parent(), Some(root));
     assert_eq!(
         owner.registry.zombies[&dead_child.id].receipt.parent,
@@ -509,7 +509,7 @@ fn shared_explicit_subreaper_adopts_orphans_and_preserves_subtree_cpu_charge() {
     birth(&mut owner, subreaper, exiting, Rc::new(Cell::new(0)));
     birth(&mut owner, exiting, child, Rc::new(Cell::new(0)));
     let done = exit(&mut owner, child, None);
-    done.effects.cancel_members(Member::cancel);
+    done.effects.cancel_members(Member::cancel).unwrap();
     drop(
         owner
             .consume_wait(exiting, query(WaitTarget::Exact(child)))
@@ -518,7 +518,7 @@ fn shared_explicit_subreaper_adopts_orphans_and_preserves_subtree_cpu_charge() {
     let orphan = key(5, 5);
     birth(&mut owner, exiting, orphan, Rc::new(Cell::new(0)));
     let done = exit(&mut owner, exiting, Some(subreaper));
-    done.effects.cancel_members(Member::cancel);
+    done.effects.cancel_members(Member::cancel).unwrap();
     assert_eq!(owner.task(orphan).unwrap().parent(), Some(subreaper));
     let consumed = owner
         .consume_wait(subreaper, query(WaitTarget::Exact(exiting)))
@@ -539,7 +539,7 @@ fn autoreap_returns_owned_receipt_without_cpu_charge_or_wait_edge() {
     let releases = Rc::new(Cell::new(0));
     birth(&mut owner, parent, key(2, 2), releases.clone());
     let done = exit(&mut owner, key(2, 2), None);
-    let permit = done.effects.cancel_members(Member::cancel);
+    let permit = done.effects.cancel_members(Member::cancel).unwrap();
     assert_eq!(permit.parent(), Some(parent));
     assert!(owner.registry.zombies.is_empty());
     assert!(owner.task(parent).unwrap().children().is_empty());
@@ -607,7 +607,8 @@ fn early_error_after_exit_begin_preserves_live_graph_and_reservation_custody() {
     birth(&mut owner, exiting, dead, releases.clone());
     exit(&mut owner, dead, None)
         .effects
-        .cancel_members(Member::cancel);
+        .cancel_members(Member::cancel)
+        .unwrap();
     let snapshot: Vec<_> = [root, exiting, live]
         .into_iter()
         .map(|key| {
@@ -657,7 +658,8 @@ fn early_error_after_exit_begin_preserves_live_graph_and_reservation_custody() {
     // survived the abandoned one, and only publication changes the graph.
     exit(&mut owner, exiting, None)
         .effects
-        .cancel_members(Member::cancel);
+        .cancel_members(Member::cancel)
+        .unwrap();
     assert_eq!(owner.task(live).unwrap().parent(), Some(root));
     assert_eq!(owner.registry.zombies[&dead.id].receipt.parent, Some(root));
 }
@@ -703,10 +705,12 @@ fn adapter_exit_work_visits_exactly_own_members_and_no_unrelated_native_resource
         }
         let done = exit(&mut owner, key(2, 2), None);
         let mut cancelled = 0;
-        done.effects.cancel_members(|member| {
-            assert_eq!(member.exit_task(), key(2, 2));
-            cancelled += 1;
-        });
+        done.effects
+            .cancel_members(|member| {
+                assert_eq!(member.exit_task(), key(2, 2));
+                cancelled += 1;
+            })
+            .unwrap();
         assert_eq!(cancelled, count);
         assert_eq!(work.member_visits.get(), count);
         assert_eq!(work.resource_visits.get(), 1);
@@ -1483,7 +1487,7 @@ fn exit_uid_receipt_reads_thread_credentials_without_a_metadata_mirror() {
             carrick_personality_linux::identity::TaskUid::new(1000);
         row.select_exit_thread(exit_tid).unwrap();
         let done = exit(&mut owner, child, None);
-        done.effects.cancel_members(Member::cancel);
+        done.effects.cancel_members(Member::cancel).unwrap();
         assert_eq!(owner.registry.zombies[&child.id].receipt.ruid, Uid(1000));
         assert_eq!(
             owner
@@ -1655,9 +1659,9 @@ fn pending_autoreap_moves_removal_credit_to_adopter() {
         || {},
     )
     .unwrap();
-    let permit = pending.effects.cancel_members(Member::cancel);
+    let permit = pending.effects.cancel_members(Member::cancel).unwrap();
     let parent_exit = exit(&mut owner, parent, None);
-    parent_exit.effects.cancel_members(Member::cancel);
+    parent_exit.effects.cancel_members(Member::cancel).unwrap();
     assert_eq!(
         old_budget.reserved.get(),
         0,
@@ -1707,7 +1711,7 @@ fn pending_exit_retirement_survives_reparenting_without_early_reap() {
     )
     .unwrap();
     let parent_exit = exit(&mut owner, parent, None);
-    parent_exit.effects.cancel_members(Member::cancel);
+    parent_exit.effects.cancel_members(Member::cancel).unwrap();
     assert!(matches!(
         owner
             .consume_wait(root, query(WaitTarget::Exact(child)))
@@ -1743,9 +1747,9 @@ fn retirement_completion_notifies_the_adopter_of_a_pending_zombie() {
         || {},
     )
     .unwrap();
-    let child_permit = pending.effects.cancel_members(Member::cancel);
+    let child_permit = pending.effects.cancel_members(Member::cancel).unwrap();
     let parent_exit = exit(&mut owner, parent, None);
-    parent_exit.effects.cancel_members(Member::cancel);
+    parent_exit.effects.cancel_members(Member::cancel).unwrap();
     drop(owner.publish_exit_retirement(pending.retirement));
     let target = owner
         .select_exit_parent(&child_permit)
@@ -1795,10 +1799,10 @@ fn pending_reparented_zombie_keeps_process_group_until_adopter_reaps() {
         || {},
     )
     .unwrap();
-    let permit = pending.effects.cancel_members(Member::cancel);
+    let permit = pending.effects.cancel_members(Member::cancel).unwrap();
     // The parent exits inside the child's MM-retirement window.
     let parent_exit = exit(&mut owner, parent, None);
-    parent_exit.effects.cancel_members(Member::cancel);
+    parent_exit.effects.cancel_members(Member::cancel).unwrap();
     // The exit lane selects its recipient before automatic removal can drop
     // the receipt; the reparented zombie keeps its job group.
     assert_eq!(
@@ -1855,9 +1859,9 @@ fn pending_reparented_child_charges_adopter_once_and_never_departed_parent() {
         || {},
     )
     .unwrap();
-    let permit = pending.effects.cancel_members(Member::cancel);
+    let permit = pending.effects.cancel_members(Member::cancel).unwrap();
     let parent_exit = exit(&mut owner, parent, None);
-    parent_exit.effects.cancel_members(Member::cancel);
+    parent_exit.effects.cancel_members(Member::cancel).unwrap();
     assert_eq!(
         owner.select_exit_parent(&permit).unwrap().prepare().parent,
         root

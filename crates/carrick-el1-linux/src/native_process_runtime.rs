@@ -5990,20 +5990,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Quarantined)?;
         }
         page.clear_exit_wait();
-        let permit = published.effects.cancel_members(|member| {
-            if member.zone.live(member.record).is_some() {
-                let _ = member.zone.claim_for_host(
-                    member.record,
-                    None,
-                    Handback::Cancelled,
-                    &NativeBucketWait {
-                        lifetime: core::marker::PhantomData,
-                        #[cfg(test)]
-                        probe: self.publication_wait_probe,
-                    },
-                );
-            }
-        });
+        let permit = published
+            .effects
+            .cancel_members(|member| {
+                if member.zone.live(member.record).is_some() {
+                    let _ = member.zone.claim_for_host(
+                        member.record,
+                        None,
+                        Handback::Cancelled,
+                        &NativeBucketWait {
+                            lifetime: core::marker::PhantomData,
+                            #[cfg(test)]
+                            probe: self.publication_wait_probe,
+                        },
+                    );
+                }
+            })
+            .map_err(|_| NativeProcessError::Quarantined)?;
         // Graph removal (`publish_exit`) and member cancellation are complete.
         // Unregister from `NativeProcessRegistry` and release all
         // `MemberControlCustody` references (graph resources, registry member,
