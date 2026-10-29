@@ -8447,3 +8447,316 @@ fn completion_owner_wait_authenticates_thread_and_independent_asid() {
         CompletionFoldError::AddressSpace
     );
 }
+
+#[test]
+fn interrupted_sleep_completion_retains_bytes_across_refusals() {
+    use carrick_abi::KernelAbi;
+    use carrick_guest_mem::{MemoryPrepareError, MemoryReadWait, UserMemoryVenue};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct Dependency(Arc<AtomicBool>);
+    impl Drop for Dependency {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    impl carrick_guest_mem::PhysicalMemoryWait for Dependency {
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn enroll(
+            &self,
+            _: Arc<dyn Fn() + Send + Sync>,
+        ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+            (Box::new(()), true)
+        }
+    }
+    struct Memory {
+        refusals: std::collections::VecDeque<Option<MemoryReadWait>>,
+        released: Arc<AtomicBool>,
+        attempts: usize,
+        commits: Vec<(u64, Vec<u8>)>,
+    }
+    struct Output<'a>(&'a mut Memory, u64);
+    impl carrick_guest_mem::PreparedGuestWrite for Output<'_> {
+        fn commit(self: Box<Self>, bytes: &[&[u8]]) {
+            self.0.commits.push((self.1, bytes[0].to_vec()));
+        }
+    }
+    impl carrick_guest_mem::GuestMemory for Memory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn read_bytes_raw(
+            &self,
+            _: u64,
+            _: usize,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            unreachable!()
+        }
+        fn write_bytes_raw(
+            &mut self,
+            _: u64,
+            _: &[u8],
+        ) -> Result<(), carrick_guest_mem::MemoryError> {
+            panic!("interrupted sleep must prepare retained output")
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[carrick_guest_mem::GuestWriteRange],
+        ) -> Result<Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>, MemoryPrepareError>
+        {
+            self.attempts += 1;
+            if let Some(Some(wait)) = self.refusals.pop_front() {
+                return Err(match wait {
+                    MemoryReadWait::Owner(wait) => MemoryPrepareError::OwnerWait(wait),
+                    MemoryReadWait::Supply(request) => MemoryPrepareError::Supply(request),
+                    MemoryReadWait::Physical(wait) => MemoryPrepareError::Physical(wait),
+                });
+            }
+            if self.refusals.is_empty() {
+                assert!(
+                    self.released.load(Ordering::Acquire),
+                    "physical custody survived re-preparation"
+                );
+            }
+            assert_eq!(ranges.len(), 1);
+            Ok(Box::new(Output(self, ranges[0].address().raw())))
+        }
+    }
+    impl CurrentMmMemory for Memory {}
+
+    for supply in [false, true] {
+        for crossing in [false, true] {
+            for cancel_after in [None, Some(1), Some(2)] {
+                for fatal in [false, true] {
+                    let (_kernel, context) = bootstrap(15_720);
+                    let mm = context.shared().mm().id();
+                    let owner = unsafe {
+                        carrick_el1_abi::PortalOwnerWait::from_owner(
+                            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                                std::num::NonZeroU64::new(1).unwrap(),
+                                carrick_el1_abi::ReservationMm::new(mm.raw()).unwrap(),
+                                std::num::NonZeroU64::new(1).unwrap(),
+                            ),
+                            carrick_el1_abi::PortalWaitCause::Editor,
+                            7,
+                        )
+                    };
+                    let first = if supply {
+                        MemoryReadWait::Supply(carrick_guest_mem::MemorySupplyRequest::Grant(
+                            carrick_el1_abi::PortalGrantWindow::decode([
+                                1, 2, 3, 1, 1, 0x1000, 0x2000, 3, 0x1000, 0, 0, 0, 0,
+                            ])
+                            .unwrap(),
+                        ))
+                    } else {
+                        MemoryReadWait::Owner(owner)
+                    };
+                    let released = Arc::new(AtomicBool::new(false));
+                    let physical = MemoryReadWait::Physical(carrick_guest_mem::OwnedMemoryWait(
+                        Arc::new(Dependency(Arc::clone(&released))),
+                    ));
+                    let mut memory = Memory {
+                        refusals: if crossing {
+                            [None, Some(first), Some(physical)].into()
+                        } else {
+                            [Some(first), Some(physical)].into()
+                        },
+                        released: Arc::clone(&released),
+                        attempts: 0,
+                        commits: Vec::new(),
+                    };
+                    let duration = Duration::new(23, 456_789);
+                    let expected = carrick_abi::LinuxTimespec::new(23, 456_789)
+                        .abi_bytes()
+                        .to_vec();
+                    let address = if crossing { 0x7fff } else { 0x7000 };
+                    let mut outcome = fold_continuation_completion(
+                        ContinuationCompletion::InterruptedSleep {
+                            remaining: Some((
+                                GuestOutputRange::new(GuestVa::new(address), 16, mm, 41).unwrap(),
+                                duration,
+                            )),
+                        },
+                        &crate::dispatch::SyscallDispatcher::new(),
+                        &context,
+                        &mut memory,
+                        (mm, 41),
+                    )
+                    .unwrap()
+                    .unwrap();
+                    for stage in 1..=2 {
+                        let DispatchOutcome::CompletionCopyoutSuspended(pending) = outcome else {
+                            panic!("saved remainder must suspend at stage {stage}: {outcome:?}")
+                        };
+                        assert_eq!(memory.attempts, stage + usize::from(crossing));
+                        assert_eq!(memory.commits.len(), usize::from(crossing));
+                        if crossing {
+                            assert_eq!(memory.commits[0], (address, expected[..1].to_vec()));
+                        }
+                        if cancel_after == Some(stage) {
+                            use carrick_el1_abi::Lifecycle;
+                            context
+                                .lifecycle_page()
+                                .process_exit_custody()
+                                .cancellation_authority()
+                                .publish(
+                                    if fatal {
+                                        carrick_core::cancellation::ProcessCancellation::FatalSignal
+                                    } else {
+                                        carrick_core::cancellation::ProcessCancellation::GroupExit
+                                    },
+                                    || panic!("no output effects held"),
+                                );
+                        }
+                        outcome = pending.resume(&context, &mut memory, (mm, 41)).unwrap();
+                        if cancel_after == Some(stage) {
+                            break;
+                        }
+                    }
+                    if let Some(cancel_after) = cancel_after {
+                        assert!(matches!(outcome, DispatchOutcome::OwnerCancelled(_)));
+                        assert_eq!(memory.attempts, cancel_after + usize::from(crossing));
+                        assert_eq!(memory.commits.len(), usize::from(crossing));
+                        // A not-yet-returned refusal belongs to the producer fixture.
+                        memory.refusals.clear();
+                        assert!(released.load(Ordering::Acquire));
+                    } else {
+                        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EINTR));
+                        assert_eq!(memory.attempts, if crossing { 4 } else { 3 });
+                        assert_eq!(memory.commits.len(), if crossing { 2 } else { 1 });
+                        assert_eq!(
+                            memory
+                                .commits
+                                .iter()
+                                .flat_map(|(_, b)| b.clone())
+                                .collect::<Vec<_>>(),
+                            expected
+                        );
+                        assert_eq!(memory.commits[0].0, address);
+                        if crossing {
+                            assert_eq!(memory.commits[1].0, 0x8000);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn interrupted_sleep_completion_authenticates_range_and_handles_fault_or_null() {
+    let (_kernel, context) = bootstrap(15_721);
+    let mm = context.shared().mm().id();
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let mut memory =
+        crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory::new(0x7000, 16, 0xa5);
+    let completion = |address, asid| ContinuationCompletion::InterruptedSleep {
+        remaining: Some((
+            GuestOutputRange::new(GuestVa::new(address), 16, mm, asid).unwrap(),
+            Duration::new(2, 3),
+        )),
+    };
+    assert_eq!(
+        fold_continuation_completion(
+            completion(0x7000, 41),
+            &dispatcher,
+            &context,
+            &mut memory,
+            (mm, 42),
+        ),
+        Err(CompletionFoldError::AddressSpace)
+    );
+    assert_eq!(memory.prepares, 0);
+    assert_eq!(memory.inner.read_bytes(0x7000, 16).unwrap(), vec![0xa5; 16]);
+    assert_eq!(
+        fold_continuation_completion(
+            completion(0x8000, 41),
+            &dispatcher,
+            &context,
+            &mut memory,
+            (mm, 41),
+        )
+        .unwrap(),
+        Some(DispatchOutcome::errno(crate::linux_abi::LINUX_EFAULT))
+    );
+    let prepares = memory.prepares;
+    assert_eq!(
+        fold_continuation_completion(
+            ContinuationCompletion::InterruptedSleep { remaining: None },
+            &dispatcher,
+            &context,
+            &mut memory,
+            (mm, 41),
+        )
+        .unwrap(),
+        Some(DispatchOutcome::errno(LINUX_EINTR))
+    );
+    assert_eq!(
+        memory.prepares, prepares,
+        "null remainder must not prepare output"
+    );
+    assert_eq!(
+        fold_continuation_completion(
+            ContinuationCompletion::InterruptedSleep {
+                remaining: Some((
+                    GuestOutputRange::new(GuestVa::new(0x7000), 8, mm, 41).unwrap(),
+                    Duration::new(2, 3),
+                ))
+            },
+            &dispatcher,
+            &context,
+            &mut memory,
+            (mm, 41),
+        ),
+        Err(CompletionFoldError::OutputLength)
+    );
+    assert_eq!(memory.prepares, prepares);
+    assert_eq!(memory.inner.read_bytes(0x7000, 16).unwrap(), vec![0xa5; 16]);
+}
+
+#[test]
+fn interrupted_sleep_completion_rejects_stale_resume_before_preparation() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    let (_kernel, context) = bootstrap(15_722);
+    let (_other_kernel, other) = bootstrap(15_723);
+    let mm = context.shared().mm().id();
+    for wrong_thread in [false, true] {
+        let mut memory = OwnerRefusingMemory::new(0x7000, 16, 0xa5);
+        memory.refuse_next();
+        let Some(DispatchOutcome::CompletionCopyoutSuspended(pending)) =
+            fold_continuation_completion(
+                ContinuationCompletion::InterruptedSleep {
+                    remaining: Some((
+                        GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, 41).unwrap(),
+                        Duration::new(2, 3),
+                    )),
+                },
+                &crate::dispatch::SyscallDispatcher::new(),
+                &context,
+                &mut memory,
+                (mm, 41),
+            )
+            .unwrap()
+        else {
+            panic!("retained remainder")
+        };
+        let prepares = memory.prepares;
+        assert_eq!(
+            pending.resume(
+                if wrong_thread { &other } else { &context },
+                &mut memory,
+                if wrong_thread { (mm, 41) } else { (mm, 42) },
+            ),
+            Err(if wrong_thread {
+                CompletionFoldError::Thread
+            } else {
+                CompletionFoldError::AddressSpace
+            })
+        );
+        assert_eq!(memory.prepares, prepares);
+        assert_eq!(memory.inner.read_bytes(0x7000, 16).unwrap(), vec![0xa5; 16]);
+    }
+}

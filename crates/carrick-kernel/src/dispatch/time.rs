@@ -1854,15 +1854,13 @@ mod s3_review_tests {
             carrick_guest_mem::GuestVa::new(0x4000),
             16,
             context.shared().mm_id(),
-            0,
+            context.shared().mm().id().raw(),
         )
         .unwrap();
         let completion = crate::kernel::continuation::ContinuationCompletion::InterruptedSleep {
             remaining: Some((remaining, Duration::from_millis(750))),
         };
-        // Until #986 retains output completions across owner waits, preserve the
-        // old fault result rather than return a bare wait that restarts sleep.
-        assert_eq!(
+        let Some(DispatchOutcome::CompletionCopyoutSuspended(pending)) =
             crate::kernel::continuation::fold_continuation_completion(
                 completion,
                 &dispatcher,
@@ -1870,10 +1868,27 @@ mod s3_review_tests {
                 &mut memory,
                 (context.shared().mm().id(), context.shared().mm().id().raw()),
             )
-            .unwrap(),
-            Some(DispatchOutcome::errno(LINUX_EFAULT))
-        );
+            .unwrap()
+        else {
+            panic!("consumed sleep retains its remainder and errno across refusal")
+        };
+        assert_eq!(memory.prepares, 1);
         assert_eq!(memory.read_bytes(0x4000, 16).unwrap(), [0xa5; 16]);
+        assert_eq!(
+            pending
+                .resume(
+                    &context,
+                    &mut memory,
+                    (context.shared().mm().id(), context.shared().mm().id().raw()),
+                )
+                .unwrap(),
+            DispatchOutcome::errno(LINUX_EINTR)
+        );
+        assert_eq!(memory.prepares, 2);
+        assert_eq!(
+            memory.read_bytes(0x4000, 16).unwrap(),
+            LinuxTimespec::new(0, 750_000_000).abi_bytes()
+        );
     }
 
     #[test]

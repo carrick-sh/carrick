@@ -20,7 +20,7 @@ use crate::linux_abi::LinuxErrno;
 #[cfg(any(test, feature = "test-support"))]
 use super::fd_table::{OpenDescription, OpenDescriptionBase, kernel_file_description};
 use super::fd_table::{TimerFdInner, TimerFdState};
-use super::{DispatchOutcome, GuestPtr, read_kernel_struct, time, write_kernel_struct};
+use super::{DispatchOutcome, GuestPtr, read_kernel_struct, time};
 
 fn copyout_format_time_record<T: carrick_abi::KernelAbi>(
     context: &crate::kernel::KernelContext,
@@ -846,23 +846,20 @@ pub(super) fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec 
 }
 
 pub fn complete_interrupted_sleep(
-    _context: &crate::kernel::KernelContext,
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     remaining: Option<GuestPtr>,
     duration: Duration,
 ) -> DispatchOutcome {
     if let Some(address) = remaining {
         let rem = linux_timespec_from_duration(duration);
-        // #986: the consumed sleep completion has no retained output cursor.
-        // A bare owner wait would discard EINTR and its saved remainder, then
-        // redispatch the original sleep. Keep this single legacy debt site
-        // until completion routing can retain that result across suspension.
-        if !matches!(
-            write_kernel_struct(memory, address.0, &rem),
-            DispatchOutcome::Returned { value: 0 }
-        ) {
-            return DispatchOutcome::errno(LINUX_EFAULT);
-        }
+        return copyout_format_time_record(
+            context,
+            memory,
+            address.0,
+            &rem,
+            DispatchOutcome::errno(LINUX_EINTR),
+        );
     }
     DispatchOutcome::Errno { errno: LINUX_EINTR }
 }
