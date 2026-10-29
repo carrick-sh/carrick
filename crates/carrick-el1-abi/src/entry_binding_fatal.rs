@@ -11,10 +11,133 @@ pub const fn is_entry_binding_fatal(sentinel: u64, tag: u64) -> bool {
     sentinel == crate::PANIC_SENTINEL && tag == ENTRY_BINDING_FATAL_TAG
 }
 
+/// Compact discriminator carried in x2 at the existing terminal HVC.
+/// Values are transport ABI; unknown values remain visible in diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum EntryBindingFatalReason {
+    EntryBinding = 1,
+    PhysicalCustody = 2,
+    MissingNativeFrame = 3,
+    RevisionCredit = 4,
+    SignalNumber = 5,
+    ProcessGraph = 6,
+    HostRescheduleKick = 7,
+    HostWorkForward = 8,
+    CpuStackSlot = 9,
+    ArchitectureFatal = 10,
+    RunFailureReturned = 11,
+    ResidencyLayout = 12,
+    RootExitRefused = 13,
+    ForkCustodyRefused = 14,
+    AffinityTopologyMissing = 15,
+    NamespaceIdentityRange = 16,
+    NamespaceIdentityLost = 17,
+    ExitCustodyLost = 18,
+    ExitPublicationLost = 19,
+    ExitReleaseLost = 20,
+    RegistryEpochExhausted = 21,
+    BirthPayloadMismatch = 22,
+    ProcessGroupCollision = 23,
+    ProcessGroupIndexLost = 24,
+    SessionCollision = 25,
+    SessionIndexLost = 26,
+    AutoreapAccountingLost = 27,
+}
+impl EntryBindingFatalReason {
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match raw {
+            1 => Some(Self::EntryBinding),
+            2 => Some(Self::PhysicalCustody),
+            3 => Some(Self::MissingNativeFrame),
+            4 => Some(Self::RevisionCredit),
+            5 => Some(Self::SignalNumber),
+            6 => Some(Self::ProcessGraph),
+            7 => Some(Self::HostRescheduleKick),
+            8 => Some(Self::HostWorkForward),
+            9 => Some(Self::CpuStackSlot),
+            10 => Some(Self::ArchitectureFatal),
+            11 => Some(Self::RunFailureReturned),
+            12 => Some(Self::ResidencyLayout),
+            13 => Some(Self::RootExitRefused),
+            14 => Some(Self::ForkCustodyRefused),
+            15 => Some(Self::AffinityTopologyMissing),
+            16 => Some(Self::NamespaceIdentityRange),
+            17 => Some(Self::NamespaceIdentityLost),
+            18 => Some(Self::ExitCustodyLost),
+            19 => Some(Self::ExitPublicationLost),
+            20 => Some(Self::ExitReleaseLost),
+            21 => Some(Self::RegistryEpochExhausted),
+            22 => Some(Self::BirthPayloadMismatch),
+            23 => Some(Self::ProcessGroupCollision),
+            24 => Some(Self::ProcessGroupIndexLost),
+            25 => Some(Self::SessionCollision),
+            26 => Some(Self::SessionIndexLost),
+            27 => Some(Self::AutoreapAccountingLost),
+
+            _ => None,
+        }
+    }
+}
+
+/// Two-register fatal payload. The caller's source coordinates occupy x3;
+/// no pointers or aggregate stack records cross this diagnostic boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryBindingFatalDetail {
+    pub reason: EntryBindingFatalReason,
+    pub line: u32,
+    pub column: u32,
+}
+impl EntryBindingFatalDetail {
+    #[track_caller]
+    pub fn at_caller(reason: EntryBindingFatalReason) -> Self {
+        let caller = core::panic::Location::caller();
+        Self {
+            reason,
+            line: caller.line(),
+            column: caller.column(),
+        }
+    }
+    pub const fn encode(self) -> [u64; 2] {
+        [
+            self.reason as u64,
+            ((self.line as u64) << 32) | self.column as u64,
+        ]
+    }
+    pub const fn decode(reason: u64, location: u64) -> Option<Self> {
+        let Some(reason) = EntryBindingFatalReason::from_raw(reason) else {
+            return None;
+        };
+        Some(Self {
+            reason,
+            line: (location >> 32) as u32,
+            column: location as u32,
+        })
+    }
+}
+struct FatalDetail(Option<u64>, Option<u64>);
+impl fmt::Display for FatalDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(raw) => match EntryBindingFatalReason::from_raw(raw) {
+                Some(reason) => write!(f, "reason={reason:?} ")?,
+                None => write!(f, "reason=unknown({raw:#x}) ")?,
+            },
+            None => f.write_str("reason=unavailable ")?,
+        }
+        match self.1 {
+            Some(location) => write!(f, "at={}:{}", location >> 32, location as u32),
+            None => f.write_str("at=unavailable"),
+        }
+    }
+}
+
 /// Live registers at the terminal HVC, distinct from the saved EL0 frame.
 /// None means the VMM could not read the register, never an invented zero.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ArmEntryFatalRegisters {
+    pub reason: Option<u64>,
+    pub source_location: Option<u64>,
     pub pc: Option<u64>,
     pub lr: Option<u64>,
     pub fp: Option<u64>,
@@ -82,7 +205,8 @@ impl fmt::Display for ArmEl1FatalReport<'_> {
             Self::Entry(diagnostic) => diagnostic.fmt(f),
             Self::EntryUnavailable(registers) => write!(
                 f,
-                "entry_binding retained_entry=unavailable registers={registers:?}"
+                "entry_binding retained_entry=unavailable {} registers={registers:?}",
+                FatalDetail(registers.reason, registers.source_location)
             ),
             Self::Panic {
                 sentinel,
@@ -150,6 +274,51 @@ impl ArmEntryBindingFatal {
         }
     }
 }
+// Keep every custody field in the fixed 1024-byte sink. Flags are 0/1;
+// long variants avoid Debug's whitespace, slot wrappers and boolean words.
+// `host_req` is the complete host_requested flag, not omitted custody state.
+struct CompactClaim(Claim);
+impl fmt::Display for CompactClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Claim::Transferring {
+                seq,
+                cancelled,
+                host_requested,
+            } => write!(
+                f,
+                "Transferring{{seq:{seq},cancelled:{},host_req:{}}}",
+                u8::from(cancelled),
+                u8::from(host_requested)
+            ),
+            Claim::Placing {
+                incarnation,
+                host_requested,
+            } => write!(
+                f,
+                "Placing{{incarnation:{incarnation:#x},host_req:{}}}",
+                u8::from(host_requested)
+            ),
+            Claim::OnCpuRequested { slot, seq } => {
+                write!(f, "OnCpuRequested{{slot:{},seq:{seq}}}", slot.raw())
+            }
+            Claim::Free => f.write_str("Free"),
+            Claim::Parked { seq } => write!(f, "Parked{{seq:{seq}}}"),
+            Claim::Host { seq } => write!(f, "Host{{seq:{seq}}}"),
+            Claim::Queued { slot, seq } => write!(f, "Queued{{slot:{},seq:{seq}}}", slot.raw()),
+            Claim::OnCpu { slot, seq } => write!(f, "OnCpu{{slot:{},seq:{seq}}}", slot.raw()),
+            Claim::Activating { incarnation } => {
+                write!(f, "Activating{{incarnation:{incarnation:#x}}}")
+            }
+            Claim::Retiring { incarnation } => {
+                write!(f, "Retiring{{incarnation:{incarnation:#x}}}")
+            }
+            Claim::FirstEntryHost { incarnation } => {
+                write!(f, "FirstEntryHost{{incarnation:{incarnation:#x}}}")
+            }
+        }
+    }
+}
 struct Register(Option<u64>);
 impl fmt::Display for Register {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -198,11 +367,12 @@ impl fmt::Display for ArmEntryBindingFatal {
             self.loaded.mm.raw(),
             self.loaded.thread_generation.raw()
         )?;
+        write!(f, "{} ", FatalDetail(r.reason, r.source_location))?;
         match self.record {
             None => f.write_str("record=none"),
             Some(record) => write!(
                 f,
-                "record={} record_source={:?} task={:#x} generation={:#x} birth={:#x} mm={:#x} incarnation={:#x}->{:#x} custody={:?}->{:?}",
+                "record={} record_source={:?} task={:#x} generation={:#x} birth={:#x} mm={:#x} incarnation={:#x}->{:#x} custody={}->{}",
                 record.id.raw(),
                 record.source,
                 record.identity.tid,
@@ -211,8 +381,8 @@ impl fmt::Display for ArmEntryBindingFatal {
                 record.identity.mm,
                 record.incarnation,
                 record.incarnation_after,
-                record.claim,
-                record.claim_after
+                CompactClaim(record.claim),
+                CompactClaim(record.claim_after)
             ),
         }
     }
@@ -223,6 +393,82 @@ mod tests {
     extern crate std;
     use super::*;
     use std::{boxed::Box, format};
+
+    #[test]
+    fn fatal_detail_round_trip_and_formatter() {
+        for raw in 1..=27 {
+            let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
+            for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
+                let detail = EntryBindingFatalDetail {
+                    reason,
+                    line,
+                    column,
+                };
+                let [r, l] = detail.encode();
+                assert_eq!(EntryBindingFatalDetail::decode(r, l), Some(detail));
+            }
+        }
+        assert_eq!(EntryBindingFatalDetail::decode(0, 0), None);
+        assert_eq!(EntryBindingFatalDetail::decode(u64::MAX, 0), None);
+        assert_eq!(
+            format!("{}", FatalDetail(Some(3), Some((1646 << 32) | 9))),
+            "reason=MissingNativeFrame at=1646:9"
+        );
+        assert_eq!(
+            format!("{}", FatalDetail(Some(99), Some(0))),
+            "reason=unknown(0x63) at=0:0"
+        );
+        assert_eq!(
+            format!("{}", FatalDetail(None, None)),
+            "reason=unavailable at=unavailable"
+        );
+        assert_eq!(
+            format!("{}", FatalDetail(Some(3), None)),
+            "reason=MissingNativeFrame at=unavailable"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CompactClaim(Claim::Transferring {
+                    seq: 7,
+                    cancelled: true,
+                    host_requested: false
+                })
+            ),
+            "Transferring{seq:7,cancelled:1,host_req:0}"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                CompactClaim(Claim::Placing {
+                    incarnation: 9,
+                    host_requested: true
+                })
+            ),
+            "Placing{incarnation:0x9,host_req:1}"
+        );
+        let line = line!() + 1;
+        let detail = EntryBindingFatalDetail::at_caller(EntryBindingFatalReason::EntryBinding);
+        assert_eq!(detail.line, line);
+        let registers = ArmEntryFatalRegisters {
+            reason: Some(3),
+            source_location: Some((1646 << 32) | 9),
+            ..Default::default()
+        };
+        let capture = ArmEntryBindingFatal::capture(
+            registers,
+            &crate::TrapFrame::default(),
+            binding(),
+            &zone(),
+            crate::SlotId::new(0),
+        );
+        for text in [
+            format!("{capture}"),
+            format!("{}", ArmEl1FatalReport::EntryUnavailable(&registers)),
+        ] {
+            assert!(text.contains("reason=MissingNativeFrame at=1646:9"));
+        }
+    }
 
     fn zone() -> Box<crate::ZoneTables> {
         let mut storage = Box::<crate::ZoneTables>::new_uninit();
@@ -399,6 +645,8 @@ mod tests {
             far: u64::MAX,
         };
         let registers = ArmEntryFatalRegisters {
+            reason: Some(u64::MAX),
+            source_location: Some(u64::MAX),
             pc: Some(u64::MAX),
             lr: Some(u64::MAX),
             fp: Some(u64::MAX),
@@ -427,9 +675,29 @@ mod tests {
         observed.id =
             crate::RecordId::from_raw(carrick_sched_core::ZONE_RECORDS as u32 - 1).unwrap();
         observed.source = ArmEntryRecordSource::Current;
-        // Exercise both long claim representations. False is longer than true
-        // in Debug, so this also bounds the flag-bearing terminal snapshot.
+        // Bound every custody variant with maximum-width fields, including
+        // an unknown transport reason. Compact flags have equal width.
         for claim in [
+            crate::Claim::Free,
+            crate::Claim::Parked { seq: u32::MAX },
+            crate::Claim::Host { seq: u32::MAX },
+            crate::Claim::Queued {
+                slot,
+                seq: u32::MAX,
+            },
+            crate::Claim::OnCpu {
+                slot,
+                seq: u32::MAX,
+            },
+            crate::Claim::Activating {
+                incarnation: u64::MAX,
+            },
+            crate::Claim::Retiring {
+                incarnation: u64::MAX,
+            },
+            crate::Claim::FirstEntryHost {
+                incarnation: u64::MAX,
+            },
             crate::Claim::OnCpuRequested {
                 slot,
                 seq: u32::MAX,

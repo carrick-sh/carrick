@@ -454,14 +454,16 @@ pub fn restore_irq(guard: IrqGuard) {
 /// Non-returning native fatal transport after an entry loses its exact binding.
 /// Guest syscall replay or a return through another task is forbidden.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-pub fn fatal_entry_binding() -> ! {
+#[track_caller]
+pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
+    let [reason, location] = carrick_el1_abi::EntryBindingFatalDetail::at_caller(reason).encode();
     // SAFETY: this runs at EL1. HVC #3 is the image's fatal boundary, with
     // the established panic sentinel and no guest return/result publication.
     unsafe {
         core::arch::asm!("hvc #3",
             in("x0") carrick_el1_abi::PANIC_SENTINEL,
             in("x1") carrick_el1_abi::ENTRY_BINDING_FATAL_TAG,
-            in("x2") 0u64, in("x3") 0u64,
+            in("x2") reason, in("x3") location,
             options(nostack));
     }
     loop {
@@ -470,6 +472,8 @@ pub fn fatal_entry_binding() -> ! {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub fn fatal_entry_binding() -> ! {
+#[track_caller]
+pub fn fatal_entry_binding(reason: carrick_el1_abi::EntryBindingFatalReason) -> ! {
+    let _ = reason;
     crate::isa::x86::fatal_entry_binding()
 }

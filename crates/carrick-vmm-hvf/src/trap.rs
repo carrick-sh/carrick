@@ -8508,6 +8508,8 @@ impl HvfInner {
                     let registers =
                         carrick_el1_abi::is_entry_binding_fatal(x0, source_line).then(|| {
                             carrick_el1_abi::ArmEntryFatalRegisters {
+                                reason: vcpu.get_reg(Reg::X2).ok(),
+                                source_location: vcpu.get_reg(Reg::X3).ok(),
                                 pc: Some(pc),
                                 lr: vcpu.get_reg(Reg::X30).ok(),
                                 fp: vcpu.get_reg(Reg::X29).ok(),

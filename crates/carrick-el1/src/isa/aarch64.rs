@@ -603,7 +603,7 @@ impl InterruptBackend for Aarch64Backend {
     }
     fn current_cpu(&mut self) -> CpuId {
         let Some(slot) = carrick_el1_abi::el1_stack_slot(hw::read_current_sp()) else {
-            hw::fatal_entry_binding()
+            hw::fatal_entry_binding(carrick_el1_abi::EntryBindingFatalReason::CpuStackSlot)
         };
         CpuId::new(slot as u32)
     }
@@ -615,7 +615,7 @@ impl CrossingBackend for Aarch64Backend {
         Ok(())
     }
     fn report_fatal(&mut self, _report: FatalReport) -> ! {
-        hw::fatal_entry_binding()
+        hw::fatal_entry_binding(carrick_el1_abi::EntryBindingFatalReason::ArchitectureFatal)
     }
 }
 
@@ -633,7 +633,7 @@ pub fn complete_native_run_failure(
             in("x1") &record as *const _ as u64,
             options(nostack));
     }
-    hw::fatal_entry_binding()
+    hw::fatal_entry_binding(carrick_el1_abi::EntryBindingFatalReason::RunFailureReturned)
 }
 
 /// Read the EL0 stack register at the native trap boundary.
