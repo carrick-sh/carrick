@@ -740,14 +740,16 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if self.zone.live(record).is_none() {
             return false;
         }
-        self.handoff = retirement.retire_current(
-            carrick_core::entry::binding(&self.task.execution, &self.task.mm),
-            carrick_core_abi::BornInZoneSource {
-                zone: self.zone,
-                slot: self.lane.slot,
-            },
-            record.id,
-        );
+        self.handoff = retirement
+            .retire_current(
+                carrick_core::entry::binding(&self.task.execution, &self.task.mm),
+                carrick_core_abi::BornInZoneSource {
+                    zone: self.zone,
+                    slot: self.lane.slot,
+                },
+                record.id,
+            )
+            .ok();
         if self.handoff.is_some() {
             self.lane.retirements += 1;
             true

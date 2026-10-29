@@ -5130,7 +5130,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.source,
                 self.record.id,
             )
-            .ok_or(NativeProcessError::Quarantined)?;
+            .map_err(|_| NativeProcessError::Quarantined)?;
         carrick_core::lifecycle::retire_cancelled_pool_member(
             page,
             entry,

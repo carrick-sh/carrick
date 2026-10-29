@@ -305,26 +305,26 @@ fn resume_production_with(
                     // The neutral owner commits exact terminal intent at the
                     // physical release seam, before a queued DirectLoad can
                     // observe the saved record's absence.
-                    if control.entry().is_some()
-                        && !carrick_core::lifecycle::Lifecycle::gate(page).is_terminal()
-                    {
-                        // A cancelled pool member outside group close still
-                        // needs the host's published-entry retirement owner.
-                        hand_back();
-                    } else if custody
-                        .retire_zone_current(control, &mut membership, binding, source, record)
-                        .is_some()
-                    {
-                        if let Some(entry) = control.entry() {
-                            carrick_core::lifecycle::retire_cancelled_pool_member(
-                                page, entry, control, membership,
-                            )
-                            .unwrap_or_else(|_| fatal());
-                        } else {
-                            membership.publish();
+                    match custody.retire_zone_current(
+                        control,
+                        &mut membership,
+                        binding,
+                        source,
+                        record,
+                    ) {
+                        Ok(_) => {
+                            if let Some(entry) = control.entry() {
+                                carrick_core::lifecycle::retire_cancelled_pool_member(
+                                    page, entry, control, membership,
+                                )
+                                .unwrap_or_else(|_| fatal());
+                            } else {
+                                membership.publish();
+                            }
                         }
+                        Err(_) => hand_back(),
                     }
-                    // None includes CurrentRelease::Requeued (#685): no
+                    // Refusal includes CurrentRelease::Requeued (#685): no
                     // terminal commit ran. Drop restores the reserved unit;
                     // the adapter operation and its record stay host-owned.
                 }

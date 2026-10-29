@@ -954,7 +954,7 @@ fn terminal_attempt(mode: TerminalAttempt) {
             carrick_core_abi::BornInZoneSource { zone: &zone, slot },
             record,
         );
-        assert_eq!(released.is_some(), host_home);
+        assert_eq!(released.is_ok(), host_home);
     }
     if refuse_lock || host_home || lose_cas {
         assert_eq!(
@@ -1018,4 +1018,98 @@ fn terminal_attempt(mode: TerminalAttempt) {
     drop(membership);
     assert_eq!(page.live(), 2);
     assert!(zone.live(zone.record_ref(peer)).is_some());
+}
+
+#[test]
+fn pool_cancellation_refuses_record_release_before_terminal_gate() {
+    use carrick_core::terminal::{Live, TerminalCustody, Thread, ThreadTerminalIdentity};
+    use carrick_el1_abi::{
+        BlockedMask, BornRecord, EntryIdentity, EntryState, Lifecycle, ThreadControlSlot,
+        ThreadLifecyclePage,
+    };
+    let page = ThreadLifecyclePage::new();
+    let member = ThreadControlSlot::new();
+    let zone = compact_zone();
+    let (slot, record, binding) = running_compact_with_identity(&zone, 11, |identity| {
+        identity.lifecycle_page = &page as *const _ as u64;
+        identity.control_slot = &member as *const _ as u64;
+    });
+    let reference = zone.record_ref(record);
+    let source = carrick_core_abi::BornInZoneSource { zone: &zone, slot };
+    let entry = page
+        .stock(
+            0,
+            EntryIdentity {
+                tid: 71,
+                visible_tid: 71,
+                thread_serial: 113,
+                birth: carrick_core_abi::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
+                ),
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    page.bind_control_address(entry, &member as *const _ as u64)
+        .unwrap();
+    member.reset_for_birth(BlockedMask(0), 0, entry).unwrap();
+    member.bind_zone_record(reference);
+    let claim = page.claim_any().unwrap();
+    assert_eq!(page.thread_born(), Some(2));
+    page.record_born(
+        claim,
+        BornRecord {
+            caller_task: 41,
+            caller_serial: 101,
+            clone_flags: 0x0001_0000,
+            clear_child_tid: 0,
+            blocked: BlockedMask(0),
+        },
+    )
+    .unwrap();
+    let identity = ThreadTerminalIdentity::from_exit(
+        binding,
+        Some(entry),
+        carrick_sched_core::process::TerminationStatus::SUCCESS,
+    )
+    .unwrap();
+    let (custody, mut membership) = TerminalCustody::<Thread, Live>::admitted(identity)
+        .begin()
+        .reserve_member(&page, &member)
+        .unwrap_or_else(|_| panic!("nonfinal member"));
+    assert!(matches!(
+        custody.retire_zone_current(&member, &mut membership, binding, source, record),
+        Err(carrick_core::terminal::ZoneRetirementRefusal::HostCustody)
+    ));
+    assert!(
+        zone.live(reference).is_some(),
+        "neutral owner must refuse an open pool gate before Free"
+    );
+    assert_eq!(
+        page.state(entry.index()),
+        Some((entry.generation(), EntryState::Born))
+    );
+    drop(membership);
+    assert_eq!(
+        page.live(),
+        2,
+        "a refused release must refund its temporary reservation"
+    );
+
+    page.close();
+    let (custody, mut membership) = TerminalCustody::<Thread, Live>::admitted(identity)
+        .begin()
+        .reserve_member(&page, &member)
+        .unwrap_or_else(|_| panic!("nonfinal closing member"));
+    custody
+        .retire_zone_current(&member, &mut membership, binding, source, record)
+        .unwrap();
+    carrick_core::lifecycle::retire_cancelled_pool_member(&page, entry, &member, membership)
+        .unwrap();
+    assert!(zone.live(reference).is_none());
+    assert_eq!(
+        page.state(entry.index()),
+        Some((entry.generation(), EntryState::Reaped))
+    );
+    assert_eq!(page.live(), 1);
 }
