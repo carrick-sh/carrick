@@ -707,6 +707,35 @@ fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
         1,
         "host must not reserve native membership twice"
     );
-    host.publish();
+    host.commit_zone_retirement().publish();
     assert_eq!(page.live(), 1, "native page retirement is still pending");
+    let again = carrick_core::terminal::reserve_host_thread_exit_membership(&page, &member)
+        .unwrap_or_else(|_| panic!("graph cleanup must preserve native provenance"));
+    assert_eq!(page.live(), 1);
+    again.publish();
+}
+
+#[test]
+fn committed_host_zone_retirement_never_refunds_or_borrows_native_membership() {
+    use carrick_core::terminal::reserve_host_thread_exit_membership;
+    use carrick_el1_abi::{Lifecycle, ThreadControlSlot, ThreadLifecyclePage};
+    let page = ThreadLifecyclePage::new();
+    let member = ThreadControlSlot::new();
+    assert_eq!(page.thread_born(), Some(2));
+    drop(reserve_host_thread_exit_membership(&page, &member).unwrap_or_else(|_| panic!("reserve")));
+    assert_eq!(page.live(), 2, "uncommitted preparation refunds membership");
+    let committed = reserve_host_thread_exit_membership(&page, &member)
+        .unwrap_or_else(|_| panic!("reserve"))
+        .commit_zone_retirement();
+    assert_eq!(page.live(), 1);
+    assert!(
+        reserve_host_thread_exit_membership(&page, &member).is_err(),
+        "host intent cannot borrow a native-owned reservation"
+    );
+    drop(committed);
+    assert_eq!(
+        page.live(),
+        1,
+        "committed terminal ownership cannot refund live"
+    );
 }

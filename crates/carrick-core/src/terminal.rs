@@ -961,6 +961,17 @@ pub struct HostThreadExitMembership<'a> {
 }
 
 impl HostThreadExitMembership<'_> {
+    /// Commit the admitted host retirement before graph removal can drop its
+    /// saved continuation. Fallible preparation must precede this point. A
+    /// committed token never refunds live membership, even if its owner drops.
+    pub fn commit_zone_retirement(mut self) -> Self {
+        if let Some(reserved) = self.reserved.as_mut() {
+            self.member.exit_custody().commit_host_zone_terminal();
+            reserved.commit_irrevocable();
+        }
+        self
+    }
+
     pub fn retire_published(
         self,
         entry: EntryRef,
@@ -995,7 +1006,7 @@ pub fn reserve_host_thread_exit_membership<'a>(
     let pin =
         crate::lifecycle::MemberControlCustody::retain(member).map_err(|_| MembershipFloor)?;
     let entry = member.member_entry();
-    let native_reserved = member.exit_custody().zone_terminal()
+    let native_reserved = member.exit_custody().native_zone_terminal()
         || crate::lifecycle::recorded_member_exit_kind(member, member.member_entry())
             == MemberExitKind::InZone;
     let reserved = if native_reserved {

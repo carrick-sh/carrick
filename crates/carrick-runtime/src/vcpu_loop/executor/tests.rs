@@ -9122,3 +9122,106 @@ fn claimed_sibling_zone_reload(retired: bool) {
         "retired sibling must publish its existing losing-member result"
     );
 }
+
+#[test]
+fn serial_host_retirement_cancels_zone_wait_before_queued_claim() {
+    use carrick_kernel::kernel::continuation::{
+        BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
+    };
+    struct Region(Box<carrick_test_support::TestEl1Region>);
+    impl Drop for Region {
+        fn drop(&mut self) {
+            assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
+                self.0.as_ptr() as usize
+            ));
+        }
+    }
+    let region = Region(carrick_test_support::TestEl1Region::zeroed());
+    carrick_el1_abi::record_el1_region_host_ptr(region.0.as_ptr() as usize);
+    let zone = carrick_el1_abi::zone_tables().unwrap();
+    let (kernel, root) = bootstrap(19_760);
+    root.thread().set_affinity(CpuAffinity::all(1));
+    let sibling = sibling(&kernel, &root, 19_761);
+    assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
+    let scheduler = Arc::new(single_cpu_scheduler(kernel.clone()));
+    let service = CarrierWaitService::new(scheduler.clone());
+    let executor = scheduler
+        .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+        .unwrap();
+    let authority = enqueue_root(&scheduler, &sibling, publish(&sibling, 17));
+    let running = scheduler.take(&executor).unwrap();
+    let key = sibling.thread().key();
+    let id = zone
+        .alloc_record(carrick_el1_abi::ThreadIdentity {
+            tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+            serial: key.serial.raw(),
+            mm: sibling.shared().mm().id().raw(),
+            file_table: sibling.resources().files().id().raw(),
+            generation: running.generation().raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let sequence = zone.next_seq(id);
+    zone.publish_park(id, sequence);
+    let record = zone.record_ref(id);
+    sibling.thread().control_slot().bind_zone_record(record);
+    let continuation = BlockedContinuation::from_zone_park(
+        ContinuationCapture::from_lease(
+            &sibling,
+            running.lease(),
+            SyscallRequest::new(98, SyscallArgs([0; 6])),
+            RestartClass::Never,
+        )
+        .unwrap(),
+        ZoneWait::new(record, sequence),
+        None,
+    );
+    let mut registration = service.prepare_registration(&continuation);
+    service.enroll(&mut registration).unwrap();
+    scheduler
+        .settle_blocked_continuation(running, continuation, registration)
+        .unwrap();
+    scheduler.wake_control(key).unwrap();
+    assert!(matches!(
+        sibling.thread().execution_state(),
+        ThreadExecutionState::Runnable { .. }
+    ));
+    scheduler.unregister_executor(&executor).unwrap();
+    let binding = FakeBinding::new(17, [Step::Exit]);
+    binding.set_cpu_residency(super::residency::TaskCpuResidency::Zone {
+        base: test_guest_cpu_state(17),
+        record,
+        origin: super::residency::ZoneResumeOrigin::GuestRecord,
+    });
+    let factory = Arc::new(FakeFactory::default());
+    factory.install(&sibling, binding.clone());
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *binding.zone_load.lock() = Some(ZoneLoad {
+        zone,
+        entered: entered_tx,
+        resume: resume_rx,
+    });
+    // Real graph retirement drops the still-kernel-owned continuation; its
+    // ZoneWait destructor claims and frees the record. No manual free or
+    // host retirement receipt substitutes for this window.
+    kernel.exit_thread(&sibling, None).unwrap();
+    assert!(zone.live(record).is_none());
+    assert!(sibling.thread().control_slot().host_retirement().is_none());
+    assert!(!binding.address_space_is_retiring());
+    let pool = start_pool(scheduler, factory, 1);
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    resume_tx.send(()).unwrap();
+    drop(authority);
+    let report = pool
+        .shutdown()
+        .expect("terminal cancellation must not kill DirectLoad worker");
+    assert_eq!(report.created(), report.joined());
+    assert_eq!(report.created(), report.destroyed());
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 0);
+    assert_eq!(binding.reaped_settlements.load(Ordering::SeqCst), 1);
+    assert!(root.exact_thread_is_live());
+}
