@@ -624,7 +624,12 @@ fn parse_minted(bytes: &[u8], scope: MintScope) -> Result<AppToken, ScalerError>
     let token = response["token"]
         .as_str()
         .filter(|t| {
-            t.starts_with("ghs_") && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            // Current installation tokens are about 390 bytes and also use `-`
+            // and `.` after the prefix; the older 40-byte shape used neither.
+            t.starts_with("ghs_")
+                && t.len() > 4
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
         })
         .ok_or(ScalerError::External("App mint token"))?;
     let grant = scope.grant();
@@ -1014,6 +1019,25 @@ mod tests {
         assert!(api.mints.borrow().is_empty());
         let (served, _, _) = serve(&api, row(), b"{\"nonce\":\"short\"}".to_vec());
         assert_eq!(served, MintServed::Ignored);
+    }
+
+    /// The shape GitHub mints today (#1012 live trial, 2026-10-29): about 390
+    /// bytes after `ghs_`, mixing `-` and `.` with alphanumerics and `_`.
+    #[test]
+    fn current_installation_token_shape_is_accepted() {
+        let token = format!("ghs_{}", "aB3_-.x9".repeat(48));
+        let response = json!({"token":token,"permissions":{"contents":"write","metadata":"read",
+            "pull_requests":"write"},"repositories":[{"name":"carrick"}]});
+        let minted = parse_minted(response.to_string().as_bytes(), MintScope::Publish).unwrap();
+        assert_eq!(minted.secret(), token);
+        for bad in ["ghs_", "ghs_has space", "ghs_quote\"", "gho_otherkind"] {
+            let response = json!({"token":bad,"permissions":{"contents":"write",
+                "pull_requests":"write"},"repositories":[{"name":"carrick"}]});
+            assert!(
+                parse_minted(response.to_string().as_bytes(), MintScope::Publish).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
