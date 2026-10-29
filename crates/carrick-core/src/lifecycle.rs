@@ -80,7 +80,7 @@ const ABI_EXIT_PENDING: u32 = 256;
 const MEMBERSHIP_CLAIMED: u32 = 512;
 const GRAPH_REFERENCE: u32 = 1024;
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) enum NativeExitCompletion {
     Member,
     AbiExit,
@@ -90,7 +90,13 @@ const REFERENCES: u32 = RESETTING - GRAPH_REFERENCE;
 
 /// Exclusive live-unit reservation for one member. Both host graph cleanup
 /// and native exit use this same admission before decrementing the page.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum MemberMembershipError {
     AlreadyTerminal,
     InFlight,
