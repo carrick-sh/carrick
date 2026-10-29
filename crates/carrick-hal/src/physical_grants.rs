@@ -16,19 +16,37 @@ pub const COW_GRANT_PERMISSIONS: MemPerms = MemPerms {
     exec: true,
 };
 
-/// Failed unpublished rollback remains in carrier custody until the existing
-/// carrier observer reports the invariant failure. Destructors never decide
-/// terminal policy or discard the issuing authority on refusal.
+/// Failed unpublished rollback remains in carrier custody. Explicit abort
+/// callers propagate the invariant failure before reopening admission;
+/// destructors only retain custody, never decide terminal policy or discard
+/// the issuing authority on refusal.
 #[derive(Default)]
 pub struct PhysicalGrantRollback {
-    receipts: parking_lot::Mutex<Vec<UnpublishedFrameInventoryApply<dyn FrameCowAuthority>>>,
+    receipts: parking_lot::Mutex<Vec<FailedPhysicalGrant>>,
+}
+struct FailedPhysicalGrant {
+    _receipt: UnpublishedFrameInventoryApply<dyn FrameCowAuthority>,
+    _backing: Option<Box<dyn Send>>,
 }
 impl PhysicalGrantRollback {
     pub fn failed(&self) -> bool {
         !self.receipts.lock().is_empty()
     }
     pub fn retain(&self, receipt: UnpublishedFrameInventoryApply<dyn FrameCowAuthority>) {
-        self.receipts.lock().push(receipt);
+        self.receipts.lock().push(FailedPhysicalGrant {
+            _receipt: receipt,
+            _backing: None,
+        });
+    }
+    fn retain_backed<R: Send + 'static>(
+        &self,
+        receipt: UnpublishedFrameInventoryApply<dyn FrameCowAuthority>,
+        backing: Option<R>,
+    ) {
+        self.receipts.lock().push(FailedPhysicalGrant {
+            _receipt: receipt,
+            _backing: backing.map(|backing| Box::new(backing) as Box<dyn Send>),
+        });
     }
 }
 
@@ -61,6 +79,15 @@ pub struct PhysicalGrantCustody {
     pub grants: Vec<PhysicalFrameGrant>,
 }
 impl StagedPhysicalGrants {
+    /// Couple allocation custody to an unpublished inventory apply. Keep this
+    /// value until the publication owner accepts both obligations. It must
+    /// never be used to undo a reply the ring could already have consumed.
+    pub fn with_backing<R: Send + 'static>(self, backing: R) -> UnpublishedPhysicalGrant<R> {
+        UnpublishedPhysicalGrant {
+            staged: self,
+            backing: Some(backing),
+        }
+    }
     pub fn authority(&self) -> &Arc<dyn FrameCowAuthority> {
         &self.authority
     }
@@ -69,6 +96,9 @@ impl StagedPhysicalGrants {
     }
     /// Move the rollback obligation into the caller's publication transaction.
     pub fn handoff(mut self) -> Result<PhysicalGrantCustody, TrapError> {
+        self.take_custody()
+    }
+    fn take_custody(&mut self) -> Result<PhysicalGrantCustody, TrapError> {
         let receipt = self
             .receipt
             .take()
@@ -216,6 +246,55 @@ impl Drop for StagedPhysicalGrants {
     }
 }
 
+/// Pre-offer custody only: an allocation lease survives a failed inventory
+/// undo together with its issuing receipt. No descriptor has been offered or
+/// published while this value owns rollback authority. Full reply settlement
+/// additionally needs descriptor, residency, table and stage-2 journals.
+#[must_use = "transfer to the publication owner or explicitly abort before offering a reply"]
+pub struct UnpublishedPhysicalGrant<R: Send + 'static> {
+    staged: StagedPhysicalGrants,
+    backing: Option<R>,
+}
+impl<R: Send + 'static> UnpublishedPhysicalGrant<R> {
+    pub fn grants(&self) -> &[PhysicalFrameGrant] {
+        self.staged.grants()
+    }
+    /// Undo inventory before allocation retirement is requested by releasing
+    /// its lease. An indeterminate undo retains the receipt AND lease in the
+    /// issuing MM's failure custody. The caller must fail the carrier on Err;
+    /// it must not report an ordinary supply refusal or reopen admission.
+    pub fn abort_inventory(mut self) -> Result<(), TrapError> {
+        self.rollback_inventory()
+    }
+    fn rollback_inventory(&mut self) -> Result<(), TrapError> {
+        if let Some(mut receipt) = self.staged.receipt.take()
+            && receipt.rollback().is_err()
+        {
+            self.staged
+                .rollback
+                .retain_backed(receipt, self.backing.take());
+            return Err(TrapError::Hypervisor(
+                "unpublished physical grant inventory rollback indeterminate".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn handoff(mut self) -> Result<(PhysicalGrantCustody, R), TrapError> {
+        let custody = self.staged.take_custody()?;
+        let backing = self.backing.take().ok_or_else(|| {
+            TrapError::Hypervisor("unpublished physical grant backing absent".into())
+        })?;
+        Ok((custody, backing))
+    }
+}
+impl<R: Send + 'static> Drop for UnpublishedPhysicalGrant<R> {
+    fn drop(&mut self) {
+        // Drop retains failure custody, but never chooses terminal policy.
+        // Native refusal paths use abort_inventory and propagate its result.
+        let _ = self.rollback_inventory();
+    }
+}
+
 /// Physical publications retained by one native MM. The neutral fork owner
 /// drops this custody only after MM inventory retirement and slot absence.
 pub struct NativePhysicalGrants<R> {
@@ -250,12 +329,15 @@ impl<R> NativePhysicalGrants<R> {
     /// exclusion keeps the ring from observing a partly admitted batch.
     pub fn publish_cow(
         &mut self,
-        staged: StagedPhysicalGrants,
-        retained: R,
+        unpublished: UnpublishedPhysicalGrant<R>,
         pool: &carrick_el1_abi::CowGrantPool,
         excluded: &carrick_sched_core::ExcludedEditor<'_>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<(), TrapError>
+    where
+        R: Send + 'static,
+    {
         let fail = || TrapError::Hypervisor("native physical grant admission mismatch".into());
+        let staged = &unpublished.staged;
         if excluded.key() != self.owner.native_mm.raw().get()
             || staged.owner != self.owner
             || staged.grants.len() != 1
@@ -263,17 +345,15 @@ impl<R> NativePhysicalGrants<R> {
             || staged.permissions != COW_GRANT_PERMISSIONS
             || pool.ready(excluded.key()).count() >= Self::REFILL_GRANTS
         {
-            drop(staged);
-            drop(retained);
+            unpublished.abort_inventory()?;
             return Err(fail());
         }
         let grant = staged.grants[0];
         if self.grants.contains_key(&grant.gpa.raw()) {
-            drop(staged);
-            drop(retained);
+            unpublished.abort_inventory()?;
             return Err(fail());
         }
-        let custody = staged.handoff()?;
+        let (custody, retained) = unpublished.handoff()?;
         let entry = self.grants.entry(grant.gpa.raw()).or_insert(NativeGrant {
             custody,
             _retained: retained,
@@ -288,23 +368,25 @@ impl<R> NativePhysicalGrants<R> {
     /// Retain an isolated backing/table publication before its reply is visible.
     pub fn retain_backing(
         &mut self,
-        staged: StagedPhysicalGrants,
-        retained: R,
-    ) -> Result<Vec<PhysicalFrameGrant>, TrapError> {
+        unpublished: UnpublishedPhysicalGrant<R>,
+    ) -> Result<Vec<PhysicalFrameGrant>, TrapError>
+    where
+        R: Send + 'static,
+    {
+        let staged = &unpublished.staged;
         if staged.owner != self.owner
             || staged.frames.len() != 1
             || staged.length.raw() > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
             || self.grants.contains_key(&staged.frames[0].0.raw())
         {
-            drop(staged);
-            drop(retained);
+            unpublished.abort_inventory()?;
             return Err(TrapError::Hypervisor(
                 "native backing publication mismatch".into(),
             ));
         }
         let key = staged.frames[0].0.raw();
         let grants = staged.grants.clone();
-        let custody = staged.handoff()?;
+        let (custody, retained) = unpublished.handoff()?;
         self.grants.insert(
             key,
             NativeGrant {
