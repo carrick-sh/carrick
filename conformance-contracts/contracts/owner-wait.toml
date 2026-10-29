@@ -75,6 +75,8 @@ vm_free = [
   "carrick-el1-linux::aarch64_process::native_user_write_preserves_nonfault_refusals",
   "carrick-el1-linux::dispatch::host_owned_poll_copyout_refusal_keeps_the_host_fallback",
   "carrick-el1-linux::ipc::tests::native_structural_refusals_retire_without_host_handback",
+  "carrick-el1-linux::ipc::tests::{native_pipe_second_granule_busy_returns_prefix_and_preserves_suffix,native_pipe_ready_without_hardware_progress_returns_prefix}",
+  "carrick-el1-linux::ipc::tests::serial_host::{native_pipe_zero_progress_busy_fails_closed_without_enosys,native_pipe_zero_progress_ready_refusal_is_bounded} (injected preparation boundary through serve_ipc: two-page reads return the delivered 4096-byte prefix, retain ordered suffix and release pins; zero progress fails closed with terminal custody; at most one Ready preparation per offset, no spin or timed retry)",
 ]
 
 [bindings.unresolved]
