@@ -2346,3 +2346,17 @@ entries, whose normal settlement remains responsible for their obligations.
 The VM-free binding primes actual thread pools with runtime adoption
 reservations containing real process-birth submissions. Two live tasks then
 exit during close; unused capacity must retire before executor joins.
+
+### Fork-child copyout diagnosis (#1035)
+
+The [five-test diagnosis](diagnoses/1035-fork-child-memory.md) separates
+poll/IPC output preparation, native discard and nonforking signal delivery.
+The VM-free `carrick-core` counterexample
+`fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms` uses
+production owner fork publication and two admitted live roots. Its explicit
+`--ignored` run remains red: native pipe-read staging returns `InRing` for a
+recoverable COW destination. The director requested ignoring this diagnostic
+while #898's retained owner-memory copyout repair proceeds. It is not an
+acceptance binding or a semantic pass for `kernel.el1.fork-cow` or
+`kernel.copyout.owner-refusal`; signed attribution and all existing work
+budgets remain required.

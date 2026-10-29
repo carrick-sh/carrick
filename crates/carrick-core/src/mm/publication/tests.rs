@@ -1460,3 +1460,210 @@ fn reservation_decommit_returns_published_backing() {
         Err(carrick_core_abi::Refusal::Hole)
     );
 }
+
+/// #1035: native pipe copyout must prepare an inherited COW destination,
+/// rather than mistake a memory refusal for an unsupported in-zone operation.
+/// Explicit diagnostic counterexample; director requested keeping this opt-in
+/// while #898 repairs retained copyout. It is not an acceptance binding.
+#[test]
+#[ignore = "#1035: red counterexample; native IPC needs retained owner-memory copyout (#898)"]
+fn fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms() {
+    use carrick_core_abi::{
+        PortalForkRequest, PortalForkTableArena, PortalOperation, ReservationMm,
+    };
+    use carrick_el1_linux::mm_portal::NativeForkPortal;
+    use carrick_el1_linux::mm_portal::test_support::{IPA, ROOT, Region, Tables, VA, admit, nodes};
+    use carrick_guest_arch::UserVa;
+    use carrick_mmu_core::aarch64::LeafAccess;
+    use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+    use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerMmu};
+    use carrick_personality_linux::native_host_file::{
+        HostFileCall, HostFileStage, HostFileUser, InZoneKind, NativeDescriptor, NativeNamespace,
+        stage,
+    };
+
+    let region = Region::new();
+    let spaces = carrick_sched_core::AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let parent_tables = Tables::new(ROOT, IPA, 1);
+    let child_tables = Tables::new(ROOT + 0x100000, 0, 0);
+    let supply = Tables::new(ROOT + 0x200000, 0, 0);
+    let child = ReservationMm::new(78).unwrap();
+    let child_index = spaces
+        .publish_closed(child.raw(), child_tables.base, child_tables.base)
+        .unwrap();
+    let view = nodes(&region);
+    let portal = carrick_el1_linux::mm_portal::MmPortal::new(nz(1), region.table(), &spaces, &view);
+    let (operation, parent_generation, layout) = {
+        let mut root = portal.root(parent, 0).unwrap();
+        (
+            PortalOperation {
+                carrier: nz(1),
+                mm: parent,
+                incarnation: nz(root.incarnation().raw()),
+                sequence: root.next_transfer_sequence().unwrap(),
+            },
+            root.generation(),
+            root.layout(),
+        )
+    };
+    region
+        .table()
+        .publish(child_index.index(), child, layout)
+        .unwrap();
+    let request = PortalForkRequest {
+        operation,
+        parent_generation,
+        child_mm: child,
+        child_tables: PortalForkTableArena::new(
+            child_tables.base,
+            child_tables.words.len() as u64 * 8,
+        )
+        .unwrap(),
+        parent_tables: PortalForkTableArena::new(supply.base, supply.words.len() as u64 * 8)
+            .unwrap(),
+        kernel_control_ipa: 0xa000_0000,
+    };
+    struct Arenas<'a>([&'a Tables; 3]);
+    impl Arenas<'_> {
+        fn word(
+            &self,
+            pa: u64,
+        ) -> Result<
+            &core::sync::atomic::AtomicU64,
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal,
+        > {
+            self.0.iter().find_map(|table| {
+                let offset = pa.checked_sub(table.base)?;
+                if !offset.is_multiple_of(8) { return None; }
+                table.words.get(offset as usize / 8)
+            }).ok_or(carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::TableOutsidePrimary)
+        }
+    }
+    impl LiveDescriptorWords for Arenas<'_> {
+        fn load(
+            &self,
+            pa: u64,
+        ) -> Result<u64, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+            Ok(self.word(pa)?.load(core::sync::atomic::Ordering::Acquire))
+        }
+        fn compare_exchange(
+            &self,
+            pa: u64,
+            before: u64,
+            after: u64,
+        ) -> Result<bool, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+            Ok(self
+                .word(pa)?
+                .compare_exchange(
+                    before,
+                    after,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok())
+        }
+        fn store_unlinked(
+            &self,
+            pa: u64,
+            value: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+            self.word(pa)?
+                .store(value, core::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+        fn publish_barrier(&self) {}
+        fn invalidate_range(&self, _: u64, _: u64) {}
+    }
+    let words = Arenas([&parent_tables, &child_tables, &supply]);
+    let scratch = portal.census_fork(request, &words, 0).unwrap();
+    let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+    // Descriptor arenas remain retained until both MMs are dropped. Physical
+    // source custody is modeled by the selected IPA, not installed stage-2
+    // backing; this component witness claims no host service or execution.
+    let mut unpublished = portal.publish_fork(plan, &words, 0).unwrap();
+    unpublished.commit(&portal, 0).unwrap();
+    spaces.open(child_index);
+
+    for (mm, table) in [(parent, &parent_tables), (child, &child_tables)] {
+        assert!(portal.admitted_handle(mm, 0).is_ok());
+        let root = Aarch64Mmu::root(table.base).unwrap();
+        assert_eq!(
+            Aarch64Mmu::translate(&words, root, UserVa::new(VA), LeafAccess::Read, true)
+                .unwrap()
+                .unwrap()
+                .output
+                .raw(),
+            IPA,
+        );
+        assert!(
+            Aarch64Mmu::translate(&words, root, UserVa::new(VA), LeafAccess::Write, true)
+                .is_err_and(
+                    |error| error == carrick_mmu_core::owner_mmu::OwnerMmuRefusal::Protection
+                )
+        );
+        let run = carrick_mmu_core::aarch64::descriptor_txn::guest_cow::classify_guest_cow_write(
+            &words,
+            carrick_mmu_core::aarch64::SubstrateGpa(table.base),
+            VA,
+            false,
+        )
+        .expect("the real fork must leave recoverable COW, not a PROT_READ mapping");
+        assert_eq!((run.va, run.old_ipa.raw(), run.len), (VA, IPA, 4096));
+    }
+
+    struct ChildCopy<'a, W> {
+        words: &'a W,
+        root: RootGpa,
+    }
+    impl<W: LiveDescriptorWords> HostFileUser for ChildCopy<'_, W> {
+        fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+            panic!("a pipe read has no user input");
+        }
+        fn writable(&mut self, address: u64, len: usize) -> usize {
+            if Aarch64Mmu::translate(
+                self.words,
+                self.root,
+                UserVa::new(address),
+                LeafAccess::Write,
+                true,
+            )
+            .is_ok_and(|translation| translation.is_some())
+            {
+                len
+            } else {
+                0
+            }
+        }
+    }
+    let mut user = ChildCopy {
+        words: &words,
+        root: Aarch64Mmu::root(child_tables.base).unwrap(),
+    };
+    let mut resolve = |_| Some(NativeDescriptor::InZone(InZoneKind::Pipe));
+    let mut releases = |_: &mut [carrick_core_abi::host_file::MapSourceReply]| 0;
+    let mut namespace = NativeNamespace {
+        table: [1, 2, 3],
+        resolve: &mut resolve,
+        releases: &mut releases,
+    };
+    let answer = stage(
+        HostFileCall::Read {
+            fd: 3,
+            buf: VA,
+            count: 1,
+        },
+        &mut namespace,
+        &mut user,
+    );
+    assert!(
+        matches!(
+            answer,
+            Some(HostFileStage::Fault {
+                address: VA,
+                access: carrick_guest_arch::Access::Write
+            })
+        ),
+        "child COW copyout must select owner preparation before IPC retry; native ARM lowers {answer:?} to ENOSYS (38)"
+    );
+}
