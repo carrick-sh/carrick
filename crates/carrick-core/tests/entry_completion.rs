@@ -700,4 +700,13 @@ fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
         MissingContinuationVerdict::Terminal,
         "record release must never precede retained terminal proof"
     );
+    let host = carrick_core::terminal::reserve_host_thread_exit_membership(&page, &member)
+        .unwrap_or_else(|_| panic!("native reservation also owns host graph cleanup"));
+    assert_eq!(
+        page.live(),
+        1,
+        "host must not reserve native membership twice"
+    );
+    host.publish();
+    assert_eq!(page.live(), 1, "native page retirement is still pending");
 }

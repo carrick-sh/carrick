@@ -2284,12 +2284,12 @@ mod tests {
 
     #[test]
     fn lifecycle_abi_birth_is_resolved_by_a_second_process() {
-        abi_birth_observed_by_peer(false, false, false);
+        abi_birth_observed_by_peer(false, false, false, false);
     }
 
     #[test]
     fn lifecycle_abi_birth_uses_reserved_resources_after_allocator_exhaustion() {
-        abi_birth_observed_by_peer(true, false, false);
+        abi_birth_observed_by_peer(true, false, false, false);
     }
 
     #[test]
@@ -2387,15 +2387,25 @@ mod tests {
 
     #[test]
     fn lifecycle_abi_birth_uses_revision_headroom_reserved_from_host_mutations() {
-        abi_birth_observed_by_peer(false, true, false);
+        abi_birth_observed_by_peer(false, true, false, false);
     }
 
     #[test]
     fn lifecycle_host_adopted_abi_exit_consumes_exact_reserved_custody() {
-        abi_birth_observed_by_peer(false, true, true);
+        abi_birth_observed_by_peer(false, true, true, false);
     }
 
-    fn abi_birth_observed_by_peer(exhaust_ids: bool, exhaust_revisions: bool, host_exit: bool) {
+    #[test]
+    fn group_exit_member_graph_retirement_does_not_retire_reaped_abi_twice() {
+        abi_birth_observed_by_peer(false, false, true, true);
+    }
+
+    fn abi_birth_observed_by_peer(
+        exhaust_ids: bool,
+        exhaust_revisions: bool,
+        host_exit: bool,
+        native_exit: bool,
+    ) {
         let (kernel, root) = bootstrap(9_670);
         let peer = kernel
             .fork_task(
@@ -2496,7 +2506,35 @@ mod tests {
             page.state(entry.index()),
             Some((entry.generation(), EntryState::Published))
         );
-        if host_exit {
+        if native_exit {
+            kernel.exit_thread(&sibling, None).unwrap();
+            // Two live threads share the page. The native group-close member
+            // owns its live reservation and reaps its exact ABI entry before
+            // the host consumes the losing job's clear-child-tid handoff.
+            assert!(root.exact_thread_is_live() && adopted.exact_thread_is_live());
+            assert_eq!(page.live(), 2);
+            let _closing = carrick_core::terminal::TerminalCustody::<
+                carrick_core::terminal::Process,
+                carrick_core::terminal::Live,
+            >::close_admission(&*page);
+            let membership =
+                carrick_core::terminal::reserve_thread_exit_membership(&*page).unwrap();
+            carrick_core::lifecycle::retire_cancelled_pool_member(
+                &*page, entry, &*control, membership,
+            )
+            .unwrap();
+            assert_eq!(page.live(), 1);
+            kernel
+                .exit_thread(&adopted, None)
+                .expect("host retires only the graph");
+            assert_eq!(page.live(), 1, "native membership is consumed exactly once");
+            assert!(root.exact_thread_is_live());
+            assert!(!adopted.exact_thread_is_live());
+            assert_eq!(
+                page.state(entry.index()),
+                Some((entry.generation(), EntryState::Reaped))
+            );
+        } else if host_exit {
             let live_before_decline = page.live();
             assert!(matches!(
                 kernel.exit_thread(
