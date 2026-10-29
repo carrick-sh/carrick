@@ -1125,6 +1125,54 @@ fn composed_native_supply(
             .unwrap();
         assert!(grants.offer_backing_reply(reply_slot, &txn));
     }
+    // Guest-originated stale candidates must leave the real pending supply
+    // untouched. The same two native MMs remain live for the real completion.
+    {
+        let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
+        let stale_owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                handle.carrier(),
+                handle.mm(),
+                NonZeroU64::new(handle.incarnation().get() + 1).unwrap(),
+            )
+        };
+        let unrelated_reply = carrick_el1_abi::PortalGrantSlot::new();
+        let mut stale_txn = txn;
+        stale_txn.id.generation = NonZeroU64::new(txn.id.generation.get() + 1).unwrap();
+        for (candidate_owner, candidate_root, candidate_reply, candidate_txn) in [
+            (stale_owner, child_physical_root, reply_slot, txn),
+            (
+                handle,
+                RootGpa::page_aligned(FrameGpa::new(0xffff0000)).unwrap(),
+                reply_slot,
+                txn,
+            ),
+            (handle, child_physical_root, &unrelated_reply, txn),
+            (handle, child_physical_root, reply_slot, stale_txn),
+        ] {
+            let result = stock.owner.settle_native_backing_reply(
+                &mut carrick_hal::fork_stock::NoTableLedger,
+                candidate_owner,
+                candidate_root,
+                candidate_reply,
+                &candidate_txn,
+                |_| panic!("a stale request must not release physical custody"),
+            );
+            assert!(
+                !result.unwrap(),
+                "guest mismatch must be refused without settling the real supply"
+            );
+            assert!(!stock.owner.is_quarantined(handle.mm()));
+            assert_eq!(
+                stock.owner.pending_native_descriptor_transaction(
+                    handle,
+                    child_physical_root,
+                    txn.id.generation
+                ),
+                Some(txn)
+            );
+        }
+    }
     if competing_publication {
         let competing = carrick_el1_abi::PortalGrantSlot::new();
         // A competing producer owns different bytes and an independent
