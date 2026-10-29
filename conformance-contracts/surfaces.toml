@@ -2124,3 +2124,11 @@ contracts = ["core.lifecycle.publication"]
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_ipc_wake_tests.rs"
 contracts = ["kernel.el1.ipc-two-process"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/mm/residency/stock.rs"
+contracts = ["kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/mm/residency/stock_tests.rs"
+contracts = ["kernel.el1.anonymous-reservations"]
