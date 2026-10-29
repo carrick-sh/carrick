@@ -183,6 +183,22 @@ impl FrameGrantResidencyRecord {
         );
     }
 
+    fn retained_overlaps(&self, start: u64, end: u64) -> bool {
+        let base = self.semantic_base.load(Ordering::Relaxed);
+        let len = self.len.load(Ordering::Relaxed);
+        if start >= end || base >= end || start >= base.saturating_add(len) {
+            return false;
+        }
+        if self.stock_root.load(Ordering::Relaxed) == 0 {
+            return true;
+        }
+        let mask = self.stock_retained.load(Ordering::Acquire);
+        (0..4).any(|bit| {
+            let page = base + bit * GRANT_PAGE_SIZE;
+            mask & (1 << bit) != 0 && page < end && start < page + GRANT_PAGE_SIZE
+        })
+    }
+
     fn retains(&self, bit: usize) -> bool {
         self.stock_root.load(Ordering::Relaxed) == 0
             || bit < 4 && self.stock_retained.load(Ordering::Acquire) & (1 << bit) != 0
@@ -602,8 +618,7 @@ impl FrameGrantResidencyTable {
             }
             let identity = record.identity();
             if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < identity.semantic_base.saturating_add(identity.len)
+                && record.retained_overlaps(start, end)
                 && !self.retire_fragment(slot, identity, start, end)
             {
                 return false;
@@ -632,8 +647,7 @@ impl FrameGrantResidencyTable {
             }
             let identity = record.identity();
             if identity.mm_key != mm_key
-                || identity.semantic_base >= end
-                || start >= identity.semantic_base.saturating_add(identity.len)
+                || !record.retained_overlaps(start, end)
                 || record.state.load(Ordering::Acquire) != state
             {
                 continue;
@@ -674,8 +688,7 @@ impl FrameGrantResidencyTable {
             }
             let identity = record.identity();
             if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < identity.semantic_base.saturating_add(identity.len)
+                && record.retained_overlaps(start, end)
                 && record.state.load(Ordering::Acquire) == state
             {
                 let _ = record.transfer_pins.compare_exchange(
@@ -696,8 +709,7 @@ impl FrameGrantResidencyTable {
             }
             let identity = record.identity();
             if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < identity.semantic_base.saturating_add(identity.len)
+                && record.retained_overlaps(start, end)
                 && !self.retire_claimed_fragment(slot, identity, start, end)
             {
                 return false;

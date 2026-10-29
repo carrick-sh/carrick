@@ -560,3 +560,39 @@ fn publication_refusal_returns_claim_custody_until_the_physical_owner_cancels() 
     assert_eq!(table.stock_record_count(), 0);
     assert!(table.publish(id).is_some());
 }
+
+#[test]
+fn a_pinned_survivor_does_not_block_retirement_inside_a_masked_hole() {
+    let table = table();
+    let who = owner(7, 1);
+    let id = chunk();
+    publish_stock(&table, who, id);
+    let hole = id.semantic_base + GRANT_PAGE_SIZE;
+    assert!(table.retire_small_span(7, hole, GRANT_PAGE_SIZE));
+    let survivor = table.lookup(7, id.semantic_base).unwrap();
+    let pin = table.pin_transfer(survivor).unwrap();
+    let replacement = FrameGrantResidencyIdentity {
+        semantic_base: hole,
+        physical_ipa: 0x700_0000,
+        len: GRANT_PAGE_SIZE,
+        frame_id: 40,
+        mapping_id: 41,
+        ..id
+    };
+    assert!(table.publish(replacement).is_some());
+    let retirement = table
+        .begin_retire_overlapping(7, hole, GRANT_PAGE_SIZE)
+        .expect("a stock row's retired hole must not reserve its pinned survivor");
+    assert!(retirement.commit());
+    assert!(table.lookup(7, hole).is_none());
+    assert_eq!(table.lookup(7, id.semantic_base).unwrap().identity, id);
+    assert_eq!(
+        table
+            .stock_record(who, carrick_guest_arch::UserVa::new(id.semantic_base))
+            .unwrap()
+            .retained
+            .bits(),
+        0b1101
+    );
+    drop(pin);
+}
