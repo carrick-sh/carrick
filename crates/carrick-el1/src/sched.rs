@@ -64,7 +64,9 @@ pub trait ThreadCpu {
         if target == carrick_sched_core::HOST_RESCHEDULE_TARGET {
             #[cfg(all(target_os = "none", target_arch = "aarch64"))]
             if crate::isa::aarch64::cross_hvc_residency_kick(slot).is_err() {
-                hw::fatal_entry_binding();
+                hw::fatal_entry_binding(
+                    carrick_el1_abi::EntryBindingFatalReason::HostRescheduleKick,
+                );
             }
             #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
             {
@@ -713,7 +715,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             );
             #[cfg(target_os = "none")]
             if action == carrick_el1_abi::Action::Forward {
-                hw::fatal_entry_binding();
+                hw::fatal_entry_binding(carrick_el1_abi::EntryBindingFatalReason::HostWorkForward);
             }
             return action;
         }

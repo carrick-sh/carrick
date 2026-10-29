@@ -1643,11 +1643,46 @@ impl core::fmt::Debug for NativeInvariant {
     }
 }
 
+#[track_caller]
 pub fn invalid_completion(reason: NativeInvariant) -> ! {
     #[cfg(target_os = "none")]
     {
-        let _ = reason;
-        carrick_el1::substrate::sched::hw::fatal_entry_binding();
+        use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+        let reason = match reason {
+            NativeInvariant::EntryBinding => Fatal::EntryBinding,
+            NativeInvariant::PhysicalCustody(reason) => match reason {
+                "root exit crossing refused" => Fatal::RootExitRefused,
+                "admitted fork custody commit refused" => Fatal::ForkCustodyRefused,
+                "affinity carrier topology missing after venue admission" => {
+                    Fatal::AffinityTopologyMissing
+                }
+                _ => Fatal::PhysicalCustody,
+            },
+            NativeInvariant::MissingNativeFrame => Fatal::MissingNativeFrame,
+            NativeInvariant::RevisionCredit => Fatal::RevisionCredit,
+            NativeInvariant::SignalNumber => Fatal::SignalNumber,
+            NativeInvariant::ProcessGraph(invariant) => {
+                use super::process_owner::GuestProcessInvariant as Graph;
+                use carrick_sched_core::process::registry::RegistryInvariant as Registry;
+                match invariant {
+                    Graph::NamespaceInternalIdentityOutOfRange(_) => Fatal::NamespaceIdentityRange,
+                    Graph::NamespaceVisibleIdentityLost(_) => Fatal::NamespaceIdentityLost,
+                    Graph::ExitCustodyLost(_) => Fatal::ExitCustodyLost,
+                    Graph::ExitPublicationLost(_) => Fatal::ExitPublicationLost,
+                    Graph::ExitReleaseLost(_) => Fatal::ExitReleaseLost,
+                    Graph::Registry(invariant) => match invariant {
+                        Registry::EpochExhausted => Fatal::RegistryEpochExhausted,
+                        Registry::BirthPayloadMismatch => Fatal::BirthPayloadMismatch,
+                        Registry::ProcessGroupCollision => Fatal::ProcessGroupCollision,
+                        Registry::ProcessGroupIndexLost => Fatal::ProcessGroupIndexLost,
+                        Registry::SessionCollision => Fatal::SessionCollision,
+                        Registry::SessionIndexLost => Fatal::SessionIndexLost,
+                        Registry::AutoreapAccountingLost => Fatal::AutoreapAccountingLost,
+                    },
+                }
+            }
+        };
+        carrick_el1::substrate::sched::hw::fatal_entry_binding(reason);
     }
     #[cfg(not(target_os = "none"))]
     carrick_fatal::carrick_fatal!(

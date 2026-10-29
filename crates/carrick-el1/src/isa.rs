@@ -87,7 +87,9 @@ pub fn frame_grant_residency_guest() -> &'static carrick_el1_abi::FrameGrantResi
     type Native = x86::X86Backend;
     let layout = <Native as carrick_guest_arch::LayoutBackend>::KERNEL_LAYOUT;
     let Some(venues) = carrick_el1_abi::KernelFaultVenues::derive(layout) else {
-        crate::substrate::sched::hw::fatal_entry_binding();
+        crate::substrate::sched::hw::fatal_entry_binding(
+            carrick_el1_abi::EntryBindingFatalReason::ResidencyLayout,
+        );
     };
     // SAFETY: LayoutBackend is the image owner's typed mapping contract.
     // derive checked alignment and region bounds; bootstrap retains this

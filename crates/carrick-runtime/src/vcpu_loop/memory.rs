@@ -893,6 +893,8 @@ mod tests {
     fn arm_entry_binding_diagnostic_reaches_the_fatal_record_without_truncation() {
         let diagnostic = carrick_el1_abi::ArmEntryBindingFatal {
             registers: carrick_el1_abi::ArmEntryFatalRegisters {
+                reason: Some(carrick_el1_abi::EntryBindingFatalReason::EntryBinding as u64),
+                source_location: Some((1646 << 32) | 9),
                 pc: Some(0x1010),
                 lr: Some(0x2020),
                 fp: Some(0x3030),
