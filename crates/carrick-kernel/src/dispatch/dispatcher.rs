@@ -1225,6 +1225,7 @@ impl FsCrossSubsystem for SyscallDispatcher {
 
 /// Cross-subsystem capabilities required during network operations (such as fd lifecycle and signal suspend).
 pub(in crate::dispatch) trait NetCrossSubsystem: Send + Sync {
+    fn fs_view(&self) -> FsView<'_>;
     fn host_signal(&self) -> &dyn HostSignalBridge;
     fn caller_net_ns(&self, context: &crate::kernel::KernelContext) -> Arc<crate::kernel::NetNs>;
     fn captured_file_table(&self) -> Arc<crate::kernel::FileTable>;
@@ -1288,6 +1289,9 @@ pub(in crate::dispatch) trait NetCrossSubsystem: Send + Sync {
 }
 
 impl NetCrossSubsystem for SyscallDispatcher {
+    fn fs_view(&self) -> FsView<'_> {
+        SyscallDispatcher::fs_view(self)
+    }
     fn host_signal(&self) -> &dyn HostSignalBridge {
         &*self.host_signal
     }

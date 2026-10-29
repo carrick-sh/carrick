@@ -2466,7 +2466,7 @@ remain director-owned; neither is available on ctb-w4.
 completion alongside completed-wait output. One suspension envelope transfers
 its memory dependency by value to existing owner-wait settlement. The retained
 operation owns no second dependency, memory permit or process-effect custody.
-Directory reads and IPC retain their existing routes.
+Directory reads now share this transport (Slice 3 below); IPC retains its existing route.
 
 Every resumed operation authenticates its exact kernel/task binding, thread
 incarnation, MM and independent ASID before any memory access. Identity failures
@@ -2488,3 +2488,49 @@ task's addrlen with zero. This is an injected stale runtime handoff, not an
 observed spontaneous guest workload failure. VM-free runtime routing and physical
 settlement add custody evidence; signed HVF, Docker differential, runtime ratios
 and exact-artifact acceptance remain director-owned and unavailable on ctb-w4.
+
+### Directory reads on shared retained output (#986 Slice 3)
+
+`kernel.fs.directory-copyout` and `kernel.memory.owner-wait` bind getdents64
+publication to the same retained-output transport as completed waits and
+recvfrom address metadata. The directory payload owns the selected open
+description, its functional lease, destination and capacity. It holds no memory
+dependency, description guard, prepared permit or process-effect custody.
+Publication obtains a fresh filesystem view inside captured-resource scope;
+no borrowed dispatch services survive suspension.
+
+Owner-memory entry captures the actual execution lease's exact kernel/task,
+thread incarnation, MM and independent ASID. Resumption authenticates that
+binding before touching memory or the shared cursor. Legacy task memory and
+carrier buffers remain lease-free and cannot admit owner-memory publication.
+Genuine internal preparation failures remain dispatch errors; only a genuine
+invalid destination becomes errno 14. Completed-wait initial publication and
+folding retain their narrower completion-invariant error type.
+
+The directory encoder, complete-record batching, page and 4096-byte bounds,
+shared open-description cursor and effect admission are preserved. Each resume
+locks the live shared cursor; it retains no offset snapshot and never resolves
+a reused numeric fd. A fault or refusal after committed records returns exactly
+that prefix without retaining replay state. Before progress, owner, supply and
+physical refusal retain the selected description through the shared envelope.
+Fatal cancellation releases that selection without output or cursor progress;
+handled signals remain deferred by existing killable-only owner-wait settlement.
+
+The structural witness
+`serial_host_directory_shared_route_transfers_only_dependency_custody` fails
+on Slice 2 with three dependency references instead of two. Shared routing
+transfers the envelope's dependency by value, leaving only the external witness
+and routed wait. Repeated-refusal tests require zero commits/cursor progress at
+preparations 1/2/3, dependency release before preparation 4 and exactly one final
+commit. Prefix tests require one complete 24-byte record, cursor 1 and no
+suspended replay on either refusal or fault. Stale handoff tests require zero
+resumed memory operations and no cursor progress. Existing close/reuse/drop,
+batching at 10/100/400/4096 and all seven runtime physical scenarios remain
+behavior-preservation evidence.
+
+This is a transport refactor, not a fix for a demonstrated failing guest
+workload. The stale handoff cases are injected internal authentication tests.
+Signed HVF execution, Docker differential, paired runtime ratios and exact
+artifact promotion remain director-owned and unavailable on ctb-w4. Existing
+fixture/oracle inputs are unchanged; these VM-free checks do not discharge
+those higher-layer obligations.

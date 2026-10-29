@@ -1880,6 +1880,7 @@ mod s3_review_tests {
                     &context,
                     &mut memory,
                     (context.shared().mm().id(), context.shared().mm().id().raw()),
+                    &dispatcher.fs_view()
                 )
                 .unwrap(),
             DispatchOutcome::errno(LINUX_EINTR)

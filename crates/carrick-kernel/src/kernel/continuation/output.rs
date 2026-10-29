@@ -3,7 +3,9 @@
 //! operation. Routing consumes the suspension and transfers its dependency.
 
 use super::{CompletionFoldError, GuestOutputRange, owner_wait_cancellation};
-use crate::dispatch::{CurrentMmMemory, DispatchOutcome};
+use crate::dispatch::{
+    CurrentMmMemory, DirectoryReadOutput, DispatchError, DispatchOutcome, FsView,
+};
 use crate::kernel::objects::{ThreadExecutionLease, ThreadKey};
 use crate::kernel::{KernelContext, KernelTaskBinding, MmId};
 use carrick_abi::{LINUX_EFAULT, LINUX_EINVAL, LinuxErrno};
@@ -95,6 +97,7 @@ struct CompletedWaitOutput {
 enum OutputOperation {
     CompletedWait(CompletedWaitOutput),
     RecvfromAddress(RecvfromAddress),
+    DirectoryRead(DirectoryReadOutput),
 }
 
 /// Dependency-free, move-only operation. It never owns a permit or editor.
@@ -127,10 +130,11 @@ impl SuspendedOutputCompletion {
         context: &KernelContext,
         memory: &mut impl CurrentMmMemory,
         mm: (MmId, u64),
-    ) -> Result<DispatchOutcome, CompletionFoldError> {
+        fs: &FsView<'_>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         let (operation, wait) = self.into_parts();
         drop(wait);
-        operation.resume(context, memory, mm)
+        operation.resume(context, memory, mm, fs)
     }
 }
 
@@ -193,12 +197,14 @@ impl RetainedOutputCompletion {
         context: &KernelContext,
         memory: &mut impl CurrentMmMemory,
         mm: (MmId, u64),
-    ) -> Result<DispatchOutcome, CompletionFoldError> {
-        self.authenticate_identity(context, mm)?;
+        fs: &FsView<'_>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.authenticate_identity(context, mm)
+            .map_err(DispatchError::CompletionInvariant)?;
         if let Some(cancelled) = owner_wait_cancellation(context) {
             return Ok(DispatchOutcome::OwnerCancelled(cancelled));
         }
-        Ok(self.publish(context, memory))
+        self.publish(context, memory, fs)
     }
     pub(super) fn publish_initial(
         self,
@@ -209,17 +215,35 @@ impl RetainedOutputCompletion {
         self.authenticate_identity(context, mm)?;
         // Legacy timeout output folds before fatal signal delivery. Its first
         // publication keeps that ordering; suspended resumes are killable.
-        Ok(self.publish(context, memory))
+        let OutputOperation::CompletedWait(output) = self.operation else {
+            unreachable!("only completed waits use initial publication")
+        };
+        Ok(output.copyout(self.binding, context, memory))
+    }
+    pub(crate) fn directory_read(
+        binding: ExactCompletionBinding,
+        output: DirectoryReadOutput,
+    ) -> Self {
+        Self {
+            binding,
+            operation: OutputOperation::DirectoryRead(output),
+        }
     }
     fn publish(
         self,
         context: &KernelContext,
         memory: &mut impl CurrentMmMemory,
-    ) -> DispatchOutcome {
+        fs: &FsView<'_>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         match self.operation {
-            OutputOperation::CompletedWait(output) => output.copyout(self.binding, context, memory),
+            OutputOperation::DirectoryRead(output) => {
+                output.publish(self.binding, context, fs, memory)
+            }
+            OutputOperation::CompletedWait(output) => {
+                Ok(output.copyout(self.binding, context, memory))
+            }
             OutputOperation::RecvfromAddress(address) => {
-                address.resume(self.binding, context, memory)
+                Ok(address.resume(self.binding, context, memory))
             }
         }
     }
@@ -367,10 +391,12 @@ mod tests {
         // collision cannot substitute for exact task/kernel authentication.
         operation.binding.thread = other.thread().key();
         let mut memory = OwnerRefusingMemory::new(0x7000, 4, 0xa5);
-        assert_eq!(
-            operation.resume(&other, &mut memory, mm).unwrap_err(),
-            CompletionFoldError::Task
-        );
+        assert!(matches!(
+            operation.resume(&other, &mut memory, mm, &dispatcher.fs_view()),
+            Err(DispatchError::CompletionInvariant(
+                CompletionFoldError::Task
+            ))
+        ));
         assert_eq!(memory.prepares, 0);
         assert_eq!(memory.reads.get(), 0);
         assert!(memory.commits.is_empty());
@@ -423,7 +449,9 @@ mod tests {
         );
         let mut memory = OwnerRefusingMemory::new(0x7000, 4, 0xa5);
         assert_eq!(
-            operation.resume(&context, &mut memory, mm).unwrap(),
+            operation
+                .resume(&context, &mut memory, mm, &dispatcher.fs_view())
+                .unwrap(),
             DispatchOutcome::Returned { value: 7 }
         );
         assert_eq!(memory.prepares, 1);

@@ -8199,7 +8199,12 @@ fn completion_owner_wait_during_group_exit_is_not_a_configuration_failure() {
     assert!(context.exact_thread_is_live() && sibling.exact_thread_is_live());
     assert_eq!(
         pending
-            .resume(&context, &mut memory, (mm, mm.raw()))
+            .resume(
+                &context,
+                &mut memory,
+                (mm, mm.raw()),
+                &crate::dispatch::SyscallDispatcher::new().fs_view()
+            )
             .unwrap(),
         DispatchOutcome::OwnerCancelled(OwnerWaitCancellation::GroupExit)
     );
@@ -8351,7 +8356,12 @@ fn completion_owner_wait_retains_output_progress_and_original_result() {
                 );
             assert_eq!(
                 pending
-                    .resume(&context, &mut memory, (mm, mm.raw()))
+                    .resume(
+                        &context,
+                        &mut memory,
+                        (mm, mm.raw()),
+                        &crate::dispatch::SyscallDispatcher::new().fs_view()
+                    )
                     .unwrap(),
                 DispatchOutcome::OwnerCancelled(OwnerWaitCancellation::GroupExit)
             );
@@ -8360,7 +8370,12 @@ fn completion_owner_wait_retains_output_progress_and_original_result() {
         } else {
             assert_eq!(
                 pending
-                    .resume(&context, &mut memory, (mm, mm.raw()))
+                    .resume(
+                        &context,
+                        &mut memory,
+                        (mm, mm.raw()),
+                        &crate::dispatch::SyscallDispatcher::new().fs_view()
+                    )
                     .unwrap(),
                 DispatchOutcome::Returned { value: 23 }
             );
@@ -8423,12 +8438,17 @@ fn completion_owner_wait_authenticates_thread_and_independent_asid() {
         Err(CompletionFoldError::Thread)
     );
     let mut memory = crate::dispatch::LinearMemory::new(0x7000, vec![0xa5; 16]);
-    assert_eq!(
-        operation
-            .resume(&context, &mut memory, (mm, 42))
-            .unwrap_err(),
-        CompletionFoldError::AddressSpace
-    );
+    assert!(matches!(
+        operation.resume(
+            &context,
+            &mut memory,
+            (mm, 42),
+            &crate::dispatch::SyscallDispatcher::new().fs_view()
+        ),
+        Err(crate::dispatch::DispatchError::CompletionInvariant(
+            CompletionFoldError::AddressSpace
+        ))
+    ));
     assert_eq!(memory.read_bytes(0x7000, 16).unwrap(), vec![0xa5; 16]);
     assert_eq!(
         fold_continuation_completion(
@@ -8609,7 +8629,14 @@ fn interrupted_sleep_completion_retains_bytes_across_refusals() {
                                     || panic!("no output effects held"),
                                 );
                         }
-                        outcome = pending.resume(&context, &mut memory, (mm, 41)).unwrap();
+                        outcome = pending
+                            .resume(
+                                &context,
+                                &mut memory,
+                                (mm, 41),
+                                &crate::dispatch::SyscallDispatcher::new().fs_view(),
+                            )
+                            .unwrap();
                         if cancel_after == Some(stage) {
                             break;
                         }
@@ -8740,17 +8767,22 @@ fn interrupted_sleep_completion_rejects_stale_resume_before_preparation() {
             panic!("retained remainder")
         };
         let prepares = memory.prepares;
+        let result = pending.resume(
+            if wrong_thread { &other } else { &context },
+            &mut memory,
+            if wrong_thread { (mm, 41) } else { (mm, 42) },
+            &crate::dispatch::SyscallDispatcher::new().fs_view(),
+        );
+        let Err(crate::dispatch::DispatchError::CompletionInvariant(error)) = result else {
+            panic!("stale completion must fail authentication")
+        };
         assert_eq!(
-            pending.resume(
-                if wrong_thread { &other } else { &context },
-                &mut memory,
-                if wrong_thread { (mm, 41) } else { (mm, 42) },
-            ),
-            Err(if wrong_thread {
+            error,
+            if wrong_thread {
                 CompletionFoldError::Thread
             } else {
                 CompletionFoldError::AddressSpace
-            })
+            }
         );
         assert_eq!(memory.prepares, prepares);
         assert_eq!(memory.inner.read_bytes(0x7000, 16).unwrap(), vec![0xa5; 16]);

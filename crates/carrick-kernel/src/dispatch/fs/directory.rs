@@ -40,87 +40,70 @@ pub(in crate::dispatch) fn directory_record_batch(
     Ok((out, next))
 }
 
-/// One directory selection retained before the first record is consumed.
-/// No guard or guest pointer is held across an owner-memory dependency.
-pub struct OwnedDirectoryRead {
+/// Dependency-free directory selection. The shared suspension owns the wait.
+pub(crate) struct DirectoryReadOutput {
     target: OpenFile,
     _lease: crate::kernel::objects::FileDescriptionFdLease,
-    thread: crate::kernel::ThreadKey,
     address: GuestVa,
     length: usize,
-    wait: carrick_guest_mem::MemoryReadWait,
 }
-impl std::fmt::Debug for OwnedDirectoryRead {
+impl std::fmt::Debug for DirectoryReadOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnedDirectoryRead")
-            .field("wait", &self.wait)
+        f.debug_struct("DirectoryReadOutput")
+            .field("address", &self.address)
+            .field("length", &self.length)
             .finish_non_exhaustive()
     }
 }
-impl PartialEq for OwnedDirectoryRead {
+impl PartialEq for DirectoryReadOutput {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.target.description, &other.target.description)
-            && self.thread == other.thread
             && self.address == other.address
             && self.length == other.length
-            && self.wait == other.wait
     }
 }
-impl Eq for OwnedDirectoryRead {}
-impl OwnedDirectoryRead {
-    pub fn wait(&self) -> &carrick_guest_mem::MemoryReadWait {
-        &self.wait
+impl Eq for DirectoryReadOutput {}
+impl DirectoryReadOutput {
+    pub(crate) fn publish(
+        self,
+        binding: crate::kernel::continuation::output::ExactCompletionBinding,
+        kernel: &crate::kernel::KernelContext,
+        fs: &FsView<'_>,
+        memory: &mut impl CurrentMmMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        resources::with_captured_resources(kernel, || {
+            fs.read_directory(
+                DirectoryReadCaller::Owner { kernel, binding },
+                memory,
+                self.target,
+                self._lease,
+                self.address,
+                self.length,
+            )
+        })
     }
 }
 
-impl SyscallDispatcher {
-    #[allow(clippy::too_many_arguments)]
-    pub fn resume_owned_directory_read<M: CurrentMmMemory>(
-        &self,
-        kernel: &crate::kernel::KernelContext,
-        request: SyscallRequest,
-        pending: OwnedDirectoryRead,
-        memory: &mut M,
-        reporter: &CompatReporter,
-        thread: Option<ThreadCtx<'_>>,
-        route: OrdinaryDispatchRoute<'_, '_>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        if request.number != carrick_abi::syscall::nr::GETDENTS64
-            || pending.thread != kernel.thread().key()
-        {
-            return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
+/// Only authenticated execution authority can publish into owner memory.
+/// Legacy task and carrier-buffer callers remain lease-free.
+pub(in crate::dispatch) enum DirectoryReadCaller<'a> {
+    Owner {
+        kernel: &'a crate::kernel::KernelContext,
+        binding: crate::kernel::continuation::output::ExactCompletionBinding,
+    },
+    LegacyTask(&'a crate::kernel::KernelContext),
+    CarrierBuffer,
+}
+impl<'a> DirectoryReadCaller<'a> {
+    fn task(&self) -> Option<&'a crate::kernel::KernelContext> {
+        match self {
+            Self::Owner { kernel, .. } | Self::LegacyTask(kernel) => Some(kernel),
+            Self::CarrierBuffer => None,
         }
-        let OwnedDirectoryRead {
-            target,
-            _lease: lease,
-            address,
-            length,
-            wait,
-            ..
-        } = pending;
-        // A ready physical dependency still owns writer exclusion. Release
-        // that custody before PREPARE acquires a fresh destination permit.
-        drop(wait);
-        let cx = SyscallCtx {
-            host_wait: route.host_wait,
-            kernel,
-            request,
-            memory,
-            reporter,
-            thread,
-            execution_lease: route.lease,
-            mm_executor: route.mm_executor,
-        };
-        resources::with_captured_resources(kernel, || {
-            self.fs_view().read_directory(
-                super::IoCaller::Task(cx.kernel),
-                &mut *cx.memory,
-                target,
-                lease,
-                address,
-                length,
-            )
-        })
+    }
+    fn visible_self(&self) -> Option<u32> {
+        self.task()
+            .and_then(|kernel| super::IoCaller::Task(kernel).visible_self())
     }
 }
 
@@ -196,13 +179,18 @@ impl<'a> FsView<'a> {
     /// handler and the native host-file venue share it.
     pub(in crate::dispatch) fn read_directory<M: CurrentMmMemory>(
         &self,
-        caller: super::IoCaller<'_>,
+        caller: DirectoryReadCaller<'_>,
         memory: &mut M,
         target: OpenFile,
         lease: crate::kernel::objects::FileDescriptionFdLease,
         address: GuestVa,
         length: usize,
     ) -> Result<DispatchOutcome, DispatchError> {
+        if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
+            && !matches!(caller, DirectoryReadCaller::Owner { .. })
+        {
+            return Err(super::carrier_buffer_is_not_owner_memory());
+        }
         let Some(mut open) = crate::kernel::FileDescription::write_for_io(&target.description)
         else {
             return Ok(DispatchOutcome::errno(LINUX_EBADF));
@@ -308,20 +296,14 @@ impl<'a> FsView<'a> {
                         MemoryPrepareError::Supply(request) => MemoryReadWait::Supply(request),
                         other => return Ok(crate::el1_delegation::owner_prepare_refusal(other)),
                     };
-                    let Some(kernel) = caller.task() else {
+                    let DirectoryReadCaller::Owner { kernel: _, binding } = caller else {
                         return Err(super::carrier_buffer_is_not_owner_memory());
                     };
                     drop(open);
-                    return Ok(DispatchOutcome::DirectoryReadSuspended(Box::new(
-                        OwnedDirectoryRead {
-                            target,
-                            _lease: lease,
-                            thread: kernel.thread().key(),
-                            address,
-                            length,
-                            wait,
-                        },
-                    )));
+                    return Ok(crate::kernel::continuation::output::RetainedOutputCompletion::directory_read(
+                        binding,
+                        DirectoryReadOutput { target, _lease: lease, address, length },
+                    ).suspend(wait));
                 }
             };
             *offset = next;
@@ -837,8 +819,15 @@ impl<'a> FsView<'a> {
             let length = usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
             let Some(target) = this.open_file(fd.0) else { return Ok(DispatchOutcome::errno(LINUX_EBADF)); };
             let Some(lease) = target.description.retain_fd_lease() else { return Ok(DispatchOutcome::errno(LINUX_EBADF)); };
+            let caller = if cx.memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                let binding = crate::kernel::continuation::output::ExactCompletionBinding::capture(cx.kernel, cx.execution_lease)
+                    .map_err(DispatchError::CompletionInvariant)?;
+                DirectoryReadCaller::Owner { kernel: cx.kernel, binding }
+            } else {
+                DirectoryReadCaller::LegacyTask(cx.kernel)
+            };
             this.read_directory(
-                super::IoCaller::Task(cx.kernel),
+                caller,
                 &mut *cx.memory,
                 target,
                 lease,

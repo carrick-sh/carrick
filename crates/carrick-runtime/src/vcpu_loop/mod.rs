@@ -1982,17 +1982,6 @@ where
                 )
             }
             binding::OwnedIoResume::PipeRead(pending) => pending.resume(&context, engine),
-            binding::OwnedIoResume::DirectoryRead(pending) => {
-                kernel.dispatcher.resume_owned_directory_read(
-                    &context,
-                    request,
-                    *pending,
-                    engine,
-                    &kernel.reporter,
-                    Some(thread),
-                    route,
-                )
-            }
         };
         self.guest_execution = Some(executor);
         if let Some(start) = census_start {
@@ -2011,29 +2000,35 @@ where
         match resume {
             binding::OwnedSyscallResume::Output(pending) => {
                 use carrick_kernel::kernel::continuation::CompletionFoldError;
-                let resume = || {
-                    let context = self
-                        .service_kernel_context
-                        .as_ref()
-                        .ok_or(CompletionFoldError::ExecutionAuthority)?;
-                    let lease_guard = self.execution_lease.lock();
-                    let lease = lease_guard
-                        .as_ref()
-                        .ok_or(CompletionFoldError::ExecutionAuthority)?;
-                    context
-                        .thread()
-                        .validate_running_execution_lease(lease)
-                        .map_err(|_| CompletionFoldError::ExecutionAuthority)?;
-                    let identity = lease
-                        .task_state_authority()
-                        .map_err(|_| CompletionFoldError::ExecutionAuthority)?;
-                    pending.resume(context, engine, identity)
-                };
-                resume().map_err(|error| {
-                    RuntimeError::Dispatch(
-                        carrick_kernel::dispatch::DispatchError::CompletionInvariant(error),
-                    )
-                })
+                let resume =
+                    || -> Result<DispatchOutcome, carrick_kernel::dispatch::DispatchError> {
+                        let context = self.service_kernel_context.as_ref().ok_or(
+                            carrick_kernel::dispatch::DispatchError::CompletionInvariant(
+                                CompletionFoldError::ExecutionAuthority,
+                            ),
+                        )?;
+                        let lease_guard = self.execution_lease.lock();
+                        let lease = lease_guard.as_ref().ok_or(
+                            carrick_kernel::dispatch::DispatchError::CompletionInvariant(
+                                CompletionFoldError::ExecutionAuthority,
+                            ),
+                        )?;
+                        context
+                            .thread()
+                            .validate_running_execution_lease(lease)
+                            .map_err(|_| {
+                                carrick_kernel::dispatch::DispatchError::CompletionInvariant(
+                                    CompletionFoldError::ExecutionAuthority,
+                                )
+                            })?;
+                        let identity = lease.task_state_authority().map_err(|_| {
+                            carrick_kernel::dispatch::DispatchError::CompletionInvariant(
+                                CompletionFoldError::ExecutionAuthority,
+                            )
+                        })?;
+                        pending.resume(context, engine, identity, &kernel.dispatcher.fs_view())
+                    };
+                resume().map_err(RuntimeError::Dispatch)
             }
             binding::OwnedSyscallResume::CopyoutRedispatch => {
                 self.redispatch_threaded_syscall(kernel, engine, host_wait)

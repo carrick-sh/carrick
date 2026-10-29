@@ -1632,7 +1632,6 @@ impl BlockedContinuation {
             | DispatchOutcome::WriteCopyInSuspended(_)
             | DispatchOutcome::SleepCopyInSuspended(_)
             | DispatchOutcome::OwnerCancelled(_)
-            | DispatchOutcome::DirectoryReadSuspended(_)
             | DispatchOutcome::PipeReadSuspended(_)
             | DispatchOutcome::OutputSuspended(_)
             | DispatchOutcome::OwnerMemoryWait { .. }

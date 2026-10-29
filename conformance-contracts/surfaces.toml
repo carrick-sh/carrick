@@ -226,7 +226,7 @@ contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kern
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.ipc.permission-classes"]
+contracts = ["kernel.fork.stage1-image", "kernel.ipc.permission-classes", "kernel.fs.directory-copyout", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/kernel_context.rs"
@@ -1761,7 +1761,7 @@ contracts = ["kernel.memory.owner-wait", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs"
-contracts = ["kernel.copyout.owner-refusal"]
+contracts = ["kernel.copyout.owner-refusal", "kernel.fs.directory-copyout", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/copyout_contention_tests.rs"
@@ -1914,7 +1914,7 @@ contracts = ["kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs/directory.rs"
-contracts = ["kernel.fs.directory-copyout"]
+contracts = ["kernel.fs.directory-copyout", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-conformance-next/tests/directory_copyout.rs"
@@ -2022,7 +2022,7 @@ contracts = ["process.exec.backing"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/native_files.rs"
-contracts = ["kernel.native.host-file-venue"]
+contracts = ["kernel.native.host-file-venue", "kernel.fs.directory-copyout", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-core-abi/src/host_file.rs"
@@ -2082,11 +2082,11 @@ contracts = ["kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation/output.rs"
-contracts = ["kernel.memory.owner-wait"]
+contracts = ["kernel.memory.owner-wait", "kernel.fs.directory-copyout"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/request.rs"
-contracts = ["kernel.memory.owner-wait"]
+contracts = ["kernel.memory.owner-wait", "kernel.fs.directory-copyout"]
 
 [[surfaces]]
 path = "crates/carrick-core/src/lifecycle.rs"
