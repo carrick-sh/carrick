@@ -51,11 +51,24 @@ pub fn fetch(
 /// Fetch the existing bounded post-mortem shape without aborting a live run.
 pub fn capture(run_id: &str) -> Result<PostMortem, ClientError> {
     let endpoint = DebugEndpoint::for_run_id(run_id)?;
-    let payload = exchange_at(
-        &endpoint,
-        &KernelDebugRequest::capture(run_id),
+    capture_at(&endpoint, run_id)
+}
+
+/// Fetch a live capture from an exact endpoint.
+pub fn capture_at(endpoint: &DebugEndpoint, run_id: &str) -> Result<PostMortem, ClientError> {
+    capture_at_with_wait(
+        endpoint,
+        run_id,
         ResponseWait::Deadline(Instant::now() + DEADLINE),
-    )?;
+    )
+}
+
+pub(super) fn capture_at_with_wait(
+    endpoint: &DebugEndpoint,
+    run_id: &str,
+    wait: ResponseWait,
+) -> Result<PostMortem, ClientError> {
+    let payload = exchange_at(endpoint, &KernelDebugRequest::capture(run_id), wait)?;
     if let Ok(refusal) = wire::decode_exact::<ServerRefusal>(&payload)
         && refusal.schema == KERNEL_DEBUG_RESPONSE_SCHEMA
     {
