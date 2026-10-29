@@ -331,6 +331,8 @@ pub(crate) struct WorkerKick {
     delivery_validation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     delivery_receipt_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    before_guest_idle: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl std::fmt::Debug for WorkerKick {
@@ -361,6 +363,8 @@ impl WorkerKick {
             delivery_validation_gate: Mutex::new(None),
             #[cfg(test)]
             delivery_receipt_gate: Mutex::new(None),
+            #[cfg(test)]
+            before_guest_idle: Mutex::new(None),
         }
     }
 
@@ -438,8 +442,20 @@ impl WorkerKick {
     /// either finds this wait under the same lock, or queued its row before
     /// the executor's scan. The guard removes the destination on every exit.
     pub(crate) fn enter_guest_idle(&self, target: GuestIdleTarget) -> GuestIdleWait<'_> {
+        #[cfg(test)]
+        {
+            let before = self.before_guest_idle.lock().take();
+            if let Some(before) = before {
+                before();
+            }
+        }
         *self.guest_idle.lock() = Some(target);
         GuestIdleWait(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_before_guest_idle(&self, before: impl FnOnce() + Send + 'static) {
+        *self.before_guest_idle.lock() = Some(Box::new(before));
     }
 
     #[cfg(test)]
