@@ -312,7 +312,8 @@ mod tests {
             drop(owner.publish_exit_retirement(published.retirement));
             let permit = published
                 .effects
-                .cancel_members(|member| assert_eq!(member.exit_task(), child));
+                .cancel_members(|member| assert_eq!(member.exit_task(), child))
+                .unwrap();
             let parent = owner.select_exit_parent(&permit).unwrap().prepare();
             assert_eq!(parent.parent, root);
             wake.publish().unwrap();

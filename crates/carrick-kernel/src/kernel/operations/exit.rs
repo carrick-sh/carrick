@@ -79,18 +79,13 @@ impl carrick_sched_core::process::exit::ExitMember for HostExitMember {
     fn commit_terminal_retirement(
         &self,
         retirement: carrick_sched_core::process::exit::ExitMemberRetirement,
-    ) {
+    ) -> Result<(), carrick_sched_core::process::exit::ExitMemberRetirementRefused> {
         carrick_core::terminal::commit_process_member_retirement(
             retirement,
             self.0.task_key(),
             self.0.control_slot(),
         )
-        .unwrap_or_else(|| {
-            carrick_fatal!(
-                "kernel::thread_retirement",
-                "committed process member lost terminal custody"
-            )
-        });
+        .ok_or(carrick_sched_core::process::exit::ExitMemberRetirementRefused)
     }
 }
 impl carrick_sched_core::process::exit::ExitEffectSource<crate::kernel::container::ContainerId>
@@ -961,6 +956,8 @@ impl Kernel {
         let kernel = Arc::clone(self);
         Ok(RetiredTaskExit {
             publish: Some(move || {
+                let publication_failed =
+                    |reason| -> ! { carrick_fatal!("kernel::task_exit_publication", "{}", reason) };
                 let mut state = kernel.registry().settled().write();
                 // Include observers registered during the prepared clear;
                 // detach this exact generation before the zombie is visible.
@@ -983,10 +980,7 @@ impl Kernel {
                         Ok((retiring, autoreaped_receipt))
                     })
                     .unwrap_or_else(|_| {
-                        carrick_fatal!(
-                            "kernel::task_exit_publication",
-                            "retired task publication lost its exact incarnation"
-                        );
+                        publication_failed("retired task publication lost its exact incarnation")
                     });
                 drop(retiring);
                 let pending_publication = prepared.reservation.commit(&mut state)?;
@@ -1036,11 +1030,16 @@ impl Kernel {
                 }
                 // Cancellation can wake a host waiter, whose callback may re-enter the
                 // registry. Never invoke it while holding the topology write lock.
-                let parent_permit = effects.after_release(released)?.cancel_members(|thread| {
-                    let _ = thread.0.cancel_kernel_owned_continuation(
-                        crate::kernel::continuation::CancellationCause::ProcessExit,
-                    );
-                });
+                let parent_permit = effects
+                    .after_release(released)?
+                    .cancel_members(|thread| {
+                        let _ = thread.0.cancel_kernel_owned_continuation(
+                            crate::kernel::continuation::CancellationCause::ProcessExit,
+                        );
+                    })
+                    .unwrap_or_else(|_| {
+                        publication_failed("committed process member lost terminal custody")
+                    });
                 // Queue the parent's exit notification after the exit reservation is
                 // committed. If notify_parent ran before commit, a parent that woke
                 // immediately would see TaskBusy in wait_child_matching and park in

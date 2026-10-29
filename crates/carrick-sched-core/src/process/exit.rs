@@ -773,11 +773,32 @@ impl ExitMemberRetirement {
         self.task == task
     }
 }
+/// Refusal to publish terminal custody for an already committed process member.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExitMemberRetirementRefused;
+
+/// Retains cancellation custody until the committed exit owner handles refusal.
+/// In particular, returning this error must not drop an unvisited continuation.
+pub struct ExitMemberRetirementFailure<Member> {
+    _remaining: alloc::vec::IntoIter<Member>,
+}
+impl<Member> core::fmt::Debug for ExitMemberRetirementFailure<Member> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ExitMemberRetirementFailure")
+    }
+}
+
 pub trait ExitMember {
     fn exit_task(&self) -> TaskKey;
     /// Apply terminal intent when this member owns a host saved continuation.
     /// Members without that continuation mint no missing-load authority.
-    fn commit_terminal_retirement(&self, _retirement: ExitMemberRetirement) {}
+    #[must_use = "terminal refusal must reach the committed exit owner"]
+    fn commit_terminal_retirement(
+        &self,
+        _retirement: ExitMemberRetirement,
+    ) -> Result<(), ExitMemberRetirementRefused> {
+        Ok(())
+    }
 }
 pub trait ExitEffectSource<C>: ExitLive<C> {
     type Member: ExitMember;
@@ -869,16 +890,28 @@ impl<Member, Resources, Transaction: Eq> PendingExitEffects<Member, Resources, T
 }
 impl<Member: ExitMember> ReadyExitEffects<Member> {
     /// Parent notification authority is published only after member cancellation.
-    pub fn cancel_members(self, mut cancel: impl FnMut(Member)) -> ExitParentPermit {
-        for member in self.members {
-            member.commit_terminal_retirement(ExitMemberRetirement { task: self.task });
-            cancel(member);
+    pub fn cancel_members(
+        self,
+        mut cancel: impl FnMut(Member),
+    ) -> Result<ExitParentPermit, ExitMemberRetirementFailure<Member>> {
+        let mut remaining = self.members.into_iter();
+        while let Some(member) = remaining.as_slice().first() {
+            if let Err(ExitMemberRetirementRefused) =
+                member.commit_terminal_retirement(ExitMemberRetirement { task: self.task })
+            {
+                return Err(ExitMemberRetirementFailure {
+                    _remaining: remaining,
+                });
+            }
+            if let Some(member) = remaining.next() {
+                cancel(member);
+            }
         }
-        ExitParentPermit {
+        Ok(ExitParentPermit {
             task: self.task,
             parent: self.parent,
             signal: self.signal,
-        }
+        })
     }
 }
 impl ExitParentPermit {
@@ -1196,5 +1229,55 @@ impl<
             return Err(error);
         }
         Ok(permit)
+    }
+}
+
+#[cfg(test)]
+mod retirement_refusal_tests {
+    use super::*;
+    use core::cell::Cell;
+
+    #[test]
+    fn refused_terminal_member_stops_cancellation_and_parent_notification() {
+        struct Member<'a>(TaskKey, &'a Cell<usize>, &'a Cell<usize>);
+        impl Drop for Member<'_> {
+            fn drop(&mut self) {
+                self.2.set(self.2.get() + 1);
+            }
+        }
+        impl ExitMember for Member<'_> {
+            fn exit_task(&self) -> TaskKey {
+                self.0
+            }
+            fn commit_terminal_retirement(
+                &self,
+                _: ExitMemberRetirement,
+            ) -> Result<(), ExitMemberRetirementRefused> {
+                self.1.set(self.1.get() + 1);
+                Err(ExitMemberRetirementRefused)
+            }
+        }
+        let calls = Cell::new(0);
+        let drops = Cell::new(0);
+        let task = TaskKey {
+            id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(1).unwrap()),
+            serial: super::super::TaskSerial::from_raw_u64(1).unwrap(),
+        };
+        let effects = ReadyExitEffects {
+            task,
+            members: alloc::vec![Member(task, &calls, &drops), Member(task, &calls, &drops)],
+            parent: None,
+            signal: ChildExitSignal::None,
+        };
+        let result = effects.cancel_members(|_| panic!("refused member cancelled"));
+        assert!(result.is_err());
+        assert_eq!(
+            drops.get(),
+            0,
+            "custody must reach the failure owner intact"
+        );
+        drop(result);
+        assert_eq!(drops.get(), 2);
+        assert_eq!(calls.get(), 1, "later members must remain untouched");
     }
 }
