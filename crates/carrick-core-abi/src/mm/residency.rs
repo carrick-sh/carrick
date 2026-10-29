@@ -1,7 +1,11 @@
 //! Exact live residency and retained grant-window custody for either ISA.
 use core::sync::atomic::{AtomicU64, Ordering};
 mod stock;
-pub use stock::*;
+pub use stock::{
+    FrameGrantResidencyLease, STOCK_CHUNKS_PER_CARRIER, STOCK_CHUNKS_PER_MM,
+    STOCK_CHUNKS_PER_REFILL, StockCapacityLease, StockChunkReservation, StockPageMask,
+    StockResidencyOwner, StockResidencyRecord,
+};
 pub const FRAME_GRANT_RESIDENCY_SLOTS: usize = 4096;
 /// Requested bulk extent: 512 Linux pages, clamped by the supplying adapter
 /// at the exact VMA or alignment edge.
