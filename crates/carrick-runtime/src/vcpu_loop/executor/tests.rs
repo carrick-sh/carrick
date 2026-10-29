@@ -449,8 +449,11 @@ struct BackendEvent {
 /// fake backend when a task loads onto an executor.
 type InheritedStateRow = (u64, u64, u64, u64, u64);
 
+type NativeTerminalIdleEntry = Box<dyn FnOnce() -> Result<(), TrapError> + Send>;
+
 #[derive(Clone, Default)]
 struct FakeFactory {
+    native_terminal_entry: Option<Arc<parking_lot::Mutex<Option<NativeTerminalIdleEntry>>>>,
     native_services: Option<Arc<parking_lot::Mutex<carrick_el1_linux::native_process_runtime::host_test_support::NativeServiceCapacityFixture>>>,
     native_progress: Option<std::sync::mpsc::Sender<usize>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -957,10 +960,21 @@ impl PersistentExecutor for FakeExecutor {
     type TaskBinding = FakeBinding;
 
     fn has_physical_idle_lane(&self) -> bool {
-        self.factory.native_services.is_some()
+        self.factory.native_services.is_some() || self.factory.native_terminal_entry.is_some()
     }
 
     fn wait_in_guest(&mut self) -> Result<super::GuestIdleExit, TrapError> {
+        if let Some(entry) = self
+            .factory
+            .native_terminal_entry
+            .as_ref()
+            .and_then(|entry| entry.lock().take())
+        {
+            entry()?;
+            return Ok(super::GuestIdleExit::Idle(super::SettledIdleSlot::admit(
+                self.idle_slot,
+            )?));
+        }
         if let Some(entry) = self.idle_entry.take() {
             entry();
             return Ok(super::GuestIdleExit::Idle(super::SettledIdleSlot::admit(
@@ -8734,6 +8748,55 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
         );
         assert_eq!(scheduler.queued_len(), 0);
     });
+}
+
+/// A native terminal park refused by a pending host request must retain its
+/// owner, publish the original group status and leave no worker shutdown error.
+#[test]
+fn native_exit_group_host_request_shuts_down_pool_cleanly() {
+    use carrick_el1_linux::native_process_runtime::host_test_support::terminal_park_tests;
+    let (kernel, _root) = bootstrap(19_741);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let (status_tx, status_rx) = std::sync::mpsc::channel();
+    let entry: NativeTerminalIdleEntry = Box::new(move || {
+        let result = terminal_park_tests::run();
+        status_tx
+            .send(result.as_ref().copied().map_err(|failure| failure.reason))
+            .unwrap();
+        result.map(|_| ()).map_err(|failure| {
+            // The VM-free backend substitutes physical entry only. Exercise
+            // the production wire codec and one-shot carrier consumer using
+            // the execution binding retained by the actual failed native entry.
+            let record = carrick_core_abi::NativeRunFailure::new(failure.binding, failure.reason);
+            let (reason, crossings) = carrick_core_abi::NativeRunFailureConsumer::default()
+                .consume(&record, failure.binding)
+                .unwrap();
+            TrapError::NativeRunFailure {
+                reason: reason.as_str(),
+                crossings,
+            }
+        })
+    });
+    let factory = Arc::new(FakeFactory {
+        native_terminal_entry: Some(Arc::new(parking_lot::Mutex::new(Some(entry)))),
+        ..FakeFactory::default()
+    });
+    let pool = start_pool(scheduler, Arc::clone(&factory), 1);
+    let status = status_rx.recv_timeout(Duration::from_secs(5));
+    // Join before asserting the observation so both red and green runs reap
+    // every physical executor and preserve the actual worker outcome.
+    let shutdown = pool.shutdown();
+    let report = shutdown.expect("native exit_group must leave a clean pool shutdown");
+    assert_eq!(
+        status.unwrap().unwrap(),
+        carrick_personality_linux::lifecycle::LinuxWaitStatus::exited(0)
+    );
+    assert_eq!(report.created(), report.destroyed());
+    assert_eq!(report.created(), report.joined());
+    assert!(
+        factory.bindings.lock().is_empty(),
+        "native members have no host task binding"
+    );
 }
 
 /// kernel.scheduler.runnable-progress: more native waits than the default
