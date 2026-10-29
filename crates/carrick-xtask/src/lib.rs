@@ -49,3 +49,5 @@ pub mod test_shards;
 pub mod workorder;
 pub mod worktree_admission;
 pub mod worktree_gc;
+
+pub mod stress_capture;

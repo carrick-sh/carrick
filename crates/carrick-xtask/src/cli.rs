@@ -22,6 +22,10 @@ pub struct Cli {
 pub enum Commands {
     #[command(about = "Acquire and renew CAS leases over refs/claims/*")]
     Claims(crate::claims::ClaimsArgs),
+    /// Repeat a signed test and capture the first selected failure (macOS).
+    StressCapture(crate::stress_capture::Args),
+    #[command(hide = true)]
+    StressCaptureChild(crate::stress_capture::ChildArgs),
     #[command(about = "Lint work-order v1 schema and GitHub provenance")]
     Workorder(crate::workorder::WorkOrderArgs),
     #[command(about = "Compare guest asm source between two git revisions")]
@@ -279,6 +283,8 @@ pub enum CliError {
     Fixtures(#[from] crate::fixtures::FixturesError),
     #[error("host lease error: {0}")]
     HostLease(#[from] crate::host_lease::HostLeaseError),
+    #[error("stress-capture: {0}")]
+    StressCapture(#[from] crate::stress_capture::Error),
     #[error("smoke-signed: {0}")]
     SmokeSigned(#[from] crate::smoke_signed::SmokeSignedError),
     #[error("accept error: {0}")]
@@ -392,6 +398,7 @@ where
     };
     if std::env::var_os("CARRICK_HOST_LEASE_SOCKET").is_none() {
         let mode = match &cli.command {
+            Commands::StressCapture(_) => Some((crate::host_lease::HostLeaseMode::Carrick, true)),
             Commands::Accept(_) => Some((crate::host_lease::HostLeaseMode::Gate, true)),
             Commands::Fixtures(args) => match &args.action {
                 crate::fixtures::FixturesAction::Restore { .. }
@@ -427,6 +434,15 @@ where
         }
     }
     match cli.command {
+        Commands::StressCaptureChild(args) => {
+            crate::stress_capture::run_child(args)?;
+            Ok(())
+        }
+        Commands::StressCapture(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::stress_capture::run(&root, args)?;
+            Ok(())
+        }
         Commands::LintSource => run_lint_source(cli.root, writer),
         Commands::Workorder(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
