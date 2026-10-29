@@ -338,3 +338,97 @@ impl PhysicalStock {
 fn native_child_exit_reclaims_stock_before_carrier_structural_shutdown() {
     super::arm_child_wait_wake_with_stock(false, false, true);
 }
+
+#[test]
+fn foreign_carrier_drain_portal_never_steals_retiring_child_space() {
+    use crate::retired_spaces::{RetiredSpace, RetiredSpaces};
+    use std::sync::{Barrier, mpsc};
+
+    let fixture = Box::leak(Box::new(super::Fixture::new(0x10000, super::asid(1))));
+    let child_mm = ReservationMm::new(7).unwrap();
+    let child_space = fixture
+        .zone
+        .spaces
+        .publish_closed(child_mm.raw(), 0x7000, 0x7000)
+        .unwrap();
+    fixture
+        .region
+        .table()
+        .publish(
+            child_space.index(),
+            child_mm,
+            carrick_el1_abi::Layout {
+                heap: carrick_el1_abi::ReservationRange::new(4096, super::VA).unwrap(),
+                arena: carrick_el1_abi::ReservationRange::new(super::VA, super::VA + 0x1000_0000)
+                    .unwrap(),
+                policy: carrick_el1_abi::ReservationPolicyPayload::new([
+                    4096,
+                    u64::MAX,
+                    u64::MAX,
+                    0,
+                    0,
+                ]),
+            },
+        )
+        .unwrap();
+
+    // Use carrier 1 for the foreign scope and carrier 2 for `fixture` so
+    // `foreign < fixture` in BTreeMap order as well.
+    let foreign_carrier = NonZeroU64::new(1).unwrap();
+    let local_carrier = NonZeroU64::new(2).unwrap();
+    let queue = RetiredSpaces::new();
+    queue.push(RetiredSpace {
+        carrier: foreign_carrier,
+        zone: 1,
+        roots: 1,
+        mm: ReservationMm::new(99).unwrap(),
+    });
+    queue.push(RetiredSpace {
+        carrier: local_carrier,
+        zone: core::ptr::from_ref(fixture.zone).addr(),
+        roots: core::ptr::from_ref(fixture.region.table()).addr(),
+        mm: child_mm,
+    });
+
+    let entered = Barrier::new(2);
+    let (release_tx, release_rx) = mpsc::channel();
+    let (drain_result, still_published) = std::thread::scope(|s| {
+        let foreign_worker = s.spawn(|| {
+            queue.drain(
+                |space| space.carrier == foreign_carrier,
+                |_| {
+                    entered.wait();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+
+        entered.wait();
+
+        let owner: crate::aarch64_process::Portal<'_> =
+            carrick_core::mm::transaction::MmPortal::for_zone(
+                local_carrier,
+                fixture.region.table(),
+                fixture.zone,
+            );
+        let drain_result = queue.drain_portal(
+            &owner,
+            fixture.zone,
+            carrick_sched_core::ZONE_SLOTS,
+            u32::from(fixture.slot.raw()),
+        );
+        let still_published = fixture.zone.spaces.find(child_mm.raw()).is_some();
+
+        release_tx.send(()).unwrap();
+        assert_eq!(foreign_worker.join().unwrap(), Ok(()));
+        (drain_result, still_published)
+    });
+
+    assert_eq!(drain_result, Ok(()));
+    assert!(
+        !still_published,
+        "foreign carrier drain stole local retiring child space; zone entry remained published"
+    );
+    assert!(queue.is_empty());
+}

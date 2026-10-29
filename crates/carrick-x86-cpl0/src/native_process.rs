@@ -21,7 +21,7 @@ use carrick_el1_linux::native_process_runtime::{
     NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
     NativeProcessRuntime, NativeProcessService,
 };
-use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces};
+use carrick_el1_linux::retired_spaces::RetiredSpaces;
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, UserVa,
 };
@@ -684,18 +684,17 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         if !carrick_x86_carrier::native_execution::leave_space(source) {
             fatal();
         }
-        let roots = core::ptr::from_ref(owner.roots).addr();
-        RETIRED_SPACES.push(RetiredSpace {
-            carrier: owner.carrier,
-            zone: core::ptr::from_ref(source.zone).addr(),
-            roots,
-            mm: ReservationMm::new(mm.mm.raw().get()).unwrap_or_else(|| fatal()),
-        });
-        // A refused drain is not fatal: the failed entry and every entry
-        // after it stay queued (`RetiredSpaces::drain`), and the next drain
-        // (the next fork's `prepare_mm_start`, or the next child exit)
-        // retries them, as on the AArch64 owner.
-        let _retry_at_next_drain = drain_retired_spaces(&owner, self.worker());
+        let retired_mm = ReservationMm::new(mm.mm.raw().get()).unwrap_or_else(|| fatal());
+        // A refused retirement is not fatal: a still-resident or `Busy` entry
+        // stays queued in this carrier's scope (`RetiredSpaces::retire_or_queue_portal`),
+        // and the next drain (`prepare_mm` or child exit) retries it.
+        let _retry_at_next_drain = RETIRED_SPACES.retire_or_queue_portal(
+            &owner,
+            source.zone,
+            carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT,
+            self.worker(),
+            retired_mm,
+        );
     }
     fn copy_siginfo(
         &mut self,
