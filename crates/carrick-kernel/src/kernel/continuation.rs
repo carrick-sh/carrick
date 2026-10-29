@@ -1632,6 +1632,7 @@ impl BlockedContinuation {
             | DispatchOutcome::RecvfromAddressSuspended(_)
             | DispatchOutcome::OwnerCancelled(_)
             | DispatchOutcome::DirectoryReadSuspended(_)
+            | DispatchOutcome::PipeReadSuspended(_)
             | DispatchOutcome::CompletionCopyoutSuspended(_)
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
@@ -3095,7 +3096,10 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
             }
         }
         ContinuationCompletion::FdWait { wait, sig_mask } => {
-            match wait.complete(memory, dispatcher) {
+            match wait.complete(context, memory, dispatcher) {
+                crate::dispatch::fd_wait::BlockingFdWaitStep::InvalidExecution => {
+                    return Err(CompletionFoldError::ExecutionAuthority);
+                }
                 crate::dispatch::fd_wait::BlockingFdWaitStep::Done(outcome) => Some(outcome),
                 crate::dispatch::fd_wait::BlockingFdWaitStep::Wait(wait) => {
                     Some(DispatchOutcome::BlockingFdWait { wait, sig_mask })

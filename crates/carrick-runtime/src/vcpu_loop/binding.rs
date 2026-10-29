@@ -251,6 +251,7 @@ pub(super) enum OwnedSyscallResume {
 pub(super) enum OwnedIoResume {
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
     DirectoryRead(Box<carrick_kernel::dispatch::OwnedDirectoryRead>),
+    PipeRead(Box<carrick_kernel::dispatch::SuspendedPipeRead>),
 }
 
 pub(super) fn owner_copyin_route(
@@ -264,6 +265,10 @@ pub(super) fn owner_copyin_route(
         DispatchOutcome::WriteCopyInSuspended(pending) => (
             pending.wait().clone(),
             OwnedSyscallResume::Io(OwnedIoResume::PreparedWrite(pending)),
+        ),
+        DispatchOutcome::PipeReadSuspended(pending) => (
+            pending.wait().clone(),
+            OwnedSyscallResume::Io(OwnedIoResume::PipeRead(pending)),
         ),
         DispatchOutcome::DirectoryReadSuspended(pending) => (
             pending.wait().clone(),

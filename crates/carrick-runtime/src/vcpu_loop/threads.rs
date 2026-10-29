@@ -187,6 +187,15 @@ pub(super) struct CloneTidOutputTransaction {
 }
 
 pub(super) trait CloneTidMemory {
+    /// Owner venues secure the complete pair before publishing either word.
+    /// Legacy test/engine memories keep the transactional direct-write path.
+    fn write_prepared_clone_tid_pair(
+        &mut self,
+        _outputs: &[(u64, &[u8])],
+    ) -> Option<Result<(), carrick_guest_mem::MemoryPrepareError>> {
+        None
+    }
+
     fn read_clone_tid_bytes(
         &self,
         address: u64,
@@ -200,6 +209,39 @@ pub(super) trait CloneTidMemory {
 }
 
 impl<E: ThreadedEngine> CloneTidMemory for E {
+    fn write_prepared_clone_tid_pair(
+        &mut self,
+        outputs: &[(u64, &[u8])],
+    ) -> Option<Result<(), carrick_guest_mem::MemoryPrepareError>> {
+        use carrick_guest_mem::{
+            GuestVa, GuestWriteRange, MemoryError, MemoryPrepareError, UserMemoryVenue,
+        };
+        if self.user_memory_venue() != UserMemoryVenue::Owner {
+            return None;
+        }
+        let ranges = outputs
+            .iter()
+            .map(|(address, bytes)| {
+                GuestWriteRange::new(GuestVa::new(*address), bytes.len()).ok_or(
+                    MemoryPrepareError::Fault(MemoryError::OutOfBounds {
+                        address: *address,
+                        length: bytes.len(),
+                    }),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>();
+        Some((|| {
+            let ranges = ranges?;
+            if ranges.is_empty() {
+                return Ok(());
+            }
+            let permit = self.prepare_write(&ranges)?;
+            let bytes = outputs.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>();
+            permit.commit(&bytes);
+            Ok(())
+        })())
+    }
+
     fn read_clone_tid_bytes(
         &self,
         address: u64,
@@ -307,6 +349,66 @@ impl CloneTidOutputTransaction {
         backend_tid: ThreadId,
     ) -> CloneTidPublishOutcome {
         let bytes = visible_tid.to_le_bytes();
+        let outputs: Vec<_> = [self.parent_address, self.child_address]
+            .into_iter()
+            .filter(|address| *address != 0)
+            .map(|address| (address, bytes.as_slice()))
+            .collect();
+        if let Some(result) = engine.write_prepared_clone_tid_pair(&outputs) {
+            let outcome = match result {
+                Ok(()) => CloneTidPublishOutcome::Published,
+                Err(error) => {
+                    // A refused preparation wrote neither output. Restoring
+                    // either preimage would touch the same closed gate and
+                    // turn an owned wait into a fatal rollback error.
+                    self.parent_preimage = None;
+                    self.child_preimage = None;
+                    let outcome =
+                        carrick_kernel::dispatch::DispatchOutcome::from_owner_memory_prepare_error(
+                            error,
+                        );
+                    if matches!(
+                        outcome,
+                        carrick_kernel::dispatch::DispatchOutcome::Errno { .. }
+                    ) {
+                        CloneTidPublishOutcome::Fault
+                    } else {
+                        CloneTidPublishOutcome::Owner(Box::new(outcome))
+                    }
+                }
+            };
+            let result_kind = match &outcome {
+                CloneTidPublishOutcome::Published => {
+                    carrick_observability::probes::HvpatchCloneTidWriteResult::Success
+                }
+                CloneTidPublishOutcome::Owner(_) => {
+                    carrick_observability::probes::HvpatchCloneTidWriteResult::Suspended
+                }
+                CloneTidPublishOutcome::Fault => {
+                    carrick_observability::probes::HvpatchCloneTidWriteResult::OutOfBounds
+                }
+            };
+            for (address, output) in [
+                (
+                    self.parent_address,
+                    carrick_observability::probes::HvpatchCloneTidOutput::Parent,
+                ),
+                (
+                    self.child_address,
+                    carrick_observability::probes::HvpatchCloneTidOutput::Child,
+                ),
+            ] {
+                if address != 0 {
+                    crate::probes::mn_clone_tid_output(
+                        backend_tid.raw(),
+                        output,
+                        address,
+                        result_kind,
+                    );
+                }
+            }
+            return outcome;
+        }
         match self.publish_one(
             engine,
             backend_tid,

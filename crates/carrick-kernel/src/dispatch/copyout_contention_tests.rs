@@ -543,3 +543,337 @@ fn stat_path_copyin(nr: u64) {
     );
     assert_eq!(memory.commits.get(), 1);
 }
+
+/// Close the real owner gate after the vector has been copied in, so this
+/// exercises pipe payload copyout rather than failing during iovec intake.
+struct GateAfterIovec<'a> {
+    memory: PortalMemory<'a>,
+    close_after: Cell<Option<u64>>,
+}
+struct GateAfterCommit<'a> {
+    permit: Box<dyn PreparedGuestWrite + 'a>,
+    spaces: &'a carrick_sched_core::AddressSpaces,
+    mm: u64,
+    address: u64,
+    close_after: &'a Cell<Option<u64>>,
+}
+impl PreparedGuestWrite for GateAfterCommit<'_> {
+    fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+        self.permit.commit(outputs);
+        if self.close_after.get() == Some(self.address) {
+            self.close_after.set(None);
+            self.spaces.raise(self.spaces.find(self.mm).unwrap());
+        }
+    }
+}
+impl GuestMemory for GateAfterIovec<'_> {
+    fn user_memory_venue(&self) -> UserMemoryVenue {
+        UserMemoryVenue::Owner
+    }
+    fn prepare_write(
+        &mut self,
+        ranges: &[GuestWriteRange],
+    ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+        let spaces = self.memory.portal.spaces;
+        let mm = self.memory.handle.mm().raw();
+        let permit = self.memory.prepare_write(ranges)?;
+        Ok(Box::new(GateAfterCommit {
+            permit,
+            spaces,
+            mm,
+            address: ranges[0].address().raw(),
+            close_after: &self.close_after,
+        }))
+    }
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        let bytes = self.memory.read_bytes_raw(address, length)?;
+        if self.close_after.get() == Some(address) {
+            self.close_after.set(None);
+            let spaces = self.memory.portal.spaces;
+            spaces.raise(spaces.find(self.memory.handle.mm().raw()).unwrap());
+        }
+        Ok(bytes)
+    }
+    fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.memory.write_bytes_raw(address, bytes)?;
+        if self.close_after.get() == Some(address) {
+            self.close_after.set(None);
+            let spaces = self.memory.portal.spaces;
+            spaces.raise(spaces.find(self.memory.handle.mm().raw()).unwrap());
+        }
+        Ok(())
+    }
+}
+impl CurrentMmMemory for GateAfterIovec<'_> {}
+
+#[test]
+fn readv_pipe_copyout_waits_for_live_sibling_gate_and_delivers_exact_bytes() {
+    readv_pipe_gate(false, false);
+}
+
+#[test]
+fn readv_pipe_later_gate_retains_cursor_and_description_after_fd_reuse() {
+    readv_pipe_gate(true, false);
+}
+
+#[test]
+fn readv_pipe_gate_then_empty_source_keeps_operation_through_readiness() {
+    readv_pipe_gate(false, true);
+}
+
+fn readv_pipe_gate(later: bool, drained: bool) {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                LinuxCloneFlags::VM
+                    | LinuxCloneFlags::SIGHAND
+                    | LinuxCloneFlags::THREAD
+                    | LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(71_102),
+            None,
+        )
+        .unwrap();
+    let root = root
+        .kernel()
+        .context(root.task().key().id, root.thread().key().tid)
+        .unwrap();
+    assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
+    assert_ne!(root.thread().key(), sibling.thread().key());
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, root.shared().mm().id().raw(), ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(711).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let backing = OwnedHostMapping::map_shared_anon(4096, HostMappingKind::PrivateAnon).unwrap();
+    let tables = Tables::new(ROOT, backing.as_ptr() as u64, 1);
+    let mut memory = GateAfterIovec {
+        memory: PortalMemory {
+            portal: &portal,
+            tables: &tables,
+            backing: &backing,
+            handle,
+            prepares: Cell::new(0),
+            commits: Cell::new(0),
+        },
+        close_after: Cell::new(None),
+    };
+    let reporter = crate::compat::CompatReporter::default();
+    let call = |number, args| SyscallRequest::new(number, SyscallArgs::from(args));
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root,
+                call(nr::PIPE2.raw(), [VA, 0, 0, 0, 0, 0]),
+                &mut memory,
+                &reporter
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = memory.read_bytes(VA, 8).unwrap();
+    let fd = i32::from_ne_bytes(pair[..4].try_into().unwrap());
+    let open = dispatcher.open_file(fd).unwrap();
+    let pipe = match &*crate::kernel::FileDescription::read_for_io(&open.description).unwrap() {
+        OpenDescription::PipeReader { pipe, .. } => Arc::clone(pipe),
+        _ => panic!("pipe reader"),
+    };
+    assert_eq!(pipe.write_bytes(b"abcdefgh"), Ok(8));
+    let mut iovec = Vec::new();
+    iovec.extend_from_slice(&(VA + 256).to_ne_bytes());
+    iovec.extend_from_slice(&(if later { 4u64 } else { 8u64 }).to_ne_bytes());
+    if later {
+        iovec.extend_from_slice(&(VA + 512).to_ne_bytes());
+        iovec.extend_from_slice(&4u64.to_ne_bytes());
+    }
+    memory.write_bytes(VA + 64, &iovec).unwrap();
+    memory
+        .close_after
+        .set(Some(if later { VA + 256 } else { VA + 64 }));
+    let request = call(
+        nr::READV.raw(),
+        [fd as u64, VA + 64, if later { 2 } else { 1 }, 0, 0, 0],
+    );
+    let outcome = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let observed = portal
+        .observe_wait(handle, PortalWaitCause::Gate)
+        .unwrap()
+        .unwrap();
+    // Release before assertions, including on the red revision.
+    carrick_el1_linux::sched::object_wait::space_access(zone, carrick_sched_core::SlotId::new(1))
+        .lower(zone.spaces.find(mm.raw()).unwrap());
+    assert_ne!(
+        observed,
+        portal
+            .observe_wait(handle, PortalWaitCause::Gate)
+            .unwrap()
+            .unwrap()
+    );
+    assert!(
+        !matches!(outcome, DispatchOutcome::Errno { .. }),
+        "valid copyout must suspend, not return EFAULT: {outcome:?}"
+    );
+    assert_eq!(pipe.buffered_bytes(), if later { 4 } else { 8 });
+    let DispatchOutcome::PipeReadSuspended(pending) = outcome else {
+        panic!("pipe operation must retain its endpoint: {outcome:?}");
+    };
+    assert_eq!(
+        pending.wait(),
+        &carrick_guest_mem::MemoryReadWait::Owner(observed)
+    );
+    if drained {
+        assert_eq!(pipe.read_with(8, |bytes| bytes.len()), Ok(8));
+    }
+    if later || drained {
+        if later {
+            assert_eq!(memory.read_bytes(VA + 256, 4).unwrap(), b"abcd");
+        }
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &sibling,
+                    call(nr::CLOSE.raw(), [fd as u64, 0, 0, 0, 0, 0]),
+                    &mut memory,
+                    &reporter
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &sibling,
+                    call(nr::PIPE2.raw(), [VA + 32, 0, 0, 0, 0, 0]),
+                    &mut memory,
+                    &reporter
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(memory.read_bytes(VA + 32, 4).unwrap(), fd.to_ne_bytes());
+        // The resumed operation must neither reread the vector nor resolve
+        // this numeric descriptor, both of which now name different inputs.
+        memory.write_bytes(VA + 64, &[0; 32]).unwrap();
+    }
+    let pending = if drained {
+        use crate::kernel::continuation::{
+            BlockedContinuation, ContinuationCapture, ContinuationEvent, RestartClass,
+            fold_continuation_completion, test_support::publish,
+        };
+        let blocked = pending.resume(&root, &mut memory).unwrap();
+        assert!(
+            matches!(blocked, DispatchOutcome::BlockingFdWait { .. }),
+            "the exact read must survive source exhaustion: {blocked:?}"
+        );
+        let generation = publish(&root, 0x898);
+        let capture = ContinuationCapture::new(
+            &root,
+            generation,
+            request,
+            RestartClass::for_syscall(nr::READV.raw()),
+        )
+        .unwrap();
+        let mut continuation =
+            BlockedContinuation::from_dispatch_outcome(blocked, capture).unwrap();
+        let service = crate::kernel::continuation::CarrierWaitService::new(Arc::new(
+            crate::kernel::Scheduler::new(Arc::clone(root.kernel())),
+        ));
+        let mut registration = service.prepare_registration(&continuation);
+        service.enroll(&mut registration).unwrap();
+        let token = registration.wake_token();
+        continuation.attach_registration(registration).unwrap();
+        // Readiness completes against the captured pipe despite fd reuse and
+        // mutated iovecs. It never reruns the numeric syscall arguments.
+        assert_eq!(pipe.write_bytes(b"abcdefgh"), Ok(8));
+        struct WakeThread(std::thread::Thread);
+        impl std::task::Wake for WakeThread {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        use std::future::Future;
+        let waker = std::task::Waker::from(Arc::new(WakeThread(std::thread::current())));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(service.event(token));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let event = loop {
+            if let std::task::Poll::Ready(event) = future.as_mut().poll(&mut cx) {
+                break Some(event.unwrap());
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            std::thread::park_timeout(remaining);
+        };
+        if event.is_none() {
+            let _ = continuation
+                .cancel(crate::kernel::continuation::CancellationCause::ServiceShutdown);
+            panic!("captured pipe readiness lost its producer subscription");
+        }
+        let event = event.unwrap();
+        assert_eq!(event, ContinuationEvent::Ready);
+        let result = continuation.resume(event, &root).unwrap();
+        let outcome = fold_continuation_completion(
+            result.completion,
+            &dispatcher,
+            &root,
+            &mut memory,
+            (root.shared().mm().id(), root.shared().mm().id().raw()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 8 });
+        assert_eq!(memory.read_bytes(VA + 256, 8).unwrap(), b"abcdefgh");
+        assert_eq!(pipe.buffered_bytes(), 0);
+        return;
+    } else {
+        pending
+    };
+    let before_resume = memory.memory.prepares.get();
+    let (result, budget) = super::budget_meter::measure(|| pending.resume(&root, &mut memory));
+    assert_eq!(result.unwrap(), DispatchOutcome::Returned { value: 8 });
+    assert_eq!(
+        budget.table_lookups, 0,
+        "resume never resolves a reused numeric fd"
+    );
+    assert_eq!(
+        budget.host_reads + budget.host_writes,
+        0,
+        "guest pipe transfer stays in the shared owner"
+    );
+    assert_eq!(
+        memory.memory.prepares.get() - before_resume,
+        1,
+        "only the refused output is prepared again"
+    );
+    let output = if later {
+        [
+            memory.read_bytes(VA + 256, 4).unwrap(),
+            memory.read_bytes(VA + 512, 4).unwrap(),
+        ]
+        .concat()
+    } else {
+        memory.read_bytes(VA + 256, 8).unwrap()
+    };
+    assert_eq!(output, b"abcdefgh");
+    assert_eq!(pipe.buffered_bytes(), 0);
+}
