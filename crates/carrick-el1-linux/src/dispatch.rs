@@ -3301,7 +3301,11 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     task,
                     validator: &file::HardwareValidator,
                 },
-                owner: self.process.as_deref_mut(),
+                owner: if frame.x[8] as usize == ipc::SYS_READ {
+                    self.process.as_deref_mut()
+                } else {
+                    None
+                },
                 wait: None,
             };
             let (disposition, sigpipe_owed) = ipc::serve_ipc_with_signals(
