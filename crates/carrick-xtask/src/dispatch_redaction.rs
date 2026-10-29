@@ -139,7 +139,9 @@ fn token_shape(bytes: &[u8], prefix: &[u8], jwt: bool) -> bool {
             let suffix = &bytes[offset + prefix.len()..];
             let length = suffix
                 .iter()
-                .take_while(|b| b.is_ascii_alphanumeric() || b"_-".contains(b))
+                .take_while(|b| {
+                    b.is_ascii_alphanumeric() || b"_-".contains(b) || (!jwt && **b == b'.')
+                })
                 .count();
             length >= 8 && (!jwt || suffix.get(length) == Some(&b'.'))
         })
@@ -179,6 +181,8 @@ mod tests {
     fn credential_shapes_are_removed_from_diagnostics() {
         for value in [
             "ghs_fakecredential",
+            // Current installation tokens mix `.` and `-` in early positions.
+            "ghs_a.b-c.d-e.f-g.h-i",
             "ghp_fakecredential",
             "github_pat_fakecredential",
             "eyJhbGciOiJub25lIn0.payload.signature",
