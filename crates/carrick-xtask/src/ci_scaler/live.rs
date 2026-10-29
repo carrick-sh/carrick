@@ -2256,6 +2256,12 @@ mod tests {
             format!("agent run=41 attempt=2 sha={}\n", "a".repeat(40)),
         )
         .unwrap();
+        // `read_policy` refuses a group-writable policy; don't inherit umask.
+        std::fs::set_permissions(
+            state.join("approved-policy"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         for file in [mint::REQUEST_FILE, mint::RESPONSE_FILE] {
             std::fs::write(state.join(file), "").unwrap();
         }
