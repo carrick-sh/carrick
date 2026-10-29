@@ -1015,7 +1015,7 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     }
 }
 
-pub(super) static RETIRED_SPACES: super::retired_spaces::RetiredSpaces =
+static RETIRED_SPACES: super::retired_spaces::RetiredSpaces =
     super::retired_spaces::RetiredSpaces::new();
 
 pub struct Aarch64Venue;
@@ -2155,7 +2155,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         let retired_mm = ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal());
         // The final child may be the run's last fork. Once its translation
         // has been released, let the shared MM owner retire the closed root
-        // now; a still-borrowed root remains in the scope's retirement queue.
+        // now; a still-borrowed root remains in the existing retirement queue.
         {
             let owner = self.portal().unwrap_or_else(|_| fatal());
             let _retained_for_later_drain = RETIRED_SPACES.retire_or_queue_portal(

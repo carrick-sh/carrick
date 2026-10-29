@@ -685,9 +685,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             fatal();
         }
         let retired_mm = ReservationMm::new(mm.mm.raw().get()).unwrap_or_else(|| fatal());
-        // A refused retirement is not fatal: a still-resident or `Busy` entry
-        // stays queued in this carrier's scope (`RetiredSpaces::retire_or_queue_portal`),
-        // and the next drain (`prepare_mm` or child exit) retries it.
+        // A refused retirement is not fatal: a still-borrowed space stays
+        // queued (`RetiredSpaces::retire_or_queue_portal`), and the next
+        // drain (the next fork's `prepare_mm_start`, or the next child exit)
+        // retries it, as on the AArch64 owner.
         let _retry_at_next_drain = RETIRED_SPACES.retire_or_queue_portal(
             &owner,
             source.zone,

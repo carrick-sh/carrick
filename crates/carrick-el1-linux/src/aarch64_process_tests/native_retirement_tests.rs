@@ -340,20 +340,20 @@ fn native_child_exit_reclaims_stock_before_carrier_structural_shutdown() {
 }
 
 #[test]
-fn foreign_carrier_drain_portal_never_steals_retiring_child_space() {
+fn concurrent_drain_portal_does_not_hide_retiring_child_space() {
     use crate::retired_spaces::{RetiredSpace, RetiredSpaces};
-    use std::sync::{Barrier, mpsc};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    let fixture = Box::leak(Box::new(super::Fixture::new(0x10000, super::asid(1))));
+    let region = crate::mm_portal::test_support::Region::new();
+    let zone = region.zone();
+    let roots = region.table();
     let child_mm = ReservationMm::new(7).unwrap();
-    let child_space = fixture
-        .zone
+    let child_space = zone
         .spaces
         .publish_closed(child_mm.raw(), 0x7000, 0x7000)
         .unwrap();
-    fixture
-        .region
-        .table()
+    roots
         .publish(
             child_space.index(),
             child_mm,
@@ -372,8 +372,6 @@ fn foreign_carrier_drain_portal_never_steals_retiring_child_space() {
         )
         .unwrap();
 
-    // Use carrier 1 for the foreign scope and carrier 2 for `fixture` so
-    // `foreign < fixture` in BTreeMap order as well.
     let foreign_carrier = NonZeroU64::new(1).unwrap();
     let local_carrier = NonZeroU64::new(2).unwrap();
     let queue = RetiredSpaces::new();
@@ -385,50 +383,117 @@ fn foreign_carrier_drain_portal_never_steals_retiring_child_space() {
     });
     queue.push(RetiredSpace {
         carrier: local_carrier,
-        zone: core::ptr::from_ref(fixture.zone).addr(),
-        roots: core::ptr::from_ref(fixture.region.table()).addr(),
+        zone: core::ptr::from_ref(zone).addr(),
+        roots: core::ptr::from_ref(roots).addr(),
         mm: child_mm,
     });
 
-    let entered = Barrier::new(2);
+    let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let (drain_result, still_published) = std::thread::scope(|s| {
-        let foreign_worker = s.spawn(|| {
-            queue.drain(
+    let queue_ref = &queue;
+    let (drain_result, still_published, visible_in_queue) = std::thread::scope(|s| {
+        let foreign_worker = s.spawn(move || {
+            queue_ref.drain(
                 |space| space.carrier == foreign_carrier,
                 |_| {
-                    entered.wait();
-                    release_rx.recv().unwrap();
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("bounded wait for second drain timed out");
                     Ok(())
                 },
             )
         });
 
-        entered.wait();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bounded wait for first drain entry timed out");
 
         let owner: crate::aarch64_process::Portal<'_> =
-            carrick_core::mm::transaction::MmPortal::for_zone(
-                local_carrier,
-                fixture.region.table(),
-                fixture.zone,
-            );
-        let drain_result = queue.drain_portal(
-            &owner,
-            fixture.zone,
-            carrick_sched_core::ZONE_SLOTS,
-            u32::from(fixture.slot.raw()),
-        );
-        let still_published = fixture.zone.spaces.find(child_mm.raw()).is_some();
+            carrick_core::mm::transaction::MmPortal::for_zone(local_carrier, roots, zone);
+        let drain_result = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
+        let still_published = zone.spaces.find(child_mm.raw()).is_some();
+        let visible_in_queue = !queue.is_empty();
 
-        release_tx.send(()).unwrap();
+        let _ = release_tx.send(());
         assert_eq!(foreign_worker.join().unwrap(), Ok(()));
-        (drain_result, still_published)
+        (drain_result, still_published, visible_in_queue)
     });
 
     assert_eq!(drain_result, Ok(()));
     assert!(
-        !still_published,
-        "foreign carrier drain stole local retiring child space; zone entry remained published"
+        !still_published || visible_in_queue,
+        "retiring child space was neither retired nor visible in queue"
     );
+    assert!(
+        !still_published,
+        "concurrent foreign drain hid local retiring child space; zone entry remained published"
+    );
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn retire_or_queue_portal_retires_ready_space_past_busy_sibling() {
+    use crate::retired_spaces::{RetiredSpace, RetiredSpaces};
+
+    let region = crate::mm_portal::test_support::Region::new();
+    let zone = region.zone();
+    let roots = region.table();
+    let layout = carrick_el1_abi::Layout {
+        heap: carrick_el1_abi::ReservationRange::new(4096, super::VA).unwrap(),
+        arena: carrick_el1_abi::ReservationRange::new(super::VA, super::VA + 0x1000_0000).unwrap(),
+        policy: carrick_el1_abi::ReservationPolicyPayload::new([4096, u64::MAX, u64::MAX, 0, 0]),
+    };
+
+    let busy_mm = ReservationMm::new(8).unwrap();
+    let busy_space = zone
+        .spaces
+        .publish_closed(busy_mm.raw(), 0x8000, 0x8000)
+        .unwrap();
+    roots.publish(busy_space.index(), busy_mm, layout).unwrap();
+
+    let ready_mm = ReservationMm::new(9).unwrap();
+    let ready_space = zone
+        .spaces
+        .publish_closed(ready_mm.raw(), 0x9000, 0x9000)
+        .unwrap();
+    roots
+        .publish(ready_space.index(), ready_mm, layout)
+        .unwrap();
+
+    let carrier = NonZeroU64::new(3).unwrap();
+    let owner: crate::aarch64_process::Portal<'_> =
+        carrick_core::mm::transaction::MmPortal::for_zone(carrier, roots, zone);
+
+    let queue = RetiredSpaces::new();
+    queue.push(RetiredSpace {
+        carrier,
+        zone: core::ptr::from_ref(zone).addr(),
+        roots: core::ptr::from_ref(roots).addr(),
+        mm: busy_mm,
+    });
+
+    // Hold the root lock on `busy_mm` so `retire_closed_space` refuses it with `Busy`.
+    let held_busy_root = owner.root_any(busy_mm, 1).unwrap();
+    assert_eq!(
+        queue.retire_or_queue_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0, ready_mm),
+        Ok(())
+    );
+    assert!(
+        zone.spaces.find(ready_mm.raw()).is_none(),
+        "ready space must retire even while an older entry on the same carrier is busy"
+    );
+    assert!(
+        zone.spaces.find(busy_mm.raw()).is_some(),
+        "busy sibling must remain published while its root lock is held"
+    );
+    assert_eq!(queue.len(), 1);
+
+    drop(held_busy_root);
+    assert_eq!(
+        queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0),
+        Ok(())
+    );
+    assert!(zone.spaces.find(busy_mm.raw()).is_none());
     assert!(queue.is_empty());
 }
