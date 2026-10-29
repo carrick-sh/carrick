@@ -491,18 +491,22 @@ fn concurrent_live_mms_cannot_overclaim_the_shared_stock_quota() {
     let base = 0x200_0000;
     many_chunks(&table, owner(7, 1), base, 1024);
     many_chunks(&table, owner(8, 2), base, 960);
-    let barrier = std::sync::Barrier::new(3);
+    let (start_a, wait_a) = std::sync::mpsc::sync_channel(1);
+    let (start_b, wait_b) = std::sync::mpsc::sync_channel(1);
     std::thread::scope(|scope| {
-        let attempt = |who| {
+        let attempt = |who, start: std::sync::mpsc::Receiver<()>| {
             let requests: alloc::vec::Vec<_> = (0..64)
                 .map(|i| request(base + (960 + i) * crate::COW_GRANT_SIZE))
                 .collect();
-            barrier.wait();
+            start
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             table.reserve_stock(who, &requests)
         };
-        let a = scope.spawn(move || attempt(owner(8, 2)));
-        let b = scope.spawn(move || attempt(owner(9, 3)));
-        barrier.wait();
+        let a = scope.spawn(move || attempt(owner(8, 2), wait_a));
+        let b = scope.spawn(move || attempt(owner(9, 3), wait_b));
+        start_a.send(()).unwrap();
+        start_b.send(()).unwrap();
         let claims = [a.join().unwrap(), b.join().unwrap()];
         let admitted = claims.iter().filter(|claim| claim.is_some()).count();
         assert!(admitted <= 1);
