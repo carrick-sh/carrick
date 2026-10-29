@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-runtime::vcpu_loop::executor::tests::serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle_slot
 schema_version = 1
 id = "kernel.el1.futex-handoff"
 title = "Guest threads that hand off through a private futex switch inside the guest at EL1, and the host still reaches every thread parked there"

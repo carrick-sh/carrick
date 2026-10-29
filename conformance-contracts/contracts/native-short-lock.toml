@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-el1-linux::native_process_runtime::tests::bucket_contention_msgrcv
 schema_version = 1
 id = "process.native.short-lock"
 title = "Native short-lock contention retains the operation and cannot publish a guest error"

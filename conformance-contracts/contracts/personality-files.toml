@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-core::file::tests
 schema_version = 1
 id = "core.personality.files"
 title = "Neutral file service vocabulary"

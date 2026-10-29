@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-runtime::vcpu_loop::lifecycle::tests::fork_child_tid_bootstrap_preserves_cow_supply_before_copyout
 schema_version = 1
 id = "kernel.fork.stage1-image"
 title = "Fork stage-1 image recycling"

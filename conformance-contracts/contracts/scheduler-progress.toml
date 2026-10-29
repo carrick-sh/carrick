@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-core-abi::service::tests::prepared_delivery_retains_cancelled_resources_until_cleanup_ack
 schema_version = 1
 id = "kernel.scheduler.runnable-progress"
 title = "Runnable scheduler affinity and preemption progress"

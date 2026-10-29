@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-sched-core::process::exec::tests::rollback_settles_siblings_before_releasing_admission
 schema_version = 1
 id = "process.exec.custody"
 title = "Exec settles predecessor siblings before releasing process admission"

@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-vmm-hvf::trap::vcpu_admission::vcpu_lifetime_tests::vcpus_live_for_the_vm_lifetime
 schema_version = 1
 # Pool admission audit (2026-10-04): reject unservable scheduler CPU counts
 # before driver/resolver publication or vCPU creation. Runtime executor tests

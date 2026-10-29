@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-embed::host_wait_policy::host_read_witness_requires_a_live_enrolled_registration
 schema_version = 1
 # Pool admission audit (2026-10-04): preserve the policy's CPU/affinity domain
 # and require one bound executor per CPU before startup. Runtime executor

@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-aarch64::owed_kick::tests::kick_absorbed_in_el1_vector_surfaces_at_the_el0_boundary
 schema_version = 1
 id = "kernel.vcpu.kick-el0-boundary"
 title = "A kick absorbed in Carrick's EL1 code surfaces at the next EL0 instruction boundary"

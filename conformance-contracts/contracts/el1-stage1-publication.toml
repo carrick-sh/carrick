@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-sched-core::spaces::tests::one_exact_guest_editor_owns_a_space_at_a_time
 # Request-lifetime follow-up: request words now carry 64-bit incarnation
 # identities and HOST_REQUEST_PROTOCOL participates in ABI hashing. Record
 # layout/hash regression bindings remain required; no new GIC/fault/page-table
