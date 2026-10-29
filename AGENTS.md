@@ -661,7 +661,9 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
 - **Ring-first:** every routed call is served exactly in ring or left
   unrouted (counted ENOSYS); a Forward-only arm is a second path. Changes to
   the crossing allowlist (`crates/carrick-personality-linux/src/crossing.rs`,
-  `docs/design/arm-ring-first-flip.tsv`) need owner sign-off.
+  `docs/design/arm-ring-first-flip.tsv`) are director-owned since the owner's
+  2026-10-29 decision (#231): they need an independent review and the signed
+  gate, not separate owner sign-off.
 - **Fix in the shared layers** (shared kernel, `carrick-abi`, `carrick-hal`,
   neutral cores) so every backend benefits; no per-backend one-offs. Move
   code, never copy it.
