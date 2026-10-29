@@ -102,51 +102,51 @@ impl UserSlot {
 /// Boxed: a refusal is the rare path, and the outcome is large.
 pub(crate) struct CopyoutRefusal(Box<DispatchOutcome>);
 
-impl CopyoutRefusal {
-    pub(crate) fn into_outcome(self) -> DispatchOutcome {
-        *self.0
-    }
-
-    pub(crate) fn from_read_error(error: carrick_guest_mem::MemoryError) -> Option<Self> {
+impl DispatchOutcome {
+    /// Convert a retryable owner memory refusal into the canonical dispatch
+    /// outcome that parks or supplies the dependency before redispatching.
+    pub fn from_owner_memory_error(error: carrick_guest_mem::MemoryError) -> Option<Self> {
         use carrick_guest_mem::{MemoryError, MemoryReadWait, MemorySupplyRequest};
         let outcome = match error {
             MemoryError::ReadSuspended(suspension) => match suspension.wait {
-                MemoryReadWait::Owner(wait) => {
-                    DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
-                }
-                MemoryReadWait::Physical(wait) => {
-                    DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
-                }
+                MemoryReadWait::Owner(wait) => Self::OwnerMemoryWait { wait, committed: 0 },
+                MemoryReadWait::Physical(wait) => Self::OwnerPhysicalWait { wait, committed: 0 },
                 MemoryReadWait::Supply(MemorySupplyRequest::Metadata { observed, .. }) => {
-                    DispatchOutcome::OwnerMemoryWait {
+                    Self::OwnerMemoryWait {
                         wait: observed,
                         committed: 0,
                     }
                 }
-                MemoryReadWait::Supply(request) => DispatchOutcome::OwnerMemorySupply {
+                MemoryReadWait::Supply(request) => Self::OwnerMemorySupply {
                     request,
                     committed: 0,
                 },
             },
-            MemoryError::OwnerWait(wait) => DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
-            MemoryError::Physical(wait) => {
-                DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
-            }
+            MemoryError::OwnerWait(wait) => Self::OwnerMemoryWait { wait, committed: 0 },
+            MemoryError::Physical(wait) => Self::OwnerPhysicalWait { wait, committed: 0 },
             MemoryError::Supply(request) => match *request {
-                MemorySupplyRequest::Metadata { observed, .. } => {
-                    DispatchOutcome::OwnerMemoryWait {
-                        wait: observed,
-                        committed: 0,
-                    }
-                }
-                request => DispatchOutcome::OwnerMemorySupply {
+                MemorySupplyRequest::Metadata { observed, .. } => Self::OwnerMemoryWait {
+                    wait: observed,
+                    committed: 0,
+                },
+                request => Self::OwnerMemorySupply {
                     request,
                     committed: 0,
                 },
             },
             _ => return None,
         };
-        Some(Self(Box::new(outcome)))
+        Some(outcome)
+    }
+}
+
+impl CopyoutRefusal {
+    pub(crate) fn into_outcome(self) -> DispatchOutcome {
+        *self.0
+    }
+
+    pub(crate) fn from_read_error(error: carrick_guest_mem::MemoryError) -> Option<Self> {
+        DispatchOutcome::from_owner_memory_error(error).map(|outcome| Self(Box::new(outcome)))
     }
 }
 

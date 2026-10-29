@@ -1325,7 +1325,7 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
     // Sibling B holds the reservation root lock on slot 1 while inspecting/planning
     // a grant for the shared block. Thread A faults on slot 0.
     let mailbox_a = carrick_el1_abi::FrameGrantMailbox::new();
-    for release_before_enroll in [true, false] {
+    for release_before_enroll in [false, true] {
         let mut frame = carrick_el1_abi::TrapFrame {
             esr: 0x92000046,
             far: VA + 8,
@@ -1395,30 +1395,48 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
                 "release before enrollment must retry immediately without parking"
             );
         } else {
-            let locked_gate = std::sync::Arc::new(std::sync::Barrier::new(2));
-            let parked_gate = std::sync::Arc::new(std::sync::Barrier::new(2));
-            let released_gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (released_tx, released_rx) = std::sync::mpsc::channel();
+            struct ReleaseSiblingOnDrop(Option<std::sync::mpsc::Sender<()>>);
+            impl Drop for ReleaseSiblingOnDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
             let table = fixture.region.table();
             let zone = fixture.zone;
             std::thread::scope(|scope| {
-                let sibling_locked = locked_gate.clone();
-                let sibling_parked = parked_gate.clone();
-                let sibling_released = released_gate.clone();
+                let mut release_guard = ReleaseSiblingOnDrop(Some(release_tx));
                 let sibling_thread = scope.spawn(move || {
-                    let held_root = table
+                    let lock_result = table
                         .lock_in(
                             crate::sched::object_wait::space_access(zone, sibling_slot),
                             index.index(),
                             handle.mm(),
                             u32::from(sibling_slot.raw()),
                         )
-                        .unwrap();
-                    sibling_locked.wait();
-                    sibling_parked.wait();
+                        .map_err(|err| format!("{err:?}"));
+                    let held_root = match lock_result {
+                        Ok(guard) => {
+                            let _ = locked_tx.send(Ok(()));
+                            guard
+                        }
+                        Err(err) => {
+                            let _ = locked_tx.send(Err(err));
+                            return;
+                        }
+                    };
+                    let wait_res = release_rx.recv_timeout(std::time::Duration::from_secs(5));
                     drop(held_root);
-                    sibling_released.wait();
+                    let _ = released_tx.send(wait_res);
                 });
-                locked_gate.wait();
+                locked_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("timed out waiting for sibling thread to lock reservation root")
+                    .expect("sibling thread failed to lock reservation root");
                 let supply = OwnerFaultSupply::new(portal).with_handle(handle);
                 assert_eq!(
                     carrick_el1::fault::dispatch_fault_with_prepared(
@@ -1470,8 +1488,16 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
                 assert!(fixture.task.linux.take_host_work_doorbell().is_some());
                 assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
                 assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
-                parked_gate.wait();
-                released_gate.wait();
+                release_guard
+                    .0
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .expect("sibling thread exited before release signal");
+                released_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("timed out waiting for sibling thread to release reservation root")
+                    .expect("sibling thread timed out waiting for fault waiter to park");
                 sibling_thread.join().unwrap();
             });
             assert_eq!(
@@ -1481,9 +1507,15 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
             );
             assert_eq!(fixture.task.service_notice.take().unwrap(), None);
             let mut handoff = None;
+            let mut prod_cpu = ProductionResumeCpu {
+                inner: cpu,
+                zone: fixture.zone,
+                task: &fixture.task,
+                service: &mut service,
+            };
             let mut zone = crate::dispatch::Zone {
                 tables: fixture.zone,
-                cpu: &mut cpu,
+                cpu: &mut prod_cpu,
                 user: &crate::sched::HardwareUserWord,
             };
             assert_eq!(
@@ -1497,6 +1529,7 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
                 .idle_entry(&mut frame, 0),
                 carrick_el1_abi::Action::Served
             );
+            cpu = prod_cpu.inner;
             assert_eq!(cpu.wfis, 0);
             let record = fixture.zone.slot(fixture.slot).current().unwrap();
             assert!(
@@ -1505,10 +1538,20 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
                     .is_none(),
                 "host-born fault wait resumes before any NativeProcessRuntime registration"
             );
-            assert!(unsafe { fixture.zone.record(record).consume_metadata_operation() });
-            assert!(!unsafe { fixture.zone.record(record).consume_metadata_operation() });
+            assert!(
+                !fixture.zone.record(record).has_object_operation(),
+                "production resume custody must consume the metadata operation token"
+            );
             assert_eq!(frame.elr, 0x401234, "resume exact fault PC");
             assert_eq!(frame.x[3], 0x7abc, "resume exact fault registers");
+            assert_eq!(
+                fixture.zone.release_current(
+                    fixture.slot,
+                    record,
+                    &carrick_sched_core::ShortLockSpin,
+                ),
+                carrick_sched_core::CurrentRelease::Released
+            );
         }
     }
 
@@ -1622,9 +1665,15 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
     crate::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu);
     drop(editor);
     let mut handoff = None;
+    let mut prod_cpu = ProductionResumeCpu {
+        inner: cpu,
+        zone: fixture.zone,
+        task: &fixture.task,
+        service: &mut service,
+    };
     let mut zone = crate::dispatch::Zone {
         tables: fixture.zone,
-        cpu: &mut cpu,
+        cpu: &mut prod_cpu,
         user: &crate::sched::HardwareUserWord,
     };
     assert_eq!(
@@ -1639,26 +1688,997 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
         carrick_el1_abi::Action::Served
     );
     let record = fixture.zone.slot(fixture.slot).current().unwrap();
-    let owner = registry()
-        .for_record(fixture.zone, fixture.zone.record_ref(record))
-        .unwrap();
-    assert!(matches!(
-        resume_selected(
-            &owner,
-            registry(),
-            BornInZoneSource {
-                zone: fixture.zone,
-                slot: fixture.slot
-            },
-            &fixture.task,
-            record,
-            &mut service,
-        ),
-        NativeResume::NoPending
-    ));
+    assert!(
+        registry()
+            .for_record(fixture.zone, fixture.zone.record_ref(record))
+            .is_some()
+    );
+    assert!(
+        !fixture.zone.record(record).has_object_operation(),
+        "production resume custody must consume the native fault wait metadata token"
+    );
     assert!(
         !registry().signal_checkpoint_needed(fixture.zone, fixture.zone.record_ref(record)),
         "sibling contention wait must never manufacture SIGSEGV"
     );
     assert_eq!(fixture.page.claimed_count(), 0);
+}
+
+struct ProductionResumeCpu<'a, X: ForkStockCrossing> {
+    inner: crate::sched::FakeCpu,
+    zone: &'static ZoneTables<Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    service: &'a mut Aarch64NativeProcessService<'static, X>,
+}
+
+impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ProductionResumeCpu<'_, X> {
+    fn save(&mut self, frame: &carrick_el1_abi::TrapFrame, ctx: &mut Aarch64ParkedContext) {
+        self.inner.save(frame, ctx);
+    }
+
+    fn load(&mut self, frame: &mut carrick_el1_abi::TrapFrame, ctx: &Aarch64ParkedContext) {
+        self.inner.load(frame, ctx);
+    }
+
+    fn resume_lifecycle(
+        &mut self,
+        _: &ZoneTables<Aarch64ParkedContext>,
+        _: &CurrentTask,
+        slot: SlotId,
+        record: carrick_el1_abi::RecordId,
+    ) -> crate::sched::ResumeAction {
+        crate::aarch64_process::resume_production_with_service(
+            self.zone,
+            self.task,
+            slot,
+            record,
+            self.service,
+        )
+    }
+
+    fn set_translation(&mut self, a: u64, b: u64) {
+        self.inner.set_translation(a, b);
+    }
+
+    fn invalidate_asid(&mut self, root: u64) {
+        self.inner.invalidate_asid(root);
+    }
+
+    fn now(&self) -> u64 {
+        self.inner.now()
+    }
+
+    fn freq(&self) -> u64 {
+        self.inner.freq()
+    }
+
+    fn set_timer(&mut self, deadline: Option<u64>) {
+        self.inner.set_timer(deadline);
+    }
+
+    fn send_sgi(&mut self, route: u64) {
+        self.inner.send_sgi(route);
+    }
+
+    fn ack_irq(&mut self) -> u32 {
+        self.inner.ack_irq()
+    }
+
+    fn end_irq(&mut self, intid: u32) {
+        self.inner.end_irq(intid);
+    }
+
+    fn wait_for_interrupt(&mut self) {
+        self.inner.wait_for_interrupt();
+    }
+
+    fn spin(&mut self) {
+        self.inner.spin();
+    }
+
+    fn own_sgi_target(&self) -> u64 {
+        self.inner.own_sgi_target()
+    }
+}
+
+#[test]
+fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exec() {
+    use crate::native_process_runtime::NativeResume;
+    use carrick_core_abi::service::{
+        EXEC_PAYLOAD_HEADER_BYTES, ExecAdoptionReceipt, ExecCall, ExecSuccessorBacking,
+        ExecSuccessorEntry, ExecSuccessorManifest, ServiceCell, encode_exec_payload_header,
+    };
+    use carrick_el1::fault::{GrantMailboxes, NoopCowResolver, PreparedFaultPath};
+    use carrick_sched_core::object_wait::ObjectWaitKey;
+    use core::num::NonZeroU16;
+
+    #[derive(Clone, Copy, Debug)]
+    enum CancelTrigger {
+        ExitGroup,
+        Kill,
+        SiblingExec,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CancelMode {
+        WhileParked,
+        QueuedProductionResume,
+        QueuedHostCancelSweep,
+    }
+
+    for (trigger_idx, trigger) in [
+        CancelTrigger::ExitGroup,
+        CancelTrigger::Kill,
+        CancelTrigger::SiblingExec,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (mode_idx, mode) in [
+            CancelMode::WhileParked,
+            CancelMode::QueuedProductionResume,
+            CancelMode::QueuedHostCancelSweep,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+            fixture.zone.spaces.set_idle_ttbr(0x30000);
+            let mut service = fixture.process_service();
+            fixture
+                .enter(
+                    fixture.control,
+                    fixture_ttbr0(fixture),
+                    &mut service,
+                    |_| (),
+                )
+                .unwrap();
+            let portal = fixture.region.portal_slots();
+            assert!(portal.bind_carrier(NonZeroU64::MIN));
+
+            let mm_key = fixture.task.mm.key.load(Ordering::Acquire);
+            let waiter_slot = SlotId::new(1);
+            fixture.zone.drive(waiter_slot, 1);
+            fixture.zone.publish_slot(waiter_slot, 1, Some(1), 2);
+            fixture.zone.enter_guest(waiter_slot);
+            fixture.zone.install_space(waiter_slot, mm_key).unwrap();
+            let waiter_control = host_born_sibling(fixture, 42);
+            let birth = waiter_control.host_birth_identity().unwrap();
+            run_as(fixture, 42, 12, 102, waiter_control);
+
+            let handle = crate::cow_resolver::admitted_fault_mm_handle(
+                fixture.zone,
+                fixture.region.table(),
+                NonZeroU64::MIN,
+                waiter_slot,
+                &fixture.task,
+            )
+            .expect("host-born sibling must obtain admitted MM handle");
+            let leader_access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+            let waiter_access = crate::sched::object_wait::space_access(fixture.zone, waiter_slot);
+            let index = waiter_access.find(handle.mm().raw()).unwrap();
+            let residency = carrick_el1::cow::test_support::residency_table();
+            let words = fixture.tables.live(&fixture.maintenance);
+            let counters = carrick_el1_abi::Counters::new();
+
+            let held_root = fixture
+                .region
+                .table()
+                .lock_in(
+                    leader_access,
+                    index.index(),
+                    handle.mm(),
+                    u32::from(fixture.slot.raw()),
+                )
+                .unwrap();
+
+            let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+            let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+            let mut waiter_frame = carrick_el1_abi::TrapFrame {
+                esr: 0x92000046,
+                far: VA + 8,
+                elr: 0x401234,
+                ..Default::default()
+            };
+            waiter_frame.x[3] = 0x7abc;
+            assert_eq!(
+                carrick_el1::fault::dispatch_fault_with_prepared(
+                    &mut waiter_frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    waiter_access,
+                    crate::cow_resolver::native_fault_supply(
+                        false,
+                        GrantMailboxes::own(&mailbox),
+                        &supply,
+                    ),
+                    Some(PreparedFaultPath {
+                        residency: &residency,
+                        resolver: &mut SelectionWords(&words),
+                        roots: Some(fixture.region.table()),
+                        file_slots: Some(portal),
+                    }),
+                    &mut NoopCowResolver,
+                ),
+                carrick_el1_abi::Action::Forward
+            );
+            let OwnerFaultSupplyOutcome::Wait(wait) = supply.outcome() else {
+                panic!(
+                    "expected reservation wait for {trigger:?}/{mode:?}: {:?}",
+                    supply.outcome()
+                );
+            };
+            let mut waiter_cpu = crate::sched::FakeCpu::default();
+            fixture.task.linux.mark_pending_host_work();
+            assert_eq!(
+                crate::cow_resolver::park_fault_owner_wait(
+                    fixture.zone,
+                    &fixture.task,
+                    &counters,
+                    waiter_slot,
+                    &mut waiter_cpu,
+                    &crate::sched::HardwareUserWord,
+                    &mut waiter_frame,
+                    wait,
+                ),
+                Some(carrick_el1_abi::Action::Idle)
+            );
+            assert!(fixture.task.linux.take_host_work_doorbell().is_some());
+            let waiter_record_id = fixture
+                .zone
+                .slot(waiter_slot)
+                .host_record()
+                .expect("park_fault_owner_wait must allocate and park the slot's home record");
+            let waiter_record = fixture.zone.record_ref(waiter_record_id);
+            waiter_control.bind_zone_record(waiter_record);
+            assert!(fixture.zone.record(waiter_record.id).has_object_operation());
+            assert!(
+                !fixture
+                    .zone
+                    .record(waiter_record.id)
+                    .has_adapter_operation(),
+                "fault owner wait uses a metadata receipt, not an adapter IPC operation"
+            );
+            let census = fixture
+                .zone
+                .record(waiter_record.id)
+                .object_wait_census()
+                .expect("parked fault waiter must be enrolled in object wait queue");
+            assert_ne!(census.queue, 0);
+            assert_eq!(census.operation, u64::MAX);
+
+            // Switch to the leader on slot 0 and drive the production exit_group,
+            // fatal signal (SIGKILL), or sibling execve closing path.
+            run_as_leader(fixture);
+            let mut exec_successor_mm = None;
+            match trigger {
+                CancelTrigger::ExitGroup => {
+                    let mut exit_frame = carrick_el1_abi::TrapFrame::default();
+                    exit_frame.x[0] = 7;
+                    exit_frame.x[8] = 94;
+                    assert_eq!(
+                        arm_call(fixture, fixture.control, &mut service, &mut exit_frame).unwrap(),
+                        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+                    );
+                }
+                CancelTrigger::Kill => {
+                    let saved = Aarch64ParkedContext::ZERO;
+                    with_process_entry(
+                        BornInZoneSource {
+                            zone: fixture.zone,
+                            slot: fixture.slot,
+                        },
+                        &fixture.task,
+                        &saved.native,
+                        fixture_ttbr0(fixture),
+                        fixture.page,
+                        fixture.control,
+                        &mut service,
+                        |entry| {
+                            assert!(matches!(
+                                entry
+                                    .exit_with_signal(
+                                        carrick_signal_core::policy::Signal::from_number(9)
+                                            .unwrap(),
+                                    )
+                                    .unwrap(),
+                                LifecycleOutcome::Transferred { .. }
+                            ));
+                        },
+                    )
+                    .unwrap();
+                }
+                CancelTrigger::SiblingExec => {
+                    let path = b"/bin/sh";
+                    let mut payload = vec![0; EXEC_PAYLOAD_HEADER_BYTES];
+                    payload.extend_from_slice(path);
+                    payload.push(0);
+                    encode_exec_payload_header(
+                        &mut payload,
+                        ExecCall::Execve,
+                        path.len() + 1,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                    let saved = Aarch64ParkedContext::ZERO;
+                    let result = with_process_entry(
+                        BornInZoneSource {
+                            zone: fixture.zone,
+                            slot: fixture.slot,
+                        },
+                        &fixture.task,
+                        &saved.native,
+                        fixture_ttbr0(fixture),
+                        fixture.page,
+                        fixture.control,
+                        &mut service,
+                        |entry| {
+                            let res = entry.begin_exec_service(payload.into_boxed_slice());
+                            assert!(entry.take_handoff_receipt().is_some());
+                            res
+                        },
+                    )
+                    .unwrap();
+                    assert!(matches!(result, Ok(NativeResume::Left(None))));
+                    let mut leader_cpu = crate::sched::FakeCpu::default();
+                    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+                    crate::dispatch::native_service_idle(
+                        fixture.zone,
+                        fixture.slot,
+                        &mut leader_cpu,
+                    );
+                    let key = ObjectWaitKey::native_service(selector.record).unwrap();
+                    let queue = fixture
+                        .zone
+                        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                        .unwrap();
+                    let member = fixture.zone.record(selector.record.id).identity();
+                    let ticket = unsafe {
+                        ServiceCell::claim_notice(
+                            &fixture.control.service,
+                            selector,
+                            NonZeroU64::MIN,
+                            member,
+                        )
+                    }
+                    .unwrap();
+                    let request = ticket.request();
+                    let manifest_address = ticket.reply_address().unwrap();
+                    let manifest =
+                        unsafe { &mut *(manifest_address.raw() as *mut ExecSuccessorManifest) };
+                    let (successor_mm, _) = manifest.proposal(request.identity).unwrap();
+                    let receipt_raw = 200 + (trigger_idx * 10 + mode_idx) as u64;
+                    let receipt =
+                        ExecAdoptionReceipt::checked(NonZeroU64::new(receipt_raw).unwrap())
+                            .unwrap();
+                    let successor_asid = carrick_guest_arch::Asid::from_registry_allocation(
+                        NonZeroU16::new(u16::try_from(receipt_raw + 12).unwrap()).unwrap(),
+                    );
+                    let successor_root = RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap();
+                    *manifest = manifest
+                        .seal(
+                            request.identity,
+                            receipt,
+                            ExecSuccessorBacking {
+                                root: successor_root,
+                                asid: successor_asid,
+                                asid_generation: NonZeroU64::new(receipt_raw + 14).unwrap(),
+                            },
+                            ExecSuccessorEntry {
+                                entry: UserVa::new(0x40_0000),
+                                stack_pointer: UserVa::new(0x7fff_f000),
+                            },
+                        )
+                        .unwrap();
+                    let successor_index = fixture.zone.spaces.find(successor_mm.raw()).unwrap();
+                    let ttbr =
+                        (u64::from(successor_asid.raw()) << 48) | successor_root.address().raw();
+                    assert!(fixture.zone.spaces.bind_initial_root(
+                        successor_index,
+                        successor_mm.raw(),
+                        ttbr,
+                        ttbr,
+                    ));
+                    assert!(
+                        ticket
+                            .publish_exec_prepared(receipt, (), |_, ()| {})
+                            .is_ok()
+                    );
+                    let mut effects = carrick_sched_core::WakeEffects::default();
+                    queue.notify_object(fixture.slot, &mut effects).unwrap();
+                    drop(queue);
+                    NativeProcessService::wake_effects(&mut service, effects);
+                    exec_successor_mm = Some(successor_mm);
+
+                    let _ = fixture.task.linux.take_host_work_doorbell();
+                    let mut leader_frame = carrick_el1_abi::TrapFrame::default();
+                    let mut handoff = None;
+                    let mut prod_cpu = ProductionResumeCpu {
+                        inner: leader_cpu,
+                        zone: fixture.zone,
+                        task: &fixture.task,
+                        service: &mut service,
+                    };
+                    let mut zone = crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut prod_cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    };
+                    assert_eq!(
+                        crate::dispatch::native_scheduler(
+                            &mut zone,
+                            &fixture.task,
+                            &counters,
+                            fixture.slot,
+                            &mut handoff,
+                        )
+                        .idle_entry(&mut leader_frame, 0),
+                        carrick_el1_abi::Action::Idle,
+                        "exec closing must suspend the leader while the fault waiter sibling is live"
+                    );
+                }
+            }
+
+            assert!(
+                fixture.page.host_birth_requested(birth),
+                "{trigger:?}/{mode:?} must request cancellation of the host-born fault waiter"
+            );
+
+            run_as(fixture, 42, 12, 102, waiter_control);
+            let mut resume_frame = carrick_el1_abi::TrapFrame::default();
+            let mut handoff = None;
+            let mut waiter_service = Aarch64NativeProcessService::with_crossing(
+                &fixture.task,
+                waiter_slot,
+                fixture.zone,
+                fixture.region.table(),
+                NonZeroU64::MIN,
+                TestStockCrossing::new(&[]),
+            );
+            let mut prod_cpu = ProductionResumeCpu {
+                inner: waiter_cpu,
+                zone: fixture.zone,
+                task: &fixture.task,
+                service: &mut waiter_service,
+            };
+            let mut zone = crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut prod_cpu,
+                user: &crate::sched::HardwareUserWord,
+            };
+            match mode {
+                CancelMode::WhileParked => {
+                    fixture.zone.unhome(waiter_slot, waiter_record.id, 2);
+                    assert_eq!(
+                        fixture.zone.claim_for_host(
+                            waiter_record,
+                            None,
+                            carrick_el1_abi::Handback::Cancelled,
+                            &carrick_sched_core::ShortLockSpin,
+                        ),
+                        carrick_sched_core::HostClaim::Claimed
+                    );
+                    fixture.zone.free_record(waiter_record.id);
+                    drop(held_root);
+                    assert_eq!(
+                        crate::dispatch::native_scheduler(
+                            &mut zone,
+                            &fixture.task,
+                            &counters,
+                            waiter_slot,
+                            &mut handoff,
+                        )
+                        .run_ready(&mut resume_frame),
+                        None,
+                        "{trigger:?}/{mode:?} must never reload a host-claimed fault waiter"
+                    );
+                }
+                CancelMode::QueuedProductionResume => {
+                    drop(held_root);
+                    assert_eq!(
+                        fixture.zone.slot(waiter_slot).queued(),
+                        1,
+                        "owner publication wakes waiter onto slot before {trigger:?} retirement"
+                    );
+                    let _ = fixture.task.linux.take_host_work_doorbell();
+                    assert_eq!(
+                        crate::dispatch::native_scheduler(
+                            &mut zone,
+                            &fixture.task,
+                            &counters,
+                            waiter_slot,
+                            &mut handoff,
+                        )
+                        .idle_entry(&mut resume_frame, 0),
+                        carrick_el1_abi::Action::Idle,
+                        "{trigger:?}/{mode:?} must retire the fault waiter via production resume custody"
+                    );
+                    assert!(
+                        fixture.task.linux.take_host_work_doorbell().is_some(),
+                        "{trigger:?}/{mode:?} production resume retirement must ring host-work doorbell"
+                    );
+                }
+                CancelMode::QueuedHostCancelSweep => {
+                    drop(held_root);
+                    assert_eq!(
+                        fixture.zone.slot(waiter_slot).queued(),
+                        1,
+                        "owner publication wakes waiter onto slot before host cancel claim"
+                    );
+                    assert_eq!(
+                        fixture.zone.claim_for_host(
+                            waiter_record,
+                            None,
+                            carrick_el1_abi::Handback::Cancelled,
+                            &carrick_sched_core::ShortLockSpin,
+                        ),
+                        carrick_sched_core::HostClaim::Claimed
+                    );
+                    assert!(fixture.zone.record(waiter_record.id).is_cancelled());
+                    assert_eq!(fixture.zone.runnable_head(waiter_slot), None);
+                    fixture.zone.free_record(waiter_record.id);
+                    assert_eq!(
+                        crate::dispatch::native_scheduler(
+                            &mut zone,
+                            &fixture.task,
+                            &counters,
+                            waiter_slot,
+                            &mut handoff,
+                        )
+                        .run_ready(&mut resume_frame),
+                        None,
+                        "{trigger:?}/{mode:?} must never reload a swept cancelled fault waiter"
+                    );
+                }
+            }
+            assert_eq!(
+                resume_frame.elr, 0,
+                "{trigger:?}/{mode:?} must never restore the cancelled fault waiter's trap frame"
+            );
+            assert!(
+                !fixture.zone.record(waiter_record.id).has_object_operation(),
+                "{trigger:?}/{mode:?} must not leave a metadata operation token on the record"
+            );
+            assert!(
+                fixture
+                    .zone
+                    .record(waiter_record.id)
+                    .object_wait_census()
+                    .is_none(),
+                "{trigger:?}/{mode:?} must leave an empty object-wait census"
+            );
+            assert!(
+                fixture.zone.live(waiter_record).is_none(),
+                "{trigger:?}/{mode:?} must release the fault waiter's zone record"
+            );
+            assert_eq!(fixture.zone.slot(waiter_slot).current(), None);
+            assert_eq!(fixture.zone.slot(waiter_slot).queued(), 0);
+            fixture.zone.release_space(waiter_slot);
+
+            fixture
+                .page
+                .reserve_cancelled_member_exit()
+                .unwrap()
+                .publish();
+            fixture
+                .page
+                .publish_exact_host_retirement(waiter_control, birth.retirement());
+            run_as_leader(fixture);
+            match trigger {
+                CancelTrigger::ExitGroup | CancelTrigger::Kill => {
+                    assert!(matches!(
+                        wake_closing_root(fixture, &mut service),
+                        crate::sched::ResumeAction::Left
+                    ));
+                    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+                }
+                CancelTrigger::SiblingExec => {
+                    let (mm, address) = fixture.page.exit_wait().unwrap();
+                    let guard = fixture
+                        .zone
+                        .lock(
+                            ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(
+                                mm.raw(),
+                                address,
+                            ),
+                            &carrick_sched_core::ShortLockSpin,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        fixture.zone.wake_host(
+                            &guard,
+                            mm.raw(),
+                            address,
+                            u32::MAX,
+                            u32::MAX,
+                            true,
+                            &mut |_| panic!("exec leader must be placed in guest"),
+                            &mut |_| {},
+                        ),
+                        1
+                    );
+                    drop(guard);
+                    let _ = fixture.task.linux.take_host_work_doorbell();
+                    let mut exec_frame = carrick_el1_abi::TrapFrame::default();
+                    let mut handoff = None;
+                    let mut prod_cpu = ProductionResumeCpu {
+                        inner: crate::sched::FakeCpu::default(),
+                        zone: fixture.zone,
+                        task: &fixture.task,
+                        service: &mut service,
+                    };
+                    let mut zone = crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut prod_cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    };
+                    assert_eq!(
+                        crate::dispatch::native_scheduler(
+                            &mut zone,
+                            &fixture.task,
+                            &counters,
+                            fixture.slot,
+                            &mut handoff,
+                        )
+                        .idle_entry(&mut exec_frame, 0),
+                        carrick_el1_abi::Action::Idle
+                    );
+                    assert!(
+                        service.crossing.exec_adopted.load(Ordering::Acquire),
+                        "exec leader must adopt successor after cancelled fault waiter retires"
+                    );
+                    assert!(
+                        fixture
+                            .zone
+                            .spaces
+                            .is_open(exec_successor_mm.unwrap().raw()),
+                        "exec leader must open successor address space after cancelled fault waiter retires"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
+    use crate::mm_portal::{GuestVa, MmError, SelectionVenues, TransferIntent, TransferStep};
+    use carrick_el1::fault::{NoopCowResolver, NoopPreparedResolver};
+    use carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal;
+    use core::sync::atomic::AtomicI32;
+
+    let fixture = Box::leak(Box::new(Fixture::with_page(
+        0x10000,
+        asid(1),
+        5,
+        Box::leak(Box::new(ThreadLifecyclePage::with_hatches(
+            carrick_el1_abi::LifecycleHatches::ON,
+        ))),
+    )));
+    // `VA + 4096` is reserved in the VMA tree (`VA..VA + 8192`), but its
+    // Stage-1 leaf is not yet resident while sibling B's grant is in flight.
+    fixture.tables.words[1536 + 1].store(0, Ordering::Relaxed);
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    assert!(fixture.control.publish_visible_tid(41));
+    let child_control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let stocked_entry = fixture
+        .page
+        .stock(
+            0,
+            carrick_el1_abi::EntryIdentity {
+                tid: 43,
+                visible_tid: 43,
+                thread_serial: 103,
+                birth: carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
+                ),
+                uid_credit: 1,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(stocked_entry, child_control as *const _ as u64)
+        .unwrap();
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let portal_slots = fixture.region.portal_slots();
+    assert!(portal_slots.bind_carrier(NonZeroU64::MIN));
+
+    let mm_key = fixture.task.mm.key.load(Ordering::Acquire);
+    let sibling_slot = SlotId::new(1);
+    fixture.zone.drive(sibling_slot, 1);
+    fixture.zone.publish_slot(sibling_slot, 1, Some(1), 2);
+    fixture.zone.enter_guest(sibling_slot);
+    fixture.zone.install_space(sibling_slot, mm_key).unwrap();
+    let _sibling_control = host_born_sibling(fixture, 42);
+    run_as_leader(fixture);
+
+    let handle = crate::cow_resolver::admitted_fault_mm_handle(
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        fixture.slot,
+        &fixture.task,
+    )
+    .expect("leader must obtain admitted MM handle");
+    let mm_portal = crate::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+
+    let tid_words = [AtomicI32::new(11), AtomicI32::new(22)];
+    let parent_tid_host_addr = tid_words[0].as_ptr() as u64;
+    let child_tid_host_addr = tid_words[1].as_ptr() as u64;
+    let non_resident_tid_va = VA + 4096;
+    let child_stack = VA + 0x1000;
+    // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
+    // CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID
+    let clone_flags: u64 = 0x0135_0f00;
+    let mut clone_frame = carrick_el1_abi::TrapFrame {
+        elr: 0x402000,
+        ..Default::default()
+    };
+    clone_frame.x[0] = clone_flags;
+    clone_frame.x[1] = child_stack;
+    clone_frame.x[2] = parent_tid_host_addr;
+    clone_frame.x[3] = 0;
+    clone_frame.x[4] = child_tid_host_addr;
+    clone_frame.x[8] = 220; // SYS_clone
+
+    // 1. Before the 2 MiB stack block page `VA + 4096` is resident in Stage-1,
+    // EL1 `serve_clone` faults in `TidOutput::capture` and forwards `clone` to
+    // the host.
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    let forwarded = arm_call(fixture, fixture.control, &mut service, &mut clone_frame);
+    crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+    assert_eq!(
+        forwarded.unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Forward,
+        "non-resident clone TID output in a valid VMA must forward to the host owner path"
+    );
+
+    // 2. On the host, `CloneTidOutputTransaction::capture` reads the TID output
+    // address through `MmPortal::select`. When sibling B acquires the
+    // reservation root lock while thread A's transfer is between `authorize`
+    // and `Supply` planning (the exact window at `MmPortal::select` line 648),
+    // `select` must return `Err(MmError::Wait(PortalOwnerWait { cause: Reservations, .. }))`
+    // rather than `Err(MmError::Busy)` or `EFAULT`.
+    let sibling_access = crate::sched::object_wait::space_access(fixture.zone, sibling_slot);
+    let index = sibling_access.find(handle.mm().raw()).unwrap();
+    let residency = Box::leak(crate::mm_portal::test_support::residency());
+    let words = fixture.tables.live(&fixture.maintenance);
+    let transfer = mm_portal
+        .begin(
+            handle,
+            GuestVa::new(non_resident_tid_va),
+            core::mem::size_of::<i32>() as u64,
+            TransferIntent::UserRead,
+            0,
+        )
+        .unwrap();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (released_tx, released_rx) = std::sync::mpsc::channel();
+    struct ReleaseSiblingOnDrop(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseSiblingOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+    struct LockRootOnTranslate<'a, W> {
+        inner: &'a W,
+        ready_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        locked_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<Result<(), String>>>>,
+    }
+    impl<W: LiveDescriptorWords> LiveDescriptorWords for LockRootOnTranslate<'_, W> {
+        fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+            let value = self.inner.load(pa)?;
+            if value == 0
+                && let Some(tx) = self.ready_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+                if let Some(rx) = self.locked_rx.lock().unwrap().take() {
+                    rx.recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("timed out waiting for sibling to lock root during clone transfer")
+                        .expect("sibling failed to lock root during clone transfer");
+                }
+            }
+            Ok(value)
+        }
+        fn compare_exchange(
+            &self,
+            pa: u64,
+            current: u64,
+            new: u64,
+        ) -> Result<bool, DescriptorRefusal> {
+            self.inner.compare_exchange(pa, current, new)
+        }
+        fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+            self.inner.store_unlinked(pa, value)
+        }
+        fn publish_barrier(&self) {
+            self.inner.publish_barrier();
+        }
+        fn invalidate_range(&self, va: u64, len: u64) {
+            self.inner.invalidate_range(va, len);
+        }
+    }
+
+    let table = fixture.region.table();
+    let zone = fixture.zone;
+    let counters = carrick_el1_abi::Counters::new();
+    let mut cpu = crate::sched::FakeCpu::default();
+    std::thread::scope(|scope| {
+        let mut release_guard = ReleaseSiblingOnDrop(Some(release_tx));
+        let sibling_thread = scope.spawn(move || {
+            if ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err()
+            {
+                return;
+            }
+            let lock_result = table
+                .lock_in(
+                    crate::sched::object_wait::space_access(zone, sibling_slot),
+                    index.index(),
+                    handle.mm(),
+                    u32::from(sibling_slot.raw()),
+                )
+                .map_err(|err| format!("{err:?}"));
+            let held_root = match lock_result {
+                Ok(guard) => {
+                    let _ = locked_tx.send(Ok(()));
+                    guard
+                }
+                Err(err) => {
+                    let _ = locked_tx.send(Err(err));
+                    return;
+                }
+            };
+            let wait_res = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(held_root);
+            let _ = released_tx.send(wait_res);
+        });
+
+        let hook_words = LockRootOnTranslate {
+            inner: &words,
+            ready_tx: std::sync::Mutex::new(Some(ready_tx)),
+            locked_rx: std::sync::Mutex::new(Some(locked_rx)),
+        };
+        let step = mm_portal.select(
+            &transfer,
+            &hook_words,
+            SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency,
+                slot: u32::from(fixture.slot.raw()),
+            },
+        );
+        let Err(MmError::Wait(wait)) = step else {
+            panic!(
+                "clone TID transfer must wait on sibling's in-flight grant reservation root instead of returning Busy/EFAULT: {step:?}"
+            );
+        };
+        assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Reservations);
+        assert_eq!(wait.handle(), handle);
+
+        fixture.task.linux.mark_pending_host_work();
+        assert_eq!(
+            crate::cow_resolver::park_fault_owner_wait(
+                fixture.zone,
+                &fixture.task,
+                &counters,
+                fixture.slot,
+                &mut cpu,
+                &crate::sched::HardwareUserWord,
+                &mut clone_frame,
+                wait,
+            ),
+            Some(carrick_el1_abi::Action::Idle)
+        );
+        assert!(fixture.task.linux.take_host_work_doorbell().is_some());
+        assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
+        assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+
+        // Sibling B finishes publishing the 2 MiB stack grant leaf and releases
+        // the reservation root lock.
+        fixture.tables.words[1536 + 1].store(
+            (IPA + 4096) | crate::mm_portal::test_support::RW,
+            Ordering::Release,
+        );
+        release_guard
+            .0
+            .take()
+            .unwrap()
+            .send(())
+            .expect("sibling thread exited before release signal");
+        released_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timed out waiting for sibling thread to release reservation root")
+            .expect("sibling thread timed out waiting for clone waiter to park");
+        sibling_thread.join().unwrap();
+    });
+
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).queued(),
+        1,
+        "sibling grant publication must wake the parked clone thread onto its slot"
+    );
+    let mut handoff = None;
+    let mut prod_cpu = ProductionResumeCpu {
+        inner: cpu,
+        zone: fixture.zone,
+        task: &fixture.task,
+        service: &mut service,
+    };
+    let mut zone_view = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut prod_cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    assert_eq!(
+        crate::dispatch::native_scheduler(
+            &mut zone_view,
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff,
+        )
+        .idle_entry(&mut clone_frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    let record = fixture.zone.slot(fixture.slot).current().unwrap();
+    assert!(!fixture.zone.record(record).has_object_operation());
+    assert_eq!(
+        fixture
+            .zone
+            .release_current(fixture.slot, record, &carrick_sched_core::ShortLockSpin,),
+        carrick_sched_core::CurrentRelease::Released
+    );
+    fixture.zone.release_space(sibling_slot);
+
+    // 3. Redispatching `clone` after sibling B's grant publication now selects
+    // the resident page on the host portal AND completes in EL1, writing the
+    // new child's visible TID to both `parent_tid_addr` and `child_tid_addr`.
+    assert!(matches!(
+        mm_portal.select(
+            &transfer,
+            &words,
+            SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency,
+                slot: u32::from(fixture.slot.raw()),
+            },
+        ),
+        Ok(TransferStep::Selected(_))
+    ));
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut clone_frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork,
+        "redispatched clone must succeed once sibling grant publication is resident"
+    );
+    let child_visible_tid = i32::try_from(clone_frame.x[0] as i64)
+        .expect("clone return value must be a positive visible TID");
+    assert!(
+        child_visible_tid > 0,
+        "clone must not fail with EFAULT (-14): got {child_visible_tid}"
+    );
+    assert_eq!(tid_words[0].load(Ordering::Acquire), child_visible_tid);
+    assert_eq!(tid_words[1].load(Ordering::Acquire), child_visible_tid);
 }

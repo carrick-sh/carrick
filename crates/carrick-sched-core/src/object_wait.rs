@@ -1484,6 +1484,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.object.operation.load(Ordering::Acquire) != 0
     }
 
+    /// Whether this record holds an adapter-owned IPC operation token
+    /// (`index != 0 && index != u64::MAX`) with an external endpoint pin.
+    pub fn has_adapter_operation(&self) -> bool {
+        !matches!(self.object.operation.load(Ordering::Acquire), 0 | u64::MAX)
+    }
+
     /// Whether this record's last object park ended at its deadline rather
     /// than by a notification. Meaningful to the owner of the record's
     /// context once the record was claimed off its park.
@@ -1494,19 +1500,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.object.expired.load(Ordering::Acquire) & OBJECT_HOST_CONTINUATION != 0
     }
 
-    /// Retire a cancelled metadata receipt under the cancellation owner's
-    /// exclusive Host/Transferring custody. Unlike an IPC operation, this
-    /// token has no external pin or adapter cleanup: its only resource is
-    /// this record. Do not manufacture an orphan adapter handback for it.
+    /// Retire a cancelled metadata receipt under the cancellation or slot
+    /// owner's exclusive custody (`Host`, `Transferring`, `OnCpu`, or
+    /// `OnCpuRequested`). Unlike an IPC operation, this token has no external
+    /// pin or adapter cleanup: its only resource is this record. Do not
+    /// manufacture an orphan adapter handback for it.
     pub(crate) fn retire_cancelled_metadata_operation(&self) {
         if !self.is_cancelled()
             || !matches!(
                 self.claim(),
                 Claim::Host { .. }
-                    | Claim::Transferring {
-                        cancelled: true,
-                        ..
-                    }
+                    | Claim::Transferring { .. }
+                    | Claim::OnCpu { .. }
+                    | Claim::OnCpuRequested { .. }
             )
             || self.object.queue.load(Ordering::Acquire) != 0
         {

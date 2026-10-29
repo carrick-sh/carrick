@@ -645,9 +645,13 @@ impl<
                 LeafAccess::Write => 2,
                 LeafAccess::Execute => 4,
             };
-            let mut root = self.root(continuation.handle.mm(), slot)?;
+            let pending = self.observe_wait(
+                continuation.handle,
+                carrick_core_abi::PortalWaitCause::PendingEdit,
+            )?;
+            let mut root = self.root_for(continuation.handle, slot)?;
             if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence()) {
-                return Err(MmError::Busy);
+                return Err(pending.map_or(MmError::Busy, MmError::Wait));
             }
             let target = if root
                 .mapping(va)
@@ -657,12 +661,17 @@ impl<
             } else {
                 carrick_core_abi::EL1_FRAME_GRANT_TARGET_SIZE
             };
-            let plan = root.fork_transfer_fault_plan(
-                va,
-                target,
-                ReservationProtection::from_bits(bits).ok_or(MmError::Invalid)?,
-                continuation.fork_sequence(),
-            )?;
+            let plan = root
+                .fork_transfer_fault_plan(
+                    va,
+                    target,
+                    ReservationProtection::from_bits(bits).ok_or(MmError::Invalid)?,
+                    continuation.fork_sequence(),
+                )
+                .map_err(|refusal| match MmError::from(refusal) {
+                    MmError::Busy => pending.map_or(MmError::Busy, MmError::Wait),
+                    other => other,
+                })?;
             let host_backing = root.mapping(plan.range.start()).and_then(|mapping| {
                 mapping
                     .host_backing

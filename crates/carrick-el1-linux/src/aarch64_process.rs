@@ -184,32 +184,100 @@ pub fn resume_production(
     slot: SlotId,
     record: RecordId,
 ) -> crate::sched::ResumeAction {
+    resume_production_with(zone, task, slot, record, |runtime, source| {
+        let mut service = Aarch64NativeProcessService::new(task, slot).unwrap_or_else(|_| fatal());
+        map_resume(
+            resume_selected(runtime, registry(), source, task, record, &mut service),
+            &mut service,
+            task,
+            slot,
+        )
+    })
+}
+
+#[cfg(test)]
+pub(super) fn resume_production_with_service<X: ForkStockCrossing>(
+    zone: &'static ZoneTables<Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    slot: SlotId,
+    record: RecordId,
+    service: &mut Aarch64NativeProcessService<'static, X>,
+) -> crate::sched::ResumeAction {
+    resume_production_with(zone, task, slot, record, |runtime, source| {
+        map_resume(
+            resume_selected(runtime, registry(), source, task, record, service),
+            service,
+            task,
+            slot,
+        )
+    })
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn resume_production_with(
+    zone: &'static ZoneTables<Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    slot: SlotId,
+    record: RecordId,
+    run_registered: impl FnOnce(
+        &NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>,
+        BornInZoneSource<'static, Aarch64ParkedContext>,
+    ) -> crate::sched::ResumeAction,
+) -> crate::sched::ResumeAction {
     let Some(runtime) = registry().for_record(zone, zone.record_ref(record)) else {
+        let rec = zone.record(record);
         if matches!(
-            zone.record(record).resume_disposition(),
+            rec.resume_disposition(),
             carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
         ) {
             // SAFETY: this exact record is selected by the execution owner.
             unsafe {
-                zone.record(record).consume_owner_continuation();
+                rec.consume_owner_continuation();
             }
             let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
             return crate::sched::ResumeAction::Left;
         }
+        let lifecycle = {
+            #[cfg(target_os = "none")]
+            {
+                task.lifecycle_refs()
+            }
+            #[cfg(not(target_os = "none"))]
+            {
+                let id = rec.identity();
+                (id.lifecycle_page != 0 && id.control_slot != 0).then(|| {
+                    // SAFETY: a live zone record in host tests retains its
+                    // published lifecycle page and control slot.
+                    unsafe {
+                        (
+                            &*(id.lifecycle_page as *const ThreadLifecyclePage),
+                            &*(id.control_slot as *const ThreadControlSlot),
+                        )
+                    }
+                })
+            }
+        };
+        let cancelled_on_slot = rec.is_cancelled()
+            || (!rec.has_adapter_operation()
+                && lifecycle.is_some_and(|(page, control)| {
+                    control.host_exit_requested()
+                        || control
+                            .host_birth_identity()
+                            .is_some_and(|birth| page.host_birth_requested(birth))
+                }));
         // SAFETY: this exact record is selected by the execution owner.
         unsafe {
-            zone.record(record).consume_metadata_operation();
+            rec.consume_metadata_operation();
+        }
+        if cancelled_on_slot {
+            let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
+            task.linux.mark_pending_host_work();
+            return crate::sched::ResumeAction::Left;
         }
         return crate::sched::ResumeAction::NoPending;
     };
     let source = BornInZoneSource { zone, slot };
-    let mut service = Aarch64NativeProcessService::new(task, slot).unwrap_or_else(|_| fatal());
-    map_resume(
-        resume_selected(&runtime, registry(), source, task, record, &mut service),
-        &mut service,
-        task,
-        slot,
-    )
+    run_registered(&runtime, source)
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]

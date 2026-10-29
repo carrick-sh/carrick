@@ -895,18 +895,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     pub fn needs_host(&self) -> bool {
         self.handback() == Some(Handback::Service)
             || self.host_wanted()
-            || (self.has_object_operation()
-                && (self.is_cancelled()
-                    || matches!(
-                        self.handback(),
-                        Some(
-                            Handback::Signal
-                                | Handback::GroupStop
-                                | Handback::Control
-                                | Handback::Cancelled
-                                | Handback::Timeout
-                        )
-                    )))
+            || (!self.is_cancelled()
+                && self.has_object_operation()
+                && matches!(
+                    self.handback(),
+                    Some(
+                        Handback::Signal
+                            | Handback::GroupStop
+                            | Handback::Control
+                            | Handback::Cancelled
+                            | Handback::Timeout
+                    )
+                ))
+            || (self.is_cancelled() && self.has_adapter_operation())
     }
 
     /// The host asked for the thread back while EL1 held its record.
@@ -2166,7 +2167,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let identity = self.record_ref(record);
         let transfer = self.begin_host_transfer(identity, Claim::Queued { slot, seq })?;
         self.remove_locked(&guard, record);
-        if rec.is_cancelled() && rec.has_object_operation() {
+        if rec.is_cancelled() && rec.has_adapter_operation() {
             rec.handback
                 .store(Handback::Cancelled as u32, Ordering::Release);
         }
@@ -2196,12 +2197,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         };
         if owner != slot || !self.needs_executor(slot, rec) {
             return None;
-        }
+        };
         let identity = self.record_ref(record);
         let transfer = self.begin_host_transfer(identity, Claim::Queued { slot, seq })?;
         self.remove_locked(&guard, record);
         let first_entry = rec.is_unadopted_birth();
-        if !first_entry && rec.is_cancelled() && rec.has_object_operation() {
+        if !first_entry && rec.is_cancelled() && rec.has_adapter_operation() {
             rec.handback
                 .store(Handback::Cancelled as u32, Ordering::Release);
         }
@@ -2519,8 +2520,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             let record = RecordId(cursor);
             let rec = self.record(record);
             cursor = rec.next.load(Ordering::Relaxed);
-            if !(rec.host_wanted() || rec.is_cancelled() && rec.has_object_operation())
-                || (rec.is_cancelled() && !rec.has_object_operation())
+            if !(rec.host_wanted() || rec.is_cancelled() && rec.has_adapter_operation())
+                || (rec.is_cancelled() && !rec.has_adapter_operation())
             {
                 continue;
             }
@@ -2561,7 +2562,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             let record = RecordId(cursor);
             let rec = self.record(record);
             cursor = rec.next.load(Ordering::Relaxed);
-            if !rec.is_cancelled() || rec.has_object_operation() {
+            if !rec.is_cancelled() || rec.has_adapter_operation() {
                 continue;
             }
             let Claim::Queued { slot: owner, seq } = rec.claim() else {
@@ -2572,6 +2573,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     self.begin_host_transfer(self.record_ref(record), Claim::Queued { slot, seq })
             {
                 self.remove_locked(&guard, record);
+                rec.retire_cancelled_metadata_operation();
                 rec.handback
                     .store(Handback::Cancelled as u32, Ordering::Release);
                 transfer.retire();
@@ -2602,6 +2604,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     fn finish_retiring_record(&self, identity: RecordRef) {
         let id = identity.id;
         let record = self.record(id);
+        record.retire_cancelled_metadata_operation();
         if record.has_object_operation() {
             return;
         }
@@ -3318,7 +3321,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         while cursor != NIL {
             let record = RecordId(cursor);
             let rec = self.record(record);
-            if !rec.is_cancelled() || rec.has_object_operation() {
+            if !rec.is_cancelled() || rec.has_adapter_operation() {
                 return matches!(rec.claim(), Claim::Queued { slot: owner, .. } if owner == slot)
                     .then_some(record);
             }
@@ -3973,6 +3976,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 continue;
             };
             if rec.is_cancelled() {
+                rec.retire_cancelled_metadata_operation();
                 rec.handback
                     .store(Handback::Cancelled as u32, Ordering::Release);
                 let discard = !rec.has_object_operation();
@@ -4032,6 +4036,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return CurrentHandback::Lost;
         };
         if rec.is_cancelled() {
+            rec.retire_cancelled_metadata_operation();
             rec.handback
                 .store(Handback::Cancelled as u32, Ordering::Release);
             if !rec.has_object_operation() {
@@ -4078,6 +4083,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let s = self.slot(slot);
         let rec = self.record(record);
         let owned = matches!(rec.claim(), Claim::OnCpu { slot: owner, .. } | Claim::OnCpuRequested { slot: owner, .. } if owner == slot);
+        if owned {
+            rec.retire_cancelled_metadata_operation();
+        }
         if owned && rec.has_object_operation() && self.unswitch_with(slot, record, wait) {
             return CurrentRelease::Requeued;
         }
@@ -4538,6 +4546,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 };
                 let discard = rec.is_cancelled();
                 if discard {
+                    rec.retire_cancelled_metadata_operation();
                     rec.handback
                         .store(Handback::Cancelled as u32, Ordering::Release);
                 } else if rec.handback() != Some(Handback::Resumed) {
