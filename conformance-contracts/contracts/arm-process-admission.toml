@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-el1-linux::aarch64_process_tests::arm_root_setup_enters_production_process_venue
 schema_version = 1
 id = "process.native.arm-admission"
 title = "ARM root setup and process calls share one authenticated native owner"

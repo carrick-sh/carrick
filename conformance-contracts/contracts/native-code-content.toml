@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-vmm-hvf::trap::code_content::tests::native_code_content_invalidation_contract
 schema_version = 1
 id = "kernel.mm.native-code-content"
 title = "Carrier byte writes revoke physical instruction dependencies"

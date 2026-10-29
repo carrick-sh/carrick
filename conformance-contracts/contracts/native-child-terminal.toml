@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-el1-linux::native_process_runtime::host_test_support::blocking_wait4_reenters_its_owner_after_host_materialization
 schema_version = 1
 id = "process.native.terminal-child"
 title = "Terminal child retirement and parent handback retain exact execution custody"

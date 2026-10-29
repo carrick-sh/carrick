@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-kernel-example::scheduler_handoff::self_affinity_change_requires_migration_before_return
 schema_version = 1
 id = "kernel.el1.guest-scheduler"
 title = "Guest threads are scheduled across vCPUs inside the guest: blocking handoffs, timed futex waits, preemption and idle need no host exit, and the host still reaches every thread parked on an idle vCPU"

@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-vmm-hvf::trap::transport_test::transport_exit_overhead_contract
 schema_version = 1
 id = "kernel.transport.exit-overhead"
 title = "Forwarded HVF syscall transport imposes zero host register accesses"

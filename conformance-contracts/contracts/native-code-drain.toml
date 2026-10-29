@@ -1,3 +1,7 @@
+# #898 diagnostic-only: entry_binding fatals now retain their invariant
+# reason and caller coordinates. Existing bindings remain the semantic
+# and work-budget evidence. Rerun the existing control:
+# carrick-runtime::vcpu_loop::memory::tests::native_instruction_content_scope_contract
 schema_version = 1
 id = "kernel.mm.native-code-drain"
 title = "Participating host writes revoke and drain active instruction content"
