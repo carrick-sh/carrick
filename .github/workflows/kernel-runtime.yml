@@ -305,6 +305,9 @@ jobs:
 
       - name: Upload signed failure evidence
         if: ${{ failure() || steps.signed-receipt.outputs.failed == 'true' }}
+        # Evidence upload must never change the job verdict: a transient
+        # upload error would otherwise fail a job whose tests passed.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: hvf-failure-evidence-${{ github.sha }}-${{ github.run_attempt }}
