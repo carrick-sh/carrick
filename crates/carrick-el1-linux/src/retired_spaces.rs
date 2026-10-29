@@ -11,7 +11,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use carrick_core::mm::reservation::{ReservationGeometry, ReservationPolicy};
-use carrick_core::mm::transaction::{MmPortal, OwnerVenue};
+use carrick_core::mm::transaction::{MmError, MmPortal, OwnerVenue};
 
 use carrick_el1_abi::{PinnedMetadataExtent, ReservationMm};
 use carrick_mmu_core::owner_mmu::OwnerMmu;
@@ -142,6 +142,29 @@ impl RetiredSpaces {
             |space| retire_closed_space(owner, space.mm, worker),
         )
     }
+
+    /// Carriers with at least one queued entry for `(zone, roots)`.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn carriers_in_scope(&self, zone: usize, roots: usize) -> Vec<NonZeroU64> {
+        let pending = self.pending.lock();
+        let mut carriers = Vec::new();
+        for space in pending.iter() {
+            if space.zone == zone && space.roots == roots && !carriers.contains(&space.carrier) {
+                carriers.push(space.carrier);
+            }
+        }
+        carriers
+    }
+
+    /// Remove every queued entry for `(zone, roots)`, returning how many
+    /// entries remained unretired in that scope.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn purge_scope(&self, zone: usize, roots: usize) -> usize {
+        let mut pending = self.pending.lock();
+        let before = pending.len();
+        pending.retain(|space| !(space.zone == zone && space.roots == roots));
+        before - pending.len()
+    }
 }
 
 impl Default for RetiredSpaces {
@@ -184,7 +207,10 @@ pub fn retire_closed_space<
     owner.spaces.close(index);
     owner
         .root_any(mm, worker)
-        .map_err(|_| NativeProcessError::Stale)?
+        .map_err(|error| match error {
+            MmError::Busy => NativeProcessError::Busy,
+            _ => NativeProcessError::Stale,
+        })?
         .retire_final()
         .map_err(|_| NativeProcessError::Busy)?;
     owner.spaces.free(index);

@@ -434,3 +434,228 @@ fn concurrent_drain_portal_does_not_hide_retiring_child_space() {
     );
     assert!(queue.is_empty());
 }
+
+fn test_reservation_layout() -> carrick_el1_abi::Layout {
+    carrick_el1_abi::Layout {
+        heap: carrick_el1_abi::ReservationRange::new(4096, super::VA).unwrap(),
+        arena: carrick_el1_abi::ReservationRange::new(super::VA, super::VA + 0x1000_0000).unwrap(),
+        policy: carrick_el1_abi::ReservationPolicyPayload::new([4096, u64::MAX, u64::MAX, 0, 0]),
+    }
+}
+
+#[test]
+fn contended_root_keeps_closed_space_queued_until_next_drain() {
+    use crate::retired_spaces::{RetiredSpace, RetiredSpaces};
+    use carrick_core::mm::transaction::{MmError, MmPortal};
+    use carrick_el1::memory::reservations::{NoRootWait, RootReleaseVenue};
+
+    let region = crate::mm_portal::test_support::Region::new();
+    let zone = region.zone();
+    let roots = region.table();
+    let carrier = NonZeroU64::new(1).unwrap();
+
+    let child_mm = ReservationMm::new(7).unwrap();
+    let child_space = zone
+        .spaces
+        .publish_closed(child_mm.raw(), 0x7000, 0x7000)
+        .unwrap();
+    zone.spaces.open(child_space);
+    roots
+        .publish(child_space.index(), child_mm, test_reservation_layout())
+        .unwrap();
+
+    let later_mm = ReservationMm::new(8).unwrap();
+    let later_space = zone
+        .spaces
+        .publish_closed(later_mm.raw(), 0x8000, 0x8000)
+        .unwrap();
+    roots
+        .publish(later_space.index(), later_mm, test_reservation_layout())
+        .unwrap();
+
+    let access = crate::sched::object_wait::space_access(zone, SlotId::new(0));
+    let held_root = RootReleaseVenue::new(roots, access.venue().unwrap())
+        .unwrap()
+        .lock(child_space.index(), child_mm, &NoRootWait)
+        .unwrap();
+
+    let queue = RetiredSpaces::new();
+    for mm in [child_mm, later_mm] {
+        queue.push(RetiredSpace {
+            carrier,
+            zone: core::ptr::from_ref(zone).addr(),
+            roots: core::ptr::from_ref(roots).addr(),
+            mm,
+        });
+    }
+
+    let owner: crate::aarch64_process::Portal<'_> = MmPortal::for_zone(carrier, roots, zone);
+    let first = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
+    assert_eq!((first, queue.len()), (Err(NativeProcessError::Busy), 2));
+    assert!(!zone.spaces.is_open(child_mm.raw()));
+    assert!(zone.spaces.find(child_mm.raw()).is_some());
+    assert!(zone.spaces.find(later_mm.raw()).is_some());
+
+    drop(held_root);
+
+    let second = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
+    assert_eq!(second, Ok(()));
+    assert!(queue.is_empty());
+    assert!(zone.spaces.find(child_mm.raw()).is_none());
+    assert!(zone.spaces.find(later_mm.raw()).is_none());
+    assert!(matches!(owner.root_any(child_mm, 0), Err(MmError::Stale)));
+    assert!(matches!(owner.root_any(later_mm, 0), Err(MmError::Stale)));
+}
+
+#[test]
+fn non_busy_root_any_error_maps_to_stale_and_drops_entry() {
+    use crate::retired_spaces::{RetiredSpace, RetiredSpaces, retire_closed_space};
+    use carrick_core::mm::transaction::MmPortal;
+
+    let region = crate::mm_portal::test_support::Region::new();
+    let zone = region.zone();
+    let roots = region.table();
+    let carrier = NonZeroU64::new(1).unwrap();
+
+    // Space exists in `zone.spaces`, so `spaces.find` and `spaces.close` pass,
+    // but no reservation root was published in `roots`: `root_any` returns
+    // `MmError::Stale`, which must keep mapping to `NativeProcessError::Stale`.
+    let unrooted_mm = ReservationMm::new(9).unwrap();
+    zone.spaces
+        .publish_closed(unrooted_mm.raw(), 0x9000, 0x9000)
+        .unwrap();
+
+    let valid_mm = ReservationMm::new(10).unwrap();
+    let valid_space = zone
+        .spaces
+        .publish_closed(valid_mm.raw(), 0xa000, 0xa000)
+        .unwrap();
+    roots
+        .publish(valid_space.index(), valid_mm, test_reservation_layout())
+        .unwrap();
+
+    let owner: crate::aarch64_process::Portal<'_> = MmPortal::for_zone(carrier, roots, zone);
+    assert_eq!(
+        retire_closed_space(&owner, unrooted_mm, 0),
+        Err(NativeProcessError::Stale)
+    );
+
+    let queue = RetiredSpaces::new();
+    for mm in [unrooted_mm, valid_mm] {
+        queue.push(RetiredSpace {
+            carrier,
+            zone: core::ptr::from_ref(zone).addr(),
+            roots: core::ptr::from_ref(roots).addr(),
+            mm,
+        });
+    }
+
+    let result = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
+    assert_eq!(result, Err(NativeProcessError::Stale));
+    assert!(queue.is_empty());
+    assert!(zone.spaces.find(valid_mm.raw()).is_none());
+}
+
+#[test]
+fn region_teardown_drains_and_clears_shared_retired_spaces_before_address_reuse() {
+    use crate::aarch64_process::{
+        Portal, drain_and_clear_retired_scope, push_retired_space_for_test,
+    };
+    use crate::mm_portal::test_support::Region;
+    use crate::retired_spaces::RetiredSpace;
+    use carrick_core::mm::transaction::MmPortal;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // 1. A ready entry left in `RETIRED_SPACES` retires cleanly when `Region` drops.
+    {
+        let region = Region::new();
+        let zone = region.zone();
+        let roots = region.table();
+        let mm = ReservationMm::new(2).unwrap();
+        let space = zone
+            .spaces
+            .publish_closed(mm.raw(), 0x2000, 0x2000)
+            .unwrap();
+        roots
+            .publish(space.index(), mm, test_reservation_layout())
+            .unwrap();
+        push_retired_space_for_test(RetiredSpace {
+            carrier: NonZeroU64::MIN,
+            zone: core::ptr::from_ref(zone).addr(),
+            roots: core::ptr::from_ref(roots).addr(),
+            mm,
+        });
+    }
+
+    // 2. If a test panics while an unretireable entry (`mm = 1` still installed
+    //    on slot 0) is queued for `(NonZeroU64::MIN, zone, roots)`, `Region::drop`
+    //    purges that scope before freeing memory so a subsequent `Region` cannot
+    //    inherit the stale entry even at the same heap addresses.
+    let panic_unwind = catch_unwind(AssertUnwindSafe(|| {
+        let region = Region::new();
+        let zone = region.zone();
+        let roots = region.table();
+        let mm = ReservationMm::new(1).unwrap();
+        let space = zone
+            .spaces
+            .publish_closed(mm.raw(), 0x1000, 0x1000)
+            .unwrap();
+        zone.spaces.open(space);
+        zone.install_space(SlotId::new(0), mm.raw()).unwrap();
+        roots
+            .publish(space.index(), mm, test_reservation_layout())
+            .unwrap();
+        push_retired_space_for_test(RetiredSpace {
+            carrier: NonZeroU64::MIN,
+            zone: core::ptr::from_ref(zone).addr(),
+            roots: core::ptr::from_ref(roots).addr(),
+            mm,
+        });
+        panic!("simulated mid-test failure with queued space");
+    }));
+    assert!(panic_unwind.is_err());
+
+    {
+        let next = Region::new();
+        let zone = next.zone();
+        let roots = next.table();
+        let mm = ReservationMm::new(1).unwrap();
+        let space = zone
+            .spaces
+            .publish_closed(mm.raw(), 0x1000, 0x1000)
+            .unwrap();
+        roots
+            .publish(space.index(), mm, test_reservation_layout())
+            .unwrap();
+        assert_eq!(drain_and_clear_retired_scope(zone, roots), 0);
+        // `next`'s own `mm = 1` was not retired by a leftover entry from the prior `Region`.
+        assert!(zone.spaces.find(mm.raw()).is_some());
+        let owner: Portal<'_> = MmPortal::for_zone(NonZeroU64::MIN, roots, zone);
+        assert!(owner.root_any(mm, 0).is_ok());
+    }
+
+    // 3. A normal (non-panicking) teardown with an unretireable entry fails the
+    //    fixture assertion at drop while still purging the shared queue.
+    let leaked_entry = catch_unwind(AssertUnwindSafe(|| {
+        let region = Region::new();
+        let zone = region.zone();
+        let roots = region.table();
+        let mm = ReservationMm::new(1).unwrap();
+        let space = zone
+            .spaces
+            .publish_closed(mm.raw(), 0x1000, 0x1000)
+            .unwrap();
+        zone.spaces.open(space);
+        zone.install_space(SlotId::new(0), mm.raw()).unwrap();
+        roots
+            .publish(space.index(), mm, test_reservation_layout())
+            .unwrap();
+        push_retired_space_for_test(RetiredSpace {
+            carrier: NonZeroU64::MIN,
+            zone: core::ptr::from_ref(zone).addr(),
+            roots: core::ptr::from_ref(roots).addr(),
+            mm,
+        });
+    }));
+    assert!(leaked_entry.is_err());
+}

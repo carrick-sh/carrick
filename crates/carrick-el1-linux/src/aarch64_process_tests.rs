@@ -955,6 +955,19 @@ impl Fixture {
     }
 }
 
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let leftover =
+            super::aarch64_process::drain_and_clear_retired_scope(self.zone, self.region.table());
+        if !std::thread::panicking() {
+            assert_eq!(
+                leftover, 0,
+                "Fixture dropped with {leftover} unretired space(s) still queued in RETIRED_SPACES"
+            );
+        }
+    }
+}
+
 #[test]
 fn native_process_entry_uses_parked_root_generation_after_record_reuse() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
