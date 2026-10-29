@@ -4647,6 +4647,53 @@ fn delegated_first_touch_stock_covers_the_roots_holes_in_the_window() {
     assert_eq!(stock_span(&dispatcher, base + 5 * PAGE), None);
 }
 
+/// A node edit between the owner read and the stock-policy lock must make
+/// the adapter decline the stale observation, preserving caller fallback.
+#[test]
+fn delegated_private_stock_policy_rejects_changed_fault_node() {
+    for replace in [false, true] {
+        let dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let page = LINUX_MMAP_BASE + STOCK_WINDOW + 2 * PAGE;
+        root.guest_mmap(
+            Placement::Fixed(page),
+            PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+        let authority = dispatcher.mem();
+        let mem = authority.lock();
+        let fault::FirstTouchOwner::Root(mapping, incarnation) =
+            mem.try_first_touch_owner(page).unwrap()
+        else {
+            panic!("expected a root-owned fault node");
+        };
+        assert!(
+            mem.try_root_grant_for_page(&mapping, incarnation, page, STOCK_WINDOW)
+                .unwrap()
+                .is_some()
+        );
+        if replace {
+            root.guest_mmap(
+                Placement::Fixed(page),
+                PAGE,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap();
+            assert_ne!(root.lock().node(page).unwrap().1, incarnation);
+        } else {
+            root.guest_mprotect(page, PAGE, READ);
+            assert_eq!(root.lock().node(page).unwrap().1, incarnation);
+        }
+        assert!(
+            mem.try_root_grant_for_page(&mapping, incarnation, page, STOCK_WINDOW)
+                .unwrap()
+                .is_none(),
+            "stale observation after replacement={replace}"
+        );
+    }
+}
+
 /// The host adapter uses the shared policy without mixing occupancy between
 /// two simultaneously admitted roots at identical VAs.
 #[test]
