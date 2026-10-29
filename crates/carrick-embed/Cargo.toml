@@ -75,6 +75,8 @@ carrick-thread = { path = "../carrick-thread", features = ["test-support"] }
 carrick-runtime = { path = "../carrick-runtime", default-features = false, features = ["test-support"] }
 carrick-el1-image = { path = "../carrick-el1-image", features = ["allocator-test-control"] }
 carrick-kernel = { path = "../carrick-kernel", features = ["deferred-capture-test-control"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 flate2.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -86,3 +88,4 @@ carrick-vmm-hvf = { path = "../carrick-vmm-hvf", features = ["metadata-grant-tes
 # Test gate lanes (`just xtask test-lanes check`; carrick-xtask src/test_lanes.rs).
 [package.metadata.carrick.test-lanes]
 "*" = "signed-hvf"
+harness_diagnostics = "host"
