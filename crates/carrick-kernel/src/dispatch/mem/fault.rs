@@ -1649,6 +1649,10 @@ impl<'a> MemView<'a> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[allow(
+        clippy::expect_used,
+        reason = "fixture adapter requires an available root; Busy witnesses use the typed planner directly"
+    )]
     pub(crate) fn with_resident_fault_plan_for_test<T>(
         &self,
         addr: u64,
@@ -1662,6 +1666,10 @@ impl<'a> MemView<'a> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    #[allow(
+        clippy::expect_used,
+        reason = "fixture adapter requires an available root; Busy witnesses use the typed planner directly"
+    )]
     pub(crate) fn with_resident_frame_grant_plan_for_test<T>(
         &self,
         addr: u64,
