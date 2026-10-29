@@ -3085,10 +3085,16 @@ impl super::thread_setup::LifecycleVenue for Fixture {
     }
     fn born_slot(
         &self,
-        _: &ThreadLifecyclePage,
-        _: carrick_el1_abi::EntryRef,
+        page: &ThreadLifecyclePage,
+        entry: carrick_el1_abi::EntryRef,
     ) -> Option<&ThreadControlSlot> {
-        None
+        let address = page.control_address(entry)?;
+        if address == 0
+            || !address.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
+        {
+            return None;
+        }
+        Some(unsafe { &*(address as *const ThreadControlSlot) })
     }
     fn wake_unplaceable_wait(
         &self,

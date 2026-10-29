@@ -71,6 +71,7 @@ pub(super) enum PersistentHvpatchCloneAttempt {
         prepared: Option<carrick_kernel::kernel::PreparedThreadClone>,
         subscription: CloneRetrySubscription,
     },
+    OwnerMemory(Box<carrick_kernel::dispatch::DispatchOutcome>),
 }
 
 /// What a parked thread clone waits on before it is retried.

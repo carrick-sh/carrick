@@ -2535,16 +2535,19 @@ where
         let linux_tid = prepared.tid();
         let visible_tid = prepared.visible_tid();
         let tid = ThreadId::from_guest_supplied_tid(linux_tid.raw());
-        let tid_outputs = match threads::CloneTidOutputTransaction::capture(
+        let mut tid_outputs = match threads::CloneTidOutputTransaction::capture(
             memory,
             parent_tid_addr,
             child_tid_addr,
         ) {
             Ok(outputs) => outputs,
-            Err(errno) => {
+            Err(threads::CloneTidCaptureError::Errno(errno)) => {
                 return Ok(PersistentHvpatchCloneAttempt::Complete(
                     threads::CloneThreadSpawn::Errno(errno),
                 ));
+            }
+            Err(threads::CloneTidCaptureError::Owner(outcome)) => {
+                return Ok(PersistentHvpatchCloneAttempt::OwnerMemory(outcome));
             }
         };
         let (task_key, thread_key, mm, expected_generation) =
@@ -2593,16 +2596,28 @@ where
             mm.raw(),
             asid_generation,
         )?;
-        if !tid_outputs.publish(memory, visible_tid, tid) {
-            tid_outputs.rollback(memory).map_err(|error| {
-                RuntimeError::Configuration(format!(
-                    "restore failed HVPatch clone TID copyout: {error}"
-                ))
-            })?;
-            ops.abort(prepared_backend)?;
-            return Ok(PersistentHvpatchCloneAttempt::Complete(
-                threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EFAULT),
-            ));
+        match tid_outputs.publish_outcome(memory, visible_tid, tid) {
+            threads::CloneTidPublishOutcome::Published => {}
+            threads::CloneTidPublishOutcome::Fault => {
+                tid_outputs.rollback(memory).map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "restore failed HVPatch clone TID copyout: {error}"
+                    ))
+                })?;
+                ops.abort(prepared_backend)?;
+                return Ok(PersistentHvpatchCloneAttempt::Complete(
+                    threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EFAULT),
+                ));
+            }
+            threads::CloneTidPublishOutcome::Owner(outcome) => {
+                tid_outputs.rollback(memory).map_err(|error| {
+                    RuntimeError::Configuration(format!(
+                        "restore suspended HVPatch clone TID copyout: {error}"
+                    ))
+                })?;
+                ops.abort(prepared_backend)?;
+                return Ok(PersistentHvpatchCloneAttempt::OwnerMemory(outcome));
+            }
         }
         if let Err(error) =
             check_hvpatch_clone_failpoint(parent_context.task(), HvpatchCloneFailpoint::TidCopyout)
@@ -3893,6 +3908,15 @@ where
                         &mut ProductionHvpatchCloneBackendOps,
                     )? {
                         PersistentHvpatchCloneAttempt::Complete(spawned) => spawned,
+                        PersistentHvpatchCloneAttempt::OwnerMemory(outcome) => {
+                            return self.service_outcome(
+                                engine,
+                                control,
+                                frame,
+                                *outcome,
+                                Some(OwnedSyscallResume::CopyoutRedispatch),
+                            );
+                        }
                         PersistentHvpatchCloneAttempt::Wait {
                             prepared,
                             subscription,
@@ -4795,6 +4819,14 @@ where
                         PersistentHvpatchCloneAttempt::Complete(spawned) => {
                             Ok(self.complete_persistent_hvpatch_clone(engine, spawned)?)
                         }
+                        PersistentHvpatchCloneAttempt::OwnerMemory(outcome) => self
+                            .service_outcome(
+                                engine,
+                                control,
+                                frame,
+                                *outcome,
+                                Some(OwnedSyscallResume::CopyoutRedispatch),
+                            ),
                         PersistentHvpatchCloneAttempt::Wait {
                             prepared,
                             subscription,

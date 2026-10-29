@@ -217,30 +217,57 @@ impl<E: ThreadedEngine> CloneTidMemory for E {
     }
 }
 
+pub(super) enum CloneTidCaptureError {
+    Errno(crate::linux_abi::LinuxErrno),
+    Owner(Box<carrick_kernel::dispatch::DispatchOutcome>),
+}
+
+impl std::fmt::Debug for CloneTidCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Errno(errno) => f.debug_tuple("Errno").field(errno).finish(),
+            Self::Owner(outcome) => f.debug_tuple("Owner").field(outcome).finish(),
+        }
+    }
+}
+
+pub(super) enum CloneTidPublishOutcome {
+    Published,
+    Fault,
+    Owner(Box<carrick_kernel::dispatch::DispatchOutcome>),
+}
+
 impl CloneTidOutputTransaction {
     pub(super) fn capture<E: CloneTidMemory>(
         engine: &E,
         parent_address: u64,
         child_address: u64,
-    ) -> Result<Self, crate::linux_abi::LinuxErrno> {
+    ) -> Result<Self, CloneTidCaptureError> {
         let read = |address: u64| {
             if address == 0 {
-                Some(None)
+                Ok(None)
             } else {
                 engine
                     .read_clone_tid_bytes(address, std::mem::size_of::<i32>())
-                    .ok()
                     .map(Some)
+                    .map_err(|error| {
+                        carrick_kernel::dispatch::DispatchOutcome::from_owner_memory_error(error)
+                            .map_or(
+                                CloneTidCaptureError::Errno(crate::linux_abi::LINUX_EFAULT),
+                                |outcome| CloneTidCaptureError::Owner(Box::new(outcome)),
+                            )
+                    })
             }
         };
         Ok(Self {
             parent_address,
-            parent_preimage: read(parent_address).ok_or(crate::linux_abi::LINUX_EFAULT)?,
+            parent_preimage: read(parent_address)?,
             child_address,
-            child_preimage: read(child_address).ok_or(crate::linux_abi::LINUX_EFAULT)?,
+            child_preimage: read(child_address)?,
         })
     }
 
+    #[cfg(test)]
     pub(super) fn publish<E: CloneTidMemory>(
         &self,
         engine: &mut E,
@@ -248,19 +275,69 @@ impl CloneTidOutputTransaction {
         backend_tid: ThreadId,
     ) -> bool {
         let bytes = visible_tid.to_le_bytes();
-        self.publish_one(
+        matches!(
+            self.publish_one(
+                engine,
+                backend_tid,
+                carrick_observability::probes::HvpatchCloneTidOutput::Parent,
+                self.parent_address,
+                &bytes,
+            ),
+            CloneTidPublishOutcome::Published
+        ) && matches!(
+            self.publish_one(
+                engine,
+                backend_tid,
+                carrick_observability::probes::HvpatchCloneTidOutput::Child,
+                self.child_address,
+                &bytes,
+            ),
+            CloneTidPublishOutcome::Published
+        )
+    }
+
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(super) fn publish_outcome<E: CloneTidMemory>(
+        &mut self,
+        engine: &mut E,
+        visible_tid: i32,
+        backend_tid: ThreadId,
+    ) -> CloneTidPublishOutcome {
+        let bytes = visible_tid.to_le_bytes();
+        match self.publish_one(
             engine,
             backend_tid,
             carrick_observability::probes::HvpatchCloneTidOutput::Parent,
             self.parent_address,
             &bytes,
-        ) && self.publish_one(
+        ) {
+            CloneTidPublishOutcome::Published => {}
+            outcome => {
+                if matches!(outcome, CloneTidPublishOutcome::Owner(_)) {
+                    self.parent_preimage = None;
+                    self.child_preimage = None;
+                }
+                return outcome;
+            }
+        }
+        match self.publish_one(
             engine,
             backend_tid,
             carrick_observability::probes::HvpatchCloneTidOutput::Child,
             self.child_address,
             &bytes,
-        )
+        ) {
+            CloneTidPublishOutcome::Published => CloneTidPublishOutcome::Published,
+            outcome => {
+                if matches!(outcome, CloneTidPublishOutcome::Owner(_)) {
+                    self.child_preimage = None;
+                }
+                outcome
+            }
+        }
     }
 
     fn publish_one<E: CloneTidMemory>(
@@ -270,9 +347,9 @@ impl CloneTidOutputTransaction {
         output: carrick_observability::probes::HvpatchCloneTidOutput,
         address: u64,
         bytes: &[u8],
-    ) -> bool {
+    ) -> CloneTidPublishOutcome {
         if address == 0 {
-            return true;
+            return CloneTidPublishOutcome::Published;
         }
         let result = engine.write_clone_tid_bytes(address, bytes);
         let result_kind = match &result {
@@ -310,7 +387,13 @@ impl CloneTidOutputTransaction {
             }
         };
         crate::probes::mn_clone_tid_output(backend_tid.raw(), output, address, result_kind);
-        result.is_ok()
+        match result {
+            Ok(()) => CloneTidPublishOutcome::Published,
+            Err(error) => carrick_kernel::dispatch::DispatchOutcome::from_owner_memory_error(error)
+                .map_or(CloneTidPublishOutcome::Fault, |outcome| {
+                    CloneTidPublishOutcome::Owner(Box::new(outcome))
+                }),
+        }
     }
 
     pub(super) fn rollback<E: CloneTidMemory>(
@@ -670,6 +753,110 @@ mod clone_tid_output_tests {
         assert!(transaction.rollback(&mut memory).is_err());
         assert_eq!(memory.bytes[&parent], 99_i32.to_le_bytes());
         assert_eq!(memory.bytes[&child], 41_i32.to_le_bytes());
+    }
+
+    #[test]
+    fn owner_suspension_in_tid_capture_or_publish_preserves_wait_outcome_without_efault() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use carrick_guest_mem::MemoryError;
+        use std::num::NonZeroU64;
+
+        struct SuspendingMemory {
+            bytes: std::collections::BTreeMap<u64, Vec<u8>>,
+            suspend_read: Option<(u64, PortalOwnerWait)>,
+            suspend_write: Option<(u64, PortalOwnerWait)>,
+            writes: Vec<u64>,
+        }
+
+        impl CloneTidMemory for SuspendingMemory {
+            fn read_clone_tid_bytes(
+                &self,
+                address: u64,
+                _len: usize,
+            ) -> Result<Vec<u8>, MemoryError> {
+                if let Some((target, wait)) = self.suspend_read
+                    && target == address
+                {
+                    return Err(MemoryError::OwnerWait(wait));
+                }
+                self.bytes
+                    .get(&address)
+                    .cloned()
+                    .ok_or(MemoryError::OutOfBounds { address, length: 4 })
+            }
+
+            fn write_clone_tid_bytes(
+                &mut self,
+                address: u64,
+                bytes: &[u8],
+            ) -> Result<(), MemoryError> {
+                if let Some((target, wait)) = self.suspend_write
+                    && target == address
+                {
+                    return Err(MemoryError::OwnerWait(wait));
+                }
+                self.writes.push(address);
+                self.bytes.insert(address, bytes.to_vec());
+                Ok(())
+            }
+        }
+
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(7).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Reservations,
+                19,
+            )
+        };
+        let parent = 0x6000_40b0_00;
+        let child = 0x6000_40b0_04;
+        let mut memory = SuspendingMemory {
+            bytes: std::collections::BTreeMap::from([
+                (parent, 11_i32.to_le_bytes().to_vec()),
+                (child, 22_i32.to_le_bytes().to_vec()),
+            ]),
+            suspend_read: Some((parent, wait)),
+            suspend_write: None,
+            writes: Vec::new(),
+        };
+
+        let Err(CloneTidCaptureError::Owner(outcome)) =
+            CloneTidOutputTransaction::capture(&memory, parent, child)
+        else {
+            panic!("expected owner memory wait from suspended TID capture");
+        };
+        assert_eq!(
+            *outcome,
+            carrick_kernel::dispatch::DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+
+        memory.suspend_read = None;
+        let Ok(mut transaction) = CloneTidOutputTransaction::capture(&memory, parent, child) else {
+            panic!("uncontended TID capture must succeed");
+        };
+        memory.suspend_write = Some((child, wait));
+        let CloneTidPublishOutcome::Owner(outcome) =
+            transaction.publish_outcome(&mut memory, 9, ThreadId::synthetic_for_tests(99))
+        else {
+            panic!("expected owner memory wait from suspended TID publish");
+        };
+        assert_eq!(
+            *outcome,
+            carrick_kernel::dispatch::DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        assert_eq!(memory.bytes[&parent], 9_i32.to_le_bytes());
+        assert_eq!(memory.bytes[&child], 22_i32.to_le_bytes());
+
+        // Rolling back a child suspension restores the written parent preimage
+        // without attempting a write to the suspended child address.
+        transaction.rollback(&mut memory).unwrap();
+        assert_eq!(memory.bytes[&parent], 11_i32.to_le_bytes());
+        assert_eq!(memory.bytes[&child], 22_i32.to_le_bytes());
+        assert_eq!(memory.writes, vec![parent, parent]);
     }
 
     /// The exec-from-thread teardown class (execfromthread, forkexecstorm,
