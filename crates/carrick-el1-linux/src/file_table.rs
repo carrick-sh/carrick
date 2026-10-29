@@ -834,7 +834,7 @@ pub fn resolve_poll_with_host_readiness(
                         .records()
                         != 0
                     {
-                        events::IN
+                        events::IN | events::RDNORM
                     } else {
                         0
                     },

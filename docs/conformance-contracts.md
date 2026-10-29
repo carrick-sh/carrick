@@ -2568,7 +2568,8 @@ replayed prefix on resume and no additional poll readiness query after its
 answer has completed. The existing transfer and IPC work bounds remain intact.
 Signed IPC and `el1_sched` binding, COW supply integration, runtime ratios and
 artifact promotion remain director-owned. Readv/pselect6 routing and x86 IPC
-binding remain the separately authorized work in #1040; no route changes here.
+binding remain the separately authorized work in #1040. Production ppoll
+admission and refusal policy are described below.
 
 The production AArch64 `TrapFrame` now admits ppoll to that same family.
 `production_trap_frame_routes_ppoll_to_the_poll_family` was red because it
