@@ -32,19 +32,17 @@ type BusyHook = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
 #[derive(Clone)]
 struct Carrier {
-    table: Arc<SharedReservations>,
-    slots: Arc<std::sync::Mutex<Vec<ReservationMm>>>,
+    table: Arc<CarrierRegion>,
+    slots: Arc<std::sync::Mutex<Vec<(ReservationMm, usize)>>>,
     busy_hook: BusyHook,
 }
 
 impl Carrier {
     fn new() -> Self {
-        // Same zeroed-region initialization as EL1 bootstrap.
-        let ptr =
-            unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::new::<SharedReservations>()) };
-        assert!(!ptr.is_null());
+        let table = Arc::new(CarrierRegion(carrick_test_support::TestEl1Region::zeroed()));
+        assert!(table.portal().bind_carrier(table.identity()));
         Self {
-            table: Arc::from(unsafe { Box::<SharedReservations>::from_raw(ptr.cast()) }),
+            table,
             slots: Arc::default(),
             busy_hook: Arc::default(),
         }
@@ -55,7 +53,7 @@ impl Carrier {
             .lock()
             .unwrap()
             .iter()
-            .position(|published| *published == mm)
+            .find_map(|(published, index)| (*published == mm).then_some(*index))
             .ok_or(Refusal::Stale)
     }
 
@@ -64,11 +62,14 @@ impl Carrier {
     fn publish(&self, dispatcher: &SyscallDispatcher) -> ReservationMm {
         let mm = ReservationMm::new(dispatcher.mm_authority().mm_id.raw()).unwrap();
         let layout = dispatcher.mem().lock().layout;
-        let index = {
-            let mut slots = self.slots.lock().unwrap();
-            slots.push(mm);
-            slots.len() - 1
-        };
+        let index = self
+            .table
+            .zone()
+            .spaces
+            .publish_closed(mm.raw(), 0x30000, 0x30000)
+            .unwrap()
+            .index();
+        self.slots.lock().unwrap().push((mm, index));
         self.table
             .publish(
                 index,
@@ -101,14 +102,104 @@ pub(in crate::dispatch) struct Root {
     pub(in crate::dispatch) mm: ReservationMm,
 }
 
+struct CarrierRegion(Box<carrick_test_support::TestEl1Region>);
+impl std::ops::Deref for CarrierRegion {
+    type Target = SharedReservations;
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the aligned allocation retains the exact ABI region.
+        unsafe {
+            &*self
+                .0
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize)
+                .cast()
+        }
+    }
+}
+impl CarrierRegion {
+    fn identity(&self) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(self.0.as_ptr() as u64).unwrap()
+    }
+    fn portal(&self) -> &carrick_el1_abi::MmPortalSlots {
+        // SAFETY: the retained aligned ABI region includes these slots.
+        unsafe {
+            &*self
+                .0
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                .cast()
+        }
+    }
+
+    fn zone(&self) -> &carrick_el1_abi::ZoneTables {
+        // SAFETY: this table is co-located with the retained reservation owner.
+        unsafe {
+            &*self
+                .0
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast()
+        }
+    }
+    fn venue(&self) -> carrick_el1::memory::reservations::RootReleaseVenue<'_> {
+        fn deliver(
+            zone: &carrick_el1_abi::ZoneTables,
+            _: carrick_sched_core::Waker,
+            effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >,
+        ) {
+            carrick_sched_core::LockWait::complete_object_wake(
+                &crate::el1_zone::HostLockWait,
+                zone,
+                effects,
+            );
+        }
+        carrick_el1::memory::reservations::RootReleaseVenue::new(
+            self,
+            carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+                zone: self.zone(),
+                waker: carrick_sched_core::Waker::Host,
+                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
+                    deliver,
+                ),
+            },
+        )
+        .unwrap()
+    }
+    fn lock_el1(
+        &self,
+        index: usize,
+        mm: ReservationMm,
+        slot: u32,
+    ) -> Result<Reservations<'_>, Refusal> {
+        self.venue().lock_el1(index, mm, slot)
+    }
+}
+// SAFETY: every view retains this exact allocation, whose shared tables use
+// their normal atomic/root-lock protocol. The fixture never relocates it.
+unsafe impl crate::kernel::mm_occupancy::AddressSpaceBacking for CarrierRegion {
+    fn region(&self) -> Option<crate::kernel::mm_occupancy::AddressSpaceRegion<'_>> {
+        Some(crate::kernel::mm_occupancy::AddressSpaceRegion {
+            carrier: self.identity(),
+            zone: self.zone(),
+            reservations: self,
+        })
+    }
+    fn settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
+        None
+    }
+}
+
 struct View(Carrier);
 impl PreparedHostReservations for View {
-    fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
-        let result = self.0.table.lock_waiting_with_context(
-            self.0.slot(mm)?,
-            mm,
-            &carrick_el1::memory::reservations::NoRootWait,
-        );
+    fn lock(
+        &self,
+        mm: ReservationMm,
+        wait: &dyn carrick_el1::memory::reservations::RootWait,
+    ) -> Result<Reservations<'_>, Refusal> {
+        let result = self.0.table.venue().lock(self.0.slot(mm)?, mm, wait);
         if matches!(result, Err(Refusal::Busy)) {
             let hook = self.0.busy_hook.lock().unwrap().take();
             if let Some(hook) = hook {
@@ -125,20 +216,38 @@ struct UnavailableProvider {
     requests: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl HostReservationProvider for UnavailableProvider {
+    fn address_space_backing(
+        &self,
+    ) -> Option<Arc<dyn crate::kernel::mm_occupancy::AddressSpaceBacking>> {
+        Some(self.carrier.table.clone())
+    }
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
         Ok(Box::new(View(self.carrier.clone())))
     }
-    fn provision_metadata(&self, _mm: ReservationMm) -> Result<(), Refusal> {
+    fn provision_metadata(
+        &self,
+        _mm: ReservationMm,
+        _wait: &dyn carrick_el1::memory::reservations::RootWait,
+    ) -> Result<(), Refusal> {
         self.requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Err(Refusal::MetadataRequired)
     }
 }
 impl HostReservationProvider for Provider {
+    fn address_space_backing(
+        &self,
+    ) -> Option<Arc<dyn crate::kernel::mm_occupancy::AddressSpaceBacking>> {
+        Some(self.0.table.clone())
+    }
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
         Ok(Box::new(View(self.0.clone())))
     }
-    fn provision_metadata(&self, _mm: ReservationMm) -> Result<(), Refusal> {
+    fn provision_metadata(
+        &self,
+        _mm: ReservationMm,
+        _wait: &dyn carrick_el1::memory::reservations::RootWait,
+    ) -> Result<(), Refusal> {
         // This deliberately finite reference substrate models a configured
         // map-count resource limit. Unlike production carrier capacity, that
         // Linux limit has an ENOMEM answer and no elastic backing service.
@@ -245,7 +354,15 @@ impl Root {
 
     pub(in crate::dispatch) fn lock(&self) -> Reservations<'_> {
         let slot = self.carrier.slot(self.mm).unwrap();
-        self.carrier.table.lock_with_context(slot, self.mm).unwrap()
+        self.carrier
+            .table
+            .venue()
+            .lock(
+                slot,
+                self.mm,
+                &carrick_el1::memory::reservations::NoRootWait,
+            )
+            .unwrap()
     }
 
     /// What guest EL1 does for `brk` on its own venue.
@@ -3817,13 +3934,17 @@ fn fixture_owner_fork(
         .reservation_provider_for_publication()
         .ok_or(Refusal::Stale)?;
     let view = provider.prepare()?;
-    let mut parent_root =
-        view.lock(ReservationMm::new(parent_authority.mm_id.raw()).ok_or(Refusal::Stale)?)?;
+    let mut parent_root = view.lock(
+        ReservationMm::new(parent_authority.mm_id.raw()).ok_or(Refusal::Stale)?,
+        &carrick_el1::memory::reservations::NoRootWait,
+    )?;
     if parent_root.generation() != seed.generation || parent_root.mm() != seed.parent {
         return Err(Refusal::Stale);
     }
-    let mut child_root =
-        view.lock(ReservationMm::new(child_authority.mm_id.raw()).ok_or(Refusal::Stale)?)?;
+    let mut child_root = view.lock(
+        ReservationMm::new(child_authority.mm_id.raw()).ok_or(Refusal::Stale)?,
+        &carrick_el1::memory::reservations::NoRootWait,
+    )?;
     let nz = |value| std::num::NonZeroU64::new(value).unwrap();
     let request = carrick_el1_abi::PortalForkRequest {
         operation: carrick_el1_abi::PortalOperation {
@@ -3881,14 +4002,20 @@ fn fixture_finish_owner_fork(
         .reservation_provider_for_publication()
         .unwrap();
     let view = provider.prepare().unwrap();
-    view.lock(completion.request.operation.mm)
-        .unwrap()
-        .finish_fork_publication(completion.request.operation)
-        .unwrap();
-    view.lock(completion.request.child_mm)
-        .unwrap()
-        .finish_fork_publication(completion.request.operation)
-        .unwrap();
+    view.lock(
+        completion.request.operation.mm,
+        &carrick_el1::memory::reservations::NoRootWait,
+    )
+    .unwrap()
+    .finish_fork_publication(completion.request.operation)
+    .unwrap();
+    view.lock(
+        completion.request.child_mm,
+        &carrick_el1::memory::reservations::NoRootWait,
+    )
+    .unwrap()
+    .finish_fork_publication(completion.request.operation)
+    .unwrap();
     let _ = child;
 }
 /// The fork-commit admission of `child`, holding both MM permits and consuming
@@ -6564,4 +6691,63 @@ fn delegated_live_leaf_reconciliation_survives_busy_root() {
             .resident
             .contains(base, ResidencyOwner::Root(incarnation))
     );
+}
+
+#[test]
+fn busy_root_reports_the_exact_holder_and_preprobe_owner_wait() {
+    use carrick_el1::memory::reservations::RootHolder;
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let delegated = dispatcher.mem().lock().delegated_root().cloned().unwrap();
+    let slot = root.carrier.slot(root.mm).unwrap();
+    let source = root
+        .carrier
+        .table
+        .zone()
+        .space_entry(std::num::NonZeroU64::new(root.mm.raw()).unwrap())
+        .unwrap()
+        .live_notifications()
+        .unwrap();
+    let held = root.carrier.table.lock_el1(slot, root.mm, 9).unwrap();
+    let before = source.observe(SpaceWaitCause::Reservations).revision();
+    let RootAccessRefusal::Busy(busy) = delegated.with_root(|_| Ok(())).unwrap_err() else {
+        panic!("a held root must retain its wait and actual holder");
+    };
+    assert_eq!(busy.holder, RootHolder::El1Slot(9));
+    assert_eq!(busy.wait.handle().mm(), root.mm);
+    assert_eq!(busy.wait.revision(), before);
+    assert_eq!(
+        busy.wait.cause(),
+        carrick_el1_abi::PortalWaitCause::Reservations
+    );
+    root.carrier
+        .table
+        .portal()
+        .authenticate_wait(root.carrier.table.zone(), busy.wait)
+        .unwrap();
+    drop(held);
+    // The peer releases inside the fixture's provider callback, before the
+    // actual Busy reaches its caller. The receipt must keep the OLD revision.
+    let RootAccessRefusal::Busy(busy) = root
+        .with_held_root_refusal(|| delegated.with_root(|_| Ok(())))
+        .unwrap_err()
+    else {
+        panic!("release before return cannot erase the refused acquisition");
+    };
+    assert_eq!(busy.holder, RootHolder::Host);
+    let after = source.observe(SpaceWaitCause::Reservations).revision();
+    assert!(
+        busy.wait.revision() < after,
+        "release before enrollment must change the sampled revision"
+    );
+    let enrollment = root
+        .carrier
+        .table
+        .portal()
+        .authenticate_wait(root.carrier.table.zone(), busy.wait)
+        .unwrap();
+    assert_eq!(enrollment.revision(), busy.wait.revision());
+    assert!(enrollment.is_live());
+    assert!(delegated.with_root(|_| Ok(())).is_ok());
 }

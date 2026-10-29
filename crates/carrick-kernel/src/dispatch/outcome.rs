@@ -1180,6 +1180,8 @@ pub enum DispatchError {
     /// copy exists to answer from instead.
     #[error("reservation root refused a host-venue step: {0:?}")]
     ReservationAuthority(carrick_el1::memory::reservations::Refusal),
+    #[error("reservation root busy: {0:?}")]
+    ReservationBusy(super::mem::ReservationBusy),
     #[error("MM executor admission failed: {0}")]
     MmExecutorAdmission(crate::kernel::MmOccupancyError),
     #[error("MM mutation requires a page-table pause while a peer executor is active")]

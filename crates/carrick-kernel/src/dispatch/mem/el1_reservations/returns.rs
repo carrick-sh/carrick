@@ -28,7 +28,7 @@ use carrick_el1_abi::ReservationSequence;
 #[derive(::core::fmt::Debug)]
 pub enum El1ReturnError {
     /// The permit is not this MM's, or the root refused a host-venue step.
-    Authority(Refusal),
+    Authority(RootAccessRefusal),
     /// The backend could not retire an owed extent.
     Backend {
         range: ReservationRange,
@@ -125,7 +125,7 @@ impl MemView<'_> {
     ) -> Result<usize, El1ReturnError> {
         let authority = self.mm_authority();
         if !permit.authorizes(&authority.mutation_coordinator, authority.mm_id) {
-            return Err(El1ReturnError::Authority(Refusal::Stale));
+            return Err(El1ReturnError::Authority(Refusal::Stale.into()));
         }
         let Some(root) = self.mem().lock().delegated_root().cloned() else {
             return Ok(0);
@@ -144,7 +144,7 @@ impl MemView<'_> {
             let mut dispatch = self.begin_conditional_vma_dispatch(permit);
             for range in owed.iter().chain(&stock) {
                 let len = usize::try_from(range.len())
-                    .map_err(|_| El1ReturnError::Authority(Refusal::Invalid))?;
+                    .map_err(|_| El1ReturnError::Authority(Refusal::Invalid.into()))?;
                 if let Err(error) = memory.unmap_range(range.start(), len) {
                     // Nothing is acknowledged; the stock is retried too.
                     self.restore_first_touch_stock(stock_spans);

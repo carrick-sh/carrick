@@ -5,6 +5,56 @@
 
 use super::*;
 use crate::dispatch::mm_authority::DispatchMmAuthority;
+use carrick_el1::memory::reservations::{NoRootWait, RootHolder, RootWait};
+
+/// A refused root probe, retaining the exact release producer and the holder
+/// from that same failed acquisition. It owns no lock or execution capacity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReservationBusy {
+    pub wait: carrick_el1_abi::PortalOwnerWait,
+    pub holder: RootHolder,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RootAccessRefusal {
+    Busy(ReservationBusy),
+    Refused(Refusal),
+}
+impl From<Refusal> for RootAccessRefusal {
+    fn from(value: Refusal) -> Self {
+        Self::Refused(value)
+    }
+}
+impl RootAccessRefusal {
+    pub fn refusal(self) -> Refusal {
+        match self {
+            Self::Busy(_) => Refusal::Busy,
+            Self::Refused(value) => value,
+        }
+    }
+}
+struct RootProbe {
+    observed: carrick_el1_abi::PortalOwnerWait,
+    holder: std::cell::Cell<Option<RootHolder>>,
+}
+impl RootWait for RootProbe {
+    fn wait(&self, _: u32, holder: RootHolder) -> bool {
+        // lock_using passes RootHolder::of_word(held) from its failed CAS.
+        self.holder.set(Some(holder));
+        false
+    }
+}
+impl RootProbe {
+    fn refusal(&self, refusal: Refusal) -> RootAccessRefusal {
+        match (refusal, self.holder.get()) {
+            (Refusal::Busy, Some(holder)) => RootAccessRefusal::Busy(ReservationBusy {
+                wait: self.observed,
+                holder,
+            }),
+            (refusal, _) => RootAccessRefusal::Refused(refusal),
+        }
+    }
+}
 
 pub trait HostReservationProvider: Send + Sync {
     /// Exact retained carrier venue for publication and final cleanup. Providers
@@ -25,7 +75,7 @@ pub trait HostReservationProvider: Send + Sync {
     /// storage remains `MetadataRequired` at this service boundary; after
     /// this attempt fails, the personality may answer Linux ENOMEM without
     /// transferring the admitted root back to a host placement authority.
-    fn provision_metadata(&self, _mm: ReservationMm) -> Result<(), Refusal> {
+    fn provision_metadata(&self, _mm: ReservationMm, _wait: &dyn RootWait) -> Result<(), Refusal> {
         Err(Refusal::MetadataRequired)
     }
 }
@@ -37,7 +87,7 @@ pub trait PreparedHostReservations {
     /// Acquisition is one-shot. `Busy` requires exact-MM editor exclusion
     /// before policy is observed; a pre-exclusion fault classifier selects
     /// that mutation route instead of waiting while holding `MemState`.
-    fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal>;
+    fn lock(&self, mm: ReservationMm, wait: &dyn RootWait) -> Result<Reservations<'_>, Refusal>;
 }
 
 /// Prepared pins plus their installed carrier provenance. A caller cannot
@@ -87,23 +137,68 @@ pub(in crate::dispatch) struct DelegatedRoot {
 }
 
 impl DelegatedRoot {
-    pub(in crate::dispatch) fn provision_metadata(&self) -> Result<(), Refusal> {
-        let _host = self.host_serial.lock();
-        self.provider.provision_metadata(self.mm)
+    fn observe_probe(&self) -> Result<RootProbe, Refusal> {
+        use carrick_sched_core::spaces::notification::SpaceWaitCause;
+        use std::num::NonZeroU64;
+        let backing = self
+            .provider
+            .address_space_backing()
+            .ok_or(Refusal::Stale)?;
+        let region = backing.region().ok_or(Refusal::Stale)?;
+        let source = region
+            .zone
+            .space_entry(NonZeroU64::new(self.mm.raw()).ok_or(Refusal::Stale)?)
+            .ok_or(Refusal::Stale)?
+            .live_notifications()
+            .map_err(|_| Refusal::Stale)?;
+        // SAFETY: finish_import admitted this exact root's notification source;
+        // the retained provider authenticates its carrier and MM identity.
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                region.carrier,
+                self.mm,
+                source.identity().incarnation,
+            )
+        };
+        // SAFETY: sampled from this live source before the root predicate.
+        let observed = unsafe {
+            carrick_el1_abi::PortalOwnerWait::from_owner(
+                handle,
+                carrick_el1_abi::PortalWaitCause::Reservations,
+                source.observe(SpaceWaitCause::Reservations).revision(),
+            )
+        };
+        Ok(RootProbe {
+            observed,
+            holder: std::cell::Cell::new(None),
+        })
     }
-    /// One host-venue step on the exact admitted root. The root guard lives
-    /// only for `step`: no host backend service ever runs under it.
+    pub(in crate::dispatch) fn provision_metadata(&self) -> Result<(), RootAccessRefusal> {
+        let _host = self.host_serial.lock();
+        let probe = self.observe_probe()?;
+        self.provider
+            .provision_metadata(self.mm, &probe)
+            .map_err(|error| probe.refusal(error))
+    }
+    /// One step on the exact admitted root. Observe the release source before
+    /// probing; the guard lives only inside step and cannot cross suspension.
     pub(in crate::dispatch) fn with_root<R>(
         &self,
         step: impl FnOnce(&mut Reservations<'_>) -> Result<R, Refusal>,
-    ) -> Result<R, Refusal> {
+    ) -> Result<R, RootAccessRefusal> {
         let _host = self.host_serial.lock();
+        let probe = self.observe_probe()?;
         let view = self.provider.prepare()?;
-        let mut model = view.lock(self.mm)?;
-        if model.mm() != self.mm || !model.is_admitted() {
-            return Err(Refusal::Stale);
+        let mut model = view
+            .lock(self.mm, &probe)
+            .map_err(|error| probe.refusal(error))?;
+        if model.mm() != self.mm
+            || !model.is_admitted()
+            || model.incarnation().raw() != probe.observed.handle().incarnation().get()
+        {
+            return Err(Refusal::Stale.into());
         }
-        let result = step(&mut model);
+        let result = step(&mut model).map_err(RootAccessRefusal::Refused);
         #[cfg(test)]
         self.node_reads
             .fetch_add(model.work, std::sync::atomic::Ordering::Relaxed);
@@ -128,7 +223,7 @@ impl DelegatedRoot {
     ) -> Result<R, Refusal> {
         let _host = self.host_serial.lock();
         let view = self.provider.prepare()?;
-        let mut model = view.lock(self.mm)?;
+        let mut model = view.lock(self.mm, &NoRootWait)?;
         if model.mm() != self.mm || model.is_admitted() {
             return Err(Refusal::Stale);
         }
@@ -222,7 +317,7 @@ impl DispatchMmAuthority {
         }
         let _host = host_serial.lock();
         let mm = ReservationMm::new(self.mm_id.raw()).ok_or(Refusal::Invalid)?;
-        let mut model = prepared.view.lock(mm)?;
+        let mut model = prepared.view.lock(mm, &NoRootWait)?;
         if model.mm() != mm {
             return Err(Refusal::Stale);
         }
@@ -255,16 +350,25 @@ mod tests {
             release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
         }
         impl HostReservationProvider for Provisioner {
+            fn address_space_backing(
+                &self,
+            ) -> Option<Arc<dyn crate::kernel::mm_occupancy::AddressSpaceBacking>> {
+                self.inner.address_space_backing()
+            }
             fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
                 self.inner.prepare()
             }
-            fn provision_metadata(&self, mm: ReservationMm) -> Result<(), Refusal> {
+            fn provision_metadata(
+                &self,
+                mm: ReservationMm,
+                wait: &dyn RootWait,
+            ) -> Result<(), Refusal> {
                 assert!(
                     self.serial.is_locked(),
                     "metadata provisioning bypassed host serialization"
                 );
                 let view = self.prepare()?;
-                let held = view.lock(mm)?;
+                let held = view.lock(mm, wait)?;
                 self.entered.send(()).unwrap();
                 self.release
                     .lock()

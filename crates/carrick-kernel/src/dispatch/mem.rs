@@ -66,6 +66,7 @@ pub(crate) mod anonymous;
 mod settled;
 pub(crate) use self::anonymous::RootAliasProposal;
 pub mod el1_reservations;
+pub use el1_reservations::{ReservationBusy, RootAccessRefusal};
 mod native_successor;
 pub use self::native_successor::NativeSuccessorImage;
 mod host_backing;
@@ -1904,7 +1905,7 @@ impl<'a> MemView<'a> {
                     out.push(u8::from(resident));
                 }
             }
-            Err(carrick_el1_abi::Refusal::Busy) => {
+            Err(RootAccessRefusal::Busy(_)) => {
                 // The root is momentarily held. Compute exact residency under
                 // owner exclusion without guessing: post-exec anonymous mappings
                 // occupy the mmap arena outside the heap, so pages there or in

@@ -226,7 +226,9 @@ impl SyscallDispatcher {
             .reservation_provider_for_publication()
             .ok_or(LINUX_ENOMEM)?;
         let view = provider.prepare().map_err(|_| LINUX_ENOMEM)?;
-        let mut root = view.lock(successor).map_err(|_| LINUX_ENOMEM)?;
+        let mut root = view
+            .lock(successor, &carrick_el1::memory::reservations::NoRootWait)
+            .map_err(|_| LINUX_ENOMEM)?;
         if root.mm() != successor || root.is_admitted() {
             return Err(LINUX_ENOMEM);
         }
