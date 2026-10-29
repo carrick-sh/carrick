@@ -615,3 +615,28 @@ fn private_file_mmap_stages_a_byte_source_request_with_its_exact_key() {
         None
     );
 }
+
+#[test]
+fn unserved_epoll_reads_do_not_prepare_output() {
+    let mut user = memory(&[]);
+    user.writable = false;
+    let mut resolve = |_| Some(NativeDescriptor::InZone(InZoneKind::Epoll));
+    let mut releases = |_: &mut [host_file::MapSourceReply]| 0;
+    let mut namespace = NativeNamespace {
+        table: TABLE,
+        resolve: &mut resolve,
+        releases: &mut releases,
+    };
+    assert!(matches!(
+        stage(
+            HostFileCall::Read {
+                fd: 0,
+                buf: BASE,
+                count: 1
+            },
+            &mut namespace,
+            &mut user
+        ),
+        Some(HostFileStage::InRing)
+    ));
+}
