@@ -447,6 +447,7 @@ mod allocator_stats_tests {
                 ),
                 GlobalFrameRetirementOutcome::DeferredActivePins { .. }
             ));
+            assert!(custody.take_global_frame_retirement_retry_request());
             let mut pin = Some(pin);
             if enroll_after_unpin {
                 drop(pin.take());
@@ -476,6 +477,12 @@ mod allocator_stats_tests {
             assert_eq!(count.load(Ordering::SeqCst), 0);
             assert_eq!(wait.receipt(), None);
             drop(pin.take());
+            assert!(
+                custody
+                    .pending_global_frame_retirement_retry
+                    .load(Ordering::Acquire),
+                "last-unpin must arm a fresh idle request after the initial request was consumed"
+            );
             let mut unmaps = 0;
             let report =
                 retry_pending_global_frame_retirements_at_idle_in_using(&custody, &mut |_, _| {

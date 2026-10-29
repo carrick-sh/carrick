@@ -15,7 +15,8 @@ readiness once. Completion captures callback effects but invokes none under
 owner guards. `GlobalFrameHostOwner` retains those effects in the same owner,
 using its existing pending-owner directory and detached idle retirement queue.
 The named persistent-executor idle boundary publishes them after owner guards
-drop. Last-unpin requests the same existing retirement turn. There is no new
+drop. The neutral owner classifies a last requested mapped pin as `ReadyToRetry`;
+the carrier requests the same existing retirement turn. There is no new
 worker wait, timer, polling loop, service journal or notification venue.
 
 Like the existing callback registry, an already captured callback can run after

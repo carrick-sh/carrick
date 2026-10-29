@@ -2107,3 +2107,7 @@ contracts = ["kernel.el1.anonymous-reservations"]
 [[surfaces]]
 path = "crates/carrick-thread/src/physical_retirement.rs"
 contracts = ["kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/mm/retirement.rs"
+contracts = ["kernel.el1.anonymous-reservations"]

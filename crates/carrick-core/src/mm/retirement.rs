@@ -604,11 +604,14 @@ pub fn settle_record_retirement(
 )]
 /// The neutral owner's verdict after one pin on a carrier stage-2 record drops.
 pub enum RecordPinRelease {
-    /// Pins remain, the identity did not match, or retirement is not yet settled.
+    /// Pins remain, the identity did not match, or retirement was not requested.
     StillHeld,
     /// Last pin dropped on a requested retirement with no backend mapping or
     /// IPA release outstanding: the backend may retire `ipa` at a safe point.
     ReadyToRetire { ipa: u64 },
+    /// Last pin dropped while exact retirement still owes backend or IPA
+    /// release work. Resume the existing physical owner at its idle boundary.
+    ReadyToRetry,
     /// Last pin dropped on a VM-destroy-terminalized predecessor that a rebind
     /// superseded: the ledger discards the record.
     RemovePredecessor,
@@ -642,6 +645,9 @@ pub fn release_record_pin_outcome(
         return RecordPinRelease::ReadyToRetire {
             ipa: record.snapshot.ipa,
         };
+    }
+    if record.snapshot.retirement_requested {
+        return RecordPinRelease::ReadyToRetry;
     }
     RecordPinRelease::StillHeld
 }
@@ -904,6 +910,13 @@ mod nonce_tests {
         backend_mapped.snapshot.backend_map_installed = true;
         assert_eq!(
             release_record_pin_outcome(&mut backend_mapped, identity),
+            RecordPinRelease::ReadyToRetry
+        );
+        let mut not_requested = base_record;
+        not_requested.snapshot.pin_count = 1;
+        not_requested.snapshot.retirement_requested = false;
+        assert_eq!(
+            release_record_pin_outcome(&mut not_requested, identity),
             RecordPinRelease::StillHeld
         );
 
