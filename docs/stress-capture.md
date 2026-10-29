@@ -83,3 +83,23 @@ stop immediately. Any observed failure yields a nonzero command result. Regex
 matching is incremental with a 64 KiB overlap; expressions requiring a match
 longer than that are unsupported. Per-run timeout ends the observation phase;
 capture and cleanup have their own separate hard bounds.
+
+Fatal capture in signed embed tests requires the harness from this change:
+`common::guest_lock()` reads `CARRICK_FATAL_HOLD_SECS` and arms
+`carrick_fatal::arm_debugger_hold` before starting guest work. Unset, zero,
+invalid or out-of-range values leave the hold disabled, matching the CLI.
+The runner supplies a positive hold of `--capture-seconds + 10` (capped at
+`u32::MAX`) on every run, including custom stderr-trigger runs.
+
+A fatal message can arrive before its hold notice. The runner waits for
+`carrick fatal: holding … s for a debugger (pid …)` before treating a live
+fatal as ready for capture. The hold notice itself triggers capture even
+with a custom stderr regex. Generic stderr matches still trigger immediately;
+a fatal that exits before announcing a hold is recorded without live artifacts.
+The normal run/hang deadlines remain in force while waiting for the notice.
+The embed test's own watchdog also remains active, so choose a hang threshold
+below that watchdog and allow for its deadline when sizing live captures.
+
+Portable tests cover the harness's environment-value arming policy and fake
+children that announce a hold, exit before a hold, or remain alive without one.
+Live fatal and hang capture still require the director's Mac verification.

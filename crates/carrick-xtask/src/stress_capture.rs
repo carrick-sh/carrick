@@ -408,12 +408,30 @@ fn monitor(
         file: File::open(stderr)?,
         overlap: Vec::new(),
     };
+    let hold_notice =
+        Regex::new(r"carrick fatal: holding [1-9][0-9]* s for a debugger \(pid [1-9][0-9]*\)\n")
+            .map_err(|error| Error::Invalid(error.to_string()))?;
+    let mut watched = patterns.to_vec();
+    watched.push(hold_notice.clone());
+    let mut pending = false;
+    let mut fatal = false;
+    let mut holding = false;
     loop {
         if let Some(trace) = tracer.as_deref_mut() {
             trace.enforce_deadline()?;
         }
         let status = child.try_wait()?;
-        let matched = tail.matches(patterns)?;
+        pending |= tail.matches(&watched)?;
+        fatal |= tail
+            .overlap
+            .windows(b"carrick fatal".len())
+            .any(|bytes| bytes == b"carrick fatal");
+        holding |= hold_notice.is_match(&tail.overlap);
+        // The fatal line precedes the hold and may arrive in a separate write.
+        // Wait for the hold announcement before stopping the process in LLDB;
+        // an exited process still reports its matched stderr normally.
+        let matched =
+            holding || (pending && (!fatal || status.is_some() || start.elapsed() >= deadline));
         // A fast failing child can leave more than one bounded read's worth
         // of stderr. Drain its recorded output before classifying the exit.
         if status.is_some()
@@ -832,7 +850,10 @@ pub fn run(root: &Path, mut args: Args) -> Result<(), Error> {
             .env("CARRICK_RUN_ID", &id)
             .env(
                 "CARRICK_FATAL_HOLD_SECS",
-                args.capture_seconds.saturating_add(10).to_string(),
+                args.capture_seconds
+                    .saturating_add(10)
+                    .min(u64::from(u32::MAX))
+                    .to_string(),
             )
             .stdout(File::create(&stdout)?)
             .stderr(File::create(&stderr)?);
@@ -1003,6 +1024,10 @@ fn render(summary: &Summary) -> String {
 }
 
 #[cfg(test)]
+#[path = "../../carrick-embed/tests/common/fatal_hold.rs"]
+mod embed_fatal_hold;
+
+#[cfg(test)]
 mod serial_host {
     // Fixture setup failures should identify the failed prerequisite.
     #![allow(clippy::expect_used)]
@@ -1042,10 +1067,19 @@ mod serial_host {
     #[test]
     fn serial_host_fake_child_monitor_and_detachment() {
         let dir = tempfile::tempdir().expect("directory");
-        let patterns = [Regex::new("carrick fatal").expect("regex")];
+        let patterns = [Regex::new("(?m)^carrick fatal$").expect("regex")];
         for (script, expected) in [
             ("exit 0", Outcome::Passed),
             ("exit 1", Outcome::Failed),
+            (
+                "echo 'carrick fatal' >&2; echo 'carrick fatal: holding 5 s for a debugger (pid 123)' >&2; sleep 5",
+                Outcome::Stderr,
+            ),
+            (
+                "echo 'carrick fatal: holding 5 s for a debugger (pid 123)' >&2; sleep 5",
+                Outcome::Stderr,
+            ),
+            ("echo 'carrick fatal' >&2; exit 134", Outcome::Stderr),
             ("echo 'carrick fatal' >&2; sleep 5", Outcome::Stderr),
             ("sleep 5", Outcome::Hang),
             ("kill -KILL $$", Outcome::Signal),
@@ -1057,6 +1091,7 @@ mod serial_host {
                 .stderr(File::create(&stderr).expect("stderr"));
             detached(&mut cmd);
             let mut child = cmd.spawn().expect("fake child");
+            let observed_from = Instant::now();
             let (outcome, _) = monitor(
                 &mut child,
                 &stderr,
@@ -1068,6 +1103,9 @@ mod serial_host {
             )
             .expect("monitor");
             assert_eq!(outcome, expected);
+            if script == "echo 'carrick fatal' >&2; sleep 5" {
+                assert!(observed_from.elapsed() >= Duration::from_millis(200));
+            }
             if outcome == Outcome::Hang {
                 let pid = i32::try_from(child.id()).expect("pid fits");
                 // SAFETY: read-only identity queries on our live fake child.
