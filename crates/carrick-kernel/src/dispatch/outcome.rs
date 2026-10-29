@@ -501,6 +501,8 @@ pub enum DispatchOutcome {
     CompletionCopyoutSuspended(
         #[serde(skip_serializing)] Box<crate::kernel::continuation::OwnedCompletionCopyout>,
     ),
+    /// A vector pipe read retains its exact endpoint and byte cursor.
+    PipeReadSuspended(#[serde(skip_serializing)] Box<super::SuspendedPipeRead>),
     /// A directory read retains its exact description before first consumption.
     DirectoryReadSuspended(#[serde(skip_serializing)] Box<super::OwnedDirectoryRead>),
     /// A write retains its exact destination and owner copy-in transfer while

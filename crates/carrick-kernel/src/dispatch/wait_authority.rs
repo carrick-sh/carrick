@@ -21,6 +21,9 @@ pub enum WaitFdGuard {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InternalWaitKind {
+    /// An admitted pipe read owns its endpoint lease independently of any
+    /// numeric file slot; readiness resumes that retained operation.
+    RetainedPipeRead,
     CarrierControl,
     /// The CPL0 carrier waits on host-bound descriptions named by the guest
     /// file owner; no host file-table slot is involved.

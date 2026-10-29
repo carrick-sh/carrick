@@ -42,6 +42,8 @@ pub enum RetainedFdSource {
 
 #[derive(Clone, Debug)]
 pub enum BlockingFdWaitKind {
+    /// A pipe vector read already owns its exact endpoint and input vector.
+    PipeRead(Arc<parking_lot::Mutex<Option<super::OwnedPipeRead>>>),
     Poll {
         entries: Vec<RetainedPollFd>,
     },
@@ -87,6 +89,9 @@ pub struct BlockingFdWait {
     /// after close/reuse.
     registrations: Arc<[RetainedFdRegistration]>,
     authority: WaitFdAuthority,
+    /// Duplicating a host target does not retain its readiness producer.
+    /// Keep admitted guards (including IPC subscriptions) until completion.
+    _targets: Arc<WaitFds>,
 }
 
 impl PartialEq for BlockingFdWait {
@@ -98,6 +103,7 @@ impl Eq for BlockingFdWait {}
 
 #[derive(Debug)]
 pub enum BlockingFdWaitStep {
+    InvalidExecution,
     Done(DispatchOutcome),
     Wait(BlockingFdWait),
 }
@@ -126,6 +132,7 @@ impl BlockingFdWait {
             kind: Box::new(kind),
             registrations: registrations.into(),
             authority: wait_fds.authority().clone(),
+            _targets: Arc::new(wait_fds),
         })
     }
 
@@ -150,6 +157,7 @@ impl BlockingFdWait {
             RetainedFdSource::BareStdio | RetainedFdSource::Negative => None,
         };
         match self.kind.as_ref() {
+            BlockingFdWaitKind::PipeRead(_) => Vec::new(),
             BlockingFdWaitKind::Poll { entries } => entries
                 .iter()
                 .filter_map(|entry| retain(&entry.source))
@@ -183,10 +191,29 @@ impl BlockingFdWait {
 
     pub fn complete(
         self,
+        context: &crate::kernel::KernelContext,
         memory: &mut impl CurrentMmMemory,
         dispatcher: &SyscallDispatcher,
     ) -> BlockingFdWaitStep {
         match self.kind.as_ref() {
+            BlockingFdWaitKind::PipeRead(pending) => {
+                let mut guard = pending.lock();
+                if guard.as_ref().is_some_and(|read| !read.source_ready()) {
+                    drop(guard);
+                    return BlockingFdWaitStep::Wait(self);
+                }
+                let Some(read) = guard.take() else {
+                    return BlockingFdWaitStep::InvalidExecution;
+                };
+                drop(guard);
+                match read.resume(context, memory) {
+                    Ok(outcome) => BlockingFdWaitStep::Done(outcome),
+                    Err(super::DispatchError::Errno(errno)) => {
+                        BlockingFdWaitStep::Done(DispatchOutcome::errno(errno))
+                    }
+                    Err(_) => BlockingFdWaitStep::InvalidExecution,
+                }
+            }
             BlockingFdWaitKind::Poll { entries } => {
                 let mut ready = 0_i64;
                 let mut output = Vec::with_capacity(entries.len());

@@ -31,7 +31,11 @@ fn pending_poll_does_not_write_guest_pollfd_before_terminal_completion() {
     let before = memory.bytes.clone();
 
     assert!(matches!(
-        negative_poll_wait(None).complete(&mut memory, &dispatcher),
+        negative_poll_wait(None).complete(
+            &dispatcher.capture_one_task_context().unwrap(),
+            &mut memory,
+            &dispatcher
+        ),
         BlockingFdWaitStep::Wait(_)
     ));
     assert_eq!(memory.bytes, before, "a re-park must not copy out revents");
@@ -47,8 +51,11 @@ fn terminal_poll_updates_only_revents_not_saved_input_fields() {
     let expected_tail = memory.bytes[8..].to_vec();
 
     assert!(matches!(
-        negative_poll_wait(Some(Instant::now() - Duration::from_secs(1)))
-            .complete(&mut memory, &dispatcher),
+        negative_poll_wait(Some(Instant::now() - Duration::from_secs(1))).complete(
+            &dispatcher.capture_one_task_context().unwrap(),
+            &mut memory,
+            &dispatcher
+        ),
         BlockingFdWaitStep::Done(DispatchOutcome::Returned { value: 0 })
     ));
     assert_eq!(memory.bytes[..6], expected_input);
@@ -95,13 +102,21 @@ fn repark_preserves_the_original_absolute_caller_deadline() {
     let mut memory = LinearMemory::new(BASE, vec![0xA5; 16]);
     let deadline = Instant::now() + Duration::from_secs(60);
 
-    let first_repark = match negative_poll_wait(Some(deadline)).complete(&mut memory, &dispatcher) {
+    let first_repark = match negative_poll_wait(Some(deadline)).complete(
+        &dispatcher.capture_one_task_context().unwrap(),
+        &mut memory,
+        &dispatcher,
+    ) {
         BlockingFdWaitStep::Wait(wait) => wait,
         other => panic!("expected pending negative poll, got {other:?}"),
     };
     assert_eq!(first_repark.caller_deadline(), Some(deadline));
 
-    let second_repark = match first_repark.complete(&mut memory, &dispatcher) {
+    let second_repark = match first_repark.complete(
+        &dispatcher.capture_one_task_context().unwrap(),
+        &mut memory,
+        &dispatcher,
+    ) {
         BlockingFdWaitStep::Wait(wait) => wait,
         other => panic!("expected second pending negative poll, got {other:?}"),
     };

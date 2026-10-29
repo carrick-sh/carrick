@@ -1981,6 +1981,7 @@ where
                     route,
                 )
             }
+            binding::OwnedIoResume::PipeRead(pending) => pending.resume(&context, engine),
             binding::OwnedIoResume::DirectoryRead(pending) => {
                 kernel.dispatcher.resume_owned_directory_read(
                     &context,
@@ -3620,8 +3621,21 @@ pub(crate) mod tests {
             let entry =
                 zone.space_entry(std::num::NonZeroU64::new(self.wait.handle().mm().raw())?)?;
             let source = entry.notifications(self.wait.handle().incarnation()).ok()?;
+            if self.wait.cause() == carrick_el1_abi::PortalWaitCause::Gate
+                && zone
+                    .spaces
+                    .gate(zone.spaces.find(self.wait.handle().mm().raw())?)
+                    == 0
+            {
+                return None;
+            }
             (source
-                .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor)
+                .observe(match self.wait.cause() {
+                    carrick_el1_abi::PortalWaitCause::Gate => {
+                        carrick_sched_core::spaces::notification::SpaceWaitCause::Gate
+                    }
+                    _ => carrick_sched_core::spaces::notification::SpaceWaitCause::Editor,
+                })
                 .revision()
                 == self.wait.revision())
             .then_some(self.wait)
@@ -3659,6 +3673,8 @@ pub(crate) mod tests {
         pub(crate) prepared_cancels: usize,
         pub(crate) prepared_commits: usize,
         pub(crate) copyout_owner_probe: Option<CopyoutOwnerProbe>,
+        // A real MM gate transition at the first unprepared output boundary.
+        pub(crate) close_gate_after_write: Option<(usize, u64)>,
         // Frame result, result already completed when injected, restart flag.
         pub(crate) injected_signals: Vec<(Option<i64>, Option<i64>, bool)>,
     }
@@ -3694,13 +3710,15 @@ pub(crate) mod tests {
 
     struct TestPreparedCopyout<'a> {
         engine: &'a mut CrashCaptureTestEngine,
-        address: u64,
+        addresses: Vec<u64>,
         committed: bool,
     }
     impl carrick_guest_mem::PreparedGuestWrite for TestPreparedCopyout<'_> {
         fn commit(mut self: Box<Self>, outputs: &[&[u8]]) {
-            let bytes = outputs.concat();
-            self.engine.guest_memory.insert(self.address, bytes);
+            assert_eq!(outputs.len(), self.addresses.len());
+            for (address, bytes) in self.addresses.iter().zip(outputs) {
+                self.engine.guest_memory.insert(*address, bytes.to_vec());
+            }
             self.engine.prepared_commits += 1;
             self.committed = true;
         }
@@ -3742,9 +3760,8 @@ pub(crate) mod tests {
                 if let Some(wait) = prepare() {
                     return Err(carrick_guest_mem::MemoryPrepareError::Physical(wait));
                 }
-                assert_eq!(ranges.len(), 1);
                 return Ok(Box::new(TestPreparedCopyout {
-                    address: ranges[0].address().raw(),
+                    addresses: ranges.iter().map(|range| range.address().raw()).collect(),
                     engine: self,
                     committed: false,
                 }));
@@ -3753,9 +3770,8 @@ pub(crate) mod tests {
                 if let Some(wait) = probe.wait_if_busy() {
                     return Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait));
                 }
-                assert_eq!(ranges.len(), 1);
                 return Ok(Box::new(TestPreparedCopyout {
-                    address: ranges[0].address().raw(),
+                    addresses: ranges.iter().map(|range| range.address().raw()).collect(),
                     engine: self,
                     committed: false,
                 }));
@@ -3825,6 +3841,11 @@ pub(crate) mod tests {
                 return Err(carrick_guest_mem::MemoryError::OwnerWait(wait));
             }
             self.guest_memory.insert(address, bytes.to_vec());
+            if let Some((zone, mm)) = self.close_gate_after_write.take() {
+                // SAFETY: the scoped test retains this aligned zone throughout.
+                let zone = unsafe { &*(zone as *const carrick_el1_abi::ZoneTables) };
+                zone.spaces.raise(zone.spaces.find(mm).unwrap());
+            }
             Ok(())
         }
     }
@@ -4206,6 +4227,121 @@ pub(crate) mod tests {
         }};
     }
     pub(crate) use test_carrier_graph_with_dispatcher;
+
+    #[test]
+    fn clone_tid_pair_waits_for_live_sibling_gate_before_any_output() {
+        use carrick_el1_abi::PortalWaitCause;
+        use carrick_el1_linux::mm_portal::{
+            MmPortal,
+            test_support::{ROOT, Region, admit_notified, nodes},
+        };
+        use std::num::NonZeroU64;
+        let dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let sibling = root
+            .kernel()
+            .reserve_thread_clone(
+                &root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::VM
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::THREAD,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(71_109))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_context()
+            .unwrap();
+        let root = root
+            .kernel()
+            .context(root.task().key().id, root.thread().key().tid)
+            .unwrap();
+        assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, root.shared().mm().id().raw(), ROOT, 1, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            NonZeroU64::new(711).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let parent = 0x6000_4000;
+        let child = parent + 4096;
+        let mut engine = CrashCaptureTestEngine::default();
+        engine
+            .guest_memory
+            .insert(parent, 11i32.to_ne_bytes().to_vec());
+        engine
+            .guest_memory
+            .insert(child, 22i32.to_ne_bytes().to_vec());
+        let mut transaction =
+            threads::CloneTidOutputTransaction::capture(&engine, parent, child).unwrap();
+        let index = zone.spaces.find(mm.raw()).unwrap();
+        zone.spaces.raise(index);
+        let wait = portal
+            .observe_wait(handle, PortalWaitCause::Gate)
+            .unwrap()
+            .unwrap();
+        engine.copyout_owner_probe = Some(CopyoutOwnerProbe {
+            wait,
+            zone: zone as *const _ as usize,
+        });
+        let suspended =
+            transaction.publish_outcome(&mut engine, 9, ThreadId::synthetic_for_tests(99));
+        let rollback = transaction.rollback(&mut engine);
+        carrick_el1_linux::sched::object_wait::space_access(
+            zone,
+            carrick_sched_core::SlotId::new(1),
+        )
+        .lower(index);
+        let threads::CloneTidPublishOutcome::Owner(outcome) = suspended else {
+            panic!("closed gate must suspend");
+        };
+        assert_eq!(
+            *outcome,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        rollback.unwrap();
+        assert_eq!(engine.guest_memory[&parent], 11i32.to_ne_bytes());
+        assert_eq!(engine.guest_memory[&child], 22i32.to_ne_bytes());
+        let mut transaction =
+            threads::CloneTidOutputTransaction::capture(&engine, parent, child).unwrap();
+        engine.copyout_owner_probe = Some(CopyoutOwnerProbe {
+            wait: portal
+                .observe_wait(handle, PortalWaitCause::Gate)
+                .unwrap()
+                .unwrap(),
+            zone: zone as *const _ as usize,
+        });
+        // If publication still uses two raw writes, the sibling closes the
+        // gate between them and even restoration of the parent must wait.
+        engine.close_gate_after_write = Some((zone as *const _ as usize, mm.raw()));
+        let result = transaction.publish_outcome(&mut engine, 9, ThreadId::synthetic_for_tests(99));
+        if zone.spaces.gate(index) != 0 {
+            carrick_el1_linux::sched::object_wait::space_access(
+                zone,
+                carrick_sched_core::SlotId::new(1),
+            )
+            .lower(index);
+        }
+        assert!(
+            matches!(result, threads::CloneTidPublishOutcome::Published),
+            "both destinations must be secured before publishing either TID"
+        );
+        assert_eq!(engine.prepared_commits, 1, "one pair permit, no raw writes");
+        assert_eq!(engine.guest_memory[&parent], 9i32.to_ne_bytes());
+        assert_eq!(engine.guest_memory[&child], 9i32.to_ne_bytes());
+    }
 
     #[test]
     fn serial_host_pipe2_owner_wait_redispatches_through_production_runtime_once() {

@@ -636,8 +636,7 @@ impl PipeInner {
     }
 }
 /// Single-window read: retain the source until its destination is secured.
-/// The vector loop still uses the counted path below until it can retain
-/// progress across a later iovec refusal (#986).
+/// Vector reads retain their cursor in `OwnedPipeRead` across refusals.
 pub(crate) fn read_pipe<M: CurrentMmMemory>(
     context: &crate::kernel::KernelContext,
     memory: &mut M,
@@ -688,8 +687,183 @@ pub(crate) fn read_pipe<M: CurrentMmMemory>(
     DispatchOutcome::returned_len_or_errno(count)
 }
 
-// Counted debt: readv needs a retained source/cursor before a later iovec can
-// suspend. Preserve its existing behavior rather than redispatch a prefix.
+/// A vector read keeps its exact endpoint and completed iovec cursor while
+/// owner memory is unavailable. No pipe lock or destination permit is parked.
+pub struct OwnedPipeRead {
+    pipe: PipeRef,
+    _lease: crate::kernel::objects::FileDescriptionFdLease,
+    thread: crate::kernel::ThreadKey,
+    mm: crate::kernel::MmId,
+    iovecs: Vec<carrick_abi::LinuxIovec>,
+    index: usize,
+    offset: usize,
+    total: i64,
+    flags: u64,
+    authority: super::WaitFdAuthority,
+}
+
+/// Only a refused operation carries a memory dependency. Readiness waits keep
+/// the operation itself, so a suspended value cannot lose its wait receipt.
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub struct SuspendedPipeRead {
+    read: OwnedPipeRead,
+    wait: carrick_guest_mem::MemoryReadWait,
+}
+
+impl SuspendedPipeRead {
+    pub fn wait(&self) -> &carrick_guest_mem::MemoryReadWait {
+        &self.wait
+    }
+
+    pub fn resume(
+        self,
+        context: &crate::kernel::KernelContext,
+        memory: &mut impl CurrentMmMemory,
+    ) -> Result<DispatchOutcome, super::DispatchError> {
+        // Physical wait receipts may themselves retain writer exclusion.
+        drop(self.wait);
+        self.read.resume(context, memory)
+    }
+}
+impl std::fmt::Debug for OwnedPipeRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedPipeRead")
+            .field("index", &self.index)
+            .field("total", &self.total)
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for OwnedPipeRead {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pipe, &other.pipe)
+            && self.thread == other.thread
+            && self.mm == other.mm
+            && self.index == other.index
+            && self.offset == other.offset
+            && self.total == other.total
+            && self.iovecs == other.iovecs
+            && self.flags == other.flags
+    }
+}
+impl Eq for OwnedPipeRead {}
+impl OwnedPipeRead {
+    pub(crate) fn new(
+        context: &crate::kernel::KernelContext,
+        pipe: PipeRef,
+        lease: crate::kernel::objects::FileDescriptionFdLease,
+        iovecs: Vec<carrick_abi::LinuxIovec>,
+        flags: u64,
+        authority: super::WaitFdAuthority,
+    ) -> Self {
+        Self {
+            pipe,
+            _lease: lease,
+            thread: context.thread().key(),
+            mm: context.shared().mm().id(),
+            iovecs,
+            index: 0,
+            offset: 0,
+            total: 0,
+            flags,
+            authority,
+        }
+    }
+    pub(crate) fn source_ready(&self) -> bool {
+        let snapshot = self.pipe.snapshot();
+        snapshot.unread != 0 || snapshot.writers == 0
+    }
+    pub fn resume(
+        mut self,
+        context: &crate::kernel::KernelContext,
+        memory: &mut impl CurrentMmMemory,
+    ) -> Result<DispatchOutcome, super::DispatchError> {
+        if self.thread != context.thread().key() || self.mm != context.shared().mm().id() {
+            return Err(super::DispatchError::Errno(carrick_abi::LINUX_EIO));
+        }
+        if let Some(cancelled) = crate::kernel::continuation::owner_wait_cancellation(context) {
+            return Ok(DispatchOutcome::OwnerCancelled(cancelled));
+        }
+        while let Some(iov) = self.iovecs.get(self.index) {
+            let length = usize::try_from(iov.iov_len)
+                .map_err(|_| super::DispatchError::LengthTooLarge(iov.iov_len))?;
+            if length == 0 {
+                self.index += 1;
+                continue;
+            }
+            if self.total > 0 && self.pipe.snapshot().unread == 0 {
+                break;
+            }
+            let address = iov
+                .iov_base
+                .checked_add(self.offset as u64)
+                .ok_or(super::DispatchError::Errno(LINUX_EFAULT))?;
+            let requested = (length - self.offset).min(crate::dispatch::copyout::COPYOUT_MAX_BYTES);
+            let outcome = read_pipe(
+                context,
+                memory,
+                address,
+                requested,
+                &self.pipe,
+                self.flags,
+                self.authority.clone(),
+            );
+            let wait = match outcome {
+                DispatchOutcome::Returned { value } => {
+                    self.total += value;
+                    self.offset += value as usize;
+                    if self.offset == length {
+                        self.index += 1;
+                        self.offset = 0;
+                    }
+                    if (value as usize) < requested {
+                        break;
+                    }
+                    continue;
+                }
+                DispatchOutcome::OwnerMemoryWait { wait, .. } => {
+                    carrick_guest_mem::MemoryReadWait::Owner(wait)
+                }
+                DispatchOutcome::OwnerPhysicalWait { wait, .. } => {
+                    carrick_guest_mem::MemoryReadWait::Physical(wait)
+                }
+                DispatchOutcome::OwnerMemorySupply { request, .. } => {
+                    carrick_guest_mem::MemoryReadWait::Supply(request)
+                }
+                DispatchOutcome::OwnerCancelled(reason) => {
+                    return Ok(DispatchOutcome::OwnerCancelled(reason));
+                }
+                DispatchOutcome::WaitOnFds { fds, sig_mask, .. } if self.total == 0 => {
+                    // Waiting for memory may let another reader drain the
+                    // source. Keep this operation through readiness too; a
+                    // numeric fd or the original iovec bytes may have changed.
+                    let authority = super::WaitFdAuthority::internal(
+                        crate::dispatch::wait_authority::InternalWaitKind::RetainedPipeRead,
+                    );
+                    let fds = fds.with_authority(authority);
+                    let wait = crate::dispatch::fd_wait::BlockingFdWait::new(
+                        crate::dispatch::fd_wait::BlockingFdWaitKind::PipeRead(Arc::new(
+                            Mutex::new(Some(self)),
+                        )),
+                        None,
+                        fds,
+                    )
+                    .map_err(super::DispatchError::Errno)?;
+                    return Ok(DispatchOutcome::BlockingFdWait { wait, sig_mask });
+                }
+                // A genuine fault or exhausted ready source returns the already
+                // transferred prefix. An internal memory wait never does.
+                _ if self.total > 0 => break,
+                other => return Ok(other),
+            };
+            return Ok(DispatchOutcome::PipeReadSuspended(Box::new(
+                SuspendedPipeRead { read: self, wait },
+            )));
+        }
+        Ok(DispatchOutcome::Returned { value: self.total })
+    }
+}
+
+// Carrier-buffer destinations have no guest owner to suspend on.
 pub(crate) fn read_pipe_unprepared<M: CurrentMmMemory>(
     memory: &mut M,
     address: u64,

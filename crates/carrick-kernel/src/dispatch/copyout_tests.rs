@@ -663,3 +663,48 @@ fn recvfrom_owner_resumes_address_without_replaying_payload() {
         );
     }
 }
+
+#[test]
+fn readv_pipe_retains_intra_iovec_progress_and_bounds_preparation() {
+    for length in [1usize, 4096, 8192] {
+        let mut guest = Guest::new();
+        let (reader, writer) = guest.pipe();
+        let bytes: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+        guest.memory.seed(PATH, &bytes);
+        assert_eq!(
+            guest.ok(
+                nr::WRITE.raw(),
+                [writer as u64, PATH, length as u64, 0, 0, 0]
+            ),
+            length as i64
+        );
+        let mut vector = OUT.to_ne_bytes().to_vec();
+        vector.extend_from_slice(&(length as u64).to_ne_bytes());
+        guest.memory.seed(LEN_ADDR, &vector);
+        let before = guest.memory.prepares;
+        let wait = guest
+            .memory
+            .refuse_after_prepares(if length > 4096 { 1 } else { 0 });
+        let outcome = guest.call(nr::READV.raw(), [reader as u64, LEN_ADDR, 1, 0, 0, 0]);
+        let DispatchOutcome::PipeReadSuspended(pending) = outcome else {
+            panic!("retained read expected: {outcome:?}");
+        };
+        assert_eq!(
+            pending.wait(),
+            &carrick_guest_mem::MemoryReadWait::Owner(wait)
+        );
+        let context = guest.dispatcher.capture_one_task_context().unwrap();
+        assert_eq!(
+            pending.resume(&context, &mut guest.memory).unwrap(),
+            DispatchOutcome::Returned {
+                value: length as i64
+            }
+        );
+        assert_eq!(guest.memory.read_bytes(OUT, length).unwrap(), bytes);
+        assert_eq!(
+            guest.memory.prepares - before,
+            length.div_ceil(4096) + 1,
+            "one preparation per bounded window plus the refused admission"
+        );
+    }
+}

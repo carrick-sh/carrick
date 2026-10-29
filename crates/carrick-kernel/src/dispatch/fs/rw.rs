@@ -303,15 +303,45 @@ fn push_resumed_iovec(
     Ok(())
 }
 
+enum IovecReadError {
+    Errno(LinuxErrno),
+    Memory(Box<MemoryError>),
+}
+impl IovecReadError {
+    fn legacy_errno(self) -> LinuxErrno {
+        match self {
+            Self::Errno(errno) => errno,
+            Self::Memory(_) => LINUX_EFAULT,
+        }
+    }
+    fn into_outcome(self) -> DispatchOutcome {
+        match self {
+            Self::Errno(errno) => DispatchOutcome::errno(errno),
+            Self::Memory(error) => DispatchOutcome::from_owner_memory_error(*error)
+                .unwrap_or_else(|| DispatchOutcome::errno(LINUX_EFAULT)),
+        }
+    }
+}
+impl From<LinuxErrno> for IovecReadError {
+    fn from(errno: LinuxErrno) -> Self {
+        Self::Errno(errno)
+    }
+}
+impl From<IovecReadError> for DispatchError {
+    fn from(error: IovecReadError) -> Self {
+        Self::Errno(error.legacy_errno())
+    }
+}
+
 fn read_iovecs_from(
     memory: &impl CurrentMmMemory,
     address: u64,
     count: usize,
     mut iovecs: Vec<LinuxIovec>,
     mut total: u64,
-) -> Result<ReadIovecsOutcome, LinuxErrno> {
+) -> Result<ReadIovecsOutcome, IovecReadError> {
     if count > LINUX_IOV_MAX {
-        return Err(LINUX_EINVAL);
+        return Err(LINUX_EINVAL.into());
     }
     let size = core::mem::size_of::<LinuxIovec>();
     while iovecs.len() < count {
@@ -322,7 +352,7 @@ fn read_iovecs_from(
             .ok_or(LINUX_EINVAL)?;
         let iovec_address = address.checked_add(offset).ok_or(LINUX_EFAULT)?;
         if iovec_address == 0 {
-            return Err(LINUX_EFAULT);
+            return Err(LINUX_EFAULT.into());
         }
         let iov_bytes = match memory.read_bytes(iovec_address, size) {
             Ok(bytes) => bytes,
@@ -333,7 +363,7 @@ fn read_iovecs_from(
                     suspension,
                 });
             }
-            Err(_) => return Err(LINUX_EFAULT),
+            Err(error) => return Err(IovecReadError::Memory(Box::new(error))),
         };
         push_resumed_iovec(&iov_bytes, &mut iovecs, &mut total)?;
     }
@@ -827,7 +857,7 @@ impl<'a> FsView<'a> {
                                     *suspension,
                                 ));
                             }
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            Err(error) => return Ok(DispatchOutcome::errno(error.legacy_errno())),
                         };
                     self.pwritev_from_iovecs(cx, pending.target, iovecs, offset, write_at_current)
                 }
@@ -2877,7 +2907,13 @@ impl<'a> FsView<'a> {
             );
             let host_wait_runner = host_wait_releaser.as_mut().map(|r| this.host_wait_runner(r));
             let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-            let iovecs = read_iovecs(memory, iov, iovcnt)?;
+            let iovecs = match read_iovecs_from(memory, iov, iovcnt, Vec::new(), 0) {
+                Ok(ReadIovecsOutcome::Ready(iovecs)) => iovecs,
+                Ok(ReadIovecsOutcome::Suspended { suspension, .. }) => {
+                    return Ok(DispatchOutcome::from_owner_memory_read_wait(suspension.wait));
+                }
+                Err(error) => return Ok(error.into_outcome()),
+            };
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
@@ -3094,46 +3130,12 @@ impl<'a> FsView<'a> {
                     let Some(read_lease) = open_file.description.retain_fd_lease() else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    let mut total = 0i64;
-                    for iov in &iovecs {
-                        let len = usize::try_from(iov.iov_len)
-                            .map_err(|_| DispatchError::LengthTooLarge(iov.iov_len))?;
-                        if len == 0 {
-                            continue;
-                        }
-                        let Some(wait_authority) = this
-                            .captured_slot_authority(fd.0)
-                            .map(WaitFdAuthority::logical)
-                        else {
-                            if total > 0 {
-                                break;
-                            }
-                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                        };
-                        match read_pipe_unprepared(
-                            memory,
-                            iov.iov_base,
-                            len,
-                            &pipe,
-                            flags,
-                            wait_authority,
-                        ) {
-                            DispatchOutcome::Returned { value } => {
-                                total += value;
-                                if (value as usize) < len {
-                                    break;
-                                }
-                            }
-                            DispatchOutcome::WaitOnFds { fds, timeout, sig_mask, completion } => {
-                                return Ok(DispatchOutcome::WaitOnFds {
-                                    fds: fds.with_description_lease(read_lease),
-                                    timeout, sig_mask, completion,
-                                });
-                            }
-                            other => return Ok(other),
-                        }
-                    }
-                    return Ok(DispatchOutcome::Returned { value: total });
+                    let Some(authority) = this.captured_slot_authority(fd.0).map(WaitFdAuthority::logical) else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    return super::pipe::OwnedPipeRead::new(
+                        cx.kernel, pipe, read_lease, iovecs, flags, authority,
+                    ).resume(cx.kernel, memory);
                 }
                 _ => {}
             }
@@ -5721,6 +5723,36 @@ mod writev_pipe_copy_tests {
         assert_eq!(
             writev_pipe_fault_boundary(3, PIPE_BUF * 2, PIPE_BUF),
             PIPE_BUF * 3
+        );
+    }
+}
+
+#[cfg(test)]
+mod iovec_owner_wait_tests {
+    use super::*;
+    use carrick_guest_mem::{GuestMemory, MemoryError};
+
+    struct Gated(carrick_el1_abi::PortalOwnerWait);
+    impl GuestMemory for Gated {
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OwnerWait(self.0))
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            panic!("iovec intake has no output");
+        }
+    }
+    impl CurrentMmMemory for Gated {}
+
+    #[test]
+    fn readv_iovec_intake_preserves_direct_owner_refusal() {
+        let wait = crate::dispatch::copyout::owner_fixture::editor_wait();
+        let result = read_iovecs_from(&Gated(wait), 0x4000, 1, Vec::new(), 0);
+        let Err(error) = result else {
+            panic!("the closed owner must refuse iovec intake");
+        };
+        assert_eq!(
+            error.into_outcome(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         );
     }
 }

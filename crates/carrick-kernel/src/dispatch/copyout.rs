@@ -103,25 +103,38 @@ impl UserSlot {
 pub(crate) struct CopyoutRefusal(Box<DispatchOutcome>);
 
 impl DispatchOutcome {
+    /// Preserve the owner preparation verdict across runtime copyout boundaries.
+    pub fn from_owner_memory_prepare_error(error: carrick_guest_mem::MemoryPrepareError) -> Self {
+        crate::el1_delegation::owner_prepare_refusal(error)
+    }
+
+    /// A typed read dependency always has a canonical suspension outcome.
+    pub fn from_owner_memory_read_wait(wait: carrick_guest_mem::MemoryReadWait) -> Self {
+        use carrick_guest_mem::{MemoryReadWait, MemorySupplyRequest};
+        match wait {
+            MemoryReadWait::Owner(wait) => Self::OwnerMemoryWait { wait, committed: 0 },
+            MemoryReadWait::Physical(wait) => Self::OwnerPhysicalWait { wait, committed: 0 },
+            MemoryReadWait::Supply(MemorySupplyRequest::Metadata { observed, .. }) => {
+                Self::OwnerMemoryWait {
+                    wait: observed,
+                    committed: 0,
+                }
+            }
+            MemoryReadWait::Supply(request) => Self::OwnerMemorySupply {
+                request,
+                committed: 0,
+            },
+        }
+    }
+
     /// Convert a retryable owner memory refusal into the canonical dispatch
     /// outcome that parks or supplies the dependency before redispatching.
     pub fn from_owner_memory_error(error: carrick_guest_mem::MemoryError) -> Option<Self> {
-        use carrick_guest_mem::{MemoryError, MemoryReadWait, MemorySupplyRequest};
+        use carrick_guest_mem::{MemoryError, MemorySupplyRequest};
         let outcome = match error {
-            MemoryError::ReadSuspended(suspension) => match suspension.wait {
-                MemoryReadWait::Owner(wait) => Self::OwnerMemoryWait { wait, committed: 0 },
-                MemoryReadWait::Physical(wait) => Self::OwnerPhysicalWait { wait, committed: 0 },
-                MemoryReadWait::Supply(MemorySupplyRequest::Metadata { observed, .. }) => {
-                    Self::OwnerMemoryWait {
-                        wait: observed,
-                        committed: 0,
-                    }
-                }
-                MemoryReadWait::Supply(request) => Self::OwnerMemorySupply {
-                    request,
-                    committed: 0,
-                },
-            },
+            MemoryError::ReadSuspended(suspension) => {
+                Self::from_owner_memory_read_wait(suspension.wait)
+            }
             MemoryError::OwnerWait(wait) => Self::OwnerMemoryWait { wait, committed: 0 },
             MemoryError::Physical(wait) => Self::OwnerPhysicalWait { wait, committed: 0 },
             MemoryError::Supply(request) => match *request {

@@ -672,6 +672,7 @@ pub mod fs;
 pub use fs::RecordLockContentionFixture;
 pub use fs::StdioSink;
 pub use fs::directory::OwnedDirectoryRead;
+pub use fs::pipe::{OwnedPipeRead, SuspendedPipeRead};
 pub use fs::rw::OwnedWriteCopyIn;
 pub use fs::state::{PipedOutput, StdioReadiness};
 pub use net::send_recv::OwnedRecvfromAddress;
