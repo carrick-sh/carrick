@@ -67,6 +67,9 @@ vm_free = [
   "carrick-el1-linux::native_process_runtime::host_test_support::{completed_ppoll_output_retains_result_and_next_byte_across_owner_wait,completed_ppoll_output_cancellation_commits_no_more_bytes}",
   "carrick-runtime::vcpu_loop::tests::serial_host_recvfrom_address_uses_shared_owner_and_physical_resume",
   "carrick-el1-linux::native_process_runtime::host_test_support::{completed_ppoll_output_retains_result_and_next_byte_across_owner_wait,completed_ppoll_output_cancellation_commits_no_more_bytes,completed_ppoll_output_cancellation_during_enrollment_never_returns_an_errno}",
+  "carrick-el1-linux::dispatch::tests::{production_trap_frame_routes_ppoll_to_the_poll_family,blocking_poll_without_a_wait_venue_does_not_publish_timeout_output}",
+  "carrick-el1-linux::ipc::tests::{native_resumed_read_fault_retires_operation_and_endpoint_pin,native_resumed_eventfd_fault_keeps_counter_and_releases_pin,poll_readiness_uses_ipc_objects_and_exact_file_table}",
+  "carrick-el1-linux::native_process_runtime::host_test_support::production_trap_frame_ppoll_retains_completed_output_across_owner_wait",
 ]
 
 [bindings.unresolved]

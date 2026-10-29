@@ -1228,7 +1228,7 @@ impl<'a> IpcObjectGuard<'a> {
     }
 
     /// This member's current level, as Linux epoll event bits.
-    fn member_level(&mut self, kind: EpollMember) -> Result<u32, IpcError> {
+    pub fn member_level(&mut self, kind: EpollMember) -> Result<u32, IpcError> {
         let readiness = match kind {
             EpollMember::EventFd => self.eventfd()?.readiness(),
             EpollMember::PipeReader => self.pipe()?.readiness(End::Reader),
