@@ -2238,12 +2238,13 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        // A refusing script exits before reading stdin, so the write may race
+        // its exit and see EPIPE; the caller's status and file checks decide.
+        match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(error) => panic!("write guest mint input: {error}"),
+        }
         child.wait_with_output().unwrap()
     }
     #[test]
@@ -2333,7 +2334,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            guest_mint(&state, GUEST_MINT_RESPOND, "overwrite")
+            guest_mint(&state, GUEST_MINT_RESPOND, &"overwrite".repeat(16 * 1024))
                 .status
                 .code(),
             Some(5)
