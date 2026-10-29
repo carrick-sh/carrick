@@ -1255,6 +1255,16 @@ where
                         );
                     }
                 }
+                Ok(Err(Ok(carrick_kernel::kernel::ProcessThreadExit::LastThread))) => {
+                    // Keep the final member signal-visible until the terminal
+                    // owner retires the task. Its clear must commit with that
+                    // retirement, not a failed nonfinal thread exit. The old
+                    // owner's clear (if any) now belongs to an already retired
+                    // member and can finish through this same drain.
+                    if let Some(owner_clear) = self.child_tid_clear.replace(clear) {
+                        pending.push(owner_clear);
+                    }
+                }
                 Ok(Err(Ok(carrick_kernel::kernel::ProcessThreadExit::AlreadyRetired)))
                     if clear.context.thread().child_tid_cleared_in_zone() =>
                 {
@@ -2127,6 +2137,135 @@ mod child_tid_owner_tests {
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
         assert!(!registry.is_clear_child_tid_addr(VA));
         publication.publish().unwrap();
+    }
+
+    #[test]
+    fn serial_host_last_sibling_clear_drain_leaves_retirement_to_terminal_owner() {
+        last_sibling_clear_drain(false);
+    }
+
+    #[test]
+    fn serial_host_last_sibling_clear_drain_preserves_displaced_owner_clear() {
+        last_sibling_clear_drain(true);
+    }
+
+    fn last_sibling_clear_drain(owner_has_clear: bool) {
+        use carrick_kernel::kernel::{LinuxWaitStatus, TaskExitSubscriber};
+
+        #[derive(Default)]
+        struct ExitStatus(parking_lot::Mutex<Vec<LinuxWaitStatus>>);
+        impl TaskExitSubscriber for ExitStatus {
+            fn publish_exit(&self, status: LinuxWaitStatus) {
+                self.0.lock().push(status);
+            }
+        }
+
+        let (kernel, root) = clear_kernel(72_550);
+        let sibling = root
+            .kernel()
+            .reserve_thread_clone(
+                &root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM
+                        | carrick_abi::LinuxCloneFlags::CHILD_CLEARTID,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(72_551))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+        sibling.thread().control_slot().set_clear_child_tid(VA);
+        assert!(root.exact_thread_is_live());
+        assert!(sibling.exact_thread_is_live());
+        let registry = Arc::new(ThreadRegistry::new(root.thread().registry_id()));
+        let threads = VcpuThreadRegistry::new();
+        let mut owner = clear_state(&kernel, &root, registry.clone(), threads);
+        if owner_has_clear {
+            registry.set_clear_child_tid(root.thread().registry_id(), VA + 4);
+            owner.capture_child_tid_clear().unwrap();
+        }
+        let status = Arc::new(ExitStatus::default());
+        root.kernel()
+            .register_task_exit_subscriber(root.task().key().id, &status)
+            .unwrap();
+        let claim = kernel
+            .try_claim_persistent_process_exit(root.thread().registry_id())
+            .unwrap();
+        assert_eq!(claim.claim, super::terminal::ProcessExitClaim::Owner);
+        kernel.begin_process_exit();
+        owner.publish_persistent_sibling_stop(&kernel).unwrap();
+        // Force the failing interleaving: after the owner's census captures
+        // the sibling clear, the owner thread exits first. The retained
+        // sibling is now the final graph member, but not the terminal owner.
+        root.kernel().exit_thread(&root, None).unwrap();
+        assert!(!root.exact_thread_is_live());
+        assert!(sibling.exact_thread_is_live());
+        let dependency = Arc::new(ClearDependency::default());
+        let mut engine = clear_engine(&root, &dependency);
+        engine.guest_memory.insert(VA + 4, vec![1; 4]);
+        let owner_wakes = Arc::new(AtomicUsize::new(0));
+        let observed = owner_wakes.clone();
+        let _owner_subscription = owner.futex.subscribe_generation(
+            owner.futex.prepare_wait(VA + 4),
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let (wakes, _subscription) = clear_wakes(&owner.futex);
+        assert!(matches!(
+            owner.drain_child_tid_clears(&kernel, &mut engine),
+            Err(PersistentThreadExitDisposition::Memory(
+                carrick_guest_mem::MemoryPrepareError::Physical(_)
+            ))
+        ));
+        assert!(registry.is_clear_child_tid_addr(VA));
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        dependency.0.store(true, Ordering::Release);
+        assert!(owner.drain_child_tid_clears(&kernel, &mut engine).is_ok());
+        assert!(owner.drain_child_tid_clears(&kernel, &mut engine).is_ok());
+        assert_ne!(engine.guest_memory[&VA], [0; 4]);
+        assert_eq!(engine.prepared_commits, usize::from(owner_has_clear));
+        assert_eq!(
+            owner_wakes.load(Ordering::SeqCst),
+            usize::from(owner_has_clear)
+        );
+        assert_eq!(
+            engine.guest_memory[&(VA + 4)],
+            if owner_has_clear { [0; 4] } else { [1; 4] }
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        assert!(registry.is_clear_child_tid_addr(VA));
+        assert!(sibling.exact_thread_is_live());
+        assert!(status.0.lock().is_empty());
+        engine.prepared_write_context = Some(sibling.retain_exact());
+        let expected = LinuxWaitStatus::from_wait_encoding(7 << 8);
+        let exit = root
+            .kernel()
+            .prepare_task_exit_key(root.task().key(), expected, None)
+            .unwrap();
+        let publication = owner
+            .commit_terminal_child_tid(&kernel, &mut engine, || exit.retire_notifying(|_| {}))
+            .unwrap()
+            .unwrap();
+        publication.publish().unwrap();
+        assert!(!root.kernel().task_key_is_live(root.task().key()));
+        assert_eq!(engine.guest_memory[&VA], [0; 4]);
+        assert!(!registry.is_clear_child_tid_addr(VA));
+        assert_eq!(*status.0.lock(), vec![expected]);
+        assert_eq!(engine.prepared_commits, 1 + usize::from(owner_has_clear));
+        assert_eq!(
+            owner_wakes.load(Ordering::SeqCst),
+            usize::from(owner_has_clear)
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
     }
 
     #[test]
