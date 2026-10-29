@@ -92,3 +92,9 @@ keeps the row WRITING through dirty-bit and quota cleanup before releasing it
 as RETIRED. The concurrent quota test uses real shared-table claims in two
 simultaneously live MM owners. These tests prove residency ownership, not
 guest execution, native lifecycle settlement or physical data readback.
+
+Self-review additionally found that retirement scans must honor masks, not
+just lookup and publication. A pinned surviving stock page initially blocked
+retirement of an independent mapping in its retired hole. That focused witness
+failed before the fix; all retirement preclaim/cancel/commit scans now use
+retained overlap, so the unrelated pin no longer blocks the hole's owner.
