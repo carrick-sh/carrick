@@ -1348,12 +1348,10 @@ impl<'a> FsView<'a> {
         let sig = common.async_sig();
         // `F_SETOWN`/`F_SETSIG` refresh must not move `fa_fd`. A description that
         // is armed without a recorded transition (status flags it was created
-        // with) records the number it is first synchronised through.
-        let fa_fd = common.async_fd().unwrap_or_else(|| {
-            let fa_fd = carrick_signal_linux::fasync::FasyncFd::new(fd);
-            common.record_async_fd(fa_fd);
-            fa_fd
-        });
+        // with) records the number it is first synchronised through, with one
+        // atomic compare-exchange so concurrent synchronisations agree.
+        let fa_fd =
+            common.record_async_fd_if_unset(carrick_signal_linux::fasync::FasyncFd::new(fd));
         carrick_signal_linux::fasync::arm(
             pipe_id,
             carrick_signal_linux::fasync::FasyncOwner {

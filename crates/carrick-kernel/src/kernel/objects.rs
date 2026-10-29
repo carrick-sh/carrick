@@ -1010,15 +1010,32 @@ impl DescriptionCommon {
     /// them, so a negative value cannot collide with a recorded `fa_fd`.
     const NO_ASYNC_FD: i32 = -1;
 
-    /// The descriptor number recorded when `O_ASYNC` was enabled, if any.
-    pub(crate) fn async_fd(&self) -> Option<carrick_signal_linux::fasync::FasyncFd> {
-        let fd = self.async_fd.load(Ordering::Relaxed);
-        (fd != Self::NO_ASYNC_FD).then(|| carrick_signal_linux::fasync::FasyncFd::new(fd))
-    }
-
     /// Record `fa_fd` on the `O_ASYNC` 0 -> 1 transition (Linux `fasync_helper`).
     pub(crate) fn record_async_fd(&self, fd: carrick_signal_linux::fasync::FasyncFd) {
         self.async_fd.store(fd.get(), Ordering::Relaxed);
+    }
+
+    /// Record `fd` as `fa_fd` only if none is recorded yet, and return the
+    /// number that is recorded afterwards (ours, or the one a concurrent caller
+    /// installed first). This is the fallback for a description that is armed
+    /// without having seen an `O_ASYNC` 0 -> 1 `F_SETFL` (its status flags were
+    /// set at creation): it is the first synchronisation that names the number,
+    /// and a racing `F_SETOWN`/`F_SETSIG` through another descriptor must not
+    /// overwrite it. A check-then-store here would let two threads publish
+    /// different `fa_fd` values for one registration.
+    pub(crate) fn record_async_fd_if_unset(
+        &self,
+        fd: carrick_signal_linux::fasync::FasyncFd,
+    ) -> carrick_signal_linux::fasync::FasyncFd {
+        match self.async_fd.compare_exchange(
+            Self::NO_ASYNC_FD,
+            fd.get(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => fd,
+            Err(recorded) => carrick_signal_linux::fasync::FasyncFd::new(recorded),
+        }
     }
 
     /// Forget the recorded `fa_fd` when `O_ASYNC` is cleared.
@@ -4007,6 +4024,50 @@ mod tests {
     use crate::kernel::ids::ObjectIdRegistry;
 
     use super::*;
+
+    /// A description created with `O_ASYNC` already set has no recorded `fa_fd`;
+    /// the first synchronisation names it and every later caller (including
+    /// ones racing it from other descriptor numbers) gets that same number.
+    #[test]
+    fn async_fd_first_synchronisation_wins_under_contention() {
+        use carrick_signal_linux::fasync::FasyncFd;
+
+        let common = DescriptionCommon::new(carrick_abi::LINUX_O_ASYNC);
+        assert_eq!(common.record_async_fd_if_unset(FasyncFd::new(7)).get(), 7);
+        assert_eq!(
+            common.record_async_fd_if_unset(FasyncFd::new(9)).get(),
+            7,
+            "a later synchronisation must not move fa_fd"
+        );
+        common.clear_async_fd();
+
+        let common = Arc::new(DescriptionCommon::new(carrick_abi::LINUX_O_ASYNC));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let seen: Vec<i32> = (0..8)
+            .map(|index| {
+                let common = Arc::clone(&common);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    common
+                        .record_async_fd_if_unset(FasyncFd::new(10 + index))
+                        .get()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(
+            seen.iter().all(|fd| *fd == seen[0]),
+            "every racer must observe the one winning fa_fd: {seen:?}"
+        );
+        assert!((10..18).contains(&seen[0]));
+        assert_eq!(
+            common.record_async_fd_if_unset(FasyncFd::new(99)).get(),
+            seen[0]
+        );
+    }
 
     #[derive(Debug, Default)]
     struct TestCeilingPublisher(AtomicU32);

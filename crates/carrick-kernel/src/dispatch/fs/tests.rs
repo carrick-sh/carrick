@@ -5476,6 +5476,119 @@ fn fasync_si_fd_changes_only_when_o_async_is_re_enabled() {
     rig.close(write_fd);
 }
 
+/// A blocking pipe write that parks after a partial copy publishes readiness
+/// from the continuation, never from a numeric fd: the writer number it ran
+/// through may be closed (or reused) by then. Both the first-chunk edge and
+/// the edge published when the continuation finishes carry the armed `fa_fd`.
+#[test]
+fn fasync_si_fd_is_the_armed_fd_across_a_parked_pipe_write() {
+    const BUFFER: u64 = 0x8000;
+    const CAPACITY: usize = crate::dispatch::fs::pipe::DEFAULT_PIPE_CAPACITY;
+    const SLACK: usize = 4096;
+
+    carrick_signal_linux::fasync::fasync_init();
+    let mut rig = SpliceTestRig::new(0x30000);
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+    let write_alias = rig.dup(write_fd);
+    assert_ne!(read_fd, write_fd);
+    assert_ne!(read_fd, write_alias);
+    assert_ne!(write_fd, write_alias);
+    rig.arm_fasync_via(read_fd);
+
+    // One page more than the pipe holds: the first copy is partial, so the
+    // write parks as a continuation through the dup'd writer number.
+    let mut blocked = match rig.run(
+        SpliceTestRig::SYS_WRITE,
+        [write_alias, BUFFER, (CAPACITY + SLACK) as u64, 0, 0, 0],
+    ) {
+        DispatchOutcome::BlockingWrite(write) => write,
+        other => panic!("expected a parked partial pipe write, got {other:?}"),
+    };
+    assert_eq!(
+        rig.take_fasync_si_fd(),
+        read_fd as i32,
+        "the first chunk's edge reports the armed fd, not the writer's number",
+    );
+    rig.assert_no_fasync_signal_pending();
+
+    // Both writer numbers close while the continuation is parked; its retained
+    // lease keeps the writer endpoint (and the registration) alive.
+    rig.close(write_alias);
+    rig.close(write_fd);
+
+    // Drain a page so the continuation can finish and publish its own edge.
+    assert_eq!(
+        rig.run(
+            SpliceTestRig::SYS_READ,
+            [read_fd, 0x4300, SLACK as u64, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned {
+            value: SLACK as i64
+        },
+    );
+    match crate::dispatch::drive_blocking_write(
+        &mut blocked,
+        &carrick_hal::NullHostSignalBridge::default(),
+    ) {
+        crate::dispatch::BlockingWriteStep::Done(DispatchOutcome::Returned { value }) => {
+            assert_eq!(value, (CAPACITY + SLACK) as i64);
+        }
+        _ => panic!("expected the parked write to complete"),
+    }
+    assert_eq!(
+        rig.take_fasync_si_fd(),
+        read_fd as i32,
+        "the continuation's edge reports the armed fd after both writer numbers closed",
+    );
+    rig.assert_no_fasync_signal_pending();
+
+    drop(blocked);
+    rig.close(read_fd);
+}
+
+/// A description created with `O_ASYNC` already in its status flags never saw
+/// an `O_ASYNC` 0 -> 1 `F_SETFL`, so its first synchronisation (here an
+/// `F_SETSIG`/`F_SETOWN` through a `dup`) names `fa_fd`; a later one through
+/// the original number must not move it.
+#[test]
+fn fasync_si_fd_for_description_created_with_o_async_is_first_synchronised_fd() {
+    carrick_signal_linux::fasync::fasync_init();
+    let mut rig = SpliceTestRig::new(0x10000);
+    let (read_fd, write_fd) = rig.pipe2(0x4200);
+    let read_alias = rig.dup(read_fd);
+    assert_ne!(read_fd, read_alias);
+    rig.dispatcher
+        .open_file(read_fd as i32)
+        .expect("read end")
+        .description
+        .common()
+        .set_status_flags(carrick_abi::LINUX_O_ASYNC);
+
+    let pid = match rig.run(SpliceTestRig::SYS_GETPID, [0; 6]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("getpid failed: {other:?}"),
+    };
+    rig.fcntl_ok(read_alias, LINUX_F_SETSIG, FASYNC_FD_TEST_SIGNAL as u64);
+    rig.fcntl_ok(read_alias, LINUX_F_SETOWN, pid);
+    rig.write_byte(write_fd);
+    assert_eq!(
+        rig.take_fasync_si_fd(),
+        read_alias as i32,
+        "the first synchronisation of a born-async description records its number",
+    );
+
+    // Refreshing through the original number leaves the recorded one alone.
+    rig.fcntl_ok(read_fd, LINUX_F_SETOWN, pid);
+    rig.fcntl_ok(read_fd, LINUX_F_SETSIG, FASYNC_FD_TEST_SIGNAL as u64);
+    rig.write_byte(write_fd);
+    assert_eq!(rig.take_fasync_si_fd(), read_alias as i32);
+    rig.assert_no_fasync_signal_pending();
+
+    rig.close(read_alias);
+    rig.close(read_fd);
+    rig.close(write_fd);
+}
+
 /// Splicing FROM readable synthetic character devices into a pipe write end:
 /// - /dev/zero and /dev/full yield requested zero bytes (LTP splice08).
 /// - /dev/null yields EOF (returns 0).
