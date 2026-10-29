@@ -2009,7 +2009,7 @@ where
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         match resume {
-            binding::OwnedSyscallResume::Completion(pending) => {
+            binding::OwnedSyscallResume::Output(pending) => {
                 use carrick_kernel::kernel::continuation::CompletionFoldError;
                 let resume = || {
                     let context = self
@@ -2020,6 +2020,10 @@ where
                     let lease = lease_guard
                         .as_ref()
                         .ok_or(CompletionFoldError::ExecutionAuthority)?;
+                    context
+                        .thread()
+                        .validate_running_execution_lease(lease)
+                        .map_err(|_| CompletionFoldError::ExecutionAuthority)?;
                     let identity = lease
                         .task_state_authority()
                         .map_err(|_| CompletionFoldError::ExecutionAuthority)?;
@@ -2038,14 +2042,6 @@ where
                 self.resume_owned_io(kernel, engine, pending, host_wait)
             }
             binding::OwnedSyscallResume::Sleep(pending) => Ok(pending.resume(engine)),
-            binding::OwnedSyscallResume::RecvfromAddress(pending) => {
-                let context = self.service_kernel_context.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration(
-                        "recvfrom address completion lost context".to_owned(),
-                    )
-                })?;
-                Ok(pending.resume(context, engine))
-            }
             binding::OwnedSyscallResume::Ipc(pending) => {
                 self.resume_ipc_copyout(kernel, engine, pending)
             }
@@ -3676,6 +3672,9 @@ pub(crate) mod tests {
         pub(crate) copyout_owner_probe: Option<CopyoutOwnerProbe>,
         // A real MM gate transition at the first unprepared output boundary.
         pub(crate) close_gate_after_write: Option<(usize, u64)>,
+        // Independent payload mapping used by the recvfrom metadata fixture.
+        pub(crate) uncontended_payload: Option<u64>,
+        pub(crate) uncontended_reads: bool,
         // Frame result, result already completed when injected, restart flag.
         pub(crate) injected_signals: Vec<(Option<i64>, Option<i64>, bool)>,
     }
@@ -3751,6 +3750,13 @@ pub(crate) mod tests {
             carrick_guest_mem::MemoryPrepareError,
         > {
             self.prepared_attempts += 1;
+            if ranges.len() == 1 && self.uncontended_payload == Some(ranges[0].address().raw()) {
+                return Ok(Box::new(TestPreparedCopyout {
+                    addresses: ranges.iter().map(|range| range.address().raw()).collect(),
+                    engine: self,
+                    committed: false,
+                }));
+            }
             if let Some(wait) = &self.prepare_dependency
                 && !wait.0.is_ready()
             {
@@ -3799,6 +3805,7 @@ pub(crate) mod tests {
             length: usize,
         ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
             if let Some(probe) = self.copyout_owner_probe
+                && !self.uncontended_reads
                 && let Some(wait) = probe.wait_if_busy()
             {
                 return Err(carrick_guest_mem::MemoryError::ReadSuspended(Box::new(
@@ -4702,6 +4709,23 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn serial_host_recvfrom_address_uses_shared_owner_and_physical_resume() {
+        for physical in [false, true] {
+            for immediate in [false, true] {
+                exercise_owner_wait_completion(
+                    carrick_abi::syscall::nr::RECVFROM,
+                    None,
+                    false,
+                    false,
+                    physical,
+                    false,
+                    Some(immediate),
+                );
+            }
+        }
+    }
+
     fn exercise_owner_wait_schedule_at(
         nr: carrick_abi::CanonicalNr,
         signum: Option<i32>,
@@ -4719,12 +4743,13 @@ pub(crate) mod tests {
         release_wins: bool,
         physical: bool,
         completion_copyout: bool,
-        interrupted_sleep: Option<bool>,
+        saved_output_schedule: Option<bool>,
     ) {
-        let immediate = interrupted_sleep.unwrap_or(false);
-        let interrupted_sleep = interrupted_sleep.is_some();
-        let physical_after_owner = interrupted_sleep && physical;
-        let physical = physical && !interrupted_sleep;
+        let immediate = saved_output_schedule.unwrap_or(false);
+        let recvfrom = nr == carrick_abi::syscall::nr::RECVFROM;
+        let interrupted_sleep = saved_output_schedule.is_some() && !recvfrom;
+        let physical_after_owner = (interrupted_sleep || recvfrom) && physical;
+        let physical = physical && !(interrupted_sleep || recvfrom);
         struct UnreadyBacking {
             ready: std::sync::atomic::AtomicBool,
             ready_on_enroll: bool,
@@ -4762,8 +4787,73 @@ pub(crate) mod tests {
         let sleep = nr == nr::NANOSLEEP || nr == nr::CLOCK_NANOSLEEP;
         let ipc_read = nr == nr::READ;
         let (process, _) = crate::hvpatch::process_context_for_tests(71_102);
-        let dispatcher = SyscallDispatcher::new();
+        let mut dispatcher = SyscallDispatcher::new();
         dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
+        // A loopback connection selects the production in-zone stream path.
+        // socketpair currently creates HostSocket descriptions, which do not
+        // use the retained post-payload address completion under test.
+        let recv_fd = if recvfrom {
+            use carrick_guest_mem::GuestMemory;
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x710000, vec![0; 4096]);
+            let reporter = carrick_kernel::compat::CompatReporter::default();
+            let mut call =
+                |number: carrick_abi::CanonicalNr,
+                 args: [u64; 6],
+                 memory: &mut carrick_kernel::dispatch::LinearMemory| {
+                    match dispatcher
+                        .dispatch(
+                            &context,
+                            SyscallRequest::new(
+                                number.raw(),
+                                carrick_kernel::compat::SyscallArgs::from(args),
+                            ),
+                            memory,
+                            &reporter,
+                        )
+                        .unwrap()
+                    {
+                        DispatchOutcome::Returned { value } => value as u64,
+                        other => panic!("stream fixture {number:?}: {other:?}"),
+                    }
+                };
+            let listener = call(nr::SOCKET, [2, 1, 0, 0, 0, 0], &mut memory);
+            let mut address = [0u8; 16];
+            address[..2].copy_from_slice(&2u16.to_ne_bytes());
+            address[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            memory.write_bytes_raw(0x710100, &address).unwrap();
+            assert_eq!(
+                call(nr::BIND, [listener, 0x710100, 16, 0, 0, 0], &mut memory),
+                0
+            );
+            assert_eq!(call(nr::LISTEN, [listener, 1, 0, 0, 0, 0], &mut memory), 0);
+            memory
+                .write_bytes_raw(0x710200, &16u32.to_ne_bytes())
+                .unwrap();
+            assert_eq!(
+                call(
+                    nr::GETSOCKNAME,
+                    [listener, 0x710100, 0x710200, 0, 0, 0],
+                    &mut memory
+                ),
+                0
+            );
+            let client = call(nr::SOCKET, [2, 1, 0, 0, 0, 0], &mut memory);
+            assert_eq!(
+                call(nr::CONNECT, [client, 0x710100, 16, 0, 0, 0], &mut memory),
+                0
+            );
+            let server = call(nr::ACCEPT, [listener, 0, 0, 0, 0, 0], &mut memory);
+            assert_eq!(call(nr::CLOSE, [listener, 0, 0, 0, 0, 0], &mut memory), 0);
+            memory.write_bytes_raw(0x710010, b"data").unwrap();
+            assert_eq!(
+                call(nr::WRITE, [client, 0x710010, 4, 0, 0, 0], &mut memory),
+                4
+            );
+            Some(server)
+        } else {
+            None
+        };
         let kernel = Arc::new(KernelState::new(
             dispatcher,
             Arc::new(EndpointTestSignalPump),
@@ -4949,7 +5039,9 @@ pub(crate) mod tests {
         let frame = carrick_hal::RawSyscall {
             current_guest_sp: None,
             number: nr,
-            args: if nr == nr::NANOSLEEP {
+            args: if let Some(fd) = recv_fd {
+                [fd as u64, 0x71_1000, 4, 0, 0x71_1040, 0x71_1020]
+            } else if nr == nr::NANOSLEEP {
                 [0x71_1000, 0x71_1020, 0, 0, 0, 0]
             } else if nr == nr::CLOCK_NANOSLEEP {
                 [1, 0, 0x71_1000, 0x71_1020, 0, 0]
@@ -5025,6 +5117,14 @@ pub(crate) mod tests {
             native_owner: native_owner.clone(),
             ..Default::default()
         };
+
+        if recvfrom {
+            engine.uncontended_payload = Some(0x71_1000);
+            engine.uncontended_reads = true;
+            engine
+                .guest_memory
+                .insert(0x71_1020, 4u32.to_ne_bytes().to_vec());
+        }
 
         // Admit once before the sibling takes its editor; output waits must
         // never re-enter this dispatcher or read the sleep request again.
@@ -5273,15 +5373,39 @@ pub(crate) mod tests {
                             .unwrap()
                         };
                         assert!(
-                            matches!(&first, DispatchOutcome::CompletionCopyoutSuspended(_)),
+                            matches!(&first, DispatchOutcome::OutputSuspended(_)),
                             "interrupted remainder must suspend, retaining errno 4: {first:?}"
                         );
                         let (first, resume) = binding::owner_copyin_route(first);
                         (first, resume.unwrap())
                     } else {
-                        let first = state
-                            .service_threaded_syscall(&kernel, &mut engine, frame, None)
-                            .unwrap();
+                        let first = if recvfrom {
+                            let mut running = scheduler.take(&registration).unwrap();
+                            let mut authority = executor::ExecutionLeaseAuthoritySlot::new(Some(
+                                running.take_lease(),
+                            ));
+                            let (cell, injected) = binding::ExecutionLeaseCell::injected();
+                            state.execution_lease = cell;
+                            let first = {
+                                let _publication = injected.install(&mut authority);
+                                state
+                                    .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                                    .unwrap()
+                            };
+                            running
+                                .restore_lease(authority.take_lease().unwrap())
+                                .unwrap();
+                            scheduler.settle_runnable_successor(running).unwrap();
+                            assert!(
+                                matches!(first, DispatchOutcome::OutputSuspended(_)),
+                                "metadata completion must suspend: {first:?}"
+                            );
+                            first
+                        } else {
+                            state
+                                .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                                .unwrap()
+                        };
                         let (first, resume) = binding::owner_copyin_route(first);
                         (
                             first,
@@ -5297,8 +5421,11 @@ pub(crate) mod tests {
                             "the production service must park on the sibling's editor, never return EFAULT",
                         );
                     }
-                    assert_eq!(engine.prepared_commits, 0);
-                    assert_eq!(root.resources().files().slot_count(), 0);
+                    assert_eq!(engine.prepared_commits, usize::from(recvfrom));
+                    assert_eq!(
+                        root.resources().files().slot_count(),
+                        if recvfrom { 2 } else { 0 }
+                    );
 
                     state.zone_mm = Some(mm.raw());
                     let mut snapshot = executor::tests::task_state(&root, 500).cpu;
@@ -5359,7 +5486,7 @@ pub(crate) mod tests {
                         scheduler.settle_runnable_successor(running).unwrap();
                         running = scheduler.take(&registration).unwrap();
                     }
-                    if !interrupted_sleep {
+                    if !interrupted_sleep && !recvfrom {
                         assert_eq!(running.generation(), generation);
                     }
                     let lease = running.take_lease();
@@ -5400,8 +5527,13 @@ pub(crate) mod tests {
                                 job.state.pending_ipc_owner = Some(pending);
                                 first
                             }
-                            binding::OwnedSyscallResume::Completion(pending) => {
-                                DispatchOutcome::CompletionCopyoutSuspended(pending)
+                            binding::OwnedSyscallResume::Output(pending) => {
+                                let DispatchOutcome::OwnerPhysicalWait { wait, .. } = first else {
+                                    panic!("physical dependency")
+                                };
+                                DispatchOutcome::OutputSuspended(Box::new(
+                                    carrick_kernel::kernel::continuation::output::SuspendedOutputCompletion::new(
+                                        *pending, carrick_guest_mem::MemoryReadWait::Physical(wait))))
                             }
                             _ => panic!("retained output operation"),
                         };
@@ -5539,7 +5671,7 @@ pub(crate) mod tests {
                     if !killing {
                         release_tx.send(()).unwrap();
                         peer.join().unwrap();
-                        if completion_copyout && physical {
+                        if (completion_copyout || recvfrom) && physical {
                             physical_backing
                                 .ready
                                 .store(true, std::sync::atomic::Ordering::Release);
@@ -5599,10 +5731,10 @@ pub(crate) mod tests {
                         exec_replacement: None,
                     };
                     let (cell, injected) = binding::ExecutionLeaseCell::injected();
-                    if completion_copyout {
+                    if completion_copyout || recvfrom {
                         job.state.execution_lease = cell;
                     }
-                    let _publication = completion_copyout
+                    let _publication = (completion_copyout || recvfrom)
                         .then(|| injected.install(&mut resumed_submission.authority));
                     let mut resumed_control = executor::HvpatchQuantumControl::for_test(
                         &need_resched,
@@ -5610,8 +5742,54 @@ pub(crate) mod tests {
                     );
                     resumed_control.binding = Some(&binding);
                     if physical_after_owner {
-                        engine.prepare_dependency =
-                            Some(carrick_guest_mem::OwnedMemoryWait(physical_backing.clone()));
+                        if recvfrom {
+                            #[derive(Debug)]
+                            struct WriterDependency {
+                                ready: Arc<UnreadyBacking>,
+                                released: Arc<std::sync::atomic::AtomicBool>,
+                            }
+                            impl Drop for WriterDependency {
+                                fn drop(&mut self) {
+                                    self.released
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                }
+                            }
+                            impl carrick_guest_mem::PhysicalMemoryWait for WriterDependency {
+                                fn is_ready(&self) -> bool {
+                                    carrick_guest_mem::PhysicalMemoryWait::is_ready(&*self.ready)
+                                }
+                                fn enroll(
+                                    &self,
+                                    wake: Arc<dyn Fn() + Send + Sync>,
+                                ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool)
+                                {
+                                    carrick_guest_mem::PhysicalMemoryWait::enroll(
+                                        &*self.ready,
+                                        wake,
+                                    )
+                                }
+                            }
+                            let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let mut wait = Some(carrick_guest_mem::OwnedMemoryWait(Arc::new(
+                                WriterDependency {
+                                    ready: physical_backing.clone(),
+                                    released: released.clone(),
+                                },
+                            )));
+                            engine.copyout_prepare = Some(Box::new(move || {
+                                if let Some(wait) = wait.take() {
+                                    return Some(wait);
+                                }
+                                assert!(
+                                    released.load(std::sync::atomic::Ordering::Acquire),
+                                    "recvfrom physical writer exclusion survived into fresh preparation"
+                                );
+                                None
+                            }));
+                        } else {
+                            engine.prepare_dependency =
+                                Some(carrick_guest_mem::OwnedMemoryWait(physical_backing.clone()));
+                        }
                     }
                     let mut completed = if physical {
                         job.poll_with_engine(&mut engine, &mut resumed_control)
@@ -5633,11 +5811,15 @@ pub(crate) mod tests {
                     };
                     if physical_after_owner && !immediate {
                         assert!(matches!(completed, executor::ExecutorExit::Blocked(_)));
-                        assert_eq!(engine.prepared_attempts, 2);
-                        assert_eq!(engine.prepared_commits, 0);
+                        assert_eq!(engine.prepared_attempts, 2 + usize::from(recvfrom));
+                        assert_eq!(engine.prepared_commits, usize::from(recvfrom));
                         assert_eq!(
                             job.state.continuation_restart,
-                            Some(carrick_kernel::kernel::continuation::RestartDecision::NoRestart)
+                            if recvfrom {
+                                None
+                            } else {
+                                Some(carrick_kernel::kernel::continuation::RestartDecision::NoRestart)
+                            }
                         );
                         // Settle the same retained completion through a second
                         // park, then publish its physical readiness.
@@ -5729,6 +5911,8 @@ pub(crate) mod tests {
                             6
                         } else if interrupted_sleep {
                             -4
+                        } else if recvfrom {
+                            4
                         } else if nr == nr::WAIT4 {
                             -10
                         } else {
@@ -5800,8 +5984,18 @@ pub(crate) mod tests {
                     if !killing {
                         assert_eq!(
                             engine.prepared_commits,
-                            usize::from(completion_copyout || (nr != nr::WAIT4 && !sleep))
+                            usize::from(recvfrom)
+                                + usize::from(completion_copyout || (nr != nr::WAIT4 && !sleep))
                         );
+                        if recvfrom {
+                            assert_eq!(engine.guest_memory[&0x71_1000], b"data");
+                            assert_eq!(engine.guest_memory[&0x71_1020], [0; 4]);
+                            assert_eq!(
+                                engine.prepared_attempts,
+                                if physical_after_owner { 4 } else { 3 },
+                                "payload, refused metadata, retry; no redispatch"
+                            );
+                        }
                         if interrupted_sleep {
                             let bytes = &engine.guest_memory[&0x71_1020];
                             assert_eq!(bytes.len(), 16);

@@ -23,16 +23,80 @@ const OUT2: u64 = BASE + 0x800;
 const LEN_ADDR: u64 = BASE + 0x40;
 const PATH: u64 = BASE + 0x2000;
 
+fn running_lease(
+    context: &crate::kernel::KernelContext,
+) -> crate::kernel::objects::ThreadExecutionLease {
+    let mm = context.shared().mm().id();
+    context
+        .thread()
+        .publish_initial_task_state(crate::kernel::objects::MigratableTaskState {
+            cpu: carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
+                carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+                    gprs: [0; 31],
+                    pc: 0,
+                    pstate: 0,
+                    trap_pc: 0,
+                    trap_pstate: 0,
+                    sp_el0: 0,
+                    elr_el1: 0,
+                    spsr_el1: 0,
+                    ttbr0: 0,
+                    ttbr1: 0,
+                    tcr: 0,
+                    sctlr_el1: 0,
+                    mair_el1: 0,
+                    vbar_el1: 0,
+                    cpacr_el1: 0,
+                    cntkctl_el1: 0,
+                    tpidr_el1: 0,
+                    actlr_el1: 0,
+                    tpidr_el0: 0,
+                    tpidrro_el0: 0,
+                    contextidr_el1: 0,
+                    vregs: [0; 32],
+                    fpsr: 0,
+                    fpcr: 0,
+                    pending_resume_pc: None,
+                    last_syscall_nr: Some(271),
+                    last_syscall_orig_x0: 0,
+                    last_fault_esr: 0,
+                    last_exit_class: 0,
+                    is_forked_child: false,
+                    syscall_continuation: None,
+                    mm_generation: mm.raw(),
+                    asid_generation: 41,
+                },
+            ),
+            mm,
+            asid_generation: 41,
+        })
+        .expect("publish task state");
+    context
+        .thread()
+        .claim_runnable(
+            crate::kernel::objects::ExecutorId::for_transitional_thread(
+                carrick_hal::ThreadId::synthetic_for_tests(41),
+            )
+            .expect("transitional executor"),
+        )
+        .expect("claim running lease")
+}
+
 struct Guest {
     dispatcher: SyscallDispatcher,
     reporter: CompatReporter,
     memory: OwnerRefusingMemory,
+    lease: Option<crate::kernel::objects::ThreadExecutionLease>,
 }
 
 impl Guest {
     fn new() -> Self {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let lease = running_lease(&context);
         Self {
-            dispatcher: SyscallDispatcher::new(),
+            dispatcher,
+            lease: Some(lease),
             reporter: CompatReporter::default(),
             memory: OwnerRefusingMemory::new(BASE, LEN, FILL),
         }
@@ -41,11 +105,12 @@ impl Guest {
     fn call(&mut self, number: u64, args: [u64; 6]) -> DispatchOutcome {
         let context = self.dispatcher.capture_one_task_context().unwrap();
         self.dispatcher
-            .dispatch(
+            .dispatch_with_lease(
                 &context,
                 SyscallRequest::new(number, SyscallArgs::from(args)),
                 &mut self.memory,
                 &self.reporter,
+                self.lease.as_ref(),
             )
             .expect("dispatch")
     }
@@ -603,7 +668,7 @@ fn recvfrom_owner_resumes_address_without_replaying_payload() {
             nr::RECVFROM.raw(),
             [left as u64, OUT, 4, flags.bits() as u64, OUT2, OUT],
         );
-        let DispatchOutcome::RecvfromAddressSuspended(first) = first else {
+        let DispatchOutcome::OutputSuspended(first) = first else {
             panic!("address read must suspend after receiving: {first:?}");
         };
         assert_eq!(
@@ -617,8 +682,13 @@ fn recvfrom_owner_resumes_address_without_replaying_payload() {
         let context = g.dispatcher.capture_one_task_context().unwrap();
         // Retain the read continuation across another read suspension.
         let wait = g.memory.refuse_next_read();
-        let DispatchOutcome::RecvfromAddressSuspended(second) =
-            first.resume(&context, &mut g.memory)
+        let DispatchOutcome::OutputSuspended(second) = first
+            .resume(
+                &context,
+                &mut g.memory,
+                g.lease.as_ref().unwrap().task_state_authority().unwrap(),
+            )
+            .unwrap()
         else {
             panic!("address read must retain its continuation");
         };
@@ -627,8 +697,13 @@ fn recvfrom_owner_resumes_address_without_replaying_payload() {
             &carrick_guest_mem::MemoryReadWait::Owner(wait)
         );
         let wait = g.memory.refuse_next();
-        let DispatchOutcome::RecvfromAddressSuspended(third) =
-            second.resume(&context, &mut g.memory)
+        let DispatchOutcome::OutputSuspended(third) = second
+            .resume(
+                &context,
+                &mut g.memory,
+                g.lease.as_ref().unwrap().task_state_authority().unwrap(),
+            )
+            .unwrap()
         else {
             panic!("validated address write must retain its own phase");
         };
@@ -639,7 +714,13 @@ fn recvfrom_owner_resumes_address_without_replaying_payload() {
         // Once validated, a write wait must not read the edited length again.
         g.memory.seed(OUT, &u32::MAX.to_ne_bytes());
         assert_eq!(
-            third.resume(&context, &mut g.memory),
+            third
+                .resume(
+                    &context,
+                    &mut g.memory,
+                    g.lease.as_ref().unwrap().task_state_authority().unwrap()
+                )
+                .unwrap(),
             DispatchOutcome::Returned { value: 4 }
         );
         assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), [0; 4]);
@@ -707,4 +788,189 @@ fn readv_pipe_retains_intra_iovec_progress_and_bounds_preparation() {
             "one preparation per bounded window plus the refused admission"
         );
     }
+}
+
+#[test]
+fn recvfrom_address_completion_rejects_wrong_task_before_memory_access() {
+    let mut g = Guest::new();
+    let (left, right) = g.stream_pair();
+    g.memory.seed(PATH, b"data");
+    assert_eq!(g.ok(nr::WRITE.raw(), [right as u64, PATH, 4, 0, 0, 0]), 4);
+    g.memory.seed(LEN_ADDR, &4u32.to_ne_bytes());
+    g.memory.refuse_after_prepares(1);
+    let first = g.call(nr::RECVFROM.raw(), [left as u64, OUT, 4, 0, OUT2, LEN_ADDR]);
+    let DispatchOutcome::OutputSuspended(pending) = first else {
+        panic!("metadata must suspend: {first:?}");
+    };
+    assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), b"data");
+    let mut successor = Guest::new();
+    successor.memory.seed(LEN_ADDR, &[0xa5; 4]);
+    let context = successor.dispatcher.capture_one_task_context().unwrap();
+    let before = successor.memory.prepares;
+    let reads = successor.memory.reads.get();
+    let resumes = successor.memory.resumes.get();
+    let commits = successor.memory.commits.len();
+    let result = pending.resume(
+        &context,
+        &mut successor.memory,
+        successor
+            .lease
+            .as_ref()
+            .unwrap()
+            .task_state_authority()
+            .unwrap(),
+    );
+    let successor_addrlen = successor.memory.inner.read_bytes(LEN_ADDR, 4).unwrap();
+    assert_eq!(
+        successor_addrlen, [0xa5; 4],
+        "stale recvfrom completion wrote another task's addrlen"
+    );
+    assert_eq!(successor.memory.prepares, before);
+    assert_eq!(successor.memory.reads.get(), reads);
+    assert_eq!(successor.memory.resumes.get(), resumes);
+    assert_eq!(successor.memory.commits.len(), commits);
+    assert!(result.is_err());
+}
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        let context = self.dispatcher.capture_one_task_context().unwrap();
+        if let Some(lease) = self.lease.take() {
+            context.thread().yield_from_executor(lease).unwrap();
+        }
+    }
+}
+
+fn suspended_address(
+    g: &mut Guest,
+    read_phase: bool,
+    address: u64,
+) -> Box<crate::kernel::continuation::output::SuspendedOutputCompletion> {
+    let (left, right) = g.stream_pair();
+    g.memory.seed(PATH, b"data");
+    assert_eq!(g.ok(nr::WRITE.raw(), [right as u64, PATH, 4, 0, 0, 0]), 4);
+    g.memory.seed(address, &4u32.to_ne_bytes());
+    if read_phase {
+        g.memory.refuse_next_read();
+    } else {
+        g.memory.refuse_after_prepares(1);
+    }
+    let outcome = g.call(nr::RECVFROM.raw(), [left as u64, OUT, 4, 0, OUT2, address]);
+    let DispatchOutcome::OutputSuspended(pending) = outcome else {
+        panic!("address completion must suspend: {outcome:?}")
+    };
+    assert_eq!(g.memory.inner.read_bytes(OUT, 4).unwrap(), b"data");
+    pending
+}
+
+#[test]
+fn recvfrom_address_stale_read_write_and_cancellation_access_no_memory() {
+    use crate::kernel::continuation::CompletionFoldError;
+    for read_phase in [false, true] {
+        for failure in 0..4 {
+            let mut g = Guest::new();
+            let pending = suspended_address(&mut g, read_phase, LEN_ADDR);
+            let context = g.dispatcher.capture_one_task_context().unwrap();
+            let mut other = Guest::new();
+            let other_context = other.dispatcher.capture_one_task_context().unwrap();
+            let mm = g.lease.as_ref().unwrap().task_state_authority().unwrap();
+            if failure >= 2 {
+                use carrick_el1_abi::Lifecycle;
+                context
+                    .lifecycle_page()
+                    .process_exit_custody()
+                    .cancellation_authority()
+                    .publish(
+                        if failure == 2 {
+                            carrick_core::cancellation::ProcessCancellation::GroupExit
+                        } else {
+                            carrick_core::cancellation::ProcessCancellation::FatalSignal
+                        },
+                        || panic!("no output effects across suspension"),
+                    );
+            }
+            let (target, memory, identity) = if failure == 0 {
+                (
+                    &other_context,
+                    &mut other.memory,
+                    other
+                        .lease
+                        .as_ref()
+                        .unwrap()
+                        .task_state_authority()
+                        .unwrap(),
+                )
+            } else {
+                (
+                    &context,
+                    &mut g.memory,
+                    if failure == 1 { (mm.0, mm.1 + 1) } else { mm },
+                )
+            };
+            let before = (
+                memory.reads.get(),
+                memory.resumes.get(),
+                memory.prepares,
+                memory.commits.len(),
+            );
+            let bytes = memory.inner.read_bytes(LEN_ADDR, 4).unwrap();
+            let result = pending.resume(target, memory, identity);
+            assert_eq!(memory.inner.read_bytes(LEN_ADDR, 4).unwrap(), bytes);
+            assert_eq!(
+                (
+                    memory.reads.get(),
+                    memory.resumes.get(),
+                    memory.prepares,
+                    memory.commits.len()
+                ),
+                before,
+                "read_phase={read_phase}, failure={failure}: rejection cannot touch memory"
+            );
+            match failure {
+                0 => assert!(result.is_err()),
+                1 => assert_eq!(result.unwrap_err(), CompletionFoldError::AddressSpace),
+                _ => assert!(matches!(
+                    result.unwrap(),
+                    DispatchOutcome::OwnerCancelled(_)
+                )),
+            }
+        }
+    }
+}
+
+#[test]
+fn recvfrom_address_write_is_one_unit_even_across_page_boundary() {
+    for address in [LEN_ADDR, BASE + 0xfff] {
+        let mut g = Guest::new();
+        let pending = suspended_address(&mut g, false, address);
+        assert_eq!(g.memory.prepares, 2, "payload and refused metadata");
+        assert_eq!(g.memory.commits, [(OUT, b"data".to_vec())]);
+        let before_reads = g.memory.reads.get();
+        // Validation is frozen; retry must not inspect a subsequent negative edit.
+        g.memory.seed(address, &u32::MAX.to_ne_bytes());
+        let context = g.dispatcher.capture_one_task_context().unwrap();
+        assert_eq!(
+            pending
+                .resume(
+                    &context,
+                    &mut g.memory,
+                    g.lease.as_ref().unwrap().task_state_authority().unwrap()
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(g.memory.prepares, 3);
+        assert_eq!(g.memory.reads.get(), before_reads);
+        assert_eq!(
+            g.memory.commits,
+            [(OUT, b"data".to_vec()), (address, vec![0; 4])]
+        );
+    }
+}
+
+#[test]
+fn recvfrom_retained_output_requires_lease_and_leaves_sendto_unchanged() {
+    let args = SyscallArgs::from([0; 6]);
+    assert!(syscall_requires_execution_lease(nr::RECVFROM.raw(), args));
+    assert!(!syscall_requires_execution_lease(nr::SENDTO.raw(), args));
 }

@@ -2383,3 +2383,32 @@ including signal delivery after publishing errno 4 with no restart despite
 `SA_RESTART`. These VM-free schedules do not prove real guest instruction or
 signal-frame execution. Signed HVF acceptance and the applicable Linux oracle
 remain director-owned; neither is available on ctb-w4.
+
+### Shared retained output (#986 Slice 2)
+
+`kernel.memory.owner-wait` now includes recvfrom's post-payload address-length
+completion alongside completed-wait output. One suspension envelope transfers
+its memory dependency by value to existing owner-wait settlement. The retained
+operation owns no second dependency, memory permit or process-effect custody.
+Directory reads and IPC retain their existing routes.
+
+Every resumed operation authenticates its exact kernel/task binding, thread
+incarnation, MM and independent ASID before any memory access. Identity failures
+are completion invariants rather than guest errno 14. Cancellation permits no
+further reads, preparations or commits. Completed sleeps preserve frozen bytes,
+the bounded zero-fill cursor, terminal result and restart disposition.
+
+Recvfrom captures execution authority before consuming payload. It reads the
+address length after payload publication, including aliases. Read suspension
+retains the original input continuation. Negative length returns errno 22;
+once validated, only the four-byte zero-length write is retried, as one prepared
+unit even across a page boundary. Its saved payload count cannot replay a receive.
+The deterministic write witness requires one refused and one successful metadata
+preparation and exactly one four-byte commit. Stale read/write and cancellation
+witnesses require zero resumed memory operations.
+
+The stale-task witness fails on main and Slice 1 by overwriting another live
+task's addrlen with zero. This is an injected stale runtime handoff, not an
+observed spontaneous guest workload failure. VM-free runtime routing and physical
+settlement add custody evidence; signed HVF, Docker differential, runtime ratios
+and exact-artifact acceptance remain director-owned and unavailable on ctb-w4.

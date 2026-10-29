@@ -1160,8 +1160,7 @@ where
             DispatchOutcome::WriteCopyInSuspended(_) | DispatchOutcome::SleepCopyInSuspended(_)
             | DispatchOutcome::DirectoryReadSuspended(_)
             | DispatchOutcome::PipeReadSuspended(_)
-            | DispatchOutcome::CompletionCopyoutSuspended(_)
-            | DispatchOutcome::RecvfromAddressSuspended(_) => {
+            | DispatchOutcome::OutputSuspended(_) => {
                 return Err(RuntimeError::Configuration(
                     "owned copy-in reached the retired single-thread loop".into(),
                 ));

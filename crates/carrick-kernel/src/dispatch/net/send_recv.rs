@@ -21,128 +21,6 @@ use crate::dispatch::{
 use crate::network::{ConnectTarget, GuestSocketAddr};
 use carrick_spec::PortProtocol;
 
-/// Address completion after a stream receive has already copied its payload.
-/// No socket or descriptor survives here: resumption cannot receive twice.
-#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
-struct RecvfromAddress {
-    addrlen: GuestPtr,
-    received: usize,
-}
-
-#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
-enum RecvfromAddressPhase {
-    Read(carrick_guest_mem::MemoryReadSuspension),
-    Write(carrick_guest_mem::MemoryReadWait),
-}
-
-/// Retains the completed receive result across address-memory dependencies.
-#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
-pub struct OwnedRecvfromAddress {
-    address: RecvfromAddress,
-    phase: RecvfromAddressPhase,
-}
-
-impl OwnedRecvfromAddress {
-    pub fn wait(&self) -> &carrick_guest_mem::MemoryReadWait {
-        match &self.phase {
-            RecvfromAddressPhase::Read(suspension) => &suspension.wait,
-            RecvfromAddressPhase::Write(wait) => wait,
-        }
-    }
-
-    pub fn resume(
-        self,
-        context: &crate::kernel::KernelContext,
-        memory: &mut impl CurrentMmMemory,
-    ) -> DispatchOutcome {
-        match self.phase {
-            RecvfromAddressPhase::Read(suspension) => {
-                let result = memory.resume_read(suspension.continuation);
-                self.address.finish_read(context, memory, result)
-            }
-            RecvfromAddressPhase::Write(_) => self.address.write(context, memory),
-        }
-    }
-}
-
-impl RecvfromAddress {
-    fn read(
-        self,
-        context: &crate::kernel::KernelContext,
-        memory: &mut impl CurrentMmMemory,
-    ) -> DispatchOutcome {
-        if self.addrlen.0 == 0 {
-            return DispatchOutcome::errno(LINUX_EFAULT);
-        }
-        let result = memory.read_bytes(self.addrlen.0, 4);
-        self.finish_read(context, memory, result)
-    }
-
-    fn finish_read(
-        self,
-        context: &crate::kernel::KernelContext,
-        memory: &mut impl CurrentMmMemory,
-        result: Result<Vec<u8>, carrick_guest_mem::MemoryError>,
-    ) -> DispatchOutcome {
-        let bytes = match result {
-            Ok(bytes) => bytes,
-            Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
-                return self.suspend(RecvfromAddressPhase::Read(*suspension));
-            }
-            Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
-        };
-        let Ok(bytes) = <[u8; 4]>::try_from(bytes.as_slice()) else {
-            return DispatchOutcome::errno(LINUX_EFAULT);
-        };
-        if i32::from_ne_bytes(bytes) < 0 {
-            return DispatchOutcome::errno(LINUX_EINVAL);
-        }
-        self.write(context, memory)
-    }
-
-    fn write(
-        self,
-        context: &crate::kernel::KernelContext,
-        memory: &mut impl CurrentMmMemory,
-    ) -> DispatchOutcome {
-        use crate::dispatch::copyout::{self, UserSlot};
-        use carrick_guest_mem::MemoryReadWait;
-        let output =
-            match copyout::prepare(context, memory, [Some(UserSlot::new(self.addrlen.0, 4))]) {
-                Ok(output) => output,
-                Err(refusal) => {
-                    let wait = match refusal.into_outcome() {
-                        DispatchOutcome::OwnerMemoryWait { wait, .. } => {
-                            MemoryReadWait::Owner(wait)
-                        }
-                        DispatchOutcome::OwnerPhysicalWait { wait, .. } => {
-                            MemoryReadWait::Physical(wait)
-                        }
-                        DispatchOutcome::OwnerMemorySupply { request, .. } => {
-                            MemoryReadWait::Supply(request)
-                        }
-                        other => return other,
-                    };
-                    // The length was already read and validated. A preparation
-                    // wait resumes only this write, even if another thread edits it.
-                    return self.suspend(RecvfromAddressPhase::Write(wait));
-                }
-            };
-        match output.commit([&0u32.to_ne_bytes()]) {
-            Ok(()) => DispatchOutcome::returned_len(self.received)
-                .unwrap_or_else(|_| DispatchOutcome::errno(LINUX_EINVAL)),
-            Err(fault) => fault.outcome(),
-        }
-    }
-
-    fn suspend(self, phase: RecvfromAddressPhase) -> DispatchOutcome {
-        DispatchOutcome::RecvfromAddressSuspended(Box::new(OwnedRecvfromAddress {
-            address: self,
-            phase,
-        }))
-    }
-}
-
 /// Everything a send path needs from the socket description, read once.
 #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 struct SocketSendView {
@@ -795,6 +673,10 @@ impl<'a> NetView<'a> {
                             && flags & LinuxMsgFlags::OOB.bits() == 0
                             && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
                         {
+                            use crate::kernel::continuation::output::{ExactCompletionBinding, RetainedOutputCompletion};
+                            let binding = ExactCompletionBinding::capture(cx.kernel, cx.execution_lease)
+                                .map_err(DispatchError::CompletionInvariant)?;
+                            let identity = binding.memory_identity();
                             use super::super::copyout::{self, UserSlot};
                             let copy_len = len.min(4096 - (buf_addr as usize & 4095));
                             // Secure only payload before consuming. addrlen is an
@@ -815,10 +697,8 @@ impl<'a> NetView<'a> {
                                         return Ok(fault.outcome());
                                     }
                                     if src_addr != 0 {
-                                        return Ok(RecvfromAddress {
-                                            addrlen: GuestPtr(src_len_addr),
-                                            received: read_len,
-                                        }.read(cx.kernel, memory));
+                                        return RetainedOutputCompletion::recvfrom_address(binding, GuestPtr(src_len_addr), read_len)
+                                            .resume(cx.kernel, memory, identity).map_err(DispatchError::CompletionInvariant);
                                     }
                                     return Ok(DispatchOutcome::returned_len(read_len)?);
                                 }

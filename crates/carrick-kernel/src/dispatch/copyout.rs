@@ -154,6 +154,20 @@ impl DispatchOutcome {
 }
 
 impl CopyoutRefusal {
+    pub(crate) fn retain(
+        self,
+        operation: crate::kernel::continuation::output::RetainedOutputCompletion,
+    ) -> DispatchOutcome {
+        use carrick_guest_mem::MemoryReadWait;
+        let wait = match self.into_outcome() {
+            DispatchOutcome::OwnerMemoryWait { wait, .. } => MemoryReadWait::Owner(wait),
+            DispatchOutcome::OwnerMemorySupply { request, .. } => MemoryReadWait::Supply(request),
+            DispatchOutcome::OwnerPhysicalWait { wait, .. } => MemoryReadWait::Physical(wait),
+            other => return other,
+        };
+        operation.suspend(wait)
+    }
+
     pub(crate) fn into_outcome(self) -> DispatchOutcome {
         *self.0
     }
@@ -647,6 +661,9 @@ pub(crate) mod owner_fixture {
         refuse_read: std::cell::Cell<Option<PortalOwnerWait>>,
         readonly: Vec<(u64, usize)>,
         pub(crate) prepares: usize,
+        pub(crate) reads: std::cell::Cell<usize>,
+        pub(crate) resumes: std::cell::Cell<usize>,
+        pub(crate) commits: Vec<(u64, Vec<u8>)>,
     }
 
     impl OwnerRefusingMemory {
@@ -660,6 +677,9 @@ pub(crate) mod owner_fixture {
                 refuse_read: std::cell::Cell::new(None),
                 readonly: Vec::new(),
                 prepares: 0,
+                reads: std::cell::Cell::new(0),
+                resumes: std::cell::Cell::new(0),
+                commits: Vec::new(),
             }
         }
 
@@ -711,6 +731,7 @@ pub(crate) mod owner_fixture {
     struct Permit<'a> {
         memory: &'a mut LinearMemory,
         ranges: Vec<GuestWriteRange>,
+        commits: &'a mut Vec<(u64, Vec<u8>)>,
     }
 
     impl PreparedGuestWrite for Permit<'_> {
@@ -718,6 +739,7 @@ pub(crate) mod owner_fixture {
             assert_eq!(outputs.len(), self.ranges.len(), "one prefix per range");
             for (range, output) in self.ranges.iter().zip(outputs) {
                 assert!(output.len() <= range.len(), "prefix exceeds its range");
+                self.commits.push((range.address().raw(), output.to_vec()));
                 self.memory
                     .write_bytes_raw(range.address().raw(), output)
                     .expect("prepared range is inside the fixture");
@@ -754,6 +776,7 @@ pub(crate) mod owner_fixture {
             Ok(Box::new(Permit {
                 memory: &mut self.inner,
                 ranges: ranges.to_vec(),
+                commits: &mut self.commits,
             }))
         }
 
@@ -771,6 +794,7 @@ pub(crate) mod owner_fixture {
         }
 
         fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.reads.set(self.reads.get() + 1);
             if let Some(wait) = self.refuse_read.take() {
                 return Err(MemoryError::ReadSuspended(Box::new(
                     carrick_guest_mem::MemoryReadSuspension {
@@ -788,6 +812,7 @@ pub(crate) mod owner_fixture {
             &self,
             continuation: carrick_guest_mem::OwnedReadContinuation,
         ) -> Result<Vec<u8>, MemoryError> {
+            self.resumes.set(self.resumes.get() + 1);
             let (address, length) = continuation
                 .take::<(u64, usize)>()
                 .expect("fixture read continuation belongs to this memory");

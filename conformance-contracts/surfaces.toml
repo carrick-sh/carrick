@@ -470,7 +470,7 @@ contracts = ["kernel.mm.syscall-code-write"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/net/send_recv.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.signal.socket-restart"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.signal.socket-restart", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/runtime.rs"
@@ -2075,3 +2075,11 @@ contracts = ["kernel.vcpu.shutdown-entry"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/threads.rs"
 contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation/output.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/request.rs"
+contracts = ["kernel.memory.owner-wait"]

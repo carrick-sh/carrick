@@ -8183,7 +8183,7 @@ fn completion_owner_wait_during_group_exit_is_not_a_configuration_failure() {
         result.is_ok(),
         "owner wait escaped completion folding: {result:?}"
     );
-    let Some(DispatchOutcome::CompletionCopyoutSuspended(pending)) = result.unwrap() else {
+    let Some(DispatchOutcome::OutputSuspended(pending)) = result.unwrap() else {
         panic!("the live sibling's editor must suspend copyout");
     };
     assert_eq!(memory.1, 1, "the first fold must reach owner preparation");
@@ -8317,16 +8317,14 @@ fn completion_owner_wait_retains_output_progress_and_original_result() {
             vec![GuestOutputRange::new(GuestVa::new(0x7fff), 5000, mm, mm.raw()).unwrap()],
         );
         let dispatcher = crate::dispatch::SyscallDispatcher::new();
-        let Some(DispatchOutcome::CompletionCopyoutSuspended(pending)) =
-            fold_continuation_completion(
-                completion,
-                &dispatcher,
-                &context,
-                &mut memory,
-                (context.shared().mm().id(), context.shared().mm().id().raw()),
-            )
-            .unwrap()
-        else {
+        let Some(DispatchOutcome::OutputSuspended(pending)) = fold_continuation_completion(
+            completion,
+            &dispatcher,
+            &context,
+            &mut memory,
+            (context.shared().mm().id(), context.shared().mm().id().raw()),
+        )
+        .unwrap() else {
             panic!("must retain refused output")
         };
         if physical {
@@ -8408,7 +8406,7 @@ fn completion_owner_wait_authenticates_thread_and_independent_asid() {
     let (_kernel, context) = bootstrap(15_713);
     let (_other_kernel, other) = bootstrap(15_714);
     let mm = context.shared().mm().id();
-    let operation = CompletionCopyout::new(
+    let operation = RetainedOutputCompletion::completed_wait(
         Ok(0),
         vec![GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, 41).unwrap()],
         &context,
@@ -8588,7 +8586,7 @@ fn interrupted_sleep_completion_retains_bytes_across_refusals() {
                     .unwrap()
                     .unwrap();
                     for stage in 1..=2 {
-                        let DispatchOutcome::CompletionCopyoutSuspended(pending) = outcome else {
+                        let DispatchOutcome::OutputSuspended(pending) = outcome else {
                             panic!("saved remainder must suspend at stage {stage}: {outcome:?}")
                         };
                         assert_eq!(memory.attempts, stage + usize::from(crossing));
@@ -8726,21 +8724,19 @@ fn interrupted_sleep_completion_rejects_stale_resume_before_preparation() {
     for wrong_thread in [false, true] {
         let mut memory = OwnerRefusingMemory::new(0x7000, 16, 0xa5);
         memory.refuse_next();
-        let Some(DispatchOutcome::CompletionCopyoutSuspended(pending)) =
-            fold_continuation_completion(
-                ContinuationCompletion::InterruptedSleep {
-                    remaining: Some((
-                        GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, 41).unwrap(),
-                        Duration::new(2, 3),
-                    )),
-                },
-                &crate::dispatch::SyscallDispatcher::new(),
-                &context,
-                &mut memory,
-                (mm, 41),
-            )
-            .unwrap()
-        else {
+        let Some(DispatchOutcome::OutputSuspended(pending)) = fold_continuation_completion(
+            ContinuationCompletion::InterruptedSleep {
+                remaining: Some((
+                    GuestOutputRange::new(GuestVa::new(0x7000), 16, mm, 41).unwrap(),
+                    Duration::new(2, 3),
+                )),
+            },
+            &crate::dispatch::SyscallDispatcher::new(),
+            &context,
+            &mut memory,
+            (mm, 41),
+        )
+        .unwrap() else {
             panic!("retained remainder")
         };
         let prepares = memory.prepares;
