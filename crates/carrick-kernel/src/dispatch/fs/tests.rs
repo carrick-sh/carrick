@@ -14678,6 +14678,8 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
     let mut dispatcher = SyscallDispatcher::new();
     dispatcher.set_rootfs_layer(RootFs::from_immutable_host_dir(lower.path()).unwrap());
     let root = dispatcher.capture_one_task_context().unwrap();
+    let lease = crate::dispatch::copyout_tests::running_lease(&root);
+    let identity = lease.task_state_authority().unwrap();
     let sibling = root
         .kernel()
         .clone_thread(
@@ -14752,8 +14754,8 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
     let description = Arc::clone(&target.description);
     let read = request(61, [fd as u64, BASE + 0x10000, 32768, 0, 0, 0]);
     memory.refusal = Some(MemoryPrepareError::OwnerWait(wait));
-    let DispatchOutcome::DirectoryReadSuspended(pending) = dispatcher
-        .dispatch(&root, read, &mut memory, &reporter)
+    let DispatchOutcome::OutputSuspended(pending) = dispatcher
+        .dispatch_with_lease(&root, read, &mut memory, &reporter, Some(&lease))
         .unwrap()
     else {
         panic!("transient owner refusal must suspend");
@@ -14787,20 +14789,8 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
         DispatchOutcome::Returned { value: fd }
     );
     assert_eq!(description.fd_ref_count(), 1);
-    let result = dispatcher
-        .resume_owned_directory_read(
-            &root,
-            read,
-            *pending,
-            &mut memory,
-            &reporter,
-            None,
-            OrdinaryDispatchRoute {
-                host_wait: None,
-                lease: None,
-                mm_executor: None,
-            },
-        )
+    let result = pending
+        .resume(&root, &mut memory, identity, &dispatcher.fs_view())
         .unwrap();
     assert_eq!(memory.commits, 1);
     let DispatchOutcome::Returned { value } = result else {
@@ -14831,7 +14821,7 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
         "internal refusal".into(),
     )));
     assert!(matches!(
-        dispatcher.dispatch(&root, read, &mut memory, &reporter),
+        dispatcher.dispatch_with_lease(&root, read, &mut memory, &reporter, Some(&lease)),
         Err(DispatchError::MemoryPreparation(_))
     ));
     memory.refusal = Some(MemoryPrepareError::Fault(MemoryError::OutOfBounds {
@@ -14840,13 +14830,13 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
     }));
     assert_eq!(
         dispatcher
-            .dispatch(&root, read, &mut memory, &reporter)
+            .dispatch_with_lease(&root, read, &mut memory, &reporter, Some(&lease))
             .unwrap(),
         DispatchOutcome::errno(LINUX_EFAULT)
     );
     memory.refusal = Some(MemoryPrepareError::OwnerWait(wait));
-    let DispatchOutcome::DirectoryReadSuspended(pending) = dispatcher
-        .dispatch(&root, read, &mut memory, &reporter)
+    let DispatchOutcome::OutputSuspended(pending) = dispatcher
+        .dispatch_with_lease(&root, read, &mut memory, &reporter, Some(&lease))
         .unwrap()
     else {
         panic!("cancellation must own the pending read");
@@ -14885,30 +14875,19 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
     memory.refusal = Some(MemoryPrepareError::Physical(
         carrick_guest_mem::OwnedMemoryWait(physical.clone()),
     ));
-    let DispatchOutcome::DirectoryReadSuspended(pending) = dispatcher
-        .dispatch(&root, read, &mut memory, &reporter)
+    let DispatchOutcome::OutputSuspended(pending) = dispatcher
+        .dispatch_with_lease(&root, read, &mut memory, &reporter, Some(&lease))
         .unwrap()
     else {
         panic!("physical preparation must retain the directory");
     };
     assert_eq!(Arc::strong_count(&physical), 2);
-    let result = dispatcher
-        .resume_owned_directory_read(
-            &root,
-            read,
-            *pending,
-            &mut memory,
-            &reporter,
-            None,
-            OrdinaryDispatchRoute {
-                host_wait: None,
-                lease: None,
-                mm_executor: None,
-            },
-        )
+    let result = pending
+        .resume(&root, &mut memory, identity, &dispatcher.fs_view())
         .unwrap();
     assert!(matches!(result, DispatchOutcome::Returned { value } if value > 0));
     assert_eq!(Arc::strong_count(&physical), 1);
+    root.thread().yield_from_executor(lease).unwrap();
 }
 
 #[test]

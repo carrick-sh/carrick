@@ -671,7 +671,7 @@ pub mod fs;
 #[cfg(any(test, feature = "test-support"))]
 pub use fs::RecordLockContentionFixture;
 pub use fs::StdioSink;
-pub use fs::directory::OwnedDirectoryRead;
+pub(crate) use fs::directory::DirectoryReadOutput;
 pub use fs::pipe::{OwnedPipeRead, SuspendedPipeRead};
 pub use fs::rw::OwnedWriteCopyIn;
 pub use fs::state::{PipedOutput, StdioReadiness};

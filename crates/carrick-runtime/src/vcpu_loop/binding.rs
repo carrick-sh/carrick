@@ -249,7 +249,6 @@ pub(super) enum OwnedSyscallResume {
 
 pub(super) enum OwnedIoResume {
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
-    DirectoryRead(Box<carrick_kernel::dispatch::OwnedDirectoryRead>),
     PipeRead(Box<carrick_kernel::dispatch::SuspendedPipeRead>),
 }
 
@@ -268,10 +267,6 @@ pub(super) fn owner_copyin_route(
         DispatchOutcome::PipeReadSuspended(pending) => (
             pending.wait().clone(),
             OwnedSyscallResume::Io(OwnedIoResume::PipeRead(pending)),
-        ),
-        DispatchOutcome::DirectoryReadSuspended(pending) => (
-            pending.wait().clone(),
-            OwnedSyscallResume::Io(OwnedIoResume::DirectoryRead(pending)),
         ),
         DispatchOutcome::SleepCopyInSuspended(pending) => {
             (pending.wait().clone(), OwnedSyscallResume::Sleep(pending))
@@ -7699,6 +7694,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum DirectoryPhysicalScenario {
+        CustodyOnly,
         KillParked,
         KillDuringEnrollment,
         KillDuringPreparation,
@@ -7743,6 +7739,11 @@ mod tests {
     #[test]
     fn serial_host_directory_physical_kill_after_ready_before_effect_admission() {
         exercise_directory_physical_resume(DirectoryPhysicalScenario::KillDuringPreparation);
+    }
+
+    #[test]
+    fn serial_host_directory_shared_route_transfers_only_dependency_custody() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::CustodyOnly);
     }
 
     /// Real dispatch, scheduler, retained directory operation and content writer.
@@ -7991,6 +7992,7 @@ mod tests {
                     }
                 }))),
             })));
+            let dependency = refusal.as_ref().unwrap().0.clone();
             let retries = Arc::new(AtomicUsize::new(0));
             let prepare_retries = retries.clone();
             let prepare_content = content.clone();
@@ -8056,20 +8058,44 @@ mod tests {
                 native_number: carrick_abi::NativeNr(61),
             };
             let request = SyscallRequest::from_raw(frame);
+            let mut running = scheduler
+                .try_take(&registration)
+                .unwrap()
+                .expect("waiter runnable");
+            assert_eq!(running.generation(), generation);
+            let initial_lease = running.take_lease();
             let outcome = kernel
                 .dispatcher
-                .dispatch_threaded(
+                .dispatch_threaded_prepared_with_mm_executor_and_lease(
                     &root,
-                    request,
+                    PreparedSyscall {
+                        request,
+                        original_args: request.args,
+                    },
                     &mut engine,
                     &reporter,
                     ThreadCtx::new(tid, &registry, &futex),
+                    carrick_kernel::dispatch::routing::OrdinaryDispatchRoute {
+                        host_wait: None,
+                        lease: Some(&initial_lease),
+                        mm_executor: None,
+                    },
                 )
                 .unwrap();
-            assert!(matches!(
-                outcome,
-                DispatchOutcome::DirectoryReadSuspended(_)
-            ));
+            running.restore_lease(initial_lease).unwrap();
+            assert!(matches!(outcome, DispatchOutcome::OutputSuspended(_)));
+            if matches!(scenario, DirectoryPhysicalScenario::CustodyOnly) {
+                let (wait, operation) = owner_copyin_route(outcome);
+                assert_eq!(
+                    Arc::strong_count(&dependency),
+                    2,
+                    "directory operation retained a second memory dependency"
+                );
+                drop((wait, operation));
+                scheduler.settle_runnable_successor(running).unwrap();
+                return;
+            }
+            drop(dependency);
             let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
                 registry,
                 futex,
@@ -8109,13 +8135,10 @@ mod tests {
                     root.retain_exact(),
                     None,
                 ));
+            let (cell, injected) = ExecutionLeaseCell::injected();
+            state.execution_lease = cell;
             let mut job =
                 suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
-            let mut running = scheduler
-                .try_take(&registration)
-                .unwrap()
-                .expect("waiter runnable");
-            assert_eq!(running.generation(), generation);
             let binding_state = executor::tests::task_state(&root, 759);
             let binding = executor::tests::hvpatch_test_binding(&root, &binding_state, 759);
             let publish = |_, _| Ok(());
@@ -8127,6 +8150,7 @@ mod tests {
                 authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
                 exec_replacement: None,
             };
+            let _publication = injected.install(&mut submission.authority);
             let need_resched = AtomicBool::new(false);
             let mut control =
                 executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);

@@ -1158,7 +1158,6 @@ where
 
         match outcome {
             DispatchOutcome::WriteCopyInSuspended(_) | DispatchOutcome::SleepCopyInSuspended(_)
-            | DispatchOutcome::DirectoryReadSuspended(_)
             | DispatchOutcome::PipeReadSuspended(_)
             | DispatchOutcome::OutputSuspended(_) => {
                 return Err(RuntimeError::Configuration(

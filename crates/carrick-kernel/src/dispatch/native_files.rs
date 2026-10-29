@@ -497,7 +497,7 @@ impl SyscallDispatcher {
                     return Served::errno(carrick_abi::LINUX_EBADF);
                 };
                 fs.read_directory(
-                    super::fs::IoCaller::CarrierBuffer,
+                    super::fs::directory::DirectoryReadCaller::CarrierBuffer,
                     &mut buffer,
                     crate::kernel::FileSlot::new(Arc::clone(description), 0),
                     lease,

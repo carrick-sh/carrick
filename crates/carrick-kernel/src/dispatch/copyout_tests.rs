@@ -23,7 +23,7 @@ const OUT2: u64 = BASE + 0x800;
 const LEN_ADDR: u64 = BASE + 0x40;
 const PATH: u64 = BASE + 0x2000;
 
-fn running_lease(
+pub(super) fn running_lease(
     context: &crate::kernel::KernelContext,
 ) -> crate::kernel::objects::ThreadExecutionLease {
     let mm = context.shared().mm().id();
@@ -687,6 +687,7 @@ fn recvfrom_owner_resumes_address_without_replaying_payload() {
                 &context,
                 &mut g.memory,
                 g.lease.as_ref().unwrap().task_state_authority().unwrap(),
+                &g.dispatcher.fs_view(),
             )
             .unwrap()
         else {
@@ -702,6 +703,7 @@ fn recvfrom_owner_resumes_address_without_replaying_payload() {
                 &context,
                 &mut g.memory,
                 g.lease.as_ref().unwrap().task_state_authority().unwrap(),
+                &g.dispatcher.fs_view(),
             )
             .unwrap()
         else {
@@ -718,7 +720,8 @@ fn recvfrom_owner_resumes_address_without_replaying_payload() {
                 .resume(
                     &context,
                     &mut g.memory,
-                    g.lease.as_ref().unwrap().task_state_authority().unwrap()
+                    g.lease.as_ref().unwrap().task_state_authority().unwrap(),
+                    &g.dispatcher.fs_view()
                 )
                 .unwrap(),
             DispatchOutcome::Returned { value: 4 }
@@ -819,6 +822,7 @@ fn recvfrom_address_completion_rejects_wrong_task_before_memory_access() {
             .unwrap()
             .task_state_authority()
             .unwrap(),
+        &successor.dispatcher.fs_view(),
     );
     let successor_addrlen = successor.memory.inner.read_bytes(LEN_ADDR, 4).unwrap();
     assert_eq!(
@@ -914,7 +918,7 @@ fn recvfrom_address_stale_read_write_and_cancellation_access_no_memory() {
                 memory.commits.len(),
             );
             let bytes = memory.inner.read_bytes(LEN_ADDR, 4).unwrap();
-            let result = pending.resume(target, memory, identity);
+            let result = pending.resume(target, memory, identity, &g.dispatcher.fs_view());
             assert_eq!(memory.inner.read_bytes(LEN_ADDR, 4).unwrap(), bytes);
             assert_eq!(
                 (
@@ -928,7 +932,12 @@ fn recvfrom_address_stale_read_write_and_cancellation_access_no_memory() {
             );
             match failure {
                 0 => assert!(result.is_err()),
-                1 => assert_eq!(result.unwrap_err(), CompletionFoldError::AddressSpace),
+                1 => assert!(matches!(
+                    result,
+                    Err(DispatchError::CompletionInvariant(
+                        CompletionFoldError::AddressSpace
+                    ))
+                )),
                 _ => assert!(matches!(
                     result.unwrap(),
                     DispatchOutcome::OwnerCancelled(_)
@@ -954,7 +963,8 @@ fn recvfrom_address_write_is_one_unit_even_across_page_boundary() {
                 .resume(
                     &context,
                     &mut g.memory,
-                    g.lease.as_ref().unwrap().task_state_authority().unwrap()
+                    g.lease.as_ref().unwrap().task_state_authority().unwrap(),
+                    &g.dispatcher.fs_view()
                 )
                 .unwrap(),
             DispatchOutcome::Returned { value: 4 }
@@ -973,4 +983,359 @@ fn recvfrom_retained_output_requires_lease_and_leaves_sendto_unchanged() {
     let args = SyscallArgs::from([0; 6]);
     assert!(syscall_requires_execution_lease(nr::RECVFROM.raw(), args));
     assert!(!syscall_requires_execution_lease(nr::SENDTO.raw(), args));
+}
+
+/// Real immutable lower fixture; all directory work goes through production dispatch.
+fn directory_guest() -> (Guest, tempfile::TempDir, i64) {
+    let lower = tempfile::tempdir().unwrap();
+    std::fs::create_dir(lower.path().join("dir")).unwrap();
+    std::fs::write(lower.path().join("dir/module.py"), b"").unwrap();
+    let mut g = Guest::new();
+    g.dispatcher.set_rootfs_layer(
+        carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
+    );
+    g.memory.seed(PATH, b"/dir\0");
+    let fd = g.ok(
+        nr::OPENAT.raw(),
+        [
+            LINUX_AT_FDCWD,
+            PATH,
+            carrick_abi::LINUX_O_DIRECTORY,
+            0,
+            0,
+            0,
+        ],
+    );
+    (g, lower, fd)
+}
+
+fn directory_cursor(g: &mut Guest, fd: i64) -> i64 {
+    g.ok(
+        nr::LSEEK.raw(),
+        [fd as u64, 0, carrick_abi::LINUX_SEEK_CUR, 0, 0, 0],
+    )
+}
+
+#[test]
+fn directory_shared_output_repeated_refusals_release_before_preparation() {
+    use carrick_guest_mem::{
+        CurrentMmMemory, GuestWriteRange, MemoryPrepareError, OwnedMemoryWait, PhysicalMemoryWait,
+        PreparedGuestWrite,
+    };
+    #[derive(Debug)]
+    struct Dependency;
+    impl PhysicalMemoryWait for Dependency {
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn enroll(
+            &self,
+            _: Arc<dyn Fn() + Send + Sync>,
+        ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+            (Box::new(()), true)
+        }
+    }
+    struct Physical<'a> {
+        inner: &'a mut OwnerRefusingMemory,
+        dependency: std::sync::Weak<Dependency>,
+        refuse: bool,
+    }
+    impl GuestMemory for Physical<'_> {
+        fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+            carrick_guest_mem::UserMemoryVenue::Owner
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.inner.read_bytes_raw(address, length)
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            panic!("prepared writes only")
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            if self.refuse {
+                self.refuse = false;
+                self.inner.prepares += 1;
+                return Err(MemoryPrepareError::Physical(OwnedMemoryWait(
+                    self.dependency.upgrade().unwrap(),
+                )));
+            }
+            assert_eq!(
+                self.dependency.strong_count(),
+                1,
+                "settlement must release dependency before PREPARE"
+            );
+            self.inner.prepare_write(ranges)
+        }
+    }
+    impl CurrentMmMemory for Physical<'_> {}
+    let (mut g, _lower, fd) = directory_guest();
+    g.memory.refuse_next();
+    let DispatchOutcome::OutputSuspended(first) =
+        g.call(nr::GETDENTS64.raw(), [fd as u64, OUT, 512, 0, 0, 0])
+    else {
+        panic!("owner refusal")
+    };
+    assert_eq!(
+        (
+            g.memory.prepares,
+            g.memory.commits.len(),
+            directory_cursor(&mut g, fd)
+        ),
+        (1, 0, 0)
+    );
+    let context = g.dispatcher.capture_one_task_context().unwrap();
+    let mm = g.lease.as_ref().unwrap().task_state_authority().unwrap();
+    g.memory.refuse_next_supply_grant();
+    let DispatchOutcome::OutputSuspended(second) = first
+        .resume(&context, &mut g.memory, mm, &g.dispatcher.fs_view())
+        .unwrap()
+    else {
+        panic!("supply refusal")
+    };
+    assert!(matches!(
+        second.wait(),
+        carrick_guest_mem::MemoryReadWait::Supply(_)
+    ));
+    assert_eq!(
+        (
+            g.memory.prepares,
+            g.memory.commits.len(),
+            directory_cursor(&mut g, fd)
+        ),
+        (2, 0, 0)
+    );
+    let dependency = Arc::new(Dependency);
+    let mut memory = Physical {
+        inner: &mut g.memory,
+        dependency: Arc::downgrade(&dependency),
+        refuse: true,
+    };
+    let DispatchOutcome::OutputSuspended(third) = second
+        .resume(&context, &mut memory, mm, &g.dispatcher.fs_view())
+        .unwrap()
+    else {
+        panic!("physical refusal")
+    };
+    assert!(matches!(
+        third.wait(),
+        carrick_guest_mem::MemoryReadWait::Physical(_)
+    ));
+    assert_eq!(memory.inner.prepares, 3);
+    assert!(memory.inner.commits.is_empty());
+    let target = g.dispatcher.open_file(fd as i32).unwrap();
+    assert!(matches!(
+        &*crate::kernel::FileDescription::read_for_io(&target.description).unwrap(),
+        super::fd_table::OpenDescription::Directory { offset: 0, .. }
+    ));
+    assert_eq!(Arc::strong_count(&dependency), 2);
+    let outcome = third
+        .resume(&context, &mut memory, mm, &g.dispatcher.fs_view())
+        .unwrap();
+    assert!(matches!(outcome, DispatchOutcome::Returned { value } if value > 0));
+    assert_eq!((memory.inner.prepares, memory.inner.commits.len()), (4, 1));
+    assert_eq!(Arc::strong_count(&dependency), 1);
+    assert_eq!(directory_cursor(&mut g, fd), 3);
+}
+
+#[test]
+fn directory_shared_output_returns_complete_prefix_on_refusal_or_fault() {
+    for fault in [false, true] {
+        let (mut g, _lower, fd) = directory_guest();
+        // Exactly one 24-byte dot record fits before the page boundary.
+        let address = BASE + 0x1000 - 24;
+        if fault {
+            g.memory.protect_readonly(BASE + 0x1000, 4096);
+        } else {
+            g.memory.refuse_after_prepares(1);
+        }
+        let result = g.call(nr::GETDENTS64.raw(), [fd as u64, address, 512, 0, 0, 0]);
+        assert_eq!(result, DispatchOutcome::Returned { value: 24 });
+        assert_eq!(g.memory.prepares, 2);
+        assert_eq!(g.memory.commits.len(), 1);
+        let bytes = &g.memory.commits[0].1;
+        assert_eq!(u16::from_ne_bytes(bytes[16..18].try_into().unwrap()), 24);
+        assert_eq!(&bytes[19..21], b".\0");
+        assert_eq!(directory_cursor(&mut g, fd), 1);
+        // No suspended replay: a new call starts at the live shared cursor.
+        assert!(g.ok(nr::GETDENTS64.raw(), [fd as u64, OUT, 512, 0, 0, 0]) > 0);
+        assert_eq!(directory_cursor(&mut g, fd), 3);
+    }
+}
+
+#[test]
+fn directory_shared_output_rejects_stale_handoff_and_cancellation_before_access() {
+    use crate::kernel::continuation::CompletionFoldError;
+    use carrick_el1_abi::Lifecycle;
+    for failure in 0..4 {
+        let (mut g, _lower, fd) = directory_guest();
+        g.memory.refuse_next();
+        let DispatchOutcome::OutputSuspended(pending) =
+            g.call(nr::GETDENTS64.raw(), [fd as u64, OUT, 512, 0, 0, 0])
+        else {
+            panic!("owner refusal")
+        };
+        let context = g.dispatcher.capture_one_task_context().unwrap();
+        let other = Guest::new();
+        let other_context = other.dispatcher.capture_one_task_context().unwrap();
+        let mm = g.lease.as_ref().unwrap().task_state_authority().unwrap();
+        if failure >= 2 {
+            context
+                .lifecycle_page()
+                .process_exit_custody()
+                .cancellation_authority()
+                .publish(
+                    if failure == 2 {
+                        carrick_core::cancellation::ProcessCancellation::FatalSignal
+                    } else {
+                        carrick_core::cancellation::ProcessCancellation::GroupExit
+                    },
+                    || panic!("no admitted effect"),
+                );
+        }
+        let before = (
+            g.memory.prepares,
+            g.memory.reads.get(),
+            g.memory.commits.len(),
+        );
+        let result = pending.resume(
+            if failure == 0 {
+                &other_context
+            } else {
+                &context
+            },
+            &mut g.memory,
+            if failure == 1 { (mm.0, mm.1 + 1) } else { mm },
+            &g.dispatcher.fs_view(),
+        );
+        assert_eq!(
+            (
+                g.memory.prepares,
+                g.memory.reads.get(),
+                g.memory.commits.len()
+            ),
+            before
+        );
+        match failure {
+            0 => assert!(matches!(result, Err(DispatchError::CompletionInvariant(_)))),
+            1 => assert!(matches!(
+                result,
+                Err(DispatchError::CompletionInvariant(
+                    CompletionFoldError::AddressSpace
+                ))
+            )),
+            2 | 3 => assert!(matches!(result, Ok(DispatchOutcome::OwnerCancelled(_)))),
+            _ => unreachable!(),
+        }
+        let target = g.dispatcher.open_file(fd as i32).unwrap();
+        assert_eq!(
+            target.description.fd_ref_count(),
+            1,
+            "rejected completion releases its functional lease"
+        );
+        assert!(matches!(
+            &*crate::kernel::FileDescription::read_for_io(&target.description).unwrap(),
+            super::fd_table::OpenDescription::Directory { offset: 0, .. }
+        ));
+    }
+}
+
+#[test]
+fn directory_shared_output_relocks_live_cursor_and_requires_owner_lease() {
+    let (mut g, _lower, fd) = directory_guest();
+    let args = SyscallArgs::from([fd as u64, OUT, 512, 0, 0, 0]);
+    assert!(syscall_requires_execution_lease(nr::GETDENTS64.raw(), args));
+    let context = g.dispatcher.capture_one_task_context().unwrap();
+    let before = g.memory.prepares;
+    assert!(matches!(
+        g.dispatcher.dispatch_with_lease(
+            &context,
+            SyscallRequest::new(nr::GETDENTS64.raw(), args),
+            &mut g.memory,
+            &g.reporter,
+            None
+        ),
+        Err(DispatchError::CompletionInvariant(
+            crate::kernel::continuation::CompletionFoldError::ExecutionAuthority
+        ))
+    ));
+    assert_eq!(g.memory.prepares, before);
+    assert_eq!(directory_cursor(&mut g, fd), 0);
+    g.memory.refuse_next();
+    let DispatchOutcome::OutputSuspended(pending) = g.call(nr::GETDENTS64.raw(), args.0) else {
+        panic!("owner refusal")
+    };
+    let dup = g.ok(nr::DUP.raw(), [fd as u64, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        g.ok(nr::GETDENTS64.raw(), [dup as u64, OUT2, 24, 0, 0, 0]),
+        24
+    );
+    assert_eq!(directory_cursor(&mut g, fd), 1);
+    let outcome = pending
+        .resume(
+            &context,
+            &mut g.memory,
+            g.lease.as_ref().unwrap().task_state_authority().unwrap(),
+            &g.dispatcher.fs_view(),
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value } = outcome else {
+        panic!("retained directory read")
+    };
+    assert!(value > 0);
+    let bytes = g.memory.inner.read_bytes(OUT, value as usize).unwrap();
+    assert_eq!(
+        &bytes[19..22],
+        b"..\0",
+        "resume must use the live shared cursor"
+    );
+    assert_eq!(directory_cursor(&mut g, dup), 3);
+}
+
+#[test]
+fn directory_shared_output_preserves_internal_preparation_error() {
+    struct BrokenPreparation;
+    impl GuestMemory for BrokenPreparation {
+        fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+            carrick_guest_mem::UserMemoryVenue::Owner
+        }
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            panic!("directory resume must not read memory")
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            panic!("prepared writes only")
+        }
+        fn prepare_write(
+            &mut self,
+            _: &[carrick_guest_mem::GuestWriteRange],
+        ) -> Result<
+            Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+            carrick_guest_mem::MemoryPrepareError,
+        > {
+            Err(carrick_guest_mem::MemoryPrepareError::Fault(
+                MemoryError::HostMap("internal preparation failure".into()),
+            ))
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for BrokenPreparation {}
+    let (mut g, _lower, fd) = directory_guest();
+    g.memory.refuse_next();
+    let DispatchOutcome::OutputSuspended(pending) =
+        g.call(nr::GETDENTS64.raw(), [fd as u64, OUT, 512, 0, 0, 0])
+    else {
+        panic!("owner refusal")
+    };
+    let context = g.dispatcher.capture_one_task_context().unwrap();
+    let outcome = pending.resume(
+        &context,
+        &mut BrokenPreparation,
+        g.lease.as_ref().unwrap().task_state_authority().unwrap(),
+        &g.dispatcher.fs_view(),
+    );
+    assert!(
+        matches!(outcome, Err(DispatchError::MemoryPreparation(message)) if message.contains("internal preparation failure"))
+    );
+    assert!(g.memory.commits.is_empty());
+    assert_eq!(directory_cursor(&mut g, fd), 0);
 }

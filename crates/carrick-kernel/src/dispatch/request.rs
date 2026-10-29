@@ -347,13 +347,19 @@ impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
 /// filesystem durability operations (`sync`, `fsync`, `fdatasync`,
 /// `sync_file_range`, `syncfs`) and scalar `write` also borrow it for host-wait
 /// handoff. `recvfrom` borrows it to capture exact retained-output identity
-/// before payload consumption. Other
-/// ordinary syscalls and non-memory ptrace requests execute without acquiring or
-/// consulting the execution lease lock.
+/// before payload consumption. `getdents64` borrows it before owner-memory
+/// publication to bind a retained directory selection. Other ordinary syscalls
+/// and non-memory ptrace requests execute without acquiring or consulting the
+/// execution lease lock.
 #[inline]
 pub const fn syscall_requires_execution_lease(nr: u64, args: SyscallArgs) -> bool {
     match nr {
-        number if number == carrick_abi::syscall::nr::RECVFROM.raw() => true,
+        number
+            if number == carrick_abi::syscall::nr::RECVFROM.raw()
+                || number == carrick_abi::syscall::nr::GETDENTS64.raw() =>
+        {
+            true
+        }
         64 | 81..=84 | 267 | 270 | 271 => true,
         117 => matches!(
             args.0[0],

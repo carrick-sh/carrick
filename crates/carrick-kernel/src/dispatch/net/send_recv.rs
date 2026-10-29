@@ -698,7 +698,7 @@ impl<'a> NetView<'a> {
                                     }
                                     if src_addr != 0 {
                                         return RetainedOutputCompletion::recvfrom_address(binding, GuestPtr(src_len_addr), read_len)
-                                            .resume(cx.kernel, memory, identity).map_err(DispatchError::CompletionInvariant);
+                                            .resume(cx.kernel, memory, identity, &this.cross.fs_view());
                                     }
                                     return Ok(DispatchOutcome::returned_len(read_len)?);
                                 }
