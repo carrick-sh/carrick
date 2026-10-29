@@ -140,6 +140,7 @@ pub(crate) fn lower_el0_fault(esr: u64, elr: u64, far: u64) -> Option<(i32, i32,
     }
 }
 
+#[derive(::core::fmt::Debug)]
 pub(crate) enum FaultSignalDisposition {
     Stopped,
     Injected,
@@ -213,10 +214,11 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     if !super::carrier_signal_selection_permitted(
         context.thread().control_slot().native_signal_owner(),
     ) {
-        return Err(RuntimeError::Configuration(
-            "synchronous fault signal reached carrier signal table for a native signal binding"
-                .to_owned(),
-        ));
+        // Host VMA resolution and ptrace stops have already settled. A root
+        // MAPERR or SIGBUS can still arrive here with a native signal table.
+        // Use its default fatal disposition rather than a stale carrier action;
+        // deliver_fault_signal records the signal for the normal core/exit path.
+        return Ok(FaultSignalDisposition::Terminate(fault.signum));
     }
 
     let action = dispatcher.registered_signal_handler(context, fault.signum);
@@ -1822,10 +1824,11 @@ where
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     static PTRACE_SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[derive(Default)]
@@ -2026,6 +2029,7 @@ mod tests {
         assert_eq!(action.term_signal, Some(signum));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn ptrace_signal_stop_queued_host_sigkill_remains_terminal() {
         let _guard = PTRACE_SIGNAL_TEST_LOCK
@@ -2070,6 +2074,7 @@ mod tests {
         let _ = crate::guest_cpu::reap_child_guest_ns(child as u32);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn synchronous_fault_stops_for_ptrace_before_default_termination() {
         let _guard = PTRACE_SIGNAL_TEST_LOCK
@@ -2242,7 +2247,11 @@ mod tests {
             ))
         ));
 
-        context.thread().control_slot().commit_native_signal_owner();
+        let custody =
+            carrick_core::lifecycle::MemberControlCustody::retain(context.thread().control_slot())
+                .unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
         let mut native_fault = FaultSignal {
             signum: crate::linux_abi::LINUX_SIGSEGV,
             si_code: 1,
@@ -2258,15 +2267,58 @@ mod tests {
                     tid,
                     &mut native_fault,
                 ),
-                Err(RuntimeError::Configuration(_))
+                Ok(FaultSignalDisposition::Terminate(
+                    crate::linux_abi::LINUX_SIGBUS
+                ))
             ),
-            "host inject_fault_signal must fail closed instead of consulting the host signal table for a native signal owner"
+            "native-owned SIGBUS must terminate through the normal signal/core path"
         );
         assert_eq!(
             native_fault.signum,
             crate::linux_abi::LINUX_SIGBUS,
             "SIGBUS reclassification still precedes the native signal table guard"
         );
+    }
+
+    #[test]
+    fn native_signal_owner_root_maperr_and_bus_terminate() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let custody =
+            carrick_core::lifecycle::MemberControlCustody::retain(context.thread().control_slot())
+                .unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        assert!(context.thread().control_slot().native_signal_owner());
+        assert_eq!(el0_fault_signal(0x9200_0046), Some((11, 1)));
+        // A stale carrier handler must never be selected for a native owner.
+        for signum in [
+            crate::linux_abi::LINUX_SIGSEGV,
+            crate::linux_abi::LINUX_SIGBUS,
+        ] {
+            let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(signum).unwrap();
+            let mut caught = carrick_abi::LinuxSigaction::empty();
+            caught.sa_handler = 0x7000;
+            context.signal_authority().install_action(signal, caught);
+            let mut trap = NoopTrap::default();
+            let disposition = inject_fault_signal(
+                &mut trap,
+                &dispatcher,
+                &context,
+                ThreadId::main_from_host_pid(),
+                &mut FaultSignal {
+                    signum,
+                    si_code: 1,
+                    si_addr: 0,
+                    interrupted_pc: Some(0x4000),
+                },
+            );
+            assert!(
+                matches!(disposition, Ok(FaultSignalDisposition::Terminate(signal)) if signal == signum),
+                "native root fault must terminate with signal {signum}: {disposition:?}"
+            );
+            assert_eq!(trap.delivered_signum, 0);
+        }
     }
 
     #[test]
@@ -2291,6 +2343,7 @@ mod tests {
         assert_eq!(action.stop_signal, None);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn initially_blocked_write_then_reader_close_returns_epipe_and_queues_sigpipe() {
         let dispatcher = SyscallDispatcher::new();

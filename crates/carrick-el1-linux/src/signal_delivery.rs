@@ -31,23 +31,6 @@ pub trait SignalMachine<C> {
 
 pub fn deliver_signal_on_syscall_return<'a, M, C, S, A>(
     task: &CurrentTask,
-    process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
-    frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
-    fpstate: &[u8],
-    machine: &mut A,
-) -> Option<CompletionRoute>
-where
-    M: Clone,
-    C: ProcessContext,
-    S: NativeProcessService<'a, C, Mm = M>,
-    A: SignalMachine<C>,
-{
-    let (_, slot) = task.lifecycle_refs()?;
-    deliver_signal_with_control(task, slot, process, frame, fpstate, machine)
-}
-
-pub fn deliver_signal_with_control<'a, M, C, S, A>(
-    task: &CurrentTask,
     slot: &carrick_el1_abi::ThreadControlSlot,
     process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
     frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
@@ -252,7 +235,7 @@ where
     }
     let mask = blocked.signals().without(Signal::SEGV);
     let _ = slot.store_blocked_then_read_pending(BlockedMask(mask.bits()), slot.pending());
-    deliver_signal_on_syscall_return(task, process, frame, fpstate, machine)
+    deliver_signal_on_syscall_return(task, slot, process, frame, fpstate, machine)
 }
 
 #[cfg(test)]
@@ -293,7 +276,7 @@ mod altstack_tests {
     }
 
     #[test]
-    fn production_deliver_signal_with_control_preserves_interrupted_sp_and_masks_daif() {
+    fn production_deliver_signal_on_syscall_return_preserves_interrupted_sp_and_masks_daif() {
         use crate::native_process_runtime::host_test_support::{
             NativeSignalFixture, take_signal_copies,
         };
@@ -333,9 +316,9 @@ mod altstack_tests {
         let mut frame = carrick_el1_abi::TrapFrame {
             elr: 0x40_0000,
             // Interrupted EL0 SPSR with Z+C flags (0x6000_0000) and internal EL0 DAIF (0x3c0).
-            // Before the fix, deliver_signal_with_control -> setup_arm_signal_frame -> build
+            // Before the fix, deliver_signal_on_syscall_return -> setup_arm_signal_frame -> build
             // fails in arm::encode because 0x3c0 is rejected by validate_pstate, causing
-            // deliver_signal_with_control to take force_delivery_fault (SIGSEGV) instead of
+            // deliver_signal_on_syscall_return to take force_delivery_fault (SIGSEGV) instead of
             // writing the handler frame!
             spsr: 0x6000_03c0,
             ..Default::default()
@@ -344,7 +327,7 @@ mod altstack_tests {
         assert_eq!(drained, 1);
         assert_eq!(
             route, None,
-            "deliver_signal_with_control must deliver SIGINT to handler without faulting on internal DAIF"
+            "deliver_signal_on_syscall_return must deliver SIGINT to handler without faulting on internal DAIF"
         );
         let copies = take_signal_copies();
         assert_eq!(copies.len(), 1, "signal frame must be copied to user stack");

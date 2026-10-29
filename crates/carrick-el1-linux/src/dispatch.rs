@@ -1268,6 +1268,57 @@ pub(super) fn native_service_idle(
     Action::Idle
 }
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn arm_deliver_declined_fault_signal_with<
+    X: super::aarch64_process::ForkStockCrossing,
+    F,
+>(
+    source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    deliver: F,
+) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
+where
+    F: FnOnce(
+        &mut super::native_process_runtime::NativeProcessEntry<
+            '_,
+            'static,
+            super::aarch64_process::Mm,
+            carrick_el1_abi::Aarch64ParkedContext,
+            super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+        >,
+        &mut TrapFrame,
+    ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
+{
+    if carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
+        source.zone,
+        source.slot,
+        task,
+        page,
+        control,
+    ) != carrick_el1::substrate::sched::NativeEntryVenue::SignalOwner
+    {
+        return Ok(Action::Forward);
+    }
+    super::aarch64_process::deliver_declined_fault_signal_with(
+        source,
+        task,
+        native,
+        ttbr0,
+        page,
+        control,
+        service,
+        frame.far,
+        |process| deliver(process, frame),
+    )
+}
+
 /// Deliver a synchronous `SIGSEGV` (`SEGV_ACCERR`) in-ring when an admitted
 /// anonymous reservation declines a permission fault on a `SignalOwner` thread.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -1298,7 +1349,7 @@ pub(crate) fn arm_deliver_declined_fault_signal(frame: &mut TrapFrame) -> Action
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    super::aarch64_process::deliver_declined_fault_signal_with(
+    arm_deliver_declined_fault_signal_with(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
         &saved.native,
@@ -1306,8 +1357,8 @@ pub(crate) fn arm_deliver_declined_fault_signal(frame: &mut TrapFrame) -> Action
         page,
         control,
         &mut service,
-        frame.far,
-        |process| super::arm_signal::deliver_on_user_return(task, process, frame),
+        frame,
+        |process, frame| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
     .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding))
 }
@@ -1333,18 +1384,23 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         }
         return Action::Served;
     };
-    if !control.native_signal_owner()
-        || (frame.esr != 0xfffc && !carrick_el1_abi::Lifecycle::gate(page).serves_ring())
+    let Some(slot) = SlotId::from_index(frame.slot as usize) else {
+        invalid_completion(NativeInvariant::EntryBinding)
+    };
+    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    let venue = carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
+        zone, slot, task, page, control,
+    );
+    // Fatal cancellation drains an already owned wait after admission closes.
+    // It does not admit new SignalOwner execution through a closed gate.
+    if venue == carrick_el1::substrate::sched::NativeEntryVenue::Host
+        && !(fatal_owner_cancel && control.native_signal_owner())
     {
         if fatal_owner_cancel {
             invalid_completion(NativeInvariant::EntryBinding)
         }
         return Action::Served;
-    };
-    let Some(slot) = SlotId::from_index(frame.slot as usize) else {
-        invalid_completion(NativeInvariant::EntryBinding)
-    };
-    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    }
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
     if frame.esr != 0xfffc
         && !(frame.esr == 0xfffe
