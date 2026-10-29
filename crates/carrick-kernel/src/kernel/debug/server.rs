@@ -645,11 +645,7 @@ fn capture_section_initial_count(capture: &PostMortem, section: CaptureAuxSectio
 fn target_section_budget(current_encoded_len: usize, cap: usize, section_bytes: usize) -> usize {
     let excess = current_encoded_len.saturating_sub(cap);
     let needed = excess.saturating_add(TRUNCATION_METADATA_MARGIN);
-    if section_bytes > needed {
-        (section_bytes - needed).min(section_bytes / 2)
-    } else {
-        0
-    }
+    section_bytes.saturating_sub(needed)
 }
 
 fn proportional_keep_count(len: usize, target_bytes: usize, section_bytes: usize) -> usize {
@@ -679,7 +675,22 @@ fn upsert_truncated(
     reason: String,
 ) {
     if let Some(existing) = truncated.iter_mut().find(|entry| entry.section == section) {
-        existing.reason = reason;
+        if existing.reason == reason {
+            return;
+        }
+        if reason.contains("response cap") {
+            if let Some((original, tail)) = existing.reason.rsplit_once("; ")
+                && tail.contains("response cap")
+            {
+                existing.reason = format!("{original}; {reason}");
+                return;
+            }
+            if existing.reason.contains("response cap") {
+                existing.reason = reason;
+                return;
+            }
+        }
+        existing.reason = format!("{}; {reason}", existing.reason);
     } else {
         truncated.push(super::post_mortem::Truncated {
             section: section.to_owned(),
@@ -732,6 +743,17 @@ fn bound_capture_response(
 ) -> Result<Vec<u8>, WireError> {
     let initial_aux_counts =
         CaptureAuxSection::ALL.map(|section| capture_section_initial_count(capture, section));
+    let mut aux_bytes =
+        CaptureAuxSection::ALL.map(|section| capture_section_reducible_bytes(capture, section));
+    let mut kernel_non_aux_bytes = capture.kernel.as_ref().map_or(0, |snapshot| {
+        let kernel_aux_bytes = aux_bytes[CaptureAuxSection::KernelExecutorReceipts.index()]
+            .saturating_add(aux_bytes[CaptureAuxSection::KernelRunQueue.index()])
+            .saturating_add(aux_bytes[CaptureAuxSection::KernelExecutors.index()])
+            .saturating_add(aux_bytes[CaptureAuxSection::KernelSchedulerAux.index()]);
+        encode_canonical(snapshot)
+            .map_or(0, |bytes| bytes.len())
+            .saturating_sub(kernel_aux_bytes)
+    });
     let initial_findings_count = capture.findings.len();
     let mut initial_degraded_tasks = capture
         .degraded_kernel
@@ -745,28 +767,21 @@ fn bound_capture_response(
     while encoded.len() > cap {
         let largest = CaptureAuxSection::ALL
             .into_iter()
-            .map(|section| (section, capture_section_reducible_bytes(capture, section)))
+            .map(|section| (section, aux_bytes[section.index()]))
             .filter(|(_, bytes)| *bytes > 0)
             .max_by(|(a_sec, a_bytes), (b_sec, b_bytes)| {
                 a_bytes.cmp(b_bytes).then_with(|| b_sec.cmp(a_sec))
             });
+        let largest_aux_bytes = largest.map_or(0, |(_, bytes)| bytes);
+        let should_degrade_kernel = capture.kernel.is_some()
+            && (kernel_non_aux_bytes > cap || kernel_non_aux_bytes >= largest_aux_bytes);
 
-        if let Some((section, section_bytes)) = largest {
-            let target_bytes = target_section_budget(encoded.len(), cap, section_bytes);
-            let initial_total = initial_aux_counts[section.index()];
-            truncate_capture_aux_section(
-                capture,
-                section,
-                initial_total,
-                target_bytes,
-                section_bytes,
-                cap,
-            );
-            encoded = encode_canonical(capture)?;
-            continue;
-        }
-
-        if let Some(snapshot) = capture.kernel.take() {
+        if should_degrade_kernel && let Some(snapshot) = capture.kernel.take() {
+            kernel_non_aux_bytes = 0;
+            aux_bytes[CaptureAuxSection::KernelExecutorReceipts.index()] = 0;
+            aux_bytes[CaptureAuxSection::KernelRunQueue.index()] = 0;
+            aux_bytes[CaptureAuxSection::KernelExecutors.index()] = 0;
+            aux_bytes[CaptureAuxSection::KernelSchedulerAux.index()] = 0;
             let reason = format!(
                 "kernel snapshot exceeded {cap}-byte wire response cap; degraded to task summary"
             );
@@ -783,6 +798,22 @@ fn bound_capture_response(
                 );
             }
             upsert_truncated(&mut capture.truncated, "kernel", reason);
+            encoded = encode_canonical(capture)?;
+            continue;
+        }
+
+        if let Some((section, section_bytes)) = largest {
+            let target_bytes = target_section_budget(encoded.len(), cap, section_bytes);
+            let initial_total = initial_aux_counts[section.index()];
+            truncate_capture_aux_section(
+                capture,
+                section,
+                initial_total,
+                target_bytes,
+                section_bytes,
+                cap,
+            );
+            aux_bytes[section.index()] = capture_section_reducible_bytes(capture, section);
             encoded = encode_canonical(capture)?;
             continue;
         }
@@ -1162,11 +1193,16 @@ fn bound_snapshot_response(
     mut encoded: Vec<u8>,
     cap: usize,
 ) -> Result<Vec<u8>, WireError> {
-    let initial_counts = match response {
+    let (initial_counts, mut aux_bytes, kernel_non_aux_bytes) = match response {
         ServerResponse::Snapshot(snapshot) => {
-            SnapshotAuxSection::ALL.map(|section| snapshot_section_initial_count(snapshot, section))
+            let counts = SnapshotAuxSection::ALL
+                .map(|section| snapshot_section_initial_count(snapshot, section));
+            let aux = SnapshotAuxSection::ALL
+                .map(|section| snapshot_section_reducible_bytes(snapshot, section));
+            let aux_total: usize = aux.iter().sum();
+            (counts, aux, encoded.len().saturating_sub(aux_total))
         }
-        _ => [0; 4],
+        _ => ([0; 4], [0; 4], 0),
     };
 
     while encoded.len() > cap {
@@ -1175,13 +1211,16 @@ fn bound_snapshot_response(
         };
         let largest = SnapshotAuxSection::ALL
             .into_iter()
-            .map(|section| (section, snapshot_section_reducible_bytes(snapshot, section)))
+            .map(|section| (section, aux_bytes[section.index()]))
             .filter(|(_, bytes)| *bytes > 0)
             .max_by(|(a_sec, a_bytes), (b_sec, b_bytes)| {
                 a_bytes.cmp(b_bytes).then_with(|| b_sec.cmp(a_sec))
             });
+        let largest_aux_bytes = largest.map_or(0, |(_, bytes)| bytes);
+        let should_degrade_kernel =
+            kernel_non_aux_bytes > cap || kernel_non_aux_bytes >= largest_aux_bytes;
 
-        if let Some((section, section_bytes)) = largest {
+        if !should_degrade_kernel && let Some((section, section_bytes)) = largest {
             let target_bytes = target_section_budget(encoded.len(), cap, section_bytes);
             let initial_total = initial_counts[section.index()];
             match section {
@@ -1244,13 +1283,15 @@ fn bound_snapshot_response(
                     }
                 }
             }
+            aux_bytes[section.index()] = snapshot_section_reducible_bytes(snapshot, section);
             encoded = encode_canonical(&**snapshot)?;
             continue;
         }
 
-        // Core coherent tables alone exceed the wire response cap; degrade to
-        // the per-task summary view rather than failing with FrameTooLarge or
-        // emitting a partial snapshot that violates referential joins.
+        // Core coherent tables account for the excess (or exceed the largest
+        // auxiliary section); degrade to the per-task summary view rather than
+        // failing with FrameTooLarge or emptying smaller auxiliary sections
+        // first.
         let mut degraded = Box::new(degrade_oversized_snapshot(snapshot, cap));
         let degraded_encoded = encode_canonical(&*degraded)?;
         let bounded = bound_degraded_response(&mut degraded, degraded_encoded, cap)?;
@@ -1737,6 +1778,11 @@ mod tests {
             "largest payload (host_threads) must be truncated"
         );
         assert!(
+            physical.host_threads.len() > (36 * 4) / 5,
+            "18 MiB section against 16 MiB cap must keep >80% of rows (got {} of 36)",
+            physical.host_threads.len()
+        );
+        assert!(
             physical
                 .unavailable
                 .iter()
@@ -1756,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_event_ring_truncates_newest_records_and_refuses_when_minimum_cannot_fit() {
+    fn oversized_event_ring_retains_newest_records_and_refuses_when_minimum_cannot_fit() {
         let mut capture = PostMortem::capture(
             None,
             AbortReason::LiveCapture {
@@ -1815,6 +1861,61 @@ mod tests {
         let second_bounded =
             encode_bounded_response(&mut second_response, target_cap).expect("second bounded");
         assert_eq!(bounded, second_bounded);
+
+        // Pre-existing capture-time truncation reasons (e.g. `bounded_rows` on
+        // `executor_receipts`) must be preserved alongside the wire-cap reason
+        // instead of overwritten.
+        let mut with_existing_note = capture.clone();
+        with_existing_note.event_ring.clear();
+        with_existing_note.event_ring_high_rate.clear();
+        with_existing_note.scheduler_aux = Some(super::super::post_mortem::SchedulerAuxCapture {
+            scheduler: Vec::new(),
+            run_queue: Vec::new(),
+            executors: Vec::new(),
+            executor_receipts: (0..200_u64)
+                .map(|seq| super::super::dto::DebugExecutorReceiptRow {
+                    sequence: seq + 1,
+                    executor: 1,
+                    event: "Dispatched".to_owned(),
+                    thread: None,
+                    generation: Some(1),
+                    observed_state: Some("runnable".to_owned()),
+                    reason: Some("r".repeat(256)),
+                })
+                .collect(),
+            executor_receipt_summary: Some(super::super::dto::DebugExecutorReceiptSummary {
+                total: 1500,
+                returned: 200,
+                message: "showing last 200 of 1500 receipts".to_owned(),
+            }),
+        });
+        with_existing_note.truncated = vec![super::super::post_mortem::Truncated {
+            section: "executor_receipts".to_owned(),
+            reason: "1500 rows exceed the 1024-row capture limit".to_owned(),
+        }];
+        let aux_full = encode_canonical(&with_existing_note).expect("encode aux capture");
+        let aux_cap = (aux_full.len() * 9) / 10;
+        let mut aux_response = ServerResponse::Capture(Box::new(with_existing_note));
+        let aux_bounded =
+            encode_bounded_response(&mut aux_response, aux_cap).expect("bound aux capture");
+        let aux_decoded: PostMortem = wire::decode_exact(&aux_bounded).expect("decode aux capture");
+        let receipt_truncation = aux_decoded
+            .truncated
+            .iter()
+            .find(|entry| entry.section == "executor_receipts")
+            .expect("executor_receipts truncation entry");
+        assert!(
+            receipt_truncation
+                .reason
+                .contains("1500 rows exceed the 1024-row capture limit"),
+            "capture-time reason must be preserved: {:?}",
+            receipt_truncation.reason
+        );
+        assert!(
+            receipt_truncation.reason.contains("of 1500 rows to fit"),
+            "wire-cap reason must be added alongside original reason: {:?}",
+            receipt_truncation.reason
+        );
 
         // When cap is smaller than even the minimum PostMortem envelope, a typed
         // WireError::FrameTooLarge error is returned.
@@ -1925,6 +2026,11 @@ mod tests {
             .as_ref()
             .expect("receipts table present");
         assert!(receipts.len() < 300, "receipts must be truncated");
+        assert!(
+            receipts.len() > (300 * 4) / 5,
+            "receipts slightly over cap must keep >80% of rows (got {} of 300)",
+            receipts.len()
+        );
         assert_eq!(
             receipts.last().map(|row| row.sequence),
             Some(300),
@@ -1995,6 +2101,8 @@ mod tests {
 
     #[test]
     fn oversized_core_snapshot_degrades_with_metadata_instead_of_failing_frame_too_large() {
+        crate::event_ring::rec(crate::event_ring::FORK, 4402, 1, 0);
+        crate::event_ring::rec(crate::event_ring::SCHED_DISPATCH, 4402, 1, 0);
         let (_temp, endpoint) =
             super::super::endpoint::tests::scoped_endpoint("debug-oversized-core");
         let bootstrap = RootBootstrap::with_mm_backend(
@@ -2006,8 +2114,10 @@ mod tests {
         )
         .expect("bootstrap");
         let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
-        let mut server =
-            KernelDebugServer::start_at(kernel, endpoint.clone(), None).expect("debug server");
+        let physical: Arc<dyn PhysicalCaptureProvider> =
+            Arc::new(UnderLimitPhysicalCaptureProvider);
+        let mut server = KernelDebugServer::start_at(kernel, endpoint.clone(), Some(physical))
+            .expect("debug server");
 
         let degraded = match super::super::client::fetch_at_with_wait(
             &endpoint,
@@ -2051,6 +2161,33 @@ mod tests {
                 .iter()
                 .any(|entry| entry.section == "kernel"),
             "truncated: {:?}",
+            capture.truncated
+        );
+        assert!(
+            !capture.event_ring.is_empty(),
+            "event_ring must survive untruncated when core kernel tables alone caused the overflow"
+        );
+        assert!(
+            !capture.event_ring_high_rate.is_empty(),
+            "event_ring_high_rate must survive untruncated when core kernel tables alone caused the overflow"
+        );
+        let physical = capture.physical.as_ref().expect(
+            "physical capture must survive when core kernel tables alone caused the overflow",
+        );
+        assert_eq!(physical.zone_census, "cpl0-zone: cpu0=idle cpu1=parked");
+        assert_eq!(physical.vcpus.len(), 2);
+        assert_eq!(physical.host_threads.len(), 2);
+        assert!(
+            physical.unavailable.is_empty(),
+            "physical.unavailable must stay empty when core kernel tables alone caused the overflow: {:?}",
+            physical.unavailable
+        );
+        assert!(
+            capture
+                .truncated
+                .iter()
+                .all(|entry| entry.section == "kernel"),
+            "only kernel must be recorded in truncated when core tables alone overflowed: {:?}",
             capture.truncated
         );
         assert!(capture.degraded_kernel.as_ref().is_some_and(|view| {
