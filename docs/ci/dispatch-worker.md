@@ -1,7 +1,7 @@
 # Owner-triggered dispatch (#797, #799, #800)
 
 Every trigger enters one agent loop on an owner's `[carrick-agent]` disposable
-JIT clone. The controller caps the pool at four clones; the job cap is 60
+JIT clone. The controller caps the pool at four clones; the job cap is 85
 minutes. Clones are destroyed after every job, including failure and timeout.
 VM-local leases and template 9000 remain as in [Contabo setup](contabo-kvm.md).
 
@@ -190,7 +190,9 @@ boundary. The private launcher is not secret (owner decision #231). Trusted
 bodies can still misdirect a credential-bearing model. The collaborators-only
 interaction limit expires on 2027-04-04 and is not a lasting trust boundary.
 Earlier jobs capped exposure at 40 minutes; the current window reserves time
-for bootstrap, a 42-minute loop and reporting. The job token can write branches belonging to other runs: the uid split and fixed refspec enforce normal scope, not its
+for bootstrap, a 67-minute loop and reporting. Publish and board tokens are
+minted on demand, so the job's length is not bounded by a token read at
+admission (#1012). The job token can write branches belonging to other runs: the uid split and fixed refspec enforce normal scope, not its
 repository grant. Ruleset 25522481 was deleted after it blocked merge queue
 creation; tag ruleset 25523683 is active.
 
@@ -214,7 +216,7 @@ There are no tool arguments for issue, PR, repository or scope. Only `select_bra
 | `select_branch {branch}` | Before workers begin, selects the new run branch or an authenticated issue-linked branch. Reads and retains its remote tip for the publication lease. |
 | `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity, a completed `carrick-agent` worker with successful upload, and the issue-derived upload bundle name. Review runs must keep the workflow blob from their head’s merge base with main. The returned contract, handoff or worker-transcript text is tagged with its dispatch provenance and marked untrusted. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
 | `read_capacity {}` | Runs pinned `agy_worker.py capacity --json` as the worker account. Reads the real `backends` map from `capacity_report`, with `installed`, `free_slots`, `quota_free`, `score` and agy `quota.groups`/`group_scores`. Augments it with exact current IDs from the launcher's live `models --backend` roster, excluding superseded IDs. Returns numeric capacity and model IDs only, never credentials or raw diagnostics. Only successful capacity reports are cached. Each admitted worker consumes its snapshot, so the next worker requires a fresh report; refused choices can reuse the current successful report. Total probes are capped at `workers + refused_workers`. Each subprocess/output is bounded (120 s, 64 KiB) inside the event wall budget. |
-| `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Checks remaining worker, tool-call and time budgets before consulting the cached capacity snapshot; refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Three refused worker requests exhaust their separate refusal budget without charging workers. Runs workers sequentially on the selected branch; each later worker sees earlier commits and a server-built handoff of contract summaries, tests and risks. All workers share 35 total minutes; owner trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
+| `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Checks remaining worker, tool-call and time budgets before consulting the cached capacity snapshot; refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Three refused worker requests exhaust their separate refusal budget without charging workers. Runs workers sequentially on the selected branch; each later worker sees earlier commits and a server-built handoff of contract summaries, tests and risks. All workers share 60 total minutes; owner trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
 | `publish {}` | Shared receipt/ownership checks; refuses `.github/workflows/*`; only the admitted branch, fixed refspec and expected-tip lease. Creates a draft with the first commit’s title or continues the owned PR. A worker can write `pr-body.md` beside `result.json`, outside its checkout, to propose a body (8 KiB, regular UTF-8 file, no symlinks). The server masks tokens, neutralises mentions with a U+2060 WORD JOINER, strips template instructions, refuses extra closing references and supplied run footers, then adds exactly one `Closes #N` line and its run footer. A refused proposal is reported with its reason and never blocks the commit push. The same body is used for creation or a REST `PATCH` on continuation. After each write, the server verifies closing references with the job token using the bounded consistency protocol below. An observed extra reference or persistent read error restores the default template on create, or the previous body on edit. A deadline alone keeps the locally validated new body and reports it as unverified. Both restorations are verified. Failure outcomes are posted on the PR, and an unverified restoration puts a manual repair warning first. The creation-run footer stays in the PR body to preserve branch ownership, and an edit ends with the current run footer. An earlier checkpoint’s proposal is passed to later workers for revision and retained when they write no proposal. With no proposal, creation fills today’s template and continuation leaves the body alone. Bodies remain untrusted dispatch-agent text in later reads. |
 | `comment {body}` | At most 8 KiB; posts only on this issue or its continued PR, with token masking, credential redaction, mentions neutralised with a WORD JOINER and a verified run footer. |
 | `finish {status, summary}` | `done`, `blocked` or `failed`; posts a human-readable outcome led by a markdown list of server-confirmed commits pushed (short SHAs), whether the body was created, updated, refused or left alone, and confirmed board changes or protected items left alone. Loop and worker statements are separately labelled as unverified claims; the loop summary is blockquoted and retained separately as `loop_summary` in `contract.json`. Raw contracts, backend/model choices and budgets sit in collapsed details. The full claims remain in artifacts. One attempt, exempt from call budget; failed posting stops the loop and triggers one server fallback. |
@@ -287,8 +289,8 @@ attributed to the worker. A rewritten branch reports “Rebased onto main at
 
 The only ceilings are `[loop]` in `.github/dispatch-tiers.toml`: 12 tool calls,
 two state reads, three workers, three refused worker requests, one publication,
-two optional comments, three status updates, 64 KiB state, 42 wall minutes
-including at most 35 total worker minutes. Each worker allocation includes `[loop].harvest_seconds`
+two optional comments, three status updates, 64 KiB state, 67 wall minutes
+including at most 60 total worker minutes. Each worker allocation includes `[loop].harvest_seconds`
 (default 180 seconds): the agent deadline is that much earlier than the
 worker deadline. Retirement, permission hand-back, snapshot, checkpoint and
 result collection use the reserved window. A timed-out worker retains partial
@@ -303,15 +305,15 @@ rollback also fails. Without a valid
 pair, publication is refused with a named reason. Production is never rerun as
 a setup failure.
 The reserve is deducted from worker and wall time, rather than added after
-either budget. The 42-minute default leaves five minutes within the 47-minute
+either budget. The 67-minute default leaves five minutes within the 72-minute
 loop step for retirement and reporting. The workflow stamps
 `CARRICK_DISPATCH_STEP_STARTED_AT` before acquiring the host lease; the working
-window is capped at step start + 47 minutes - the five-minute final reserve,
+window is capped at step start + 72 minutes - the five-minute final reserve,
 so lease waits consume working time. Post-loop capture has its own 90-second
 window within that reserve. If final capture fails after finish, the existing
 contract, handoff and logs are re-masked and scanned for upload; scan failures
-still disable upload. The loop also stops by job minute 55
-to leave five minutes of the 60-minute job for finalization and upload. There
+still disable upload. The loop also stops by job minute 80
+to leave five minutes of the 85-minute job for finalization and upload. There
 are no dispatch tier tables or tier-selected credentials. The loop chooses
 from live capacity and explains its choice in the outcome. Capacity snapshots
 expire after two minutes, including before the first worker, and each admitted

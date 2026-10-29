@@ -10,7 +10,7 @@ publishes = 1
 comments = 2
 status_updates = 3
 response_bytes = 65536
-wall_minutes = 42
-worker_minutes = 35
+wall_minutes = 67
+worker_minutes = 60
 # Included in worker_minutes and wall_minutes, never added to either.
 harvest_seconds = 180
