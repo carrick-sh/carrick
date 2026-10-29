@@ -438,16 +438,25 @@ impl<R> NativePhysicalGrants<R> {
             && staged.length.raw() <= carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
             && txn.id.mm_key.get() == self.owner.native_mm.raw().get()
             && txn.id.generation == window.operation.sequence
-            && matches!(txn.op, DescriptorOp::Prepare { publication, resident, backing }
-                if backing == staged.frames[0].1
-                    && publication.ipa == staged.frames[0].0.raw()
-                    && publication.va == window.range.start()
-                    && publication.len > 0
-                    && publication.len <= window.range.len()
-                    && publication.len <= staged.length.raw()
-                    && publication.writable == staged.permissions.write
-                    && publication.executable == staged.permissions.exec
-                    && resident.va == window.fault_page && resident.len == 4096)
+            && match txn.op {
+                DescriptorOp::Prepare {
+                    publication,
+                    resident,
+                    backing,
+                } => {
+                    backing == staged.frames[0].1
+                        && publication.ipa == staged.frames[0].0.raw()
+                        && publication.va == window.range.start()
+                        && publication.len > 0
+                        && publication.len <= window.range.len()
+                        && publication.len <= staged.length.raw()
+                        && publication.writable == staged.permissions.write
+                        && publication.executable == staged.permissions.exec
+                        && resident.va == window.fault_page
+                        && resident.len == 4096
+                }
+                _ => false,
+            }
             && !self.grants.contains_key(&staged.frames[0].0.raw());
         if !valid {
             unpublished.abort_with_release(release_unused)?;
