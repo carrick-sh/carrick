@@ -184,6 +184,34 @@ fn commit(root: &mut Reservations<'_>, decision: Decision) -> u64 {
 }
 
 impl Root {
+    /// Refuse a host probe while a peer owns the real root, releasing before
+    /// that refusal reaches the caller. No timeout drives the root release.
+    fn with_held_root_refusal<T>(&self, work: impl FnOnce() -> T) -> T {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
+        let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
+        *self.carrier.busy_hook.lock().unwrap() = Some(Box::new(move || {
+            attempted_tx.send(()).unwrap();
+            released_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }));
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let held = self.lock();
+                ready_tx.send(()).unwrap();
+                attempted_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(held);
+                released_tx.send(()).unwrap();
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            work()
+        })
+    }
     /// Publish this dispatcher MM's root, install the carrier provider and
     /// admit it (the production bind admission).
     pub(in crate::dispatch) fn admit(dispatcher: &SyscallDispatcher) -> Self {
@@ -5479,7 +5507,7 @@ fn delegated_admission_releases_host_marks_over_the_roots_holes() {
 
 #[test]
 fn delegated_published_grant_settles_after_backing_leaves_pristine() {
-    published_grant_settlement(None, true);
+    published_grant_settlement(None, true, false);
 }
 
 /// A guest-lane fault still owns its first-touch plan when its verified
@@ -5617,20 +5645,20 @@ fn delegated_guest_grant_reuses_fault_plan_alias_exclusion() {
 
 #[test]
 fn delegated_published_grant_settles_after_guest_retirement_without_reviving_residency() {
-    published_grant_settlement(Some(0), true);
+    published_grant_settlement(Some(0), true, false);
 }
 
 #[test]
 fn delegated_published_grant_does_not_republish_stock_retired_beside_the_fault() {
-    published_grant_settlement(Some(1), true);
+    published_grant_settlement(Some(1), true, false);
 }
 
 #[test]
 fn delegated_partial_retirement_settlement_preserves_the_unretired_fault() {
-    published_grant_settlement(Some(1), false);
+    published_grant_settlement(Some(1), false, false);
 }
 
-fn published_grant_settlement(retired_page: Option<u64>, precommit: bool) {
+fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, contended: bool) {
     use carrick_guest_mem::GuestVa;
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
@@ -5822,61 +5850,68 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool) {
         model.complete_deferring_return(completion, slot).unwrap();
         assert!(model.mapping(retired).is_none());
     }
-    crate::dispatch::mm_mutation::test_support::with_permit(
-        dispatcher.mm_mutation_coordinator(),
-        |permit| {
-            let plan = dispatcher.reprotected_frame_grant_plan(permit, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt, LinuxProtFlags::READ | LinuxProtFlags::WRITE)
+    let settle = || {
+        crate::dispatch::mm_mutation::test_support::with_permit(
+            dispatcher.mm_mutation_coordinator(),
+            |permit| {
+                let plan = dispatcher.reprotected_frame_grant_plan(permit, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt, LinuxProtFlags::READ | LinuxProtFlags::WRITE)
                 .expect("a verified publication settles after physical preparation and residency reconciliation");
-            assert_eq!(
-                matches!(plan, PublishedFrameGrantPlan::Retired(_)),
-                retired_page.is_some()
-            );
-            if let PublishedFrameGrantPlan::Resident(ref resident) = plan {
-                assert_eq!((resident.start(), resident.len()), (start, len));
-            }
-            let residency_before = dispatcher.mem().lock().resident.ranges();
-            let publication = dispatcher.mem_view().commit_published_frame_grant(Ok(plan));
-            let table = Box::new(carrick_el1_abi::FrameGrantResidencyTable::new());
-            publication.publish(&table, grant);
-            assert_eq!(
-                table.is_guest_committed(grant.mm_key, fault),
-                retired_page != Some(0),
-                "the exact authenticated resident page must retain its commit evidence"
-            );
-            for page in (start..start + len).step_by(PAGE as usize) {
-                if retired_page.is_some_and(|retired| page == fault + retired * PAGE) {
-                    assert!(
-                        table.lookup(grant.mm_key, page).is_none(),
-                        "retired page regained authority"
-                    );
-                } else {
-                    let retained = table
-                        .lookup(grant.mm_key, page)
-                        .expect("surviving prepared page lost authority");
-                    assert_eq!(retained.expected_ipa, grant.physical_ipa + page - start);
-                    assert_eq!(retained.identity.owner_generation, grant.owner_generation);
-                }
-            }
-            if let Some(page) = retired_page {
-                if precommit || page == 0 {
-                    assert_eq!(
-                        dispatcher.mem().lock().resident.ranges(),
-                        residency_before,
-                        "receipt settlement must not revive retired residency"
-                    );
-                }
-                assert!(root.lock().mapping(fault + page * PAGE).is_none());
-                let mut returns = Vec::new();
-                root.lock()
-                    .observe_deferred_returns(&mut |owed| returns.push(owed));
                 assert_eq!(
-                    returns.len(),
-                    1,
-                    "the return remains owed until the backend receipt"
+                    matches!(plan, PublishedFrameGrantPlan::Retired(_)),
+                    retired_page.is_some()
                 );
-            }
-        },
-    );
+                if let PublishedFrameGrantPlan::Resident(ref resident) = plan {
+                    assert_eq!((resident.start(), resident.len()), (start, len));
+                }
+                let residency_before = dispatcher.mem().lock().resident.ranges();
+                let publication = dispatcher.mem_view().commit_published_frame_grant(Ok(plan));
+                let table = Box::new(carrick_el1_abi::FrameGrantResidencyTable::new());
+                publication.publish(&table, grant);
+                assert_eq!(
+                    table.is_guest_committed(grant.mm_key, fault),
+                    retired_page != Some(0),
+                    "the exact authenticated resident page must retain its commit evidence"
+                );
+                for page in (start..start + len).step_by(PAGE as usize) {
+                    if retired_page.is_some_and(|retired| page == fault + retired * PAGE) {
+                        assert!(
+                            table.lookup(grant.mm_key, page).is_none(),
+                            "retired page regained authority"
+                        );
+                    } else {
+                        let retained = table
+                            .lookup(grant.mm_key, page)
+                            .expect("surviving prepared page lost authority");
+                        assert_eq!(retained.expected_ipa, grant.physical_ipa + page - start);
+                        assert_eq!(retained.identity.owner_generation, grant.owner_generation);
+                    }
+                }
+                if let Some(page) = retired_page {
+                    if precommit || page == 0 {
+                        assert_eq!(
+                            dispatcher.mem().lock().resident.ranges(),
+                            residency_before,
+                            "receipt settlement must not revive retired residency"
+                        );
+                    }
+                    assert!(root.lock().mapping(fault + page * PAGE).is_none());
+                    let mut returns = Vec::new();
+                    root.lock()
+                        .observe_deferred_returns(&mut |owed| returns.push(owed));
+                    assert_eq!(
+                        returns.len(),
+                        1,
+                        "the return remains owed until the backend receipt"
+                    );
+                }
+            },
+        );
+    };
+    if contended {
+        root.with_held_root_refusal(settle);
+    } else {
+        settle();
+    }
     assert!(
         dispatcher
             .with_resident_fault_plan_for_test(fault, |_| ())
@@ -6498,4 +6533,35 @@ fn delegated_resident_record_survives_busy_root_without_changing_owner() {
             .contains(base + PAGE, ResidencyOwner::Root(incarnation))
     );
     assert_eq!(mapping.range.start(), base);
+}
+
+#[test]
+#[ignore = "carrier-fatal on a contended root after publication; tracked by #1068 late-settlement design"]
+fn delegated_published_grant_settlement_survives_busy_root() {
+    published_grant_settlement(None, true, true);
+}
+
+#[test]
+#[ignore = "carrier-fatal on a contended root after publication; tracked by #1068 late-settlement design"]
+fn delegated_live_leaf_reconciliation_survives_busy_root() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let base = LINUX_MMAP_BASE + 4 * PAGE;
+    root.guest_mmap(
+        Placement::Fixed(base),
+        2 * PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    let (_, incarnation) = root.lock().node(base).unwrap();
+    let mut executor = dispatcher.enter_mm_executor().unwrap();
+    let guard = crate::dispatch::mm_mutation::from_executor(&mut executor).unwrap();
+    assert!(root.with_held_root_refusal(|| dispatcher.reconcile_el1_resident_page(&guard, base)));
+    assert!(
+        dispatcher
+            .mem()
+            .lock()
+            .resident
+            .contains(base, ResidencyOwner::Root(incarnation))
+    );
 }
