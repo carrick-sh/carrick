@@ -3859,6 +3859,7 @@ fn owner_copyout_unavailable_is_not_a_user_memory_fault() {
         NativeProcessError::Busy,
         NativeProcessError::Unsupported,
         NativeProcessError::Stale,
+        NativeProcessError::Quarantined,
         NativeProcessError::Fault,
     ] {
         let mut service = fixture.service();
@@ -3885,6 +3886,22 @@ fn owner_copyout_unavailable_is_not_a_user_memory_fault() {
                 OwnedCopyError::Unavailable
             }))
         );
+        if matches!(
+            error,
+            NativeProcessError::Busy | NativeProcessError::Stale | NativeProcessError::Quarantined
+        ) {
+            let operation = carrick_sched_core::object_wait::OperationToken::new(7, 1).unwrap();
+            assert!(matches!(
+                entry.prepare_owned_copyout(
+                    carrick_core::mm::transaction::CopyoutRequest {
+                        address: UserVa::new(0x10000),
+                        len: carrick_guest_arch::GuestLen::new(8),
+                    },
+                    operation
+                ),
+                carrick_core::mm::transaction::CopyoutPreparation::Unrouted(_)
+            ));
+        }
     }
 }
 
