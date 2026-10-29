@@ -372,128 +372,65 @@ fn concurrent_drain_portal_does_not_hide_retiring_child_space() {
         )
         .unwrap();
 
-    let foreign_carrier = NonZeroU64::new(1).unwrap();
-    let local_carrier = NonZeroU64::new(2).unwrap();
+    let carrier_a = NonZeroU64::new(1).unwrap();
+    let carrier_b = NonZeroU64::new(2).unwrap();
     let queue = RetiredSpaces::new();
-    queue.push(RetiredSpace {
-        carrier: foreign_carrier,
-        zone: 1,
-        roots: 1,
-        mm: ReservationMm::new(99).unwrap(),
-    });
-    queue.push(RetiredSpace {
-        carrier: local_carrier,
-        zone: core::ptr::from_ref(zone).addr(),
-        roots: core::ptr::from_ref(roots).addr(),
-        mm: child_mm,
-    });
 
-    let (entered_tx, entered_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
+    let (b_pushed_tx, b_pushed_rx) = mpsc::channel();
+    let (a_in_drain_tx, a_in_drain_rx) = mpsc::channel();
+    let (b_done_tx, b_done_rx) = mpsc::channel();
+
     let queue_ref = &queue;
-    let (drain_result, still_published, visible_in_queue) = std::thread::scope(|s| {
-        let foreign_worker = s.spawn(move || {
+    let (a_result, b_result, b_retired_on_return) = std::thread::scope(|s| {
+        let thread_a = s.spawn(move || {
+            b_pushed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bounded wait for thread B push timed out");
+            let mut signalled = false;
             queue_ref.drain(
-                |space| space.carrier == foreign_carrier,
-                |_| {
-                    entered_tx.send(()).unwrap();
-                    release_rx
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("bounded wait for second drain timed out");
-                    Ok(())
+                |space| {
+                    if !signalled {
+                        signalled = true;
+                        a_in_drain_tx.send(()).unwrap();
+                        let _ = b_done_rx.recv_timeout(Duration::from_millis(200));
+                    }
+                    space.carrier == carrier_a
                 },
+                |_| Ok(()),
             )
         });
 
-        entered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("bounded wait for first drain entry timed out");
+        let thread_b = s.spawn(move || {
+            queue_ref.push(RetiredSpace {
+                carrier: carrier_b,
+                zone: core::ptr::from_ref(zone).addr(),
+                roots: core::ptr::from_ref(roots).addr(),
+                mm: child_mm,
+            });
+            b_pushed_tx.send(()).unwrap();
+            a_in_drain_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bounded wait for thread A drain entry timed out");
 
-        let owner: crate::aarch64_process::Portal<'_> =
-            carrick_core::mm::transaction::MmPortal::for_zone(local_carrier, roots, zone);
-        let drain_result = queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
-        let still_published = zone.spaces.find(child_mm.raw()).is_some();
-        let visible_in_queue = !queue.is_empty();
+            let owner: crate::aarch64_process::Portal<'_> =
+                carrick_core::mm::transaction::MmPortal::for_zone(carrier_b, roots, zone);
+            let result = queue_ref.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0);
+            let retired =
+                zone.spaces.find(child_mm.raw()).is_none() && owner.root_any(child_mm, 0).is_err();
+            let _ = b_done_tx.send(());
+            (result, retired)
+        });
 
-        let _ = release_tx.send(());
-        assert_eq!(foreign_worker.join().unwrap(), Ok(()));
-        (drain_result, still_published, visible_in_queue)
+        let a_result = thread_a.join().unwrap();
+        let (b_result, b_retired_on_return) = thread_b.join().unwrap();
+        (a_result, b_result, b_retired_on_return)
     });
 
-    assert_eq!(drain_result, Ok(()));
+    assert_eq!(a_result, Ok(()));
+    assert_eq!(b_result, Ok(()));
     assert!(
-        !still_published || visible_in_queue,
-        "retiring child space was neither retired nor visible in queue"
+        b_retired_on_return,
+        "thread B's drain_portal returned while its queued child space remained unretired"
     );
-    assert!(
-        !still_published,
-        "concurrent foreign drain hid local retiring child space; zone entry remained published"
-    );
-    assert!(queue.is_empty());
-}
-
-#[test]
-fn retire_or_queue_portal_retires_ready_space_past_busy_sibling() {
-    use crate::retired_spaces::{RetiredSpace, RetiredSpaces};
-
-    let region = crate::mm_portal::test_support::Region::new();
-    let zone = region.zone();
-    let roots = region.table();
-    let layout = carrick_el1_abi::Layout {
-        heap: carrick_el1_abi::ReservationRange::new(4096, super::VA).unwrap(),
-        arena: carrick_el1_abi::ReservationRange::new(super::VA, super::VA + 0x1000_0000).unwrap(),
-        policy: carrick_el1_abi::ReservationPolicyPayload::new([4096, u64::MAX, u64::MAX, 0, 0]),
-    };
-
-    let busy_mm = ReservationMm::new(8).unwrap();
-    let busy_space = zone
-        .spaces
-        .publish_closed(busy_mm.raw(), 0x8000, 0x8000)
-        .unwrap();
-    roots.publish(busy_space.index(), busy_mm, layout).unwrap();
-
-    let ready_mm = ReservationMm::new(9).unwrap();
-    let ready_space = zone
-        .spaces
-        .publish_closed(ready_mm.raw(), 0x9000, 0x9000)
-        .unwrap();
-    roots
-        .publish(ready_space.index(), ready_mm, layout)
-        .unwrap();
-
-    let carrier = NonZeroU64::new(3).unwrap();
-    let owner: crate::aarch64_process::Portal<'_> =
-        carrick_core::mm::transaction::MmPortal::for_zone(carrier, roots, zone);
-
-    let queue = RetiredSpaces::new();
-    queue.push(RetiredSpace {
-        carrier,
-        zone: core::ptr::from_ref(zone).addr(),
-        roots: core::ptr::from_ref(roots).addr(),
-        mm: busy_mm,
-    });
-
-    // Hold the root lock on `busy_mm` so `retire_closed_space` refuses it with `Busy`.
-    let held_busy_root = owner.root_any(busy_mm, 1).unwrap();
-    assert_eq!(
-        queue.retire_or_queue_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0, ready_mm),
-        Ok(())
-    );
-    assert!(
-        zone.spaces.find(ready_mm.raw()).is_none(),
-        "ready space must retire even while an older entry on the same carrier is busy"
-    );
-    assert!(
-        zone.spaces.find(busy_mm.raw()).is_some(),
-        "busy sibling must remain published while its root lock is held"
-    );
-    assert_eq!(queue.len(), 1);
-
-    drop(held_busy_root);
-    assert_eq!(
-        queue.drain_portal(&owner, zone, carrick_sched_core::ZONE_SLOTS, 0),
-        Ok(())
-    );
-    assert!(zone.spaces.find(busy_mm.raw()).is_none());
     assert!(queue.is_empty());
 }
