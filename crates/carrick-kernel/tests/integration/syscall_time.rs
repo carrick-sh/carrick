@@ -926,31 +926,36 @@ fn s3_production_interrupted_sleep_copyout() {
     let dispatcher = SyscallDispatcher::new();
     let context = dispatcher.capture_one_task_context().unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0xa5; 64]);
+    let current_mm = (context.shared().mm().id(), context.shared().mm().id().raw());
     let output = GuestOutputRange::new(
         carrick_guest_mem::GuestVa::new(0x4000),
         16,
-        context.shared().mm_id(),
-        0,
+        current_mm.0,
+        current_mm.1,
     )
     .unwrap();
+    let outcome = fold_continuation_completion(
+        ContinuationCompletion::InterruptedSleep {
+            remaining: Some((output, std::time::Duration::from_millis(750))),
+        },
+        &dispatcher,
+        &context,
+        &mut memory,
+        current_mm,
+    )
+    .unwrap()
+    .expect("an interrupted sleep must complete without redispatch");
     assert_eq!(
-        fold_continuation_completion(
-            ContinuationCompletion::InterruptedSleep {
-                remaining: Some((output, std::time::Duration::from_millis(750)))
-            },
-            &dispatcher,
-            &context,
-            &mut memory,
-            (context.shared().mm().id(), context.shared().mm().id().raw()),
-        )
-        .unwrap(),
-        Some(DispatchOutcome::errno(carrick_abi::LINUX_EINTR))
+        outcome,
+        DispatchOutcome::errno(carrick_abi::LINUX_EINTR),
+        "publishing the retained remainder preserves the terminal EINTR"
     );
-    let bytes = memory.read_bytes(0x4000, 16).unwrap();
     assert_eq!(
-        i64::from_ne_bytes(bytes[8..].try_into().unwrap()),
-        750_000_000
+        memory.read_bytes(0x4000, 16).unwrap(),
+        LinuxTimespec::new(0, 750_000_000).as_bytes(),
+        "publish the complete retained remainder rather than zero output"
     );
+    assert_eq!(memory.read_bytes(0x4010, 48).unwrap(), [0xa5; 48]);
 }
 
 #[test]
