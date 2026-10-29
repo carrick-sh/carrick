@@ -1146,7 +1146,7 @@ impl<'s> FaultSupply<'s> {
     }
 
     fn decline(self) {
-        if let Self::Owner(owner) = self {
+        if let Some(owner) = self.owner() {
             owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
         }
     }
@@ -1311,7 +1311,7 @@ fn dispatch_classified_fault<
         let mm_key = task.mm.key.load(Ordering::Acquire);
         if mm_key == 0 {
             return Action::Forward;
-        }
+        };
         let Some(index) = spaces.find(mm_key) else {
             return Action::Forward;
         };
@@ -1337,7 +1337,11 @@ fn dispatch_classified_fault<
                     supply.wait(observed);
                     return Action::Forward;
                 }
-                RootFaultAdmission::Declined if supply.is_owner() => {
+                RootFaultAdmission::Declined => {
+                    supply.decline();
+                    return Action::Forward;
+                }
+                RootFaultAdmission::Unmapped if supply.is_owner() => {
                     supply.decline();
                     return Action::Forward;
                 }
@@ -1422,7 +1426,8 @@ fn dispatch_classified_fault<
                 far & !4095,
                 access,
             ) {
-                RootFaultAdmission::Declined if supply.is_owner() => supply.decline(),
+                RootFaultAdmission::Declined => supply.decline(),
+                RootFaultAdmission::Unmapped if supply.is_owner() => supply.decline(),
                 RootFaultAdmission::Busy => supply.wait(observed),
                 _ => {}
             }
@@ -1466,6 +1471,12 @@ fn dispatch_classified_fault<
         ) {
             RootFaultAdmission::Declined => {
                 supply.decline();
+                return Action::Forward;
+            }
+            RootFaultAdmission::Unmapped => {
+                if supply.is_owner() {
+                    supply.decline();
+                }
                 return Action::Forward;
             }
             RootFaultAdmission::Busy => {

@@ -14,6 +14,69 @@ const TIMER_RETRY_NS: u64 = 50_000;
 #[path = "sched/object_wait.rs"]
 pub mod object_wait;
 
+/// The execution venue that owns an EL1 exit for the loaded slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeEntryVenue {
+    /// Host carrier / executor owns the exit.
+    Host,
+    /// Host-loaded execution whose signal table and synchronous permission-fault
+    /// delivery belong to the native process owner, while IRQ host work,
+    /// first-touch supply and forwarded syscalls remain on the host path.
+    SignalOwner,
+    /// Native process execution record owns the exit.
+    NativeProcess(RecordId),
+}
+
+impl NativeEntryVenue {
+    /// Select the execution venue for the loaded slot using explicit lifecycle
+    /// and control references (used by EL1 entry points and host-memory tests).
+    pub fn select_with_lifecycle(
+        zone: &ZoneTables,
+        slot: SlotId,
+        task: &CurrentTask,
+        page: &carrick_el1_abi::ThreadLifecyclePage,
+        control: &carrick_el1_abi::ThreadControlSlot,
+    ) -> Self {
+        if !carrick_el1_abi::Lifecycle::gate(page).serves_ring()
+            || !task.owns_lifecycle_page(page)
+            || !task.owns_control_slot(control)
+        {
+            return Self::Host;
+        }
+        if let Some(record) = zone
+            .slot(slot)
+            .current()
+            .or_else(|| zone.slot(slot).host_record())
+            .filter(|record| zone.record(*record).is_native_owned())
+        {
+            return Self::NativeProcess(record);
+        }
+        let mm = task.mm.key.load(Ordering::Acquire);
+        if mm != 0 && zone.installed_space(slot) == mm && control.native_signal_owner() {
+            return Self::SignalOwner;
+        }
+        Self::Host
+    }
+
+    /// Select the execution venue for the loaded slot from the published
+    /// [`CurrentTask`] metadata.
+    pub fn select(zone: &ZoneTables, slot: SlotId, task: &CurrentTask) -> Self {
+        if let Some((page, control)) = task.lifecycle_refs() {
+            return Self::select_with_lifecycle(zone, slot, task, page, control);
+        }
+        if task.metadata.lifecycle_page.load(Ordering::Acquire) != 0
+            || task.metadata.control_slot.load(Ordering::Acquire) != 0
+        {
+            return Self::Host;
+        }
+        zone.slot(slot)
+            .current()
+            .or_else(|| zone.slot(slot).host_record())
+            .filter(|record| zone.record(*record).is_native_owned())
+            .map_or(Self::Host, Self::NativeProcess)
+    }
+}
+
 /// The CPU state and the per-vCPU hardware the in-guest scheduler uses.
 pub trait ThreadCpu {
     /// Save the running thread's `frame` and live state into `ctx`.
@@ -715,11 +778,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
             .fetch_add(1, Ordering::Relaxed);
-        if let Some(record) = self
-            .zone
-            .slot(self.slot)
-            .current()
-            .filter(|record| self.zone.record(*record).is_native_owned())
+        if let NativeEntryVenue::NativeProcess(record) =
+            NativeEntryVenue::select(self.zone, self.slot, self.task)
         {
             let action = self.cpu.host_work_boundary(
                 self.zone,

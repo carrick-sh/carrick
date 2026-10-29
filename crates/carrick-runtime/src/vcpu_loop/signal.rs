@@ -210,6 +210,14 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
         return Ok(FaultSignalDisposition::Stopped);
     }
     carrick_kernel::exec_helpers::stop_for_debug_signal(fault.signum);
+    if !super::carrier_signal_selection_permitted(
+        context.thread().control_slot().native_signal_owner(),
+    ) {
+        return Err(RuntimeError::Configuration(
+            "synchronous fault signal reached carrier signal table for a native signal binding"
+                .to_owned(),
+        ));
+    }
 
     let action = dispatcher.registered_signal_handler(context, fault.signum);
     if dispatcher.signal_blocked(context, this_tid, fault.signum) || action.is_none() {
@@ -2233,6 +2241,32 @@ mod tests {
                 crate::linux_abi::LINUX_SIGBUS
             ))
         ));
+
+        context.thread().control_slot().commit_native_signal_owner();
+        let mut native_fault = FaultSignal {
+            signum: crate::linux_abi::LINUX_SIGSEGV,
+            si_code: 1,
+            si_addr: fault_addr,
+            interrupted_pc: Some(0x2240d8),
+        };
+        assert!(
+            matches!(
+                inject_fault_signal(
+                    &mut NoopTrap::default(),
+                    &child,
+                    &context,
+                    tid,
+                    &mut native_fault,
+                ),
+                Err(RuntimeError::Configuration(_))
+            ),
+            "host inject_fault_signal must fail closed instead of consulting the host signal table for a native signal owner"
+        );
+        assert_eq!(
+            native_fault.signum,
+            crate::linux_abi::LINUX_SIGBUS,
+            "SIGBUS reclassification still precedes the native signal table guard"
+        );
     }
 
     #[test]

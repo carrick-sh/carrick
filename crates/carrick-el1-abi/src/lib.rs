@@ -1607,6 +1607,18 @@ impl CurrentTask {
         self.metadata.lifecycle_page.store(page, Ordering::Release);
     }
 
+    /// Whether the loaded task's published lifecycle-page address names `page`.
+    pub fn owns_lifecycle_page(&self, page: &ThreadLifecyclePage) -> bool {
+        self.metadata.lifecycle_page.load(Ordering::Acquire)
+            == core::ptr::from_ref(page).addr() as u64
+    }
+
+    /// Whether the loaded task's published control-slot address names `control`.
+    pub fn owns_control_slot(&self, control: &ThreadControlSlot) -> bool {
+        self.metadata.control_slot.load(Ordering::Acquire)
+            == core::ptr::from_ref(control).addr() as u64
+    }
+
     /// The process leader's namespace PID, shared by every thread in its
     /// process and cleared before a task slot is reused.
     pub fn publish_visible_pid(&self, pid: u32) {

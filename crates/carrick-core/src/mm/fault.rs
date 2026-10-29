@@ -131,14 +131,18 @@ pub fn root_fault_admission<
         LeafAccess::Write => 2,
         LeafAccess::Execute => 4,
     };
-    if model.mapping(page).is_some_and(|mapping| {
-        !mapping.anonymous
-            || carrick_core_abi::ReservationProtection::from_bits(bits)
-                .is_some_and(|access| mapping.protection.permits(access))
-    }) {
-        RootFaultAdmission::Allowed
-    } else {
-        RootFaultAdmission::Declined
+    match model.mapping(page) {
+        Some(mapping) => {
+            if !mapping.anonymous
+                || carrick_core_abi::ReservationProtection::from_bits(bits)
+                    .is_some_and(|access| mapping.protection.permits(access))
+            {
+                RootFaultAdmission::Allowed
+            } else {
+                RootFaultAdmission::Declined
+            }
+        }
+        None => RootFaultAdmission::Unmapped,
     }
 }
 
@@ -148,6 +152,7 @@ pub enum RootFaultAdmission {
     NotDelegated,
     Allowed,
     Declined,
+    Unmapped,
     Unavailable,
 }
 

@@ -4563,6 +4563,683 @@ fn arm_signal_setup_then_timed_futex_keeps_its_deadline() {
 }
 
 #[test]
+fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
+    use carrick_el1::fault::{
+        GrantMailboxes, NoopCowResolver, NoopPreparedResolver, OwnerFaultSupply,
+        OwnerFaultSupplyOutcome, PreparedFaultPath,
+    };
+    use carrick_el1::substrate::sched::NativeEntryVenue;
+    use carrick_el1_abi::Lifecycle;
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let action = Action {
+        disposition: Disposition::Handler(HandlerAddress(0x40_0100)),
+        ..Default::default()
+    };
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(Signal::SEGV, Some(action))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    assert!(fixture.control.native_signal_owner());
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    // Plain signal setup owns no scheduler park. Its temporary home was
+    // correctly released; the action remains in the registered process graph.
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert!(fixture.zone.slot(fixture.slot).host_record().is_none());
+    assert_eq!(
+        NativeEntryVenue::select_with_lifecycle(
+            fixture.zone,
+            fixture.slot,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+        ),
+        NativeEntryVenue::SignalOwner,
+        "root thread with native_signal_owner must select SignalOwner after AdmissionHome::drop"
+    );
+    assert_eq!(
+        NativeEntryVenue::select_with_lifecycle(
+            fixture.zone,
+            SlotId::new(1),
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+        ),
+        NativeEntryVenue::Host,
+        "another execution lane cannot borrow this member's MM"
+    );
+    assert!(
+        !super::native_process_runtime::native_entry_owned(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            carrick_sched_core::object_wait::OwnerEntry::Syscall,
+        ),
+        "signal ownership alone must not transfer the host-loaded syscall venue"
+    );
+    assert!(
+        !super::native_process_runtime::native_entry_owned(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            carrick_sched_core::object_wait::OwnerEntry::Exception,
+        ),
+        "signal ownership alone must not route non-declined root exceptions into native service"
+    );
+
+    // P1-b: a HostOnly or Closed lifecycle gate must fall back to Host instead
+    // of entering native admission and fail-stopping.
+    let host_only_page = ThreadLifecyclePage::new();
+    host_only_page.decline_to_host();
+    fixture.task.publish_lifecycle(
+        &host_only_page as *const _ as u64,
+        fixture.control as *const _ as u64,
+    );
+    assert_eq!(
+        NativeEntryVenue::select_with_lifecycle(
+            fixture.zone,
+            fixture.slot,
+            &fixture.task,
+            &host_only_page,
+            fixture.control,
+        ),
+        NativeEntryVenue::Host,
+        "HostOnly lifecycle gate must fall back to Host venue"
+    );
+    fixture.task.publish_lifecycle(
+        fixture.page as *const _ as u64,
+        fixture.control as *const _ as u64,
+    );
+
+    // Director witness: a root process with native_signal_owner and an IRQ
+    // host-work exit (esr == 0) must still take the direct host Action::Forward
+    // path instead of entering host_work_boundary.
+    fixture.task.linux.mark_pending_host_work();
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    let mut irq_frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let mut cpu = crate::sched::FakeCpu::default();
+    assert_eq!(
+        crate::dispatch::dispatch_irq_with_regions(
+            &mut irq_frame,
+            counters,
+            core::slice::from_ref(&fixture.task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+        ),
+        carrick_el1_abi::Action::Forward,
+        "root SignalOwner IRQ host-work exit must remain on the host forward path"
+    );
+    assert!(
+        cpu.host_work_boundaries.is_empty(),
+        "root SignalOwner must not enter native host_work_boundary on IRQ host work"
+    );
+    fixture
+        .task
+        .linux
+        .take_host_work_doorbell()
+        .unwrap()
+        .settled();
+
+    // Production fault path: mprotect [VA, VA + 4096) to PROT_READ, take a
+    // write permission fault (ESR 0x9200004f) on the SignalOwner root after
+    // AdmissionHome::drop, and verify dispatch_fault_with_prepared +
+    // settle_declined_owner_fault + deliver_declined_fault_signal builds the
+    // user handler frame in-ring.
+    let mm = carrick_el1_abi::ReservationMm::new(fixture.address.mm.raw().get()).unwrap();
+    let decision = super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    )
+    .root_any(mm, 0)
+    .unwrap()
+    .mprotect(
+        carrick_el1_abi::ReservationRange::new(
+            crate::mm_portal::test_support::VA,
+            crate::mm_portal::test_support::VA + 4096,
+        )
+        .unwrap(),
+        carrick_el1_abi::ReservationProtection::READ,
+    )
+    .unwrap();
+    let carrick_el1::memory::reservations::Decision::Work(request) = decision else {
+        panic!("mprotect must stage a protection proposal")
+    };
+    let receipt = unsafe {
+        carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+            request,
+            carrick_el1_abi::ReservationBackingReceipt {
+                receipt: request.sequence.raw(),
+                granted_bytes: 0,
+                returned_bytes: 0,
+            },
+        )
+    }
+    .unwrap();
+    super::aarch64_process::Portal::for_zone(NonZeroU64::MIN, fixture.region.table(), fixture.zone)
+        .root_any(mm, 0)
+        .unwrap()
+        .complete(receipt)
+        .unwrap();
+    let portal = unsafe {
+        &*fixture
+            .region
+            .ptr
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+            .cast::<carrick_el1_abi::MmPortalSlots>()
+    };
+    let residency = unsafe {
+        &*fixture
+            .region
+            .ptr
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize)
+            .cast::<carrick_el1_abi::FrameGrantResidencyTable>()
+    };
+    let handle = crate::cow_resolver::admitted_fault_mm_handle(
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        fixture.slot,
+        &fixture.task,
+    )
+    .unwrap();
+    let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+
+    // Unmapped fault (first-touch / growsdown / SIGBUS candidate) must NOT be
+    // marked PolicyDeclined on Mailbox supply and must forward to the host.
+    let unmapped_supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    let mut unmapped_frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        esr: 0x9200_004f,
+        far: crate::mm_portal::test_support::VA + 0x20000,
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let unmapped_action = carrick_el1::fault::dispatch_fault_with_prepared(
+        &mut unmapped_frame,
+        counters,
+        core::slice::from_ref(&fixture.task),
+        crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+        crate::cow_resolver::native_fault_supply(
+            false,
+            GrantMailboxes::own(&mailbox),
+            &unmapped_supply,
+        ),
+        Some(PreparedFaultPath {
+            residency,
+            resolver: &mut NoopPreparedResolver,
+            roots: Some(fixture.region.table()),
+            file_slots: Some(portal),
+        }),
+        &mut NoopCowResolver,
+    );
+    assert_eq!(unmapped_action, carrick_el1_abi::Action::Forward);
+    assert_eq!(
+        unmapped_supply.outcome(),
+        OwnerFaultSupplyOutcome::Unavailable
+    );
+    assert_eq!(
+        crate::cow_resolver::settle_declined_owner_fault(
+            NativeEntryVenue::SignalOwner,
+            &fixture.task,
+            unmapped_action,
+            unmapped_supply.outcome(),
+            || panic!("unmapped fault must forward to host"),
+        ),
+        carrick_el1_abi::Action::Forward,
+    );
+
+    // Declined write permission fault on PROT_READ anonymous mapping:
+    let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    let mut frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        esr: 0x9200_004f,
+        far: crate::mm_portal::test_support::VA,
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let fault_action = carrick_el1::fault::dispatch_fault_with_prepared(
+        &mut frame,
+        counters,
+        core::slice::from_ref(&fixture.task),
+        crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+        crate::cow_resolver::native_fault_supply(false, GrantMailboxes::own(&mailbox), &supply),
+        Some(PreparedFaultPath {
+            residency,
+            resolver: &mut NoopPreparedResolver,
+            roots: Some(fixture.region.table()),
+            file_slots: Some(portal),
+        }),
+        &mut NoopCowResolver,
+    );
+    assert_eq!(fault_action, carrick_el1_abi::Action::Forward);
+    assert_eq!(
+        supply.outcome(),
+        OwnerFaultSupplyOutcome::PolicyDeclined,
+        "mapped anonymous PROT_READ write fault must record PolicyDeclined on Mailbox owner supply"
+    );
+
+    // Ptrace-traced root task must still forward to the host ptrace fault stop.
+    fixture.task.publish_ptrace_traced(true);
+    assert_eq!(
+        crate::cow_resolver::settle_declined_owner_fault(
+            NativeEntryVenue::SignalOwner,
+            &fixture.task,
+            fault_action,
+            supply.outcome(),
+            || panic!("ptrace-traced fault must forward to host ptrace stop"),
+        ),
+        carrick_el1_abi::Action::Forward,
+    );
+    fixture.task.publish_ptrace_traced(false);
+
+    // Untraced SignalOwner delivers SIGSEGV/SEGV_ACCERR in-ring and builds the
+    // user signal frame.
+    let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
+    let sp = UserVa::new(stack.0.as_mut_ptr() as u64 + stack.0.len() as u64);
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let mut machine = ArmWaitSignalMachine {
+        user_sp: sp,
+        backend: ArmWaitSignalBackend,
+    };
+    let settled = crate::cow_resolver::settle_declined_owner_fault(
+        NativeEntryVenue::SignalOwner,
+        &fixture.task,
+        fault_action,
+        supply.outcome(),
+        || {
+            super::aarch64_process::deliver_declined_fault_signal(
+                source,
+                &fixture.task,
+                &ThreadCtx::ZERO,
+                fixture_ttbr0(fixture),
+                fixture.page,
+                fixture.control,
+                &mut service,
+                &mut frame,
+                fp.as_bytes(),
+                &mut machine,
+            )
+            .unwrap()
+        },
+    );
+    assert_eq!(settled, carrick_el1_abi::Action::Served);
+    assert!(
+        fixture.zone.slot(fixture.slot).current().is_none(),
+        "AdmissionHome::drop must leave the root slot without a lingering zone record"
+    );
+    assert_eq!(
+        frame.elr, 0x40_0100,
+        "installed handler must run instead of default termination"
+    );
+    let offset = frame.x[1] as usize - stack.0.as_ptr() as usize;
+    let signal = carrick_personality_linux::signal::arm::SignalFrame::ref_from_bytes(
+        &stack.0[offset
+            ..offset + core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()],
+    )
+    .unwrap();
+    let info = signal.rt.siginfo;
+    let (signum, code, address) = (info.si_signo, info.si_code, info.si_addr);
+    assert_eq!(
+        (signum, code, address),
+        (11, 2, crate::mm_portal::test_support::VA)
+    );
+}
+
+#[test]
+fn arm_rehomed_exception_service_refusal_builds_handler_frame() {
+    use super::native_process_runtime::NativeResume;
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_sched_core::object_wait::ObjectWaitKey;
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    use zerocopy::{FromBytes, IntoBytes};
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let action = Action {
+        disposition: Disposition::Handler(HandlerAddress(0x40_0100)),
+        ..Default::default()
+    };
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(Signal::SEGV, Some(action))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+
+    // Enter a native Fault service operation after AdmissionHome::drop (which
+    // rehomes onto a fresh record whose native_owned hint is false, exercising
+    // has_native_execution_owner() + control.bind_zone_record(reference)).
+    let fault = carrick_guest_arch::FaultInfo {
+        address: UserVa::new(crate::mm_portal::test_support::VA),
+        access: carrick_guest_arch::Access::Write,
+        present: true,
+    };
+    assert!(matches!(
+        with_process_entry(
+            source,
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.page,
+            fixture.control,
+            &mut service,
+            |process| {
+                let result = process
+                    .begin_service(ServiceOperation::Fault(fault), None)
+                    .unwrap();
+                assert!(process.take_handoff_receipt().is_some());
+                result
+            },
+        )
+        .unwrap(),
+        NativeResume::Left(None)
+    ));
+    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+    assert_eq!(
+        fixture.control.zone_record(),
+        Some(selector.record),
+        "rehome_entry must bind the new RecordRef onto the member control slot"
+    );
+    let key = ObjectWaitKey::native_service(selector.record).unwrap();
+    {
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let member = queue
+            .native_service_member(selector.record)
+            .expect("rehomed exception owner must be observable via has_native_execution_owner");
+        let ticket = unsafe {
+            ServiceCell::claim_notice(&fixture.control.service, selector, NonZeroU64::MIN, member)
+        }
+        .ok()
+        .unwrap();
+        assert!(ticket.complete(false).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut Default::default())
+            .unwrap();
+    }
+    let switched = fixture.zone.switch_in(fixture.slot).unwrap();
+    assert_eq!(switched, selector.record.id);
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let resumed = super::aarch64_process::resume_selected(
+        &runtime,
+        registry(),
+        source,
+        &fixture.task,
+        switched,
+        &mut service,
+    );
+    assert!(matches!(
+        super::aarch64_process::map_resume(resumed, &mut service, &fixture.task, fixture.slot),
+        crate::sched::ResumeAction::NoPending
+    ));
+    let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
+    let sp = UserVa::new(stack.0.as_mut_ptr() as u64 + stack.0.len() as u64);
+    let mut frame = carrick_el1_abi::TrapFrame {
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let mut machine = ArmWaitSignalMachine {
+        user_sp: sp,
+        backend: ArmWaitSignalBackend,
+    };
+    with_process_entry(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| {
+            assert_eq!(
+                crate::signal_delivery::deliver_signal_with_control(
+                    &fixture.task,
+                    fixture.control,
+                    process,
+                    &mut frame,
+                    fp.as_bytes(),
+                    &mut machine,
+                ),
+                None
+            );
+        },
+    )
+    .unwrap();
+    assert_eq!(frame.elr, 0x40_0100);
+    let offset = frame.x[1] as usize - stack.0.as_ptr() as usize;
+    let signal = carrick_personality_linux::signal::arm::SignalFrame::ref_from_bytes(
+        &stack.0[offset
+            ..offset + core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()],
+    )
+    .unwrap();
+    let info = signal.rt.siginfo;
+    let (signum, code, address) = (info.si_signo, info.si_code, info.si_addr);
+    assert_eq!(
+        (signum, code, address),
+        (11, 2, crate::mm_portal::test_support::VA)
+    );
+}
+
+#[test]
+fn arm_permission_fault_sig_dfl_terminates_through_native_owner() {
+    use carrick_signal_core::policy::{Action, Disposition, Signal};
+    use zerocopy::IntoBytes;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let ignore = Action {
+        disposition: Disposition::Ignore,
+        ..Default::default()
+    };
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(Signal::PIPE, Some(ignore))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        esr: 0x9200_004f,
+        far: crate::mm_portal::test_support::VA,
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let mut machine = ArmWaitSignalMachine {
+        user_sp: UserVa::new(0x7000),
+        backend: ArmWaitSignalBackend,
+    };
+    assert_eq!(
+        super::aarch64_process::deliver_declined_fault_signal(
+            source,
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.page,
+            fixture.control,
+            &mut service,
+            &mut frame,
+            fp.as_bytes(),
+            &mut machine,
+        )
+        .unwrap(),
+        carrick_el1_abi::Action::Idle,
+    );
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(
+        service.crossing.root_exit_status.load(Ordering::Acquire),
+        11
+    );
+}
+
+#[test]
+fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_group_exit() {
+    use carrick_el1_abi::Lifecycle;
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    use zerocopy::IntoBytes;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let handler = Action {
+        disposition: Disposition::Handler(HandlerAddress(0x40_0100)),
+        ..Default::default()
+    };
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(Signal::SEGV, Some(handler))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    let (_sibling_control, _) = imported_thread(fixture);
+    assert_eq!(fixture.page.live(), 2);
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
+    let sp = UserVa::new(stack.0.as_mut_ptr() as u64 + stack.0.len() as u64);
+    let mut frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        esr: 0x9200_004f,
+        far: crate::mm_portal::test_support::VA,
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let mut machine = ArmWaitSignalMachine {
+        user_sp: sp,
+        backend: ArmWaitSignalBackend,
+    };
+    assert_eq!(
+        super::aarch64_process::deliver_declined_fault_signal(
+            source,
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.page,
+            fixture.control,
+            &mut service,
+            &mut frame,
+            fp.as_bytes(),
+            &mut machine,
+        )
+        .unwrap(),
+        carrick_el1_abi::Action::Served,
+    );
+    assert_eq!(frame.elr, 0x40_0100);
+    assert_eq!(fixture.page.live(), 2);
+
+    // Reset SIGSEGV to SIG_DFL with two live threads: declined fault initiates
+    // group exit and parks the caller until the sibling retires.
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(Signal::SEGV, Some(Action::default()))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        super::aarch64_process::deliver_declined_fault_signal(
+            source,
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.page,
+            fixture.control,
+            &mut service,
+            &mut frame,
+            fp.as_bytes(),
+            &mut machine,
+        )
+        .unwrap(),
+        carrick_el1_abi::Action::Idle,
+    );
+    assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Closed);
+    assert!(fixture.task.linux.has_pending_host_work());
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn arm_signal_setup_uses_one_native_owner() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let mut service = fixture.process_service();
