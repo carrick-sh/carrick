@@ -19,6 +19,14 @@ pub(crate) struct NativeChildPhysical {
     >,
     pub rollback: std::sync::Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
 }
+impl carrick_hal::physical_grants::NativeSupplyCustody for NativeChildPhysical {
+    type Backing = std::sync::Arc<NativeFrameBacking>;
+    fn supplied(
+        &mut self,
+    ) -> Option<&mut carrick_hal::physical_grants::NativePhysicalGrants<Self::Backing>> {
+        self.supplied.as_mut()
+    }
+}
 impl NativeChildPhysical {
     pub fn new(inherited: Vec<crate::trap::ForkPhysicalRetention>) -> Self {
         let mut sources = carrick_hal::fork_stock::ForkHostBackingCustody::default();
@@ -48,6 +56,34 @@ pub(crate) struct NativeFrameBacking {
     pub ipa: u64,
     pub generation: u64,
     pub length: u64,
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl NativeFrameBacking {
+    /// Rollback requires terminal exact-generation release, not an eventual
+    /// request from Drop. Any pins or uncertain backend result fail closed.
+    pub(crate) fn release_unused(&self) -> Result<(), carrick_hal::TrapError> {
+        let carrier = self.carrier.upgrade().ok_or_else(|| {
+            carrick_hal::TrapError::Hypervisor(
+                "native backing carrier absent during rollback".into(),
+            )
+        })?;
+        let outcome = crate::trap::retire_global_frame_host_owner_if_generation_in(
+            &carrier,
+            self.ipa,
+            self.length,
+            self.generation,
+        );
+        if !outcome.is_retired() {
+            return Err(carrick_hal::TrapError::Hypervisor(format!(
+                "native backing exact-generation release indeterminate: {outcome:?}"
+            )));
+        }
+        carrier
+            .native_frame_backings
+            .lock()
+            .remove(&(self.ipa, self.generation));
+        Ok(())
+    }
 }
 impl Drop for NativeFrameBacking {
     fn drop(&mut self) {

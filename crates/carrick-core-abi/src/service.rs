@@ -441,6 +441,7 @@ pub enum ServiceError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreparedDeliveryError {
     Cancelled,
+    Refused,
     Service(ServiceError),
 }
 
@@ -1480,12 +1481,13 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
     ///
     /// This is delivery, not process/MM adoption. The receiving owner retains
     /// the result even if the ring cancels after delivery. On cancellation
-    /// before delivery no callback runs and no acknowledgment is published:
-    /// the returned ticket must survive rollback (including cleanup refusal).
+    /// before delivery no callback runs and no acknowledgment is published.
+    /// A refused handoff returns its prepared value and pinned ticket too;
+    /// the caller must verify rollback before acknowledging either refusal.
     pub fn publish_prepared<T>(
         mut self,
         prepared: T,
-        transfer: impl FnOnce(T),
+        transfer: impl FnOnce(T) -> Result<(), T>,
     ) -> Result<(), (PreparedDeliveryError, Self, T)> {
         let cancelled = match self.reserve_acknowledgment() {
             Ok(cancelled) => cancelled,
@@ -1495,7 +1497,10 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
             self.cell.state.store(CANCEL_REQUESTED, Ordering::Release);
             return Err((PreparedDeliveryError::Cancelled, self, prepared));
         }
-        transfer(prepared);
+        if let Err(prepared) = transfer(prepared) {
+            self.cell.state.store(SERVICING, Ordering::Release);
+            return Err((PreparedDeliveryError::Refused, self, prepared));
+        }
         self.finish_acknowledgment(1, 0, false);
         Ok(())
     }
@@ -1919,6 +1924,7 @@ mod tests {
             b_ticket
                 .publish_prepared(Prepared(drops.clone()), |resource| {
                     published = Some(resource);
+                    Ok(())
                 })
                 .is_ok()
         );
@@ -1938,6 +1944,35 @@ mod tests {
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         drop(published);
         assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn refused_prepared_handoff_keeps_ticket_pinned_until_verified_cleanup() {
+        use alloc::sync::Arc;
+        let cell = Arc::new(ServiceCell::new());
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(owner, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        let ticket = ServiceCell::claim_owned(cell.clone(), request).unwrap();
+        let Err((PreparedDeliveryError::Refused, ticket, prepared)) =
+            ticket.publish_prepared(42, Err)
+        else {
+            panic!("refused handoff must return custody without ACK");
+        };
+        assert_eq!(prepared, 42);
+        assert_eq!(
+            Arc::strong_count(&cell),
+            2,
+            "ticket pin survives handoff refusal"
+        );
+        assert_eq!(cell.consume(request.identity), Err(ServiceError::Busy));
+        assert!(!cell.cancel(request.identity).unwrap());
+        // Explicit physical/table cleanup completes here in the native caller.
+        assert!(ticket.complete(false).is_ok());
+        assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Cancelled));
+        assert_eq!(Arc::strong_count(&cell), 1);
     }
 
     #[test]
@@ -1973,6 +2008,7 @@ mod tests {
                     assert_eq!(cell.cancel(request.identity), Err(ServiceError::Busy));
                     assert_eq!(cell.consume(request.identity), Err(ServiceError::Busy));
                     retained = Some(resource);
+                    Ok(())
                 })
                 .is_ok()
         );

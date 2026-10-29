@@ -1506,6 +1506,24 @@ impl DescriptorTxnSlot {
                 Ordering::Acquire,
             )
             .ok()?;
+        let receipt = self.read_receipt(id);
+        self.state.store(DESCRIPTOR_TXN_IDLE, Ordering::Release);
+        Some(receipt)
+    }
+    /// Host owner: inspect without acknowledging or allowing slot reuse.
+    /// The same serialized host owner must later consume this receipt. EL1
+    /// cannot mutate RECEIPT, so all physical/table settlement precedes ACK.
+    pub fn inspect_receipt(&self, id: DescriptorTxnId) -> Option<DescriptorReceipt> {
+        if self.state.load(Ordering::Acquire) != DESCRIPTOR_TXN_RECEIPT
+            || self.mm_key.load(Ordering::Relaxed) != id.mm_key.get()
+            || self.generation.load(Ordering::Relaxed) != id.generation.get()
+        {
+            return None;
+        }
+        Some(self.read_receipt(id))
+    }
+
+    fn read_receipt(&self, id: DescriptorTxnId) -> DescriptorReceipt {
         let refusal = || {
             u32::try_from(self.receipt_refusal.load(Ordering::Relaxed))
                 .ok()
@@ -1541,13 +1559,11 @@ impl DescriptorTxnSlot {
             OUTCOME_ROLLED_BACK => DescriptorOutcome::RolledBack(refusal()),
             _ => DescriptorOutcome::Indeterminate(refusal()),
         };
-        let receipt = DescriptorReceipt {
+        DescriptorReceipt {
             id,
             digest: self.receipt_digest.load(Ordering::Relaxed),
             outcome,
-        };
-        self.state.store(DESCRIPTOR_TXN_IDLE, Ordering::Release);
-        Some(receipt)
+        }
     }
 }
 

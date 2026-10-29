@@ -25,7 +25,7 @@ pub struct PhysicalGrantRollback {
     receipts: parking_lot::Mutex<Vec<FailedPhysicalGrant>>,
 }
 struct FailedPhysicalGrant {
-    _receipt: UnpublishedFrameInventoryApply<dyn FrameCowAuthority>,
+    _receipt: Option<UnpublishedFrameInventoryApply<dyn FrameCowAuthority>>,
     _backing: Option<Box<dyn Send>>,
 }
 impl PhysicalGrantRollback {
@@ -34,8 +34,14 @@ impl PhysicalGrantRollback {
     }
     pub fn retain(&self, receipt: UnpublishedFrameInventoryApply<dyn FrameCowAuthority>) {
         self.receipts.lock().push(FailedPhysicalGrant {
-            _receipt: receipt,
+            _receipt: Some(receipt),
             _backing: None,
+        });
+    }
+    pub fn retain_allocation<R: Send + 'static>(&self, backing: R) {
+        self.receipts.lock().push(FailedPhysicalGrant {
+            _receipt: None,
+            _backing: Some(Box::new(backing)),
         });
     }
     fn retain_backed<R: Send + 'static>(
@@ -44,7 +50,7 @@ impl PhysicalGrantRollback {
         backing: Option<R>,
     ) {
         self.receipts.lock().push(FailedPhysicalGrant {
-            _receipt: receipt,
+            _receipt: Some(receipt),
             _backing: backing.map(|backing| Box::new(backing) as Box<dyn Send>),
         });
     }
@@ -266,6 +272,38 @@ impl<R: Send + 'static> UnpublishedPhysicalGrant<R> {
     pub fn abort_inventory(mut self) -> Result<(), TrapError> {
         self.rollback_inventory()
     }
+    /// Native pre-offer cancellation also verifies stage-2 and allocation
+    /// release. Preserve even an already-undone receipt if release is unknown.
+    pub fn abort_with_release(
+        mut self,
+        release: impl FnOnce(&R) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        let mut receipt = self
+            .staged
+            .receipt
+            .take()
+            .ok_or_else(NativePhysicalGrants::<R>::reply_failure)?;
+        let result = receipt
+            .rollback()
+            .map_err(|_| {
+                TrapError::Hypervisor(
+                    "unpublished physical grant inventory rollback indeterminate".into(),
+                )
+            })
+            .and_then(|()| {
+                release(
+                    self.backing
+                        .as_ref()
+                        .ok_or_else(NativePhysicalGrants::<R>::reply_failure)?,
+                )
+            });
+        if result.is_err() {
+            self.staged
+                .rollback
+                .retain_backed(receipt, self.backing.take());
+        }
+        result
+    }
     fn rollback_inventory(&mut self) -> Result<(), TrapError> {
         if let Some(mut receipt) = self.staged.receipt.take()
             && receipt.rollback().is_err()
@@ -300,6 +338,30 @@ impl<R: Send + 'static> Drop for UnpublishedPhysicalGrant<R> {
 pub struct NativePhysicalGrants<R> {
     owner: GuestFrameOwner,
     grants: std::collections::BTreeMap<u64, NativeGrant<R>>,
+    replies: std::collections::BTreeMap<usize, PrivateSupplyTransaction<R>>,
+    failed: bool,
+}
+/// Physical custody exposed to the neutral fork/table settlement owner.
+/// Backends supply storage mechanics; they do not decide terminal outcomes.
+pub trait NativeSupplyCustody {
+    type Backing;
+    fn supplied(&mut self) -> Option<&mut NativePhysicalGrants<Self::Backing>>;
+}
+/// One exact-MM, exact-root backing publication. Offered custody is never
+/// rolled back by Drop: only authenticated withdrawal or the ring's completed
+/// undo receipt can authorize release. A failed transaction stays here intact.
+pub struct PrivateSupplyTransaction<R> {
+    txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    window: carrick_el1_abi::PortalGrantWindow,
+    physical: Option<NativeGrant<R>>,
+    settlement: Option<BackingReplySettlement>,
+    acknowledged: bool,
+    offered: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackingReplySettlement {
+    Receipt(carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt),
+    Withdrawn,
 }
 struct NativeGrant<R> {
     custody: PhysicalGrantCustody,
@@ -320,10 +382,236 @@ impl<R> NativePhysicalGrants<R> {
         Self {
             owner,
             grants: Default::default(),
+            replies: Default::default(),
+            failed: false,
         }
     }
     pub fn owner(&self) -> GuestFrameOwner {
         self.owner
+    }
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+    /// A new request on the same authenticated reply lane proves the previous
+    /// synchronous settlement returned to the ring. Keep its tombstone until
+    /// then. Bound concurrent journals independently of allocation size.
+    pub fn backing_reply_available(
+        &self,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> bool {
+        !self.failed
+            && window.operation.mm.raw() == self.owner.native_mm.raw().get()
+            && window.operation.incarnation == self.owner.root_generation.raw()
+            && self.replies.get(&Self::reply_key(slot)).map_or(
+                self.replies.len() < carrick_el1_abi::FRAME_GRANT_RESIDENCY_SLOTS,
+                |prior| {
+                    prior.acknowledged
+                        && window.operation.sequence > prior.window.operation.sequence
+                },
+            )
+    }
+    fn reply_key(slot: &carrick_el1_abi::PortalGrantSlot) -> usize {
+        core::ptr::from_ref(slot).addr()
+    }
+    /// Couple the exact transaction, inventory undo and allocation BEFORE
+    /// submit makes it consumable. No wider reservation authority is created.
+    pub fn stage_backing_reply(
+        &mut self,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+        window: carrick_el1_abi::PortalGrantWindow,
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        unpublished: UnpublishedPhysicalGrant<R>,
+        release_unused: impl FnOnce(&R) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError>
+    where
+        R: Send + 'static,
+    {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp;
+        let staged = &unpublished.staged;
+        let valid = window.valid()
+            && self.backing_reply_available(slot, window)
+            && !self.replies.values().any(|prior| prior.txn.id == txn.id)
+            && staged.owner == self.owner
+            && staged.frames.len() == 1
+            && staged.grants.len() == 1
+            && staged.length.raw() <= carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
+            && txn.id.mm_key.get() == self.owner.native_mm.raw().get()
+            && txn.id.generation == window.operation.sequence
+            && matches!(txn.op, DescriptorOp::Prepare { publication, resident, backing }
+                if backing == staged.frames[0].1
+                    && publication.ipa == staged.frames[0].0.raw()
+                    && publication.va == window.range.start()
+                    && publication.len > 0
+                    && publication.len <= window.range.len()
+                    && publication.len <= staged.length.raw()
+                    && publication.writable == staged.permissions.write
+                    && publication.executable == staged.permissions.exec
+                    && resident.va == window.fault_page && resident.len == 4096)
+            && !self.grants.contains_key(&staged.frames[0].0.raw());
+        if !valid {
+            unpublished.abort_with_release(release_unused)?;
+            return Err(TrapError::Hypervisor(
+                "native backing transaction admission mismatch".into(),
+            ));
+        }
+        let (custody, retained) = unpublished.handoff()?;
+        self.replies.insert(
+            Self::reply_key(slot),
+            PrivateSupplyTransaction {
+                txn,
+                window,
+                physical: Some(NativeGrant {
+                    custody,
+                    _retained: retained,
+                    published: None,
+                }),
+                settlement: None,
+                acknowledged: false,
+                offered: false,
+            },
+        );
+        Ok(())
+    }
+    /// Publish only while the exact service ticket reserves delivery against
+    /// cancellation. This bounded transfer cannot release or roll back bytes.
+    pub fn offer_backing_reply(
+        &mut self,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> bool {
+        if self.failed {
+            return false;
+        }
+        let Some(pending) = self.replies.get_mut(&Self::reply_key(slot)) else {
+            return false;
+        };
+        if pending.txn != *txn || pending.offered || pending.acknowledged {
+            return false;
+        }
+        pending.offered = slot.submit(pending.window, txn);
+        pending.offered
+    }
+    pub fn pending_backing_reply(
+        &self,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+        generation: NonZeroU64,
+    ) -> Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn> {
+        let pending = self.replies.get(&Self::reply_key(slot))?;
+        (pending.txn.id.generation == generation && !pending.acknowledged).then_some(pending.txn)
+    }
+    /// Settle physical custody, retaining the exact receipt through table
+    /// settlement and ACK. The release adapter must return Ok ONLY after exact
+    /// stage-2 generation retirement and allocation release have completed.
+    /// Deferred pins, unknown inventory undo, and failed release are fatal.
+    /// A successful ring receipt already includes completed invalidation.
+    pub fn settle_backing_reply(
+        &mut self,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        release: impl FnOnce(&R) -> Result<(), TrapError>,
+    ) -> Result<BackingReplySettlement, TrapError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+        let result = (|| {
+            if self.failed {
+                return Err(Self::reply_failure());
+            }
+            let pending = self
+                .replies
+                .get_mut(&Self::reply_key(slot))
+                .ok_or_else(Self::reply_failure)?;
+            if pending.txn != *txn || pending.acknowledged {
+                return Err(Self::reply_failure());
+            }
+            if let Some(settled) = pending.settlement {
+                return Ok(settled);
+            }
+            let outcome = if !pending.offered {
+                BackingReplySettlement::Withdrawn
+            } else if let Some(receipt) = slot.inspect_receipt(pending.window, txn) {
+                if receipt.id != txn.id || receipt.digest != txn.digest() {
+                    return Err(Self::reply_failure());
+                }
+                match receipt.outcome {
+                    DescriptorOutcome::Applied(_) => {
+                        txn.verify_receipt(&receipt)
+                            .map_err(|_| Self::reply_failure())?;
+                    }
+                    DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_) => {}
+                    DescriptorOutcome::Indeterminate(_) => return Err(Self::reply_failure()),
+                }
+                BackingReplySettlement::Receipt(receipt)
+            } else if slot.withdraw(pending.window, txn) {
+                BackingReplySettlement::Withdrawn
+            } else {
+                return Err(Self::reply_failure());
+            };
+            if !matches!(outcome, BackingReplySettlement::Receipt(receipt)
+                if matches!(receipt.outcome, DescriptorOutcome::Applied(_)))
+            {
+                let physical = pending.physical.as_mut().ok_or_else(Self::reply_failure)?;
+                physical
+                    .custody
+                    .receipt
+                    .rollback()
+                    .map_err(|_| Self::reply_failure())?;
+                release(&physical._retained)?;
+            }
+            pending.settlement = Some(outcome);
+            Ok(outcome)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    /// Called only after the table owner has settled the SAME outcome. Keep a
+    /// tombstone until a later authenticated request reuses this reply lane.
+    /// No current-leaf query can overturn an earlier authenticated apply.
+    pub fn acknowledge_backing_reply(
+        &mut self,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<(), TrapError> {
+        let result = (|| {
+            if self.failed {
+                return Err(Self::reply_failure());
+            }
+            let pending = self
+                .replies
+                .get_mut(&Self::reply_key(slot))
+                .ok_or_else(Self::reply_failure)?;
+            if pending.txn != *txn || pending.acknowledged {
+                return Err(Self::reply_failure());
+            }
+            let outcome = pending.settlement.ok_or_else(Self::reply_failure)?;
+            if let BackingReplySettlement::Receipt(receipt) = outcome
+                && slot.take_receipt(pending.window, txn) != Some(receipt)
+            {
+                return Err(Self::reply_failure());
+            }
+            let physical = pending.physical.take().ok_or_else(Self::reply_failure)?;
+            if matches!(outcome, BackingReplySettlement::Receipt(receipt)
+                if matches!(receipt.outcome, carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)))
+            {
+                self.grants
+                    .insert(physical.custody.frames[0].0.raw(), physical);
+            }
+            // Refused physical custody drops only AFTER verified explicit
+            // release, and after table settlement. Offered/unknown never drops.
+            pending.acknowledged = true;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    pub fn fail_backing_reply(&mut self) {
+        self.failed = true;
+    }
+    fn reply_failure() -> TrapError {
+        TrapError::Hypervisor("native backing transaction settlement indeterminate".into())
     }
     /// Retain the inventory receipt and backing before publishing READY. The
     /// exclusion keeps the ring from observing a partly admitted batch.
@@ -338,7 +626,8 @@ impl<R> NativePhysicalGrants<R> {
     {
         let fail = || TrapError::Hypervisor("native physical grant admission mismatch".into());
         let staged = &unpublished.staged;
-        if excluded.key() != self.owner.native_mm.raw().get()
+        if self.failed
+            || excluded.key() != self.owner.native_mm.raw().get()
             || staged.owner != self.owner
             || staged.grants.len() != 1
             || staged.length.raw() != carrick_el1_abi::COW_GRANT_SIZE
@@ -365,38 +654,6 @@ impl<R> NativePhysicalGrants<R> {
         entry.published = Some(published);
         Ok(())
     }
-    /// Retain an isolated backing/table publication before its reply is visible.
-    pub fn retain_backing(
-        &mut self,
-        unpublished: UnpublishedPhysicalGrant<R>,
-    ) -> Result<Vec<PhysicalFrameGrant>, TrapError>
-    where
-        R: Send + 'static,
-    {
-        let staged = &unpublished.staged;
-        if staged.owner != self.owner
-            || staged.frames.len() != 1
-            || staged.length.raw() > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
-            || self.grants.contains_key(&staged.frames[0].0.raw())
-        {
-            unpublished.abort_inventory()?;
-            return Err(TrapError::Hypervisor(
-                "native backing publication mismatch".into(),
-            ));
-        }
-        let key = staged.frames[0].0.raw();
-        let grants = staged.grants.clone();
-        let (custody, retained) = unpublished.handoff()?;
-        self.grants.insert(
-            key,
-            NativeGrant {
-                custody,
-                _retained: retained,
-                published: None,
-            },
-        );
-        Ok(grants)
-    }
     /// Settle exact USED receipts while the MM editor is excluded.
     ///
     /// USED authenticates a completed ring-owned publication, not the current
@@ -409,7 +666,10 @@ impl<R> NativePhysicalGrants<R> {
         excluded: &carrick_sched_core::ExcludedEditor<'_>,
     ) -> Result<usize, TrapError> {
         let fail = || TrapError::Hypervisor("native USED physical receipt mismatch".into());
-        if excluded.key() != self.owner.native_mm.raw().get() || pool.claimed_by(excluded) {
+        if self.failed
+            || excluded.key() != self.owner.native_mm.raw().get()
+            || pool.claimed_by(excluded)
+        {
             return Err(fail());
         }
         let mut count = 0;

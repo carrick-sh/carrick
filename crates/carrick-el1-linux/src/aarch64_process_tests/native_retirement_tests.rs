@@ -17,6 +17,14 @@ pub(super) struct PhysicalChild {
     _inherited: RecordPin<PinVenue>,
     pub supplied: Option<carrick_hal::physical_grants::NativePhysicalGrants<SupplyBacking>>,
 }
+impl carrick_hal::physical_grants::NativeSupplyCustody for PhysicalChild {
+    type Backing = SupplyBacking;
+    fn supplied(
+        &mut self,
+    ) -> Option<&mut carrick_hal::physical_grants::NativePhysicalGrants<SupplyBacking>> {
+        self.supplied.as_mut()
+    }
+}
 pub(super) struct SupplyBacking {
     record: Arc<Mutex<CarrierStage2Record>>,
     identity: CarrierStage2RecordIdentity,
@@ -24,20 +32,33 @@ pub(super) struct SupplyBacking {
     mapping: carrick_hal::MappingId,
     early_drop: Arc<core::sync::atomic::AtomicBool>,
 }
-impl Drop for SupplyBacking {
-    fn drop(&mut self) {
+impl SupplyBacking {
+    pub(super) fn release_unused(&self) -> Result<(), carrick_hal::TrapError> {
         if self.authority.live_mapping_row(self.mapping).is_some() {
             self.early_drop.store(true, Ordering::Release);
+            return Err(carrick_hal::TrapError::Hypervisor(
+                "live inventory at release".into(),
+            ));
         }
         let mut record = self.record.lock().unwrap();
-        assert!(matches!(
-            prepare_record_retirement(&mut record, self.identity),
-            RecordRetirement::Unmap { .. }
-        ));
-        assert_eq!(
-            settle_record_retirement(&mut record, self.identity, Ok(())),
-            CarrierStage2RetireOutcome::RetiredUnmapped
-        );
+        let outcome = match prepare_record_retirement(&mut record, self.identity) {
+            RecordRetirement::Unmap { .. } => {
+                settle_record_retirement(&mut record, self.identity, Ok(()))
+            }
+            RecordRetirement::Complete(outcome) => outcome,
+        };
+        if outcome == CarrierStage2RetireOutcome::RetiredUnmapped {
+            Ok(())
+        } else {
+            Err(carrick_hal::TrapError::Hypervisor(format!(
+                "nonterminal release: {outcome:?}"
+            )))
+        }
+    }
+}
+impl Drop for SupplyBacking {
+    fn drop(&mut self) {
+        self.release_unused().unwrap();
     }
 }
 
@@ -271,6 +292,48 @@ impl PhysicalStock {
             mapping: carrick_hal::MappingId::from_kernel_allocation(grant.identity.mapping_id),
             early_drop: self.early_drop.clone(),
         }
+    }
+    pub fn track_backing_tables(
+        &mut self,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) {
+        // Existing fixture tables are already linked; nevertheless the real
+        // table owner must retain and authenticate this empty grant journal.
+        let reservation = self
+            .owner
+            .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root, 0)
+            .unwrap();
+        self.owner
+            .track_native_descriptor_tables(&mut NoTableLedger, reservation, txn)
+            .unwrap();
+    }
+    pub fn settle_backing_reply(
+        &mut self,
+        owner: carrick_el1_abi::El1MmHandle,
+        generation: NonZeroU64,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+    ) {
+        let root = self.owner.child_root(owner.mm()).unwrap();
+        let grants = self
+            .owner
+            .child_physical_mut(owner.mm(), root)
+            .unwrap()
+            .supplied
+            .as_mut()
+            .unwrap();
+        let txn = grants.pending_backing_reply(slot, generation).unwrap();
+        self.owner
+            .settle_native_backing_reply(
+                &mut NoTableLedger,
+                owner,
+                root,
+                slot,
+                &txn,
+                SupplyBacking::release_unused,
+            )
+            .unwrap();
     }
     pub fn retire(
         &mut self,
