@@ -2971,10 +2971,7 @@ impl carrick_el1::memory::AnonymousBackingProbe for ReservationSupplyMemory<'_> 
         va: UserVa,
     ) -> Option<carrick_guest_arch::UserRange> {
         let page = self.residency.lookup(mm.raw(), va.raw())?;
-        carrick_guest_arch::UserRange::checked(
-            UserVa::new(page.identity.semantic_base),
-            carrick_guest_arch::GuestLen::new(page.identity.len),
-        )
+        page.retained_span()
     }
 }
 impl carrick_el1::memory::AnonymousPermissionEditor for ReservationSupplyMemory<'_> {
