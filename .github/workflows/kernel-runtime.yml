@@ -309,7 +309,7 @@ jobs:
         with:
           name: hvf-failure-evidence-${{ github.sha }}-${{ github.run_attempt }}
           path: |
-            target/el1-gate/${{ github.sha }}/*.log
+            target/el1-gate/*/*.log
             target/embed-post-mortem/**
             target/embed-logs/**
           if-no-files-found: warn
