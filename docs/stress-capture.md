@@ -64,7 +64,9 @@ just xtask stress-capture \
 
 Probe descriptions are restricted to Carrick USDT selectors, with a predicate
 covering the test PID and its descendants. Probe arguments are uninterpreted
-integers, not assumed pointer layouts. DTrace uses `-Z`, an internal tick
+signed 64-bit integers (matching macOS D's `argN` types), not assumed pointer
+layouts. Startup failures include the retained DTrace diagnostic and its log
+path in the run record. DTrace uses `-Z`, an internal tick
 limit, and an independent runner deadline. A startup gate prevents the test
 from outrunning probe admission. A trace with zero scoped events is explicitly
 inconclusive; a successful iteration may have no failure-probe events. Do not
