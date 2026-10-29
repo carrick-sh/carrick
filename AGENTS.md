@@ -412,6 +412,14 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
 - **No host readiness pipe for an in-zone object.** Carrick-owned waiters
   park on the object's wait queue and probe readiness once after enrolling
   (closes the lost-wakeup gap).
+- **Contention is never fatal, never an errno and never "no plan".** A
+  `Busy` from a lock, gate, editor, root or pending fork means "not now":
+  keep the owned operation, release the execution lease, enrol on the
+  holder's existing release notification and probe once, then rerun. Only a
+  broken invariant (`Stale`, `Invalid`, `Quarantined`) is fatal. Four
+  same-shape defects in one night: `record_resident` (#1068), retired spaces
+  (#1062), a zero-progress pipe read (#1044) and a pinned frame (#1058).
+  Witness every new refusal arm with "Busy once, then success".
 - **On a contained fast path only ENOENT is authoritative**; an errno a
   carrick-added flag could cause (e.g. `O_NOFOLLOW` → `ELOOP`) falls back to
   the resolving path.
