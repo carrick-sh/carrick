@@ -2091,3 +2091,7 @@ contracts = ["kernel.memory.owner-wait"]
 [[surfaces]]
 path = "crates/carrick-core/src/lifecycle.rs"
 contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/operations/exit.rs"
+contracts = ["kernel.vcpu.shutdown-entry"]

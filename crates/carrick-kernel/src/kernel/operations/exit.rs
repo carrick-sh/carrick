@@ -558,8 +558,11 @@ impl Kernel {
             None
         } else {
             Some(
-                carrick_core::terminal::reserve_thread_exit_membership(&*lifecycle)
-                    .map_err(|_| KernelOperationError::LastThreadRequiresTaskExit(tid))?,
+                carrick_core::terminal::reserve_host_thread_exit_membership(
+                    &*lifecycle,
+                    context.thread.control_slot(),
+                )
+                .map_err(|_| KernelOperationError::LastThreadRequiresTaskExit(tid))?,
             )
         };
         check_failpoint(failpoint, KernelFailpoint::AfterMembershipReserve)?;
@@ -631,10 +634,8 @@ impl Kernel {
                 ThreadRetirementLane::Host => state.retired_threads.push(retired),
                 ThreadRetirementLane::HostAdopted(owned) => {
                     let retirement_error = match live_membership.take() {
-                        Some(membership) => owned
-                            .control
-                            .lifecycle()
-                            .retire_published_host_member(owned.entry, &owned.control, membership)
+                        Some(membership) => membership
+                            .retire_published(owned.entry, &*owned.control)
                             .err()
                             .map(Some),
                         None => Some(None),

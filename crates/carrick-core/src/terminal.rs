@@ -950,6 +950,67 @@ impl TerminalCustody<Thread, Live> {
     }
 }
 
+/// Host graph cleanup either owns a live reservation or consumes the native
+/// terminal owner's membership ownership. Record absence grants neither.
+#[must_use]
+pub struct HostThreadExitMembership<'a> {
+    page: &'a dyn Lifecycle,
+    member: crate::lifecycle::MemberControlCustody<'a, dyn MemberControl + 'a>,
+    entry: Option<EntryRef>,
+    reserved: Option<NonfinalExitMembership<'a>>,
+}
+
+impl HostThreadExitMembership<'_> {
+    pub fn retire_published(
+        self,
+        entry: EntryRef,
+        member: &dyn MemberControl,
+    ) -> Result<(), crate::lifecycle::TransitionError> {
+        if !core::ptr::addr_eq(self.member.control(), member)
+            || self.entry != Some(entry)
+            || member.member_entry() != self.entry
+        {
+            return Err(crate::lifecycle::TransitionError::StaleGeneration);
+        }
+        if let Some(reserved) = self.reserved {
+            crate::lifecycle::retire_host_member(self.page, entry, member, reserved)?;
+        }
+        Ok(())
+    }
+
+    pub fn publish(self) {
+        if let Some(reserved) = self.reserved {
+            reserved.publish();
+        }
+    }
+}
+
+/// Select membership ownership before changing the live count. Native terminal
+/// intent precedes record release, while its ABI publication may still lag.
+/// A host completing that missing-record claim retires only the host graph.
+pub fn reserve_host_thread_exit_membership<'a>(
+    page: &'a impl Lifecycle,
+    member: &'a dyn MemberControl,
+) -> Result<HostThreadExitMembership<'a>, MembershipFloor> {
+    let pin =
+        crate::lifecycle::MemberControlCustody::retain(member).map_err(|_| MembershipFloor)?;
+    let entry = member.member_entry();
+    let native_reserved = member.exit_custody().zone_terminal()
+        || crate::lifecycle::recorded_member_exit_kind(member, member.member_entry())
+            == MemberExitKind::InZone;
+    let reserved = if native_reserved {
+        None
+    } else {
+        Some(reserve_thread_exit_membership(page)?)
+    };
+    Ok(HostThreadExitMembership {
+        page,
+        member: pin,
+        entry,
+        reserved,
+    })
+}
+
 /// Reserve one exiting member using the neutral process owner's phase.
 /// A host member and an in-zone member obey the same floor, including when
 /// the root reserves its caller before publishing the exit wait channel.

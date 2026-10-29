@@ -2358,45 +2358,13 @@ The VM-free binding primes actual thread pools with runtime adoption
 reservations containing real process-birth submissions. Two live tasks then
 exit during close; unused capacity must retire before executor joins.
 
-An irrevocable process-exit owner also retains custody when a host control
-request wins just before its futex park. The queue owner undoes the unpublished
-enrollment and hands the exact continuation to that request through the existing
-unswitch transition. Ordinary interruptible parks keep their refusal behavior;
-foreign guards, stale bindings and absent owner continuations cannot authorize
-this terminal handback. The VM-free two-live-member witness was red with
-`NativeQuarantined`: the refused park reached `run_failed`, which retired the
-record before reporting failure. It requires retained custody, sibling retirement
-and the original exit status 0 after host re-entry. The core binding additionally
-checks zero remaining wait entries and one exact handback. The pool binding runs
-that same native fixture inside an executor's idle quantum, joins every worker
-and requires status 0 plus clean shutdown. Its refused native entry retains the
-actual execution binding through the production failure codec and one-shot
-carrier consumer. These are constant-work assertions. Signed stress attribution
-remains director-owned; the observed missing-record error alone cannot prove
-expected group retirement rather than secondary retirement by `run_failed`.
-
-A refused zone reload carries its exact missing `RecordRef` as a typed error.
-The neutral terminal owner authenticates it against the retained member's
-birth and saved zone binding. Only irreversible zone-retirement intent, committed in-zone exit or an exact
-host retirement receipt authorizes terminal settlement; cancellation requests,
-closed process admission and missing records alone do not. The pool witness
-`group_close_retires_claimed_sibling_without_killing_executor` starts two real
-Kernel threads, holds the sibling's load claim while process close starts,
-retires it through Kernel thread exit and publishes its exact host retirement
-receipt, then resumes the refused reload. The leader remains alive, so MM
-retirement cannot supply this verdict. It requires zero guest entries for the
-retired sibling and every executor joined and destroyed. Native group exit
-additionally exercises the in-zone provenance in the terminal-park binding.
-These are constant-work assertions; signed branch attribution and stress
-acceptance remain with the director.
-
-The neutral `TerminalCustody<Thread, Terminal>` publishes zone-retirement intent
-before releasing the member's current record. This intent is distinct from the
-later lifecycle receipt and is not available to `run_failed`. The core binding
-`terminal_member_proof_precedes_lifecycle_receipt_after_record_release` observes
-the freed continuation while the lifecycle receipt still says Active. It must
-already receive a terminal verdict. Ordinary failure cleanup of an identical
-record must still receive an invariant-violation verdict.
+Host graph cleanup reuses the exact native member's membership ownership when
+terminal intent or its committed receipt already exists. It must neither reserve
+a second live unit nor retire the ABI entry again. The two-live-thread binding
+`group_exit_member_graph_retirement_does_not_retire_reaped_abi_twice` publishes a
+real ABI birth, retires that member natively, and then retires its host graph.
+The core binding also checks this ownership while native page commit is pending.
+The cleanup token pins the member control and snapshots its entry incarnation.
 
 ### Interrupted-sleep remainder publication (#986 Slice 1)
 
