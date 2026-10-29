@@ -717,41 +717,6 @@ where
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn deliver_declined_fault_signal<X: ForkStockCrossing, A>(
-    source: BornInZoneSource<'static, Aarch64ParkedContext>,
-    task: &'static CurrentTask,
-    native: &carrick_sched_core::ThreadCtx,
-    ttbr0: u64,
-    page: &'static ThreadLifecyclePage,
-    control: &'static ThreadControlSlot,
-    service: &mut Aarch64NativeProcessService<'static, X>,
-    frame: &mut carrick_el1_abi::TrapFrame,
-    fpstate: &[u8],
-    machine: &mut A,
-) -> Result<carrick_el1_abi::Action, NativeProcessError>
-where
-    A: super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>,
-    A::Backend: carrick_guest_arch::ArchTypes<NativeFrame = carrick_el1_abi::TrapFrame>,
-{
-    deliver_declined_fault_signal_with(
-        source,
-        task,
-        native,
-        ttbr0,
-        page,
-        control,
-        service,
-        frame.far,
-        |process| {
-            super::signal_delivery::deliver_signal_with_control(
-                task, control, process, frame, fpstate, machine,
-            )
-        },
-    )
-}
-
 /// Read the MM's root incarnation from the parked execution context. The
 /// scheduler record incarnation only names reuse of that record slot.
 ///

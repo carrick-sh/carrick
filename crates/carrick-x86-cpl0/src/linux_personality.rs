@@ -375,8 +375,10 @@ pub(crate) fn deliver_signal_on_syscall_return(
     frame: &mut NativeFrame,
     fpstate: &XsaveArea,
 ) -> Option<CompletionRoute> {
+    let (_, control) = task.lifecycle_refs()?;
     carrick_el1_linux::signal_delivery::deliver_signal_on_syscall_return(
         task,
+        control,
         process,
         frame,
         &fpstate.0,

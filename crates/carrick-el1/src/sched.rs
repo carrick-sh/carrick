@@ -37,12 +37,25 @@ impl NativeEntryVenue {
         page: &carrick_el1_abi::ThreadLifecyclePage,
         control: &carrick_el1_abi::ThreadControlSlot,
     ) -> Self {
-        if !carrick_el1_abi::Lifecycle::gate(page).serves_ring()
-            || !task.owns_lifecycle_page(page)
-            || !task.owns_control_slot(control)
-        {
-            return Self::Host;
-        }
+        Self::select_for_slot(zone, slot, task, Some((page, control)))
+    }
+
+    /// Select the execution venue from the published task metadata.
+    pub fn select(zone: &ZoneTables, slot: SlotId, task: &CurrentTask) -> Self {
+        Self::select_for_slot(zone, slot, task, task.lifecycle_refs())
+    }
+
+    fn select_for_slot(
+        zone: &ZoneTables,
+        slot: SlotId,
+        task: &CurrentTask,
+        lifecycle: Option<(
+            &carrick_el1_abi::ThreadLifecyclePage,
+            &carrick_el1_abi::ThreadControlSlot,
+        )>,
+    ) -> Self {
+        // Execution custody survives exec/group-exit admission closing. These
+        // records have no loaded host task to receive a forwarded exception.
         if let Some(record) = zone
             .slot(slot)
             .current()
@@ -51,29 +64,20 @@ impl NativeEntryVenue {
         {
             return Self::NativeProcess(record);
         }
+        let Some((page, control)) = lifecycle else {
+            return Self::Host;
+        };
+        if !task.owns_lifecycle_page(page)
+            || !task.owns_control_slot(control)
+            || !carrick_el1_abi::Lifecycle::gate(page).serves_ring()
+        {
+            return Self::Host;
+        }
         let mm = task.mm.key.load(Ordering::Acquire);
         if mm != 0 && zone.installed_space(slot) == mm && control.native_signal_owner() {
             return Self::SignalOwner;
         }
         Self::Host
-    }
-
-    /// Select the execution venue for the loaded slot from the published
-    /// [`CurrentTask`] metadata.
-    pub fn select(zone: &ZoneTables, slot: SlotId, task: &CurrentTask) -> Self {
-        if let Some((page, control)) = task.lifecycle_refs() {
-            return Self::select_with_lifecycle(zone, slot, task, page, control);
-        }
-        if task.metadata.lifecycle_page.load(Ordering::Acquire) != 0
-            || task.metadata.control_slot.load(Ordering::Acquire) != 0
-        {
-            return Self::Host;
-        }
-        zone.slot(slot)
-            .current()
-            .or_else(|| zone.slot(slot).host_record())
-            .filter(|record| zone.record(*record).is_native_owned())
-            .map_or(Self::Host, Self::NativeProcess)
     }
 }
 
