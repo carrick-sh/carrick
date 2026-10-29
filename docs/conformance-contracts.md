@@ -836,6 +836,17 @@ clear/wake ordering and graph refusal. The signed anonymous and fork-COW
 comparison fixtures bind the terminal runtime path; broader pthread and exec
 acceptance remains open.
 
+The two-live-thread binding
+`serial_host_last_sibling_clear_drain_leaves_retirement_to_terminal_owner`
+forces the group-exit owner to retire before its captured
+`CLONE_CHILD_CLEARTID` sibling. `LastThread` leaves that exact sibling in the
+graph for the existing terminal task-exit owner; it is not a failed clear.
+The drain transfers the final clear to terminal custody without a write or
+wake. The terminal owner then retires the task, commits one clear and one wake,
+and publishes the original group status once, including across a memory wait. Repeated drain and
+terminal clear processing must perform no additional writes or wakes.
+This VM-free binding does not replace signed `el1_files_exit_group_stress`.
+
 `kernel.process.wait-owner` covers selection and consumption of a process's
 children by wait4/waitid. Linux authority is wait(2)'s clone-child partition,
 WNOWAIT observation, and consuming reap; wait4(2) supplies subtree CPU charging.
