@@ -270,12 +270,28 @@ fn resume_production_with(
             rec.consume_metadata_operation();
         }
         if cancelled_on_slot {
-            let (page, control) = lifecycle.unwrap_or_else(|| fatal());
             let binding = common_entry::execution_binding(task);
             let source = BornInZoneSource { zone, slot };
+            let hand_back = || {
+                if carrick_core::entry::yield_current_to_host(binding, source, record).is_none() {
+                    // An adapter operation cannot be released by the lifecycle
+                    // owner. Keep its exact token and queue it for host service.
+                    let _ = zone.unswitch(slot, record);
+                }
+            };
+            let Some((page, control)) = lifecycle else {
+                // An unregistered cancelled record can predate lifecycle
+                // publication. Preserve it for its host owner without minting
+                // terminal authority from missing lifecycle references.
+                hand_back();
+                task.linux.mark_pending_host_work();
+                return crate::sched::ResumeAction::Left;
+            };
             let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
                 binding,
                 control.entry(),
+                // This custody only orders membership and record release; it
+                // never publishes a status verdict. The host retains status.
                 carrick_sched_core::process::TerminationStatus::SUCCESS,
             )
             .unwrap_or_else(|| fatal());
@@ -289,17 +305,28 @@ fn resume_production_with(
                     // The neutral owner commits exact terminal intent at the
                     // physical release seam, before a queued DirectLoad can
                     // observe the saved record's absence.
-                    custody
+                    if control.entry().is_some()
+                        && !carrick_core::lifecycle::Lifecycle::gate(page).is_terminal()
+                    {
+                        // A cancelled pool member outside group close still
+                        // needs the host's published-entry retirement owner.
+                        hand_back();
+                    } else if custody
                         .retire_zone_current(control, &mut membership, binding, source, record)
-                        .unwrap_or_else(|| fatal());
-                    if let Some(entry) = control.entry() {
-                        carrick_core::lifecycle::retire_cancelled_pool_member(
-                            page, entry, control, membership,
-                        )
-                        .unwrap_or_else(|_| fatal());
-                    } else {
-                        membership.publish();
+                        .is_some()
+                    {
+                        if let Some(entry) = control.entry() {
+                            carrick_core::lifecycle::retire_cancelled_pool_member(
+                                page, entry, control, membership,
+                            )
+                            .unwrap_or_else(|_| fatal());
+                        } else {
+                            membership.publish();
+                        }
                     }
+                    // None includes CurrentRelease::Requeued (#685): no
+                    // terminal commit ran. Drop restores the reserved unit;
+                    // the adapter operation and its record stay host-owned.
                 }
                 Err((_, error)) => {
                     use carrick_core::lifecycle::MemberMembershipError;
@@ -308,15 +335,16 @@ fn resume_production_with(
                         MemberMembershipError::AlreadyTerminal => {
                             match carrick_core::terminal::settle_losing_zone_current(
                                 control, binding, source, record,
-                            )
-                            .unwrap_or_else(|| fatal())
-                            {
-                                LosingMemberSettlement::Released(_) => {}
-                                LosingMemberSettlement::HostCustody => {
-                                    carrick_core::entry::yield_current_to_host(
-                                        binding, source, record,
-                                    )
-                                    .unwrap_or_else(|| fatal());
+                            ) {
+                                Some(LosingMemberSettlement::Released(_)) | None => {}
+                                Some(LosingMemberSettlement::HostCustody) => {
+                                    // Defensive against terminal evidence
+                                    // disappearing between admission and
+                                    // settlement. Production raw exit commits
+                                    // ZoneRetirement before ABI publication,
+                                    // so its ABI rollback cannot remove that
+                                    // evidence. Never free on this fallback.
+                                    hand_back();
                                 }
                             }
                         }
@@ -324,8 +352,7 @@ fn resume_production_with(
                         // the next transition. Preserve its record for host
                         // service rather than releasing without terminal proof.
                         MemberMembershipError::InFlight | MemberMembershipError::Floor => {
-                            carrick_core::entry::yield_current_to_host(binding, source, record)
-                                .unwrap_or_else(|| fatal());
+                            hand_back();
                         }
                         MemberMembershipError::InvalidMember => fatal(),
                     }
