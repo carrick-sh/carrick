@@ -2375,6 +2375,29 @@ carrier consumer. These are constant-work assertions. Signed stress attribution
 remains director-owned; the observed missing-record error alone cannot prove
 expected group retirement rather than secondary retirement by `run_failed`.
 
+A refused zone reload carries its exact missing `RecordRef` as a typed error.
+The neutral terminal owner authenticates it against the retained member's
+birth and saved zone binding. Only irreversible zone-retirement intent, committed in-zone exit or an exact
+host retirement receipt authorizes terminal settlement; cancellation requests,
+closed process admission and missing records alone do not. The pool witness
+`group_close_retires_claimed_sibling_without_killing_executor` starts two real
+Kernel threads, holds the sibling's load claim while process close starts,
+retires it through Kernel thread exit and publishes its exact host retirement
+receipt, then resumes the refused reload. The leader remains alive, so MM
+retirement cannot supply this verdict. It requires zero guest entries for the
+retired sibling and every executor joined and destroyed. Native group exit
+additionally exercises the in-zone provenance in the terminal-park binding.
+These are constant-work assertions; signed branch attribution and stress
+acceptance remain with the director.
+
+The neutral `TerminalCustody<Thread, Terminal>` publishes zone-retirement intent
+before releasing the member's current record. This intent is distinct from the
+later lifecycle receipt and is not available to `run_failed`. The core binding
+`terminal_member_proof_precedes_lifecycle_receipt_after_record_release` observes
+the freed continuation while the lifecycle receipt still says Active. It must
+already receive a terminal verdict. Ordinary failure cleanup of an identical
+record must still receive an invariant-violation verdict.
+
 ### Interrupted-sleep remainder publication (#986 Slice 1)
 
 `kernel.memory.owner-wait` includes the frozen remainder from an interrupted

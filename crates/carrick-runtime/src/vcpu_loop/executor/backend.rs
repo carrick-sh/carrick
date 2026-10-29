@@ -140,8 +140,13 @@ impl HvpatchResidencyHandle {
                         record,
                         origin,
                     }) => {
-                        return super::residency::materialize_zone(base, *record, *origin)
-                            .map(Some);
+                        return super::residency::materialize_zone(
+                            base,
+                            *record,
+                            *origin,
+                            carrick_hal::trap::ZoneRestoreSite::CrossExecutorRecheck,
+                        )
+                        .map(Some);
                     }
                     None => return Ok(None),
                     Some(TaskCpuResidency::Resident { .. }) => {}
@@ -158,7 +163,13 @@ impl HvpatchResidencyHandle {
                     record,
                     origin,
                 }) => {
-                    return super::residency::materialize_zone(base, *record, *origin).map(Some);
+                    return super::residency::materialize_zone(
+                        base,
+                        *record,
+                        *origin,
+                        carrick_hal::trap::ZoneRestoreSite::CrossExecutorWait,
+                    )
+                    .map(Some);
                 }
                 None => return Ok(None),
                 Some(TaskCpuResidency::Resident { .. }) => {
@@ -930,7 +941,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 base,
                 record,
                 origin,
-            }) => Some(super::residency::materialize_zone(&base, record, origin)?),
+            }) => Some(super::residency::materialize_zone(
+                &base,
+                record,
+                origin,
+                carrick_hal::trap::ZoneRestoreSite::DirectLoad,
+            )?),
             _ => None,
         };
         let cpu = materialized_cpu.as_ref().unwrap_or(initial_cpu);

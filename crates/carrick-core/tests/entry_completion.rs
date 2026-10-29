@@ -632,3 +632,72 @@ fn compact_fork_child_gate_releases_owned_wait_with_sourceful_access() {
     assert_eq!(handed.get(), 1);
     assert_eq!(delivered.get(), 1);
 }
+
+#[test]
+fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
+    use carrick_core::terminal::{
+        Live, MissingContinuationVerdict, TerminalCustody, Thread, ThreadBirthIdentity,
+        ThreadTerminalIdentity, missing_zone_continuation,
+    };
+    use carrick_el1_abi::{Lifecycle, ThreadControlSlot, ThreadLifecyclePage};
+    let zone = compact_zone();
+    let (slot, record, binding) = running_compact(&zone, 0);
+    let reference = zone.record_ref(record);
+    let source = carrick_core_abi::BornInZoneSource { zone: &zone, slot };
+    let member = ThreadControlSlot::new();
+    let birth = ThreadBirthIdentity::from_parts(
+        binding.task,
+        carrick_core_abi::BirthSerial::of_task(
+            carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
+        ),
+        binding.thread_generation,
+    )
+    .unwrap();
+    member.publish_host_birth_identity(birth);
+    member.bind_zone_record(reference);
+    let page = ThreadLifecyclePage::new();
+    assert_eq!(page.thread_born(), Some(2));
+    let identity = ThreadTerminalIdentity::from_exit(
+        binding,
+        None,
+        carrick_sched_core::process::TerminationStatus::SUCCESS,
+    )
+    .unwrap();
+    let (custody, _membership) = TerminalCustody::<Thread, Live>::admitted(identity)
+        .begin()
+        .reserve_nonfinal(&page)
+        .unwrap_or_else(|_| panic!("nonfinal member"));
+    let classify = || {
+        missing_zone_continuation(
+            &member,
+            birth,
+            member.host_birth_identity(),
+            reference,
+            member.zone_record(),
+        )
+    };
+    assert_eq!(classify(), MissingContinuationVerdict::InvariantViolation);
+    let foreign = ExecutionBinding {
+        thread_generation: EntryThreadGeneration::from_raw(999),
+        ..binding
+    };
+    assert!(
+        custody
+            .retire_zone_current(&member, foreign, source, record)
+            .is_none()
+    );
+    assert_eq!(classify(), MissingContinuationVerdict::InvariantViolation);
+    custody
+        .retire_zone_current(&member, binding, source, record)
+        .unwrap();
+    assert!(zone.live(reference).is_none());
+    assert_eq!(
+        carrick_core::lifecycle::recorded_member_exit_kind(&member, None),
+        carrick_core::lifecycle::MemberExitKind::Active
+    );
+    assert_eq!(
+        classify(),
+        MissingContinuationVerdict::Terminal,
+        "record release must never precede retained terminal proof"
+    );
+}

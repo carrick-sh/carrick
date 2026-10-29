@@ -74,7 +74,8 @@ const HOST_RETIRING: u32 = 8;
 
 const GRAPH_REGISTERED: u32 = 16;
 const NATIVE_SIGNAL_OWNER: u32 = 32;
-const GRAPH_REFERENCE: u32 = 64;
+const ZONE_TERMINAL: u32 = 64;
+const GRAPH_REFERENCE: u32 = 128;
 const RESETTING: u32 = 1 << 31;
 const REFERENCES: u32 = RESETTING - GRAPH_REFERENCE;
 
@@ -99,6 +100,13 @@ impl MemberExitCustody {
     #[cfg(test)]
     pub(crate) fn test_record(&self, word: u32) {
         self.word.store(word, Ordering::Release);
+    }
+    /// Irrevocable terminal custody is published before its record is freed.
+    pub(crate) fn commit_zone_terminal(&self) {
+        self.word.fetch_or(ZONE_TERMINAL, Ordering::Release);
+    }
+    pub(crate) fn zone_terminal(&self) -> bool {
+        self.word.load(Ordering::Acquire) & ZONE_TERMINAL != 0
     }
     pub fn referenced(&self) -> bool {
         self.word.load(Ordering::Acquire) & REFERENCES != 0

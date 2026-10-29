@@ -97,6 +97,17 @@ struct DescendantPublication {
     published: Option<std::sync::mpsc::Sender<()>>,
 }
 
+struct ZoneLoad {
+    zone: &'static carrick_el1_abi::ZoneTables,
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+impl std::fmt::Debug for ZoneLoad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZoneLoad").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 struct FakeBinding {
     drop_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -104,6 +115,7 @@ struct FakeBinding {
     thread: parking_lot::Mutex<Option<Arc<carrick_kernel::kernel::Thread>>>,
     steps: parking_lot::Mutex<VecDeque<Step>>,
     load_fails: AtomicBool,
+    zone_load: parking_lot::Mutex<Option<ZoneLoad>>,
     affinity_on_load: parking_lot::Mutex<Option<GuestCpuId>>,
     save_fails: AtomicBool,
     audit_fails: AtomicBool,
@@ -127,6 +139,7 @@ struct FakeBinding {
     retire_detached_address_space_resume: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     retire_requires_materialized: AtomicBool,
     terminal_residency_retired: AtomicBool,
+    reaped_settlements: AtomicUsize,
     residency: parking_lot::Mutex<super::residency::TaskCpuResidency>,
     residency_condvar: parking_lot::Condvar,
 }
@@ -177,6 +190,7 @@ impl FakeBinding {
             thread: parking_lot::Mutex::new(None),
             steps: parking_lot::Mutex::new(steps.into_iter().collect()),
             load_fails: AtomicBool::new(false),
+            zone_load: parking_lot::Mutex::new(None),
             affinity_on_load: parking_lot::Mutex::new(None),
             save_fails: AtomicBool::new(false),
             audit_fails: AtomicBool::new(false),
@@ -198,6 +212,7 @@ impl FakeBinding {
             retire_detached_address_space_resume: parking_lot::Mutex::new(None),
             retire_requires_materialized: AtomicBool::new(false),
             terminal_residency_retired: AtomicBool::new(false),
+            reaped_settlements: AtomicUsize::new(0),
             residency: parking_lot::Mutex::new(super::residency::TaskCpuResidency::Materialized(
                 test_guest_cpu_state(marker),
             )),
@@ -303,6 +318,11 @@ impl PersistentTaskBinding for FakeBinding {
         }
     }
 
+    fn after_reaped_settlement(&self) {
+        self.reaped_settlements.fetch_add(1, Ordering::SeqCst);
+        self.after_terminal_settlement();
+    }
+
     fn take_address_space_retirement(
         &self,
     ) -> Option<crate::hvpatch::PendingAddressSpaceRetirement> {
@@ -374,7 +394,13 @@ impl PersistentTaskBinding for FakeBinding {
                     record,
                     origin,
                 } => {
-                    return super::residency::materialize_zone(base, *record, *origin).map(Some);
+                    return super::residency::materialize_zone(
+                        base,
+                        *record,
+                        *origin,
+                        carrick_hal::trap::ZoneRestoreSite::MaterializeAccessor,
+                    )
+                    .map(Some);
                 }
                 super::residency::TaskCpuResidency::Resident { .. } => {
                     let now = std::time::Instant::now();
@@ -1013,6 +1039,29 @@ impl PersistentExecutor for FakeExecutor {
             return Err(TrapError::Hypervisor("concurrent double-load".to_owned()));
         }
         let binding = Arc::clone(task.binding());
+        if let Some(load) = binding.zone_load.lock().take() {
+            load.entered.send(()).unwrap();
+            load.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            let super::residency::TaskCpuResidency::Zone {
+                base,
+                record,
+                origin,
+            } = binding.cpu_residency().unwrap()
+            else {
+                panic!("zone continuation")
+            };
+            let result = super::residency::materialize_zone_at(
+                load.zone,
+                &base,
+                record,
+                origin,
+                carrick_hal::trap::ZoneRestoreSite::DirectLoad,
+            );
+            if result.is_err() {
+                self.factory.concurrent_loads.lock().remove(&key);
+            }
+            result?;
+        }
         if binding.load_fails.load(Ordering::SeqCst) {
             self.factory.concurrent_loads.lock().remove(&key);
             return Err(TrapError::Hypervisor("injected load failure".to_owned()));
@@ -8979,4 +9028,97 @@ fn shutdown_entry_latch_is_sticky_and_scoped_across_two_live_executors() {
         "shutdown belongs to its executor, not the carrier thread population"
     );
     assert_eq!(counts, [0, 1], "kick only the published physical entry");
+}
+
+/// The sibling's exact host retirement wins while its executor holds a claim.
+/// The process close has started but its leader and MM remain alive.
+#[test]
+fn group_close_retires_claimed_sibling_without_killing_executor() {
+    claimed_sibling_zone_reload(true);
+}
+
+#[test]
+fn missing_claimed_sibling_without_retirement_still_fails_closed() {
+    claimed_sibling_zone_reload(false);
+}
+
+#[cfg(test)]
+fn claimed_sibling_zone_reload(retired: bool) {
+    use carrick_core::terminal::{Live, Process, TerminalCustody};
+    let (kernel, root) = bootstrap(19_750);
+    root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+    let sibling = sibling(&kernel, &root, 19_751);
+    assert_eq!(root.task().threads().len(), 2);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel.clone()));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(17, [Step::Exit]);
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    // SAFETY: TestEl1Region owns aligned, zeroed ABI storage for this test.
+    let zone = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<carrick_el1_abi::ZoneTables>()
+    };
+    let key = sibling.thread().key();
+    let id = zone
+        .alloc_record(carrick_el1_abi::ThreadIdentity {
+            tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+            serial: key.serial.raw(),
+            mm: sibling.shared().mm().id().raw(),
+            file_table: sibling.resources().files().id().raw(),
+            generation: sibling.task().key().serial.raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let record = zone.record_ref(id);
+    sibling.thread().control_slot().bind_zone_record(record);
+    binding.set_cpu_residency(super::residency::TaskCpuResidency::Zone {
+        base: test_guest_cpu_state(17),
+        record,
+        origin: super::residency::ZoneResumeOrigin::GuestRecord,
+    });
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *binding.zone_load.lock() = Some(ZoneLoad {
+        zone,
+        entered: entered_tx,
+        resume: resume_rx,
+    });
+    factory.install(&sibling, binding.clone());
+    let pool = start_pool(scheduler.clone(), factory.clone(), 1);
+    let authority = enqueue_root(&scheduler, &sibling, publish(&sibling, 17));
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!binding.address_space_is_retiring());
+    let page = root.lifecycle_page();
+    let _close = TerminalCustody::<Process, Live>::close_admission(&*page);
+    if retired {
+        kernel.exit_thread(&sibling, None).unwrap();
+        let birth = carrick_kernel::kernel::objects::host_birth_identity(sibling.task().key(), key)
+            .unwrap();
+        page.publish_exact_host_retirement(sibling.thread().control_slot(), birth.retirement());
+    }
+    zone.free_record(id);
+    assert!(zone.live(record).is_none());
+    assert_eq!(root.task().threads().len(), if retired { 1 } else { 2 });
+    resume_tx.send(()).unwrap();
+    drop(authority);
+    let shutdown = pool.shutdown();
+    if !retired {
+        let failure = shutdown.expect_err("record absence without retirement must kill the worker");
+        assert_eq!(failure.retired_workers(), 1);
+        return;
+    }
+    let report = shutdown.expect("retired sibling must leave a clean pool shutdown");
+    assert_eq!(report.created(), report.joined());
+    assert_eq!(report.created(), report.destroyed());
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        binding.reaped_settlements.load(Ordering::SeqCst),
+        1,
+        "retired sibling must publish its existing losing-member result"
+    );
 }
