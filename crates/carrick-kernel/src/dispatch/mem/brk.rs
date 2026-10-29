@@ -195,7 +195,7 @@ impl<'a> MemView<'a> {
             Ok(answer) => answer,
             // No root node left to record the move: brk(2) fails by
             // returning the unchanged break.
-            Err(Refusal::MetadataRequired) => {
+            Err(RootAccessRefusal::Refused(Refusal::MetadataRequired)) => {
                 return Ok(Err(BreakAnswer {
                     value: root
                         .with_root(|model| Ok(model.brk_current()))

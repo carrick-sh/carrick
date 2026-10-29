@@ -4,7 +4,6 @@ use super::*;
 use crate::dispatch::mm_mutation::{HostAliasPermit, MmMutationGuard};
 use crate::dispatch::mm_quiesce::FrameCowExactMmGuard;
 use crate::kernel::MmId;
-use carrick_el1::memory::reservations::Refusal;
 use carrick_el1_abi::ReservationRange;
 
 #[derive(
@@ -437,7 +436,7 @@ impl SyscallDispatcher {
     pub fn first_touch_is_root_owned(&self, page: u64) -> bool {
         let page = page_floor(page, self.linux_page_size());
         match self.mem().lock().try_first_touch_owner(page) {
-            Ok(FirstTouchOwner::Root(..)) | Err(Refusal::Busy) => true,
+            Ok(FirstTouchOwner::Root(..)) | Err(RootAccessRefusal::Busy(_)) => true,
             Ok(FirstTouchOwner::Host | FirstTouchOwner::Unmapped) => false,
             Err(refusal) => super::anonymous::broken_root("a first-touch observation", refusal),
         }
@@ -465,7 +464,8 @@ impl SyscallDispatcher {
                         carrick_mmu_core::aarch64::LeafAccess::Execute => LinuxProtFlags::EXEC,
                     })
                 }),
-            Ok(FirstTouchOwner::Host | FirstTouchOwner::Unmapped) | Err(Refusal::Busy) => false,
+            Ok(FirstTouchOwner::Host | FirstTouchOwner::Unmapped)
+            | Err(RootAccessRefusal::Busy(_)) => false,
             Err(refusal) => super::anonymous::broken_root("a first-touch observation", refusal),
         }
     }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use carrick_el1::memory::reservations::{
-    Refusal, Reservations, ResolvedReservationNodes, RootReleaseVenue, SharedReservations,
+    Refusal, Reservations, ResolvedReservationNodes, RootReleaseVenue, RootWait, SharedReservations,
 };
 use carrick_el1_abi::ReservationMm;
 use carrick_guest_mem::HostVa;
@@ -81,11 +81,11 @@ impl HostReservationProvider for CarrierReservations {
             &self.access,
         ))))
     }
-    fn provision_metadata(&self, mm: ReservationMm) -> Result<(), Refusal> {
+    fn provision_metadata(&self, mm: ReservationMm, wait: &dyn RootWait) -> Result<(), Refusal> {
         // Carrier capacity publication is serialized outside all MM locks.
         let _capacity = self.capacity.lock();
         let view = self.prepare()?;
-        let mut root = view.lock(mm)?;
+        let mut root = view.lock(mm, wait)?;
         match root.secure_host_nodes(carrick_el1::memory::reservations::HOST_RESERVE) {
             Ok(()) => return Ok(()),
             Err(Refusal::MetadataRequired) => {}
@@ -140,7 +140,7 @@ impl HostReservationProvider for CarrierReservations {
 struct PreparedView(Arc<Prepared>);
 
 impl PreparedHostReservations for PreparedView {
-    fn lock(&self, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
+    fn lock(&self, mm: ReservationMm, wait: &dyn RootWait) -> Result<Reservations<'_>, Refusal> {
         let region = self.0.access.region().map_err(|_| Refusal::Stale)?;
         // SAFETY: this is the same owned carrier region as the reservation
         // table. ZoneTables are shared atomics and fit the ABI region bounds.
@@ -175,12 +175,7 @@ impl PreparedHostReservations for PreparedView {
                 ),
             },
         )?
-        .lock_resolved(
-            index,
-            mm,
-            &self.0.nodes,
-            &carrick_el1::memory::reservations::NoRootWait,
-        )
+        .lock_resolved(index, mm, &self.0.nodes, wait)
     }
 }
 

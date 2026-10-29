@@ -169,12 +169,17 @@ impl HostMetadataNeed {
 /// fails with. Fires `hvpatch-el1-root-host-refusal` first, so a trace's
 /// stack names the refusing step (the error alone does not).
 #[inline(never)]
-pub(in crate::dispatch) fn root_refusal(refusal: Refusal) -> DispatchError {
-    crate::probes::hvpatch_el1_root_host_refusal(refusal as u32);
-    DispatchError::ReservationAuthority(refusal)
+pub(in crate::dispatch) fn root_refusal(refusal: impl Into<RootAccessRefusal>) -> DispatchError {
+    let refusal = refusal.into();
+    crate::probes::hvpatch_el1_root_host_refusal(refusal.refusal() as u32);
+    match refusal {
+        RootAccessRefusal::Busy(busy) => DispatchError::ReservationBusy(busy),
+        RootAccessRefusal::Refused(refusal) => DispatchError::ReservationAuthority(refusal),
+    }
 }
 
-pub(super) fn broken_root(context: &str, refusal: Refusal) -> ! {
+pub(super) fn broken_root(context: &str, refusal: impl Into<RootAccessRefusal>) -> ! {
+    let refusal = refusal.into();
     carrick_fatal!(
         "dispatch::anonymous",
         "delegated anonymous root refused {context}: {refusal:?}"
@@ -1588,7 +1593,7 @@ impl MemView<'_> {
         mem: &MemState,
         root: &DelegatedRoot,
         step: impl FnOnce(&mut Reservations<'_>) -> Result<R, Refusal>,
-    ) -> Result<R, Refusal> {
+    ) -> Result<R, RootAccessRefusal> {
         // Both limits infinite: no proposal can exceed them, so nothing is
         // charged (and the guest venue sees zero external charges until a
         // finite limit is pushed, which charges again).
@@ -1615,7 +1620,7 @@ impl MemView<'_> {
         mem: &MemState,
         root: &DelegatedRoot,
         step: impl FnOnce(&mut Reservations<'_>) -> Result<R, Refusal>,
-    ) -> Result<R, Refusal> {
+    ) -> Result<R, RootAccessRefusal> {
         self.with_charged_root(mem, root, |model| {
             model.begin_host_proposal()?;
             step(model)
@@ -1627,7 +1632,7 @@ impl MemView<'_> {
         &self,
         mem: &MemState,
         root: &DelegatedRoot,
-    ) -> Result<(), Refusal> {
+    ) -> Result<(), RootAccessRefusal> {
         self.with_charged_root(mem, root, |_| Ok(()))
     }
 
@@ -1658,7 +1663,7 @@ impl MemView<'_> {
             })
         };
         let secured = match secure() {
-            Err(Refusal::MetadataRequired) => {
+            Err(RootAccessRefusal::Refused(Refusal::MetadataRequired)) => {
                 // The failed proposal held no committed edit. No MemState
                 // or root lock is retained across carrier allocation.
                 match root.provision_metadata() {
@@ -1666,7 +1671,7 @@ impl MemView<'_> {
                     // A real capacity request has now failed. Linux also
                     // answers ENOMEM when mapping metadata cannot be
                     // allocated; this MM remains admitted and unchanged.
-                    Err(Refusal::Limit | Refusal::MetadataRequired) => {
+                    Err(RootAccessRefusal::Refused(Refusal::Limit | Refusal::MetadataRequired)) => {
                         return Ok(Some(LINUX_ENOMEM));
                     }
                     Err(refusal) => return Err(root_refusal(refusal)),
@@ -1677,7 +1682,7 @@ impl MemView<'_> {
         };
         match secured {
             Ok(()) => Ok(None),
-            Err(Refusal::MetadataRequired) => Ok(Some(LINUX_ENOMEM)),
+            Err(RootAccessRefusal::Refused(Refusal::MetadataRequired)) => Ok(Some(LINUX_ENOMEM)),
             Err(refusal) => Err(root_refusal(refusal)),
         }
     }
@@ -1707,13 +1712,13 @@ impl MemView<'_> {
             }
             // mmap/munmap/mprotect proposals always carry work.
             Ok(Decision::Complete(_)) => Err(root_refusal(Refusal::Invalid)),
-            Err(
+            Err(RootAccessRefusal::Refused(
                 refusal @ (Refusal::Limit
                 | Refusal::Collision
                 | Refusal::ForeignMapping
                 | Refusal::Hole
                 | Refusal::MetadataRequired),
-            ) => Ok(Err(refusal)),
+            )) => Ok(Err(refusal)),
             Err(refusal) => Err(root_refusal(refusal)),
         }
     }
@@ -1771,12 +1776,12 @@ impl MemView<'_> {
                 mem.retire_stale_first_touch(&holes);
                 Ok(Ok(placed.start()))
             }
-            Err(
+            Err(RootAccessRefusal::Refused(
                 refusal @ (Refusal::Limit
                 | Refusal::Collision
                 | Refusal::ForeignMapping
                 | Refusal::MetadataRequired),
-            ) => Ok(Err(refusal)),
+            )) => Ok(Err(refusal)),
             Err(refusal) => Err(root_refusal(refusal)),
         }
     }
@@ -2273,13 +2278,19 @@ impl MemView<'_> {
                 }
                 // Growth over a limit, nothing in place and no room, or no
                 // root node left to record it.
-                Err(Refusal::Limit | Refusal::MetadataRequired) => {
+                Err(RootAccessRefusal::Refused(Refusal::Limit | Refusal::MetadataRequired)) => {
                     return Ok(Some(DispatchOutcome::errno(LINUX_ENOMEM)));
                 }
-                Err(Refusal::Hole) => return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT))),
-                Err(Refusal::Invalid) => return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL))),
+                Err(RootAccessRefusal::Refused(Refusal::Hole)) => {
+                    return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
+                }
+                Err(RootAccessRefusal::Refused(Refusal::Invalid)) => {
+                    return Ok(Some(DispatchOutcome::errno(LINUX_EINVAL)));
+                }
                 // A fixed destination the root cannot own.
-                Err(Refusal::ForeignMapping | Refusal::Collision) => return Ok(None),
+                Err(RootAccessRefusal::Refused(Refusal::ForeignMapping | Refusal::Collision)) => {
+                    return Ok(None);
+                }
                 Err(refusal) => return Err(root_refusal(refusal)),
             }
         };
