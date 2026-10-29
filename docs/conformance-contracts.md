@@ -2358,6 +2358,23 @@ The VM-free binding primes actual thread pools with runtime adoption
 reservations containing real process-birth submissions. Two live tasks then
 exit during close; unused capacity must retire before executor joins.
 
+An irrevocable process-exit owner also retains custody when a host control
+request wins just before its futex park. The queue owner undoes the unpublished
+enrollment and hands the exact continuation to that request through the existing
+unswitch transition. Ordinary interruptible parks keep their refusal behavior;
+foreign guards, stale bindings and absent owner continuations cannot authorize
+this terminal handback. The VM-free two-live-member witness was red with
+`NativeQuarantined`: the refused park reached `run_failed`, which retired the
+record before reporting failure. It requires retained custody, sibling retirement
+and the original exit status 0 after host re-entry. The core binding additionally
+checks zero remaining wait entries and one exact handback. The pool binding runs
+that same native fixture inside an executor's idle quantum, joins every worker
+and requires status 0 plus clean shutdown. Its refused native entry retains the
+actual execution binding through the production failure codec and one-shot
+carrier consumer. These are constant-work assertions. Signed stress attribution
+remains director-owned; the observed missing-record error alone cannot prove
+expected group retirement rather than secondary retirement by `run_failed`.
+
 ### Interrupted-sleep remainder publication (#986 Slice 1)
 
 `kernel.memory.owner-wait` includes the frozen remainder from an interrupted

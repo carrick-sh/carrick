@@ -5271,11 +5271,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             *zone.record(record).ctx_mut() = *self.words;
             zone.record(record).publish_owner_continuation(entry);
         }
-        let Some(receipt) = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        ) else {
+        let sequence = carrick_el1_abi::EntryRecordGeneration(sequence);
+        // Only the process owner owes a retained close continuation. A losing
+        // caller already published its member receipt and retires below.
+        let receipt = if is_owner {
+            carrick_core::terminal::park_process_exit(start, &guard, sequence)
+        } else {
+            carrick_core::entry::publish_handoff_park(start, &guard, sequence)
+        };
+        let Some(receipt) = receipt else {
             if !is_owner {
                 // SAFETY: the park CAS was refused while this slot still owns
                 // `record`; consume the continuation and retire the losing

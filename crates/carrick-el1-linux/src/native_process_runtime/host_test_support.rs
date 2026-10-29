@@ -367,7 +367,6 @@ pub struct NativeSignalFixture {
     runtime: Arc<NativeProcessRuntime<'static, AddressContext<RootGpa>, ParkedContextWords>>,
     task: &'static CurrentTask,
     control: &'static ThreadControlSlot,
-    #[cfg(test)]
     page: &'static ThreadLifecyclePage,
     child_page: &'static ThreadLifecyclePage,
     child_controls: &'static [ThreadControlSlot; 9],
@@ -489,7 +488,6 @@ impl NativeSignalFixture {
             runtime,
             task,
             control,
-            #[cfg(test)]
             page,
             child_page,
             child_controls,
@@ -1457,7 +1455,6 @@ impl NativeServiceCapacityFixture {
     }
 }
 
-#[cfg(test)]
 fn native_exec_fixture() -> NativeSignalFixture {
     NativeSignalFixture::new(
         ExecutionBinding {
@@ -1729,7 +1726,6 @@ fn refused_exec_preparation_is_cancelled_exactly_once() {
     assert!(fixture.zone.spaces.find(successor_mm.raw()).is_none());
 }
 
-#[cfg(test)]
 struct ExecSibling {
     task: &'static CurrentTask,
     control: &'static ThreadControlSlot,
@@ -1750,7 +1746,6 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
     )
 }
 
-#[cfg(test)]
 fn add_service_sibling(
     fixture: &NativeSignalFixture,
     operation: Option<carrick_core_abi::service::ServiceOperation>,
@@ -1915,6 +1910,9 @@ fn add_service_sibling(
         service_ticket,
     }
 }
+
+#[path = "tests/terminal_park.rs"]
+pub mod terminal_park_tests;
 
 #[cfg(test)]
 #[test]

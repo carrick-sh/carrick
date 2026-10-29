@@ -388,6 +388,72 @@ fn running_compact(
 }
 
 #[test]
+fn terminal_park_hands_back_only_an_exact_requested_owner() {
+    use carrick_core::entry::{prepare_handoff, publish_handoff_park};
+    use carrick_core_abi::{BornInZoneSource, EntryRecordGeneration};
+    use carrick_sched_core::object_wait::OwnerEntry;
+    use carrick_sched_core::{Claim, Handback, HostClaim, ShortLockSpin};
+
+    for (terminal, owner_continuation, wrong_guard) in [
+        (true, true, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let zone = compact_zone();
+        let foreign = compact_zone();
+        let (slot, record, binding) = running_compact(&zone, 19);
+        let source = BornInZoneSource { zone: &zone, slot };
+        let start = prepare_handoff(binding, source, record).unwrap();
+        let reference = zone.record_ref(record);
+        assert!(
+            matches!(zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin),
+            HostClaim::El1Held { slot: owner } if owner == slot)
+        );
+        if owner_continuation {
+            // SAFETY: this exact fixture still owns the running record.
+            unsafe {
+                zone.record(record)
+                    .publish_owner_continuation(OwnerEntry::Syscall)
+            };
+        }
+        let guard = zone
+            .lock(ZoneTables::bucket_of(29, 0x1000), &ShortLockSpin)
+            .unwrap();
+        let sequence = zone.next_seq(record);
+        zone.enqueue(&guard, record, sequence, 29, 0x1000, u32::MAX, 0)
+            .unwrap();
+        let foreign_guard = foreign
+            .lock(ZoneTables::bucket_of(29, 0x1000), &ShortLockSpin)
+            .unwrap();
+        let selected_guard = if wrong_guard { &foreign_guard } else { &guard };
+        let receipt = if terminal {
+            carrick_core::terminal::park_process_exit(
+                start,
+                selected_guard,
+                EntryRecordGeneration(sequence),
+            )
+        } else {
+            publish_handoff_park(start, selected_guard, EntryRecordGeneration(sequence))
+        };
+        let accepted = terminal && owner_continuation && !wrong_guard;
+        assert_eq!(receipt.is_some(), accepted);
+        if accepted {
+            assert_eq!(zone.slot(slot).current(), None);
+            assert_eq!(zone.record(record).entry_count(), 0);
+            assert_eq!(zone.take_service_head(slot), Some(reference));
+            assert!(zone.live(reference).is_some());
+        } else {
+            assert_eq!(zone.slot(slot).current(), Some(record));
+            assert!(matches!(
+                zone.record(record).claim(),
+                Claim::OnCpuRequested { .. }
+            ));
+        }
+    }
+}
+
+#[test]
 fn compact_born_entry_parks_with_actual_handoff_receipt() {
     use carrick_core::entry::{
         admit_born_in_zone, handoff_born_in_zone, prepare_handoff, publish_handoff_park,

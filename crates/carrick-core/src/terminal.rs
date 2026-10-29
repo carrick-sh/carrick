@@ -297,6 +297,16 @@ pub struct Terminal;
 pub struct Closing;
 pub struct Settled;
 
+/// Park an irrevocable process-close continuation, or hand it to the host
+/// request which won entry admission. Both outcomes retain terminal custody.
+pub fn park_process_exit<C: carrick_core_abi::EntryContext>(
+    start: crate::entry::HandoffStart<'_, C>,
+    guard: &carrick_sched_core::BucketGuard<'_, C>,
+    sequence: carrick_core_abi::EntryRecordGeneration,
+) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+    crate::entry::publish_terminal_park(start, guard, sequence)
+}
+
 /// Raw task membership supplied by the graph that owns its registry. Core
 /// decides whether an absent task makes a terminal retry already retired.
 pub trait TaskMembership {

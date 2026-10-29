@@ -289,17 +289,56 @@ pub fn publish_handoff_park<C: EntryContext>(
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: EntryRecordGeneration,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+    publish_handoff_park_with(start, guard, sequence, ParkCustody::Interruptible)
+}
+
+enum ParkCustody {
+    Interruptible,
+    Terminal,
+}
+
+/// Terminal custody cannot return an interrupted park to its syscall caller.
+/// A pending host request instead receives the retained owner continuation.
+pub(crate) fn publish_terminal_park<C: EntryContext>(
+    start: HandoffStart<'_, C>,
+    guard: &carrick_sched_core::BucketGuard<'_, C>,
+    sequence: EntryRecordGeneration,
+) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+    publish_handoff_park_with(start, guard, sequence, ParkCustody::Terminal)
+}
+
+fn publish_handoff_park_with<C: EntryContext>(
+    start: HandoffStart<'_, C>,
+    guard: &carrick_sched_core::BucketGuard<'_, C>,
+    sequence: EntryRecordGeneration,
+    custody: ParkCustody,
+) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     if !core::ptr::eq(start.source.zone, guard.zone())
         || record_binding(start.binding, start.source, start.record.record) != Some(start.record)
         || sequence.0 != start.source.zone.next_seq(start.record.record)
-        || !start.source.zone.publish_guest_park(
-            guard,
-            start.source.slot,
-            start.record.record,
-            sequence.0,
-        )
     {
         return None;
+    }
+    let zone = start.source.zone;
+    let record = start.record.record;
+    if !zone.publish_guest_park(guard, start.source.slot, record, sequence.0) {
+        // Failed publication undid enrollment and retained the running owner.
+        // Only this exact host-request transition licenses a terminal handback;
+        // no missing, stale, foreign-slot or cancelled record is accepted.
+        if !matches!(custody, ParkCustody::Terminal)
+            || zone.record(record).is_cancelled()
+            || !matches!(
+                zone.record(record).resume_disposition(),
+                carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
+            )
+            || !matches!(zone.record(record).claim(),
+                carrick_sched_core::Claim::OnCpuRequested { slot, .. }
+                    if slot == start.source.slot)
+            || record_binding(start.binding, start.source, record) != Some(start.record)
+            || !zone.unswitch(start.source.slot, record)
+        {
+            return None;
+        }
     }
     Some(start.published())
 }
