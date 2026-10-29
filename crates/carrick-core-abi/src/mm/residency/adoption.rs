@@ -63,6 +63,11 @@ impl core::fmt::Debug for StockAdoptionTransaction<'_> {
     }
 }
 impl StockAdoptionTransaction<'_> {
+    fn quarantine(&self) {
+        self.table.slots[self.slot]
+            .stock_retained
+            .fetch_or(STOCK_QUARANTINED, Ordering::AcqRel);
+    }
     fn matches(&self) -> bool {
         let record = &self.table.slots[self.slot];
         record.state.load(Ordering::Acquire) == self.epoch
@@ -80,6 +85,7 @@ impl StockAdoptionTransaction<'_> {
             return Err(StockAdoptionRefusal::AlreadySettled);
         }
         if !self.matches() {
+            self.quarantine();
             return Err(StockAdoptionRefusal::PreimageChanged);
         }
         let Some(snapshot) = snapshot(
@@ -89,6 +95,7 @@ impl StockAdoptionTransaction<'_> {
             self.staged_mappings,
             self.committed[0],
         ) else {
+            self.quarantine();
             return Err(StockAdoptionRefusal::PreimageChanged);
         };
         self.table.dirty[self.slot / 64].fetch_or(1 << (self.slot % 64), Ordering::Release);
@@ -103,6 +110,7 @@ impl StockAdoptionTransaction<'_> {
             return Err(StockAdoptionRefusal::AlreadySettled);
         }
         if !self.matches() {
+            self.quarantine();
             return Err(StockAdoptionRefusal::PreimageChanged);
         }
         let record = &self.table.slots[self.slot];
@@ -122,9 +130,7 @@ impl Drop for StockAdoptionTransaction<'_> {
         if self.active {
             // The exact-MM editor excludes legitimate record replacement.
             // Never clear a mismatched claim or authorize physical release.
-            self.table.slots[self.slot]
-                .stock_retained
-                .fetch_or(STOCK_QUARANTINED, Ordering::AcqRel);
+            self.quarantine();
         }
     }
 }

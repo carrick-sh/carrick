@@ -402,6 +402,7 @@ fn stock_adoption_failed_settlement_returns_custody_without_reopening_row() {
     assert!(table.stock_adoptions(who, id).is_none());
     assert_eq!(pending.commit(), Err(StockAdoptionRefusal::PreimageChanged));
     assert!(table.stock_adoptions(who, id).is_none());
+    assert!(table.stock_adoption_quarantined(who, id));
     drop(pending);
     assert!(table.stock_adoption_quarantined(who, id));
     assert_eq!(table.stock_record_count(), 1);
@@ -493,6 +494,10 @@ fn stock_adoption_quarantine_latch_blocks_even_a_damaged_pin_claim() {
         pending.rollback(),
         Err(StockAdoptionRefusal::PreimageChanged)
     );
+    assert!(table.stock_adoption_quarantined(who, id));
+    assert!(table.stock_adoption_quarantined(who, id));
+    assert!(!table.record_commit(token));
+    assert!(table.pin_transfer(token).is_none());
     drop(pending);
     assert!(table.stock_adoption_quarantined(who, id));
     assert!(!table.record_commit(token));

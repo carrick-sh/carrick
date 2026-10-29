@@ -43,7 +43,8 @@ all overlay words, stages the complete validated change, and exposes no stable
 adoption snapshot until commit. Explicit rollback restores its exact overlay
 preimage before reopening the row. Dropping an unsettled transaction retains
 its claim and latches quarantine; it never guesses that descriptor undo
-succeeded. Quarantine blocks adoption, commit bits, transfer pinning and
+succeeded. A settlement preimage mismatch latches quarantine before returning
+refusal, even while its borrowed guard remains retained. Quarantine blocks adoption, commit bits, transfer pinning and
 retirement. The enclosing owner must retain physical custody as in S3.
 
 This is one transaction participant, not permission to publish descriptors.
