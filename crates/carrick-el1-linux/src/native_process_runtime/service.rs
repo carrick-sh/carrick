@@ -65,8 +65,16 @@ struct PendingHostFile {
 }
 
 /// Ring-owned input of a typed service, retained until completion ACK.
+pub(super) struct OwnedCopyout {
+    pub address: UserVa,
+    pub bytes: Vec<u8>,
+    pub offset: usize,
+    pub result: SyscallResult,
+}
+
 enum ServicePayload {
     None,
+    Copyout(OwnedCopyout),
     Exec(Box<[u8]>),
     HostFile(PendingHostFile),
 }
@@ -78,6 +86,7 @@ pub(super) struct PendingService<'a> {
     _exec_payload: Option<Box<[u8]>>,
     /// The same custody for a host-file record, which the carrier also writes.
     host_file: Option<PendingHostFile>,
+    copyout: Option<Box<OwnedCopyout>>,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     retry_syscall_after_supply: bool,
     carrier_continuation: Option<CarrierContinuation>,
@@ -134,6 +143,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .graph
             .lock()
             .service_wait(&record)
+            .filter(|pending| pending.copyout.is_none() || pending.claim.cancellation().is_some())
             .map(|pending| (pending.request, pending.control.clone()));
         let Some((request, control)) = pending else {
             // Scalar IPC has a retained adapter token, not a host-service cell.
@@ -300,6 +310,56 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         })
     }
 
+    #[inline(never)]
+    pub(super) fn drain_copyout(
+        &mut self,
+        mut result: Result<NativeResume, NativeProcessError>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        while result.is_ok() {
+            let Some(output) = self.copyout_ready.take() else {
+                break;
+            };
+            result = self.finish_copyout(*output);
+        }
+        result
+    }
+
+    /// Commit a completed ring answer a bounded page at a time. Owner waits
+    /// retain both the answer and its next unwritten byte in the service row.
+    #[inline(never)]
+    pub(super) fn finish_copyout(
+        &mut self,
+        mut output: OwnedCopyout,
+    ) -> Result<NativeResume, NativeProcessError> {
+        while output.offset < output.bytes.len() {
+            let address = output
+                .address
+                .raw()
+                .checked_add(output.offset as u64)
+                .ok_or(NativeProcessError::Fault)?;
+            let count = (4096 - (address as usize & 4095)).min(output.bytes.len() - output.offset);
+            match self.copy_owner_frame(
+                UserVa::new(address),
+                &output.bytes[output.offset..output.offset + count],
+            ) {
+                Ok(()) => output.offset += count,
+                Err(NativeProcessError::OwnerWait(wait)) => {
+                    return self.begin_service_inner(
+                        ServiceOperation::CarrierWork {
+                            entry: OwnerEntry::Syscall,
+                        },
+                        None,
+                        Some(wait),
+                        ServicePayload::Copyout(output),
+                        false,
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(NativeResume::Returned(output.result))
+    }
+
     /// Intake may capture backing, but never waits for another guest. The
     /// owning request is visible to terminal close before its physical intake.
     #[inline(never)]
@@ -461,6 +521,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         payload: ServicePayload,
         retry_syscall_after_supply: bool,
     ) -> Result<NativeResume, NativeProcessError> {
+        let (payload, copyout) = match payload {
+            ServicePayload::Copyout(output) => (ServicePayload::None, Some(Box::new(output))),
+            payload => (payload, None),
+        };
         let (exec_payload, host_file) = match (operation, payload) {
             (ServiceOperation::Exec { .. }, ServicePayload::Exec(payload)) => (Some(payload), None),
             (ServiceOperation::HostFile { .. }, ServicePayload::HostFile(pending)) => {
@@ -471,6 +535,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Stale);
             }
             (_, ServicePayload::None) => (None, None),
+            (_, ServicePayload::Copyout(_)) => unreachable!(),
         };
         let (page, control, mm) = {
             let graph = self.runtime.graph.lock();
@@ -619,6 +684,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 reply,
                 _exec_payload: exec_payload,
                 host_file,
+                copyout,
                 exec_successor,
                 retry_syscall_after_supply,
                 carrier_continuation,
@@ -829,7 +895,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let key =
                     ObjectWaitKey::native_service(self.record).ok_or(ObjectWaitError::Stale)?;
                 let _queue = zone.object_wait(key, &carrick_sched_core::ShortLockSpin)?;
-                if self.signal_interrupts_current()
+                let interruptible = self
+                    .runtime
+                    .graph
+                    .lock()
+                    .service_wait(&self.record)
+                    .is_none_or(|pending| {
+                        pending.copyout.is_none() || pending.claim.cancellation().is_some()
+                    });
+                if (interruptible && self.signal_interrupts_current())
                     || self.runtime.graph.lock().pending.has_exit(&self.key)
                 {
                     self.control
@@ -1468,7 +1542,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(NativeProcessError::Quarantined);
         }
         let retry_syscall_after_supply = pending.retry_syscall_after_supply;
-        let exiting = self.runtime.graph.lock().pending.has_exit(&self.key);
+        let exiting = self.runtime.graph.lock().pending.has_exit(&self.key)
+            || (pending.copyout.is_some() && pending.claim.cancellation().is_some());
         if (exiting || result == ServiceResult::Cancelled)
             && let Some(PendingServiceReply::Fault(reply)) = &pending.reply
         {
@@ -1587,7 +1662,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .record(self.record.id)
                 .consume_owner_continuation();
         }
+        let output = pending.copyout.take();
         let completed = (|| {
+            if output.is_some() {
+                return Ok(NativeResume::NoPending);
+            }
             if retry_syscall_after_supply {
                 return match result {
                     ServiceResult::Supplied => Ok(NativeResume::RetrySyscall),
@@ -1807,6 +1886,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Some(CarrierContinuation::Parked(_))
         ) && matches!(completed, Ok(NativeResume::NoPending));
         self.release_service_claim(pending.claim)?;
+        if let Some(output) = output {
+            // Unwind all service/queue frames before the next write attempt.
+            // The entering owner drains this exact completed output below.
+            self.copyout_ready = Some(output);
+            return Ok(NativeResume::NoPending);
+        }
         if redrive {
             // Also covers an ACK already ready at enrollment: that caller does
             // not pass through resume_checkpoint before returning to EL0.

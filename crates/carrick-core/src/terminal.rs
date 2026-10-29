@@ -296,6 +296,9 @@ where
             .map_err(|_| carrick_core_abi::lifecycle::GateState::ForkClosing)?;
         Ok(Self(page))
     }
+    pub fn cancellation(&self) -> Option<ProcessCancellation> {
+        self.0.process_exit_custody().cancellation()
+    }
     pub fn admitted(&self) -> bool {
         !self.0.gate().is_terminal()
     }

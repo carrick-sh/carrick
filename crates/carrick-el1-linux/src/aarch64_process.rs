@@ -2483,6 +2483,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                     &mut venue,
                 )
                 .map_err(|failure| match failure {
+                    UserWriteError::Owner(carrick_core::mm::transaction::MmError::Wait(wait)) => {
+                        NativeProcessError::OwnerWait(wait)
+                    }
                     UserWriteError::Owner(_) => NativeProcessError::Fault,
                     UserWriteError::Mechanics(error) => error,
                     UserWriteError::Busy => NativeProcessError::Busy,

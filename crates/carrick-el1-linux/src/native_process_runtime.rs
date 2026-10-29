@@ -230,6 +230,7 @@ pub enum NativeProcessError {
     Stale,
     Exhausted,
     Fault,
+    OwnerWait(carrick_core_abi::PortalOwnerWait),
     ForkRefused(super::native_fork_refusal::NativeForkRefusal),
     Unsupported,
     GroupExitCustody,
@@ -248,6 +249,7 @@ impl NativeProcessError {
             Self::ForkRefused(refusal) => refusal.error().run_failure_reason(),
             Self::Unsupported => R::NativeUnsupported,
             Self::Busy => R::NativeBusy,
+            Self::OwnerWait(_) => R::NativeFault,
             Self::Quarantined => R::NativeQuarantined,
             Self::NoChild => R::NativeNoChild,
             Self::GroupExitCustody => R::X86GroupExitCustody,
@@ -257,7 +259,7 @@ impl NativeProcessError {
         match self {
             Self::Invalid | Self::Stale => -22,
             Self::Exhausted | Self::Busy => -11,
-            Self::Fault => -14,
+            Self::Fault | Self::OwnerWait(_) => -14,
             Self::ForkRefused(refusal) => refusal.error().errno(),
             Self::Unsupported | Self::GroupExitCustody => -38,
             Self::Quarantined => -5,
@@ -548,6 +550,16 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         _bytes: &[u8],
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
+    }
+    /// Exact-MM bounded output for ring operations. Preserve an owner wait
+    /// instead of collapsing it into a guest address fault.
+    fn copy_owned_bytes(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        self.copy_signal_bytes(mm, address, bytes)
     }
     /// Copy a completed syscall's output to the caller's user memory on the
     /// selected record's live address space, with EL0 permissions. The
@@ -3545,6 +3557,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             slot,
             owner_continuation,
+            copyout_ready: None,
         })
     }
     /// Enter through the exact process registry. A non-leader thread retains
@@ -3587,6 +3600,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             slot: Some(member_control),
             owner_continuation,
+            copyout_ready: None,
         }))
     }
 
@@ -3831,6 +3845,7 @@ pub struct NativeProcessEntry<
     // Captured by native admission under its existing graph guard. Ordinary
     // syscall dispatch does not acquire another graph lock for this checkpoint.
     owner_continuation: bool,
+    copyout_ready: Option<Box<service::OwnedCopyout>>,
 }
 
 impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
@@ -4523,7 +4538,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .resources()
             .mm
             .clone();
-        self.service.copy_signal_bytes(&mm, address, bytes)
+        self.service
+            .copy_signal_bytes(&mm, address, bytes)
+            .map_err(|error| match error {
+                NativeProcessError::OwnerWait(_) => NativeProcessError::Fault,
+                other => other,
+            })
+    }
+    fn copy_owner_frame(
+        &mut self,
+        address: UserVa,
+        bytes: &[u8],
+    ) -> Result<(), NativeProcessError> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        self.service.copy_owned_bytes(&mm, address, bytes)
     }
     fn park_signal_wait(
         &mut self,
@@ -5336,7 +5374,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return result.map_err(NativeProcessError::run_failure_reason);
         }
         if let Some(result) = self.resume_service() {
-            match result.map_err(NativeProcessError::run_failure_reason)? {
+            let result = self
+                .drain_copyout(result)
+                .map_err(NativeProcessError::run_failure_reason)?;
+            match result {
                 NativeResume::NoPending => {}
                 NativeResume::RetrySyscall => return Ok(NativeResume::RetrySyscall),
                 NativeResume::Left(status) => {
@@ -7007,8 +7048,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
         self.run_failure.take()
     }
-    fn copy_out_owned(&mut self, dst: UserVa, bytes: &[u8]) -> Option<bool> {
-        Some(self.copy_signal_frame(dst, bytes).is_ok())
+    fn copy_out_owned(
+        &mut self,
+        dst: UserVa,
+        bytes: &[u8],
+    ) -> Option<Result<(), carrick_personality_linux::lifecycle::OwnedCopyError>> {
+        use carrick_personality_linux::lifecycle::OwnedCopyError;
+        Some(
+            self.copy_owner_frame(dst, bytes)
+                .map_err(|error| match error {
+                    NativeProcessError::OwnerWait(wait) => OwnedCopyError::Wait(wait),
+                    _ => OwnedCopyError::Fault,
+                }),
+        )
+    }
+    fn complete_copyout(
+        &mut self,
+        address: UserVa,
+        bytes: Vec<u8>,
+        result: SyscallResult,
+    ) -> LifecycleOutcome {
+        let result = self.finish_copyout(service::OwnedCopyout {
+            address,
+            bytes,
+            offset: 0,
+            result,
+        });
+        match self.drain_copyout(result) {
+            Ok(NativeResume::Returned(result)) => returned(result.raw()),
+            Ok(NativeResume::Left(None)) => LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                result: SyscallResult::new(0),
+            },
+            Ok(_) => self.fail(NativeProcessError::Quarantined),
+            Err(error) => self.fail(error),
+        }
     }
     fn take_map_source(
         &mut self,
@@ -9201,6 +9275,8 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error,
+                child_copy_error_at: None,
+                on_copy_complete: None,
                 on_signal_clock: None,
             };
             let mut parent = runtime
@@ -9458,6 +9534,8 @@ mod tests {
                     tid_writes: Vec::new(),
                     refuse_copy: false,
                     child_copy_error: None,
+                    child_copy_error_at: None,
+                    on_copy_complete: None,
                     on_signal_clock: None,
                 };
                 let mut entry = runtimes[index]
@@ -9576,6 +9654,8 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                child_copy_error_at: None,
+                on_copy_complete: None,
                 on_signal_clock: None,
             },
             Physical {
@@ -9588,6 +9668,8 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                child_copy_error_at: None,
+                on_copy_complete: None,
                 on_signal_clock: None,
             },
         ];
@@ -9967,6 +10049,8 @@ mod tests {
                         tid_writes: Vec::new(),
                         refuse_copy: false,
                         child_copy_error: None,
+                        child_copy_error_at: None,
+                        on_copy_complete: None,
                         on_signal_clock: None,
                     };
                     let mut entry = runtime
@@ -10027,6 +10111,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -10174,6 +10260,8 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                child_copy_error_at: None,
+                on_copy_complete: None,
                 on_signal_clock: None,
             };
             let mut entry = runtime
@@ -10405,6 +10493,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let observed = crate::common_entry::execution_binding(&thread);
@@ -10721,6 +10811,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut process = runtime
@@ -10948,6 +11040,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         use carrick_personality_linux::signal::{ProcessSignals, SignalWaitOutcome};
@@ -11294,6 +11388,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -11410,6 +11506,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -11556,6 +11654,8 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                child_copy_error_at: None,
+                on_copy_complete: None,
                 on_signal_clock: None,
             };
             assert!(zone.slot(slot).current().is_none());
@@ -11833,6 +11933,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         assert!(zone.slot(slot).current().is_none());
@@ -12063,6 +12165,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let parent = TaskKey {
@@ -12702,6 +12806,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         use carrick_personality_linux::signal::ProcessSignals;
@@ -12804,6 +12910,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut parent_entry = runtime
@@ -12895,6 +13003,8 @@ mod tests {
                         tid_writes: Vec::new(),
                         refuse_copy: false,
                         child_copy_error: None,
+                        child_copy_error_at: None,
+                        on_copy_complete: None,
                         on_signal_clock: None,
                     };
                     let mut entry = runtime
@@ -12942,6 +13052,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -13117,6 +13229,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let parent = TaskKey {
@@ -13314,6 +13428,8 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                child_copy_error_at: None,
+                on_copy_complete: None,
                 on_signal_clock: None,
             };
             let root = TaskKey {
@@ -13546,6 +13662,8 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                child_copy_error_at: None,
+                on_copy_complete: None,
                 on_signal_clock: None,
             };
             let parent = TaskKey {
@@ -13819,6 +13937,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14061,6 +14181,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14168,6 +14290,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14305,6 +14429,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14408,6 +14534,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -14565,6 +14693,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -15011,6 +15141,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         let mut entry = runtime
@@ -15207,6 +15339,8 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            child_copy_error_at: None,
+            on_copy_complete: None,
             on_signal_clock: None,
         };
         use carrick_personality_linux::ipc::{IpcOutcome, ProcessIpcVenue};
