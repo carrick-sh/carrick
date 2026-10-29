@@ -5099,9 +5099,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let (custody, membership) = custody
             .reserve_nonfinal(page)
             .map_err(|_| NativeProcessError::Quarantined)?;
-        let receipt =
-            carrick_core::entry::retire_current(self.binding, self.source, self.record.id)
-                .ok_or(NativeProcessError::Quarantined)?;
+        let receipt = custody
+            .retire_zone_current(self.control, self.binding, self.source, self.record.id)
+            .ok_or(NativeProcessError::Quarantined)?;
         carrick_core::lifecycle::retire_cancelled_pool_member(
             page,
             entry,

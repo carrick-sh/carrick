@@ -447,6 +447,39 @@ where
                 );
                 continue;
             }
+            if let crate::trap::TrapError::ZoneContinuationMissing { record, .. } = &error {
+                let member = running.thread().control_slot();
+                let birth = carrick_kernel::kernel::objects::host_birth_identity(
+                    running.thread().task_key(),
+                    thread,
+                );
+                let verdict = birth.map(|birth| {
+                    carrick_core::terminal::missing_zone_continuation(
+                        member,
+                        birth,
+                        member.host_birth_identity(),
+                        *record,
+                        member.zone_record(),
+                    )
+                });
+                if verdict == Some(carrick_core::terminal::MissingContinuationVerdict::Terminal) {
+                    // The neutral owner authenticated this exact member's end.
+                    // No backend or executor infers death from record absence.
+                    binding
+                        .clear_terminal_cpu_residency()
+                        .map_err(|error| error.to_string())?;
+                    scheduler
+                        .settle_exited(running)
+                        .map_err(|error| error.to_string())?;
+                    resolver.retire(thread, generation);
+                    binding.after_reaped_settlement();
+                    receipts.record(
+                        executor_id,
+                        ExecutorPoolEvent::SettledExited { thread, generation },
+                    );
+                    continue;
+                }
+            }
             let settlement = fail_running_and_retire::<F::TaskBinding, _>(
                 resolver.as_ref(),
                 scheduler,

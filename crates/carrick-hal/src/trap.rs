@@ -403,6 +403,15 @@ impl HostAliasBacking {
     }
 }
 
+/// The load path which observed an absent saved zone continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZoneRestoreSite {
+    DirectLoad,
+    CrossExecutorRecheck,
+    CrossExecutorWait,
+    MaterializeAccessor,
+}
+
 #[derive(Debug, ::thiserror::Error)]
 pub enum TrapError {
     /// An authenticated native owner retired its root; never resume the guest.
@@ -426,6 +435,13 @@ pub enum TrapError {
     },
     #[error("syscall trapping is not available on this platform")]
     UnsupportedPlatform,
+    /// Absence is not itself terminal authority. The neutral owner must
+    /// authenticate the retained member's exact retirement before settlement.
+    #[error("zone record {record:?} is gone during {site:?}")]
+    ZoneContinuationMissing {
+        record: carrick_sched_core::RecordRef,
+        site: ZoneRestoreSite,
+    },
     #[error("hypervisor operation failed: {0}")]
     Hypervisor(String),
     /// The signal frame could not be written to the guest's user stack. Linux

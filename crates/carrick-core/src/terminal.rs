@@ -39,6 +39,38 @@ pub fn native_exception_retains_terminal_wake<C: carrick_core_abi::EntryContext>
     owned && zone.live(record).is_some()
 }
 
+/// A missing saved continuation is benign only after exact member retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissingContinuationVerdict {
+    Terminal,
+    InvariantViolation,
+}
+
+/// Classify an absent zone record using the retained control incarnation.
+/// The load error supplies `missing`; raw control observations never mint
+/// terminal authority. Cancellation or process close alone proves nothing.
+pub fn missing_zone_continuation(
+    member: &dyn MemberControl,
+    expected_birth: ThreadBirthIdentity,
+    observed_birth: Option<ThreadBirthIdentity>,
+    missing: carrick_sched_core::RecordRef,
+    bound_record: Option<carrick_sched_core::RecordRef>,
+) -> MissingContinuationVerdict {
+    if observed_birth != Some(expected_birth) || bound_record != Some(missing) {
+        return MissingContinuationVerdict::InvariantViolation;
+    }
+    let in_zone = crate::lifecycle::recorded_member_exit_kind(member, member.member_entry())
+        == MemberExitKind::InZone;
+    let host_retired = member
+        .host_retirement()
+        .is_some_and(|receipt| receipt.acknowledges(expected_birth));
+    if member.exit_custody().zone_terminal() || in_zone || host_retired {
+        MissingContinuationVerdict::Terminal
+    } else {
+        MissingContinuationVerdict::InvariantViolation
+    }
+}
+
 pub struct PoolMemberObservation<'a> {
     pub entry: EntryRef,
     /// The control slot retained by this member, even if its shared pool
@@ -992,6 +1024,26 @@ impl TerminalCustody<Thread, Exiting> {
 }
 
 impl TerminalCustody<Thread, Terminal> {
+    /// Publish the exact terminal member before making its continuation absent.
+    /// Unlike failure cleanup, this requires admitted nonfinal terminal custody.
+    pub fn retire_zone_current<C: carrick_core_abi::EntryContext>(
+        &self,
+        member: &dyn MemberControl,
+        binding: ExecutionBinding,
+        source: carrick_core_abi::BornInZoneSource<'_, C>,
+        record: carrick_sched_core::RecordId,
+    ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+        if binding != self.identity.binding() || member.member_entry() != self.identity.entry() {
+            return None;
+        }
+        crate::entry::prepare_handoff(binding, source, record)?;
+        // A load which observes the subsequent record Free publication must
+        // also observe this terminal provenance. Later lifecycle publication
+        // can lag it; failure cleanup alone never mints this authority.
+        member.exit_custody().commit_zone_terminal();
+        crate::entry::retire_current(binding, source, record)
+    }
+
     pub fn into_verdict(self, page: &impl Lifecycle) -> RetirementVerdict {
         RetirementVerdict::RetireThread {
             identity: self.identity,

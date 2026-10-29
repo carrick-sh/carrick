@@ -106,7 +106,12 @@ impl TaskCpuResidency {
             origin,
         } = self
         {
-            let cpu = materialize_zone(base, *record, *origin)?;
+            let cpu = materialize_zone(
+                base,
+                *record,
+                *origin,
+                carrick_hal::trap::ZoneRestoreSite::MaterializeAccessor,
+            )?;
             *self = Self::Materialized(cpu);
         }
         match self {
@@ -135,17 +140,35 @@ pub(crate) fn materialize_zone(
     base: &GuestCpuState,
     record: carrick_el1_abi::RecordRef,
     origin: ZoneResumeOrigin,
+    site: carrick_hal::trap::ZoneRestoreSite,
 ) -> Result<GuestCpuState, TrapError> {
     let zone = carrick_el1_abi::zone_tables()
         .ok_or_else(|| TrapError::Hypervisor("zone residency without zone tables".to_owned()))?;
-    materialize_zone_in(zone, base, record, origin)
+    materialize_zone_at(zone, base, record, origin, site)
 }
 
+#[cfg(test)]
 fn materialize_zone_in(
     zone: &carrick_el1_abi::ZoneTables,
     base: &GuestCpuState,
     record: carrick_el1_abi::RecordRef,
     origin: ZoneResumeOrigin,
+) -> Result<GuestCpuState, TrapError> {
+    materialize_zone_at(
+        zone,
+        base,
+        record,
+        origin,
+        carrick_hal::trap::ZoneRestoreSite::MaterializeAccessor,
+    )
+}
+
+pub(crate) fn materialize_zone_at(
+    zone: &carrick_el1_abi::ZoneTables,
+    base: &GuestCpuState,
+    record: carrick_el1_abi::RecordRef,
+    origin: ZoneResumeOrigin,
+    site: carrick_hal::trap::ZoneRestoreSite,
 ) -> Result<GuestCpuState, TrapError> {
     let GuestCpuState::Aarch64V1(base) = base else {
         return Err(TrapError::Hypervisor(
@@ -154,7 +177,7 @@ fn materialize_zone_in(
     };
     let rec = zone
         .live(record)
-        .ok_or_else(|| TrapError::Hypervisor(format!("zone record {record:?} is gone")))?;
+        .ok_or(TrapError::ZoneContinuationMissing { record, site })?;
     if !matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. }) {
         return Err(TrapError::Hypervisor(format!(
             "zone record {record:?} is not host-owned: {:?}",

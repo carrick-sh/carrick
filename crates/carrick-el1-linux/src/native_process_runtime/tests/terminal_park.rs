@@ -68,6 +68,18 @@ pub fn run() -> Result<LinuxWaitStatus, NativeTerminalFailure> {
     let live_members = fixture.page.live();
     assert_eq!(live_members, 1);
     assert!(sibling.control.host_exit_requested());
+    // A requested group exit has not yet retired this exact sibling.
+    assert_eq!(
+        carrick_core::terminal::missing_zone_continuation(
+            sibling.control,
+            sibling.control.host_birth_identity().unwrap(),
+            sibling.control.host_birth_identity(),
+            sibling.record,
+            sibling.control.zone_record(),
+        ),
+        carrick_core::terminal::MissingContinuationVerdict::InvariantViolation
+    );
+
     let mut sibling_service = fixture.service();
     let mut member = fixture
         .runtime
@@ -99,6 +111,39 @@ pub fn run() -> Result<LinuxWaitStatus, NativeTerminalFailure> {
     assert_eq!(live_members, 0);
     let sibling_record_retired = fixture.zone.live(sibling.record).is_none();
     assert!(sibling_record_retired);
+    use carrick_core::terminal::{MissingContinuationVerdict, missing_zone_continuation};
+    let birth = sibling.control.host_birth_identity().unwrap();
+    assert_eq!(
+        missing_zone_continuation(
+            sibling.control,
+            birth,
+            Some(birth),
+            sibling.record,
+            sibling.control.zone_record(),
+        ),
+        MissingContinuationVerdict::Terminal
+    );
+    // A recycled/foreign binding cannot borrow this member's terminal receipt.
+    assert_eq!(
+        missing_zone_continuation(
+            sibling.control,
+            birth,
+            Some(birth),
+            fixture.record,
+            sibling.control.zone_record(),
+        ),
+        MissingContinuationVerdict::InvariantViolation
+    );
+    assert_eq!(
+        missing_zone_continuation(
+            sibling.control,
+            birth,
+            fixture.control.host_birth_identity(),
+            sibling.record,
+            sibling.control.zone_record(),
+        ),
+        MissingContinuationVerdict::InvariantViolation
+    );
 
     // The existing host handback reloads a fresh home record and renews its
     // retained native registry binding before entering the owner checkpoint.
@@ -153,4 +198,46 @@ pub fn run() -> Result<LinuxWaitStatus, NativeTerminalFailure> {
 #[test]
 fn exit_group_host_request_before_terminal_park_retains_owner() {
     assert_eq!(run().unwrap(), LinuxWaitStatus::exited(0));
+}
+
+#[cfg(test)]
+#[test]
+fn run_failed_never_mints_terminal_load_authority() {
+    let fixture = native_exec_fixture();
+    let _sibling = add_service_sibling(&fixture, None);
+    assert_eq!(fixture.page.live(), 2);
+    let mut service = fixture.service();
+    let saved = words(fixture.address);
+    let mut owner = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    owner.run_failed(carrick_core_abi::NativeRunFailureReason::NativeQuarantined);
+    assert_eq!(
+        owner.take_run_failure(),
+        Some(carrick_core_abi::NativeRunFailureReason::NativeQuarantined)
+    );
+    assert!(fixture.zone.live(fixture.record).is_none());
+    let birth = fixture.control.host_birth_identity().unwrap();
+    assert_eq!(
+        carrick_core::terminal::missing_zone_continuation(
+            fixture.control,
+            birth,
+            Some(birth),
+            fixture.record,
+            fixture.control.zone_record(),
+        ),
+        carrick_core::terminal::MissingContinuationVerdict::InvariantViolation,
+        "run_failed cleanup must never mint ordinary terminal authority"
+    );
 }
