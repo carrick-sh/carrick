@@ -79,7 +79,10 @@ pub use epoll::SYS_EPOLL_PWAIT;
 /// Returns a table only when it is the task's complete descriptor namespace
 /// (a missing descriptor is then EBADF, not a host descriptor).
 pub trait IpcTables {
-    fn table_of(&self, task: &CurrentTask) -> Option<RawTableId>;
+    fn table_for_file_table(&self, file_table: u64) -> Option<RawTableId>;
+    fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
+        self.table_for_file_table(task.linux.file_table.load(Ordering::Acquire))
+    }
     fn owned_table_of(&self, _task: &CurrentTask) -> Option<RawTableId> {
         None
     }
@@ -214,8 +217,8 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
 pub struct MapTables<'a>(pub &'a IpcTableMap);
 
 impl IpcTables for MapTables<'_> {
-    fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
-        self.0.lookup(task.linux.file_table.load(Ordering::Acquire))
+    fn table_for_file_table(&self, file_table: u64) -> Option<RawTableId> {
+        self.0.lookup(file_table)
     }
     fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
         self.0
@@ -255,8 +258,8 @@ struct GuestTables;
 
 #[cfg(target_os = "none")]
 impl IpcTables for GuestTables {
-    fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
-        MapTables(carrick_el1_abi::ipc_table_map_guest()).table_of(task)
+    fn table_for_file_table(&self, file_table: u64) -> Option<RawTableId> {
+        MapTables(carrick_el1_abi::ipc_table_map_guest()).table_for_file_table(file_table)
     }
     fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
         MapTables(carrick_el1_abi::ipc_table_map_guest()).owned_table_of(task)
@@ -845,6 +848,16 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 };
                 let served = handback(frame, token, op, IpcHandback::Sigpipe, result, venue);
                 return (leave(sched, IpcLeave::SigpipeHandback, served), false);
+            }
+            StepStatus::Fault if native_sigpipe => {
+                // Native owners cannot transfer this token to the host-only
+                // handback ABI. Genuine faults settle here, including a
+                // zero-byte read that already parked on readiness or memory.
+                if written == 0 {
+                    carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+                } else {
+                    written as i64
+                }
             }
             StepStatus::Fault if written == 0 && !resumed => {
                 // The host resolves the fault (first touch or EFAULT).
@@ -1504,6 +1517,9 @@ mod tests {
         }
         /// One trap into the adapter on the slot.
         fn call(&mut self, frame: &mut TrapFrame) -> IpcServed {
+            self.call_with_owner(frame, false)
+        }
+        fn call_with_owner(&mut self, frame: &mut TrapFrame, native: bool) -> IpcServed {
             let zone: &ZoneTables = &self.zone;
             let mut sched = Sched {
                 handoff: None,
@@ -1522,7 +1538,7 @@ mod tests {
                 task: &self.task,
                 mem: &self.mem,
             };
-            serve_ipc(&mut sched, frame, &venue, &mut user)
+            serve_ipc_with_sigpipe(&mut sched, frame, &venue, &mut user, native).0
         }
         /// Queue thread `tid` of `mm`, runnable on the slot, about to issue
         /// the syscall in `frame` (its SVC at `svc`).
@@ -2436,6 +2452,147 @@ mod tests {
             1,
             "undelivered byte remains available to the retained read"
         );
+    }
+
+    #[test]
+    fn poll_readiness_uses_ipc_objects_and_exact_file_table() {
+        use crate::file_table::{
+            LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, PollFd, resolve_poll,
+        };
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let (read, write, _) = w.pipe(a, BLOCK);
+        let event = w.eventfd(a, 5, EventMode::Counter, BLOCK);
+        let b = w.fork_table(a, 202);
+        let mut fds = [
+            PollFd {
+                fd: read,
+                events: LINUX_POLLIN,
+                revents: -1,
+            },
+            PollFd {
+                fd: event,
+                events: LINUX_POLLIN | LINUX_POLLOUT,
+                revents: -1,
+            },
+            PollFd {
+                fd: -1,
+                events: LINUX_POLLIN,
+                revents: -1,
+            },
+            PollFd {
+                fd: 60,
+                events: 0,
+                revents: -1,
+            },
+        ];
+        let table = w.task.linux.file_table.load(Ordering::Acquire);
+        assert_eq!(
+            resolve_poll(&[], &[], &[], Some(&w.venue()), table, &mut fds),
+            Some(2)
+        );
+        assert_eq!(
+            fds.map(|fd| fd.revents),
+            [0, LINUX_POLLIN | LINUX_POLLOUT, 0, LINUX_POLLNVAL]
+        );
+        w.host_close(a, write);
+        w.host_close(b, write);
+        fds[0].events = 0;
+        assert_eq!(
+            resolve_poll(&[], &[], &[], Some(&w.venue()), table, &mut fds),
+            Some(3)
+        );
+        assert_eq!(fds[0].revents, LINUX_POLLHUP);
+        assert_eq!(
+            resolve_poll(&[], &[], &[], Some(&w.venue()), 9999, &mut fds),
+            Some(3)
+        );
+        assert_eq!(
+            fds[0].revents, LINUX_POLLNVAL,
+            "another file table cannot borrow this mapping"
+        );
+    }
+
+    #[test]
+    fn native_resumed_eventfd_fault_keeps_counter_and_releases_pin() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let event = w.eventfd(a, 0, EventMode::Counter, BLOCK);
+        let (other_read, _, _) = w.pipe(a, BLOCK);
+        let b = w.fork_table(a, 202);
+        let backing = w.host().get(a, Fd(event)).unwrap().backing;
+        let Some(IpcBacking::EventFd { object }) = IpcBacking::decode(backing) else {
+            unreachable!()
+        };
+        w.mem.write(OTHER_MM, 0x10000, &7u64.to_ne_bytes());
+        let b_write = syscall(SYS_WRITE, event, 0x10000, 8, B_SVC);
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        let mut frame = syscall(SYS_READ, event, 0x300000, 8, A_SVC);
+        assert_eq!(w.call_with_owner(&mut frame, true), SWITCHED);
+        frame = b_write;
+        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, 8));
+        frame = syscall(SYS_READ, other_read, 0x10000, 1, B_SVC);
+        assert_eq!(w.call(&mut frame), SWITCHED);
+        reenter(&mut frame, A_SVC);
+        assert_eq!(w.call_with_owner(&mut frame, true), RETURNED);
+        assert_eq!(frame.x[0] as i64, -14);
+        assert_eq!(frame.x[8], SYS_READ as u64);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .eventfd()
+                .unwrap()
+                .value(),
+            7
+        );
+        w.host_close(a, event);
+        w.host_close(b, event);
+        assert!(
+            w.region.lock(object, &HostWait).is_err(),
+            "no operation pin retains the closed eventfd"
+        );
+    }
+
+    #[test]
+    fn native_resumed_read_fault_retires_operation_and_endpoint_pin() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let (read, write, object) = w.pipe(a, BLOCK);
+        let (other_read, _, _) = w.pipe(a, BLOCK);
+        let b = w.fork_table(a, 202);
+        w.mem.write(OTHER_MM, 0x10000, &[7]);
+        let b_write = syscall(SYS_WRITE, write, 0x10000, 1, B_SVC);
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        let mut frame = syscall(SYS_READ, read, 0x300000, 1, A_SVC);
+        assert_eq!(w.call_with_owner(&mut frame, true), SWITCHED);
+        frame = b_write;
+        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, 1));
+        frame = syscall(SYS_READ, other_read, 0x10000, 1, B_SVC);
+        assert_eq!(w.call(&mut frame), SWITCHED);
+        reenter(&mut frame, A_SVC);
+        assert_eq!(w.call_with_owner(&mut frame, true), RETURNED);
+        assert_eq!(frame.x[0] as i64, -14);
+        assert_eq!(frame.x[8], SYS_READ as u64);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .unread_bytes(),
+            1
+        );
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(!w.zone.record(current).has_object_operation());
+        // Closing every numeric reader must retire the endpoint. A leaked
+        // operation pin would keep it alive and incorrectly accept this write.
+        w.host_close(a, read);
+        w.host_close(b, read);
+        w.mem.write(MM, 0x10000, &[9]);
+        frame = syscall(SYS_WRITE, write, 0x10000, 1, A_SVC);
+        assert_eq!(w.call_with_owner(&mut frame, true), RETURNED);
+        assert_eq!(frame.x[0] as i64, -32);
     }
 
     #[test]

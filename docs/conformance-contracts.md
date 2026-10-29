@@ -229,3 +229,26 @@ answer has completed. The existing transfer and IPC work bounds remain intact.
 Signed IPC and `el1_sched` binding, COW supply integration, runtime ratios and
 artifact promotion remain director-owned. Readv/pselect6 routing and x86 IPC
 binding remain the separately authorized work in #1040; no route changes here.
+
+The production AArch64 `TrapFrame` now admits ppoll to that same family.
+`production_trap_frame_routes_ppoll_to_the_poll_family` was red because it
+forwarded ordinal 73; the production-frame native completion binding also
+crosses the real classifier before suspending output on a Gate dependency.
+IPC poll snapshots use the shared pipe/eventfd readiness levels and zone-only
+epoll probe, with exact file-table lookup and independent duplicate entries.
+Unavailable or contended snapshots do not become POLLNVAL or false readiness.
+
+Output preparation begins only after a readiness decision completes. The old
+fallback dropped its local `PollContinuation` after clearing the executor;
+it is removed. Without a retained readiness venue, blocking and signal-mask
+polls remain unrouted and preserve user output (retained readiness: #1051).
+Ppoll has no host syscall
+allowlist fallback. Host-bound descriptors require an authenticated carrier
+readiness observation; a host-only selector cannot wait for an in-zone
+producer. These supported snapshots and copyout continuations are shared
+between ISAs; x86 IPC binding and broader routing remain #1040.
+
+Native pipe/eventfd copy faults settle their operation in ring, including a
+zero-byte read resumed after readiness or memory suspension. Genuine faults
+return errno 14 and release the operation pin; a delivered prefix remains a
+short read. The host-owned handback path retains its existing contract.
