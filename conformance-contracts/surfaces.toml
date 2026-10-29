@@ -2095,3 +2095,11 @@ contracts = ["kernel.vcpu.shutdown-entry"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/operations/exit.rs"
 contracts = ["kernel.vcpu.shutdown-entry"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/mm/reservation/stock.rs"
+contracts = ["kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/mm/reservation/root.rs"
+contracts = ["kernel.el1.anonymous-reservations"]

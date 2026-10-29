@@ -373,5 +373,55 @@ Final closure still requires the existing production-path service witness green
 at 64/256/1024, unchanged strict signed exit slope <0.125 with exit-class
 attribution, signed readback/zeroing and lifecycle/permission/return gates,
 ARM64 Linux differential and exact-artifact smoke/full acceptance. Neither
-this documentation revision nor Slice 1 supplies that evidence. No runtime
-code changes are part of this revision.
+this documentation revision nor Slice 1 supplies that evidence. The design revision introduced no runtime changes; the subsequent Slice 1
+policy extraction is recorded below.
+
+## Slice 1 implementation record
+
+The extraction on `work/898-supply-s1` stacks on #1030, following the worker
+brief rather than the original main-only landing proposal above. It retains
+#1030's active red service-budget witness and its existing binding. This is
+intermediate policy work, not closure of #898.
+
+`PrivateStockPlan` and `StockExclusions` live with the neutral reservation
+owner in `reservation/stock.rs`. The plan stores the exact MM and ring-owned
+root incarnation, fault-node incarnation, typed candidate range and fault VA,
+root observation generation, request sequence, ordered node/hole facts,
+backend exclusions, pending request and owed-return observations. Revalidation
+rebuilds and compares those facts under the root editor. It does not accept an
+unchanged fault node or backend version as authority. The physical owner
+`GuestFrameOwner` is intentionally not imported from the HAL into this neutral
+core; Slice 1 identifies the reservation owner with its exact MM/root pair.
+Native physical identity remains a later transaction obligation.
+
+Inputs hold at most 256 occupancy/host observations and the planner snapshots
+at most 256 nodes per bulk window; excessive fragmentation refuses before
+mutation. These are intermediate policy observation bounds, not changes to the
+native space ceilings or service budgets. Host residency, deferred anonymous
+materialization and inventory observations stay in the adapter. Pending edits
+(including move sources) and owed returns are taken directly from the root.
+The host calls the shared planner and revalidator while retaining its root
+editor; physical publication and native fault planning are unchanged.
+
+The production-policy witness is
+`private_stock_plan_future_holes_are_exact_mm_and_revalidated`, with two live
+roots at identical VAs, pending proposals, node replacement and owed returns.
+`private_stock_plan_excludes_occupancy_and_bounds_fragmented_inputs` covers
+host/descriptor occupancy and bounded fragmented inputs. The delegated host
+witness exercises independent first-touch occupancy in two live MMs. The
+ordinary mapping-bound authenticator remains separately asserted, including
+refusal of a widened plan.
+
+No `PrivateSupplyTransaction`, `StockPhysicalCapability`, `StockAdoption`,
+`StockCapacityLease` or `StockResidencyRecord` is introduced in Slice 1. Those
+owners, native integration, physical publication/rollback, lifecycle settlement,
+permissions, sparse retention and the unchanged strict service/exit slope
+remain required by subsequent slices. HVF and Docker evidence cannot run on
+ctb-w3.
+
+Red-first evidence used the unchanged production `transfer_fault_plan` with
+this witness's small node: it selected `[0x202000, 0x203000)` instead of the
+required future-hole run `[0x200000, 0x300000)`, failing the assertion with exit
+101. The green witness selects through `private_stock_plan`; it also explicitly
+asserts that `transfer_fault_plan` retains that original narrower range and
+rejects widening its ordinary grant to the stock selection.

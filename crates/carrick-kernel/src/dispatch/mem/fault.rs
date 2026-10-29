@@ -575,144 +575,106 @@ impl MemState {
         let Some(window) = ReservationRange::new(window_start, window_end) else {
             return Ok(None);
         };
-        // Stock stays inside the arena and inside the half window holding
-        // `page`: a stock grant never claims a whole block, which only a
-        // mapping that fills it may (EL1 cannot retire part of a block).
-        let half = (max_len / 2).max(crate::linux_abi::LINUX_PAGE_SIZE);
-        let arena_start = (page - page % half).max(self.layout.mmap_base);
-        let arena_end = (page - page % half)
-            .saturating_add(half)
-            .min(self.layout.mmap_base.saturating_add(self.layout.mmap_size));
-        let mut eligible: Vec<(u64, u64)> = Vec::new();
-        let mut owed: Vec<(u64, u64)> = Vec::new();
         root.with_root(|model| {
-            let mut cursor = window_start;
-            let hole = |eligible: &mut Vec<(u64, u64)>, start: u64, end: u64| {
-                let (start, end) = (start.max(arena_start), end.min(arena_end));
-                if start < end {
-                    eligible.push((start, end));
-                }
-            };
+            let mut exclusions = carrick_core::mm::reservation::StockExclusions::new();
+            let mut failure = None;
+            // Host residency is incarnation-qualified. Eligibility of the
+            // nodes and holes themselves belongs solely to the shared owner.
             model.observe_nodes(window, &mut |node, node_incarnation| {
-                let (start, end) = (
+                for (start, end) in self.resident.within(
                     node.range.start().max(window_start),
                     node.range.end().min(window_end),
-                );
-                if start > cursor {
-                    hole(&mut eligible, cursor, start);
-                }
-                cursor = cursor.max(end);
-                if !node.anonymous
-                    || node.protection != mapping.protection
-                    || super::anonymous::in_heap(node.range.start(), node.range.end(), self.layout)
-                {
-                    return;
-                }
-                // Committed pages split the run, exactly as a commit
-                // disarms them: each piece answers under its own
-                // incarnation.
-                let mut piece_start = start;
-                for (resident_start, resident_end) in
-                    self.resident
-                        .within(start, end, ResidencyOwner::Root(node_incarnation))
-                {
-                    if resident_start > piece_start {
-                        eligible.push((piece_start, resident_start));
+                    ResidencyOwner::Root(node_incarnation),
+                ) {
+                    if let Some(range) = ReservationRange::new(start, end)
+                        && let Err(error) = exclusions.exclude_occupied(range)
+                    {
+                        failure = Some(error);
                     }
-                    piece_start = piece_start.max(resident_end);
-                }
-                if piece_start < end {
-                    eligible.push((piece_start, end));
                 }
             })?;
-            if cursor < window_end {
-                hole(&mut eligible, cursor, window_end);
+            // MAP_FIXED can supersede old host facts within the fault node.
+            // Keep this host observation rule in the adapter; it cannot
+            // suppress root-owned pending edits or unsettled returns.
+            let mut block_old_host = |start: u64, end: u64| {
+                for (start, end) in [
+                    (start, end.min(mapping.range.start())),
+                    (start.max(mapping.range.end()), end),
+                ] {
+                    if let Some(range) = ReservationRange::new(start, end)
+                        && let Err(error) = exclusions.exclude_host_only(range)
+                    {
+                        failure = Some(error);
+                    }
+                }
+            };
+            if let Ok(len) = usize::try_from(max_len) {
+                for span in self
+                    .deferred_anonymous
+                    .materialized_within(GuestVa::new(window_start), len)
+                {
+                    block_old_host(span.start.raw(), span.end.raw());
+                }
             }
-            model.observe_deferred_returns(&mut |entry| {
-                owed.push((entry.range.start(), entry.range.end()));
-            });
-            Ok(())
-        })?;
-        // Holes the host itself still records resident are not stock, and
-        // no span this MM's committed backing still occupies is fresh.
-        let mut blocked = owed;
-        // A guest MAP_FIXED may replace an immutable file page that the
-        // host had recorded resident. The EL1 editor either journals a live
-        // predecessor above, or proves there was no terminal to return.
-        // In the latter case the old host facts do not own this incarnation.
-        let mut block_old_host = |start: u64, end: u64| {
-            if start < mapping.range.start() {
-                blocked.push((start, end.min(mapping.range.start())));
-            }
-            if end > mapping.range.end() {
-                blocked.push((start.max(mapping.range.end()), end));
-            }
-        };
-        if let Ok(len) = usize::try_from(max_len) {
-            for span in self
-                .deferred_anonymous
-                .materialized_within(GuestVa::new(window_start), len)
+            for (start, end) in self
+                .resident
+                .within(window_start, window_end, ResidencyOwner::Host)
             {
-                block_old_host(span.start.raw(), span.end.raw());
+                block_old_host(start, end);
             }
-        }
-        for (start, end) in self
-            .resident
-            .within(window_start, window_end, ResidencyOwner::Host)
-        {
-            block_old_host(start, end);
-        }
-        blocked.extend(
-            self.prepared_root_grants
+            for (_, span) in self
+                .prepared_root_grants
                 .iter()
                 .filter(|(owner, _)| *owner == incarnation)
-                .map(|(_, span)| (span.start(), span.end())),
-        );
-        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
-            table.live_spans_overlapping(root.mm().raw(), window_start, max_len, |start, end| {
-                blocked.push((start, end));
-            });
-        }
-        // The maximal contiguous eligible run containing `page`.
-        eligible.sort_unstable();
-        let Some(index) = eligible
-            .iter()
-            .position(|&(start, end)| start <= page && page < end)
-        else {
-            return Ok(None);
-        };
-        let (mut start, mut end) = eligible[index];
-        for &(piece_start, piece_end) in eligible[..index].iter().rev() {
-            if piece_end != start {
-                break;
+            {
+                if let Err(error) = exclusions.exclude_occupied(*span) {
+                    failure = Some(error);
+                }
             }
-            start = piece_start;
-        }
-        for &(piece_start, piece_end) in &eligible[index + 1..] {
-            if piece_start != end {
-                break;
+            if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+                table.live_spans_overlapping(
+                    root.mm().raw(),
+                    window_start,
+                    max_len,
+                    |start, end| {
+                        if let Some(range) = ReservationRange::new(start, end)
+                            && let Err(error) = exclusions.exclude_occupied(range)
+                        {
+                            failure = Some(error);
+                        }
+                    },
+                );
             }
-            end = piece_end;
-        }
-        for (blocked_start, blocked_end) in blocked {
-            if blocked_end <= start || blocked_start >= end {
-                continue;
-            }
-            if blocked_start <= page && page < blocked_end {
+            if failure.is_some() {
+                // Excessive speculative observations do not authorize a
+                // partial plan. Existing caller fallback stays unchanged.
                 return Ok(None);
             }
-            if blocked_end <= page {
-                start = start.max(blocked_end);
-            } else {
-                end = end.min(blocked_start);
-            }
-        }
-        let Some(range) =
-            carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(ResidentFaultRange { range, prot }))
+            let plan = match model.private_stock_plan(
+                carrick_core_abi::UserVa::new(page),
+                carrick_core_abi::GuestLen::new(max_len),
+                &exclusions,
+            ) {
+                Ok(plan) => plan,
+                Err(
+                    Refusal::Busy
+                    | Refusal::Hole
+                    | Refusal::Limit
+                    | Refusal::MetadataRequired
+                    | Refusal::ForeignMapping,
+                ) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            model.revalidate_private_stock_plan(&plan, &exclusions)?;
+            let range = carrick_vfs::GuestMemoryRange::new(
+                GuestVa::new(plan.range().start()),
+                GuestVa::new(plan.range().end()),
+            )
+            .ok_or(Refusal::Invalid)?;
+            Ok(Some(ResidentFaultRange { range, prot }))
+        })
     }
 
     /// Retire the host's residency facts for `holes`: ranges the root held
