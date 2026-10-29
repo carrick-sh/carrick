@@ -1007,6 +1007,13 @@ impl PersistentExecutor for FakeExecutor {
                 self.idle_slot,
             )?));
         }
+        if let Some((slot, zone)) = self.idle_slot.zip(carrick_el1_abi::zone_tables())
+            && (zone.head_needs_host(slot) || zone.slot(slot).queued() != 0)
+        {
+            return Ok(super::GuestIdleExit::Idle(super::SettledIdleSlot::admit(
+                self.idle_slot,
+            )?));
+        }
         let Some(native) = &self.factory.native_services else {
             return Ok(super::GuestIdleExit::Unsupported);
         };
@@ -9126,6 +9133,455 @@ fn claimed_sibling_zone_reload(retired: bool) {
 #[test]
 fn serial_host_retirement_cancels_zone_wait_before_queued_claim() {
     terminal_zone_wait_before_queued_claim(false, false);
+}
+
+/// #1071 reduction: production scheduler/continuation and zone materializer,
+/// scripted hardware. This proves two bounded executor quanta, not execution
+/// of HvpatchProductionPhase::ResumeZone or delivery of a physical WFI kick.
+#[test]
+fn serial_host_zone_park_wake_loads_on_second_executor_without_poke() {
+    zone_park_wake_loads_on_second_executor(false);
+}
+
+/// kernel.scheduler.runnable-progress: publish real zone-held work in the
+/// scan/enrollment gap. The scripted idle boundary records an attempted sleep
+/// immediately, so RED is bounded and never rescued by a diagnostic poke.
+#[test]
+fn serial_host_zone_service_between_scan_and_idle_enrollment_is_claimed() {
+    struct Region(Box<carrick_test_support::TestEl1Region>);
+    impl Drop for Region {
+        fn drop(&mut self) {
+            assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
+                self.0.as_ptr() as usize
+            ));
+        }
+    }
+    let region = Region(carrick_test_support::TestEl1Region::zeroed());
+    carrick_el1_abi::record_el1_region_host_ptr(region.0.as_ptr() as usize);
+    let zone = carrick_el1_abi::zone_tables().unwrap();
+    let (kernel, a) = bootstrap(19_790);
+    a.thread().set_affinity(CpuAffinity::all(1));
+    let partner = sibling(&kernel, &a, 19_791);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let kick = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+    let destination = scheduler.register_executor(kick.clone()).unwrap();
+    let origin = scheduler
+        .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+        .unwrap();
+    let partner_authority = enqueue_root(&scheduler, &partner, publish(&partner, 1073));
+    scheduler
+        .settle_blocked(scheduler.take(&origin).unwrap(), BlockedReason::HostWait)
+        .unwrap();
+    let generation = publish(&a, 1074);
+    let control = a.thread().control_slot();
+    // SAFETY: this exact live control is mapped directly in the host fixture.
+    unsafe {
+        control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+            core::ptr::from_ref(control).expose_provenance() as u64,
+        ));
+    }
+    let slot = carrick_el1_abi::SlotId::new(0);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, 0, Some(0), 0);
+    let factory = FakeFactory::default();
+    let mut backend = factory.create(&destination).unwrap();
+    backend.idle_slot = Some(slot);
+    let slept = Arc::new(AtomicBool::new(false));
+    let idle_slept = slept.clone();
+    backend.idle_entry = Some(Box::new(move || {
+        idle_slept.store(true, Ordering::Release);
+    }));
+    let publisher = scheduler.clone();
+    let publish_origin = origin.clone();
+    let key = a.thread().key();
+    kick.install_before_guest_idle(move || {
+        assert_eq!(
+            zone.slot(slot).queued(),
+            0,
+            "pre-scan saw an empty zone queue"
+        );
+        publisher.make_runnable(key).unwrap();
+        assert_eq!(
+            zone.slot(slot).queued(),
+            1,
+            "real scheduler publication is zone-held"
+        );
+        assert!(
+            publisher.try_take(&publish_origin).unwrap().is_none(),
+            "host queue cannot find the zone-held row"
+        );
+    });
+    carrick_kernel::el1_zone::with_test_zone(zone, || {
+        let next = super::next_runnable(&scheduler, &mut backend, &destination, &kick)
+            .unwrap_or_else(|_| panic!("next runnable"));
+        assert!(
+            !slept.load(Ordering::Acquire),
+            "executor slept with a Service head published before enrollment"
+        );
+        let running = next.expect("post-enrollment probe claims zone service without another poke");
+        assert_eq!(running.thread_key(), a.thread().key());
+        assert_eq!(running.generation(), generation);
+        assert_eq!(zone.slot(slot).queued(), 0);
+        assert!(matches!(
+            partner.thread().execution_state(),
+            ThreadExecutionState::Blocked {
+                reason: BlockedReason::HostWait,
+                ..
+            }
+        ));
+        scheduler.settle_exited(running).unwrap();
+    });
+    backend.destroy().unwrap();
+    scheduler.unregister_executor(&destination).unwrap();
+    scheduler.unregister_executor(&origin).unwrap();
+    drop(partner_authority);
+}
+
+#[test]
+fn serial_host_zone_handback_between_scan_and_idle_enrollment_is_claimed() {
+    use carrick_kernel::kernel::continuation::{
+        BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
+    };
+    struct Region(Box<carrick_test_support::TestEl1Region>);
+    impl Drop for Region {
+        fn drop(&mut self) {
+            assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
+                self.0.as_ptr() as usize
+            ));
+        }
+    }
+    let region = Region(carrick_test_support::TestEl1Region::zeroed());
+    carrick_el1_abi::record_el1_region_host_ptr(region.0.as_ptr() as usize);
+    let zone = carrick_el1_abi::zone_tables().unwrap();
+    let (kernel, a) = bootstrap(19_792);
+    a.thread().set_affinity(CpuAffinity::all(1));
+    let partner = sibling(&kernel, &a, 19_793);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let service = CarrierWaitService::new(scheduler.clone());
+    let kick = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+    let destination = scheduler.register_executor(kick.clone()).unwrap();
+    let origin = scheduler
+        .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+        .unwrap();
+    let partner_authority = enqueue_root(&scheduler, &partner, publish(&partner, 1075));
+    scheduler
+        .settle_blocked(scheduler.take(&origin).unwrap(), BlockedReason::HostWait)
+        .unwrap();
+    let authority = enqueue_root(&scheduler, &a, publish(&a, 1076));
+    let running = scheduler.take(&origin).unwrap();
+    let generation = running.generation();
+    let key = a.thread().key();
+    let id = zone
+        .alloc_record(carrick_el1_abi::ThreadIdentity {
+            tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+            serial: key.serial.raw(),
+            mm: a.shared().mm().id().raw(),
+            file_table: a.resources().files().id().raw(),
+            generation: generation.raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let sequence = zone.next_seq(id);
+    zone.publish_park(id, sequence);
+    let reference = zone.record_ref(id);
+    a.thread().control_slot().bind_zone_record(reference);
+    let continuation = BlockedContinuation::from_zone_park(
+        ContinuationCapture::from_lease(
+            &a,
+            running.lease(),
+            SyscallRequest::new(98, SyscallArgs([0; 6])),
+            RestartClass::Never,
+        )
+        .unwrap(),
+        ZoneWait::new(reference, sequence),
+        None,
+    );
+    let mut registration = service.prepare_registration(&continuation);
+    service.enroll(&mut registration).unwrap();
+    scheduler
+        .settle_blocked_continuation(running, continuation, registration)
+        .unwrap();
+    let slot = carrick_el1_abi::SlotId::new(0);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, 0, Some(0), 0);
+    let factory = FakeFactory::default();
+    let mut backend = factory.create(&destination).unwrap();
+    backend.idle_slot = Some(slot);
+    let slept = Arc::new(AtomicBool::new(false));
+    let idle_slept = slept.clone();
+    backend.idle_entry = Some(Box::new(move || {
+        idle_slept.store(true, Ordering::Release);
+    }));
+    let publisher = scheduler.clone();
+    let publish_origin = origin.clone();
+    let mm = a.shared().mm().id().raw();
+    kick.install_before_guest_idle(move || {
+        assert_eq!(
+            zone.slot(slot).queued(),
+            0,
+            "pre-scan saw an empty zone queue"
+        );
+        let here = carrick_sched_core::ExecutionSlot::zone(slot);
+        assert_eq!(
+            carrick_kernel::el1_zone::claim(reference, None, carrick_el1_abi::Handback::Woken),
+            carrick_el1_abi::HostClaim::Claimed
+        );
+        zone.publish_slot(slot, mm, Some(0), 0);
+        assert!(zone.occupancy.replace(here, 0, mm));
+        zone.enter_guest(slot);
+        assert_eq!(
+            zone.place_from_host(id),
+            Some(carrick_el1_abi::HostPlacement {
+                slot,
+                resched: true,
+            })
+        );
+        zone.leave_guest(slot, &carrick_kernel::el1_zone::HostLockWait);
+        zone.occupancy.vacate_any(here);
+        let _ = zone.take_resched(slot);
+        zone.publish_slot(slot, 0, Some(0), 0);
+        assert_eq!(
+            zone.slot(slot).queued(),
+            1,
+            "woken zone record is queued on slot"
+        );
+        assert!(
+            publisher.try_take(&publish_origin).unwrap().is_none(),
+            "host queue cannot find un-adopted zone handback"
+        );
+    });
+    carrick_kernel::el1_zone::with_test_zone(zone, || {
+        let next = super::next_runnable(&scheduler, &mut backend, &destination, &kick)
+            .unwrap_or_else(|_| panic!("next runnable"));
+        assert!(
+            !slept.load(Ordering::Acquire),
+            "executor slept with a zone handback published before enrollment"
+        );
+        let running =
+            next.expect("post-enrollment probe adopts zone handback without another poke");
+        assert_eq!(running.thread_key(), a.thread().key());
+        assert!(running.generation() > generation);
+        assert_eq!(zone.slot(slot).queued(), 0);
+        scheduler.settle_exited(running).unwrap();
+    });
+    backend.destroy().unwrap();
+    scheduler.unregister_executor(&destination).unwrap();
+    scheduler.unregister_executor(&origin).unwrap();
+    drop((authority, partner_authority));
+}
+
+#[test]
+fn serial_host_zone_park_wake_between_switch_out_and_save_reaches_next_boundary() {
+    zone_park_wake_loads_on_second_executor(true);
+}
+
+fn zone_park_wake_loads_on_second_executor(wake_before_save: bool) {
+    use carrick_kernel::kernel::continuation::{
+        BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
+    };
+    struct Region(Box<carrick_test_support::TestEl1Region>);
+    impl Drop for Region {
+        fn drop(&mut self) {
+            assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
+                self.0.as_ptr() as usize
+            ));
+        }
+    }
+    let region = Region(carrick_test_support::TestEl1Region::zeroed());
+    carrick_el1_abi::record_el1_region_host_ptr(region.0.as_ptr() as usize);
+    let zone = carrick_el1_abi::zone_tables().unwrap();
+    let (kernel, a) = bootstrap(19_780);
+    a.thread().set_affinity(CpuAffinity::all(1));
+    let partner = sibling(&kernel, &a, 19_781);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let service = CarrierWaitService::new(scheduler.clone());
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(1071, [Step::Block, Step::Yield]);
+    factory.install(&a, binding.clone());
+    let registrations = std::array::from_fn::<_, 2, _>(|_| {
+        scheduler
+            .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+            .unwrap()
+    });
+    let mut executors = registrations
+        .iter()
+        .map(|r| factory.create(r).unwrap())
+        .collect::<Vec<_>>();
+    let partner_authority = enqueue_root(&scheduler, &partner, publish(&partner, 1072));
+    scheduler
+        .settle_blocked(
+            scheduler.take(&registrations[1]).unwrap(),
+            BlockedReason::HostWait,
+        )
+        .unwrap();
+    let authority = enqueue_root(&scheduler, &a, publish(&a, 1071));
+    let mut record = None;
+    for index in 0..2 {
+        let mut running = scheduler
+            .take(&registrations[index])
+            .expect("A claimed without external poke");
+        assert_eq!(running.thread().key(), a.thread().key());
+        let lease = running.take_lease();
+        let mut load_observer = None;
+        if index == 0 {
+            let key = a.thread().key();
+            let id = zone
+                .alloc_record(carrick_el1_abi::ThreadIdentity {
+                    tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+                    serial: key.serial.raw(),
+                    mm: a.shared().mm().id().raw(),
+                    file_table: a.resources().files().id().raw(),
+                    generation: running.generation().raw(),
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            let sequence = zone.next_seq(id);
+            zone.publish_park(id, sequence);
+            let reference = zone.record_ref(id);
+            a.thread().control_slot().bind_zone_record(reference);
+            binding.block_with_continuation(BlockedContinuation::from_zone_park(
+                ContinuationCapture::from_lease(
+                    &a,
+                    &lease,
+                    SyscallRequest::new(98, SyscallArgs([0; 6])),
+                    RestartClass::Never,
+                )
+                .unwrap(),
+                ZoneWait::new(reference, sequence),
+                None,
+            ));
+            record = Some(reference);
+        } else {
+            // The scripted backend's save retains hardware residency, so
+            // supply the zone snapshot that the real zone-park path saves.
+            binding.set_cpu_residency(super::residency::TaskCpuResidency::Zone {
+                base: test_guest_cpu_state(1071),
+                record: record.unwrap(),
+                origin: super::residency::ZoneResumeOrigin::GuestRecord,
+            });
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            resume_tx.send(()).unwrap(); // no coordinator kick during load
+            *binding.zone_load.lock() = Some(ZoneLoad {
+                zone,
+                entered: entered_tx,
+                resume: resume_rx,
+            });
+            load_observer = Some(entered_rx);
+        }
+        let task = RunnableTask {
+            thread: a.thread().key(),
+            generation: running.generation(),
+            lease: &lease,
+            binding: binding.clone(),
+        };
+        executors[index].load(&task).expect("Loaded");
+        if let Some(observer) = load_observer {
+            observer.try_recv().expect("zone materializer reached");
+        }
+        drop(task);
+        let publish_descendant = |_, _| Ok(());
+        let mut submission = ExecutorSubmissionContext {
+            registration: None,
+            scheduler: &scheduler,
+            publish_test_descendant: &publish_descendant,
+            current: None,
+            authority: ExecutionLeaseAuthoritySlot::from(Some(lease)),
+            exec_replacement: None,
+        };
+        let exit = executors[index]
+            .run_until_boundary(&AtomicBool::new(false), &mut submission)
+            .unwrap();
+        running
+            .restore_lease(submission.take_execution_lease().unwrap())
+            .unwrap();
+        scheduler.begin_switch_out(&running).unwrap();
+        if index == 0 && wake_before_save {
+            assert!(matches!(
+                a.thread().execution_state(),
+                ThreadExecutionState::SwitchingOut {
+                    wake_pending: false,
+                    ..
+                }
+            ));
+            // tp-1 reduction: the blocked boundary has been read, but the
+            // backend has not saved yet. A wake must survive switch-out,
+            // registration enrollment and blocked-continuation settlement.
+            assert_eq!(
+                carrick_kernel::el1_zone::claim(
+                    record.unwrap(),
+                    None,
+                    carrick_el1_abi::Handback::Woken
+                ),
+                carrick_el1_abi::HostClaim::Claimed
+            );
+            scheduler.wake(a.thread().key()).unwrap();
+            assert!(matches!(
+                a.thread().execution_state(),
+                ThreadExecutionState::SwitchingOut {
+                    wake_pending: true,
+                    ..
+                }
+            ));
+        }
+        let saved = executors[index].save(running.take_lease()).unwrap();
+        running.restore_lease(saved.into_lease()).unwrap();
+        if index == 0 {
+            let ExecutorExit::BlockedContinuation { continuation, .. } = exit else {
+                panic!("zone park boundary")
+            };
+            let mut registration = service.prepare_registration(&continuation);
+            service.enroll(&mut registration).unwrap();
+            scheduler
+                .settle_blocked_continuation(running, *continuation, registration)
+                .unwrap();
+            if wake_before_save {
+                assert!(
+                    matches!(
+                        a.thread().execution_state(),
+                        ThreadExecutionState::Runnable { .. }
+                    ),
+                    "pre-save wake survives settlement"
+                );
+            } else {
+                assert!(matches!(
+                    a.thread().execution_state(),
+                    ThreadExecutionState::Blocked {
+                        continuation: Some(_),
+                        ..
+                    }
+                ));
+                scheduler.wake_control(a.thread().key()).unwrap();
+            }
+        } else {
+            assert!(
+                matches!(exit, ExecutorExit::Yielded),
+                "next boundary in exactly one scripted step"
+            );
+            scheduler.settle_exited(running).unwrap();
+        }
+        assert!(matches!(
+            partner.thread().execution_state(),
+            ThreadExecutionState::Blocked {
+                reason: BlockedReason::HostWait,
+                ..
+            }
+        ));
+    }
+    assert_eq!(binding.progress.load(Ordering::Acquire), 2);
+    for executor in executors {
+        executor.destroy().unwrap();
+    }
+    for registration in &registrations {
+        scheduler.unregister_executor(registration).unwrap();
+    }
+    drop((authority, partner_authority));
 }
 
 #[test]

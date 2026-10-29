@@ -1701,83 +1701,8 @@ fn next_runnable<F: PersistentExecutor>(
         }
         return Ok(Some(scheduler.take(registration)?));
     };
-    if scheduler.release_lent_cpu_if_returning(registration) {
-        // The CPU this spare borrowed goes back to its returning owner before
-        // the spare claims anything more; the thread it owes an adoption
-        // goes back to its host continuation for another executor.
-        if let Some(record) = crate::vcpu_loop::zone::take_pending_adoption() {
-            scheduler.publish_zone_handback(record);
-        }
-        return Ok(None);
-    }
-    if let Some(record) = crate::vcpu_loop::zone::take_pending_adoption() {
-        if let Some(custody) = zone.claim_current_first_entry_activation(record)
-            && adopt_born_record(scheduler, zone, custody)?
-        {
-            return Ok(scheduler.try_take(registration)?);
-        }
-        if let Some(running) = scheduler.adopt_zone_handback(registration, record)? {
-            return Ok(Some(running));
-        }
-        zone.counters
-            .lost_adoptions
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    zone.sweep_cancelled(slot);
-    carrick_kernel::el1_zone::hand_back_wanted(slot);
-    if registration.is_spare() {
-        // No guest CPU runs this vCPU: nothing queued on it is this
-        // executor's to claim now. It parks on the run queue until it
-        // borrows a CPU, and gives up its slot before it sleeps
-        // (`ExecutorKick::parking_spare`), so nothing waits there for it.
-        return Ok(scheduler.try_take(registration)?);
-    }
-    if let Some(service) = zone.take_service_head_for_executor(slot) {
-        let record = match service {
-            carrick_el1_abi::ServiceHead::FirstEntry(custody) => {
-                #[cfg(any(test, feature = "test-support"))]
-                carrick_kernel::el1_zone::first_entry_test_control::emit(
-                    carrick_kernel::el1_zone::first_entry_test_control::Event::ExecutorTaken(
-                        custody.record(),
-                    ),
-                );
-                if adopt_born_record(scheduler, zone, custody)? {
-                    return Ok(scheduler.try_take(registration)?);
-                }
-                return Ok(None);
-            }
-            carrick_el1_abi::ServiceHead::Record(record) => record,
-        };
-        if zone.live(record).and_then(|rec| rec.handback())
-            != Some(carrick_el1_abi::Handback::Service)
-        {
-            // A thread ready at EL0 in another address space: this executor
-            // loads it, exactly as the thread it took off its vCPU.
-            let taken = scheduler.adopt_zone_handback(registration, record)?;
-            if taken.is_none() {
-                zone.counters
-                    .lost_adoptions
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            return Ok(taken);
-        }
-        let key = carrick_kernel::el1_zone::service_key(record);
-        let taken = match key {
-            Some((thread, generation)) => {
-                zone.free_record(record.id);
-                scheduler.take_zone(registration, thread, generation)?
-            }
-            None => None,
-        };
-        if taken.is_none() {
-            zone.counters
-                .stale_services
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+    if let ZoneProbe::Consumed(taken) = probe_zone_runnable(scheduler, zone, slot, registration)? {
         return Ok(taken);
-    }
-    if let Some(running) = scheduler.try_take(registration)? {
-        return Ok(Some(running));
     }
     // Publish this lease's mailbox, then look once more: a wake either
     // reaches this wait or published its work before the scan. A worker's
@@ -1787,14 +1712,8 @@ fn next_runnable<F: PersistentExecutor>(
         usize::from(slot.raw()),
         scheduler.kernel(),
     );
-    match scheduler.try_take(registration) {
-        Ok(Some(running)) => {
-            return Ok(Some(running));
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return Err(error.into());
-        }
+    if let ZoneProbe::Consumed(taken) = probe_zone_runnable(scheduler, zone, slot, registration)? {
+        return Ok(taken);
     }
     if kick.is_shutdown_interrupted() {
         drop(idle_wait);
@@ -1813,6 +1732,98 @@ fn next_runnable<F: PersistentExecutor>(
         }
         GuestIdleExit::Unsupported => Ok(Some(scheduler.take(registration)?)),
     }
+}
+
+enum ZoneProbe {
+    Empty,
+    Consumed(Option<carrick_kernel::kernel::RunnableThread>),
+}
+
+fn probe_zone_runnable(
+    scheduler: &Arc<Scheduler>,
+    zone: &carrick_el1_abi::ZoneTables,
+    slot: carrick_el1_abi::SlotId,
+    registration: &carrick_kernel::kernel::ExecutorRegistration,
+) -> Result<ZoneProbe, NextError> {
+    if scheduler.release_lent_cpu_if_returning(registration) {
+        // The CPU this spare borrowed goes back to its returning owner before
+        // the spare claims anything more; the thread it owes an adoption
+        // goes back to its host continuation for another executor.
+        if let Some(record) = crate::vcpu_loop::zone::take_pending_adoption() {
+            scheduler.publish_zone_handback(record);
+        }
+        return Ok(ZoneProbe::Consumed(None));
+    }
+    if let Some(record) = crate::vcpu_loop::zone::take_pending_adoption() {
+        if let Some(custody) = zone.claim_current_first_entry_activation(record)
+            && adopt_born_record(scheduler, zone, custody)?
+        {
+            return Ok(ZoneProbe::Consumed(scheduler.try_take(registration)?));
+        }
+        if let Some(running) = scheduler.adopt_zone_handback(registration, record)? {
+            return Ok(ZoneProbe::Consumed(Some(running)));
+        }
+        zone.counters
+            .lost_adoptions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    zone.sweep_cancelled(slot);
+    carrick_kernel::el1_zone::hand_back_wanted(slot);
+    if registration.is_spare() {
+        // No guest CPU runs this vCPU: nothing queued on it is this
+        // executor's to claim now. It parks on the run queue until it
+        // borrows a CPU, and gives up its slot before it sleeps
+        // (`ExecutorKick::parking_spare`), so nothing waits there for it.
+        return Ok(ZoneProbe::Consumed(scheduler.try_take(registration)?));
+    }
+    if let Some(service) = zone.take_service_head_for_executor(slot) {
+        let record = match service {
+            carrick_el1_abi::ServiceHead::FirstEntry(custody) => {
+                #[cfg(any(test, feature = "test-support"))]
+                carrick_kernel::el1_zone::first_entry_test_control::emit(
+                    carrick_kernel::el1_zone::first_entry_test_control::Event::ExecutorTaken(
+                        custody.record(),
+                    ),
+                );
+                if adopt_born_record(scheduler, zone, custody)? {
+                    return Ok(ZoneProbe::Consumed(scheduler.try_take(registration)?));
+                }
+                return Ok(ZoneProbe::Consumed(None));
+            }
+            carrick_el1_abi::ServiceHead::Record(record) => record,
+        };
+        if zone.live(record).and_then(|rec| rec.handback())
+            != Some(carrick_el1_abi::Handback::Service)
+        {
+            // A thread ready at EL0 in another address space: this executor
+            // loads it, exactly as the thread it took off its vCPU.
+            let taken = scheduler.adopt_zone_handback(registration, record)?;
+            if taken.is_none() {
+                zone.counters
+                    .lost_adoptions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(ZoneProbe::Consumed(taken));
+        }
+        let key = carrick_kernel::el1_zone::service_key(record);
+        let taken = match key {
+            Some((thread, generation)) => {
+                zone.free_record(record.id);
+                scheduler.take_zone(registration, thread, generation)?
+            }
+            None => None,
+        };
+        if taken.is_none() {
+            zone.counters
+                .stale_services
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(ZoneProbe::Consumed(taken));
+    }
+    if let Some(running) = scheduler.try_take(registration)? {
+        return Ok(ZoneProbe::Consumed(Some(running)));
+    }
+    Ok(ZoneProbe::Empty)
 }
 
 const fn executor_claim_probe_asid_generation(validated: Option<u64>) -> u64 {
