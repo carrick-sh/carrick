@@ -1294,17 +1294,36 @@ pub struct ZoneRetirement<'member, 'page> {
     membership: &'member mut NonfinalExitMembership<'page>,
     admission: Option<&'member mut crate::lifecycle::ExitAdmission<'page>>,
 }
+
+/// A neutral retirement refusal never licenses freeing the retained record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneRetirementRefusal {
+    /// A pool member without ABI exit admission needs its host while the
+    /// lifecycle gate remains live: closing-caller reaping is not permitted.
+    HostCustody,
+    /// No release receipt was produced, including a scheduler requeue that
+    /// preserves an adapter operation for its existing host owner.
+    NotReleased,
+}
+
 impl ZoneRetirement<'_, '_> {
     pub fn retire_current<C: carrick_core_abi::EntryContext>(
         self,
         binding: ExecutionBinding,
         source: carrick_core_abi::BornInZoneSource<'_, C>,
         record: carrick_sched_core::RecordId,
-    ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+    ) -> Result<carrick_core_abi::EntryHandoffReceipt<C>, ZoneRetirementRefusal> {
         if binding != self.identity.binding() {
-            return None;
+            return Err(ZoneRetirementRefusal::NotReleased);
+        }
+        if self.admission.is_none()
+            && self.identity.entry().is_some()
+            && !self.membership.permits_cancelled_pool_retirement()
+        {
+            return Err(ZoneRetirementRefusal::HostCustody);
         }
         crate::entry::retire_current_with(binding, source, record, self)
+            .ok_or(ZoneRetirementRefusal::NotReleased)
     }
 }
 
@@ -1362,8 +1381,9 @@ impl TerminalCustody<Thread, Terminal> {
         binding: ExecutionBinding,
         source: carrick_core_abi::BornInZoneSource<'_, C>,
         record: carrick_sched_core::RecordId,
-    ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-        self.zone_retirement(member, membership, None)?
+    ) -> Result<carrick_core_abi::EntryHandoffReceipt<C>, ZoneRetirementRefusal> {
+        self.zone_retirement(member, membership, None)
+            .ok_or(ZoneRetirementRefusal::NotReleased)?
             .retire_current(binding, source, record)
     }
 

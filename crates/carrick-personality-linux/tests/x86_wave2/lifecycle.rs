@@ -391,14 +391,16 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
             assert!(unsafe { zone.record(record.id).take_object_operation() }.is_some());
             return false;
         }
-        self.handoff = retirement.retire_current(
-            self.binding,
-            BornInZoneSource {
-                zone: &self.process.zone,
-                slot: SLOT,
-            },
-            record.id,
-        );
+        self.handoff = retirement
+            .retire_current(
+                self.binding,
+                BornInZoneSource {
+                    zone: &self.process.zone,
+                    slot: SLOT,
+                },
+                record.id,
+            )
+            .ok();
         if self.handoff.is_some() {
             let slot = self.thread().unwrap().slot;
             let cleanup = carrick_core::terminal::reserve_host_thread_exit_membership(

@@ -1076,6 +1076,10 @@ impl ReservedLiveUnit {
 }
 
 impl NonfinalExitMembership<'_> {
+    pub(crate) fn permits_cancelled_pool_retirement(&self) -> bool {
+        self.page.gate().is_terminal()
+    }
+
     pub(crate) fn owns_member(&self, member: &dyn MemberControl) -> bool {
         self.member
             .as_ref()

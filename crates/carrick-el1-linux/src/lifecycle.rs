@@ -505,14 +505,16 @@ impl<
         if zone.tables.live(record).is_none() {
             return false;
         }
-        self.handoff = retirement.retire_current(
-            carrick_core::entry::binding(&task.execution, &task.mm),
-            carrick_el1_abi::BornInZoneSource {
-                zone: zone.tables,
-                slot,
-            },
-            record.id,
-        );
+        self.handoff = retirement
+            .retire_current(
+                carrick_core::entry::binding(&task.execution, &task.mm),
+                carrick_el1_abi::BornInZoneSource {
+                    zone: zone.tables,
+                    slot,
+                },
+                record.id,
+            )
+            .ok();
         #[cfg(test)]
         if self.handoff.is_some() {
             let page_address =
