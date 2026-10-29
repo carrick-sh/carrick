@@ -312,7 +312,11 @@ impl Watchdog {
                     "WATCHDOG post-mortem directory: {}",
                     post_mortem_dir.display()
                 );
-                match diagnostics::persist_watchdog(&run_id, &post_mortem_dir) {
+                // The abort sink writes at the configured root. Keep this
+                // live capture separate so it cannot overwrite our IPC census
+                // or race a liveness abort that is already writing there.
+                let watchdog_dir = post_mortem_dir.join("watchdog");
+                match diagnostics::persist_watchdog(&run_id, &watchdog_dir) {
                     Ok(path) => eprintln!("WATCHDOG post-mortem written: {}", path.display()),
                     Err(error) => eprintln!("WATCHDOG post-mortem write failed: {error}"),
                 }
