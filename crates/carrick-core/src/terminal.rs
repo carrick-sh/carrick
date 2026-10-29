@@ -913,6 +913,27 @@ impl TerminalCustody<Process, Closing> {
 }
 
 impl TerminalCustody<Process, Settled> {
+    pub fn retire_caller_zone_current<C: carrick_core_abi::EntryContext>(
+        self,
+        member: &dyn MemberControl,
+        binding: ExecutionBinding,
+        source: carrick_core_abi::BornInZoneSource<'_, C>,
+        record: carrick_sched_core::RecordId,
+    ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+        if self.identity.disposition != ProcessCloseDisposition::Exit
+            || binding.mm != EntryMmKey::from_raw(self.identity.address.mm.raw().get())
+        {
+            return None;
+        }
+        let _pin = crate::lifecycle::MemberControlCustody::retain(member).ok()?;
+        crate::entry::retire_current_with(binding, source, record, || {
+            member
+                .exit_custody()
+                .commit_zone_terminal(crate::lifecycle::NativeExitCompletion::Member);
+            true
+        })
+    }
+
     pub fn identity(self) -> ProcessTerminalIdentity {
         self.identity
     }
@@ -950,6 +971,108 @@ impl TerminalCustody<Thread, Live> {
     }
 }
 
+#[derive(Debug)]
+struct MemberControlIdentity(usize);
+#[derive(Debug)]
+struct LifecycleIdentity(usize);
+
+/// Sole exact ABI reap custody retained after native host graph removal.
+/// Its storage owner must retain the same member and lifecycle allocations.
+#[derive(Debug)]
+#[must_use]
+pub struct NativeAbiReap {
+    entry: EntryRef,
+    member: MemberControlIdentity,
+    page: LifecycleIdentity,
+}
+#[derive(Debug)]
+pub enum NativeAbiReapError {
+    Transition(crate::lifecycle::TransitionError),
+    ActivityUnderflow(u64),
+}
+impl From<crate::lifecycle::TransitionError> for NativeAbiReapError {
+    fn from(value: crate::lifecycle::TransitionError) -> Self {
+        Self::Transition(value)
+    }
+}
+impl NativeAbiReap {
+    /// Pending publication is retained, never discarded or inferred from graph
+    /// absence. Only this ticket's exact ExitedInZone -> Reaped completes debt.
+    pub fn settle(
+        &self,
+        page: &dyn Lifecycle,
+        member: &dyn MemberControl,
+    ) -> Result<bool, NativeAbiReapError> {
+        use crate::lifecycle::{EntryState, TransitionError};
+        if self.page.0 != core::ptr::from_ref(page).addr()
+            || self.member.0 != core::ptr::from_ref(member).addr()
+            || member.member_entry() != Some(self.entry)
+        {
+            return Err(TransitionError::StaleGeneration.into());
+        }
+        let (generation, state) = page
+            .state(self.entry.index())
+            .ok_or(TransitionError::NoSuchEntry)?;
+        if generation != self.entry.generation() {
+            return Err(TransitionError::StaleGeneration.into());
+        }
+        match state {
+            EntryState::ExitingBorn | EntryState::ExitingPublished => Ok(false),
+            EntryState::ExitedInZone => {
+                page.reap(self.entry)?;
+                if let Some(activity) = page.activity() {
+                    activity
+                        .complete(1)
+                        .map_err(NativeAbiReapError::ActivityUnderflow)?;
+                }
+                Ok(true)
+            }
+            state => Err(TransitionError::WrongState(state).into()),
+        }
+    }
+}
+
+/// Apply the committed process owner's exact member verdict before cancellation
+/// drops a saved continuation. Process membership belongs to that owner; this
+/// publication never reserves or refunds an additional nonfinal live unit.
+pub fn commit_process_member_retirement(
+    retirement: carrick_sched_core::process::exit::ExitMemberRetirement,
+    task: TaskKey,
+    member: &dyn MemberControl,
+) -> Option<()> {
+    if !retirement.authorizes(task) {
+        return None;
+    }
+    let _pin = crate::lifecycle::MemberControlCustody::retain(member).ok()?;
+    member.exit_custody().commit_host_zone_terminal();
+    Some(())
+}
+
+pub enum LosingMemberSettlement<C: carrick_core_abi::EntryContext> {
+    Released(carrick_core_abi::EntryHandoffReceipt<C>),
+    HostCustody,
+}
+/// A preparing host owner retains the continuation; an already committed
+/// owner licenses exact release without a second membership decrement.
+pub fn settle_losing_zone_current<C: carrick_core_abi::EntryContext>(
+    member: &dyn MemberControl,
+    binding: ExecutionBinding,
+    source: carrick_core_abi::BornInZoneSource<'_, C>,
+    record: carrick_sched_core::RecordId,
+) -> Option<LosingMemberSettlement<C>> {
+    let _pin = crate::lifecycle::MemberControlCustody::retain(member).ok()?;
+    crate::entry::prepare_handoff(binding, source, record)?;
+    if member.exit_custody().zone_terminal()
+        || crate::lifecycle::recorded_member_exit_kind(member, member.member_entry())
+            == MemberExitKind::InZone
+        || member.host_retirement().is_some()
+    {
+        crate::entry::retire_current(binding, source, record).map(LosingMemberSettlement::Released)
+    } else {
+        Some(LosingMemberSettlement::HostCustody)
+    }
+}
+
 /// Host graph cleanup either owns a live reservation or consumes the native
 /// terminal owner's membership ownership. Record absence grants neither.
 #[must_use]
@@ -966,8 +1089,8 @@ impl HostThreadExitMembership<'_> {
     /// committed token never refunds live membership, even if its owner drops.
     pub fn commit_zone_retirement(mut self) -> Self {
         if let Some(reserved) = self.reserved.as_mut() {
-            self.member.exit_custody().commit_host_zone_terminal();
             reserved.commit_irrevocable();
+            self.member.exit_custody().commit_host_zone_terminal();
         }
         self
     }
@@ -976,17 +1099,32 @@ impl HostThreadExitMembership<'_> {
         self,
         entry: EntryRef,
         member: &dyn MemberControl,
-    ) -> Result<(), crate::lifecycle::TransitionError> {
+    ) -> Result<Option<NativeAbiReap>, NativeAbiReapError> {
+        use crate::lifecycle::{EntryState, TransitionError};
         if !core::ptr::addr_eq(self.member.control(), member)
             || self.entry != Some(entry)
             || member.member_entry() != self.entry
         {
-            return Err(crate::lifecycle::TransitionError::StaleGeneration);
+            return Err(TransitionError::StaleGeneration.into());
         }
         if let Some(reserved) = self.reserved {
             crate::lifecycle::retire_host_member(self.page, entry, member, reserved)?;
+            return Ok(None);
         }
-        Ok(())
+        if member.exit_custody().abi_exit_pending()
+            || self.page.state(entry.index())
+                == Some((entry.generation(), EntryState::ExitedInZone))
+        {
+            let ticket = NativeAbiReap {
+                entry,
+                member: MemberControlIdentity(core::ptr::from_ref(member).addr()),
+                page: LifecycleIdentity(core::ptr::from_ref(self.page).addr()),
+            };
+            if !ticket.settle(self.page, member)? {
+                return Ok(Some(ticket));
+            }
+        }
+        Ok(None)
     }
 
     pub fn publish(self) {
@@ -1002,17 +1140,31 @@ impl HostThreadExitMembership<'_> {
 pub fn reserve_host_thread_exit_membership<'a>(
     page: &'a impl Lifecycle,
     member: &'a dyn MemberControl,
-) -> Result<HostThreadExitMembership<'a>, MembershipFloor> {
-    let pin =
-        crate::lifecycle::MemberControlCustody::retain(member).map_err(|_| MembershipFloor)?;
+) -> Result<HostThreadExitMembership<'a>, crate::lifecycle::MemberMembershipError> {
+    let pin = crate::lifecycle::MemberControlCustody::retain(member)
+        .map_err(|_| crate::lifecycle::MemberMembershipError::InvalidMember)?;
     let entry = member.member_entry();
     let native_reserved = member.exit_custody().native_zone_terminal()
         || crate::lifecycle::recorded_member_exit_kind(member, member.member_entry())
             == MemberExitKind::InZone;
-    let reserved = if native_reserved {
+    let reserved = if native_reserved || member.host_retirement().is_some() {
         None
+    } else if member.exit_custody().zone_terminal() {
+        return Err(crate::lifecycle::MemberMembershipError::InFlight);
     } else {
-        Some(reserve_thread_exit_membership(page)?)
+        match crate::lifecycle::reserve_member_exit(page, member) {
+            Ok(membership) => Some(membership),
+            Err(crate::lifecycle::MemberMembershipError::AlreadyTerminal)
+                if member.exit_custody().native_zone_terminal()
+                    || crate::lifecycle::recorded_member_exit_kind(
+                        member,
+                        member.member_entry(),
+                    ) == MemberExitKind::InZone =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        }
     };
     Ok(HostThreadExitMembership {
         page,
@@ -1057,7 +1209,35 @@ impl TerminalCustody<Thread, Exiting> {
         }
     }
 
-    pub fn reserve_nonfinal<'a>(
+    pub fn reserve_member<'a>(
+        self,
+        page: &'a impl Lifecycle,
+        member: &'a dyn MemberControl,
+    ) -> Result<
+        (
+            TerminalCustody<Thread, Terminal>,
+            NonfinalExitMembership<'a>,
+        ),
+        (Self, crate::lifecycle::MemberMembershipError),
+    > {
+        if member.member_entry() != self.identity.entry() {
+            return Err((self, crate::lifecycle::MemberMembershipError::InvalidMember));
+        }
+        let membership = match crate::lifecycle::reserve_member_exit(page, member) {
+            Ok(membership) => membership,
+            Err(error) => return Err((self, error)),
+        };
+        Ok((
+            TerminalCustody {
+                identity: self.identity,
+                phase: PhantomData,
+            },
+            membership,
+        ))
+    }
+
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn reserve_nonfinal_for_test<'a>(
         self,
         page: &'a impl Lifecycle,
     ) -> Result<
@@ -1070,6 +1250,7 @@ impl TerminalCustody<Thread, Exiting> {
         self.reserve_nonfinal_with(page, || {})
     }
 
+    #[cfg(any(test, feature = "host-test"))]
     fn reserve_nonfinal_with<'a>(
         self,
         page: &'a impl Lifecycle,
@@ -1095,25 +1276,90 @@ impl TerminalCustody<Thread, Exiting> {
     }
 }
 
-impl TerminalCustody<Thread, Terminal> {
-    /// Publish the exact terminal member before making its continuation absent.
-    /// Unlike failure cleanup, this requires admitted nonfinal terminal custody.
-    pub fn retire_zone_current<C: carrick_core_abi::EntryContext>(
-        &self,
-        member: &dyn MemberControl,
+/// Exact native terminal release. The scheduler invokes its commit only after
+/// excluding requeue, while it still owns the record. Terminal intent and live
+/// ownership precede Free; the optional ABI admission remains irrevocable until
+/// its caller publishes the exit for the retained reap owner.
+#[must_use]
+pub struct ZoneRetirement<'member, 'page> {
+    identity: ThreadTerminalIdentity,
+    member: crate::lifecycle::MemberControlCustody<'member, dyn MemberControl + 'member>,
+    membership: &'member mut NonfinalExitMembership<'page>,
+    admission: Option<&'member mut crate::lifecycle::ExitAdmission<'page>>,
+}
+impl ZoneRetirement<'_, '_> {
+    pub fn retire_current<C: carrick_core_abi::EntryContext>(
+        self,
         binding: ExecutionBinding,
         source: carrick_core_abi::BornInZoneSource<'_, C>,
         record: carrick_sched_core::RecordId,
     ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-        if binding != self.identity.binding() || member.member_entry() != self.identity.entry() {
+        if binding != self.identity.binding() {
             return None;
         }
-        crate::entry::prepare_handoff(binding, source, record)?;
-        // A load which observes the subsequent record Free publication must
-        // also observe this terminal provenance. Later lifecycle publication
-        // can lag it; failure cleanup alone never mints this authority.
-        member.exit_custody().commit_zone_terminal();
-        crate::entry::retire_current(binding, source, record)
+        crate::entry::retire_current_with(binding, source, record, || {
+            let completion = if let Some(admission) = self.admission {
+                admission.commit_irrevocable();
+                crate::lifecycle::NativeExitCompletion::AbiExit
+            } else {
+                crate::lifecycle::NativeExitCompletion::Member
+            };
+            self.membership.commit_irrevocable();
+            self.member.exit_custody().commit_zone_terminal(completion);
+            true
+        })
+    }
+}
+
+impl TerminalCustody<Thread, Terminal> {
+    pub fn zone_retirement<'member, 'page>(
+        &self,
+        member: &'member dyn MemberControl,
+        membership: &'member mut NonfinalExitMembership<'page>,
+        admission: Option<&'member mut crate::lifecycle::ExitAdmission<'page>>,
+    ) -> Option<ZoneRetirement<'member, 'page>> {
+        if member.member_entry() != self.identity.entry()
+            || !membership.owns_member(member)
+            || admission.as_ref().is_some_and(|admission| {
+                !admission.matches_membership(self.identity.entry(), membership)
+            })
+        {
+            return None;
+        }
+        Some(ZoneRetirement {
+            identity: self.identity,
+            member: crate::lifecycle::MemberControlCustody::retain(member).ok()?,
+            membership,
+            admission,
+        })
+    }
+
+    pub fn retire_zone_current<C: carrick_core_abi::EntryContext>(
+        &self,
+        member: &dyn MemberControl,
+        membership: &mut NonfinalExitMembership<'_>,
+        binding: ExecutionBinding,
+        source: carrick_core_abi::BornInZoneSource<'_, C>,
+        record: carrick_sched_core::RecordId,
+    ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+        self.zone_retirement(member, membership, None)?
+            .retire_current(binding, source, record)
+    }
+
+    /// A losing process-close caller has irrevocably selected terminal exit.
+    /// Keep its exact unit consumed even if later release or ABI work fails.
+    pub fn commit_zone_membership(
+        &self,
+        member: &dyn MemberControl,
+        membership: &mut NonfinalExitMembership<'_>,
+    ) -> Option<()> {
+        let retirement = self.zone_retirement(member, membership, None)?;
+        retirement.membership.commit_irrevocable();
+        retirement
+            .member
+            .exit_custody()
+            .commit_zone_terminal(crate::lifecycle::NativeExitCompletion::Member);
+        Some(())
     }
 
     pub fn into_verdict(self, page: &impl Lifecycle) -> RetirementVerdict {
@@ -1473,7 +1719,7 @@ mod tests {
                     let (_custody, unfinished) =
                         TerminalCustody::<Thread, Live>::admitted(identity)
                             .begin()
-                            .reserve_nonfinal(&page)
+                            .reserve_nonfinal_for_test(&page)
                             .unwrap_or_else(|_| {
                                 panic!("the only remaining sibling can retire after process close")
                             });
@@ -1482,7 +1728,7 @@ mod tests {
                     assert_eq!(page.live(), 1, "abandoned sibling exit restores its unit");
                     let (_custody, sibling) = TerminalCustody::<Thread, Live>::admitted(identity)
                         .begin()
-                        .reserve_nonfinal(&page)
+                        .reserve_nonfinal_for_test(&page)
                         .unwrap_or_else(|_| panic!("restored sibling exit must be admitted"));
                     sibling.publish();
                 })
@@ -1505,7 +1751,7 @@ mod tests {
                 .unwrap(),
             )
             .begin()
-            .reserve_nonfinal(&page)
+            .reserve_nonfinal_for_test(&page)
             .is_err(),
             "zero live units cannot be spent again"
         );
@@ -1685,7 +1931,7 @@ mod tests {
         .unwrap();
         let (_thread, membership) = TerminalCustody::<Thread, Live>::admitted(identity)
             .begin()
-            .reserve_nonfinal(&page)
+            .reserve_nonfinal_for_test(&page)
             .unwrap_or_else(|_| panic!("admitted exiting sibling must finish during close"));
         assert_eq!(page.claimed_count(), 1);
         admission.commit_with_member(&member).unwrap();

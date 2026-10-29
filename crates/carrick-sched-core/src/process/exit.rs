@@ -763,8 +763,21 @@ pub struct ReleasedTaskSet<Transaction> {
     task_ids: Vec<TaskId>,
 }
 
+/// A committed process owner licenses terminal cancellation of one member.
+/// Construction stays with matching topology release, before cancellation.
+pub struct ExitMemberRetirement {
+    task: TaskKey,
+}
+impl ExitMemberRetirement {
+    pub fn authorizes(&self, task: TaskKey) -> bool {
+        self.task == task
+    }
+}
 pub trait ExitMember {
     fn exit_task(&self) -> TaskKey;
+    /// Apply terminal intent when this member owns a host saved continuation.
+    /// Members without that continuation mint no missing-load authority.
+    fn commit_terminal_retirement(&self, _retirement: ExitMemberRetirement) {}
 }
 pub trait ExitEffectSource<C>: ExitLive<C> {
     type Member: ExitMember;
@@ -854,10 +867,11 @@ impl<Member, Resources, Transaction: Eq> PendingExitEffects<Member, Resources, T
         })
     }
 }
-impl<Member> ReadyExitEffects<Member> {
+impl<Member: ExitMember> ReadyExitEffects<Member> {
     /// Parent notification authority is published only after member cancellation.
     pub fn cancel_members(self, mut cancel: impl FnMut(Member)) -> ExitParentPermit {
         for member in self.members {
+            member.commit_terminal_retirement(ExitMemberRetirement { task: self.task });
             cancel(member);
         }
         ExitParentPermit {

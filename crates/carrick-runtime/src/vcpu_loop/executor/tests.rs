@@ -9125,6 +9125,20 @@ fn claimed_sibling_zone_reload(retired: bool) {
 
 #[test]
 fn serial_host_retirement_cancels_zone_wait_before_queued_claim() {
+    terminal_zone_wait_before_queued_claim(false, false);
+}
+
+#[test]
+fn serial_host_process_exit_cancels_zone_wait_before_queued_claim() {
+    terminal_zone_wait_before_queued_claim(true, false);
+}
+
+#[test]
+fn serial_host_shutdown_request_preserves_zone_wait_until_terminal_admission() {
+    terminal_zone_wait_before_queued_claim(false, true);
+}
+
+fn terminal_zone_wait_before_queued_claim(process_exit: bool, shutdown_request: bool) {
     use carrick_kernel::kernel::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
     };
@@ -9208,7 +9222,27 @@ fn serial_host_retirement_cancels_zone_wait_before_queued_claim() {
     // Real graph retirement drops the still-kernel-owned continuation; its
     // ZoneWait destructor claims and frees the record. No manual free or
     // host retirement receipt substitutes for this window.
-    kernel.exit_thread(&sibling, None).unwrap();
+    if shutdown_request {
+        assert_eq!(
+            kernel.request_container_shutdown(root.task().container().id()),
+            1
+        );
+        assert!(
+            zone.live(record).is_some(),
+            "shutdown request cannot consume a live member's saved context"
+        );
+    }
+    if process_exit {
+        kernel
+            .exit_task(
+                root.task().key().id,
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+    } else {
+        kernel.exit_thread(&sibling, None).unwrap();
+    }
     assert!(zone.live(record).is_none());
     assert!(sibling.thread().control_slot().host_retirement().is_none());
     assert!(!binding.address_space_is_retiring());
@@ -9223,5 +9257,13 @@ fn serial_host_retirement_cancels_zone_wait_before_queued_claim() {
     assert_eq!(report.created(), report.destroyed());
     assert_eq!(binding.progress.load(Ordering::SeqCst), 0);
     assert_eq!(binding.reaped_settlements.load(Ordering::SeqCst), 1);
-    assert!(root.exact_thread_is_live());
+    if process_exit {
+        assert!(
+            kernel
+                .context(root.task().key().id, root.thread().key().tid)
+                .is_err()
+        );
+    } else {
+        assert!(root.exact_thread_is_live());
+    }
 }

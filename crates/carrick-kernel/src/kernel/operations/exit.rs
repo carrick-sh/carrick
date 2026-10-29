@@ -76,6 +76,22 @@ impl carrick_sched_core::process::exit::ExitMember for HostExitMember {
     fn exit_task(&self) -> TaskKey {
         self.0.task_key()
     }
+    fn commit_terminal_retirement(
+        &self,
+        retirement: carrick_sched_core::process::exit::ExitMemberRetirement,
+    ) {
+        carrick_core::terminal::commit_process_member_retirement(
+            retirement,
+            self.0.task_key(),
+            self.0.control_slot(),
+        )
+        .unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::thread_retirement",
+                "committed process member lost terminal custody"
+            )
+        });
+    }
 }
 impl carrick_sched_core::process::exit::ExitEffectSource<crate::kernel::container::ContainerId>
     for TaskRecord
@@ -562,11 +578,20 @@ impl Kernel {
                     &*lifecycle,
                     context.thread.control_slot(),
                 )
-                .map_err(|_| KernelOperationError::LastThreadRequiresTaskExit(tid))?,
+                .map_err(|error| match error {
+                    carrick_core::lifecycle::MemberMembershipError::Floor => {
+                        KernelOperationError::LastThreadRequiresTaskExit(tid)
+                    }
+                    _ => KernelOperationError::LifecycleAdmissionBusy(context.task.key().id),
+                })?,
             )
         };
         check_failpoint(failpoint, KernelFailpoint::AfterMembershipReserve)?;
         if matches!(lane, ThreadRetirementLane::Host) {
+            self.registry()
+                .thread_ledger()
+                .reserve_native_reap()
+                .map_err(|_| KernelOperationError::RetiredThreadCapacity(1))?;
             if let Some(owned) = record.thread_pool.take_published(context.thread.key()) {
                 lane = ThreadRetirementLane::HostAdopted(owned);
             }
@@ -637,18 +662,25 @@ impl Kernel {
             match lane {
                 ThreadRetirementLane::Host => state.retired_threads.push(retired),
                 ThreadRetirementLane::HostAdopted(owned) => {
-                    let retirement_error = match live_membership.take() {
-                        Some(membership) => membership
-                            .retire_published(owned.entry, &*owned.control)
-                            .err()
-                            .map(Some),
-                        None => Some(None),
-                    };
-                    if let Some(error) = retirement_error {
-                        carrick_fatal!(
-                            "kernel::thread_retirement",
-                            "host retirement lost exact ABI generation or reserved membership: {error:?}"
-                        );
+                    let ticket = live_membership
+                        .take()
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "kernel::thread_retirement",
+                                "host retirement lost membership custody"
+                            )
+                        })
+                        .retire_published(owned.entry, &*owned.control)
+                        .unwrap_or_else(|error| {
+                            carrick_fatal!(
+                                "kernel::thread_retirement",
+                                "host retirement lost exact ABI custody: {error:?}"
+                            )
+                        });
+                    if let Some(ticket) = ticket {
+                        self.registry()
+                            .thread_ledger()
+                            .defer_native_reap(ticket, owned.control.clone());
                     }
                     state.retired_threads.push_reserved(owned.storage, retired);
                 }

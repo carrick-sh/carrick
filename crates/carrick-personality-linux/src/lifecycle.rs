@@ -437,7 +437,11 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn enqueue_born(&mut self, record: RecordRef);
     fn exit_record(&self) -> Option<ExitRecord>;
     fn wake_child_tid(&mut self, mm: EntryMmKey, address: UserVa) -> bool;
-    fn release_current(&mut self, record: RecordRef) -> bool;
+    fn release_current(
+        &mut self,
+        record: RecordRef,
+        retirement: carrick_core::terminal::ZoneRetirement<'_, '_>,
+    ) -> bool;
     fn run_next(&mut self, timeout_result: SyscallResult) -> (Served, SyscallResult);
     fn result(&self) -> SyscallResult;
     fn set_result(&mut self, result: SyscallResult);
@@ -1227,12 +1231,6 @@ fn serve_exit<'a>(
     if record.identity.tid != binding.task.raw() {
         return decline!(LifecycleDecline::ExitIdentity);
     }
-    let admission = page
-        .begin_exit(entry)
-        .inspect_err(|_| {
-            native.record_decline(LifecycleDecline::ExitAdmission);
-        })
-        .ok()?;
     let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
         binding,
         Some(entry),
@@ -1245,10 +1243,18 @@ fn serve_exit<'a>(
     .begin();
     // Core reserves the page's nonfinal membership before the native
     // handoff; a declined handoff restores that membership on drop.
-    let (custody, membership) = custody
-        .reserve_nonfinal(page)
+    let (custody, mut membership) = custody
+        .reserve_member(page, slot)
         .map_err(|_| {
             native.record_decline(LifecycleDecline::ExitLast);
+        })
+        .ok()?;
+    // The member claim precedes ABI admission, so a host retirement which
+    // already owns the live unit never encounters a new Exiting state.
+    let mut admission = page
+        .begin_exit(entry)
+        .inspect_err(|_| {
+            native.record_decline(LifecycleDecline::ExitAdmission);
         })
         .ok()?;
     let clear_child_tid = slot.clear_child_tid();
@@ -1268,7 +1274,8 @@ fn serve_exit<'a>(
             });
         }
     }
-    if !native.release_current(record.reference) {
+    let retirement = custody.zone_retirement(slot, &mut membership, Some(&mut admission))?;
+    if !native.release_current(record.reference, retirement) {
         // A host claim requeued the record after the clear and wake above
         // (`CurrentRelease::Requeued`): the exit re-runs, in the zone or on
         // the host. The joiner is already woken; suppress the second clear
@@ -1281,7 +1288,7 @@ fn serve_exit<'a>(
     if admission.commit_with_member(slot).is_err() {
         // Unreachable (checked above; only this thread leaves Born or
         // Published that way): the host must look at this process.
-        native.task_state()?.mark_pending_host_work();
+        native.fail_lifecycle(NativeRunFailureReason::NativeQuarantined);
     }
     membership.publish();
     native.thread_exited(custody.into_verdict(page));

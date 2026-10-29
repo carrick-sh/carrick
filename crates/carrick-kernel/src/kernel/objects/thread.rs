@@ -2169,6 +2169,17 @@ impl Thread {
         cause: crate::kernel::continuation::CancellationCause,
     ) -> Option<crate::kernel::continuation::CancellationReceipt> {
         let mut execution = self.execution.lock();
+        // A shutdown request has not admitted this member's terminal exit.
+        // Keep its native checkpoint for SIGKILL/control wake; ordinary host
+        // services can still be cancelled to release their host waiters.
+        if cause == crate::kernel::continuation::CancellationCause::ServiceShutdown
+            && execution
+                .blocked_continuation
+                .as_ref()
+                .is_some_and(|continuation| continuation.zone_wait().is_some())
+        {
+            return None;
+        }
         let continuation = execution.blocked_continuation.take()?;
         let receipt = continuation.cancel(cause);
         if let ThreadExecutionState::Blocked {

@@ -732,11 +732,15 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
         )
     }
-    fn release_current(&mut self, record: RecordRef) -> bool {
+    fn release_current(
+        &mut self,
+        record: RecordRef,
+        retirement: carrick_core::terminal::ZoneRetirement<'_, '_>,
+    ) -> bool {
         if self.zone.live(record).is_none() {
             return false;
         }
-        self.handoff = carrick_core::entry::retire_current(
+        self.handoff = retirement.retire_current(
             carrick_core::entry::binding(&self.task.execution, &self.task.mm),
             carrick_core_abi::BornInZoneSource {
                 zone: self.zone,
@@ -1023,11 +1027,21 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             self.zone.slot(self.lane.slot).current(),
             LifecycleInvariant::ExitRecord,
         );
-        committed(
-            self.release_current(self.zone.record_ref(record))
-                .then_some(()),
+        // This bounded fixture's child-exit owner published above. Its sidecar
+        // has no host executor claim or saved TaskCpuResidency; pool-member
+        // membership and missing-load authority belong to the shared runtime.
+        self.handoff = Some(committed(
+            carrick_core::entry::retire_current(
+                carrick_core::entry::binding(&self.task.execution, &self.task.mm),
+                carrick_core_abi::BornInZoneSource {
+                    zone: self.zone,
+                    slot: self.lane.slot,
+                },
+                record,
+            ),
             LifecycleInvariant::ExitRetirement,
-        );
+        ));
+        self.lane.retirements += 1;
         Some(committed(
             self.resume_after_child_exit(),
             LifecycleInvariant::ExitSwitch,

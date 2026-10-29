@@ -326,6 +326,12 @@ pub(crate) struct ThreadIdentityPool {
     published: Mutex<Vec<PublishedAbiThread>>,
 }
 
+#[derive(Debug)]
+struct PendingNativeAbiReap {
+    ticket: carrick_core::terminal::NativeAbiReap,
+    control: super::objects::ThreadControlLease,
+}
+
 /// Unique custody transferred from birth settlement to either retirement lane.
 #[derive(Debug)]
 pub(in crate::kernel) struct PublishedAbiThread {
@@ -600,6 +606,7 @@ pub struct ThreadLedger {
     /// loads zero knows every earlier birth is in the graph.
     pending: AtomicUsize,
     births: Mutex<Vec<PreparedThreadClone>>,
+    native_reaps: Mutex<Vec<PendingNativeAbiReap>>,
     /// Serializes settlement: a reader that sees `pending > 0` waits here for
     /// the settler that took the births to finish publishing them.
     settling: Mutex<()>,
@@ -609,6 +616,43 @@ pub struct ThreadLedger {
 }
 
 impl ThreadLedger {
+    pub(in crate::kernel) fn reserve_native_reap(
+        &self,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.native_reaps.lock().try_reserve(1)
+    }
+    pub(in crate::kernel) fn defer_native_reap(
+        &self,
+        ticket: carrick_core::terminal::NativeAbiReap,
+        control: super::objects::ThreadControlLease,
+    ) {
+        self.native_reaps
+            .lock()
+            .push(PendingNativeAbiReap { ticket, control });
+    }
+    fn settle_native_reaps(&self) {
+        let mut pending = self.native_reaps.lock();
+        let mut index = 0;
+        while index < pending.len() {
+            let reap = &pending[index];
+            let page = reap.control.lifecycle();
+            if reap
+                .ticket
+                .settle(&*page, &*reap.control)
+                .unwrap_or_else(|error| {
+                    carrick_fatal::carrick_fatal!(
+                        "thread::ledger",
+                        "native ABI reap lost exact custody: {error:?}"
+                    )
+                })
+            {
+                pending.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     pub(crate) fn for_root(page: &super::objects::ThreadLifecycleLease) -> Self {
         let activity = super::objects::ThreadLedgerActivityLease::for_page(page);
         page.bind_activity(activity.clone());
@@ -616,6 +660,7 @@ impl ThreadLedger {
             depth: AtomicUsize::new(pool_depth_from_env()),
             pending: AtomicUsize::new(0),
             births: Mutex::new(Vec::new()),
+            native_reaps: Mutex::new(Vec::new()),
             settling: Mutex::new(()),
             in_flight: Arc::default(),
             activity,
@@ -668,6 +713,7 @@ impl ThreadLedger {
         let mut exited = Vec::new();
         {
             let mut state = lock.write();
+            self.settle_native_reaps();
             for birth in births {
                 // A birth whose task left the live set before settlement is
                 // dropped, which cancels it; there is nothing to publish into.
@@ -2284,12 +2330,12 @@ mod tests {
 
     #[test]
     fn lifecycle_abi_birth_is_resolved_by_a_second_process() {
-        abi_birth_observed_by_peer(false, false, false, false);
+        abi_birth_observed_by_peer(false, false, AbiExitFixture::Live);
     }
 
     #[test]
     fn lifecycle_abi_birth_uses_reserved_resources_after_allocator_exhaustion() {
-        abi_birth_observed_by_peer(true, false, false, false);
+        abi_birth_observed_by_peer(true, false, AbiExitFixture::Live);
     }
 
     #[test]
@@ -2387,24 +2433,42 @@ mod tests {
 
     #[test]
     fn lifecycle_abi_birth_uses_revision_headroom_reserved_from_host_mutations() {
-        abi_birth_observed_by_peer(false, true, false, false);
+        abi_birth_observed_by_peer(false, true, AbiExitFixture::Live);
     }
 
     #[test]
     fn lifecycle_host_adopted_abi_exit_consumes_exact_reserved_custody() {
-        abi_birth_observed_by_peer(false, true, true, false);
+        abi_birth_observed_by_peer(false, true, AbiExitFixture::Host);
     }
 
     #[test]
     fn group_exit_member_graph_retirement_does_not_retire_reaped_abi_twice() {
-        abi_birth_observed_by_peer(false, false, true, true);
+        abi_birth_observed_by_peer(false, false, AbiExitFixture::NativeCancelled);
+    }
+
+    #[test]
+    fn raw_exit_keeps_abi_reap_custody_when_host_graph_cleanup_wins() {
+        abi_birth_observed_by_peer(false, false, AbiExitFixture::Raw);
+    }
+
+    #[test]
+    fn raw_exit_reap_custody_survives_task_removal_before_publication() {
+        abi_birth_observed_by_peer(false, false, AbiExitFixture::RawAfterTaskRemoval);
+    }
+
+    #[derive(Clone, Copy)]
+    enum AbiExitFixture {
+        Live,
+        Host,
+        NativeCancelled,
+        Raw,
+        RawAfterTaskRemoval,
     }
 
     fn abi_birth_observed_by_peer(
         exhaust_ids: bool,
         exhaust_revisions: bool,
-        host_exit: bool,
-        native_exit: bool,
+        exit: AbiExitFixture,
     ) {
         let (kernel, root) = bootstrap(9_670);
         let peer = kernel
@@ -2506,7 +2570,99 @@ mod tests {
             page.state(entry.index()),
             Some((entry.generation(), EntryState::Published))
         );
-        if native_exit {
+        if matches!(
+            exit,
+            AbiExitFixture::Raw | AbiExitFixture::RawAfterTaskRemoval
+        ) {
+            kernel.exit_thread(&sibling, None).unwrap();
+            assert!(root.exact_thread_is_live() && adopted.exact_thread_is_live());
+            assert_eq!(page.live(), 2);
+            let region = carrick_test_support::TestEl1Region::zeroed();
+            // SAFETY: retained ABI-aligned region owns the zero-initialized zone.
+            let zone = unsafe {
+                &*region
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                    .cast::<carrick_el1_abi::ZoneTables>()
+            };
+            let slot = carrick_sched_core::SlotId::new(0);
+            let mm = root.shared().mm().id().raw();
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, mm, None, 0);
+            zone.enter_guest(slot);
+            let space = zone.spaces.publish_closed(mm, 0x1000, 0x1000).unwrap();
+            zone.spaces.open(space);
+            zone.install_space(slot, mm).unwrap();
+            let record = zone
+                .alloc_record(carrick_el1_abi::ThreadIdentity {
+                    tid: identity.tid as u64,
+                    serial: identity.thread_serial,
+                    mm,
+                    file_table: adopted.resources().files().id().raw(),
+                    generation: 1,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    affinity: 1,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            zone.requeue_preempted(slot, record);
+            assert_eq!(zone.switch_in(slot), Some(record));
+            let binding = carrick_el1_abi::ExecutionBinding {
+                task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid as u64),
+                generation: carrick_core_abi::SnapshotGeneration::from_raw(1),
+                mm: carrick_core_abi::EntryMmKey::from_raw(mm),
+                thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(
+                    identity.thread_serial,
+                ),
+            };
+            let mut admission = page.begin_exit(entry).unwrap();
+            let terminal = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+                binding,
+                Some(entry),
+                carrick_sched_core::process::TerminationStatus::SUCCESS,
+            )
+            .unwrap();
+            let (custody, mut membership) = carrick_core::terminal::TerminalCustody::<
+                carrick_core::terminal::Thread,
+                carrick_core::terminal::Live,
+            >::admitted(terminal)
+            .begin()
+            .reserve_member(&*page, &*control)
+            .unwrap_or_else(|_| panic!("reserve"));
+            custody
+                .zone_retirement(&*control, &mut membership, Some(&mut admission))
+                .unwrap()
+                .retire_current(
+                    binding,
+                    carrick_el1_abi::BornInZoneSource { zone, slot },
+                    record,
+                )
+                .unwrap();
+            // Actual raw-exit release has completed, but its ABI publication
+            // and ledger announcement have not. A queued host claim wins here.
+            kernel.exit_thread(&adopted, None).unwrap();
+            assert!(!adopted.exact_thread_is_live());
+            if matches!(exit, AbiExitFixture::RawAfterTaskRemoval) {
+                kernel
+                    .exit_task(
+                        root.task().key().id,
+                        super::super::LinuxWaitStatus::from_wait_encoding(0),
+                        None,
+                    )
+                    .unwrap();
+            }
+            admission.commit_with_member(&*control).unwrap();
+            membership.publish();
+            drop(kernel.registry().settled().read());
+            assert_eq!(
+                page.state(entry.index()),
+                Some((entry.generation(), EntryState::Reaped)),
+                "host graph cleanup must retain the pending raw ABI reap"
+            );
+            assert_eq!(kernel.registry().thread_ledger().activity.pending(), 0);
+            assert_eq!(page.live(), 1);
+        } else if matches!(exit, AbiExitFixture::NativeCancelled) {
             kernel.exit_thread(&sibling, None).unwrap();
             // Two live threads share the page. The native group-close member
             // owns its live reservation and reaps its exact ABI entry before
@@ -2534,7 +2690,7 @@ mod tests {
                 page.state(entry.index()),
                 Some((entry.generation(), EntryState::Reaped))
             );
-        } else if host_exit {
+        } else if matches!(exit, AbiExitFixture::Host) {
             let live_before_decline = page.live();
             assert!(matches!(
                 kernel.exit_thread(

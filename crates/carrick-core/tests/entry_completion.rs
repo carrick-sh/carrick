@@ -663,9 +663,9 @@ fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
         carrick_sched_core::process::TerminationStatus::SUCCESS,
     )
     .unwrap();
-    let (custody, _membership) = TerminalCustody::<Thread, Live>::admitted(identity)
+    let (custody, mut _membership) = TerminalCustody::<Thread, Live>::admitted(identity)
         .begin()
-        .reserve_nonfinal(&page)
+        .reserve_member(&page, &member)
         .unwrap_or_else(|_| panic!("nonfinal member"));
     let classify = || {
         missing_zone_continuation(
@@ -683,12 +683,12 @@ fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
     };
     assert!(
         custody
-            .retire_zone_current(&member, foreign, source, record)
+            .retire_zone_current(&member, &mut _membership, foreign, source, record)
             .is_none()
     );
     assert_eq!(classify(), MissingContinuationVerdict::InvariantViolation);
     custody
-        .retire_zone_current(&member, binding, source, record)
+        .retire_zone_current(&member, &mut _membership, binding, source, record)
         .unwrap();
     assert!(zone.live(reference).is_none());
     assert_eq!(
@@ -699,6 +699,12 @@ fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
         classify(),
         MissingContinuationVerdict::Terminal,
         "record release must never precede retained terminal proof"
+    );
+    drop(_membership);
+    assert_eq!(
+        page.live(),
+        1,
+        "released terminal membership must not refund on drop"
     );
     let host = carrick_core::terminal::reserve_host_thread_exit_membership(&page, &member)
         .unwrap_or_else(|_| panic!("native reservation also owns host graph cleanup"));

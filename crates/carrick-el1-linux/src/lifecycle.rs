@@ -488,7 +488,11 @@ impl<
             )
             .is_some()
     }
-    fn release_current(&mut self, record: RecordRef) -> bool {
+    fn release_current(
+        &mut self,
+        record: RecordRef,
+        retirement: carrick_core::terminal::ZoneRetirement<'_, '_>,
+    ) -> bool {
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return false;
         };
@@ -501,7 +505,7 @@ impl<
         if zone.tables.live(record).is_none() {
             return false;
         }
-        self.handoff = carrick_core::entry::retire_current(
+        self.handoff = retirement.retire_current(
             carrick_core::entry::binding(&task.execution, &task.mm),
             carrick_el1_abi::BornInZoneSource {
                 zone: zone.tables,

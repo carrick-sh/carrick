@@ -399,15 +399,29 @@ pub fn retire_current<C: EntryContext>(
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+    retire_current_with(binding, source, record, || true)
+}
+
+/// The terminal owner commits provenance at the scheduler's release seam.
+pub(crate) fn retire_current_with<C: EntryContext>(
+    binding: ExecutionBinding,
+    source: BornInZoneSource<'_, C>,
+    record: carrick_sched_core::RecordId,
+    commit: impl FnOnce() -> bool,
+) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let start = prepare_handoff(binding, source, record)?;
     let identity = source.zone.record(record).identity();
     let released = if source.zone.slot(source.slot).current().is_none() {
-        source.zone.release_host_home(source.slot, record)
-    } else {
         source
             .zone
-            .release_current(source.slot, record, &carrick_sched_core::ShortLockSpin)
-            == carrick_sched_core::CurrentRelease::Released
+            .release_host_home_with(source.slot, record, commit)
+    } else {
+        source.zone.release_current_with(
+            source.slot,
+            record,
+            &carrick_sched_core::ShortLockSpin,
+            commit,
+        )? == carrick_sched_core::CurrentRelease::Released
     };
     if !released {
         return None;

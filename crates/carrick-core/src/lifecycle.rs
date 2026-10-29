@@ -76,9 +76,75 @@ const GRAPH_REGISTERED: u32 = 16;
 const NATIVE_SIGNAL_OWNER: u32 = 32;
 const ZONE_TERMINAL: u32 = 64;
 const ZONE_HOST_TERMINAL: u32 = 128;
-const GRAPH_REFERENCE: u32 = 256;
+const ABI_EXIT_PENDING: u32 = 256;
+const MEMBERSHIP_CLAIMED: u32 = 512;
+const GRAPH_REFERENCE: u32 = 1024;
+
+#[derive(Clone, Copy)]
+pub(crate) enum NativeExitCompletion {
+    Member,
+    AbiExit,
+}
 const RESETTING: u32 = 1 << 31;
 const REFERENCES: u32 = RESETTING - GRAPH_REFERENCE;
+
+/// Exclusive live-unit reservation for one member. Both host graph cleanup
+/// and native exit use this same admission before decrementing the page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberMembershipError {
+    AlreadyTerminal,
+    InFlight,
+    Floor,
+    InvalidMember,
+}
+
+struct MemberExitClaim<'a, W: crate::cancellation::CancellationWord> {
+    word: &'a W,
+    committed: bool,
+}
+fn claim_member_exit<W: crate::cancellation::CancellationWord>(
+    word: &W,
+) -> Result<MemberExitClaim<'_, W>, MemberMembershipError> {
+    let mut observed = word.load(Ordering::Acquire);
+    loop {
+        if observed & (ZONE_TERMINAL | IN_ZONE_COMMITTED) != 0 {
+            return Err(MemberMembershipError::AlreadyTerminal);
+        }
+        if observed & (MEMBERSHIP_CLAIMED | HOST_RETIRING) != 0 {
+            return Err(MemberMembershipError::InFlight);
+        }
+        if observed & RESETTING != 0 || observed & REFERENCES == REFERENCES {
+            return Err(MemberMembershipError::InvalidMember);
+        }
+        match word.compare_exchange(
+            observed,
+            (observed | MEMBERSHIP_CLAIMED) + GRAPH_REFERENCE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Ok(MemberExitClaim {
+                    word,
+                    committed: false,
+                });
+            }
+            Err(actual) => observed = actual,
+        }
+    }
+}
+impl<W: crate::cancellation::CancellationWord> Drop for MemberExitClaim<'_, W> {
+    fn drop(&mut self) {
+        self.word.fetch_sub(
+            GRAPH_REFERENCE
+                + if self.committed {
+                    0
+                } else {
+                    MEMBERSHIP_CLAIMED
+                },
+            Ordering::AcqRel,
+        );
+    }
+}
 
 /// Shared ownership and exit provenance for one control incarnation. Only
 /// core's admitted exit operations can publish its terminal provenance.
@@ -103,8 +169,15 @@ impl MemberExitCustody {
         self.word.store(word, Ordering::Release);
     }
     /// Irrevocable terminal custody is published before its record is freed.
-    pub(crate) fn commit_zone_terminal(&self) {
-        self.word.fetch_or(ZONE_TERMINAL, Ordering::Release);
+    pub(crate) fn commit_zone_terminal(&self, completion: NativeExitCompletion) {
+        let abi = match completion {
+            NativeExitCompletion::Member => 0,
+            NativeExitCompletion::AbiExit => ABI_EXIT_PENDING,
+        };
+        self.word.fetch_or(ZONE_TERMINAL | abi, Ordering::Release);
+    }
+    pub(crate) fn abi_exit_pending(&self) -> bool {
+        self.word.load(Ordering::Acquire) & ABI_EXIT_PENDING != 0
     }
     pub(crate) fn zone_terminal(&self) -> bool {
         self.word.load(Ordering::Acquire) & ZONE_TERMINAL != 0
@@ -239,6 +312,20 @@ pub trait MemberControl {
     fn member_entry(&self) -> Option<EntryRef>;
     fn exit_custody(&self) -> &MemberExitCustody;
     fn host_retirement(&self) -> Option<crate::terminal::HostThreadRetirementReceipt>;
+}
+
+pub(crate) fn reserve_member_exit<'a>(
+    page: &'a impl Lifecycle,
+    member: &'a dyn MemberControl,
+) -> Result<NonfinalExitMembership<'a>, MemberMembershipError> {
+    if member.host_retirement().is_some() {
+        return Err(MemberMembershipError::AlreadyTerminal);
+    }
+    let claim = claim_member_exit(&member.exit_custody().word)?;
+    let mut membership = crate::terminal::reserve_thread_exit_membership(page)
+        .map_err(|_| MemberMembershipError::Floor)?;
+    membership.member = Some(claim);
+    Ok(membership)
 }
 
 pub fn recorded_member_exit_kind(
@@ -576,6 +663,7 @@ pub trait Lifecycle {
         Ok(NonfinalExitMembership {
             page: self,
             reserved: Some(ReservedLiveUnit::new()),
+            member: None,
         })
     }
 
@@ -590,6 +678,7 @@ pub trait Lifecycle {
         Ok(NonfinalExitMembership {
             page: self,
             reserved: Some(ReservedLiveUnit::new()),
+            member: None,
         })
     }
 
@@ -603,6 +692,7 @@ pub trait Lifecycle {
         Ok(NonfinalExitMembership {
             page: self,
             reserved: Some(ReservedLiveUnit::new()),
+            member: None,
         })
     }
 
@@ -861,6 +951,7 @@ pub trait Lifecycle {
             page: self,
             entry: r,
             committed: false,
+            irrevocable: false,
         };
         let gate = self.gate();
         if gate != GateState::Open {
@@ -895,6 +986,7 @@ pub trait Lifecycle {
 pub struct NonfinalExitMembership<'a> {
     page: &'a dyn Lifecycle,
     reserved: Option<ReservedLiveUnit>,
+    member: Option<MemberExitClaim<'a, AtomicU32>>,
 }
 
 /// Proof that one live unit was removed from an exact page. Its constructor
@@ -908,15 +1000,23 @@ impl ReservedLiveUnit {
 }
 
 impl NonfinalExitMembership<'_> {
+    pub(crate) fn owns_member(&self, member: &dyn MemberControl) -> bool {
+        self.member
+            .as_ref()
+            .is_some_and(|claim| core::ptr::eq(claim.word, &member.exit_custody().word))
+    }
     /// The exact terminal owner crossed its irreversible publication point.
     /// Dropping this token can no longer restore a terminated member's unit.
     pub(crate) fn commit_irrevocable(&mut self) {
         self.reserved.take();
+        if let Some(member) = self.member.as_mut() {
+            member.committed = true;
+        }
     }
 
     /// The graph's exact-thread retirement and ledger publication completed.
     pub fn publish(mut self) {
-        self.reserved.take();
+        self.commit_irrevocable();
     }
 }
 
@@ -933,9 +1033,20 @@ pub struct ExitAdmission<'a> {
     page: &'a dyn Lifecycle,
     entry: EntryRef,
     committed: bool,
+    irrevocable: bool,
 }
 
 impl ExitAdmission<'_> {
+    pub(crate) fn commit_irrevocable(&mut self) {
+        self.irrevocable = true;
+    }
+    pub(crate) fn matches_membership(
+        &self,
+        entry: Option<EntryRef>,
+        membership: &NonfinalExitMembership<'_>,
+    ) -> bool {
+        entry == Some(self.entry) && core::ptr::addr_eq(self.page, membership.page)
+    }
     /// Publish the member-owned exit kind before making the shared entry
     /// reappable. Closing may observe the marker during the admitted window,
     /// but claimed_count prevents settlement until this CAS completes.
@@ -982,7 +1093,7 @@ impl ExitAdmission<'_> {
 
 impl Drop for ExitAdmission<'_> {
     fn drop(&mut self) {
-        if self.committed {
+        if self.committed || self.irrevocable {
             return;
         }
         // Publication can race this rollback, so retry only that exact CAS
@@ -1129,5 +1240,91 @@ mod membership_tests {
         assert!(member.custody.zone_terminal());
         assert!(!member.custody.native_zone_terminal());
         assert_eq!(page.live(), 1);
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_models {
+    use super::*;
+    use crate::cancellation::{CancellationAuthority, CancellationWord, ProcessCancellation};
+    use loom::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32 as LoomWord},
+    };
+    use loom::thread;
+
+    struct Word(LoomWord);
+    impl CancellationWord for Word {
+        fn load(&self, order: Ordering) -> u32 {
+            self.0.load(order)
+        }
+        fn compare_exchange(
+            &self,
+            old: u32,
+            new: u32,
+            success: Ordering,
+            failure: Ordering,
+        ) -> Result<u32, u32> {
+            self.0.compare_exchange(old, new, success, failure)
+        }
+        fn fetch_sub(&self, value: u32, order: Ordering) -> u32 {
+            self.0.fetch_sub(value, order)
+        }
+        fn fetch_or(&self, value: u32, order: Ordering) -> u32 {
+            self.0.fetch_or(value, order)
+        }
+    }
+
+    #[test]
+    fn concurrent_group_exit_and_direct_load_share_exact_member_admission() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.max_branches = 10_000;
+        model.check(|| {
+            let cancellation = Arc::new(CancellationAuthority::with_word(Word(LoomWord::new(0))));
+            let member = Arc::new(Word(LoomWord::new(0)));
+            let live = Arc::new(LoomWord::new(2));
+            let absent = Arc::new(AtomicBool::new(false));
+            let retire =
+                |member: &Word, live: &LoomWord, absent: &AtomicBool| match claim_member_exit(
+                    member,
+                ) {
+                    Ok(mut claim) => {
+                        assert!(live.fetch_sub(1, Ordering::AcqRel) > 0);
+                        claim.committed = true;
+                        member.fetch_or(ZONE_TERMINAL, Ordering::Release);
+                        absent.store(true, Ordering::Release);
+                    }
+                    Err(
+                        MemberMembershipError::AlreadyTerminal | MemberMembershipError::InFlight,
+                    ) => {}
+                    Err(error) => panic!("unexpected admission: {error:?}"),
+                };
+            let root_cancellation = cancellation.clone();
+            let root_member = member.clone();
+            let root_live = live.clone();
+            let root_absent = absent.clone();
+            let root = thread::spawn(move || {
+                root_cancellation.publish(ProcessCancellation::GroupExit, thread::yield_now);
+                // The close owner reserves its own distinct caller unit, then
+                // races the sibling's exit to retire that same exact member.
+                assert!(root_live.fetch_sub(1, Ordering::AcqRel) > 0);
+                retire(&root_member, &root_live, &root_absent);
+            });
+            let sibling_member = member.clone();
+            let sibling_live = live.clone();
+            let sibling_absent = absent.clone();
+            let sibling = thread::spawn(move || {
+                cancellation.publish(ProcessCancellation::GroupExit, thread::yield_now);
+                retire(&sibling_member, &sibling_live, &sibling_absent);
+            });
+            if absent.load(Ordering::Acquire) {
+                assert_ne!(member.load(Ordering::Acquire) & ZONE_TERMINAL, 0);
+            }
+            root.join().unwrap();
+            sibling.join().unwrap();
+            assert_eq!(live.load(Ordering::Acquire), 0, "one unit per live member");
+            assert_eq!(member.load(Ordering::Acquire) & REFERENCES, 0);
+        });
     }
 }

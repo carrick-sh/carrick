@@ -666,3 +666,69 @@ fn delayed_closing_cannot_overwrite_replacement_handback() {
         );
     });
 }
+
+/// Two live members enter group exit while a host claim targets the sibling.
+/// The process-owner election and live units are bounded atomic venues; the
+/// target's claim, release, incarnation and absent-record read are production
+/// ZoneTables operations. The owner's unrelated record is outside this model.
+#[test]
+fn concurrent_group_exit_keeps_direct_load_terminal_intent_before_release() {
+    model_composed(|| {
+        let zone = zone();
+        zone.publish_slot(SLOT, 7, None, 0);
+        assert!(
+            zone.occupancy
+                .replace(occupancy::ExecutionSlot::zone(SLOT), 0, 7)
+        );
+        let id = zone
+            .alloc_record(ThreadIdentity {
+                tid: 42,
+                serial: 102,
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                lifecycle_page: 1,
+                control_slot: 1,
+                affinity_source: crate::AffinitySource::UNBOUND,
+                affinity: 1,
+            })
+            .unwrap();
+        let record = zone.record_ref(id);
+        zone.requeue_preempted(SLOT, id);
+        assert_eq!(zone.switch_in(SLOT), Some(id));
+        let owner = Arc::new(AtomicU32::new(0));
+        let live = Arc::new(AtomicU32::new(2));
+        let intent = Arc::new(AtomicU32::new(0));
+        let root_owner = owner.clone();
+        let root_live = live.clone();
+        let root = thread::spawn(move || {
+            let _ = root_owner.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+            assert!(root_live.fetch_sub(1, Ordering::AcqRel) > 0);
+        });
+        let member_zone = zone.clone();
+        let member_live = live.clone();
+        let member_intent = intent.clone();
+        let member = thread::spawn(move || {
+            let _ = owner.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+            assert!(member_live.fetch_sub(1, Ordering::AcqRel) > 0);
+            assert_eq!(
+                member_zone.release_current_with(SLOT, id, &SpinForever, || {
+                    member_intent.fetch_or(1, Ordering::Release);
+                    true
+                }),
+                Some(CurrentRelease::Released)
+            );
+        });
+        let _ = zone.claim_for_host(record, None, Handback::Control, &SpinForever);
+        if zone.live(record).is_none() {
+            assert_eq!(
+                intent.load(Ordering::Acquire),
+                1,
+                "DirectLoad observed absence before terminal intent"
+            );
+        }
+        root.join().unwrap();
+        member.join().unwrap();
+        assert_eq!(live.load(Ordering::Acquire), 0);
+    });
+}
