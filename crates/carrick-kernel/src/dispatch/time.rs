@@ -1860,7 +1860,7 @@ mod s3_review_tests {
         let completion = crate::kernel::continuation::ContinuationCompletion::InterruptedSleep {
             remaining: Some((remaining, Duration::from_millis(750))),
         };
-        let Some(DispatchOutcome::CompletionCopyoutSuspended(pending)) =
+        let Some(DispatchOutcome::OutputSuspended(pending)) =
             crate::kernel::continuation::fold_continuation_completion(
                 completion,
                 &dispatcher,

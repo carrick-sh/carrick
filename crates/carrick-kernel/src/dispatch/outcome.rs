@@ -498,8 +498,9 @@ pub enum FdWaitCompletion {
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
     /// A completed wait retains output progress across an owner-memory wait.
-    CompletionCopyoutSuspended(
-        #[serde(skip_serializing)] Box<crate::kernel::continuation::OwnedCompletionCopyout>,
+    OutputSuspended(
+        #[serde(skip_serializing)]
+        Box<crate::kernel::continuation::output::SuspendedOutputCompletion>,
     ),
     /// A vector pipe read retains its exact endpoint and byte cursor.
     PipeReadSuspended(#[serde(skip_serializing)] Box<super::SuspendedPipeRead>),
@@ -511,8 +512,6 @@ pub enum DispatchOutcome {
     /// Backend: park on the exact memory dependency and resume the retained
     /// timespec copy before creating the sleep's timed continuation.
     SleepCopyInSuspended(#[serde(skip_serializing)] Box<super::OwnedSleepCopyIn>),
-    /// Resume only address completion; the receive payload is already copied.
-    RecvfromAddressSuspended(#[serde(skip_serializing)] Box<super::OwnedRecvfromAddress>),
     /// Backend: write `value` into the guest's syscall return register, service any
     /// signal that became pending during the call, and resume the task.
     Returned { value: i64 },

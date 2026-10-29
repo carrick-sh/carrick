@@ -345,12 +345,15 @@ impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
 /// memory access requests (`PTRACE_PEEKTEXT`, `PTRACE_PEEKDATA`, `PTRACE_POKETEXT`,
 /// `PTRACE_POKEDATA`) consume the execution lease. The selected
 /// filesystem durability operations (`sync`, `fsync`, `fdatasync`,
-/// `sync_file_range`, `syncfs`) and scalar `write` also borrow it for host-wait handoff. Other
+/// `sync_file_range`, `syncfs`) and scalar `write` also borrow it for host-wait
+/// handoff. `recvfrom` borrows it to capture exact retained-output identity
+/// before payload consumption. Other
 /// ordinary syscalls and non-memory ptrace requests execute without acquiring or
 /// consulting the execution lease lock.
 #[inline]
 pub const fn syscall_requires_execution_lease(nr: u64, args: SyscallArgs) -> bool {
     match nr {
+        number if number == carrick_abi::syscall::nr::RECVFROM.raw() => true,
         64 | 81..=84 | 267 | 270 | 271 => true,
         117 => matches!(
             args.0[0],

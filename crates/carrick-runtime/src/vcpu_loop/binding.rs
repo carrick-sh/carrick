@@ -240,12 +240,11 @@ pub(super) enum OwnerSupplyWait {
 /// The syscall operation to resume after an owner-memory dependency.
 /// A retained transfer cannot fall through to numeric syscall redispatch.
 pub(super) enum OwnedSyscallResume {
-    Completion(Box<carrick_kernel::kernel::continuation::OwnedCompletionCopyout>),
+    Output(Box<carrick_kernel::kernel::continuation::output::RetainedOutputCompletion>),
     CopyoutRedispatch,
     Ipc(carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation),
     Io(OwnedIoResume),
     Sleep(Box<carrick_kernel::dispatch::OwnedSleepCopyIn>),
-    RecvfromAddress(Box<carrick_kernel::dispatch::OwnedRecvfromAddress>),
 }
 
 pub(super) enum OwnedIoResume {
@@ -258,10 +257,10 @@ pub(super) fn owner_copyin_route(
     outcome: DispatchOutcome,
 ) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
     let (wait, resume) = match outcome {
-        DispatchOutcome::CompletionCopyoutSuspended(pending) => (
-            pending.wait().clone(),
-            OwnedSyscallResume::Completion(pending),
-        ),
+        DispatchOutcome::OutputSuspended(pending) => {
+            let (operation, wait) = pending.into_parts();
+            (wait, OwnedSyscallResume::Output(Box::new(operation)))
+        }
         DispatchOutcome::WriteCopyInSuspended(pending) => (
             pending.wait().clone(),
             OwnedSyscallResume::Io(OwnedIoResume::PreparedWrite(pending)),
@@ -277,24 +276,9 @@ pub(super) fn owner_copyin_route(
         DispatchOutcome::SleepCopyInSuspended(pending) => {
             (pending.wait().clone(), OwnedSyscallResume::Sleep(pending))
         }
-        DispatchOutcome::RecvfromAddressSuspended(pending) => (
-            pending.wait().clone(),
-            OwnedSyscallResume::RecvfromAddress(pending),
-        ),
         other => return (other, None),
     };
-    let wait_outcome = match wait {
-        carrick_guest_mem::MemoryReadWait::Owner(wait) => {
-            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
-        }
-        carrick_guest_mem::MemoryReadWait::Supply(request) => DispatchOutcome::OwnerMemorySupply {
-            request,
-            committed: 0,
-        },
-        carrick_guest_mem::MemoryReadWait::Physical(wait) => {
-            DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
-        }
-    };
+    let wait_outcome = DispatchOutcome::from_owner_memory_read_wait(wait);
     (wait_outcome, Some(resume))
 }
 
@@ -7163,13 +7147,10 @@ mod tests {
             outcome,
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         );
-        let Some(OwnedSyscallResume::Completion(pending)) = resume else {
+        let Some(OwnedSyscallResume::Output(pending)) = resume else {
             panic!("lost completed wait ownership")
         };
-        assert_eq!(
-            pending.wait(),
-            &carrick_guest_mem::MemoryReadWait::Owner(wait)
-        );
+        assert!(pending.is_completed_wait());
         use carrick_el1_abi::Lifecycle;
         context
             .lifecycle_page()
@@ -7180,7 +7161,7 @@ mod tests {
                 || panic!("no effects"),
             );
         assert!(matches!(
-            super::super::owner_wait::OwnerWait::new((), OwnedSyscallResume::Completion(pending))
+            super::super::owner_wait::OwnerWait::new((), OwnedSyscallResume::Output(pending))
                 .settle(
                     || carrick_kernel::kernel::continuation::owner_wait_cancellation(&context),
                     |_| false

@@ -45,12 +45,11 @@ enum ZoneWaitPolicy {
 impl ZoneWaitPolicy {
     fn for_owner_resume(resume: &OwnedSyscallResume) -> Self {
         match resume {
-            OwnedSyscallResume::Completion(_)
+            OwnedSyscallResume::Output(_)
             | OwnedSyscallResume::CopyoutRedispatch
             | OwnedSyscallResume::Ipc(_)
             | OwnedSyscallResume::Io(_)
-            | OwnedSyscallResume::Sleep(_)
-            | OwnedSyscallResume::RecvfromAddress(_) => Self::KillableOwnerMemory,
+            | OwnedSyscallResume::Sleep(_) => Self::KillableOwnerMemory,
         }
     }
 }
@@ -975,7 +974,9 @@ where
         };
         // Internal completion-output waits retain the completed syscall's
         // restart decision. A fresh interruption still owns its own outcome.
-        if interruption.is_some() || !matches!(&resume, OwnedSyscallResume::Completion(_)) {
+        if interruption.is_some()
+            || !matches!(&resume, OwnedSyscallResume::Output(operation) if operation.is_completed_wait())
+        {
             self.state.continuation_restart = None;
         }
         let outcome = match interruption {
