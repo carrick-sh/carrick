@@ -1015,7 +1015,7 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     }
 }
 
-static RETIRED_SPACES: super::retired_spaces::RetiredSpaces =
+pub(super) static RETIRED_SPACES: super::retired_spaces::RetiredSpaces =
     super::retired_spaces::RetiredSpaces::new();
 
 pub struct Aarch64Venue;
@@ -1495,20 +1495,15 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let _ = (successor_grant, predecessor_grant);
 
-        RETIRED_SPACES.push(super::retired_spaces::RetiredSpace {
-            carrier: self.carrier,
-            zone: core::ptr::from_ref(self.zone).addr(),
-            roots: core::ptr::from_ref(self.roots).addr(),
-            mm: predecessor_mm,
-        });
         {
             let owner = self.portal().map_err(|_| NativeProcessError::Quarantined)?;
             RETIRED_SPACES
-                .drain_portal(
+                .retire_or_queue_portal(
                     &owner,
                     self.zone,
                     carrick_sched_core::ZONE_SLOTS,
                     self.worker(),
+                    predecessor_mm,
                 )
                 .map_err(|_| NativeProcessError::Quarantined)?;
         }
@@ -2157,31 +2152,24 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, live);
         }
         self.zone.release_space(self.slot);
-        RETIRED_SPACES.push(super::retired_spaces::RetiredSpace {
-            carrier: self.carrier,
-            zone: core::ptr::from_ref(self.zone).addr(),
-            roots: core::ptr::from_ref(self.roots).addr(),
-            mm: ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal()),
-        });
+        let retired_mm = ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal());
         // The final child may be the run's last fork. Once its translation
         // has been released, let the shared MM owner retire the closed root
-        // now; a still-borrowed root remains in the existing retirement queue.
+        // now; a still-borrowed root remains in the scope's retirement queue.
         {
             let owner = self.portal().unwrap_or_else(|_| fatal());
-            let _retained_for_later_drain = RETIRED_SPACES.drain_portal(
+            let _retained_for_later_drain = RETIRED_SPACES.retire_or_queue_portal(
                 &owner,
                 self.zone,
                 carrick_sched_core::ZONE_SLOTS,
                 self.worker(),
+                retired_mm,
             );
         }
         // The portal borrow ends before physical table/lifecycle clearing.
         if self
             .crossing
-            .cross_child_reclaim(
-                ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal()),
-                u64::from(self.worker()),
-            )
+            .cross_child_reclaim(retired_mm, u64::from(self.worker()))
             .is_err()
         {
             fatal();

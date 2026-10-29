@@ -1200,6 +1200,165 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
     );
 }
 
+#[cfg(test)]
+#[test]
+fn finish_exec_successor_ignores_unrelated_busy_child_in_retired_spaces() {
+    use carrick_core_abi::service::{
+        ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
+        ServiceBirth, ServiceIdentity,
+    };
+    use carrick_core_abi::{El1MmHandle, EntryThreadGeneration, SnapshotGeneration};
+    use carrick_sched_core::process::TaskId;
+    use core::num::NonZeroI32;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let service = fixture.process_service();
+
+    // Queue an unrelated closed child MM whose pending reservation work makes
+    // `retire_final` return `Busy` during drain.
+    let busy_mm = ReservationMm::new(9).unwrap();
+    let busy_space = fixture
+        .zone
+        .spaces
+        .publish_closed(busy_mm.raw(), 0x9000, 0x9000)
+        .unwrap();
+    fixture
+        .region
+        .table()
+        .publish(
+            busy_space.index(),
+            busy_mm,
+            carrick_el1_abi::Layout {
+                heap: carrick_el1_abi::ReservationRange::new(4096, VA).unwrap(),
+                arena: carrick_el1_abi::ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
+                policy: carrick_el1_abi::ReservationPolicyPayload::new([
+                    4096,
+                    u64::MAX,
+                    u64::MAX,
+                    0,
+                    0,
+                ]),
+            },
+        )
+        .unwrap();
+    let view = crate::mm_portal::test_support::nodes(fixture.region);
+    fixture
+        .region
+        .table()
+        .lock_el1_resolved(busy_space.index(), busy_mm, &view, 0)
+        .unwrap()
+        .finish_import()
+        .unwrap();
+    let carrick_core::mm::reservation::Decision::Work(busy_pending) = fixture
+        .region
+        .table()
+        .lock(busy_space.index(), busy_mm)
+        .unwrap()
+        .mmap(
+            carrick_core::mm::reservation::Placement::Fixed(VA),
+            4096,
+            carrick_el1_abi::ReservationProtection::READ_WRITE,
+        )
+        .unwrap()
+    else {
+        panic!("expected pending reservation work");
+    };
+    super::aarch64_process::RETIRED_SPACES.push(crate::retired_spaces::RetiredSpace {
+        carrier: NonZeroU64::MIN,
+        zone: core::ptr::from_ref(fixture.zone).addr(),
+        roots: core::ptr::from_ref(fixture.region.table()).addr(),
+        mm: busy_mm,
+    });
+
+    let identity = ServiceIdentity {
+        birth: ServiceBirth {
+            process: TaskKey {
+                id: TaskId::from_registry_allocation(NonZeroI32::new(7).unwrap()),
+                serial: TaskSerial::from_registry_allocation(NonZeroU64::new(11).unwrap()),
+            },
+            thread: EntryThreadGeneration::from_raw(13),
+            record: carrick_sched_core::RecordRef {
+                id: RecordId::from_raw(7).unwrap(),
+                incarnation: 17,
+            },
+            mm: unsafe {
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    ReservationMm::new(19).unwrap(),
+                    NonZeroU64::new(23).unwrap(),
+                )
+            },
+        },
+        execution: SnapshotGeneration::from_raw(29),
+        sequence: NonZeroU64::new(31).unwrap(),
+    };
+    let successor_mm = ReservationMm::new(17).unwrap();
+    let slot = service.prepare_exec_successor_slot(successor_mm).unwrap();
+    let root_gen = slot.root_generation();
+    let receipt = ExecAdoptionReceipt::checked(NonZeroU64::MIN).unwrap();
+    let root = RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap();
+    let manifest = ExecSuccessorManifest::propose(identity, successor_mm, root_gen)
+        .seal(
+            identity,
+            receipt,
+            ExecSuccessorBacking {
+                root,
+                asid: asid(47),
+                asid_generation: NonZeroU64::new(53).unwrap(),
+            },
+            ExecSuccessorEntry {
+                entry: UserVa::new(0x40_0000),
+                stack_pointer: UserVa::new(0x7fff_f000),
+            },
+        )
+        .unwrap();
+    let index = fixture.zone.spaces.find(successor_mm.raw()).unwrap();
+    let ttbr = (u64::from(asid(47).raw()) << 48) | root.address().raw();
+    assert!(
+        fixture
+            .zone
+            .spaces
+            .bind_initial_root(index, successor_mm.raw(), ttbr, ttbr)
+    );
+    let _admitted = slot.prepare_adoption().unwrap();
+    let successor = service
+        .adopt_exec_successor(identity, receipt, &manifest)
+        .unwrap();
+    slot.commit();
+
+    let predecessor_mm = fixture.address.mm.raw().get();
+    let finish_outcome = service.finish_exec_successor(fixture.address, successor.address);
+    let predecessor_still_published = fixture.zone.spaces.find(predecessor_mm).is_some();
+
+    // Clean up `busy_mm` so `RETIRED_SPACES` leaves nothing behind even if the assertion fails.
+    fixture
+        .region
+        .table()
+        .lock(busy_space.index(), busy_mm)
+        .unwrap()
+        .refuse(busy_pending)
+        .unwrap();
+    let owner: crate::aarch64_process::Portal<'_> =
+        carrick_core::mm::transaction::MmPortal::for_zone(
+            NonZeroU64::MIN,
+            fixture.region.table(),
+            fixture.zone,
+        );
+    let _ = super::aarch64_process::RETIRED_SPACES.drain_portal(
+        &owner,
+        fixture.zone,
+        carrick_sched_core::ZONE_SLOTS,
+        u32::from(fixture.slot.raw()),
+    );
+
+    // `TestStockCrossing::cross_exec_settle` returns `Unsupported` once
+    // predecessor retirement succeeds; an unrelated `Busy` child must not
+    // turn `finish_exec_successor` into `Quarantined` or leave `predecessor_mm`
+    // in `zone.spaces`.
+    assert_eq!(finish_outcome, Err(NativeProcessError::Unsupported));
+    assert!(!predecessor_still_published);
+}
+
 #[test]
 fn first_process_call_acquires_a_root_authenticated_home_record() {
     let fixture = Fixture::new(0x10000, asid(1));
