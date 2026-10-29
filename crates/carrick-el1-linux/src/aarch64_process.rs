@@ -1025,7 +1025,8 @@ static RETIRED_SPACES: super::retired_spaces::RetiredSpaces =
 /// `NonZeroU64::MIN`, small `ReservationMm` values, and heap-allocated
 /// `(zone, roots)` addresses. Tearing down a fixture scope before freeing its
 /// region prevents an earlier test's queued entry from matching a later
-/// incarnation at the same addresses.
+/// incarnation at the same addresses. While unwinding from a failed test it
+/// only purges: a drain could panic again and abort the whole test binary.
 #[cfg(any(test, feature = "host-test"))]
 pub(crate) fn drain_and_clear_retired_scope(
     zone: &ZoneTables<Aarch64ParkedContext>,
@@ -1033,6 +1034,9 @@ pub(crate) fn drain_and_clear_retired_scope(
 ) -> usize {
     let zone_address = core::ptr::from_ref(zone).addr();
     let roots_address = core::ptr::from_ref(roots).addr();
+    if std::thread::panicking() {
+        return RETIRED_SPACES.purge_scope(zone_address, roots_address);
+    }
     for carrier in RETIRED_SPACES.carriers_in_scope(zone_address, roots_address) {
         let owner: Portal<'_> =
             carrick_core::mm::transaction::MmPortal::for_zone(carrier, roots, zone);
