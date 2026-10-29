@@ -300,6 +300,9 @@ impl FrameGrantResidencyTable {
             return None;
         }
         record.store_identity(shape);
+        for word in &record.stock_mappings {
+            word.store(0, Ordering::Relaxed);
+        }
         record.stock_root.store(
             stock.map_or(0, |(owner, _)| owner.root.raw().get()),
             Ordering::Relaxed,
@@ -331,7 +334,10 @@ impl FrameGrantResidencyTable {
     ) -> bool {
         let record = &self.slots[slot];
         let epoch = record.state.load(Ordering::Acquire);
-        if epoch & GRANT_STATE_MASK != GRANT_LIVE || record.identity() != identity {
+        if record.quarantined()
+            || epoch & GRANT_STATE_MASK != GRANT_LIVE
+            || record.identity() != identity
+        {
             return false;
         }
         if claimed {
@@ -352,14 +358,14 @@ impl FrameGrantResidencyTable {
         }
         let mut mask = record.stock_retained.load(Ordering::Acquire);
         for bit in 0..4 {
-            let va = identity.semantic_base + bit * GRANT_PAGE_SIZE;
+            let va = identity.semantic_base + bit as u64 * GRANT_PAGE_SIZE;
             if va < end && start < va + GRANT_PAGE_SIZE {
-                mask &= !(1 << bit);
+                mask = super::adoption::clear_page(record, mask, bit);
             }
         }
         record.stock_retained.store(mask, Ordering::Release);
-        record.committed[0].fetch_and(mask, Ordering::AcqRel);
-        if mask == 0 {
+        record.committed[0].fetch_and(mask & 15, Ordering::AcqRel);
+        if mask & 15 == 0 {
             record.state.store(
                 (epoch & !GRANT_STATE_MASK) | GRANT_WRITING,
                 Ordering::Release,

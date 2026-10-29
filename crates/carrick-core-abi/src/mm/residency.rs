@@ -1,6 +1,10 @@
 //! Exact live residency and retained grant-window custody for either ISA.
 use core::sync::atomic::{AtomicU64, Ordering};
+mod adoption;
 mod stock;
+pub use adoption::{
+    StockAdoptionRefusal, StockAdoptionSnapshot, StockAdoptionTransaction, StockPageAdoption,
+};
 pub use stock::{
     FrameGrantResidencyLease, STOCK_CHUNKS_PER_CARRIER, STOCK_CHUNKS_PER_MM,
     STOCK_CHUNKS_PER_REFILL, StockCapacityLease, StockChunkReservation, StockPageMask,
@@ -114,10 +118,12 @@ pub struct FrameGrantResidencyRecord {
     // Zero root denotes an ordinary mapping-bound row.
     stock_root: AtomicU64,
     stock_retained: AtomicU64,
-    _reserved: [u64; 4],
+    stock_mappings: [AtomicU64; 4],
 }
 
 impl FrameGrantResidencyRecord {
+    pub const STOCK_MAPPINGS_OFFSET: usize = core::mem::offset_of!(Self, stock_mappings);
+    pub const STOCK_ADOPTION_ENCODING: u64 = 1;
     pub const STOCK_ROOT_OFFSET: usize = core::mem::offset_of!(Self, stock_root);
     pub const STOCK_RETAINED_OFFSET: usize = core::mem::offset_of!(Self, stock_retained);
     pub const COMMITTED_OFFSET: usize = core::mem::offset_of!(Self, committed);
@@ -137,7 +143,7 @@ impl FrameGrantResidencyRecord {
             transfer_pins: AtomicU64::new(TRANSFER_PIN_RETIRED),
             stock_root: AtomicU64::new(0),
             stock_retained: AtomicU64::new(0),
-            _reserved: [0; 4],
+            stock_mappings: [const { AtomicU64::new(0) }; 4],
         }
     }
 
@@ -197,6 +203,11 @@ impl FrameGrantResidencyRecord {
             let page = base + bit * GRANT_PAGE_SIZE;
             mask & (1 << bit) != 0 && page < end && start < page + GRANT_PAGE_SIZE
         })
+    }
+
+    fn quarantined(&self) -> bool {
+        self.stock_root.load(Ordering::Acquire) != 0
+            && self.stock_retained.load(Ordering::Acquire) & adoption::STOCK_QUARANTINED != 0
     }
 
     fn retains(&self, bit: usize) -> bool {
@@ -400,7 +411,8 @@ impl FrameGrantResidencyTable {
     /// this pin and refuses; stale page tokens cannot pin a successor.
     pub fn pin_transfer(&self, page: FrameGrantResidencyPage) -> Option<FrameGrantTransferPin<'_>> {
         let record = self.slots.get(page.slot)?;
-        if record.state.load(Ordering::Acquire) != page.epoch
+        if record.quarantined()
+            || record.state.load(Ordering::Acquire) != page.epoch
             || record.identity() != page.identity
             || !record.retains(page.bit)
         {
@@ -413,7 +425,8 @@ impl FrameGrantResidencyTable {
             })
             .ok()?;
         let pin = FrameGrantTransferPin { record };
-        if record.state.load(Ordering::Acquire) != page.epoch
+        if record.quarantined()
+            || record.state.load(Ordering::Acquire) != page.epoch
             || record.identity() != page.identity
             || !record.retains(page.bit)
         {
@@ -428,7 +441,9 @@ impl FrameGrantResidencyTable {
         let Some(record) = self.slots.get(page.slot) else {
             return false;
         };
-        if record.state.load(Ordering::Acquire) != page.epoch
+        if record.quarantined()
+            || record.transfer_pins.load(Ordering::Acquire) >= TRANSFER_PIN_RETIRED
+            || record.state.load(Ordering::Acquire) != page.epoch
             || record.identity() != page.identity
             || !record.retains(page.bit)
             || page.bit >= (page.identity.len / GRANT_PAGE_SIZE) as usize
@@ -470,7 +485,10 @@ impl FrameGrantResidencyTable {
                 let slot = word_index * 64 + bit;
                 let record = &self.slots[slot];
                 let epoch = record.state.load(Ordering::Acquire);
-                if epoch & GRANT_STATE_MASK == GRANT_LIVE {
+                if epoch & GRANT_STATE_MASK == GRANT_LIVE
+                    && !record.quarantined()
+                    && record.transfer_pins.load(Ordering::Acquire) < TRANSFER_PIN_RETIRED
+                {
                     let identity = record.identity();
                     if identity.mm_key == mm_key && record.state.load(Ordering::Acquire) == epoch {
                         let bits =
@@ -488,7 +506,9 @@ impl FrameGrantResidencyTable {
         let Some(record) = self.slots.get(slot) else {
             return false;
         };
-        if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE
+        if record.quarantined()
+            || record.transfer_pins.load(Ordering::Acquire) >= TRANSFER_PIN_RETIRED
+            || record.state.load(Ordering::Acquire) & GRANT_STATE_MASK != GRANT_LIVE
             || record.identity() != identity
         {
             return false;
@@ -518,7 +538,10 @@ impl FrameGrantResidencyTable {
             return false;
         };
         let epoch = record.state.load(Ordering::Acquire);
-        if epoch & GRANT_STATE_MASK != GRANT_LIVE || record.identity() != identity {
+        if record.quarantined()
+            || epoch & GRANT_STATE_MASK != GRANT_LIVE
+            || record.identity() != identity
+        {
             return false;
         }
         if record
@@ -652,6 +675,10 @@ impl FrameGrantResidencyTable {
             {
                 continue;
             }
+            if record.quarantined() {
+                self.cancel_retirement(mm_key, start, end);
+                return None;
+            }
             if record
                 .transfer_pins
                 .compare_exchange(
@@ -687,7 +714,8 @@ impl FrameGrantResidencyTable {
                 continue;
             }
             let identity = record.identity();
-            if identity.mm_key == mm_key
+            if !record.quarantined()
+                && identity.mm_key == mm_key
                 && record.retained_overlaps(start, end)
                 && record.state.load(Ordering::Acquire) == state
             {
@@ -994,3 +1022,6 @@ mod tests {
 
 #[cfg(test)]
 mod stock_tests;
+
+#[cfg(test)]
+mod adoption_tests;
