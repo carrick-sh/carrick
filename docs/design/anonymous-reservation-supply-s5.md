@@ -1,8 +1,9 @@
 # Anonymous reservation supply: adoption storage transaction
 
 Part of #898; follows #1064 on `work/898-supply-s4`. Inventory written
-against the actual S4 tree before implementation. Incremental landing and the
-explicitly ignored service-budget witness follow the owner decision on #898.
+against the S4 tree before implementation; line references were corrected
+against that parent during the final audit, without changing scope or estimates.
+Incremental landing and the explicitly ignored service-budget witness follow the owner decision on #898.
 The final native integration layer must remove that ignore and pass its
 unchanged workload and budget.
 
@@ -19,14 +20,15 @@ This layer does not enable speculative native grants.
 
 | Existing file/type on S4 | Change | Estimated changed lines |
 |---|---|---:|
-| `crates/carrick-core-abi/src/mm/residency.rs:100` `FrameGrantResidencyRecord`, `:63` `FrameGrantResidencyPage`, `:264` `FrameGrantResidencyTable`, `:423` `record_commit` | Consume four reserved words for per-page mapping incarnations; pack access into the existing stock word; reject commits during adoption/quarantine; keep record size unchanged | 60–120 |
-| `crates/carrick-core-abi/src/mm/residency/stock.rs:141` `StockCapacityLease`, `:211` `reserve_stock`, `:327` `retire_stock_fragment` | Initialize concrete adoption storage with the existing refill claim; retire per-page overlay in place, preserving survivors | 35–80 |
-| NEW `crates/carrick-core-abi/src/mm/residency/adoption.rs` | NEW `StockPageAdoption`, `StockAdoptionSnapshot`, `StockAdoptionTransaction`; bounded, allocation-free staging, explicit commit/rollback, fail-closed uncompleted/drop state; no physical or descriptor authority conferred | 300–500 |
+| `crates/carrick-core-abi/src/mm/residency.rs:101` `FrameGrantResidencyRecord`, `:29` `FrameGrantResidencyIdentity`, `:62` `FrameGrantResidencyPage`, `:219` `FrameGrantTransferPin`, `:231` `FrameGrantResidencyRetirement`, `:265` `FrameGrantResidencyTable`, `:427` `record_commit` | Consume four reserved words for per-page mapping incarnations; pack access into the existing stock word; reject commits during adoption/quarantine; keep record size unchanged | 60–120 |
+| `crates/carrick-core-abi/src/mm/residency/stock.rs:114` `StockCapacityLease`, `:16` `StockResidencyOwner`, `:23` `StockPageMask`, `:174` `reserve_stock`, `:324` `retire_stock_fragment` | Initialize concrete adoption storage with the existing refill claim; retire per-page overlay in place, preserving survivors | 35–80 |
+| `crates/carrick-core-abi/src/mm/reservation.rs:38` `ReservationIncarnation`, `:87` `ReservationProtection`; `crates/carrick-guest-arch/src/lib.rs:298,299` `MmGeneration`, `ContextGeneration` | Existing semantic inputs, unchanged; used by overlay and two-owner fixtures | 0–10 |
+| NEW `crates/carrick-core-abi/src/mm/residency/adoption.rs` | NEW `StockPageAdoption`, `StockAdoptionSnapshot`, `StockAdoptionTransaction`, `StockAdoptionRefusal`; bounded, allocation-free staging, explicit commit/rollback, fail-closed uncompleted/drop state; no physical or descriptor authority conferred | 300–500 |
 | NEW `crates/carrick-core-abi/src/mm/residency/adoption_tests.rs` | Real shared-table two-owner tests, mixed permissions including NONE, complete-preimage rollback, pin conflict, stale/foreign generations, retired-hole reuse, quarantine, batch snapshots | 500–850 |
-| `crates/carrick-el1-abi/src/lib.rs:1067` ABI fingerprint | Include adoption word offset/encoding identity; frozen hash update | 5–15 |
-| `conformance-contracts/surfaces.toml:2047`; `conformance-contracts/contracts/el1-anonymous-reservations.toml:25` | Classify new shared-owner files and scoped witnesses, preserve slope threshold | 10–25 |
+| `crates/carrick-el1-abi/src/lib.rs:1070` ABI fingerprint | Include adoption word offset/encoding identity; frozen hash update | 5–15 |
+| `conformance-contracts/surfaces.toml:2055`; `conformance-contracts/contracts/el1-anonymous-reservations.toml:25` | Classify new shared-owner files and scoped witnesses, preserve slope threshold | 10–25 |
 | NEW this document | Inventory, boundary and evidence | 80–120 |
-| **S5 estimate** | | **990–1,710** |
+| **S5 estimate** | | **990–1,720** |
 
 ## What this participant guarantees
 
