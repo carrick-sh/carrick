@@ -2606,6 +2606,85 @@ fn owner_fork_resident_child_cow_copies_with_production_classifier() {
     assert_eq!(&replacement.borrow()[..4], b"fork");
 }
 
+/// Diagnostic admission witness, not a discard implementation or physical
+/// acceptance binding. The director requested retaining this red reduction
+/// until the shared physical supply/return owner from #1030 exists.
+#[test]
+#[ignore = "#1035: native MADV_DONTNEED has no shared discard/physical-return service"]
+fn owner_fork_child_dontneed_must_select_discard_with_two_live_mms() {
+    use carrick_el1::memory::{ReservationDisposition, decide_anonymous_syscall};
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let parent_tables = Tables::new(ROOT, IPA, 2);
+    let child = Tables::new(ROOT + 0x100000, 0, 0);
+    let supply = Tables::new(ROOT + 0x200000, 0, 0);
+    let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
+    let arenas = [&parent_tables, &child, &supply];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let plan = portal.census_fork(request, &words, 0).unwrap();
+    let plan = portal.prepare_fork(request, plan, &words, 0).unwrap();
+    let receipt = portal
+        .publish_fork(plan, &words, 0)
+        .unwrap()
+        .commit(&portal, 0)
+        .unwrap();
+    spaces.open(spaces.find(receipt.child.mm().raw()).unwrap());
+    assert_ne!(parent, receipt.child.mm());
+    for (mm, tables) in [(parent, &parent_tables), (receipt.child.mm(), &child)] {
+        assert!(
+            spaces
+                .grant(spaces.find(mm.raw()).unwrap(), mm.raw())
+                .is_some()
+        );
+        assert!(
+            region
+                .table()
+                .admitted(spaces.find(mm.raw()).unwrap().index(), mm)
+        );
+        for page in 0..2 {
+            assert!(carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(
+                tables.words[1536 + page].load(Ordering::Acquire)
+            ));
+            assert_eq!(
+                fork_translate(&words, tables.base, VA + page as u64 * 4096),
+                IPA + page as u64 * 4096,
+                "both live roots retain the same non-identity COW output"
+            );
+        }
+    }
+    let current = carrick_el1_abi::CurrentTask::new();
+    current.execution.task.store(78, Ordering::Release);
+    current.mm.thread_generation.store(1, Ordering::Release);
+    current
+        .mm
+        .key
+        .store(receipt.child.mm().raw(), Ordering::Release);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = carrick_personality_linux::crossing::nr::MADVISE.raw();
+    frame.x[0] = VA;
+    frame.x[1] = 8192;
+    frame.x[2] = carrick_abi::LINUX_MADV_DONTNEED;
+    let mut root = portal.root(receipt.child.mm(), 0).unwrap();
+    let before = root.mapping(VA).unwrap();
+    match decide_anonymous_syscall(&frame, &current, &mut root) {
+        ReservationDisposition::Work(pending) => {
+            assert_eq!(pending.request().mm, receipt.child.mm());
+            assert_eq!(pending.request().range, before.range);
+            pending.cancel(&mut root).unwrap();
+        }
+        ReservationDisposition::Forward => panic!(
+            "#1035: child MADV_DONTNEED declines to Crossing; native refusal returns ENOSYS (38); expected an owned discard preserving parent COW bytes and VMA permissions"
+        ),
+        _ => panic!("#1035: child discard requires a descriptor/backing transaction"),
+    }
+}
+
 struct FailingForkWords<'a> {
     inner: ForkWords<'a>,
     live_cas: core::cell::Cell<usize>,

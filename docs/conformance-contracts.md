@@ -1,5 +1,14 @@
 # Conformance contracts
 
+The #1035 native anonymous-discard diagnostic extends the scope discussion of
+`kernel.mm.anonymous-discard` and `kernel.mm.anonymous-discard-no-scrub`.
+Its real-fork admission witness is explicitly ignored at the director's request
+and remains red when selected; the separate native Crossing characterization
+observes ENOSYS (38), not correct discard. Neither is an enabled semantic or
+frame-return acceptance binding. The missing shared physical settlement owner,
+the #1030 design dependency and the required two-MM byte/accounting proof are
+recorded in [the diagnosis](diagnoses/1035-native-anonymous-discard.md).
+
 Carrick treats Linux semantics and non-pathological operational complexity as
 one correctness obligation. A syscall that returns the expected value by
 polling, copying unbounded data, serializing unrelated work, or using a worse

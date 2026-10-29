@@ -667,6 +667,11 @@ fn native_child_exec_refusal_parks_once_and_resumes_with_enosys() {
 }
 
 #[test]
+fn native_child_madvise_crossing_refusal_returns_enosys() {
+    two_native_children_service_waits(ServiceWitness::MadviseRefusal);
+}
+
+#[test]
 fn interrupted_native_service_preserves_instruction_and_registers() {
     two_native_children_service_waits(ServiceWitness::Interrupt);
 }
@@ -772,6 +777,7 @@ enum ServiceWitness {
     Completed,
     Retry,
     ExecRefusal,
+    MadviseRefusal,
     Interrupt,
     Exception {
         esr: u64,
@@ -873,6 +879,18 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
         frame.elr = 0x4004;
         frame.esr = 0x15 << 26;
         let action = match witness {
+            ServiceWitness::MadviseRefusal => {
+                frame.x[8] = carrick_personality_linux::crossing::nr::MADVISE.raw();
+                frame.x[0] = VA;
+                frame.x[1] = 4096;
+                frame.x[2] = carrick_abi::LINUX_MADV_DONTNEED;
+                assert_eq!(
+                    carrick_personality_linux::dispatch::route_aarch64(frame.x[8], u64::MAX),
+                    carrick_personality_linux::dispatch::Family::Unported,
+                    "characterization of the missing service, not acceptance of ENOSYS"
+                );
+                carrick_el1_abi::Action::Forward
+            }
             ServiceWitness::Completed => {
                 fixture.task.linux.record_completed_with_work();
                 carrick_el1_abi::Action::ServedWithWork
@@ -1165,7 +1183,10 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             } else {
                 assert!(
                     ticket
-                        .complete(!matches!(witness, ServiceWitness::Exception { .. }))
+                        .complete(!matches!(
+                            witness,
+                            ServiceWitness::Exception { .. } | ServiceWitness::MadviseRefusal
+                        ))
                         .is_ok()
                 );
             }
@@ -1271,6 +1292,16 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
                 matches!(resumed, NativeResume::Returned(result) if result.raw() as u64 == retained_x0),
                 "{witness:?}"
             );
+        } else if matches!(witness, ServiceWitness::MadviseRefusal) {
+            let expected = if request.identity == first_request.identity {
+                -4
+            } else {
+                -38
+            };
+            assert!(
+                matches!(resumed, NativeResume::Returned(result) if result.raw() == expected),
+                "MADV_DONTNEED Crossing must expose the real refused (38) or cancelled (4) errno"
+            );
         } else {
             assert!(matches!(resumed, NativeResume::NoPending), "{witness:?}");
         }
@@ -1287,6 +1318,9 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
         assert_eq!(page.claimed_count(), 0);
         let retained = unsafe { &fixture.zone.record(child).ctx_mut().native };
         let expected = match witness {
+            // Returned carries the errno to the entry adapter, checked above;
+            // resume_selected does not install it into the saved SVC argument.
+            ServiceWitness::MadviseRefusal => (VA, 0x4004),
             ServiceWitness::Retry => (42, 0x4000),
             ServiceWitness::ExecRefusal => ((-38_i64) as u64, 0x4004),
             _ => (73, 0x4004),
