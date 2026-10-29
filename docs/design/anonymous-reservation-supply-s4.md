@@ -42,6 +42,7 @@ split further without moving enablement ahead of its prerequisites.
 | `crates/carrick-el1/src/memory.rs:761` `HardwareAnonymousEditor::stock_span`; `crates/carrick-x86-cpl0/src/anonymous.rs:168` counterpart | Consume shared contiguous retained-span query, never span a retired hole | 10–25 |
 | `crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs:2890` existing fixture stock-span adapter | Same shared query, no slope change | 5–15 |
 | `crates/carrick-el1-abi/src/lib.rs:928,1067,4245` layout fingerprint and frozen hash | Include new stock-word offsets and updated table size in host/image ABI identity | 5–15 |
+| `conformance-contracts/surfaces.toml:2047` existing stock surface mapping | Classify the two new residency files under the same anonymous-reservation contract | 8–12 |
 | `conformance-contracts/contracts/el1-anonymous-reservations.toml` existing binding | Add capacity/retirement witness, preserve active slope binding and threshold | 1–5 |
 | NEW this document | Inventory, split, limitations and proof | 80–130 |
 | **S4 total** | | **1,496–2,425** |
