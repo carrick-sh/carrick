@@ -2446,6 +2446,18 @@ VM-free schedules cover constant work per retired member and one retained raw
 reap ticket per pending member. Signed 30-run acceptance remains director-owned;
 these bindings do not establish a signed pass rate.
 
+The host executor binding
+`serial_host_missing_terminal_continuation_finishes_exit_owner` holds a sibling's
+DirectLoad claim across the `cancelled_on_slot` neutral retirement seam. The
+closing process retains a second live Kernel member. Native retirement consumes
+one membership and releases the exact record without a host receipt; the real
+runtime job must then withdraw its host registry membership, publish its exact
+host retirement and complete its losing-member result. The neutral process
+owner must observe those receipts and settle. The fixture calls the production ARM cancellation checkpoint through a host-test
+wrapper; it does not execute guest instructions.
+This is constant work per member; the signed parked-thread exit-group stress
+remains director-owned on HVF.
+
 ### Interrupted-sleep remainder publication (#986 Slice 1)
 
 `kernel.memory.owner-wait` includes the frozen remainder from an interrupted

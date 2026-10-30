@@ -468,11 +468,13 @@ where
                     binding
                         .clear_terminal_cpu_residency()
                         .map_err(|error| error.to_string())?;
+                    let task_key = running.thread().task_key();
                     scheduler
                         .settle_exited(running)
                         .map_err(|error| error.to_string())?;
                     resolver.retire(thread, generation);
                     binding.after_reaped_settlement();
+                    notify_exit_settled(scheduler, task_key);
                     receipts.record(
                         executor_id,
                         ExecutorPoolEvent::SettledExited { thread, generation },
@@ -1521,27 +1523,7 @@ where
                 }
                 if matches!(event, ExecutorPoolEvent::SettledExited { .. }) {
                     binding.after_terminal_settlement();
-                    let task_key = settlement_thread.task_key();
-                    let (status, owner) = if let Some(zombie) = scheduler
-                        .kernel()
-                        .registry()
-                        .exited_process(task_key.id)
-                        .filter(|exited| exited.key == task_key)
-                    {
-                        (
-                            zombie.status,
-                            carrick_kernel::observe::ExitOwner::from(zombie.parent),
-                        )
-                    } else {
-                        (
-                            carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
-                            carrick_kernel::observe::ExitOwner::Nobody,
-                        )
-                    };
-                    scheduler
-                        .kernel()
-                        .auditors()
-                        .exit_settled(task_key, status, owner);
+                    notify_exit_settled(scheduler, settlement_thread.task_key());
                 }
                 receipts.record(executor_id, event);
                 probe_executor_lifecycle(
@@ -1839,6 +1821,29 @@ const fn process_leader_event_identity(task_pid: i32, tid: i32) -> Option<(i32, 
     } else {
         None
     }
+}
+
+fn notify_exit_settled(scheduler: &Scheduler, task_key: carrick_kernel::kernel::TaskKey) {
+    let (status, owner) = if let Some(zombie) = scheduler
+        .kernel()
+        .registry()
+        .exited_process(task_key.id)
+        .filter(|exited| exited.key == task_key)
+    {
+        (
+            zombie.status,
+            carrick_kernel::observe::ExitOwner::from(zombie.parent),
+        )
+    } else {
+        (
+            carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+            carrick_kernel::observe::ExitOwner::Nobody,
+        )
+    };
+    scheduler
+        .kernel()
+        .auditors()
+        .exit_settled(task_key, status, owner);
 }
 
 #[cfg(all(test, feature = "loom"))]

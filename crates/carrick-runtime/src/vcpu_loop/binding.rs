@@ -1768,7 +1768,7 @@ where
                     if !self.state.thread_exit_withdrawn {
                         let _ = self
                             .state
-                            .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                            .withdraw_persistent_terminal_owner_runtime(&self.kernel);
                         self.state.thread_exit_withdrawn = true;
                     }
                     self.state.handoff_child_tid_clear();
@@ -1921,7 +1921,7 @@ where
                     if !self.state.thread_exit_withdrawn {
                         let _ = self
                             .state
-                            .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                            .withdraw_persistent_terminal_owner_runtime(&self.kernel);
                         self.state.thread_exit_withdrawn = true;
                     }
                     self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
@@ -2010,7 +2010,7 @@ where
         // wake this owner by that key; retiring it here loses the only wake.
         if self.terminal_runtime == PersistentTerminalRuntimeState::Resident {
             self.state
-                .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                .withdraw_persistent_terminal_owner_runtime(&self.kernel);
             self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
         }
         drop(self.state.guest_execution.take());
@@ -3148,6 +3148,25 @@ where
                 );
             });
         self.state.handoff_child_tid_clear();
+        // Native terminal intent authenticates record absence, but does not
+        // withdraw the host runtime member. A refused DirectLoad can arrive
+        // here before this job has ever polled its normal terminal path.
+        if !self.state.thread_exit_withdrawn {
+            self.state
+                .withdraw_persistent_terminal_owner_runtime(&self.kernel);
+            self.state.thread_exit_withdrawn = true;
+        }
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "losing member lost exact host retirement context"
+                );
+            });
+        self.publish_host_thread_retirement(context);
         if self.terminal_result.is_none() {
             self.terminal_result = Some(Ok(VcpuLoopOutcome::ThreadDone));
         }
@@ -4432,7 +4451,7 @@ where
                 self.state.handoff_child_tid_clear();
                 if !self.state.thread_exit_withdrawn {
                     self.state
-                        .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                        .withdraw_persistent_terminal_owner_runtime(&self.kernel);
                     self.state.thread_exit_withdrawn = true;
                 }
                 return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
