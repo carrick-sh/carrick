@@ -1402,13 +1402,27 @@ impl<'a> MemView<'a> {
                     let owner_len = match &*description {
                         OpenDescription::HostFile { host_fd, metadata, .. }
                             if owner_file_eligible && metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::File =>
-                                host_fd_file_len(host_fd.raw()),
+                                host_fd_file_len(host_fd.raw()).map(Ok),
+                        // Reopening /proc/self/exe retains the executable
+                        // object, not a HostFile description. Its source is
+                        // already readable by the same private backing venue.
+                        // Eager UserWrite here would reacquire our own MM gate.
+                        OpenDescription::ProcExecutable { executable, .. } if owner_file_eligible =>
+                            Some(executable.source().len().map(|len| len as u64)),
                         _ => None,
                     };
                     Some((lowering, owner_len))
                 }).unwrap_or((false, None))
             } else {
                 (false, None)
+            };
+            let owner_file_candidate_len = match owner_file_candidate_len.transpose() {
+                Ok(length) => length,
+                Err(error) => return Ok(request.refused_by(
+                    MmapRefusal::Internal("executable length could not be read during mmap"),
+                    linux_errno::EIO,
+                    format_args!("{error}"),
+                )),
             };
             // A plain private anonymous mapping a delegated root can own
             // itself; every other mapping is host-served on a delegated MM.
@@ -2344,6 +2358,18 @@ impl<'a> MemView<'a> {
                     ));
                 }
                 if let Err(error) = memory.write_bytes_unchecked(address, &bytes) {
+                    if let MemoryError::OwnerWait(wait) = &error
+                        && wait.cause() == carrick_el1_abi::PortalWaitCause::Gate
+                        && carrick_hal::el1_editor_exclusion::with_held_exclusion(
+                            wait.handle().mm().raw(), |held| held.is_some(),
+                        )
+                    {
+                        // This is invalid reacquisition, not foreign contention:
+                        // redispatch would close our gate again before copying.
+                        return Err(DispatchError::MmapSelfHeldOwnerGate(*wait));
+                    }
+                    // Foreign waits here require retained address/source custody,
+                    // not numeric syscall redispatch (follow-up #1124).
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("file content could not be copied into the mapping"),
