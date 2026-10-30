@@ -1,3 +1,6 @@
+# #1044: owned-yield replies are typed separately from memory preparation.
+# The retained IPC/CarrierWork seam bindings below cover that API change;
+# existing fork, lifecycle, file and inotify acceptance remains unchanged.
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
@@ -17,6 +20,7 @@ rationale = "F0 establishes capability-authorized types without a file implement
 structural_budgets = []
 [bindings]
 vm_free = [
+  "carrick-el1-linux::native_process_runtime::host_test_support::ipc_busy_yield_retains_operation_and_pin_through_carrier_work (owned-yield reply typing and exact token/pin custody only)",
   "carrick-core::file::tests",
   "carrick-kernel::el1_delegation::owned_recall::zone_file_service_tests::serial_host::{zone_file_create_write_read_two_live_pins_are_coherent_and_preserve_cursors,zone_file_append_across_two_live_pins_never_overwrites,zone_file_replayed_and_foreign_pins_are_stale_and_spare_live_peers,zone_file_pin_exhaustion_rolls_back_and_retired_handles_refuse_old_keys,zone_file_pin_release_visits_one_record_at_each_population,zone_file_positional_io_visits_only_touched_pages_and_bytes,zone_file_marked_inode_queues_read_and_write_events_and_refuses_busy_or_spilled_watches,zone_file_drop_and_rebuild_over_same_storage_preserves_live_pins_and_never_overwrites_slot,zone_file_demoted_inode_is_unsupported_while_generation_change_is_stale,zone_file_release_queues_terminal_handoff_in_service_region_not_global_pointer}",
 ]
