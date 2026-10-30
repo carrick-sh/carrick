@@ -221,6 +221,9 @@ impl SyscallDispatcher {
         mut ctx: MutationSyscallCtx<'_, 'authority, 'lease, M>,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
         let handler = resolve_mutation_handler(ctx.request.number.raw())?;
+        if let Some(outcome) = self.mem_view().resume_completed_host_venue(&mut ctx) {
+            return Some(outcome);
+        }
         // A delegated MM's host mapping syscall first reconciles the returns
         // its EL1 root owes, so no host step plans over retired memory.
         let permit = ctx.mm_mutation.host_alias_permit();

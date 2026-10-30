@@ -187,6 +187,9 @@ impl DelegatedRoot {
             holder: std::cell::Cell::new(None),
         })
     }
+    pub(in crate::dispatch) fn handle(&self) -> Result<carrick_el1_abi::El1MmHandle, Refusal> {
+        self.observe_probe().map(|probe| probe.observed.handle())
+    }
     pub(in crate::dispatch) fn provision_metadata(&self) -> Result<(), RootAccessRefusal> {
         let _host = self.host_serial.lock();
         let probe = self.observe_probe()?;
