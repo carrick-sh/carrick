@@ -1249,14 +1249,10 @@ where
         Ok(completions)
     }
 
-    /// Logical HVPatch exit while the physical vCPU remains owned by the
-    /// persistent worker. Kernel execution settlement and vCPU detach are
-    /// deliberately left to Task 4 after this method returns `Exited`.
-    pub(super) fn withdraw_persistent_terminal_owner_runtime(
-        &mut self,
-        kernel: &Kernel,
-        _engine: &mut E,
-    ) -> bool {
+    /// Withdraw the logical runtime member without borrowing a physical
+    /// engine. Kernel execution settlement and vCPU detach remain owned by
+    /// the persistent executor, including a refused terminal DirectLoad.
+    pub(super) fn withdraw_persistent_terminal_owner_runtime(&mut self, kernel: &Kernel) -> bool {
         let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 1);
         let last = self.registry.exit(self.this_tid);
@@ -1518,7 +1514,7 @@ where
                 carrick_observability::probes::HvpatchThreadTerminalReason::GuestThreadExit,
                 code,
             );
-            let registry_last = self.withdraw_persistent_terminal_owner_runtime(kernel, engine);
+            let registry_last = self.withdraw_persistent_terminal_owner_runtime(kernel);
             self.thread_exit_withdrawn = true;
             if kernel.hvpatch_process.is_none() {
                 last = registry_last;
@@ -2208,7 +2204,7 @@ mod child_tid_owner_tests {
         let dependency = Arc::new(ClearDependency::default());
         let mut engine = clear_engine(&root, &dependency);
         let (wakes, _subscription) = clear_wakes(&state.futex);
-        state.withdraw_persistent_terminal_owner_runtime(&kernel, &mut engine);
+        state.withdraw_persistent_terminal_owner_runtime(&kernel);
         let prepare = || {
             root.kernel()
                 .prepare_task_exit_key(
@@ -2813,7 +2809,7 @@ mod child_tid_owner_tests {
             dependency.0.store(true, Ordering::Release);
             let mut engine = clear_engine(&root, &dependency);
             let (table_wakes, _subscription) = clear_wakes(&state.futex);
-            state.withdraw_persistent_terminal_owner_runtime(&kernel, &mut engine);
+            state.withdraw_persistent_terminal_owner_runtime(&kernel);
             let graph_exit = root
                 .kernel()
                 .prepare_task_exit_key(

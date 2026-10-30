@@ -108,8 +108,17 @@ impl std::fmt::Debug for ZoneLoad {
     }
 }
 
+struct TerminalDelegate(Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>);
+
+impl std::fmt::Debug for TerminalDelegate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalDelegate").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug)]
 struct FakeBinding {
+    terminal_delegate: parking_lot::Mutex<Option<TerminalDelegate>>,
     drop_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     marker: u64,
     thread: parking_lot::Mutex<Option<Arc<carrick_kernel::kernel::Thread>>>,
@@ -185,6 +194,7 @@ pub(crate) fn test_guest_cpu_state(marker: u64) -> GuestCpuState {
 impl FakeBinding {
     fn new(marker: u64, steps: impl IntoIterator<Item = Step>) -> Arc<Self> {
         Arc::new(Self {
+            terminal_delegate: parking_lot::Mutex::new(None),
             drop_notification: parking_lot::Mutex::new(None),
             marker,
             thread: parking_lot::Mutex::new(None),
@@ -320,6 +330,9 @@ impl PersistentTaskBinding for FakeBinding {
 
     fn after_reaped_settlement(&self) {
         self.reaped_settlements.fetch_add(1, Ordering::SeqCst);
+        if let Some(delegate) = self.terminal_delegate.lock().as_ref() {
+            delegate.0.after_reaped_settlement();
+        }
         self.after_terminal_settlement();
     }
 
@@ -9722,4 +9735,223 @@ fn terminal_zone_wait_before_queued_claim(process_exit: bool, shutdown_request: 
     } else {
         assert!(root.exact_thread_is_live());
     }
+}
+
+/// A DirectLoad overlaps the cancelled_on_slot release seam. The native
+/// owner consumes membership and frees the record; only the host job can
+/// withdraw runtime registration and return its exact retirement receipt.
+#[test]
+fn serial_host_missing_terminal_continuation_finishes_exit_owner() {
+    use crate::vcpu_loop::{binding, continuation, tests::*, *};
+    use carrick_core::terminal::{
+        HostMemberObservation, Live, Process, RetirementVerdict, TerminalCustody,
+    };
+    use carrick_el1_abi::Lifecycle;
+    use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+    use carrick_sched_core::{SlotId, process::TerminationStatus};
+    use std::num::NonZeroU64;
+
+    let (kernel, root) = bootstrap(19_770);
+    root.thread().set_affinity(CpuAffinity::all(1));
+    let sibling = sibling(&kernel, &root, 19_771);
+    let tid = ThreadId::synthetic_for_tests(19_771);
+    let registry = Arc::new(ThreadRegistry::new(ThreadId::synthetic_for_tests(19_770)));
+    registry.register_child_with_tid(tid, 0);
+    let runtime_kernel = Arc::new(KernelState::new(
+        SyscallDispatcher::new(),
+        Arc::new(EndpointTestSignalPump),
+        Arc::new(EndpointTestSignalArrival),
+        None,
+        None,
+    ));
+    let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+        registry.clone(),
+        Arc::new(FutexTable::new()),
+        Arc::new(NoopPlatformFutex),
+        Arc::new(|_| Arc::new(NoopPlatformFutex)),
+        runtime_kernel.process_fork_barrier.clone(),
+        runtime_kernel.crash_capture.clone(),
+        Some(Arc::clone(sibling.thread())),
+        None,
+        sibling.thread().key().tid,
+        runtime_kernel.fatal_signal.current_generation(),
+        tid,
+        Arc::new(parking_lot::Mutex::new(Vec::new())),
+        Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+        carrick_hal::InGuestFlag::for_guest_thread(),
+        1_000,
+    );
+    state.service_kernel_context = Some(sibling.retain_exact());
+    let result = HvpatchLoopResult::pending();
+    let completion = continuation::LogicalJobCompletion::pending();
+    let production = binding::ProductionHvpatchLoopJob {
+        kernel: runtime_kernel,
+        state,
+        phase: HvpatchProductionPhase::Resident,
+        registration_wait: None,
+        slot_wait: None,
+        terminal_settlement: HvpatchExternalTerminalSettlement::new(
+            result.clone(),
+            completion.clone(),
+        ),
+        terminal_result: None,
+        completion: completion.clone(),
+        traps: 0,
+        budget_floor: 0,
+        seen_signal_progress: signal_progress_count(),
+        last_signal_progress: Instant::now(),
+        terminal_runtime: binding::PersistentTerminalRuntimeState::Resident,
+        pending_terminal_retirement: None,
+        pending_terminal_inventory: None,
+        external_exec: None,
+    };
+    let quantum = Arc::new(continuation::HvpatchTaskQuantum::new(
+        Box::new(binding::HvpatchLoopJob::production(
+            production,
+            binding::InjectedExecutionLeaseSlot::new(),
+        )),
+        completion.clone(),
+    ));
+    let real_binding = Arc::new(continuation::HvpatchTaskBinding::new(
+        TaskLoadIdentity {
+            abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            version: 1,
+            mm: sibling.shared().mm().id(),
+            asid_generation: 1,
+        },
+        quantum,
+        Box::new(()),
+    ));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel.clone()));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(17, [Step::Exit]);
+    *binding.terminal_delegate.lock() = Some(TerminalDelegate(real_binding));
+    let page = root.lifecycle_page();
+    let member = sibling.thread().control_slot();
+    let task = Box::leak(Box::new(carrick_el1_abi::CurrentTask::new()));
+    task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(sibling.thread().key().tid.raw()),
+        carrick_el1_abi::SnapshotGeneration::UNISSUED,
+        sibling.resources().files().id().raw(),
+    );
+    task.mm
+        .key
+        .store(sibling.shared().mm().id().raw(), Ordering::Release);
+    task.mm
+        .thread_generation
+        .store(sibling.thread().key().serial.raw(), Ordering::Release);
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    // SAFETY: the fixture retains aligned, zeroed ABI storage for the pool.
+    let zone = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<carrick_el1_abi::ZoneTables>()
+    };
+    let mm = sibling.shared().mm().id().raw();
+    let space = zone.spaces.publish_closed(mm, 0x10000, 0x10000).unwrap();
+    zone.spaces.open(space);
+    let slot = SlotId::new(0);
+    zone.drive(slot, mm);
+    zone.publish_slot(slot, mm, Some(1), 1);
+    zone.enter_guest(slot);
+    zone.install_space(slot, sibling.shared().mm().id().raw())
+        .unwrap();
+    let key = sibling.thread().key();
+    let id = zone
+        .current_or_new(
+            slot,
+            carrick_el1_abi::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+                serial: key.serial.raw(),
+                mm: sibling.shared().mm().id().raw(),
+                file_table: sibling.resources().files().id().raw(),
+                generation: 0,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: page.page_address().raw() as u64,
+                control_slot: member as *const _ as u64,
+            },
+        )
+        .unwrap();
+    zone.requeue_preempted(slot, id);
+    assert_eq!(zone.switch_in(slot), Some(id));
+    let record = zone.record_ref(id);
+    member.bind_zone_record(record);
+    binding.set_cpu_residency(super::residency::TaskCpuResidency::Zone {
+        base: test_guest_cpu_state(17),
+        record,
+        origin: super::residency::ZoneResumeOrigin::GuestRecord,
+    });
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *binding.zone_load.lock() = Some(ZoneLoad {
+        zone,
+        entered: entered_tx,
+        resume: resume_rx,
+    });
+    factory.install(&sibling, binding.clone());
+    let pool = start_pool(scheduler.clone(), factory, 1);
+    let authority = enqueue_root(&scheduler, &sibling, publish(&sibling, 17));
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
+    let address = AddressContext {
+        root: RootGpa::page_aligned(FrameGpa::new(0x10000)).unwrap(),
+        mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+        generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+    };
+    let closing = TerminalCustody::<Process, Live>::begin_exit(
+        TerminalCustody::<Process, Live>::close_admission(&*page),
+        root.task().key(),
+        address,
+        TerminationStatus::SUCCESS,
+    )
+    .unwrap();
+    let birth = member.host_birth_identity().unwrap();
+    let RetirementVerdict::CancelMembers { members, .. } =
+        closing.cancel_members(vec![], vec![birth])
+    else {
+        panic!("closing owns cancellation");
+    };
+    let observe = || [HostMemberObservation::Adopted { birth, member }];
+    assert!(
+        closing
+            .observe_members(&*page, &members, &[], &observe())
+            .is_none()
+    );
+    member.request_host_exit();
+    assert_eq!(
+        carrick_el1_linux::aarch64_process::resume_unregistered_for_host_test(zone, task, slot, id,),
+        carrick_el1_linux::sched::ResumeAction::Left,
+    );
+    assert!(zone.live(record).is_none());
+    assert_eq!(page.live(), 0);
+    assert!(member.host_retirement().is_none());
+    resume_tx.send(()).unwrap();
+    drop(authority);
+    let report = pool
+        .shutdown()
+        .expect("terminal member must not kill executor");
+    assert_eq!(report.created(), report.joined());
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 0);
+    assert!(
+        !registry.is_live(tid),
+        "terminal DirectLoad must withdraw host runtime membership"
+    );
+    assert!(
+        member
+            .host_retirement()
+            .is_some_and(|receipt| receipt.acknowledges(birth)),
+        "terminal DirectLoad must publish exact host retirement"
+    );
+    let receipts = closing
+        .observe_members(&*page, &members, &[], &observe())
+        .expect("exit owner must observe member retirement");
+    assert!(
+        closing.settle(&*page, receipts).is_ok(),
+        "exit owner must complete"
+    );
+    assert!(completion.is_finished());
+    assert!(matches!(result.wait(), Ok(VcpuLoopOutcome::ThreadDone)));
+    assert!(root.exact_thread_is_live());
 }

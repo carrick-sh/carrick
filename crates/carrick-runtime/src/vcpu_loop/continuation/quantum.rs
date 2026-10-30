@@ -477,6 +477,7 @@ impl HvpatchTaskBinding {
             }
         };
         if publish_logical_result {
+            carrick_kernel::event_ring::rec_hvpatch_settle_step(0, self.identity.mm.raw(), 5);
             self.quantum.after_reaped_settlement();
         }
     }

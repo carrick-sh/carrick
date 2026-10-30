@@ -213,7 +213,26 @@ pub(super) fn resume_production_with_service<X: ForkStockCrossing>(
     })
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+/// Drive the production checkpoint without admitting a native process owner.
+/// The host fixture retains the exact record, task and lifecycle backing.
+#[cfg(feature = "host-test")]
+#[allow(clippy::panic)]
+pub fn resume_unregistered_for_host_test(
+    zone: &'static ZoneTables<Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    slot: SlotId,
+    record: RecordId,
+) -> crate::sched::ResumeAction {
+    resume_production_with(zone, task, slot, record, |_, _| {
+        panic!("unregistered host fixture reached a registered native owner")
+    })
+}
+
+#[cfg(any(
+    test,
+    feature = "host-test",
+    all(target_os = "none", target_arch = "aarch64")
+))]
 fn resume_production_with(
     zone: &'static ZoneTables<Aarch64ParkedContext>,
     task: &'static CurrentTask,
