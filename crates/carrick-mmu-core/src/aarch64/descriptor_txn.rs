@@ -87,9 +87,9 @@ use super::{
     AP_MASK, AP_PRIV_RO, AP_RO, AP_RW, El1PrivateLeafState, GuestLeafPublication,
     GuestPermissionCeiling, GuestPermissionEdit, LeafAccess, NON_GLOBAL, PA_MASK_1GIB,
     PA_MASK_2MIB, PA_MASK_4KIB, PA_MASK_TABLE, PT_PAGE, SW_EL1_COW, SW_EL1_MAY_EXEC,
-    SW_EL1_MAY_WRITE, SW_EL1_PRIVATE, SW_RETIRED, SubstrateGpa, TYPE_BITS, TYPE_BLOCK,
-    TYPE_TABLE_OR_PAGE, USER_PAGE_FLAGS, UXN, VALID, el1_cow, el1_private_leaf_state,
-    terminal_descriptor_permits_el0,
+    SW_EL1_MAY_WRITE, SW_EL1_PRIVATE, SW_FORK_COW_DEFERRED, SW_RETIRED, SubstrateGpa, TYPE_BITS,
+    TYPE_BLOCK, TYPE_TABLE_OR_PAGE, USER_PAGE_FLAGS, UXN, VALID, el1_cow, el1_private_leaf_state,
+    settle_deferred_fork_cow, terminal_descriptor_permits_el0,
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
@@ -2251,13 +2251,26 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                     return Err(DescriptorRefusal::WrongBacking);
                 }
                 match state {
+                    // Deferred fork COW is consumed here: the inherited
+                    // output becomes resident fork-COW armed, never
+                    // writable onto the frame the other side still maps.
                     El1PrivateLeafState::Prepared
                         if terminal_descriptor_permits_el0(descriptor | VALID, access) =>
                     {
-                        Ok(descriptor | VALID)
+                        Ok(settle_deferred_fork_cow(descriptor, descriptor | VALID))
                     }
+                    // A COW-armed leaf with Linux write intent already
+                    // satisfies a write publication: the retried store
+                    // takes the EL1 COW copy, as for any fork-armed leaf.
                     El1PrivateLeafState::Resident
-                        if terminal_descriptor_permits_el0(descriptor, access) =>
+                        if terminal_descriptor_permits_el0(descriptor, access)
+                            || (access == LeafAccess::Write
+                                && el1_cow(descriptor)
+                                && descriptor & SW_EL1_MAY_WRITE != 0
+                                && terminal_descriptor_permits_el0(
+                                    descriptor,
+                                    LeafAccess::Read,
+                                )) =>
                     {
                         Ok(descriptor)
                     }
@@ -2309,11 +2322,16 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 } else {
                     (AP_RO, if edit.executable { 0 } else { UXN })
                 };
-                Ok((descriptor & !AP_MASK & !UXN) | ap | uxn)
+                // A prepared leaf stays invalid and keeps deferred fork COW:
+                // its later Publish arms COW whatever AP this records.
+                Ok(settle_deferred_fork_cow(
+                    descriptor,
+                    (descriptor & !AP_MASK & !UXN) | ap | uxn,
+                ))
             }
             DescriptorOp::Retire(_) => match state {
                 El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident => {
-                    Ok((descriptor & !VALID) | SW_RETIRED)
+                    Ok((descriptor & !VALID & !SW_FORK_COW_DEFERRED) | SW_RETIRED)
                 }
                 _ => Err(DescriptorRefusal::NotPrivateAnonymous),
             },
@@ -2352,7 +2370,8 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                         if descriptor & VALID == 0 {
                             // Retired/prepared backing maintenance must leave
                             // the page inaccessible until its later publication.
-                            return Ok(repointed);
+                            // The copy it now names is private to this MM.
+                            return Ok(repointed & !SW_FORK_COW_DEFERRED);
                         }
                         if descriptor & SW_EL1_PRIVATE == 0 {
                             let wants_write = writable_pages & (1 << ((base - va) / PT_PAGE)) != 0;
@@ -2382,7 +2401,9 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 if state == El1PrivateLeafState::Prepared {
                     // The compound can include untouched pages. Moving their
                     // backing must not make them resident or widen access.
-                    return Ok(repointed);
+                    // Their new output is this MM's private copy, so any
+                    // deferred fork COW is consumed with the copy.
+                    return Ok(repointed & !SW_FORK_COW_DEFERRED);
                 }
                 // Fork arming recorded the page's actual Linux write intent,
                 // not just the allocation ceiling. Read-only and PROT_NONE
@@ -3512,6 +3533,150 @@ mod tests {
 
         fn nz(value: u64) -> NonZeroU64 {
             NonZeroU64::new(value).unwrap()
+        }
+
+        /// Deferred fork COW (#1107, #1146) through the guest executor: fork
+        /// records it on an invalid prepared leaf, every invalid edit keeps
+        /// or drops it deliberately, and the first residency (`Publish`)
+        /// consumes it into the armed COW encoding with no allocation.
+        #[test]
+        fn deferred_fork_cow_is_kept_while_prepared_and_armed_at_residency() {
+            let fork = TerminalEdit::fork_arm(false, false, false, true, 0, 0);
+            let span = PageSpan::new(VA, PT_PAGE);
+            let marker = SW_FORK_COW_DEFERRED;
+            let publish = |access| DescriptorOp::Publish {
+                span,
+                expected_ipa: SubstrateGpa(IPA),
+                access,
+            };
+            let protect = |readable, writable| {
+                DescriptorOp::Protect(GuestPermissionEdit {
+                    va: VA,
+                    len: PT_PAGE,
+                    readable,
+                    writable,
+                    executable: false,
+                    cow_ceiling: None,
+                })
+            };
+            let setup = |writable: bool| {
+                let words = fixture(3);
+                applied(run(
+                    &words,
+                    prepare(1, PageSpan::EMPTY, writable),
+                    &TableGrants::NONE,
+                ));
+                let pa = leaf_pa(VA);
+                let before = words.get(pa);
+                assert_eq!(before & marker, 0, "a fresh grant defers nothing");
+                applied(run(
+                    &words,
+                    DescriptorOp::Terminal { span, edit: fork },
+                    &TableGrants::NONE,
+                ));
+                let forked = words.get(pa);
+                assert_eq!(forked, before | marker, "fork records only the marker");
+                (words, pa)
+            };
+
+            // A grandchild fork finds it recorded and stores nothing.
+            let (words, pa) = setup(true);
+            let forked = words.get(pa);
+            let again = applied(run(
+                &words,
+                DescriptorOp::Terminal { span, edit: fork },
+                &TableGrants::NONE,
+            ));
+            assert_eq!(again.live_stores, 0);
+            assert_eq!(words.get(pa), forked);
+            // PROT_NONE keeps it on the invalid leaf and refuses publication.
+            applied(run(&words, protect(false, false), &TableGrants::NONE));
+            let none = words.get(pa);
+            assert_eq!(none & (VALID | marker), marker);
+            assert_eq!(none & AP_MASK, AP_PRIV_RO);
+            assert_eq!(
+                run(&words, publish(LeafAccess::Read), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied)
+            );
+            // mprotect(RW) keeps it; publication arms COW, never RW.
+            applied(run(&words, protect(true, true), &TableGrants::NONE));
+            assert_eq!(words.get(pa) & (VALID | marker | AP_MASK), marker | AP_RW);
+            applied(run(&words, publish(LeafAccess::Write), &TableGrants::NONE));
+            let published = words.get(pa);
+            assert_eq!(published & (VALID | marker), VALID, "cleared before VALID");
+            assert!(el1_cow(published));
+            assert_eq!(published & AP_MASK, AP_RO);
+            assert_ne!(published & SW_EL1_MAY_WRITE, 0, "write intent recorded");
+            assert_eq!(
+                published & PA_MASK_4KIB,
+                IPA,
+                "no allocation at publication"
+            );
+            assert!(!terminal_descriptor_permits_el0(
+                published,
+                LeafAccess::Write
+            ));
+            // A racing write publication is satisfied; its retry takes the
+            // EL1 COW copy. EL1 mprotect refuses the armed leaf as usual.
+            let racing = applied(run(&words, publish(LeafAccess::Write), &TableGrants::NONE));
+            assert_eq!(racing.live_stores, 0);
+            assert_eq!(
+                run(&words, protect(true, true), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::CowArmed)
+            );
+
+            // Retirement drops it with the lease.
+            let (words, pa) = setup(true);
+            applied(run(&words, DescriptorOp::Retire(span), &TableGrants::NONE));
+            let retired = words.get(pa);
+            assert_eq!(retired & marker, 0);
+            assert_eq!(
+                el1_private_leaf_state(retired),
+                El1PrivateLeafState::Retired
+            );
+            // So does the munmap rule.
+            let (words, pa) = setup(true);
+            applied(run(
+                &words,
+                DescriptorOp::Terminal {
+                    span,
+                    edit: TerminalEdit {
+                        rule: crate::aarch64::TerminalRule::pt(crate::aarch64::PtOp::Retire),
+                        asid_scoped: true,
+                        excluded_ipa: 0,
+                        excluded_len: 0,
+                        reclaim_budget: 0,
+                    },
+                },
+                &TableGrants::NONE,
+            ));
+            assert_eq!(words.get(pa) & marker, 0);
+            // A read-only grant publishes armed without write intent.
+            let (words, pa) = setup(false);
+            applied(run(&words, publish(LeafAccess::Read), &TableGrants::NONE));
+            let read_only = words.get(pa);
+            assert!(el1_cow(read_only));
+            assert_eq!(read_only & (marker | SW_EL1_MAY_WRITE), 0);
+            // A compound COW copy moves an untouched neighbour onto this
+            // MM's private copy, which consumes the marker.
+            let (words, pa) = setup(true);
+            let destination = 0x009d_0000_0000;
+            applied(run(
+                &words,
+                DescriptorOp::CowRepoint {
+                    access: CowRepointAccess::RecordedPrivate,
+                    va: VA,
+                    len: PT_PAGE,
+                    old_ipa: SubstrateGpa(IPA),
+                    new_ipa: SubstrateGpa(destination),
+                    backing: backing(80),
+                },
+                &TableGrants::NONE,
+            ));
+            let moved = words.get(pa);
+            assert_eq!(moved & PA_MASK_4KIB, destination);
+            assert_eq!(el1_private_leaf_state(moved), El1PrivateLeafState::Prepared);
+            assert_eq!(moved & marker, 0);
         }
 
         #[test]
