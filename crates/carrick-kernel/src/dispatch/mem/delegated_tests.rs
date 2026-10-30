@@ -310,6 +310,38 @@ fn commit(root: &mut Reservations<'_>, decision: Decision) -> u64 {
 }
 
 impl Root {
+    /// Keep a real peer root holder live throughout publication classification
+    /// and accounting. The calling thread keeps all of its borrowed guards.
+    fn with_held_root<T>(&self, work: impl FnOnce() -> T) -> T {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        struct Release(Option<std::sync::mpsc::SyncSender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let held = self.lock();
+                ready_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(held);
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let release = Release(Some(release_tx));
+            let result = work();
+            drop(release);
+            result
+        })
+    }
+
     /// Refuse a host probe while a peer owns the real root, releasing before
     /// that refusal reaches the caller. No timeout drives the root release.
     pub(in crate::dispatch) fn with_held_root_refusal<T>(&self, work: impl FnOnce() -> T) -> T {
@@ -6042,6 +6074,9 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                 dispatcher
                     .reprotected_frame_grant_plan(
                         permit,
+                        dispatcher
+                            .frame_grant_publication_snapshot(permit, grant, fault)
+                            .expect("pre-publication snapshot"),
                         wrong_owner,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                         &receipt,
@@ -6055,6 +6090,9 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                 dispatcher
                     .reprotected_frame_grant_plan(
                         permit,
+                        dispatcher
+                            .frame_grant_publication_snapshot(permit, grant, fault)
+                            .expect("pre-publication snapshot"),
                         wrong_mm,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                         &receipt,
@@ -6072,6 +6110,9 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                 dispatcher
                     .reprotected_frame_grant_plan(
                         permit,
+                        dispatcher
+                            .frame_grant_publication_snapshot(permit, grant, fault)
+                            .expect("pre-publication snapshot"),
                         grant,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                         &receipt,
@@ -6085,6 +6126,9 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                     .mem_view()
                     .reprotected_frame_grant_plan(
                         permit,
+                        dispatcher
+                            .frame_grant_publication_snapshot(permit, grant, fault)
+                            .expect("pre-publication snapshot"),
                         grant,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                         &receipt,
@@ -6097,6 +6141,9 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                 .mem_view()
                 .reprotected_frame_grant_plan(
                     permit,
+                    dispatcher
+                        .frame_grant_publication_snapshot(permit, grant, fault)
+                        .expect("pre-publication snapshot"),
                     grant,
                     LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                     &receipt,
@@ -6138,11 +6185,14 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
         model.complete_deferring_return(completion, slot).unwrap();
         assert!(model.mapping(retired).is_none());
     }
-    let settle = || {
-        crate::dispatch::mm_mutation::test_support::with_permit(
-            dispatcher.mm_mutation_coordinator(),
-            |permit| {
-                let plan = dispatcher.reprotected_frame_grant_plan(permit, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt, LinuxProtFlags::READ | LinuxProtFlags::WRITE)
+    crate::dispatch::mm_mutation::test_support::with_permit(
+        dispatcher.mm_mutation_coordinator(),
+        |permit| {
+            let snapshot = dispatcher
+                .frame_grant_publication_snapshot(permit, grant, fault)
+                .expect("snapshot before descriptor publication/settlement");
+            let settle = || {
+                let plan = dispatcher.reprotected_frame_grant_plan(permit, snapshot, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt, LinuxProtFlags::READ | LinuxProtFlags::WRITE)
                 .expect("a verified publication settles after physical preparation and residency reconciliation");
                 assert_eq!(
                     matches!(plan, PublishedFrameGrantPlan::Retired(_)),
@@ -6192,14 +6242,18 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                         "the return remains owed until the backend receipt"
                     );
                 }
-            },
-        );
-    };
-    if contended {
-        root.with_held_root_refusal(settle);
-    } else {
-        settle();
-    }
+            };
+            if contended {
+                assert!(
+                    retired_page.is_none(),
+                    "held-root fixture keeps its post-settlement root assertions outside the held interval"
+                );
+                root.with_held_root(settle);
+            } else {
+                settle();
+            }
+        },
+    );
     assert!(
         dispatcher
             .with_resident_fault_plan_for_test(fault, |_| ())
@@ -6833,7 +6887,6 @@ fn delegated_resident_record_survives_busy_root_without_changing_owner() {
 }
 
 #[test]
-#[ignore = "carrier-fatal on a contended root after publication; tracked by #1068 late-settlement design"]
 fn delegated_published_grant_settlement_survives_busy_root() {
     published_grant_settlement(None, true, true);
 }
