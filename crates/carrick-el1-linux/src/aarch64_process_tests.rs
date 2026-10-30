@@ -9690,8 +9690,13 @@ fn arm_host_exec_from_sibling_with_parked_threads_rebinds_root_entry() {
     .expect("post-exec replacement leader must rebind root entry without Stale/EntryBinding");
     assert_eq!(
         route,
-        carrick_personality_linux::dispatch::CompletionRoute::Served
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
+    assert_eq!(
+        fixture.page.state(1),
+        Some((1, carrick_el1_abi::EntryState::Reaped))
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
     assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 0);
 }

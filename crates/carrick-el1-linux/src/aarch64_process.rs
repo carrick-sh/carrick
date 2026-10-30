@@ -446,6 +446,11 @@ fn admit_entry_runtime(
         address.mm.raw().get(),
         address.generation.raw().get(),
     );
+    if let Some(runtime) = REGISTRY
+        .rebind_host_exec::<Aarch64Mmu>(source, task, page, control, address, address, words)?
+    {
+        return Ok((runtime, address));
+    }
     let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source, task, page, control, address, address, words,
     )?);

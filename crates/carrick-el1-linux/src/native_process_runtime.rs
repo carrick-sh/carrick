@@ -1733,6 +1733,317 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         Ok(())
     }
 
+    /// Rebind an already-registered root process to its host-promoted exec
+    /// replacement leader and reap any retired predecessor pool entry.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rebind_host_exec<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
+        &self,
+        source: BornInZoneSource<'a, C>,
+        current: &'a CurrentTask,
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+        mm: M,
+        address: AddressContext<RootGpa>,
+        words: C,
+    ) -> Result<Option<Arc<NativeProcessRuntime<'a, M, C>>>, NativeProcessError> {
+        let binding = super::common_entry::execution_binding(current);
+        let key = NativeExecutionKey::new(source.zone, binding, address)?;
+        let execution = key.task.issued().ok_or(NativeProcessError::Invalid)?;
+        let process = host_admitted_process(execution.id, control)?;
+        if !self
+            .state
+            .lock()
+            .by_process
+            .contains_key(&(key.carrier, process))
+        {
+            return Ok(None);
+        }
+        if control.entry().is_some() {
+            return Err(NativeProcessError::Stale);
+        }
+        let record = source
+            .zone
+            .slot(source.slot)
+            .current()
+            .or_else(|| source.zone.slot(source.slot).host_record())
+            .ok_or(NativeProcessError::Stale)?;
+        carrick_core::entry::prepare_handoff(binding, source, record)
+            .ok_or(NativeProcessError::Stale)?;
+        let reference = source.zone.record_ref(record);
+        let identity = source.zone.record(record).identity();
+        let visible = current
+            .visible_pid()
+            .and_then(NonZeroU32::new)
+            .ok_or(NativeProcessError::Invalid)?;
+        if !words.authenticates(address)
+            || address.mm.raw().get() != binding.mm.raw()
+            || identity.lifecycle_page != page as *const _ as u64
+            || identity.control_slot != control as *const _ as u64
+            || current.metadata.lifecycle_page.load(Ordering::Acquire) != identity.lifecycle_page
+            || current.metadata.control_slot.load(Ordering::Acquire) != identity.control_slot
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let index = source
+            .zone
+            .spaces
+            .find(binding.mm.raw())
+            .ok_or(NativeProcessError::Stale)?;
+        if source
+            .zone
+            .spaces
+            .grant(index, binding.mm.raw())
+            .is_none_or(|grant| B::root(grant.ttbr0).ok() != Some(address.root))
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let file_table = if identity.file_table != 0 {
+            identity.file_table
+        } else {
+            1
+        };
+        NonZeroU64::new(file_table).ok_or(NativeProcessError::Stale)?;
+        let expected_host = member_host_identity(page, control)?;
+
+        let mut state = self.state.lock();
+        let (old_group, old_keys) = state
+            .by_process
+            .get(&(key.carrier, process))
+            .cloned()
+            .ok_or(NativeProcessError::Stale)?;
+        let (runtime, group_process) = state
+            .groups
+            .get(&old_group)
+            .cloned()
+            .ok_or(NativeProcessError::Stale)?;
+        if group_process != process || !core::ptr::eq(runtime.zone, source.zone) {
+            return Err(NativeProcessError::Stale);
+        }
+        let new_group = Self::group_key(source.zone, address, page, visible.get());
+        let record_key = Self::record_key(source.zone, reference);
+        if (new_group != old_group && state.groups.contains_key(&new_group))
+            || (state.members.contains_key(&key) && !old_keys.contains(&key))
+            || state
+                .records
+                .get(&record_key)
+                .is_some_and(|existing| !old_keys.contains(existing))
+        {
+            return Err(NativeProcessError::Busy);
+        }
+
+        let mut graph = runtime.graph.lock();
+        if graph.root_key != process || graph.pending.has_exit(&process) {
+            return Err(NativeProcessError::Stale);
+        }
+        {
+            let row = graph
+                .owner
+                .task(process)
+                .map_err(|_| NativeProcessError::Stale)?;
+            if row.metadata().namespace_pid != visible.get() {
+                return Err(NativeProcessError::Stale);
+            }
+            let resources = row.native().resources();
+            if !core::ptr::eq(resources.page, page)
+                || core::ptr::eq(resources.control, control)
+                || resources.control.visible_tid().is_some()
+                || resources.address == address
+                || resources.address.mm == address.mm
+            {
+                return Err(NativeProcessError::Stale);
+            }
+            if resources.members.iter().any(|member| {
+                let retained = source.zone.record(member.record.id);
+                member.record != reference
+                    && retained.incarnation() == member.record.incarnation
+                    && matches!(
+                        retained.claim(),
+                        carrick_sched_core::Claim::OnCpu { .. }
+                            | carrick_sched_core::Claim::OnCpuRequested { .. }
+                    )
+            }) {
+                return Err(NativeProcessError::Busy);
+            }
+        }
+
+        let imported = NativeProcessRuntime::<M, C>::imported_members(
+            source.zone,
+            page,
+            control,
+            process,
+            binding.mm.raw(),
+            identity.file_table,
+        )?;
+        let leader_member_control = retain_member_control(control)?;
+        let resource_control_custody =
+            carrick_core::lifecycle::MemberControlCustody::retain(control)
+                .map_err(|_| NativeProcessError::Stale)?;
+        let registry_member_control = retain_member_control(control)?;
+        let mut members = vec![NativeMember {
+            thread: NativeThreadIdentity::Issued(execution),
+            process,
+            zone: source.zone,
+            record: reference,
+            signal_projection: None,
+            control: leader_member_control,
+            expected_host,
+        }];
+        members.extend(imported.iter().map(|(member, _, _)| member.clone()));
+        let mut pending_custodies = Vec::with_capacity(members.len());
+        for member in &members {
+            pending_custodies.push(
+                carrick_el1_abi::NativePendingCustody::try_admit(member.control.clone())
+                    .map_err(|_| NativeProcessError::Busy)?,
+            );
+        }
+        if !control.publish_visible_tid(visible.get()) {
+            return Err(NativeProcessError::Stale);
+        }
+        if !source.zone.mark_native_owned(record) {
+            return Err(NativeProcessError::Stale);
+        }
+        if let Some(carrier_mask) = source.zone.carrier_affinity_mask() {
+            control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[
+                carrier_mask,
+            ]));
+        }
+
+        let mut additional_thread_claims = Vec::with_capacity(imported.len());
+        {
+            let visible_namespace = graph.visible_namespace;
+            let mut n = graph.namespace.lock();
+            for (member, visible_tid, _) in &imported {
+                let number = n
+                    .reserve_exact(member.thread.id().raw(), ClaimKind::Thread)
+                    .map_err(|_| NativeProcessError::Exhausted)?;
+                n.advance_visible_past(
+                    visible_namespace,
+                    VisibleIdentity::from_existing_member(*visible_tid),
+                )
+                .ok_or(NativeProcessError::Exhausted)?;
+                additional_thread_claims.push((number, ClaimKind::Thread));
+            }
+        }
+
+        let namespace = graph.namespace.clone();
+        let row = graph
+            .owner
+            .task_mut(process)
+            .map_err(|_| NativeProcessError::Stale)?;
+        let (credentials, comm) = row
+            .threads
+            .threads
+            .iter()
+            .find(|thread| thread.tid == visible.get())
+            .or_else(|| row.threads.threads.first())
+            .map_or(
+                (
+                    carrick_personality_linux::identity::TaskCredentials::ROOT,
+                    [0u8; 16],
+                ),
+                |thread| (thread.credentials.clone(), thread.comm),
+            );
+        row.init_leader(visible.get(), credentials, comm);
+        for (_, tid, _) in &imported {
+            row.spawn_thread(visible.get(), tid.get())
+                .map_err(|_| NativeProcessError::Invalid)?;
+        }
+        row.has_execed = true;
+        row.dumpable = 1;
+        *row.context_mut() = words;
+
+        let wake_generation = row.native().wake();
+        let resources = row.native_mut().resources_mut();
+        {
+            let mut n = namespace.lock();
+            resources._thread_claim.claims.retain(|&(number, kind)| {
+                if number.get() == execution.id.raw() {
+                    true
+                } else {
+                    n.release(number, kind);
+                    false
+                }
+            });
+        }
+        resources
+            ._thread_claim
+            .claims
+            .extend(additional_thread_claims);
+        for old_member in resources.members.drain(..) {
+            if old_member.record == reference {
+                continue;
+            }
+            if signal_record_exists(source.zone, old_member.record) {
+                let _ = source.zone.claim_for_host(
+                    old_member.record,
+                    None,
+                    Handback::Cancelled,
+                    &carrick_sched_core::ShortLockSpin,
+                );
+            }
+            if source.zone.record(old_member.record.id).incarnation()
+                == old_member.record.incarnation
+            {
+                source.zone.free_record(old_member.record.id);
+            }
+        }
+        resources._control_custody = resource_control_custody;
+        resources.record = reference;
+        resources.control = control;
+        resources.mm = mm;
+        resources.address = address;
+        resources.file_table = file_table;
+        resources.interrupted_child_waits.clear();
+        resources.map_stash.clear();
+        resources.pending_child_tid = None;
+        resources.signals.reset_for_exec_survivor(reference);
+        for (member, pending) in members.iter_mut().zip(pending_custodies) {
+            member.control.commit_registration();
+            member.signal_projection =
+                Some(resources.signals.project_member(member.record, pending));
+        }
+        resources.members = members;
+        resources.channel = Some(Arc::new(WaitChannel {
+            generation: wake_generation,
+            mm: address.mm.raw().get(),
+        }));
+        row.native().resources().sync_non_interrupting_signals();
+
+        for old_key in old_keys {
+            if let Some(old_member) = state.members.remove(&old_key) {
+                state
+                    .records
+                    .remove(&Self::record_key(source.zone, old_member.record));
+            }
+        }
+        state.groups.remove(&old_group);
+        state.members.insert(
+            key,
+            NativeOwnerMember {
+                runtime: runtime.clone(),
+                process,
+                address,
+                record: reference,
+                control: registry_member_control,
+            },
+        );
+        state.groups.insert(new_group, (runtime.clone(), process));
+        state
+            .by_process
+            .insert((key.carrier, process), (new_group, vec![key]));
+        state.records.insert(record_key, key);
+        state
+            .members
+            .get(&key)
+            .ok_or(NativeProcessError::Stale)?
+            .control
+            .commit_native_signal_owner();
+        drop(graph);
+        drop(state);
+        Ok(Some(runtime))
+    }
+
     /// Renew retained execution custody (including Born -> issued adoption).
     /// The process key and address incarnation remain owned by the same graph.
     #[inline(never)]
@@ -2879,6 +3190,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 })
                 .ok_or(NativeProcessError::Stale)?;
             let control = owned_control(page, leader, address).ok_or(NativeProcessError::Stale)?;
+            if state == carrick_el1_abi::EntryState::Published && control.visible_tid().is_none() {
+                carrick_el1_abi::Lifecycle::retire_published(page, entry)
+                    .map_err(|_| NativeProcessError::Stale)?;
+                continue;
+            }
             let record = control.zone_record().ok_or(NativeProcessError::Stale)?;
             if !signal_record_exists(zone, record) {
                 return Err(NativeProcessError::Stale);
