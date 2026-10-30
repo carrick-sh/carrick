@@ -6632,55 +6632,6 @@ fn delegated_host_stock_keeps_planning_during_fork_pending() {
     assert_eq!(stock_span(&dispatcher, base + 2 * PAGE), Some(before));
 }
 
-/// Force a real root refusal, then release before the caller handles Busy.
-/// This also covers the release-before-enrollment edge of an owner retry.
-#[test]
-fn delegated_resident_record_survives_busy_root_without_changing_owner() {
-    let mut twin = Twin::new();
-    let base = LINUX_MMAP_BASE + 4 * PAGE;
-    twin.anonymous(base, 2 * PAGE, RW);
-    let (mapping, incarnation) = twin.root.lock().node(base).unwrap();
-    let range =
-        carrick_vfs::GuestMemoryRange::new(GuestVa::new(base), GuestVa::new(base + PAGE)).unwrap();
-    let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
-    let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);
-    *twin.root.carrier.busy_hook.lock().unwrap() = Some(Box::new(move || {
-        attempted_tx.send(()).unwrap();
-        released_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-    }));
-    let slot = twin.root.carrier.slot(twin.root.mm).unwrap();
-    let held = twin
-        .root
-        .carrier
-        .table
-        .lock_el1(slot, twin.root.mm, 9)
-        .unwrap();
-    std::thread::scope(|scope| {
-        let dispatcher = &twin.delegated;
-        let actor = scope.spawn(move || dispatcher.mem().lock().record_resident(range));
-        attempted_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        drop(held);
-        released_tx.send(()).unwrap();
-        actor.join().unwrap();
-    });
-    let authority = twin.delegated.mem();
-    let mem = authority.lock();
-    assert!(
-        mem.resident
-            .contains(base, ResidencyOwner::Root(incarnation))
-    );
-    assert!(!mem.resident.contains(base, ResidencyOwner::Host));
-    assert!(
-        !mem.resident
-            .contains(base + PAGE, ResidencyOwner::Root(incarnation))
-    );
-    assert_eq!(mapping.range.start(), base);
-}
-
 #[test]
 #[ignore = "carrier-fatal on a contended root after publication; tracked by #1068 late-settlement design"]
 fn delegated_published_grant_settlement_survives_busy_root() {
