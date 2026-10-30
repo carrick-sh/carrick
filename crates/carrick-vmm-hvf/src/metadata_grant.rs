@@ -360,6 +360,8 @@ fn settle_native_exec_predecessor(
 
 pub const MAX_DYNAMIC_EXTENT_SLOTS: usize = 128;
 
+/// Guest allocator grants and returns. Carrier-retained ABI storage has its
+/// own lifetime authority and is excluded from this allocator population.
 #[derive(
     ::core::fmt::Debug,
     ::core::clone::Clone,
@@ -726,10 +728,14 @@ impl HostApertureState {
             u64,
         ) -> Result<MetadataPublication, MetadataResolutionError>,
     ) -> Result<MetadataExtent, MetadataResolutionError> {
-        let backing = MetadataBacking::Allocated(
+        // Fork slots keep these bytes reachable for the carrier lifetime.
+        // They are retained ABI storage, not a grant the guest allocator can
+        // admit or return. The existing aperture owner keeps the exact token
+        // and backing until retained retirement or successful VM destruction.
+        let backing = MetadataBacking::Retained(Arc::new(MetadataBacking::Allocated(
             allocate_metadata_backing(EL1_DYNAMIC_METADATA_EXTENT_SIZE)
                 .map_err(|_| MetadataResolutionError::Busy)?,
-        );
+        )));
         self.install_backing_using(backing, generation, publish)
     }
 
