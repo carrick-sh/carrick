@@ -1047,16 +1047,12 @@ impl GrantResidencyPublication {
     }
 }
 
-impl<'permit> From<ResidentFrameGrantPlan<'permit>> for PublishedFrameGrantPlan<'permit> {
-    fn from(plan: ResidentFrameGrantPlan<'permit>) -> Self {
+impl<'permit> TryFrom<ResidentFrameGrantPlan<'permit>> for PublishedFrameGrantPlan<'permit> {
+    type Error = PublishedFrameGrantRefusal;
+
+    fn try_from(plan: ResidentFrameGrantPlan<'permit>) -> Result<Self, Self::Error> {
         plan.publication
             .classify(LinuxProtFlags::from_bits_truncate(plan.prot), None)
-            .unwrap_or_else(|error| {
-                carrick_fatal!(
-                    "dispatch::resident_frame_grant",
-                    "invalid pinned publication snapshot: {error:?}"
-                )
-            })
     }
 }
 

@@ -296,12 +296,13 @@ impl SyscallDispatcher {
     /// residency only for the fragments not overtaken by retirement.
     pub fn commit_published_frame_grant<'permit>(
         &self,
-        plan: impl Into<PublishedFrameGrantPlan<'permit>>,
+        plan: impl TryInto<PublishedFrameGrantPlan<'permit>, Error: std::fmt::Debug>,
         residency: carrick_el1_abi::FrameGrantResidencyIdentity,
     ) {
-        let publication = self
-            .mem_view()
-            .commit_published_frame_grant(Ok(plan.into()));
+        let plan = plan
+            .try_into()
+            .map_err(|error| format!("invalid pinned publication snapshot: {error:?}"));
+        let publication = self.mem_view().commit_published_frame_grant(plan);
         if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
             publication.publish(table, residency);
         }
