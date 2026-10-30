@@ -4344,7 +4344,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x60a54b09ffc096f9);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x52cb3bfbb9fd6a32);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

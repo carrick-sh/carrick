@@ -5009,6 +5009,20 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         Ok(())
     }
 
+    fn enter_native_fault_signal(&mut self) -> Result<(), TrapError> {
+        use carrick_hal::RegAccess as _;
+        self.pending_resume_pc = None;
+        if self.get_reg(Reg::Pstate)? & 0xf != 0 {
+            let pc = self.get_reg(Reg::ElrEl1)?;
+            let pstate = self.get_reg(Reg::SpsrEl1)?;
+            self.set_reg(Reg::Pc, pc)?;
+            self.set_reg(Reg::Pstate, pstate)?;
+        }
+        self.vcpu
+            .get_mut()
+            .cancel_native_owner_wait(carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0)
+    }
+
     fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
         let carrick_hal::SignalInjection {
             signum,

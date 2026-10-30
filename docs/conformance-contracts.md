@@ -2776,3 +2776,29 @@ These bindings exercise the production dispatcher and completion fold. They
 do not establish signed scheduler/VMM or Docker differential acceptance.
 Those gates remain director-owned. Immediate ppoll publication and the other
 operation families still listed on #986 remain outside this slice.
+
+### Host-classified synchronous faults (#1075)
+
+`kernel.el1.signal-delivery-owner` includes native-owner MAPERR (signal 11,
+si_code 1) and file-past-EOF BUS_ADRERR (signal 7, si_code 2), retaining the
+exact fault address. Authority is `sigaction(2)` and `signal(7)`. One retained
+payload per exact thread crosses the host VMA classification boundary; no host
+signal action is selected. The existing native checkpoint and shared signal
+owner select the action once. Blocked or ignored synchronous faults become
+default, and that selected default returns to the existing host core/exit path
+without a second ptrace stop. Busy admission retains the payload and forwards.
+The compiled fault stack chain charges the larger resolver/checkpoint prefix;
+no polling, extra execution pool or second signal frame builder is introduced.
+
+VM-free bindings cover both numeric payloads, native handler frames, selected
+default, ignored and blocked actions, and action replacement before delivery.
+The retained-home Busy witness exercises the same admission path. The existing
+`siglongjmpaltstack` probe now recovers from real MAPERR and file-past-EOF faults
+through `siglongjmp`, and checks default and blocked signal 11 in fork children
+with a five-second pipe wait. Its updated source requires deliberate native
+Linux oracle refresh and fresh ARM libc executables; no cached result is claimed
+for that changed input. Signed probe/frame execution and the existing
+`crash_parked_thread` core witness remain director-owned on HVF. No Docker or
+HVF is available on ctb-w1. CPL0 already delivers MAPERR through the shared
+owner; missing file-backed classification and host-to-native checkpoint wiring
+are tracked by #1084 (related cancellation seam #1078).

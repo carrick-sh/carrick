@@ -5222,6 +5222,40 @@ where
                 return Ok(executor::ExecutorExit::Syscall);
             }
         }
+        if let Some(thread) = self.state.kernel_thread.as_ref()
+            && let Some((signal, code, address, default)) =
+                thread.control_slot().synchronous_fault()
+        {
+            if default {
+                let context = self
+                    .kernel
+                    .dispatcher
+                    .capture_kernel_context(self.state.linux_tid)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "capture native fault context: {error}"
+                        ))
+                    })?;
+                if let Some(outcome) = super::signal::deliver_fault_signal(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    super::signal::FaultSignal {
+                        signum: signal.number(),
+                        si_code: code,
+                        si_addr: address,
+                        interrupted_pc: None,
+                    },
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
+            } else {
+                engine.enter_native_fault_signal()?;
+            }
+        }
         self.state
             .publish_thread_run_state(carrick_kernel::run_state::RunState::Running, 'R');
         if let Some(thread) = self.state.kernel_thread.as_ref() {

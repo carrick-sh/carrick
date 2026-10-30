@@ -1306,6 +1306,12 @@ where
     {
         return Ok(Action::Forward);
     }
+    // A host-classified fault returns through the durable signal checkpoint.
+    // It is a fault return, never fatal-owner cancellation or syscall restart.
+    if let Some((_, _, address, _)) = control.synchronous_fault() {
+        frame.esr = 0x9200_0004;
+        frame.far = address;
+    }
     declined_fault_admission_result(super::aarch64_process::deliver_declined_fault_signal_with(
         source,
         task,
@@ -1375,8 +1381,8 @@ fn declined_fault_admission_busy_once_then_success() {
     );
 }
 
-/// Deliver a synchronous `SIGSEGV` (`SEGV_ACCERR`) in-ring when an admitted
-/// anonymous reservation declines a permission fault on a `SignalOwner` thread.
+/// The in-ring synchronous fault venue for declined reservation permissions
+/// and host-classified faults on a `SignalOwner` thread.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
 pub(crate) fn arm_deliver_declined_fault_signal(frame: &mut TrapFrame) -> Action {
@@ -1427,6 +1433,13 @@ pub(crate) fn arm_deliver_declined_fault_signal(frame: &mut TrapFrame) -> Action
 fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
         unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
+    if current_tasks
+        .get(frame.slot as usize)
+        .and_then(|task| task.lifecycle_refs())
+        .is_some_and(|(_, control)| control.synchronous_fault().is_some())
+    {
+        return arm_deliver_declined_fault_signal(frame);
+    }
     let fatal_owner_cancel = frame.esr == 0xfffc;
     let Some(task) = current_tasks.get(frame.slot as usize) else {
         if fatal_owner_cancel {

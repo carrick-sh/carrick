@@ -86,6 +86,16 @@ where
             None
         }
         policy::Disposition::Default => {
+            // The host already classified this synchronous fault. Select its
+            // disposition here once, then return only a fatal verdict to the
+            // existing host core/exit path. Carrier signal tables stay out.
+            if slot
+                .synchronous_fault()
+                .is_some_and(|(signal, _, _, _)| signal == sig)
+            {
+                slot.synchronous_fault_default();
+                return None;
+            }
             if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
                 Some(match process.exit_with_signal(sig) {
                     Ok(_) => CompletionRoute::Suspended,
@@ -118,12 +128,15 @@ where
             if restarted == Some(false) {
                 return force_delivery_fault(
                     task,
+                    slot,
                     process,
                     frame,
                     fpstate,
                     machine,
-                    sig,
-                    thread_blocked,
+                    SignalDeliveryFailure {
+                        original: sig,
+                        blocked: thread_blocked,
+                    },
                 );
             }
             let interrupted_sp = machine.user_sp(frame);
@@ -135,12 +148,15 @@ where
             let Some((sp, stack)) = selected_stack else {
                 return force_delivery_fault(
                     task,
+                    slot,
                     process,
                     frame,
                     fpstate,
                     machine,
-                    sig,
-                    thread_blocked,
+                    SignalDeliveryFailure {
+                        original: sig,
+                        blocked: thread_blocked,
+                    },
                 );
             };
             let params = carrick_personality_linux::signal::SignalFrameParams {
@@ -173,13 +189,22 @@ where
             if setup.is_err() {
                 return force_delivery_fault(
                     task,
+                    slot,
                     process,
                     frame,
                     fpstate,
                     machine,
-                    sig,
-                    thread_blocked,
+                    SignalDeliveryFailure {
+                        original: sig,
+                        blocked: thread_blocked,
+                    },
                 );
+            }
+            if slot
+                .synchronous_fault()
+                .is_some_and(|(signal, _, _, _)| signal == sig)
+            {
+                slot.clear_synchronous_fault();
             }
             commit_handler_stack(slot, stack, sp, interrupted_sp, action.flags.on_stack);
             let mask = policy::handler_block_mask(sig, action, thread_blocked);
@@ -207,14 +232,19 @@ fn commit_handler_stack(
     }
 }
 
+struct SignalDeliveryFailure {
+    original: Signal,
+    blocked: SigBlockMask,
+}
+
 fn force_delivery_fault<'a, M, C, S, A>(
     task: &CurrentTask,
+    slot: &carrick_el1_abi::ThreadControlSlot,
     process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
     frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
     fpstate: &[u8],
     machine: &mut A,
-    original: Signal,
-    blocked: SigBlockMask,
+    failure: SignalDeliveryFailure,
 ) -> Option<CompletionRoute>
 where
     M: Clone,
@@ -222,6 +252,14 @@ where
     S: NativeProcessService<'a, C, Mm = M>,
     A: SignalMachine<C>,
 {
+    let SignalDeliveryFailure { original, blocked } = failure;
+    if let Some((_, code, address, _)) = slot.synchronous_fault() {
+        // Match host synchronous injection: an unusable handler stack is
+        // terminal SIGSEGV, including when the original fault was SIGBUS.
+        slot.publish_synchronous_fault(Signal::SEGV, code, address);
+        slot.synchronous_fault_default();
+        return None;
+    }
     if original == Signal::SEGV {
         return Some(match process.exit_with_signal(Signal::SEGV) {
             Ok(_) => CompletionRoute::Suspended,
@@ -229,7 +267,6 @@ where
             Err(_) => CompletionRoute::InvalidCompletion,
         });
     }
-    let (_, slot) = task.lifecycle_refs()?;
     if process.force_sigsegv(blocked).is_err() {
         return Some(CompletionRoute::InvalidCompletion);
     }
