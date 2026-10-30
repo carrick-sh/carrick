@@ -1567,71 +1567,77 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         let Some(window) = slot.window() else {
             return Ok(());
         };
-        let accepted = 'apply: {
-            if disposition == crate::native_process_runtime::FaultReplyDisposition::Cancel {
-                break 'apply None;
-            }
-            let owner = self.portal().map_err(|_| MmError::Stale)?;
-            let target = match carrick_core::mm::frames::grant_target(&owner, window, self.worker())
-            {
-                Ok(target) => target,
-                Err(MmError::Stale) => break 'apply None,
-                Err(error) => return Err(error),
-            };
-            let root = target.grant().ttbr0;
-            let live = if let Some(words) = self.words {
-                PreparedWords::Borrowed(words)
-            } else {
-                #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-                {
-                    let words = match super::mm_portal::production::current_mm_words(
-                        carrick_el1::isa::aarch64::hardware_live_ttbr(),
-                        root,
-                        &CURRENT_MM_MAINTENANCE,
-                    ) {
-                        Ok(words) => words,
-                        Err(_) => break 'apply None,
+        let applied = (|| {
+            let accepted = 'apply: {
+                if disposition == crate::native_process_runtime::FaultReplyDisposition::Cancel {
+                    break 'apply None;
+                }
+                let owner = self.portal().map_err(|_| MmError::Stale)?;
+                let target =
+                    match carrick_core::mm::frames::grant_target(&owner, window, self.worker()) {
+                        Ok(target) => target,
+                        Err(MmError::Stale) => break 'apply None,
+                        Err(error) => return Err(error),
                     };
-                    PreparedWords::Owned(Box::new(words))
-                }
-                #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-                {
-                    return Err(MmError::Core);
-                }
-            };
-            let residency = if let Some(residency) = self.residency {
-                residency
-            } else {
-                #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-                {
-                    carrick_el1::isa::frame_grant_residency_guest()
-                }
-                #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-                {
-                    return Err(MmError::Core);
-                }
-            };
-            carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
-                slot,
-                &*live,
-                residency,
-                target,
-                || {
+                let root = target.grant().ttbr0;
+                let live = if let Some(words) = self.words {
+                    PreparedWords::Borrowed(words)
+                } else {
                     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-                    crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, root);
+                    {
+                        let words = match super::mm_portal::production::current_mm_words(
+                            carrick_el1::isa::aarch64::hardware_live_ttbr(),
+                            root,
+                            &CURRENT_MM_MAINTENANCE,
+                        ) {
+                            Ok(words) => words,
+                            Err(_) => break 'apply None,
+                        };
+                        PreparedWords::Owned(Box::new(words))
+                    }
                     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-                    let _ = root;
-                },
-            )
-            .map(|receipt| {
-                matches!(receipt.outcome,
+                    {
+                        return Err(MmError::Core);
+                    }
+                };
+                let residency = if let Some(residency) = self.residency {
+                    residency
+                } else {
+                    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                    {
+                        carrick_el1::isa::frame_grant_residency_guest()
+                    }
+                    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+                    {
+                        return Err(MmError::Core);
+                    }
+                };
+                carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
+                    slot,
+                    &*live,
+                    residency,
+                    target,
+                    || {
+                        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                        crate::sched::ThreadCpu::invalidate_asid(
+                            &mut crate::sched::HardwareCpu,
+                            root,
+                        );
+                        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+                        let _ = root;
+                    },
+                )
+                .map(|receipt| {
+                    matches!(receipt.outcome,
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
                 | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
                     carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
                         | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot
                 ))
-            })
-        };
+                })
+            };
+            Ok(accepted)
+        })();
         let owner_handle = unsafe {
             // SAFETY: the retained reply was selected for this owner. This
             // candidate grants no new MM authority; the carrier authenticates
@@ -1665,7 +1671,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         // The carrier authenticated the full receipt. Retain only the retry
         // verdict across the crossing, not a by-value descriptor journal.
-        if accepted != Some(false) {
+        if applied? != Some(false) {
             Ok(())
         } else {
             Err(MmError::Stale)

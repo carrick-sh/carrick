@@ -1058,9 +1058,6 @@ impl NativeService {
         )
         .ok_or_else(stale)?;
         let key = ObjectWaitKey::native_service(request.identity.birth.record).ok_or_else(stale)?;
-        let queue = zone
-            .object_wait(key, &carrick_sched_core::ShortLockSpin)
-            .map_err(|_| stale())?;
         let mut stock = custody.fork_stock.lock();
         if stock.owner.child_owner(handle.mm()) != Some(handle)
             || stock.owner.child_root(handle.mm()) != Some(root)
@@ -1073,16 +1070,27 @@ impl NativeService {
             .child_physical_mut(handle.mm(), root)
             .and_then(|physical| physical.supplied.as_mut())
             .ok_or_else(stale)?;
+        // Acquire the host mutex before the guest queue, never beneath it.
+        // No native-service queue holder acquires ForkStock. This queue spans
+        // only the bounded ServiceCell/descriptor publication and notification;
+        // cancellation releases it before physical/table undo or backing drop.
+        let queue = zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| stale())?;
         let mut offered = false;
         let delivery = self.ticket.publish_prepared((), |()| {
             offered = grants.offer_backing_reply(reply, txn);
             if offered { Ok(()) } else { Err(()) }
         });
-        match delivery {
-            Ok(()) => {}
+        let queue = match delivery {
+            Ok(()) => {
+                drop(stock);
+                queue
+            }
             Err((reason, ticket, ())) => {
-                // No offer occurred. Keep the ticket pinned through complete
-                // verified rollback, including any cleanup failure.
+                drop(queue);
+                // The returned ticket keeps the service BUSY and reply pinned
+                // until rollback settles. No queue guard spans this release.
                 if !settle_backing_and_tables(&custody, &mut stock, handle, root, reply, txn)? {
                     return Err(stale());
                 }
@@ -1093,14 +1101,19 @@ impl NativeService {
                 ) {
                     return Err(stale());
                 }
+                drop(stock);
+                let queue = zone
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .map_err(|_| stale())?;
                 ticket.complete(false).map_err(|_| stale())?;
+                queue
             }
-        }
-        drop(stock);
+        };
         let mut effects = carrick_sched_core::WakeEffects::default();
         queue
             .notify_object(self.slot, &mut effects)
             .map_err(|_| stale())?;
+        drop(queue);
         carrick_observability::probes::hvpatch_native_fault_supply(
             handle.mm().raw(),
             request.identity.sequence.get(),
@@ -1232,6 +1245,9 @@ pub(super) fn take(
         let Some(generation) = custody.live_generation() else {
             return Err(stale());
         };
+        // Metadata retention can acquire host mutexes. Snapshot the member,
+        // retain its allocation outside the queue, then revalidate at claim.
+        drop(queue);
         let address = carrick_guest_arch::KernelVa::new(identity.control_slot);
         let Some((_, base, len)) = retained_dynamic_metadata(
             custody,
@@ -1276,21 +1292,36 @@ pub(super) fn take(
         {
             return Err(stale());
         }
-        // SAFETY: initialized control belongs to the exact live native record;
-        // the service queue serializes cancellation/consumption with this intake.
+        // SAFETY: the pin retains initialized control storage. The exact
+        // member and control identity are revalidated under the service queue.
         let control = unsafe { &*control };
-        if control.zone_record() != Some(selector.record) || !control.native_signal_owner() {
-            return consumed.miss("native-service control owner changed");
-        }
         let pin = ServicePin {
             cell: core::ptr::NonNull::from(&control.service),
             _mapping: pin,
             _carrier: Arc::clone(custody),
         };
-        // SAFETY: exact record/control and native birth authenticated above. The
+        let queue = zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| stale())?;
+        if custody.live_generation() != Some(generation)
+            || queue.native_service_member(selector.record) != Some(identity)
+        {
+            drop(queue);
+            return consumed.miss("native-service member changed during metadata retention");
+        }
+        if control.zone_record() != Some(selector.record) || !control.native_signal_owner() {
+            drop(queue);
+            return consumed.miss("native-service control owner changed");
+        }
+        // A refused claim consumes its pin. Keep the allocation alive until
+        // after the queue drops even if teardown removed its aperture entry.
+        let claim_backing = Arc::clone(&pin._mapping._backing);
+        // SAFETY: exact member/control revalidated under its queue above. The
         // ring's active service claim retains its admitted MM through ticket ACK.
         let ticket =
             unsafe { ServiceCell::claim_notice(pin, selector, custody.transfer_carrier, identity) };
+        drop(queue);
+        drop(claim_backing);
         match ticket {
             Ok(mut ticket) => {
                 let portal = region
