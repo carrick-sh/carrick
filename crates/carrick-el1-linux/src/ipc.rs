@@ -38,7 +38,7 @@
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{
-    PrefixCopy, StepStatus, from_sched_token, to_sched_token, transfer, wait_key,
+    PrefixCopy, StepStatus, from_sched_token, to_sched_token, transfer_with_buffers, wait_key,
 };
 use carrick_el1::substrate::sched::object_wait::OperationResumePc;
 pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
@@ -59,6 +59,7 @@ use core::sync::atomic::Ordering;
 mod linux {
     pub const SYS_READ: usize = 63;
     pub const SYS_WRITE: usize = 64;
+    pub const SYS_READV: usize = 65;
     pub const EBADF: i64 = -9;
     pub const EAGAIN: i64 = -11;
     pub const EINVAL: i64 = -22;
@@ -70,7 +71,7 @@ mod linux {
     /// Length of the AArch64 SVC instruction ELR points past.
     pub const SVC_LEN: u64 = 4;
 }
-pub use linux::{SYS_READ, SYS_WRITE};
+pub use linux::{SYS_READ, SYS_READV, SYS_WRITE};
 
 mod epoll;
 pub use epoll::SYS_EPOLL_PWAIT;
@@ -364,7 +365,12 @@ pub fn serve_ipc_with_sigpipe<C: ThreadCpu, U: UserWord, M: UserCopy>(
     native_sigpipe: bool,
 ) -> (IpcServed, bool) {
     let nr = frame.x[8] as usize;
-    if nr != SYS_READ && nr != SYS_WRITE && nr != SYS_EPOLL_PWAIT {
+    // Legacy handback serves contiguous operations only. Readv belongs to the
+    // native ring owner; decline before snapshot, pin or any transfer effect.
+    if nr == SYS_READV && !native_sigpipe {
+        return (IpcServed::Forward, false);
+    }
+    if nr != SYS_READ && nr != SYS_READV && nr != SYS_WRITE && nr != SYS_EPOLL_PWAIT {
         return (IpcServed::Forward, false);
     }
     let (token, op, resumed) = match sched.take_object_operation() {
@@ -479,7 +485,8 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     };
     let table = TableId::from_raw(table);
     let fd = Fd(frame.x[0] as i32);
-    let reading = frame.x[8] as usize == SYS_READ;
+    let scatter = frame.x[8] as usize == SYS_READV;
+    let reading = scatter || frame.x[8] as usize == SYS_READ;
     let fda = region.fd(EL1_WAIT);
     // A snapshot first (no retention): host-backed descriptions are never
     // pinned in EL1, so EL1 never holds a hold it could not release.
@@ -537,11 +544,69 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         AccessMode::WriteOnly => !reading,
         AccessMode::Path => false,
     };
-    let count = frame.x[2].min(linux::MAX_RW_COUNT);
+    // Snapshot the headers before any object effect. The operation token owns
+    // the initialized records even while its user header pages change.
+    let scatter_token = if scatter {
+        if frame.x[2] > carrick_abi::LINUX_IOV_MAX as u64 {
+            release_pin(sched, OfdPin::from_raw(op.pin), region);
+            return Admission::Immediate(linux::EINVAL);
+        }
+        let mut token = match region.begin_operation(op) {
+            Ok(token) => token,
+            Err(_) => {
+                release_pin(sched, OfdPin::from_raw(op.pin), region);
+                return refuse(sched, IpcLeave::NoOperationRecord);
+            }
+        };
+        let mut total = 0u64;
+        let mut error = None;
+        for index in 0..frame.x[2] {
+            let mut header = [0u8; 16];
+            let address = frame.x[1].checked_add(index * 16);
+            if !address.is_some_and(|address| user.copy_in(&mut header, address)) {
+                error = Some(-14);
+                break;
+            }
+            let mut word = [0; 8];
+            word.copy_from_slice(&header[..8]);
+            let address = u64::from_le_bytes(word);
+            word.copy_from_slice(&header[8..]);
+            let len = u64::from_le_bytes(word);
+            let Some(sum) = total.checked_add(len).filter(|sum| *sum <= i64::MAX as u64) else {
+                error = Some(linux::EINVAL);
+                break;
+            };
+            total = sum;
+            region
+                .append_operation_buffer(
+                    &mut token,
+                    carrick_el1_abi::ipc::IpcUserBuffer {
+                        address: IpcUserVa(address),
+                        len: carrick_guest_arch::GuestLen::new(len),
+                    },
+                )
+                .unwrap_or_else(|_| {
+                    crate::dispatch::invalid_completion(
+                        crate::dispatch::NativeInvariant::EntryBinding,
+                    )
+                });
+        }
+        if let Some(error) = error {
+            finish(sched, token, region);
+            return Admission::Immediate(error);
+        }
+        op.buffer_count = frame.x[2] as u32;
+        Some((token, total.min(linux::MAX_RW_COUNT)))
+    } else {
+        None
+    };
+    let count = scatter_token
+        .as_ref()
+        .map_or(frame.x[2].min(linux::MAX_RW_COUNT), |(_, count)| *count);
     let eventfd = matches!(kind, IpcOpKind::EventFdRead | IpcOpKind::EventFdWrite);
     let immediate = if !permitted {
         Some(linux::EBADF)
-    } else if !eventfd && count == 0 {
+    } else if count == 0 && (scatter || !eventfd) {
         Some(0)
     } else if eventfd && count < linux::EVENTFD_WORD {
         Some(linux::EINVAL)
@@ -549,7 +614,11 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
         None
     };
     if let Some(result) = immediate {
-        release_pin(sched, OfdPin::from_raw(op.pin), region);
+        if let Some((token, _)) = scatter_token {
+            finish(sched, token, region);
+        } else {
+            release_pin(sched, OfdPin::from_raw(op.pin), region);
+        }
         return Admission::Immediate(result);
     }
     // eventfd(2): a write copies its value once, before it can block.
@@ -565,6 +634,12 @@ fn admit<C: ThreadCpu, U: UserWord, M: UserCopy>(
     op.object = object.to_raw();
     op.progress = WriteProgress::new(if eventfd { linux::EVENTFD_WORD } else { count });
     op.value = IpcEventValue(u64::from_ne_bytes(value));
+    if let Some((token, _)) = scatter_token {
+        region.update_operation(&token, op).unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
+        return Admission::Admitted(token, op);
+    }
     match region.begin_operation(op) {
         Ok(token) => Admission::Admitted(token, op),
         Err(_) => {
@@ -694,7 +769,10 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 );
             }
         };
-        let (status, wake) = match transfer(&mut guard, &mut op, &mut copy) {
+        let buffers = region.operation_buffers(&token).unwrap_or_else(|_| {
+            crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
+        });
+        let (status, wake) = match transfer_with_buffers(&mut guard, &mut op, &mut copy, buffers) {
             Ok(step) => step,
             Err(_) => {
                 drop(guard);
@@ -2461,15 +2539,20 @@ mod tests {
 
     #[test]
     fn two_live_process_pipe_owner_wait_retains_exact_bytes_and_cursor() {
-        pipe_owner_wait_with_peer(false);
+        pipe_owner_wait_with_peer(false, false);
     }
 
     #[test]
     fn two_live_process_pipe_owner_wait_returns_delivered_prefix_if_peer_drains() {
-        pipe_owner_wait_with_peer(true);
+        pipe_owner_wait_with_peer(true, false);
     }
 
-    fn pipe_owner_wait_with_peer(peer_drains: bool) {
+    #[test]
+    fn two_live_process_readv_retains_snapshot_and_partial_second_iov() {
+        pipe_owner_wait_with_peer(false, true);
+    }
+
+    fn pipe_owner_wait_with_peer(peer_drains: bool, scatter: bool) {
         use crate::mm_portal::test_support::{IPA, Region, Tables, VA, nodes, residency};
         use crate::mm_portal::{GuestVa, MmError, MmPortal, TransferIntent};
         use carrick_core_abi::{
@@ -2567,6 +2650,12 @@ mod tests {
             }
         }
         let mut frame = syscall(SYS_READ, read, VA, 8192, A_SVC);
+        if scatter {
+            let headers = [VA, 2048, VA + 2048, 6144];
+            let bytes: Vec<u8> = headers.into_iter().flat_map(u64::to_le_bytes).collect();
+            w.mem.write(MM, 0x18000, &bytes);
+            frame = syscall(SYS_READV, read, 0x18000, 2, A_SVC);
+        }
         {
             let mut check = |at, len| {
                 if at == VA + 4096 && !raised {
@@ -2628,12 +2717,17 @@ mod tests {
                 tables: &w.tables,
             };
             assert_eq!(
-                serve_ipc(&mut sched, &mut frame, &venue, &mut user),
+                serve_ipc_with_sigpipe(&mut sched, &mut frame, &venue, &mut user, scatter).0,
                 SWITCHED,
                 "an owner refusal after a delivered page must park with its cursor"
             );
         }
         drop(view);
+        if scatter {
+            // A sibling can mutate header memory while this operation waits.
+            // The retained token, never the user table, owns its destinations.
+            w.mem.write(MM, 0x18000, &[0xff; 32]);
+        }
         assert_eq!(w.mem.read(MM, VA, 4096), pattern[..4096]);
         assert_eq!(
             w.region
@@ -2657,7 +2751,10 @@ mod tests {
         assert_eq!(w.call(&mut frame), SWITCHED);
         reenter(&mut frame, A_SVC);
         let delivered = if peer_drains { 4096 } else { 8192 };
-        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, delivered));
+        assert_eq!(
+            (w.call_with_owner(&mut frame, scatter), frame.x[0]),
+            (RETURNED, delivered)
+        );
         assert_eq!(
             w.mem.read(MM, VA, delivered as usize),
             pattern[..delivered as usize]
@@ -2829,9 +2926,111 @@ mod tests {
         );
     }
 
+    #[test]
+    fn readv_validates_count_headers_and_signed_total_before_consumption() {
+        let mut w = world();
+        let table = w.table(w.a_tid);
+        let (read, write, _) = w.pipe(table, BLOCK);
+        w.mem.write(MM, 0x10000, b"abc");
+        let mut send = syscall(SYS_WRITE, write, 0x10000, 3, A_SVC);
+        assert_eq!((w.call(&mut send), send.x[0]), (RETURNED, 3));
+        for (pointer, count, errno) in [
+            (0x18000, 1025, -22),
+            (0x18000, u64::MAX, -22),
+            (0x18000, 1, -14),
+        ] {
+            let mut frame = syscall(SYS_READV, read, pointer, count, A_SVC);
+            assert_eq!(w.call_with_owner(&mut frame, true), RETURNED);
+            assert_eq!(frame.x[0] as i64, errno);
+        }
+        let headers = [0x20000u64, i64::MAX as u64, 0x30000, 1];
+        let bytes: Vec<u8> = headers.into_iter().flat_map(u64::to_le_bytes).collect();
+        w.mem.write(MM, 0x18000, &bytes);
+        let mut frame = syscall(SYS_READV, read, 0x18000, 2, A_SVC);
+        assert_eq!(w.call_with_owner(&mut frame, true), RETURNED);
+        assert_eq!(frame.x[0] as i64, -22);
+        w.mem.map(MM, 0x20000, 3);
+        frame = syscall(SYS_READ, read, 0x20000, 3, A_SVC);
+        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, 3));
+        assert_eq!(w.mem.read(MM, 0x20000, 3), b"abc");
+    }
+
+    #[test]
+    fn readv_empty_eventfd_vectors_return_zero_without_consuming_counter() {
+        let mut w = world();
+        let table = w.table(w.a_tid);
+        let event = w.eventfd(table, 17, EventMode::Counter, BLOCK);
+        let mut frame = syscall(SYS_READV, event, u64::MAX, 0, A_SVC);
+        assert_eq!(
+            (w.call_with_owner(&mut frame, true), frame.x[0]),
+            (RETURNED, 0)
+        );
+        let headers: Vec<u8> = [u64::MAX, 0]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        w.mem.write(MM, 0x18000, &headers);
+        frame = syscall(SYS_READV, event, 0x18000, 1, A_SVC);
+        assert_eq!(
+            (w.call_with_owner(&mut frame, true), frame.x[0]),
+            (RETURNED, 0)
+        );
+        w.mem.map(MM, 0x20000, 8);
+        frame = syscall(SYS_READ, event, 0x20000, 8, A_SVC);
+        assert_eq!(
+            (w.call_with_owner(&mut frame, true), frame.x[0]),
+            (RETURNED, 8)
+        );
+        assert_eq!(w.mem.read(MM, 0x20000, 8), 17u64.to_ne_bytes());
+    }
+
+    #[test]
+    fn readv_legacy_handback_venue_declines_before_any_effect() {
+        let mut w = world();
+        let table = w.table(w.a_tid);
+        let event = w.eventfd(table, 17, EventMode::Counter, BLOCK);
+        let mut frame = syscall(SYS_READV, event, u64::MAX, 1025, A_SVC);
+        let before = frame;
+        assert_eq!(w.call(&mut frame), IpcServed::Forward);
+        assert_eq!((frame.x, frame.elr), (before.x, before.elr));
+        w.mem.map(MM, 0x20000, 8);
+        frame = syscall(SYS_READ, event, 0x20000, 8, A_SVC);
+        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, 8));
+        assert_eq!(w.mem.read(MM, 0x20000, 8), 17u64.to_ne_bytes());
+    }
+
+    #[test]
+    fn readv_skips_empty_iovecs_and_scatters_eventfd_word() {
+        let mut w = world();
+        let table = w.table(w.a_tid);
+        let event = w.eventfd(table, 0x10203, EventMode::Counter, BLOCK);
+        w.mem.map(MM, 0x20000, 3);
+        w.mem.map(MM, 0x30000, 5);
+        let headers = [u64::MAX, 0, 0x20000, 3, 0x30000, 5];
+        let bytes: Vec<u8> = headers.into_iter().flat_map(u64::to_le_bytes).collect();
+        w.mem.write(MM, 0x18000, &bytes);
+        let mut frame = syscall(SYS_READV, event, 0x18000, 3, A_SVC);
+        assert_eq!(
+            (w.call_with_owner(&mut frame, true), frame.x[0]),
+            (RETURNED, 8)
+        );
+        let actual = [w.mem.read(MM, 0x20000, 3), w.mem.read(MM, 0x30000, 5)].concat();
+        assert_eq!(actual, 0x10203u64.to_ne_bytes());
+    }
+
+    #[test]
+    fn readv_partial_second_iov_busy_returns_prefix_and_ordered_suffix() {
+        refused_preparation_read(
+            true,
+            4096,
+            Some(crate::native_process_runtime::NativeProcessError::Busy),
+        );
+    }
+
     /// Inject physical refusal through the production native classifier, or
     /// a Ready reply whose hardware copy still refuses. Drive the real loop.
     fn refused_preparation_read(
+        scatter: bool,
         prefix: usize,
         error: Option<crate::native_process_runtime::NativeProcessError>,
     ) {
@@ -2840,6 +3039,14 @@ mod tests {
         let mut w = world();
         let table = w.table(w.a_tid);
         let (read, write, object) = w.pipe(table, BLOCK);
+        let peer_table = if scatter {
+            let peer_table = w.fork_table(table, 202);
+            let peer = syscall(SYS_READ, read, 0x10000, 1, B_SVC);
+            w.queue(202, OTHER_MM, &peer, B_SVC);
+            Some(peer_table)
+        } else {
+            None
+        };
         let pattern: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
         w.mem.write(MM, 0x10000, &pattern);
         let mut frame = syscall(SYS_WRITE, write, 0x10000, 8192, A_SVC);
@@ -2890,6 +3097,12 @@ mod tests {
             }
         }
         frame = syscall(SYS_READ, read, 0x20000, 8192, A_SVC);
+        if scatter {
+            let headers = [0x20000u64, 2048, 0x20800, 6144];
+            let bytes: Vec<u8> = headers.into_iter().flat_map(u64::to_le_bytes).collect();
+            w.mem.write(MM, 0x18000, &bytes);
+            frame = syscall(65, read, 0x18000, 2, A_SVC);
+        }
         if prefix == 0 {
             // Terminal custody needs a real selected scheduler record, just
             // as it does for a native process in production.
@@ -2947,6 +3160,10 @@ mod tests {
             (RETURNED, (8192 - prefix) as u64)
         );
         assert_eq!(w.mem.read(MM, 0x20000, 8192 - prefix), pattern[prefix..]);
+        if let Some(peer_table) = peer_table {
+            w.host_close(peer_table, read);
+            w.host_close(peer_table, write);
+        }
         w.host_close(table, read);
         w.host_close(table, write);
         assert!(
@@ -2958,6 +3175,7 @@ mod tests {
     #[test]
     fn native_pipe_second_granule_busy_returns_prefix_and_preserves_suffix() {
         refused_preparation_read(
+            false,
             4096,
             Some(crate::native_process_runtime::NativeProcessError::Busy),
         );
@@ -2965,7 +3183,7 @@ mod tests {
 
     #[test]
     fn native_pipe_ready_without_hardware_progress_returns_prefix() {
-        refused_preparation_read(4096, None);
+        refused_preparation_read(false, 4096, None);
     }
 
     /// One refused output, an owned yield, then the same operation completes.
@@ -3204,7 +3422,7 @@ mod tests {
             preparation_child(
                 "ipc::tests::serial_host::native_pipe_zero_progress_ready_refusal_is_bounded",
                 true,
-                || refused_preparation_read(0, None),
+                || refused_preparation_read(false, 0, None),
             );
         }
         #[test]
@@ -3214,6 +3432,7 @@ mod tests {
                 true,
                 || {
                     refused_preparation_read(
+                        false,
                         0,
                         Some(crate::native_process_runtime::NativeProcessError::Stale),
                     )
@@ -3227,6 +3446,7 @@ mod tests {
                 true,
                 || {
                     refused_preparation_read(
+                        false,
                         0,
                         Some(crate::native_process_runtime::NativeProcessError::Quarantined),
                     )

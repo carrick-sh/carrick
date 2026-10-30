@@ -39,6 +39,7 @@ pub use crate::sched::SchedCall;
 pub enum Family {
     Anonymous(AnonymousCall),
     Read,
+    Readv,
     Write,
     EpollWait,
     Lifecycle(LifecycleCall),
@@ -336,6 +337,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
         FamilyCompletion::Forward
     }
     /// Removed by order 8.
+    fn readv(&mut self) -> FamilyCompletion {
+        FamilyCompletion::Forward
+    }
     fn write(&mut self) -> FamilyCompletion {
         FamilyCompletion::Forward
     }
@@ -546,6 +550,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
             completion
         }
         Family::Read => pending.read(),
+        Family::Readv => pending.readv(),
         Family::Write => pending.write(),
         Family::EpollWait => pending.epoll_wait(),
         Family::Lifecycle(_) => FamilyCompletion::Forward,
@@ -657,6 +662,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         222 => Family::Anonymous(AnonymousCall::Mmap),
         226 => Family::Anonymous(AnonymousCall::Mprotect),
         63 => Family::Read,
+        65 => Family::Readv,
         64 => Family::Write,
         22 => Family::EpollWait,
         62 => Family::FileSeek,
@@ -921,7 +927,9 @@ fn finish<'a, C: EntryContext + 'a>(
                 .store(original, core::sync::atomic::Ordering::Relaxed);
         }
     }
-    if (result == FamilyCompletion::Forward && run.forward_reason == ForwardReason::Unported)
+    if (result == FamilyCompletion::Forward
+        && (run.forward_reason == ForwardReason::Unported
+            || ordinal == crate::crossing::nr::READV.raw()))
         || (pending.crossing_set() == crate::crossing::HostCrossingSet::X86
             && matches!(
                 result,
@@ -1094,7 +1102,10 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && matches!(family, Family::Lifecycle(_))
         && matches!(ordinal, 99 | 132 | 135);
     let transfer = pending.ipc_available()
-        && matches!(family, Family::Read | Family::Write | Family::EpollWait);
+        && matches!(
+            family,
+            Family::Read | Family::Readv | Family::Write | Family::EpollWait
+        );
     let owned_descriptor = family == Family::Descriptor && pending.native_descriptor_owner();
     // Identity/resource operations complete synchronously under their owner.
     // Serve them before handing back metadata work; an absent owner still

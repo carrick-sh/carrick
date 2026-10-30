@@ -681,8 +681,9 @@ pub const EL1_IPC_BASE: u64 = EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_S
 /// IPA span reserved for the directory mapping: the fixed directory head
 /// and the reservations of its elastic stores
 /// ([`ipc::IPC_DIRECTORY_BYTES`] must fit). Address space only: the host
-/// commits a store's pages as it publishes segments.
-pub const EL1_IPC_DIRECTORY_SPAN: u64 = 0x800_0000;
+/// commits a store's pages as it publishes segments; token-owned scatter
+/// snapshots commit only their initialized prefixes.
+pub const EL1_IPC_DIRECTORY_SPAN: u64 = 0xA00_0000;
 /// Guest VA/IPA of the IPC byte pool.
 pub const EL1_IPC_POOL_BASE: u64 = EL1_IPC_BASE + EL1_IPC_DIRECTORY_SPAN;
 /// Length of the IPC byte pool (the authority's pool is exactly this long):
@@ -4242,7 +4243,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x661ef1c57f329093);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x8fbcaa470589a950);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

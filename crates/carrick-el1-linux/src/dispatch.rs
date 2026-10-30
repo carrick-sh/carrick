@@ -1927,6 +1927,9 @@ impl<
     fn read(&mut self) -> FamilyCompletion {
         self.ipc_transfer()
     }
+    fn readv(&mut self) -> FamilyCompletion {
+        self.ipc_transfer()
+    }
     fn write(&mut self) -> FamilyCompletion {
         self.ipc_transfer()
     }

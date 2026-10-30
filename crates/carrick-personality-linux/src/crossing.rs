@@ -216,7 +216,6 @@ host_crossings! {
     Lseek = nr::LSEEK, true, Permanent;
     Read = nr::READ, true, Permanent;
     Write = nr::WRITE, true, Permanent;
-    Readv = nr::READV, false, Permanent;
     Writev = nr::WRITEV, false, Permanent;
     Pread64 = nr::PREAD64, true, Permanent;
     Pwrite64 = nr::PWRITE64, true, Permanent;
@@ -445,6 +444,12 @@ mod tests {
     }
 
     #[test]
+    fn readv_has_no_host_syscall_fallback() {
+        assert!(!HostCrossingSet::Aarch64.is_allowed(nr::READV));
+        assert!(!HostCrossingSet::X86.is_allowed(nr::READV));
+    }
+
+    #[test]
     fn ppoll_has_no_host_syscall_fallback() {
         assert!(!HostCrossingSet::Aarch64.is_allowed(nr::PPOLL));
         assert!(!HostCrossingSet::X86.is_allowed(nr::PPOLL));
@@ -539,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 122);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 121);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
@@ -554,6 +559,7 @@ mod tests {
             CanonicalNr(27), // inotify_add_watch
             CanonicalNr(28), // inotify_rm_watch
             nr::PPOLL,
+            nr::READV,
             CanonicalNr(98),  // futex
             CanonicalNr(99),  // set_robust_list
             CanonicalNr(122), // sched_setaffinity

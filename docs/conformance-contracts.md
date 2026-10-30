@@ -2593,3 +2593,23 @@ Native pipe/eventfd copy faults settle their operation in ring, including a
 zero-byte read resumed after readiness or memory suspension. Genuine faults
 return errno 14 and release the operation pin; a delivered prefix remains a
 short read. The host-owned handback path retains its existing contract.
+
+### Retained scatter input (#1040)
+
+`kernel.memory.owner-wait` includes native IPC readv. Its operation token
+retains a pointer-free iovec snapshot and exact range/byte cursor in the shared
+IPC directory, outside every guest stack. Only admitted headers commit pages
+in this reserved store; ordinary read/write initialization touches none of it.
+The shared transfer core splits at both iovec ends and physical 4096-byte
+boundaries. Preparation runs after the object lock is dropped, just as for read.
+A Busy refusal after a partial second iovec returns the delivered prefix;
+subsequent reads receive the remaining source bytes in order. A memory-owner
+wait retains the snapshot even when a second live process changes user headers.
+No endpoint lookup or consumed-byte replay occurs on resumption.
+
+Linux authority is readv(2): array-order output, partial progress, errno 22
+for excessive counts or signed-total overflow and errno 14 for bad headers.
+The VM-free bindings are listed in the owner-wait descriptor. Eventfd scatter
+input uses the same eight-byte staged transfer. Host-file readv remains
+unrouted at this slice, with no syscall fallback. Signed acceptance and x86
+IPC binding remain separate stack obligations.

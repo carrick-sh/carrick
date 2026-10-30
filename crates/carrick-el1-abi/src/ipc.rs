@@ -112,6 +112,16 @@ pub const IPC_OFD_SEGMENT: usize = 2048;
 /// Suspended-operation records ([`IpcOperation`] behind an [`IpcOpToken`]).
 /// Exhaustion refuses before effects (`NoOperations`: EL1 forwards).
 pub const IPC_OPERATIONS: usize = 1024;
+/// Scatter destination capacity retained by one operation.
+pub const IPC_OPERATION_BUFFERS: usize = 1024;
+
+/// A pointer-free user destination retained by an operation's single owner.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpcUserBuffer {
+    pub address: IpcUserVa,
+    pub len: carrick_guest_arch::GuestLen,
+}
 /// Zone-wide ceiling on pipe and eventfd objects: the elastic object store's
 /// reservation (ENFILE beyond it).
 pub const IPC_MAX_OBJECTS: usize = 1 << 18;
@@ -496,8 +506,13 @@ pub const IPC_DESCRIPTOR_STORAGE_OFFSET: usize = page_round(
 type DescriptorStorage = fd::storage::Storage<IPC_DESCRIPTOR_STORAGE_NODES>;
 /// Length of the directory mapping: fixed head plus every store's
 /// reservation, a multiple of 16 KiB (the host's stage-2 granule).
-pub const IPC_DIRECTORY_BYTES: usize = (IPC_DESCRIPTOR_STORAGE_OFFSET
-    + core::mem::size_of::<DescriptorStorage>())
+pub const IPC_OPERATION_BUFFERS_OFFSET: usize =
+    page_round(IPC_DESCRIPTOR_STORAGE_OFFSET + core::mem::size_of::<DescriptorStorage>());
+/// Scatter snapshots have reserved address space but commit no page until an
+/// admitted operation writes its initialized prefix. Ordinary read/write
+/// operations never touch this store, including directory initialization.
+pub const IPC_DIRECTORY_BYTES: usize = (IPC_OPERATION_BUFFERS_OFFSET
+    + IPC_OPERATIONS * IPC_OPERATION_BUFFERS * core::mem::size_of::<IpcUserBuffer>())
 .next_multiple_of(0x4000);
 const _: () =
     assert!(IPC_EPOLL_ITEMS_OFFSET.is_multiple_of(core::mem::align_of::<epoll::IpcEpollItem>()));
@@ -568,6 +583,12 @@ const LAYOUT_FACTS: &[u64] = &[
     END_WRITER,
     INDEX_BITS,
     IPC_OPERATIONS as u64,
+    IPC_OPERATION_BUFFERS as u64,
+    core::mem::size_of::<IpcUserBuffer>() as u64,
+    IPC_OPERATION_BUFFERS_OFFSET as u64,
+    core::mem::offset_of!(IpcOperation, buffer_count) as u64,
+    core::mem::offset_of!(IpcOperation, buffer_index) as u64,
+    core::mem::offset_of!(IpcOperation, buffer_offset) as u64,
     core::mem::size_of::<IpcOperationSlot>() as u64,
     core::mem::offset_of!(IpcDirectory, operations) as u64,
     core::mem::offset_of!(IpcDirectory, host_wake_summary) as u64,
@@ -667,6 +688,11 @@ pub struct IpcOperation {
     pub mm: IpcMmKey,
     pub buf: IpcUserVa,
     pub progress: WriteProgress,
+    /// Immutable scatter snapshot size; zero selects the contiguous buffer.
+    pub buffer_count: u32,
+    /// Next destination and byte within it; consumed only with delivered bytes.
+    pub buffer_index: u32,
+    pub buffer_offset: u64,
     pub park_seq: u64,
     /// An eventfd write's counter value, copied from `buf` before the
     /// operation could block: a resumed write adds this value, never a
@@ -759,6 +785,9 @@ impl IpcOperation {
         mm: IpcMmKey(0),
         buf: IpcUserVa(0),
         progress: WriteProgress { len: 0, written: 0 },
+        buffer_count: 0,
+        buffer_index: 0,
+        buffer_offset: 0,
         park_seq: 0,
         value: IpcEventValue(0),
         orig_x0: 0,
@@ -1822,6 +1851,53 @@ impl<'a> IpcRegion<'a> {
         let slot = self.op_slot(token)?;
         // SAFETY: the token's owner is the slot's only accessor.
         Ok(unsafe { *slot.op.get() })
+    }
+
+    fn operation_buffer_ptr(&self, token: &IpcOpToken) -> *mut IpcUserBuffer {
+        // SAFETY: the directory covers this reserved store. Callers first
+        // authenticate the slot and bound the initialized prefix.
+        unsafe {
+            self.base
+                .add(IPC_OPERATION_BUFFERS_OFFSET)
+                .cast::<IpcUserBuffer>()
+                .add(token.index as usize * IPC_OPERATION_BUFFERS)
+        }
+    }
+
+    /// Append an initialized destination to the exact operation's snapshot.
+    /// No slot may be overwritten or observed before initialization.
+    pub fn append_operation_buffer(
+        &self,
+        token: &mut IpcOpToken,
+        buffer: IpcUserBuffer,
+    ) -> Result<(), IpcError> {
+        let slot = self.op_slot(token)?;
+        // SAFETY: only the token owner can access this live slot.
+        let op = unsafe { &mut *slot.op.get() };
+        let index = op.buffer_count as usize;
+        if index >= IPC_OPERATION_BUFFERS {
+            return Err(IpcError::Corrupt);
+        }
+        // SAFETY: in bounds, disjoint from the operation; sole token owner.
+        unsafe { self.operation_buffer_ptr(token).add(index).write(buffer) };
+        op.buffer_count += 1;
+        Ok(())
+    }
+
+    /// Immutable snapshot under the operation token's exclusive custody.
+    pub fn operation_buffers<'t>(
+        &'t self,
+        token: &'t IpcOpToken,
+    ) -> Result<&'t [IpcUserBuffer], IpcError> {
+        let slot = self.op_slot(token)?;
+        // SAFETY: single token ownership; append initializes each counted row.
+        let count = unsafe { (*slot.op.get()).buffer_count as usize };
+        if count > IPC_OPERATION_BUFFERS {
+            return Err(IpcError::Corrupt);
+        }
+        // SAFETY: only the initialized prefix is exposed; token borrow prevents
+        // concurrent append or retirement by its single owner.
+        Ok(unsafe { core::slice::from_raw_parts(self.operation_buffer_ptr(token), count) })
     }
 
     /// Store the owner's progress (e.g. bytes transferred before re-parking).

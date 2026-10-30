@@ -128,6 +128,17 @@ pub fn transfer<U: UserCopy>(
     op: &mut IpcOperation,
     copy: &mut PrefixCopy<'_, U>,
 ) -> Result<(StepStatus, WakeSet), IpcError> {
+    transfer_with_buffers(guard, op, copy, &[])
+}
+
+/// The same staged transfer with token-owned scatter destinations. The cursor
+/// advances only for copied bytes and survives owner preparation and parking.
+pub fn transfer_with_buffers<U: UserCopy>(
+    guard: &mut IpcObjectGuard<'_>,
+    op: &mut IpcOperation,
+    copy: &mut PrefixCopy<'_, U>,
+    buffers: &[carrick_el1_abi::ipc::IpcUserBuffer],
+) -> Result<(StepStatus, WakeSet), IpcError> {
     let buf = op.buf.0;
     let mut wake = WakeSet::default();
     let mut owe = |w: WakeSet| {
@@ -140,7 +151,14 @@ pub fn transfer<U: UserCopy>(
             let base = buf.wrapping_add(op.progress.written);
             let mut at = 0u64;
             let step = p.read_with(op.progress.remaining(), |chunk| {
-                let n = copy.copy_out(base.wrapping_add(at), chunk);
+                let n = copy_to_buffers(
+                    copy,
+                    buffers,
+                    &mut op.buffer_index,
+                    &mut op.buffer_offset,
+                    base.wrapping_add(at),
+                    chunk,
+                );
                 at += n as u64;
                 n
             });
@@ -174,10 +192,21 @@ pub fn transfer<U: UserCopy>(
         }
         IpcOpKind::EventFdRead => {
             let e = guard.eventfd()?;
+            let cursor = (op.buffer_index, op.buffer_offset);
             let step = e.read_with(|value| {
                 let bytes = value.to_ne_bytes();
-                copy.copy_out(buf, &bytes) == bytes.len()
+                copy_to_buffers(
+                    copy,
+                    buffers,
+                    &mut op.buffer_index,
+                    &mut op.buffer_offset,
+                    buf,
+                    &bytes,
+                ) == bytes.len()
             });
+            if step.result.is_err() {
+                (op.buffer_index, op.buffer_offset) = cursor;
+            }
             owe(step.wake);
             match step.result {
                 Ok(_) => {
@@ -205,6 +234,44 @@ pub fn transfer<U: UserCopy>(
         IpcOpKind::None | IpcOpKind::EpollWait => return Err(IpcError::Corrupt),
     };
     Ok((status, wake))
+}
+
+fn copy_to_buffers<U: UserCopy>(
+    copy: &mut PrefixCopy<'_, U>,
+    buffers: &[carrick_el1_abi::ipc::IpcUserBuffer],
+    index: &mut u32,
+    offset: &mut u64,
+    contiguous: u64,
+    bytes: &[u8],
+) -> usize {
+    if buffers.is_empty() {
+        return copy.copy_out(contiguous, bytes);
+    }
+    let mut done = 0;
+    while done < bytes.len() {
+        let Some(buffer) = buffers.get(*index as usize) else {
+            break;
+        };
+        let Some(remaining) = buffer.len.raw().checked_sub(*offset) else {
+            break;
+        };
+        if remaining == 0 {
+            *index += 1;
+            *offset = 0;
+            continue;
+        }
+        let Some(address) = buffer.address.0.checked_add(*offset) else {
+            break;
+        };
+        let count = remaining.min((bytes.len() - done) as u64) as usize;
+        let copied = copy.copy_out(address, &bytes[done..done + count]);
+        done += copied;
+        *offset += copied as u64;
+        if copied < count {
+            break;
+        }
+    }
+    done
 }
 
 fn blocked_or(e: pipe::Error) -> Result<StepStatus, IpcError> {

@@ -5,8 +5,8 @@
 schema_version = 1
 id = "kernel.el1.arm-ring-first-crossing"
 title = "Ring-first refusal preserves ISA policy, family work and completion transport"
-guest_surfaces = ["syscall:getuid", "syscall:getpid", "syscall:clock_gettime", "syscall:exit", "syscall:exit_group", "syscall:mmap", "syscall:clone", "syscall:wait4", "syscall:rt_sigreturn", "vmm:hvf", "entry:x86"]
-semantic_authority = ["man 2 _exit", "man 2 exit_group", "man 2 mmap", "man 2 waitpid", "https://man7.org/linux/man-pages/man2/signalfd.2.html", "docs/design/arm-ring-first-flip.md"]
+guest_surfaces = ["syscall:readv", "syscall:getuid", "syscall:getpid", "syscall:clock_gettime", "syscall:exit", "syscall:exit_group", "syscall:mmap", "syscall:clone", "syscall:wait4", "syscall:rt_sigreturn", "vmm:hvf", "entry:x86"]
+semantic_authority = ["man 2 readv; owner routing decision 2026-10-29 (#231/#1040)", "man 2 _exit", "man 2 exit_group", "man 2 mmap", "man 2 waitpid", "https://man7.org/linux/man-pages/man2/signalfd.2.html", "docs/design/arm-ring-first-flip.md"]
 fixture = "fixtures/linux-aarch64-hello/src/ring_first.rs"
 scale_points = [1]
 structural_budgets = []
@@ -35,8 +35,12 @@ changing either live policy.
 """
 
 [bindings]
-vm_free = "carrick-el1-linux::production_x86_family_absences_obey_eight_crossings_without_user_memory; carrick-personality-linux::dispatch::ring_first_tests::owed_work_does_not_replay_handback_accounted_forward_or_x86; carrick-personality-linux::dispatch::ring_first_tests::no_effect_arm_forward_replays_saved_argument_not_mutated_frame; carrick-el1-linux::x86_context_selects_x86_crossings_without_arm_aperture; carrick-el1-linux::x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal; carrick-personality-linux::crossing::tests::both_sets_match_the_exhaustive_census_through_512; carrick-personality-linux::dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work; carrick-personality-linux::dispatch::ring_first_tests::failed_entry_admission_cannot_bypass_crossing_policy; carrick-personality-linux::dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier; carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors; carrick-vmm-hvf::hatch::tests::aperture_configuration_preserves_service_copy_slot_zero; carrick-vmm-hvf::hatch::tests::carrier_admission_rejects_conflicting_ring_policy_without_changing_it; carrick-mem::memory::el1_shim_tests::mailbox_shim_routes_raw_clock_gettime_only_when_fast_paths_are_enabled"
+vm_free = "carrick-personality-linux::crossing::tests::readv_has_no_host_syscall_fallback; carrick-el1-linux::ipc::tests::{readv_partial_second_iov_busy_returns_prefix_and_ordered_suffix,two_live_process_readv_retains_snapshot_and_partial_second_iov,readv_legacy_handback_venue_declines_before_any_effect}; carrick-el1-linux::production_x86_family_absences_obey_eight_crossings_without_user_memory; carrick-personality-linux::dispatch::ring_first_tests::owed_work_does_not_replay_handback_accounted_forward_or_x86; carrick-personality-linux::dispatch::ring_first_tests::no_effect_arm_forward_replays_saved_argument_not_mutated_frame; carrick-el1-linux::x86_context_selects_x86_crossings_without_arm_aperture; carrick-el1-linux::x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal; carrick-personality-linux::crossing::tests::both_sets_match_the_exhaustive_census_through_512; carrick-personality-linux::dispatch::ring_first_tests::strict_arm_preserves_family_declines_handback_and_owed_work; carrick-personality-linux::dispatch::ring_first_tests::failed_entry_admission_cannot_bypass_crossing_policy; carrick-personality-linux::dispatch::ring_first_tests::strict_arm_terminal_calls_without_process_owner_cross_to_carrier; carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors; carrick-vmm-hvf::hatch::tests::aperture_configuration_preserves_service_copy_slot_zero; carrick-vmm-hvf::hatch::tests::carrier_admission_rejects_conflicting_ring_policy_without_changing_it; carrick-mem::memory::el1_shim_tests::mailbox_shim_routes_raw_clock_gettime_only_when_fast_paths_are_enabled"
 embed = "carrick-embed::arm_ring_first_strict_glibc_loader_witness; carrick-embed::arm_ring_first_opt_out_glibc_loader_witness; carrick-embed::arm_ring_first_strict_refusal_witness; carrick-embed::arm_ring_first_hatch_disabled_forward_witness; carrick-embed::arm_ring_first_strict_glibc_fork_wait_witness; carrick-embed::arm_ring_first_opt_out_glibc_fork_wait_witness"
 
 [bindings.unresolved]
 docker = "Strict ENOSYS is the explicit owner policy, not Linux syscall coverage. Docker execution is prohibited in this scoped task; Linux terminal semantics come from the syscall specifications."
+
+# #1040: native IPC readv uses the shared ring transfer and retained-copyout
+# owner. Unsupported venues decline before effects and are counted ENOSYS in
+# strict mode. Signed acceptance and the x86 IPC transport are separate layers.
