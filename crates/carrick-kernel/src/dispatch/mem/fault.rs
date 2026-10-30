@@ -1720,8 +1720,9 @@ impl<'a> MemView<'a> {
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
-        page: u64,
+        page: GuestVa,
     ) -> Result<FrameGrantPublicationSnapshot<'permit>, RootAccessRefusal> {
+        let page = page.raw();
         if grant.mm_key != permit.mm().raw() {
             return Err(Refusal::Stale.into());
         }

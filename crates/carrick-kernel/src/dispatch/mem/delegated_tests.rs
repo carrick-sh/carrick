@@ -6075,7 +6075,7 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                     .reprotected_frame_grant_plan(
                         permit,
                         dispatcher
-                            .frame_grant_publication_snapshot(permit, grant, fault)
+                            .frame_grant_publication_snapshot(permit, grant, GuestVa::new(fault))
                             .expect("pre-publication snapshot"),
                         wrong_owner,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
@@ -6091,7 +6091,7 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                     .reprotected_frame_grant_plan(
                         permit,
                         dispatcher
-                            .frame_grant_publication_snapshot(permit, grant, fault)
+                            .frame_grant_publication_snapshot(permit, grant, GuestVa::new(fault))
                             .expect("pre-publication snapshot"),
                         wrong_mm,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
@@ -6111,7 +6111,7 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                     .reprotected_frame_grant_plan(
                         permit,
                         dispatcher
-                            .frame_grant_publication_snapshot(permit, grant, fault)
+                            .frame_grant_publication_snapshot(permit, grant, GuestVa::new(fault))
                             .expect("pre-publication snapshot"),
                         grant,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
@@ -6127,7 +6127,7 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                     .reprotected_frame_grant_plan(
                         permit,
                         dispatcher
-                            .frame_grant_publication_snapshot(permit, grant, fault)
+                            .frame_grant_publication_snapshot(permit, grant, GuestVa::new(fault))
                             .expect("pre-publication snapshot"),
                         grant,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
@@ -6142,7 +6142,7 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
                 .reprotected_frame_grant_plan(
                     permit,
                     dispatcher
-                        .frame_grant_publication_snapshot(permit, grant, fault)
+                        .frame_grant_publication_snapshot(permit, grant, GuestVa::new(fault))
                         .expect("pre-publication snapshot"),
                     grant,
                     LinuxProtFlags::READ | LinuxProtFlags::WRITE,
@@ -6189,7 +6189,7 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool, conten
         dispatcher.mm_mutation_coordinator(),
         |permit| {
             let snapshot = dispatcher
-                .frame_grant_publication_snapshot(permit, grant, fault)
+                .frame_grant_publication_snapshot(permit, grant, GuestVa::new(fault))
                 .expect("snapshot before descriptor publication/settlement");
             let settle = || {
                 let plan = dispatcher.reprotected_frame_grant_plan(permit, snapshot, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt, LinuxProtFlags::READ | LinuxProtFlags::WRITE)

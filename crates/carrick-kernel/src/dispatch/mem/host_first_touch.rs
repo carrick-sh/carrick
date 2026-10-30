@@ -245,7 +245,7 @@ impl SyscallDispatcher {
         &self,
         permit: &'permit super::super::mm_mutation::HostAliasPermit<'_>,
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
-        page: u64,
+        page: GuestVa,
     ) -> Result<FrameGrantPublicationSnapshot<'permit>, RootAccessRefusal> {
         self.mem_view()
             .frame_grant_publication_snapshot(permit, grant, page)
