@@ -7,7 +7,7 @@
 //! keeps the token only in memory, for at most [`FRESH`]. A refusal, a
 //! timeout or a missing channel is returned as a [`MintFailure`]; callers
 //! record it and fall back to the job token (publication) or report the board
-//! unavailable.
+//! unavailable. Bootstrap (#1034) has no fallback: it fails the step.
 use crate::ci_scaler::mint::{
     AppToken, MintNonce, MintRefusal, MintRequest, MintResponse, MintScope, REQUEST_FILE,
     RESPONSE_FILE, RESPONSE_LIMIT,

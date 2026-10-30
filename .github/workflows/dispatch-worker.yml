@@ -146,8 +146,8 @@ jobs:
       - name: Bootstrap pinned agent tools and private foreground launcher
         id: bootstrap
         timeout-minutes: 10
-        env:
-          GH_TOKEN: ${{ secrets.AGENT_DIRECTOR_TOKEN }}
+        # The launcher read token is minted on demand by the ctb controller
+        # through the runner state directory (#1034); no secret is passed.
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner bootstrap'
       - name: Admit continuation before agent execution
         id: admission

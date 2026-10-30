@@ -1,5 +1,7 @@
 //! Job-scoped tools and credentials for any Unix `carrick-agent` runner.
+use crate::ci_scaler::mint::{AppToken, MintScope};
 use crate::ci_scaler::{ScalerError, execute};
+use crate::dispatch_mint::MintFailure;
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
 use std::collections::BTreeMap;
@@ -41,7 +43,14 @@ struct Tool {
     member: String,
 }
 
-fn invoke(dir: &Path, program: &str, args: &[&str]) -> Result<(), ScalerError> {
+/// Run a bootstrap command. No inherited GitHub token reaches it; only the
+/// launcher fetch gets the controller-minted `launcher` token (#1034).
+fn invoke(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    launcher: Option<&AppToken>,
+) -> Result<(), ScalerError> {
     let mut command = if program == "git" {
         crate::dispatch_worker::git_invocation(dir, args)
     } else {
@@ -49,26 +58,44 @@ fn invoke(dir: &Path, program: &str, args: &[&str]) -> Result<(), ScalerError> {
         command.args(args).current_dir(dir);
         command
     };
+    command.env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN");
+    if let Some(token) = launcher {
+        command.env("GH_TOKEN", token.secret());
+    }
     let result = execute(&mut command, &[], std::time::Duration::from_secs(120));
     if let Err(error) = result {
-        if program == "git" && args.first() == Some(&"fetch") {
-            return Err(check_token(dir).err().unwrap_or(error));
+        if let Some(token) = launcher {
+            return Err(check_token(dir, token).err().unwrap_or(error));
         }
         return Err(error);
     }
     Ok(())
 }
 
-fn check_token(root: &Path) -> Result<(), ScalerError> {
+/// The launcher token, minted by the ctb controller for this job. A refusal
+/// or an unavailable controller fails bootstrap; no other token is tried.
+fn launcher_token(
+    mint: impl FnOnce() -> Result<AppToken, MintFailure>,
+) -> Result<AppToken, ScalerError> {
+    mint().map_err(|failure| {
+        ScalerError::Usage(format!(
+            "host/infra: no controller-minted bootstrap token ({}); bootstrap requires read access to the private launcher repository and uses no other token",
+            failure.describe()
+        ))
+    })
+}
+
+fn check_token(root: &Path, token: &AppToken) -> Result<(), ScalerError> {
     let repository = "carrick-sh/agy-director";
-    let message = "host/infra: AGENT_DIRECTOR_TOKEN rejected or expired, or GitHub access unavailable; bootstrap requires read access to the private launcher repository";
-    if !std::env::var("GH_TOKEN").is_ok_and(|token| !token.is_empty()) {
-        return Err(ScalerError::Guard(message));
-    }
+    let message = "host/infra: controller-minted bootstrap token rejected or expired, or GitHub access unavailable; bootstrap requires read access to the private launcher repository";
+    let mut command = std::process::Command::new("gh");
+    command
+        .args(["api", &format!("repos/{repository}")])
+        .current_dir(root)
+        .env_remove("GITHUB_TOKEN")
+        .env("GH_TOKEN", token.secret());
     execute(
-        std::process::Command::new("gh")
-            .args(["api", &format!("repos/{repository}")])
-            .current_dir(root),
+        &mut command,
         &[],
         std::time::Duration::from_secs(30).min(job_remaining(39)?),
     )
@@ -301,8 +328,13 @@ fn extract(tool: &Tool, archive: &Path, bin: &Path) -> Result<(), ScalerError> {
     Ok(())
 }
 
-fn bootstrap(root: &Path) -> Result<(), ScalerError> {
-    check_token(root)?;
+fn bootstrap(
+    root: &Path,
+    mint: impl FnOnce() -> Result<AppToken, MintFailure>,
+) -> Result<(), ScalerError> {
+    // Mint first, before any state or download, and before `remember` so the
+    // token is in this job's redaction set.
+    let launcher = launcher_token(mint)?;
     let state = state()?;
     private_dir(&state)?;
     crate::dispatch_redaction::remember()?;
@@ -346,16 +378,17 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
                     .ok_or(ScalerError::Guard("non-UTF8 runner path"))?,
                 &tool.url,
             ],
+            None,
         )?;
         extract(tool, &archive, &bin)?;
         std::fs::remove_file(archive)?;
     }
     // Cargo's repository toolchain selection installs rust-toolchain.toml before
     // this driver is built. The workflow caches tools, never the isolated home.
-    invoke(root, "rustup", &["show", "active-toolchain"])?;
+    invoke(root, "rustup", &["show", "active-toolchain"], None)?;
     let director = state.join("director");
     private_dir(&director)?;
-    invoke(&director, "git", &["init"])?;
+    invoke(&director, "git", &["init"], None)?;
     invoke(
         &director,
         "git",
@@ -371,8 +404,14 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
             "https://github.com/carrick-sh/agy-director",
             &manifest.director_sha,
         ],
+        Some(&launcher),
     )?;
-    invoke(&director, "git", &["checkout", "--detach", "FETCH_HEAD"])?;
+    invoke(
+        &director,
+        "git",
+        &["checkout", "--detach", "FETCH_HEAD"],
+        None,
+    )?;
     let mut paths = std::fs::OpenOptions::new()
         .append(true)
         .open(std::env::var_os("GITHUB_PATH").ok_or(ScalerError::Guard("missing GITHUB_PATH"))?)?;
@@ -422,7 +461,9 @@ fn agy_auth(home: &Path, raw: &str) -> Result<(), ScalerError> {
 
 pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
     match args.action {
-        Action::Bootstrap => bootstrap(root),
+        Action::Bootstrap => bootstrap(root, || {
+            crate::dispatch_mint::app_token(MintScope::Bootstrap)
+        }),
         Action::Auth { event } => auth(root, &event),
         Action::Cleanup => {
             crate::dispatch_worker::cleanup_dispatch_users()?;
@@ -627,6 +668,32 @@ printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
         tool.sha256 = Some(crate::provision::compute_sha256(&archive).unwrap());
         extract(&tool, &archive, temp.path()).unwrap();
         assert_eq!(std::fs::read(temp.path().join("just")).unwrap(), b"tool");
+    }
+    #[test]
+    fn controller_refusal_fails_bootstrap_without_a_fallback() {
+        use crate::ci_scaler::mint::MintRefusal;
+        use crate::dispatch_mint::MintUnavailable;
+        for failure in [
+            MintFailure::Refused(MintRefusal::ScopeNotAllowed),
+            MintFailure::Refused(MintRefusal::BudgetExhausted),
+            MintFailure::Refused(MintRefusal::JobNotInProgress),
+            MintFailure::Unavailable(MintUnavailable::NoChannel),
+            MintFailure::Unavailable(MintUnavailable::Timeout),
+        ] {
+            // The mint is the first thing bootstrap does: a failure returns
+            // before any state, download or other credential is touched.
+            let error = bootstrap(Path::new("/nonexistent"), || Err(failure))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("host/infra: no controller-minted bootstrap token"),
+                "{error}"
+            );
+            assert!(error.contains(failure.describe()), "{error}");
+            assert!(error.contains("uses no other token"), "{error}");
+        }
+        let token = launcher_token(|| Ok(AppToken::for_test("ghs_launcherFixture0123")));
+        assert_eq!(token.unwrap().secret(), "ghs_launcherFixture0123");
     }
     #[test]
     fn credentials_are_private_and_never_overwrite_an_existing_file() {

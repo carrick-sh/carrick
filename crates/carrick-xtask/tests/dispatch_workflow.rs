@@ -55,10 +55,13 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
             && retire < upload
     );
     assert!(!format!("{:?}", steps[retire]).contains("github.token"));
-    assert_eq!(
-        steps[bootstrap]["env"]["GH_TOKEN"].as_str(),
-        Some("${{ secrets.AGENT_DIRECTOR_TOKEN }}")
+    // The controller mints the launcher token (#1034); bootstrap gets no
+    // secret and no job token.
+    assert!(
+        steps[bootstrap]["env"].is_badvalue(),
+        "bootstrap has an env"
     );
+    assert!(!format!("{:?}", steps[bootstrap]).contains("secrets."));
     assert_eq!(
         steps[agent]["env"]["GH_TOKEN"].as_str(),
         Some("${{ github.token }}")
@@ -84,16 +87,6 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
             .contains("steps.loop.outputs.artifacts_ready == 'true'"),
         "unscanned artifacts must never upload"
     );
-    for (index, step) in steps.iter().enumerate() {
-        if index != bootstrap {
-            assert!(
-                !step["env"]["GH_TOKEN"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("AGENT_DIRECTOR_TOKEN")
-            );
-        }
-    }
 }
 
 #[test]
@@ -123,9 +116,14 @@ fn provider_workflow_provisions_every_available_worker_credential() {
 fn only_dispatch_workflow_references_dispatch_secrets() {
     let workflows =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
-    let secrets = ["AGENT_DIRECTOR_TOKEN", "CODEX_AUTH_JSON", "AGY_OAUTH_TOKEN"];
-    // Minted on demand by the ctb controller (#1012); no workflow passes them.
-    let retired = ["DISPATCH_BOARD_TOKEN", "DISPATCH_PUBLISH_TOKEN"];
+    let secrets = ["CODEX_AUTH_JSON", "AGY_OAUTH_TOKEN"];
+    // Minted on demand by the ctb controller (#1012, #1034); no workflow
+    // passes them.
+    let retired = [
+        "AGENT_DIRECTOR_TOKEN",
+        "DISPATCH_BOARD_TOKEN",
+        "DISPATCH_PUBLISH_TOKEN",
+    ];
     let mut saw_dispatch = false;
     let mut other_workflows = 0;
     for entry in std::fs::read_dir(workflows).unwrap() {

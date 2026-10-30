@@ -1,7 +1,8 @@
 //! On-demand dispatch App tokens (#1012), minted by the standing controller.
 //!
 //! A dispatch tool server on an agent clone asks for a `publish` or `board`
-//! token right before it writes. It writes a request into the runner state
+//! token right before it writes; the workflow's bootstrap step asks once for
+//! a `bootstrap` token to fetch the private launcher (#1034). It writes a request into the runner state
 //! directory beside the assignment rendezvous. The controller reads it through
 //! the scoped PVE guest agent and checks it against the run it assigned that
 //! runner, against GitHub's live job state and against a per-job mint budget.
@@ -32,23 +33,29 @@ pub(crate) const RESPONSE_LIMIT: usize = 8192;
 /// operation reuses its token for up to 45 minutes, so a normal job mints at
 /// most two or three of each.
 pub(super) const MINTS_PER_SCOPE: usize = 6;
+/// Bootstrap fetches the launcher once per job, so it gets one token. A
+/// re-run is a new job with its own budget.
+pub(super) const BOOTSTRAP_MINTS: usize = 1;
 /// Answered requests (minted or refused) recorded per clone. A full log
 /// refuses every later request, so the ledger row stays bounded.
 pub(super) const LOG_LIMIT: usize = 32;
 
-/// The only two grants the controller mints. Each maps to a fixed,
+/// The only grants the controller mints. Each maps to a fixed,
 /// controller-owned permission body.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MintScope {
     Publish,
     Board,
+    /// Read the pinned private launcher, `carrick-sh/agy-director` (#1034).
+    Bootstrap,
 }
 impl MintScope {
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "publish" => Some(Self::Publish),
             "board" => Some(Self::Board),
+            "bootstrap" => Some(Self::Bootstrap),
             _ => None,
         }
     }
@@ -56,14 +63,26 @@ impl MintScope {
         match self {
             Self::Publish => "publish",
             Self::Board => "board",
+            Self::Bootstrap => "bootstrap",
         }
     }
-    /// Exactly what `agent-secrets.sh` mints today for the same secrets.
+    /// Publish and board are exactly what `agent-secrets.sh` minted for the
+    /// same secrets. Bootstrap reads only the launcher repository: tools are
+    /// public downloads and the job token covers carrick itself.
     pub(super) fn grant(self) -> Value {
         match self {
             Self::Publish => json!({"repositories":["carrick"],
                 "permissions":{"contents":"write","pull_requests":"write"}}),
             Self::Board => json!({"permissions":{"organization_projects":"write"}}),
+            Self::Bootstrap => json!({"repositories":["agy-director"],
+                "permissions":{"contents":"read"}}),
+        }
+    }
+    /// Successful mints allowed for one assigned job.
+    pub(super) fn budget(self) -> usize {
+        match self {
+            Self::Publish | Self::Board => MINTS_PER_SCOPE,
+            Self::Bootstrap => BOOTSTRAP_MINTS,
         }
     }
 }
@@ -298,7 +317,7 @@ fn budget_refusal(row: &Record, scope: MintScope, job: JobId) -> Option<MintRefu
         .iter()
         .filter(|m| m.refused.is_none() && m.scope == Some(scope) && m.job == Some(job))
         .count();
-    (row.mints.len() >= LOG_LIMIT || minted >= MINTS_PER_SCOPE)
+    (row.mints.len() >= LOG_LIMIT || minted >= scope.budget())
         .then_some(MintRefusal::BudgetExhausted)
 }
 
@@ -982,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_outside_publish_and_board_is_refused() {
+    fn scope_outside_the_fixed_grants_is_refused() {
         for scope in ["admin", "contents", "Publish", ""] {
             let api = Api::new();
             let (served, exchange, _) = serve(&api, row(), request(scope, 41));
@@ -1074,6 +1093,86 @@ mod tests {
         let config = mint_config("header.claims.signature", MintScope::Board).unwrap();
         assert!(config.contains(r#"organization_projects\"#));
         assert!(config.contains("Bearer header.claims.signature"));
+    }
+
+    #[test]
+    fn bootstrap_scope_reads_only_the_launcher_repository() {
+        assert_eq!(MintScope::parse("bootstrap"), Some(MintScope::Bootstrap));
+        assert_eq!(MintScope::Bootstrap.label(), "bootstrap");
+        assert_eq!(
+            MintScope::Bootstrap.grant(),
+            json!({"repositories":["agy-director"],"permissions":{"contents":"read"}})
+        );
+        let ok = json!({"token":SECRET,"permissions":{"contents":"read","metadata":"read"},
+            "repositories":[{"name":"agy-director"}]});
+        assert!(parse_minted(ok.to_string().as_bytes(), MintScope::Bootstrap).is_ok());
+        let mut write = ok.clone();
+        write["permissions"]["contents"] = "write".into();
+        assert!(parse_minted(write.to_string().as_bytes(), MintScope::Bootstrap).is_err());
+        for repos in [
+            json!([{"name":"carrick"}]),
+            json!([{"name":"agy-director"}, {"name":"carrick"}]),
+        ] {
+            let mut wider = ok.clone();
+            wider["repositories"] = repos;
+            assert!(parse_minted(wider.to_string().as_bytes(), MintScope::Bootstrap).is_err());
+        }
+        // A publish-shaped token is never accepted as a bootstrap token.
+        let publish = json!({"token":SECRET,"permissions":{"contents":"write",
+            "pull_requests":"write"},"repositories":[{"name":"carrick"}]});
+        assert!(parse_minted(publish.to_string().as_bytes(), MintScope::Bootstrap).is_err());
+        let config = mint_config("header.claims.signature", MintScope::Bootstrap).unwrap();
+        assert!(config.contains(r#"\"agy-director\""#) && config.contains(r#"\"read\""#));
+    }
+
+    #[test]
+    fn bootstrap_mints_once_per_job_and_is_revoked_at_reap() {
+        let api = Api::new();
+        let (dir, mut ledger) = published(row());
+        let mut exchange = Exchange {
+            request: Some(request("bootstrap", 41)),
+            next: vec![nonce_request(&"e".repeat(32), "bootstrap")],
+            ..Exchange::default()
+        };
+        let mut held = HeldTokens::default();
+        let path = dir.path().join("ledger.json");
+        assert_eq!(
+            serve_mint(&api, &mut exchange, NAME, &mut ledger, &path, &mut held).unwrap(),
+            MintServed::Minted(MintScope::Bootstrap)
+        );
+        assert_eq!(ledger.rows[0].mints[0].scope, Some(MintScope::Bootstrap));
+        assert!(!serde_json::to_string(&ledger).unwrap().contains(SECRET));
+        let reads = *api.reads.borrow();
+        // The job's second bootstrap request is over budget.
+        assert_eq!(
+            serve_mint(&api, &mut exchange, NAME, &mut ledger, &path, &mut held).unwrap(),
+            MintServed::Refused(MintRefusal::BudgetExhausted)
+        );
+        assert_eq!(*api.reads.borrow(), reads, "budget checked before GitHub");
+        assert_eq!(*api.mints.borrow(), vec![MintScope::Bootstrap]);
+        assert!(exchange.responses[1].contains("budget_exhausted"));
+        assert_eq!(ledger.rows[0].mints.len(), 2);
+        // Bootstrap's budget is its own: publish still mints.
+        let mut spent = row();
+        spent.mints = ledger.rows[0].mints.clone();
+        let publish = nonce_request(&"d".repeat(32), "publish");
+        let (served, _, _) = serve(&Api::new(), spent, publish);
+        assert_eq!(served, MintServed::Minted(MintScope::Publish));
+        // A failed bootstrap mint does not spend the budget.
+        let mut failed = row();
+        failed.mints.push(MintEntry {
+            nonce: MintNonce::try_from("c".repeat(32)).unwrap(),
+            scope: Some(MintScope::Bootstrap),
+            job: Some(JobId(77)),
+            refused: Some(MintRefusal::MintFailed),
+        });
+        let (served, _, _) = serve(&Api::new(), failed, request("bootstrap", 41));
+        assert_eq!(served, MintServed::Minted(MintScope::Bootstrap));
+        // Held while the job runs, then revoked like the other scopes.
+        assert_eq!(held.revoke_finished(&api, &ledger), 0);
+        ledger.rows[0].state = State::Reaping;
+        assert_eq!(held.revoke_finished(&api, &ledger), 1);
+        assert_eq!(*api.revoked.borrow(), vec![format!("{SECRET}1")]);
     }
 
     #[test]
