@@ -3507,6 +3507,7 @@ mod tests {
 #[cfg(test)]
 mod physical_projection_tests {
     use super::*;
+    use carrick_hal::physical_grants::PhysicalGrantRelease;
     use std::sync::Arc;
 
     struct AllocationDropProbe(Arc<std::sync::atomic::AtomicBool>);
@@ -3558,16 +3559,242 @@ mod physical_projection_tests {
                 "acknowledged reply addresses exhausted admission at fault {index}"
             );
             grants
-                .stage_backing_reply(reply, window, txn, staged.with_backing(()), |_| Ok(()))
+                .stage_backing_reply(reply, window, txn, staged.with_backing(()), |_| {
+                    Ok(PhysicalGrantRelease::Released)
+                })
                 .unwrap();
             assert!(grants.offer_backing_reply(reply, &txn));
             grants
-                .settle_backing_reply(reply, &txn, |_| Ok(()))
+                .settle_backing_reply(reply, &txn, |_| Ok(PhysicalGrantRelease::Released))
                 .unwrap();
             grants.acknowledge_backing_reply(reply, &txn).unwrap();
             assert!(inventory.snapshot().mappings.is_empty());
         }
         assert!(!grants.failed());
+    }
+
+    #[test]
+    fn pinned_backing_settlement_retains_the_transaction_until_retirement() {
+        use carrick_core::mm::retirement::*;
+        use carrick_hal::physical_grants::{
+            NativePhysicalGrants, PhysicalGrantRollback, StagedPhysicalGrants,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone, Debug)]
+        struct Venue(Arc<Mutex<CarrierStage2Record>>);
+        impl RecordPinVenue for Venue {
+            fn release_pin(&self, identity: CarrierStage2RecordIdentity) {
+                release_record_pin_outcome(&mut self.0.lock(), identity);
+            }
+        }
+        struct Backing {
+            record: Arc<Mutex<CarrierStage2Record>>,
+            identity: CarrierStage2RecordIdentity,
+            frees: Arc<AtomicUsize>,
+            unmaps: Arc<AtomicUsize>,
+        }
+        impl Backing {
+            fn new(ipa: u64) -> Self {
+                let identity = CarrierStage2RecordIdentity {
+                    record_id: CarrierStage2RecordId(ipa),
+                    vm_generation: CarrierVmGeneration(1),
+                    logical_owner: Some(CarrierLogicalOwner {
+                        id: ipa,
+                        generation: ipa,
+                    }),
+                };
+                Self {
+                    record: Arc::new(Mutex::new(CarrierStage2Record {
+                        snapshot: CarrierStage2RecordSnapshot {
+                            record_id: identity.record_id,
+                            vm_generation: identity.vm_generation,
+                            logical_owner: identity.logical_owner,
+                            ipa,
+                            len: 16384,
+                            host_addr: 0,
+                            mapped: true,
+                            backend_map_installed: true,
+                            release_ipa: false,
+                            perms: 3,
+                            pin_count: 0,
+                            retirement_requested: false,
+                            retry_eligible: false,
+                            retry_pending: None,
+                            terminalized_by_vm_destroy: false,
+                            superseded_by_rebind: false,
+                            release_in_flight: false,
+                            release_retry_pending: false,
+                        },
+                        unmap_in_flight: false,
+                    })),
+                    identity,
+                    frees: Arc::default(),
+                    unmaps: Arc::default(),
+                }
+            }
+            fn release(&self) -> Result<PhysicalGrantRelease, carrick_hal::TrapError> {
+                let mut record = self.record.lock();
+                let outcome = match prepare_record_retirement(&mut record, self.identity) {
+                    RecordRetirement::Unmap { .. } => {
+                        self.unmaps.fetch_add(1, Ordering::SeqCst);
+                        settle_record_retirement(&mut record, self.identity, Ok(()))
+                    }
+                    RecordRetirement::Complete(outcome) => outcome,
+                };
+                match outcome {
+                    CarrierStage2RetireOutcome::DeferredActivePins
+                    | CarrierStage2RetireOutcome::RetryPending(_) => {
+                        Ok(PhysicalGrantRelease::RetainUntilMmRetirement)
+                    }
+                    CarrierStage2RetireOutcome::RetiredUnmapped => {
+                        Ok(PhysicalGrantRelease::Released)
+                    }
+                    other => panic!("unexpected release: {other:?}"),
+                }
+            }
+        }
+        impl Drop for Backing {
+            fn drop(&mut self) {
+                assert_eq!(self.release().unwrap(), PhysicalGrantRelease::Released);
+                self.frees.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let rollback = Arc::new(PhysicalGrantRollback::default());
+        let owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let backing = Backing::new(0x10000);
+        let frees = backing.frees.clone();
+        let unmaps = backing.unmaps.clone();
+        let record = backing.record.clone();
+        let pin = pin_record(&mut record.lock(), backing.identity, Venue(record.clone())).unwrap();
+        let staged = StagedPhysicalGrants::stage(
+            rollback.clone(),
+            source.clone(),
+            [carrick_guest_arch::FrameGpa::new(0x10000)],
+            0,
+            16384,
+            owner,
+        )
+        .unwrap();
+        let (window, txn) = refused_backing_candidate(owner, staged.grants()[0]);
+        let reply = carrick_el1_abi::PortalGrantSlot::new();
+        let mut grants = NativePhysicalGrants::new(owner);
+        grants
+            .stage_backing_reply(
+                &reply,
+                window,
+                txn,
+                staged.with_backing(backing),
+                Backing::release,
+            )
+            .unwrap();
+        assert!(grants.offer_backing_reply(&reply, &txn));
+        // Cancellation withdraws the reply but must not discard pinned bytes.
+        grants
+            .settle_backing_reply(&reply, &txn, Backing::release)
+            .unwrap();
+        assert!(!grants.failed());
+        grants
+            .settle_backing_reply(&reply, &txn, |_| panic!("duplicate physical release"))
+            .unwrap();
+        grants.acknowledge_backing_reply(&reply, &txn).unwrap();
+        assert_eq!(rollback.retained_count(), 1);
+        assert!(!rollback.failed());
+        assert_eq!(frees.load(Ordering::SeqCst), 0);
+        assert_eq!(unmaps.load(Ordering::SeqCst), 0);
+        drop(pin);
+        // A second live MM owns a separate real inventory publication. Neither
+        // retrying this MM nor retiring its retained allocation may touch it.
+        let peer_owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(42).unwrap()),
+            ..owner
+        };
+        let peer_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer = StagedPhysicalGrants::stage(
+            Arc::default(),
+            source.clone(),
+            [carrick_guest_arch::FrameGpa::new(0x18000)],
+            0,
+            16384,
+            peer_owner,
+        )
+        .unwrap()
+        .with_backing(AllocationDropProbe(peer_dropped.clone()));
+        let peer_before = inventory.snapshot();
+        // A subsequent fault is admitted in this MM through the same owner.
+        let staged = StagedPhysicalGrants::stage(
+            rollback.clone(),
+            source,
+            [carrick_guest_arch::FrameGpa::new(0x14000)],
+            0,
+            16384,
+            owner,
+        )
+        .unwrap();
+        let (window, txn) = refused_backing_candidate(owner, staged.grants()[0]);
+        let next = carrick_el1_abi::PortalGrantSlot::new();
+        assert!(grants.backing_reply_available(&next, window));
+        grants
+            .stage_backing_reply(
+                &next,
+                window,
+                txn,
+                staged.with_backing(Backing::new(0x14000)),
+                Backing::release,
+            )
+            .unwrap();
+        assert!(grants.offer_backing_reply(&next, &txn));
+        grants
+            .settle_backing_reply(&next, &txn, Backing::release)
+            .unwrap();
+        grants.acknowledge_backing_reply(&next, &txn).unwrap();
+        assert_eq!(frees.load(Ordering::SeqCst), 0);
+        drop(grants);
+        drop(rollback); // issuing-MM retirement
+        assert_eq!(unmaps.load(Ordering::SeqCst), 1);
+        assert_eq!(frees.load(Ordering::SeqCst), 1);
+        assert_eq!(inventory.snapshot().frames, peer_before.frames);
+        assert_eq!(inventory.snapshot().mappings, peer_before.mappings);
+        assert!(!peer_dropped.load(Ordering::Acquire));
+        peer.abort_with_release(|_| Ok(PhysicalGrantRelease::Released))
+            .unwrap();
+        assert!(peer_dropped.load(Ordering::Acquire));
+        assert!(inventory.snapshot().mappings.is_empty());
+    }
+
+    #[test]
+    fn unpublished_pin_retention_keeps_mm_admission_open() {
+        use carrick_hal::physical_grants::{PhysicalGrantRollback, StagedPhysicalGrants};
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let source = inventory.physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let rollback = Arc::new(PhysicalGrantRollback::default());
+        let owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        StagedPhysicalGrants::stage(
+            rollback.clone(),
+            source,
+            [carrick_guest_arch::FrameGpa::new(0x10000)],
+            0,
+            16384,
+            owner,
+        )
+        .unwrap()
+        .with_backing(AllocationDropProbe(dropped.clone()))
+        .abort_with_release(|_| Ok(PhysicalGrantRelease::RetainUntilMmRetirement))
+        .unwrap();
+        assert!(inventory.snapshot().mappings.is_empty());
+        assert!(!rollback.failed());
+        assert_eq!(rollback.retained_count(), 1);
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+        drop(rollback);
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
@@ -3626,14 +3853,14 @@ mod physical_projection_tests {
                     inventory: inventory.clone(),
                     observed: observed.clone(),
                 }),
-                |_| Ok(()),
+                |_| Ok(PhysicalGrantRelease::Released),
             )
             .unwrap();
         assert!(grants.offer_backing_reply(&slot, &txn));
         grants
             .settle_backing_reply(&slot, &txn, |_| {
                 assert_eq!(inventory.snapshot().mappings, before.mappings);
-                Ok(())
+                Ok(PhysicalGrantRelease::Released)
             })
             .unwrap();
         assert!(
@@ -3722,7 +3949,7 @@ mod physical_projection_tests {
                         window,
                         txn,
                         staged.with_backing(AllocationDropProbe(dropped.clone())),
-                        |_| Ok(()),
+                        |_| Ok(PhysicalGrantRelease::Released),
                     )
                     .unwrap();
                 let delivery_cell = carrick_core_abi::service::ServiceCell::new();
@@ -3824,7 +4051,7 @@ mod physical_projection_tests {
                             "injected exact generation pin/unmap failure".into(),
                         ))
                     } else {
-                        Ok(())
+                        Ok(PhysicalGrantRelease::Released)
                     }
                 });
                 let fails = matches!(boundary, 3 | 4 | 5 | 7 | 9);
@@ -3989,7 +4216,7 @@ mod physical_projection_tests {
                                 inventory: Arc::clone(&inventory),
                                 observed: Arc::clone(&observed),
                             }),
-                            |_| Ok(())
+                            |_| Ok(PhysicalGrantRelease::Released)
                         )
                         .is_err()
                 );
@@ -4097,7 +4324,7 @@ mod physical_projection_tests {
                 window,
                 txn,
                 staged.with_backing(AllocationDropProbe(Arc::clone(&released))),
-                |_| Ok(()),
+                |_| Ok(PhysicalGrantRelease::Released),
             )
             .unwrap_err();
         assert!(error.to_string().contains("rollback indeterminate"));

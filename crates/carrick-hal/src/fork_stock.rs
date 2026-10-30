@@ -1209,7 +1209,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
         release: impl FnOnce(
             &<C as crate::physical_grants::NativeSupplyCustody>::Backing,
-        ) -> Result<(), crate::TrapError>,
+        )
+            -> Result<crate::physical_grants::PhysicalGrantRelease, crate::TrapError>,
     ) -> Result<bool, crate::TrapError>
     where
         C: crate::physical_grants::NativeSupplyCustody,

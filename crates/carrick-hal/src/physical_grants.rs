@@ -23,6 +23,7 @@ pub const COW_GRANT_PERMISSIONS: MemPerms = MemPerms {
 #[derive(Default)]
 pub struct PhysicalGrantRollback {
     receipts: parking_lot::Mutex<Vec<FailedPhysicalGrant>>,
+    retained: parking_lot::Mutex<Vec<Box<dyn Send>>>,
 }
 struct FailedPhysicalGrant {
     _receipt: Option<UnpublishedFrameInventoryApply<dyn FrameCowAuthority>>,
@@ -31,6 +32,14 @@ struct FailedPhysicalGrant {
 impl PhysicalGrantRollback {
     pub fn failed(&self) -> bool {
         !self.receipts.lock().is_empty()
+    }
+    /// Ordinary release contention retains allocation custody until this MM
+    /// retires. It is not failed inventory undo and must not close admission.
+    pub fn retain_until_mm_retirement<R: Send + 'static>(&self, backing: R) {
+        self.retained.lock().push(Box::new(backing));
+    }
+    pub fn retained_count(&self) -> usize {
+        self.retained.lock().len()
     }
     pub fn retain(&self, receipt: UnpublishedFrameInventoryApply<dyn FrameCowAuthority>) {
         self.receipts.lock().push(FailedPhysicalGrant {
@@ -54,6 +63,14 @@ impl PhysicalGrantRollback {
             _backing: backing.map(|backing| Box::new(backing) as Box<dyn Send>),
         });
     }
+}
+
+/// Settlement of a release obligation, rather than a fabricated retirement
+/// receipt. Contention transfers the unused bytes to their issuing MM owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalGrantRelease {
+    Released,
+    RetainUntilMmRetirement,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -272,11 +289,12 @@ impl<R: Send + 'static> UnpublishedPhysicalGrant<R> {
     pub fn abort_inventory(mut self) -> Result<(), TrapError> {
         self.rollback_inventory()
     }
-    /// Native pre-offer cancellation also verifies stage-2 and allocation
-    /// release. Preserve even an already-undone receipt if release is unknown.
+    /// Native pre-offer cancellation settles the allocation release obligation,
+    /// including ordinary retained custody. Preserve the receipt if undo or
+    /// release is indeterminate.
     pub fn abort_with_release(
         mut self,
-        release: impl FnOnce(&R) -> Result<(), TrapError>,
+        release: impl FnOnce(&R) -> Result<PhysicalGrantRelease, TrapError>,
     ) -> Result<(), TrapError> {
         let mut receipt = self
             .staged
@@ -297,12 +315,21 @@ impl<R: Send + 'static> UnpublishedPhysicalGrant<R> {
                         .ok_or_else(NativePhysicalGrants::<R>::reply_failure)?,
                 )
             });
-        if result.is_err() {
-            self.staged
-                .rollback
-                .retain_backed(receipt, self.backing.take());
+        match result {
+            Ok(PhysicalGrantRelease::RetainUntilMmRetirement) => {
+                if let Some(backing) = self.backing.take() {
+                    self.staged.rollback.retain_until_mm_retirement(backing);
+                }
+                Ok(())
+            }
+            Ok(PhysicalGrantRelease::Released) => Ok(()),
+            Err(error) => {
+                self.staged
+                    .rollback
+                    .retain_backed(receipt, self.backing.take());
+                Err(error)
+            }
         }
-        result
     }
     fn rollback_inventory(&mut self) -> Result<(), TrapError> {
         if let Some(mut receipt) = self.staged.receipt.take()
@@ -344,7 +371,7 @@ pub struct NativePhysicalGrants<R> {
 /// Physical custody exposed to the neutral fork/table settlement owner.
 /// Backends supply storage mechanics; they do not decide terminal outcomes.
 pub trait NativeSupplyCustody {
-    type Backing;
+    type Backing: Send + 'static;
     fn supplied(&mut self) -> Option<&mut NativePhysicalGrants<Self::Backing>>;
 }
 /// One exact-MM, exact-root backing publication. Offered custody is never
@@ -356,6 +383,8 @@ pub struct PrivateSupplyTransaction<R> {
     physical: Option<NativeGrant<R>>,
     settlement: Option<BackingReplySettlement>,
     offered: bool,
+    release: Option<PhysicalGrantRelease>,
+    rollback: Arc<PhysicalGrantRollback>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackingReplySettlement {
@@ -375,7 +404,7 @@ impl<R> core::fmt::Debug for NativePhysicalGrants<R> {
             .finish()
     }
 }
-impl<R> NativePhysicalGrants<R> {
+impl<R: Send + 'static> NativePhysicalGrants<R> {
     pub const REFILL_GRANTS: usize = 2;
     pub fn new(owner: GuestFrameOwner) -> Self {
         Self {
@@ -415,7 +444,7 @@ impl<R> NativePhysicalGrants<R> {
         window: carrick_el1_abi::PortalGrantWindow,
         txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
         unpublished: UnpublishedPhysicalGrant<R>,
-        release_unused: impl FnOnce(&R) -> Result<(), TrapError>,
+        release_unused: impl FnOnce(&R) -> Result<PhysicalGrantRelease, TrapError>,
     ) -> Result<(), TrapError>
     where
         R: Send + 'static,
@@ -457,6 +486,7 @@ impl<R> NativePhysicalGrants<R> {
                 "native backing transaction admission mismatch".into(),
             ));
         }
+        let rollback = Arc::clone(&unpublished.staged.rollback);
         let (custody, retained) = unpublished.handoff()?;
         self.replies.insert(
             Self::reply_key(slot),
@@ -470,6 +500,8 @@ impl<R> NativePhysicalGrants<R> {
                 }),
                 settlement: None,
                 offered: false,
+                release: None,
+                rollback,
             },
         );
         Ok(())
@@ -502,15 +534,15 @@ impl<R> NativePhysicalGrants<R> {
         (pending.txn.id.generation == generation).then_some(pending.txn)
     }
     /// Settle physical custody, retaining the exact receipt through table
-    /// settlement and ACK. The release adapter must return Ok ONLY after exact
-    /// stage-2 generation retirement and allocation release have completed.
-    /// Deferred pins, unknown inventory undo, and failed release are fatal.
+    /// settlement and ACK. The adapter reports exact terminal release or
+    /// transfers the unused allocation to issuing-MM retirement custody.
+    /// Only unknown inventory undo and indeterminate release are fatal.
     /// A successful ring receipt already includes completed invalidation.
     pub fn settle_backing_reply(
         &mut self,
         slot: &carrick_el1_abi::PortalGrantSlot,
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-        release: impl FnOnce(&R) -> Result<(), TrapError>,
+        release: impl FnOnce(&R) -> Result<PhysicalGrantRelease, TrapError>,
     ) -> Result<BackingReplySettlement, TrapError> {
         use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
         let result = (|| {
@@ -556,7 +588,7 @@ impl<R> NativePhysicalGrants<R> {
                     .receipt
                     .rollback()
                     .map_err(|_| Self::reply_failure())?;
-                release(&physical._retained)?;
+                pending.release = Some(release(&physical._retained)?);
             }
             pending.settlement = Some(outcome);
             Ok(outcome)
@@ -597,9 +629,11 @@ impl<R> NativePhysicalGrants<R> {
             {
                 self.grants
                     .insert(physical.custody.frames[0].0.raw(), physical);
+            } else if pending.release == Some(PhysicalGrantRelease::RetainUntilMmRetirement) {
+                pending.rollback.retain_until_mm_retirement(physical);
             }
-            // Refused physical custody drops only AFTER verified explicit
-            // release, and after table settlement. Offered/unknown never drops.
+            // Refused bytes are released or transferred to issuing-MM custody
+            // only after table settlement. Offered/unknown never drops.
             self.replies.remove(&Self::reply_key(slot));
             Ok(())
         })();

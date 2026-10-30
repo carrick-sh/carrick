@@ -758,6 +758,7 @@ impl NativeService {
                     ipa,
                     generation,
                     length: carrick_el1_abi::COW_GRANT_SIZE,
+                    retained_owner: Default::default(),
                 });
                 custody
                     .native_frame_backings
@@ -890,6 +891,7 @@ impl NativeService {
             ipa,
             generation,
             length,
+            retained_owner: Default::default(),
         });
         custody
             .native_frame_backings
@@ -935,13 +937,21 @@ impl NativeService {
                         .map_err(|_| stale())?;
                     return Err(error);
                 }
-                if let Err(release_error) = retained.release_unused() {
-                    physical.rollback.retain_allocation(retained);
-                    stock
-                        .owner
-                        .quarantine_native_supply(handle, root)
-                        .map_err(|_| stale())?;
-                    return Err(release_error);
+                match retained.release_unused() {
+                    Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released) => {}
+                    Ok(
+                        carrick_hal::physical_grants::PhysicalGrantRelease::RetainUntilMmRetirement,
+                    ) => {
+                        physical.rollback.retain_until_mm_retirement(retained);
+                    }
+                    Err(release_error) => {
+                        physical.rollback.retain_allocation(retained);
+                        stock
+                            .owner
+                            .quarantine_native_supply(handle, root)
+                            .map_err(|_| stale())?;
+                        return Err(release_error);
+                    }
                 }
                 return Err(error);
             }
