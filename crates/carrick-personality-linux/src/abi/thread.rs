@@ -599,7 +599,9 @@ impl ThreadControlSlot {
             word >> 31 != 0,
         ))
     }
-    /// Called only by the admitted native signal owner after action selection.
+    /// Publish a terminal verdict after native action selection, or preserve
+    /// signal termination when the native venue/admission is unavailable. The
+    /// stopped host consumes this verdict and clears the exact-thread payload.
     pub fn synchronous_fault_default(&self) {
         self.fault_signal.fetch_or(1 << 31, Ordering::Release);
     }

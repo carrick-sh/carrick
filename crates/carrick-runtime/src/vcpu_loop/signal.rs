@@ -231,8 +231,19 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
             carrick_personality_linux::signal::policy::Signal::from_number(fault.signum)
                 .ok_or_else(|| RuntimeError::Configuration("invalid native fault signal".into()))?;
         control.publish_synchronous_fault(signal, fault.si_code, fault.si_addr);
-        trap.enter_native_fault_signal()?;
-        return Ok(FaultSignalDisposition::Injected);
+        return match trap.enter_native_fault_signal() {
+            Ok(carrick_hal::NativeFaultSignalEntry::Entered) => {
+                Ok(FaultSignalDisposition::Injected)
+            }
+            Ok(carrick_hal::NativeFaultSignalEntry::NoVenue) => {
+                control.clear_synchronous_fault();
+                Ok(FaultSignalDisposition::Terminate(fault.signum))
+            }
+            Err(error) => {
+                control.clear_synchronous_fault();
+                Err(error.into())
+            }
+        };
     }
 
     let action = dispatcher.registered_signal_handler(context, fault.signum);
@@ -1849,6 +1860,7 @@ mod tests {
     struct NoopTrap {
         restart: bool,
         native_fault_checkpoints: usize,
+        no_native_fault_venue: bool,
         delivered_signum: i32,
         delivered_handler: u64,
         delivered_interrupted_pc: Option<u64>,
@@ -1875,9 +1887,15 @@ mod tests {
             Err(TrapError::UnsupportedPlatform)
         }
 
-        fn enter_native_fault_signal(&mut self) -> Result<(), TrapError> {
+        fn enter_native_fault_signal(
+            &mut self,
+        ) -> Result<carrick_hal::NativeFaultSignalEntry, TrapError> {
             self.native_fault_checkpoints += 1;
-            Ok(())
+            Ok(if self.no_native_fault_venue {
+                carrick_hal::NativeFaultSignalEntry::NoVenue
+            } else {
+                carrick_hal::NativeFaultSignalEntry::Entered
+            })
         }
 
         fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
@@ -2361,6 +2379,58 @@ mod tests {
             );
             assert!(control.synchronous_fault().is_none());
             assert_eq!(trap.native_fault_checkpoints, 1);
+        }
+    }
+
+    #[test]
+    fn native_signal_owner_without_fault_venue_terminates_and_clears_payload() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let custody =
+            carrick_core::lifecycle::MemberControlCustody::retain(context.thread().control_slot())
+                .unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        assert!(context.thread().control_slot().native_signal_owner());
+        // A stale carrier handler must never be selected for a native owner.
+        for signum in [
+            crate::linux_abi::LINUX_SIGSEGV,
+            crate::linux_abi::LINUX_SIGBUS,
+        ] {
+            let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(signum).unwrap();
+            let mut caught = carrick_abi::LinuxSigaction::empty();
+            caught.sa_handler = 0x7000;
+            context.signal_authority().install_action(signal, caught);
+            let mut trap = NoopTrap {
+                no_native_fault_venue: true,
+                ..Default::default()
+            };
+            let mut fault = FaultSignal {
+                signum,
+                si_code: 1,
+                si_addr: 0x1234_5000,
+                interrupted_pc: Some(0x4000),
+            };
+            let disposition = inject_fault_signal(
+                &mut trap,
+                &dispatcher,
+                &context,
+                ThreadId::main_from_host_pid(),
+                &mut fault,
+            );
+            assert!(
+                matches!(disposition, Ok(FaultSignalDisposition::Terminate(signal)) if signal == signum),
+                "no native fault venue must retain signal death: {disposition:?}"
+            );
+            assert!(
+                context
+                    .thread()
+                    .control_slot()
+                    .synchronous_fault()
+                    .is_none()
+            );
+            assert_eq!(trap.native_fault_checkpoints, 1);
+            assert_eq!(trap.delivered_signum, 0);
         }
     }
 

@@ -4975,6 +4975,10 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     );
     assert_eq!(settled, carrick_el1_abi::Action::Served);
     assert!(
+        fixture.control.synchronous_fault().is_none(),
+        "Busy once, then success must consume the retained fault"
+    );
+    assert!(
         fixture.zone.slot(fixture.slot).current().is_none(),
         "AdmissionHome::drop must leave the root slot without a lingering zone record"
     );
@@ -11128,4 +11132,120 @@ fn arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path() {
         fixture.control.synchronous_fault(),
         Some((Signal::SEGV, 2, 0x1234_5000, true))
     );
+}
+
+#[test]
+fn arm_classified_fault_racing_live_sibling_exit_group_settles() {
+    use carrick_signal_core::policy::Signal;
+    for published_before_close in [true, false] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let mut service = fixture.process_service();
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |_| (),
+            )
+            .unwrap();
+        let control = host_born_sibling(fixture, 42);
+        let mut gettid = carrick_el1_abi::TrapFrame::default();
+        gettid.x[8] = 178;
+        arm_call(fixture, control, &mut service, &mut gettid).unwrap();
+        assert_eq!(gettid.x[0], 42);
+        assert!(leader_sees_thread(fixture, &mut service, 42));
+        assert!(control.native_signal_owner());
+        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+        // Thread 42 has faulted while thread 41 wins exit_group admission.
+        if published_before_close {
+            control.publish_synchronous_fault(Signal::SEGV, 1, 0x1234_5000);
+        }
+        let mut exit = carrick_el1_abi::TrapFrame::default();
+        exit.x[0] = 7;
+        exit.x[8] = 94;
+        assert_eq!(
+            arm_call(fixture, fixture.control, &mut service, &mut exit).unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended
+        );
+        assert_eq!(
+            carrick_el1_abi::Lifecycle::gate(fixture.page),
+            carrick_el1_abi::GateState::Closed
+        );
+        assert!(control.host_exit_requested());
+        run_as(fixture, 42, 12, 102, control);
+        if !published_before_close {
+            control.publish_synchronous_fault(Signal::SEGV, 1, 0x1234_5000);
+        }
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: 0xfffc,
+            elr: 0x40_0200,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::dispatch::arm_deliver_declined_fault_signal_with(
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot
+                },
+                &fixture.task,
+                &ThreadCtx::ZERO,
+                fixture_ttbr0(fixture),
+                fixture.page,
+                control,
+                &mut service,
+                &mut frame,
+                |_, _| panic!("closed owner must not select a signal action")
+            )
+            .unwrap(),
+            carrick_el1_abi::Action::Forward
+        );
+        assert_eq!(
+            control.synchronous_fault(),
+            Some((Signal::SEGV, 1, 0x1234_5000, true)),
+            "closed gate must return a terminal verdict, not re-enter forever"
+        );
+        assert_eq!(frame.esr, 0xfffc);
+        assert_eq!(frame.elr, 0x40_0200);
+    }
+}
+
+#[test]
+fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() {
+    use carrick_signal_core::policy::Signal;
+    for esr in [0, 0x5600_0000, 0xfffd, 0xfffe] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let mut service = fixture.process_service();
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |_| (),
+            )
+            .unwrap();
+        fixture
+            .control
+            .publish_synchronous_fault(Signal::SEGV, 1, 0x1234_5000);
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr,
+            far: 0xabc,
+            ..Default::default()
+        };
+        let result = super::dispatch::arm_deliver_declined_fault_signal_with(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.page,
+            fixture.control,
+            &mut service,
+            &mut frame,
+            |_, _| panic!("non-fault entry must fail before delivery"),
+        );
+        assert_eq!(result, Err(NativeProcessError::Invalid));
+        assert_eq!((frame.esr, frame.far), (esr, 0xabc));
+    }
 }

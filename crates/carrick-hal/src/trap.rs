@@ -74,6 +74,15 @@ pub type ExecInventoryCommits = (
     Option<crate::FrameInventoryCommit<()>>,
 );
 
+/// Whether an engine entered the exact-thread native fault owner.
+/// An absent venue is a supported fallback decision, not a backend failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeFaultSignalEntry {
+    Entered,
+    /// Preserve signal termination until this engine has a native entry venue.
+    NoVenue,
+}
+
 /// Arguments describing a signal to be injected into a guest vCPU.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignalInjection {
@@ -220,8 +229,9 @@ pub trait SyscallTrap {
     fn inject_signal(&mut self, signal: SignalInjection) -> Result<(), TrapError>;
     /// Re-enter the native signal owner for an exact-thread classified fault.
     /// The payload is retained by the thread control, never by carrier actions.
-    fn enter_native_fault_signal(&mut self) -> Result<(), TrapError> {
-        Err(TrapError::UnsupportedPlatform)
+    /// `NoVenue` leaves guest registers unchanged; the caller settles the fault.
+    fn enter_native_fault_signal(&mut self) -> Result<NativeFaultSignalEntry, TrapError> {
+        Ok(NativeFaultSignalEntry::NoVenue)
     }
 
     /// The Linux syscall number of the most recently dispatched `svc`, used to

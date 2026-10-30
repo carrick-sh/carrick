@@ -1697,6 +1697,37 @@ mod tests {
         fn kick(&self) {}
     }
 
+    #[test]
+    fn native_fault_entry_has_no_venue_without_register_changes() {
+        let vcpu = TestVcpu {
+            gprs: [0x1234; 16],
+            rip: 0x40_1000,
+            rsp: 0x70_0000,
+            rflags: 0x202,
+            ..Default::default()
+        };
+        let mut engine = X86EngineCore::from_parts(TestVmm, vcpu, test_layout());
+        let before = (
+            engine.vcpu.gprs,
+            engine.vcpu.rip,
+            engine.vcpu.rsp,
+            engine.vcpu.rflags,
+        );
+        assert_eq!(
+            engine.enter_native_fault_signal().unwrap(),
+            carrick_hal::NativeFaultSignalEntry::NoVenue
+        );
+        assert_eq!(
+            (
+                engine.vcpu.gprs,
+                engine.vcpu.rip,
+                engine.vcpu.rsp,
+                engine.vcpu.rflags
+            ),
+            before
+        );
+    }
+
     #[derive(Default)]
     struct TestVmm;
 
