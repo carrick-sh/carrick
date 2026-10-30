@@ -261,13 +261,56 @@ fn el1_ipc_backing_tokens_roundtrip_and_reject_unknown_tags() {
 fn el1_ipc_layout_is_frozen_and_fits_one_metadata_extent() {
     assert_ne!(IPC_LAYOUT_HASH, 0);
     assert_eq!(core::mem::size_of::<IpcObjectRecord>() % 64, 0);
-    assert_eq!(core::mem::size_of::<IpcOperation>(), 128);
+    assert_eq!(core::mem::size_of::<IpcOperation>(), 144);
     assert_eq!(core::mem::size_of::<IpcPipeStorage>(), 24);
     assert!(
         core::mem::size_of::<IpcDirectory>() <= crate::EL1_DYNAMIC_METADATA_EXTENT_SIZE,
         "directory head {} bytes",
         core::mem::size_of::<IpcDirectory>()
     );
+}
+
+#[test]
+fn operation_scatter_snapshot_rejects_stale_tokens_and_resets_on_reuse() {
+    let fx = fixture(1 << 20);
+    let mut token = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
+    for index in 0..IPC_OPERATION_BUFFERS {
+        fx.region
+            .append_operation_buffer(
+                &mut token,
+                IpcUserBuffer {
+                    address: IpcUserVa(0x10000 + index as u64 * 4096),
+                    len: carrick_guest_arch::GuestLen::new(4096),
+                },
+            )
+            .unwrap();
+    }
+    let extra = IpcUserBuffer {
+        address: IpcUserVa(0),
+        len: carrick_guest_arch::GuestLen::new(0),
+    };
+    assert_eq!(
+        fx.region.append_operation_buffer(&mut token, extra),
+        Err(IpcError::Corrupt)
+    );
+    let buffers = fx.region.operation_buffers(&token).unwrap();
+    assert_eq!(buffers.len(), IPC_OPERATION_BUFFERS);
+    assert_eq!(buffers[0].address, IpcUserVa(0x10000));
+    assert_eq!(
+        buffers[IPC_OPERATION_BUFFERS - 1].address,
+        IpcUserVa(0x10000 + (IPC_OPERATION_BUFFERS - 1) as u64 * 4096)
+    );
+    let raw = token.into_raw();
+    fx.region
+        .finish_operation(IpcOpToken::from_raw(raw))
+        .unwrap();
+    let stale = IpcOpToken::from_raw(raw);
+    assert_eq!(fx.region.operation_buffers(&stale), Err(IpcError::Stale));
+    let mut next = fx.region.begin_operation(IpcOperation::EMPTY).unwrap();
+    assert!(fx.region.operation_buffers(&next).unwrap().is_empty());
+    fx.region.append_operation_buffer(&mut next, extra).unwrap();
+    assert_eq!(fx.region.operation_buffers(&next).unwrap(), &[extra]);
+    fx.region.finish_operation(next).unwrap();
 }
 
 #[test]
