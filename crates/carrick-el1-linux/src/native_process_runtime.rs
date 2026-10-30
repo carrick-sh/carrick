@@ -6756,15 +6756,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.service.quarantine_born(born);
             return Err(NativeProcessError::Quarantined);
         }
-        if let Err(error) = thread_stock::replenish(
-            self.runtime,
-            &mut self.runtime.graph.lock(),
-            child_key,
-            visible.get(),
-        ) {
-            self.run_failure = Some(error.run_failure_reason());
-            return Err(NativeProcessError::Quarantined);
-        }
         let child_mm = self
             .runtime
             .graph
@@ -7115,6 +7106,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
             return Err(error.errno());
         }
+        thread_stock::admission_settled(self.runtime, self.key);
         Ok(())
     }
     fn set_calling_tid(&mut self, tid: u32) {
@@ -12287,7 +12279,12 @@ mod tests {
                     .collect::<Vec<_>>()
             });
             if signal_exit_continuation {
-                // Hold an identity issued by the native fork owner.
+                // Prime through the real first-clone admission, then hold an
+                // identity issued by this native process owner.
+                assert!(matches!(
+                    child_entry.prepare_thread_birth(),
+                    carrick_personality_linux::lifecycle::ThreadBirthAdmission::Ready
+                ));
                 let claim = child_page.claim_any().unwrap();
                 assert!(matches!(
                     child_entry
@@ -13469,7 +13466,6 @@ mod tests {
                 serial: TaskSerial::from_raw_u64(11).unwrap(),
             };
             let mut actors = vec![parent];
-            let mut actor_pids = vec![41_i64];
             for depth in 0..depth_count {
                 let current = *actors.last().unwrap();
                 let row_address = runtime
@@ -13502,7 +13498,7 @@ mod tests {
                     LifecycleOutcome::Transferred { .. }
                 ));
                 assert!(entry.take_handoff_receipt().is_some());
-                actor_pids.push(result.raw());
+                assert_eq!(result.raw(), 42 + depth as i64);
                 actors.push(next);
                 activate(&runtime, source, &task, next);
                 if depth + 1 < depth_count {
@@ -13601,7 +13597,7 @@ mod tests {
             };
             if depth_count == 2 {
                 // The original child has the lower PID and remains eligible.
-                assert_eq!(result.raw(), actor_pids[1]);
+                assert_eq!(result.raw(), 42);
                 let LifecycleOutcome::Returned { result, .. } = entry.wait4(
                     ProcessWaitPid::from_syscall_argument(u64::MAX),
                     UserVa::new(0x8000),
@@ -13610,9 +13606,9 @@ mod tests {
                 ) else {
                     panic!("inherited zombie return")
                 };
-                assert_eq!(result.raw(), actor_pids[2]);
+                assert_eq!(result.raw(), 43);
             } else {
-                assert_eq!(result.raw(), actor_pids[3]);
+                assert_eq!(result.raw(), 44);
             }
             assert_eq!(
                 service.copies.last(),
@@ -15640,6 +15636,7 @@ mod tests {
                 .namespace_child_key(entry.key, pid1.raw() as u32)
                 .is_some()
         );
+        assert_eq!(pid1.raw(), 43);
         assert_eq!(entry.service.abort_count, 1);
         assert!(!entry.service.loan_in_flight);
 
@@ -15664,6 +15661,7 @@ mod tests {
                 .namespace_child_key(entry.key, pid2.raw() as u32)
                 .is_some()
         );
+        assert_eq!(pid2.raw(), 45);
         assert!(
             pid2.raw() > pid1.raw(),
             "issued child identities stay distinct"
@@ -15692,6 +15690,7 @@ mod tests {
                 .namespace_child_key(entry.key, pid3.raw() as u32)
                 .is_some()
         );
+        assert_eq!(pid3.raw(), 47);
         assert!(
             pid3.raw() > pid2.raw(),
             "issued child identities stay distinct"
@@ -15737,6 +15736,7 @@ mod tests {
                 .namespace_child_key(entry.key, pid4.raw() as u32)
                 .is_some()
         );
+        assert_eq!(pid4.raw(), 49);
         assert!(
             pid4.raw() > pid3.raw(),
             "issued child identities stay distinct"

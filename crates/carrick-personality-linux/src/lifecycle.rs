@@ -454,6 +454,10 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn retain_native_birth(&mut self, _record: RecordRef, _control: &ThreadControlSlot) -> bool {
         false
     }
+    /// Undo retained service/control admission before freeing an unpublished birth.
+    fn release_native_birth(&mut self, _record: RecordRef, _control: &ThreadControlSlot) -> bool {
+        false
+    }
     /// ISA-only context availability, checked before any output or pool claim.
     fn can_prepare_child(&self, stack: UserVa, tls: Option<UserVa>) -> bool;
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext);
@@ -1055,6 +1059,9 @@ fn serve_clone<'a>(
                     }
                     native.record_decline(LifecycleDecline::ClonePoolEmpty);
                 }
+                if managed {
+                    native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+                }
                 return None;
             }
         }
@@ -1074,6 +1081,9 @@ fn serve_clone<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
+        if managed {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         return None;
     };
     let Ok(visible) = i32::try_from(identity.visible_tid) else {
@@ -1083,6 +1093,9 @@ fn serve_clone<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
+        if managed {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         return None;
     };
     if !child_slot.publish_visible_tid(identity.visible_tid) {
@@ -1090,6 +1103,9 @@ fn serve_clone<'a>(
             native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
         if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
+        if managed {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return None;
@@ -1129,12 +1145,18 @@ fn serve_clone<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
+        if managed {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         return None;
     }
     if managed && !native.retain_native_birth(record, child_slot) {
         native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
     }
     if !outputs.publish(identity.visible_tid, native) {
+        if managed && !native.release_native_birth(record, child_slot) {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         native.free_record(record);
         if page.unclaim(claimed).is_err() {
             native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
@@ -1142,16 +1164,27 @@ fn serve_clone<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        return None;
+        return managed.then(|| {
+            returned(
+                SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                false,
+            )
+        });
     }
 
     if page.thread_born().is_none() {
         outputs.rollback(native);
+        if managed && !native.release_native_birth(record, child_slot) {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         native.free_record(record);
         if page.unclaim(claimed).is_err() {
             native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
         if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
+        if managed {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return None;
@@ -1185,6 +1218,9 @@ fn serve_clone<'a>(
     }) {
         let _ = page.try_exit();
         outputs.rollback(native);
+        if managed && !native.release_native_birth(record, child_slot) {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
         native.free_record(record);
         if let Some(claimed) = claim
             && page.unclaim(claimed).is_err()

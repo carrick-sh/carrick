@@ -183,12 +183,26 @@ fn native_fork_child_waits_for_final_retired_control_pin() {
     child_thread_admission(7, 1, ChildStockCase::Pinned);
 }
 
+/// Keep the parent live while 256 births cycle every retired control. Each
+/// round leaves a release-less final pin after dropping signal projections;
+/// the fixture's WFI trap bounds a missing notification immediately.
+#[test]
+fn native_fork_child_clone_storm_recycles_exited_pinned_controls() {
+    child_thread_admission(7, 32, ChildStockCase::Pinned);
+}
+
+#[test]
+fn native_fork_child_claimed_sibling_birth_parks_until_settlement() {
+    child_thread_admission(6, 1, ChildStockCase::Claimed);
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ChildStockCase {
     FirstBirth,
     Reuse,
     Capacity,
     Pinned,
+    Claimed,
 }
 
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
@@ -306,13 +320,12 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                 .is_some_and(|(_, state)| state == carrick_el1_abi::EntryState::Reserved)
         })
         .count();
-    if case != ChildStockCase::FirstBirth {
-        assert!(
-            initial > 0 && initial < count as usize,
-            "the fork must stock before clone, then admit beyond that stock"
-        );
-    }
-    let baseline_claims = crate::native_process_runtime::thread_stock::claim_counts(&owner);
+    assert_eq!(
+        initial, 0,
+        "fork must not burn visible thread IDs before the first clone"
+    );
+    let mut baseline_claims = crate::native_process_runtime::thread_stock::claim_counts(&owner);
+    baseline_claims.thread_claims += 4;
     for _round in 0..rounds {
         let mut tids = Vec::new();
         for admitted in 0..count {
@@ -351,6 +364,110 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
         if case == ChildStockCase::FirstBirth {
             return;
         }
+        if case == ChildStockCase::Claimed {
+            use carrick_personality_linux::lifecycle::{ProcessNative, ThreadBirthAdmission};
+            let caller = fixture
+                .zone
+                .record_ref(fixture.zone.slot(fixture.slot).current().unwrap());
+            let claims =
+                crate::native_process_runtime::thread_stock::claim_sibling_births(&owner, caller);
+            assert_eq!(claims.len(), 1, "leader and six real workers remain live");
+            frame.x[8] = 220;
+            frame.x[..6].copy_from_slice(&[0x50f00, VA + 0x12000, 0, 0, 0, 0]);
+            // SAFETY: this fixture owns the current execution record.
+            let mut saved = unsafe { *fixture.zone.record(caller.id).ctx_mut() };
+            crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+            {
+                let mut entry = owner
+                    .enter(
+                        BornInZoneSource {
+                            zone: fixture.zone,
+                            slot: fixture.slot,
+                        },
+                        &fixture.task,
+                        saved,
+                        &mut service,
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(
+                        entry.prepare_thread_birth(),
+                        ThreadBirthAdmission::Owned(
+                            carrick_personality_linux::lifecycle::LifecycleOutcome::Transferred { .. }
+                        )
+                    ),
+                    "a sibling's claim is Busy, never capacity EAGAIN"
+                );
+                assert!(entry.take_handoff_receipt().is_some());
+                assert!(fixture.zone.slot(fixture.slot).current().is_none());
+                for claim in claims {
+                    page.unclaim(claim).unwrap();
+                }
+                // Exercise the actual publication callback, after returning the claims.
+                entry.lifecycle_admission_settled().unwrap();
+            }
+            let mut handoff = None;
+            {
+                let mut zone = crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                };
+                assert_eq!(
+                    crate::dispatch::native_scheduler(
+                        &mut zone,
+                        &fixture.task,
+                        &counters,
+                        fixture.slot,
+                        &mut handoff,
+                    )
+                    .idle_entry(&mut frame, 0),
+                    carrick_el1_abi::Action::Served
+                );
+            }
+            // Give each already queued peer one real registration/scheduler
+            // turn before selecting the notified caller. No clock or wait retry.
+            for _ in 0..page.live() {
+                if fixture.zone.slot(fixture.slot).current() == Some(caller.id) {
+                    break;
+                }
+                frame.x[8] = 178;
+                loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters);
+                let mut zone = crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                };
+                assert!(
+                    crate::dispatch::native_scheduler(
+                        &mut zone,
+                        &fixture.task,
+                        &counters,
+                        fixture.slot,
+                        &mut handoff,
+                    )
+                    .yield_queued(&mut frame)
+                    .is_some()
+                );
+            }
+            assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(caller.id));
+            assert!(matches!(
+                crate::aarch64_process::resume_production_with_service(
+                    fixture.zone,
+                    &fixture.task,
+                    fixture.slot,
+                    caller.id,
+                    &mut service,
+                ),
+                crate::sched::ResumeAction::RetrySyscall
+            ));
+            assert_ne!(
+                loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters),
+                carrick_personality_linux::dispatch::CompletionRoute::Forward
+            );
+            assert!((frame.x[0] as i64) > 0);
+            assert_eq!(page.live(), 8);
+        }
         if case == ChildStockCase::Capacity {
             frame.x[8] = 220;
             frame.x[..6].copy_from_slice(&[0x50f00, VA + 0x12000, 0, 0, 0, 0]);
@@ -366,7 +483,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
         }
         let mut pins = Vec::new();
         let mut transient_pins = Vec::new();
-        for _ in 0..count + 1 {
+        for _ in 0..page.live() + 1 {
             if page.live() == 1 {
                 break;
             }

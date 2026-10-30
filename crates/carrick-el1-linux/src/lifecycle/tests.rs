@@ -408,6 +408,65 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
     })
 }
 
+fn serve_directly_with_process<P: ProcessNative>(
+    w: &mut World,
+    frame: &mut TrapFrame,
+    user: &mut FaultingUser,
+    process: &mut P,
+) -> Option<Action> {
+    let task = &w.tasks[SLOT_IDX];
+    let name_cache = InotifyNameCache::new();
+    let ordinal = frame.x[8];
+    let mut native = super::El1PendingFamilies {
+        handoff: None,
+        frame,
+        counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &name_cache,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        process: Some(process),
+        source: None,
+        anonymous: None,
+        cache_lookup: |_| core::ptr::null_mut(),
+        lifecycle_user: Some(user),
+    };
+    let carrick_personality_linux::dispatch::Family::Lifecycle(call) =
+        carrick_personality_linux::dispatch::route_aarch64(ordinal, u64::MAX)
+    else {
+        return None;
+    };
+    let outcome = invoke(call, &mut native);
+    let result = outcome.as_ref().map_or(
+        carrick_personality_linux::dispatch::FamilyCompletion::Forward,
+        lifecycle_effect,
+    );
+    if let Some(LifecycleOutcome::Returned { result, .. }) = outcome {
+        native.frame.x[0] = result.raw() as u64;
+    }
+    (result != carrick_personality_linux::dispatch::FamilyCompletion::Forward).then(|| {
+        use carrick_personality_linux::dispatch::{CompletionRoute, completion_route};
+        match completion_route(result, task.linux.has_pending_host_work()) {
+            CompletionRoute::HostCustody => Action::HostCustody,
+            CompletionRoute::Served => Action::Served,
+            CompletionRoute::WithWork => Action::ServedWithWork,
+            CompletionRoute::Suspended => Action::Idle,
+            CompletionRoute::Forward => Action::Forward,
+            CompletionRoute::NativeService => Action::Forward,
+            CompletionRoute::InvalidCompletion => panic!("stale entry completion"),
+        }
+    })
+}
+
 fn clone_args(flags: u64, parent_tid: u64, child_tid: u64) -> [u64; 5] {
     [flags, CHILD_STACK, parent_tid, CHILD_TLS, child_tid]
 }
@@ -3173,4 +3232,124 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
         failure.reason,
         carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody
     );
+}
+
+#[test]
+fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
+    struct Owner {
+        binding: carrick_el1_abi::ExecutionBinding,
+        record: Option<carrick_el1_abi::RecordRef>,
+        zone: *const ZoneTables,
+    }
+    impl ProcessNative for Owner {
+        fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+            self.binding
+        }
+        fn fork(&mut self, _: ProcessForkChildTid) -> LifecycleOutcome {
+            panic!("unexpected fork")
+        }
+        fn wait4(
+            &mut self,
+            _: ProcessWaitPid,
+            _: UserVa,
+            _: LinuxWaitOptions,
+            _: UserVa,
+        ) -> LifecycleOutcome {
+            panic!("unexpected wait")
+        }
+        fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+            panic!("unexpected exit")
+        }
+        fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
+            ThreadBirthAdmission::Ready
+        }
+        fn bind_thread_birth(
+            &mut self,
+            record: carrick_el1_abi::RecordRef,
+            control: &ThreadControlSlot,
+        ) -> Result<(), i64> {
+            self.record = Some(record);
+            // SAFETY: World retains this scheduler for the whole witness.
+            unsafe { &*self.zone }
+                .bind_object_wait(
+                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
+                    &carrick_sched_core::ShortLockSpin,
+                )
+                .unwrap();
+            control.bind_zone_record(record);
+            // SAFETY: this fixture owns the never-reused synthetic MM.
+            let mm = unsafe {
+                carrick_core_abi::El1MmHandle::from_admitted_owner(
+                    core::num::NonZeroU64::MIN,
+                    carrick_core_abi::ReservationMm::new(MM).unwrap(),
+                    core::num::NonZeroU64::MIN,
+                )
+            };
+            control
+                .service
+                .bind(carrick_core_abi::service::ServiceBirth {
+                    process: carrick_sched_core::process::TaskKey {
+                        id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                            core::num::NonZeroI32::new(PARENT_TID as i32).unwrap(),
+                        ),
+                        serial: carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                    },
+                    thread: carrick_core_abi::EntryThreadGeneration::from_raw(CHILD_SERIAL),
+                    record,
+                    mm,
+                })
+                .map_err(|_| -5)
+        }
+    }
+    let mut w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.leader_slot().publish_visible_tid(PARENT_TID as u32));
+    let entry = w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
+    let mut owner = Owner {
+        binding: crate::common_entry::execution_binding(w.task()),
+        record: None,
+        zone: &*w.zone,
+    };
+    let parent_word = Box::new(0xaaaa_u32);
+    let mut user = FaultingUser {
+        deny_out: vec![addr(&*parent_word)],
+        ..Default::default()
+    };
+    let args = clone_args(GLIBC_FLAGS, addr(&*parent_word), 0);
+    let mut frame = TrapFrame {
+        slot: SLOT_IDX as u64,
+        ..Default::default()
+    };
+    frame.x[..5].copy_from_slice(&args);
+    frame.x[8] = SYS_CLONE as u64;
+    let action = serve_directly_with_process(&mut w, &mut frame, &mut user, &mut owner);
+    assert!(
+        owner.record.is_some(),
+        "witness must reach managed retained birth before copyout refusal"
+    );
+    assert_eq!(action, Some(Action::Served));
+    assert_eq!(frame.x[0] as i64, -14);
+    assert_eq!(
+        w.page().state(0),
+        Some((entry.generation(), EntryState::Reserved))
+    );
+    assert_eq!(w.venue.child_slot(0).zone_record(), None);
+    let old_key =
+        carrick_sched_core::object_wait::ObjectWaitKey::native_service(owner.record.unwrap())
+            .unwrap();
+    assert!(matches!(
+        w.zone
+            .object_wait(old_key, &carrick_sched_core::ShortLockSpin),
+        Err(carrick_sched_core::object_wait::ObjectWaitError::Stale)
+    ));
+    assert_eq!(w.zone.slot(SLOT).queued(), 0);
+    assert_eq!(w.page().live(), 1);
+    user.deny_out.clear();
+    frame.x[..5].copy_from_slice(&args);
+    assert_eq!(
+        serve_directly_with_process(&mut w, &mut frame, &mut user, &mut owner),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0], u64::from(CHILD_VISIBLE));
+    assert_eq!(*parent_word, CHILD_VISIBLE);
+    assert_eq!(w.page().live(), 2);
 }

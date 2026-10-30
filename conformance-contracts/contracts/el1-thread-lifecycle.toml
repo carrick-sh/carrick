@@ -69,10 +69,15 @@ docker = "Each fixture mode asserts Linux semantics only and is meant to run unc
 embed_structural = "Not yet a registered WorkObservation binding: el1_thread_lifecycle_spawn_slope asserts, outside the contract evaluator, forwarded `exit` calls per added thread < 0.05 across 16/64/256 rounds (fractional, so not expressible as an integer affine budget) and prints the forwarded clone, rt_sigprocmask, sigaltstack, set_robust_list and gettid slopes. Expected RED until thread exit is served in the zone (stage L3/L4)."
 # #1100 VM-free bindings: native_fork_child_first_allocation_and_thread_admission;
 # native_fork_child_refills_retires_and_reuses_thread_stock (six births beyond
-# initial four, three rounds, no remaining namespace claims or physical loans);
+# the first clone's initial four, three rounds, no remaining namespace claims or physical loans);
 # native_fork_child_capacity_refusal_is_eagain (seven active workers);
 # native_fork_child_waits_for_final_retired_control_pin (actual retained signal
-# projection, owned clone resumes on final release). See contract documentation.
+# projection followed by a release-less transient pin, owned clone resumes on final release).
+# native_fork_child_clone_storm_recycles_exited_pinned_controls (32 rounds, 256 births);
+# native_fork_child_claimed_sibling_birth_parks_until_settlement (multiple live child threads);
+# managed_clone_copyout_fault_unbinds_birth_before_retry (errno 14, exact unbind and retry);
+# unmanaged_thread_birth_reusing_freed_record_does_not_observe_stale_mm (MM 1, not 99).
+# Fork alone reserves no spare thread identities. See contract documentation.
 production = "Kernel ThreadIdentityPool and ThreadLedger (L1), lifecycle page and control slot ABI (L2), EL1 lifecycle personality (L3) and settle-before-context runtime gates (L4)."
 
 [[structural_budgets]]
