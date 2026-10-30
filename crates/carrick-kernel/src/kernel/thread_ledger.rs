@@ -716,10 +716,7 @@ impl ThreadLedger {
             for birth in births {
                 // A birth whose task left the live set before settlement is
                 // dropped, which cancels it; there is nothing to publish into.
-                if let Ok(publication) = birth.publish_reserved(&mut state, PublicationLane::Settle)
-                {
-                    published.push(publication);
-                }
+                published.push(birth.publish_reserved(&mut state, PublicationLane::Settle));
             }
             let kernel = self
                 .kernel
@@ -795,17 +792,16 @@ impl ThreadLedger {
                                     "ABI birth prepare failed: error={error}"
                                 )
                             });
-                        let publication = prepared
-                            .publish_reserved(
-                                &mut state,
-                                PublicationLane::AbiBorn(&mut pooled.revisions),
-                            )
-                            .unwrap_or_else(|error| {
-                                carrick_fatal::carrick_fatal!(
-                                    "thread::ledger",
-                                    "ABI birth publication failed: error={error}"
-                                )
-                            });
+                        let publication = prepared.publish_reserved(
+                            &mut state,
+                            PublicationLane::AbiBorn(&mut pooled.revisions),
+                        );
+                        if let Some(error) = publication.error() {
+                            carrick_fatal::carrick_fatal!(
+                                "thread::ledger",
+                                "ABI birth publication failed: error={error}"
+                            );
+                        }
                         match control.lifecycle().publish(entry) {
                             Ok(())
                             | Err(carrick_el1_abi::TransitionError::WrongState(
@@ -954,6 +950,8 @@ impl ThreadLedger {
         drop(settling);
         // After-lock work runs with neither the registry lock nor the settle
         // gate held: reservation-change subscribers read the registry.
+        // Failed births also retain their reservation until this point: its
+        // rollback enters Registry::settled and can acquire the settle gate.
         // Dropping the published clone opens its start gate — a birth has
         // already happened, so publication has nothing left to wait for; the
         // lane that runs it adopts it from the registry by `ThreadKey`.

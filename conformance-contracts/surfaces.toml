@@ -1818,6 +1818,10 @@ path = "crates/carrick-kernel/src/kernel/thread_ledger.rs"
 contracts = ["kernel.scheduler.runnable-progress", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
+path = "crates/carrick-kernel/src/kernel/operations/thread.rs"
+contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
 path = "crates/carrick-el1-linux/src/lifecycle.rs"
 contracts = ["kernel.scheduler.runnable-progress"]
 
