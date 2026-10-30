@@ -33,7 +33,9 @@ pub(super) struct SupplyBacking {
     early_drop: Arc<core::sync::atomic::AtomicBool>,
 }
 impl SupplyBacking {
-    pub(super) fn release_unused(&self) -> Result<(), carrick_hal::TrapError> {
+    pub(super) fn release_unused(
+        &self,
+    ) -> Result<carrick_hal::physical_grants::PhysicalGrantRelease, carrick_hal::TrapError> {
         if self.authority.live_mapping_row(self.mapping).is_some() {
             self.early_drop.store(true, Ordering::Release);
             return Err(carrick_hal::TrapError::Hypervisor(
@@ -48,17 +50,26 @@ impl SupplyBacking {
             RecordRetirement::Complete(outcome) => outcome,
         };
         if outcome == CarrierStage2RetireOutcome::RetiredUnmapped {
-            Ok(())
+            Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released)
+        } else if matches!(
+            outcome,
+            CarrierStage2RetireOutcome::DeferredActivePins
+                | CarrierStage2RetireOutcome::RetryPending(_)
+        ) {
+            Ok(carrick_hal::physical_grants::PhysicalGrantRelease::RetainUntilMmRetirement)
         } else {
             Err(carrick_hal::TrapError::Hypervisor(format!(
-                "nonterminal release: {outcome:?}"
+                "indeterminate release: {outcome:?}"
             )))
         }
     }
 }
 impl Drop for SupplyBacking {
     fn drop(&mut self) {
-        self.release_unused().unwrap();
+        assert_eq!(
+            self.release_unused().unwrap(),
+            carrick_hal::physical_grants::PhysicalGrantRelease::Released
+        );
     }
 }
 
@@ -159,9 +170,24 @@ impl PhysicalStock {
             KernelVa::new(base.as_ptr() as u64 + controls_offset as u64),
         )
         .unwrap();
-        self.owner
-            .install(child.into_iter().chain(parent).collect(), vec![lifecycle])
-            .unwrap();
+        let mut table_stock: Vec<_> = child.into_iter().chain(parent).collect();
+        // Composed supply appends backing beyond the original fork arena.
+        // Seed two distinct spares before admission: one per simultaneous
+        // reply in the competing-publication witness. Never install live stock.
+        if self.tables.2 > 32 * 512 {
+            for page in (32..self.tables.2 / 512).rev().take(2) {
+                let offset = page * 512;
+                // SAFETY: the fixture retains this complete atomic table arena.
+                let words =
+                    unsafe { core::slice::from_raw_parts(self.tables.0.as_ptr().add(offset), 512) };
+                assert!(words.iter().all(|word| word.load(Ordering::Acquire) == 0));
+                table_stock.push(
+                    RootGpa::page_aligned(FrameGpa::new(self.tables.1 + offset as u64 * 8))
+                        .unwrap(),
+                );
+            }
+        }
+        self.owner.install(table_stock, vec![lifecycle]).unwrap();
         let aliases = window.prepare_affinity_aliases(lifecycle).unwrap();
         let execution =
             GrantExecution::new(carrick_guest_arch::CpuId::new(0), req.binding, req.context);
@@ -297,16 +323,17 @@ impl PhysicalStock {
         &mut self,
         owner: carrick_el1_abi::El1MmHandle,
         root: RootGpa,
-        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        txn: &mut carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
     ) {
-        // Existing fixture tables are already linked; nevertheless the real
-        // table owner must retain and authenticate this empty grant journal.
+        // Reserve an actual unused table from the spares seeded before loan.
+        // Existing tables are linked, so settlement returns this whole grant.
         let reservation = self
             .owner
-            .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root, 0)
+            .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root, 1)
             .unwrap();
+        txn.tables = reservation.descriptor_tables();
         self.owner
-            .track_native_descriptor_tables(&mut NoTableLedger, reservation, txn)
+            .track_native_descriptor_tables(&mut NoTableLedger, reservation, *txn)
             .unwrap();
     }
     pub fn settle_backing_reply(

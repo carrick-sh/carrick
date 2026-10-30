@@ -402,6 +402,7 @@ impl PreparedNativeExecSuccessor {
             ipa,
             generation,
             length: 0x4000,
+            retained_owner: Default::default(),
         });
         custody
             .native_frame_backings

@@ -253,6 +253,11 @@ fn composed_native_supply(
     end: SupplyEnd,
 ) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    // Keep descriptor grants disjoint from the original 32-page fork arena.
+    // No live-word venue or raw table pointer has been formed yet.
+    let mut table_words = core::mem::take(&mut fixture.tables.words).into_vec();
+    table_words.extend((0..32 * 512).map(|_| core::sync::atomic::AtomicU64::new(0)));
+    fixture.tables.words = table_words.into_boxed_slice();
     if let Some(absent_page) = absent_page {
         // Parent's two-page reservation has only one page resident.
         // Actual native fork must carry that descriptor into the child even
@@ -1076,7 +1081,7 @@ fn composed_native_supply(
     use carrick_mmu_core::aarch64::descriptor_txn::{
         DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
     };
-    let txn = DescriptorTxn {
+    let mut txn = DescriptorTxn {
         id: DescriptorTxnId {
             mm_key: NonZeroU64::new(identity.mm).unwrap(),
             generation: window.operation.sequence,
@@ -1106,7 +1111,7 @@ fn composed_native_supply(
     {
         let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
         let retained = stock.backing(&staged, backing_len, NonZeroU64::new(7).unwrap());
-        stock.track_backing_tables(handle, child_physical_root, txn);
+        stock.track_backing_tables(handle, child_physical_root, &mut txn);
         let grants = stock
             .owner
             .child_physical_mut(handle.mm(), child_physical_root)
@@ -1204,7 +1209,7 @@ fn composed_native_supply(
         {
             let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
             let retained = stock.backing(&competitor, backing_len, NonZeroU64::new(8).unwrap());
-            stock.track_backing_tables(handle, child_physical_root, competing_txn);
+            stock.track_backing_tables(handle, child_physical_root, &mut competing_txn);
             let grants = stock
                 .owner
                 .child_physical_mut(handle.mm(), child_physical_root)
