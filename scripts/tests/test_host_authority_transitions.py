@@ -1112,6 +1112,21 @@ class MatrixOrchestrationTest(unittest.TestCase):
                         (Path(directory) / ".rustup").resolve(),
                     )
 
+    def test_missing_passwd_home_links_no_caches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing_home = Path(directory) / "no-create-home"
+            provisioned_home = Path(directory) / "rustup"
+            provisioned_home.mkdir()
+            with mock.patch.object(
+                pwd, "getpwuid", return_value=mock.Mock(pw_dir=str(missing_home))
+            ), mock.patch.dict(os.environ, {"RUSTUP_HOME": str(provisioned_home)}):
+                with self.host_authority._execution_context(ROOT) as execution:
+                    self.assertEqual(
+                        execution.rustup_home, provisioned_home.resolve()
+                    )
+                    self.assertEqual(list(execution.cargo_home.iterdir()), [])
+            self.assertFalse(missing_home.exists())
+
     def test_hostile_temp_ancestor_cannot_choose_cargo_cwd_or_home(self):
         matrix = self.load()
         profile = matrix.profiles["macos-hvf-default"]
