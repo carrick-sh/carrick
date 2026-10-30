@@ -1,0 +1,24 @@
+schema_version = 1
+id = "kernel.mm.shared-file-reuse"
+title = "Shared file initialization owns reused arena bytes"
+guest_surfaces = ["syscall:mmap", "syscall:munmap", "syscall:sched_setaffinity"]
+semantic_authority = ["man 2 mmap: file mappings initialize from the selected file offset; the partial final page is zero-filled", "man 2 sched_setaffinity: affinity restricts execution CPUs, not mmap eligibility"]
+fixture = "unit:shared_file_reuse_after_affinity_change_needs_no_anonymous_scrub"
+scale_points = [1, 7, 32]
+rationale = "A read-only shared file mapping over a retired anonymous arena grant initializes all bytes from its file snapshot, including the partial-page zero tail. It must not request anonymous backing maintenance from an admitted owner. The bounded VM-free fixture changes guest affinity policy and models the ARM owner's Unsupported scrub refusal; it does not execute a vCPU or establish migration behavior. Existing private-file lowering and anonymous reuse remain unchanged."
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::mem::tests::shared_file_reuse_after_affinity_change_needs_no_anonymous_scrub; actual anonymous mmap/munmap and sched_setaffinity dispatch, a dense file description, and counted shared-file initialization at 1/7/32 pages"
+
+[bindings.unresolved]
+embed_structural = "Director-owned: el1_sched_futex_handoff_after_self_affinity_change must pass 10/10 on one signed artifact. HVF is unavailable on ctb-w3."
+docker = "Director-owned native ARM64 comparison; Docker is unavailable on ctb-w3."
+embed_timing = "Director-owned same-workload uninstrumented signed versus Docker ratio. VM-free operation counts do not establish runtime cost."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "guest_memory_copy_bytes"
+base = 0
+per_unit = 4096
+layers = ["vm-free"]
+rationale = "Exactly one full-range file initialization writes 4096 bytes per guest page. No preceding anonymous scrub writes the range again. The fixture also asserts one initialization call and zero anonymous backing scrub calls."

@@ -2590,3 +2590,18 @@ park/wake and a fresh OnCpu generation. The stale requeue CAS must lose, then
 terminal commit must keep live=1 and ExitingPublished until actual ABI commit.
 This supplements the scheduler callback-count guard without manufacturing a
 natural Kernel/Kernel claim overlap.
+
+### Shared file arena reuse (#1104)
+
+`kernel.mm.shared-file-reuse` requires read-only shared file initialization to
+replace retired anonymous bytes without anonymous backing maintenance. The
+VM-free binding `shared_file_reuse_after_affinity_change_needs_no_anonymous_scrub`
+uses real mmap/munmap and guest affinity dispatch at 1, 7 and 32 pages. It
+models the admitted ARM owner's unsupported shared scrub and requires the
+file's bytes, the partial-page zero tail, one full-range initialization and zero
+anonymous scrubs. Affinity changes policy here; this is no claim of real
+vCPU migration or scheduler execution. Private-file fallback and anonymous
+reuse retain their existing paths. Eager owner-copy contention and eager-shape
+repairs remain #1124/#1141. Signed 10/10 affinity-handoff acceptance, the
+Linux oracle and runtime ratios remain director-owned; this worker has
+neither HVF nor Docker.
