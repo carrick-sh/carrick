@@ -443,6 +443,89 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(NativeResume::Returned(output.result))
     }
 
+    /// Only a retained IPC operation authorizes this refusal handback.
+    /// A native service token has its own pending row and is not an IPC pin.
+    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+    fn retains_ipc_operation(&self, exit: NativeServiceExit) -> bool {
+        if !matches!(exit, NativeServiceExit::CarrierWork)
+            || !self
+                .source
+                .zone
+                .record(self.record.id)
+                .has_adapter_operation()
+        {
+            return false;
+        }
+        self.runtime
+            .graph
+            .lock()
+            .service_wait(&self.record)
+            .is_none_or(|pending| pending.adapter)
+    }
+
+    /// Fold the owned-IPC exit after preparation unwinds. Unadmitted bridges,
+    /// notably exec, retain their existing outcome until they own staged input.
+    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+    #[inline(never)]
+    pub(crate) fn settle_service_exit(
+        &mut self,
+        result: Result<NativeResume, NativeProcessError>,
+        exit: NativeServiceExit,
+    ) -> Result<NativeResume, NativeProcessError> {
+        if !self.retains_ipc_operation(exit) {
+            let result = result?;
+            if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
+                return Err(NativeProcessError::Quarantined);
+            }
+            return Ok(result);
+        }
+        let result = result.map_err(|error| match error {
+            NativeProcessError::ForkRefused(refusal) => refusal.error(),
+            error => error,
+        });
+        let result = match result {
+            Ok(NativeResume::RetrySyscall) => self.yield_service_checkpoint()?,
+            Ok(result) => result,
+            Err(
+                NativeProcessError::Invalid
+                | NativeProcessError::Stale
+                | NativeProcessError::Quarantined,
+            ) => return result,
+            // The wrapper was decoded above; another wrapper is a codec invariant.
+            Err(NativeProcessError::ForkRefused(_)) => return Err(NativeProcessError::Invalid),
+            Err(
+                NativeProcessError::Busy
+                | NativeProcessError::Exhausted
+                | NativeProcessError::OwnerWait(_)
+                | NativeProcessError::GroupExitCustody,
+            ) => {
+                // The same IPC owner reselects preparation at its checkpoint,
+                // including enrollment on an explicit owner dependency. No
+                // user result or fresh syscall may replace the retained token.
+                self.yield_service_checkpoint()?
+            }
+            Err(
+                error @ (NativeProcessError::Fault
+                | NativeProcessError::Unsupported
+                | NativeProcessError::NoChild),
+            ) => {
+                self.adapter_ready = None;
+                NativeResume::Returned(
+                    self.retire_adapter_result(SyscallResult::new(error.errno()))?,
+                )
+            }
+        };
+        if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
+            // The operation is still installed: an empty receipt after a
+            // deferred preparation is not failed execution authentication.
+            let result = self.yield_service_checkpoint()?;
+            self.take_handoff_receipt()
+                .ok_or(NativeProcessError::Quarantined)?;
+            return Ok(result);
+        }
+        Ok(result)
+    }
+
     /// Intake may capture backing, but never waits for another guest. The
     /// owning request is visible to terminal close before its physical intake.
     #[inline(never)]
@@ -1024,7 +1107,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// A supply that won before enrollment is ready work, not a reason to
     /// finish under the IPC dispatch stack. The exact record keeps its token.
     #[inline(never)]
-    fn yield_service_checkpoint(&mut self) -> Result<NativeResume, NativeProcessError> {
+    pub(super) fn yield_service_checkpoint(&mut self) -> Result<NativeResume, NativeProcessError> {
         let start = carrick_core::entry::prepare_handoff(self.binding, self.source, self.record.id)
             .ok_or(NativeProcessError::Stale)?;
         // SAFETY: this exact admitted record is still held by this lane.
@@ -1770,6 +1853,33 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     #[inline(never)]
+    fn retire_adapter_result(
+        &mut self,
+        error: SyscallResult,
+    ) -> Result<SyscallResult, NativeProcessError> {
+        let token = carrick_core::wait::take_object_operation(
+            self.source.zone,
+            self.source.slot,
+            self.source.zone.record(self.record.id).identity(),
+        )
+        .map_err(|_| NativeProcessError::Quarantined)?
+        .ok_or(NativeProcessError::Stale)?;
+        let written = self.service.retire_adapter_operation(self.binding, token)?;
+        // SAFETY: this exact admitted record still owns the completed adapter.
+        unsafe {
+            self.source
+                .zone
+                .record(self.record.id)
+                .consume_owner_continuation()
+        };
+        Ok(if written == 0 {
+            error
+        } else {
+            SyscallResult::new(written as i64)
+        })
+    }
+
+    #[inline(never)]
     fn finish_adapter_service(
         &mut self,
         result: ServiceResult,
@@ -1778,19 +1888,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let value = if result == ServiceResult::Supplied {
             None
         } else {
-            let token = carrick_core::wait::take_object_operation(
-                self.source.zone,
-                self.source.slot,
-                self.source.zone.record(self.record.id).identity(),
-            )
-            .map_err(|_| NativeProcessError::Quarantined)?
-            .ok_or(NativeProcessError::Stale)?;
-            let written = self.service.retire_adapter_operation(self.binding, token)?;
-            Some(SyscallResult::new(if written == 0 {
-                carrick_syscall_abi::LINUX_EFAULT.guest_retval()
-            } else {
-                written as i64
-            }))
+            Some(self.retire_adapter_result(SyscallResult::new(
+                carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+            ))?)
         };
         self.release_service_claim(claim)?;
         Ok(value.map_or(NativeResume::RetrySyscall, NativeResume::Returned))

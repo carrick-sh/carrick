@@ -253,3 +253,23 @@ Native pipe/eventfd copy faults settle their operation in ring, including a
 zero-byte read resumed after readiness or memory suspension. Genuine faults
 return errno 14 and release the operation pin; a delivered prefix remains a
 short read. The host-owned handback path retains its existing contract.
+
+Adapter service admission may itself refuse the retained IPC operation. The
+Busy-once binding `ipc_preparation_busy_once_requeues_then_completes_exact_operation`
+forces the production member-wait admission check to refuse once, then admits
+and acknowledges CarrierWork. It requires zero notices on refusal, one requeue,
+the same operation identity and endpoint pin, and successful completion after
+closing the numeric fd. The service-exit bindings exercise the production ARM
+closure's shared refusal mapping, including an empty receipt while preparation
+is still owed. They require resumption of the same record without restaging its
+owned IPC operation. Invalid, Stale and genuine Quarantined authentication
+failures remain invariants. These VM-free schedules reduce the admission seam;
+they do not emulate the mask storm's guest signal handlers or prove a signed
+pass rate. The director retains the five-run signed mask-storm check on #1044.
+
+The service-exit handback is scoped to CarrierWork with a retained IPC
+operation and pin. Native service tokens do not authorize it, and even a
+retained IPC token cannot authorize retrying the separately staged exec
+bridge. The bridge keeps its current outcome; retaining staged service input
+before adding an exec retry is follow-up #1116. This slice makes no new exec
+or vfork acceptance claim.

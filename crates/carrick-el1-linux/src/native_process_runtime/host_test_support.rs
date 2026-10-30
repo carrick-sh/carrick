@@ -1550,16 +1550,25 @@ fn carrier_work_wake_preserves_the_completed_syscall_result() {
                 &mut service,
             )
             .unwrap();
+        let result = entry.begin_service(
+            ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Syscall,
+            },
+            None,
+        );
         assert!(matches!(
-            entry.begin_service(
-                ServiceOperation::CarrierWork {
-                    entry: OwnerEntry::Syscall,
-                },
-                None,
-            ),
+            entry.settle_service_exit(result, NativeServiceExit::CarrierWork),
             Ok(NativeResume::Left(None))
         ));
-        assert!(entry.take_handoff_receipt().is_some());
+        // A native service token is not an IPC token/pin. Its ordinary
+        // bridge refusal must retain main's outcome rather than gain a retry.
+        assert!(matches!(
+            entry.settle_service_exit(
+                Err(NativeProcessError::Busy),
+                NativeServiceExit::CarrierWork
+            ),
+            Err(NativeProcessError::Busy)
+        ));
     }
 
     let notice = fixture.task.service_notice.take().unwrap().unwrap();
@@ -4322,7 +4331,24 @@ fn owner_copyout_unavailable_is_not_a_user_memory_fault() {
 }
 
 #[cfg(test)]
-fn retained_ipc_supply(supplied: bool, already_ready: bool, yielding: bool) {
+#[derive(Clone, Copy)]
+enum AdapterRefusal {
+    None,
+    Drain,
+    ExitBusy,
+    ExitDeferred,
+    Transient(NativeProcessError),
+    Invariant(NativeProcessError),
+    Bridge,
+}
+
+#[cfg(test)]
+fn retained_ipc_supply(
+    supplied: bool,
+    already_ready: bool,
+    yielding: bool,
+    refusal: AdapterRefusal,
+) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
     use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
     use carrick_el1_abi::ipc::{
@@ -4407,6 +4433,108 @@ fn retained_ipc_supply(supplied: bool, already_ready: bool, yielding: bool) {
             fixture.task.service_notice.take().unwrap().is_none(),
             "IPC frames must unwind before physical enrollment"
         );
+        let work = ServiceOperation::CarrierWork {
+            entry: OwnerEntry::Syscall,
+        };
+        if matches!(
+            refusal,
+            AdapterRefusal::Bridge | AdapterRefusal::Invariant(_)
+        ) {
+            let (error, operation) = match refusal {
+                AdapterRefusal::Bridge => (NativeProcessError::Busy, NativeServiceExit::Bridge),
+                AdapterRefusal::Invariant(error) => (error, NativeServiceExit::CarrierWork),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(entry.settle_service_exit(Err(error), operation), Err(observed) if observed == error)
+            );
+            assert_eq!(entry.adapter_ready.as_ref().unwrap().identity, identity);
+            assert!(entry.take_handoff_receipt().is_none());
+        }
+        if !matches!(
+            refusal,
+            AdapterRefusal::None | AdapterRefusal::Bridge | AdapterRefusal::Invariant(_)
+        ) {
+            let admission_busy =
+                matches!(refusal, AdapterRefusal::Drain | AdapterRefusal::ExitBusy);
+            if admission_busy {
+                // The real member-wait check refuses admission once. The
+                // existing owner settles that wait before the next checkpoint.
+                fixture.runtime.graph.lock().insert_member_wait(
+                    fixture.record,
+                    MemberWait::Signal(PendingSignalWait {
+                        kind: PendingSignalKind::Suspend,
+                        channel: Arc::new(WaitChannel {
+                            generation: ProcessWake::new(),
+                            mm: binding.mm.raw(),
+                        }),
+                        deadline: None,
+                    }),
+                );
+            }
+            if matches!(refusal, AdapterRefusal::Drain) {
+                entry.drain_owned_preparation();
+                assert!(entry.take_handoff_receipt().is_some());
+            } else {
+                let result = match refusal {
+                    AdapterRefusal::ExitBusy => entry.begin_service(work, None),
+                    AdapterRefusal::ExitDeferred => Ok(NativeResume::Left(None)),
+                    AdapterRefusal::Transient(error) => Err(error),
+                    _ => unreachable!(),
+                };
+                if matches!(refusal, AdapterRefusal::ExitBusy) {
+                    assert!(matches!(result, Err(NativeProcessError::Busy)));
+                }
+                assert!(matches!(
+                    entry
+                        .settle_service_exit(result, NativeServiceExit::CarrierWork)
+                        .unwrap(),
+                    NativeResume::Left(None)
+                ));
+            }
+            assert_eq!(entry.adapter_ready.as_ref().unwrap().identity, identity);
+            assert!(fixture.task.service_notice.take().unwrap().is_none());
+            if admission_busy {
+                fixture
+                    .runtime
+                    .graph
+                    .lock()
+                    .remove_signal_wait(&fixture.record);
+            }
+            drop(entry);
+            let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+            assert_eq!(selected.record, fixture.record.id);
+            let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+                .unwrap()
+                .words;
+            entry = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    source,
+                    fixture.task,
+                    fixture.address,
+                    &saved,
+                    &mut service,
+                )
+                .unwrap();
+            assert!(matches!(
+                entry.resume_checkpoint().unwrap(),
+                NativeResume::RetrySyscall
+            ));
+            let retained = carrick_core::wait::take_object_operation(
+                fixture.zone,
+                fixture.slot,
+                fixture.zone.record(fixture.record.id).identity(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(retained.identity(), identity);
+            assert!(matches!(
+                entry.yield_owned_operation(retained),
+                carrick_core::mm::transaction::OwnedOperationYield::Suspended
+            ));
+        }
         entry.drain_owned_preparation();
         assert!(entry.take_handoff_receipt().is_some());
     }
@@ -4505,6 +4633,36 @@ fn retained_ipc_supply(supplied: bool, already_ready: bool, yielding: bool) {
         assert_eq!(token.identity(), identity);
         let token = carrick_el1::substrate::ipc::from_sched_token(token).unwrap();
         assert_eq!(region.operation(&token).unwrap(), op);
+        // Complete the retained read through the shipping transfer core, not
+        // just its preparation. The fd is gone, so only this exact pin can
+        // deliver the original counter once and keep the endpoint alive.
+        struct CompleteCopy(Vec<u8>);
+        impl crate::file::UserCopy for CompleteCopy {
+            fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+                false
+            }
+            fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
+                assert_eq!(address, 0x10000);
+                self.0.extend_from_slice(bytes);
+                true
+            }
+        }
+        let mut active = region.operation(&token).unwrap();
+        let mut copy = CompleteCopy(Vec::new());
+        let mut object_guard = region
+            .lock(object, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let (status, _) = carrick_el1::substrate::ipc::transfer(
+            &mut object_guard,
+            &mut active,
+            &mut carrick_el1::substrate::ipc::PrefixCopy::new(&mut copy),
+        )
+        .unwrap();
+        assert_eq!(status, carrick_el1::substrate::ipc::StepStatus::Complete);
+        assert_eq!(active.progress.written, 8);
+        assert_eq!(object_guard.eventfd().unwrap().value(), 0);
+        drop(object_guard);
+        assert_eq!(copy.0, 7u64.to_ne_bytes());
         let op = region.finish_operation(token).unwrap();
         let release = region
             .fd(carrick_sched_core::ShortLockSpin)
@@ -4540,26 +4698,115 @@ fn retained_ipc_supply(supplied: bool, already_ready: bool, yielding: bool) {
 #[cfg(test)]
 #[test]
 fn ipc_backing_supply_retains_the_exact_operation_and_pin() {
-    retained_ipc_supply(true, false, false);
+    retained_ipc_supply(true, false, false, AdapterRefusal::None);
 }
 #[cfg(test)]
 #[test]
 fn ipc_backing_refusal_retires_the_operation_and_pin() {
-    retained_ipc_supply(false, false, false);
+    retained_ipc_supply(false, false, false, AdapterRefusal::None);
 }
 #[cfg(test)]
 #[test]
 fn ipc_already_ready_supply_defers_completion_to_the_checkpoint() {
-    retained_ipc_supply(true, true, false);
+    retained_ipc_supply(true, true, false, AdapterRefusal::None);
 }
 #[cfg(test)]
 #[test]
 fn ipc_already_ready_refusal_retires_at_the_checkpoint() {
-    retained_ipc_supply(false, true, false);
+    retained_ipc_supply(false, true, false, AdapterRefusal::None);
 }
 
 #[cfg(test)]
 #[test]
 fn ipc_busy_yield_retains_operation_and_pin_through_carrier_work() {
-    retained_ipc_supply(true, false, true);
+    retained_ipc_supply(true, false, true, AdapterRefusal::None);
+}
+
+#[cfg(test)]
+#[test]
+fn ipc_preparation_busy_once_requeues_then_completes_exact_operation() {
+    retained_ipc_supply(true, false, true, AdapterRefusal::Drain);
+}
+
+#[cfg(test)]
+#[test]
+fn native_service_exit_busy_requeues_and_resumes_the_record() {
+    retained_ipc_supply(true, false, true, AdapterRefusal::ExitBusy);
+}
+
+#[cfg(test)]
+#[test]
+fn native_service_exit_busy_retains_ipc_operation_and_pin() {
+    retained_ipc_supply(
+        true,
+        false,
+        true,
+        AdapterRefusal::Transient(NativeProcessError::Busy),
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn native_service_exit_deferred_preparation_is_not_quarantined() {
+    retained_ipc_supply(true, false, true, AdapterRefusal::ExitDeferred);
+}
+
+#[cfg(test)]
+#[test]
+fn native_service_exit_refusal_policy_preserves_retry_and_authentication() {
+    use crate::native_fork_refusal::{NativeForkCause, NativeForkRefusal, NativeForkStage};
+    for error in [
+        NativeProcessError::Exhausted,
+        NativeProcessError::GroupExitCustody,
+        NativeProcessError::ForkRefused(NativeForkRefusal {
+            stage: NativeForkStage::Commit,
+            cause: NativeForkCause::Busy,
+        }),
+    ] {
+        retained_ipc_supply(true, false, true, AdapterRefusal::Transient(error));
+    }
+    for error in [
+        NativeProcessError::Invalid,
+        NativeProcessError::Stale,
+        NativeProcessError::Quarantined,
+    ] {
+        retained_ipc_supply(true, false, true, AdapterRefusal::Invariant(error));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn native_service_exit_exec_bridge_keeps_its_existing_refusal() {
+    // Native exec's staged bridge has no CarrierWork operation. Even an IPC
+    // token cannot authorize retrying its already staged argv (follow-up #1116).
+    retained_ipc_supply(true, false, true, AdapterRefusal::Bridge);
+}
+
+#[cfg(test)]
+#[test]
+fn native_service_exit_missing_unowned_receipt_remains_an_invariant() {
+    let fixture = native_exec_fixture();
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.settle_service_exit(Ok(NativeResume::Left(None)), NativeServiceExit::Bridge),
+        Err(NativeProcessError::Quarantined)
+    ));
+    assert!(matches!(
+        entry.settle_service_exit(Err(NativeProcessError::Busy), NativeServiceExit::Bridge),
+        Err(NativeProcessError::Busy)
+    ));
 }

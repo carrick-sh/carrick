@@ -267,3 +267,11 @@ clippy feature closures; those need further headroom first. This is a proposal
 for the director, not a budget change. The ARM gate still does not prove CPL0
 chain depth or guard pages; shared ownership changes compile for CPL0 through
 `clippy-linux`.
+
+Service admission refusal folding (#1044) runs after the physical preparation
+stack unwinds. The retained IPC owner reselects preparation at its checkpoint;
+folding cannot nest a backing reply. The native service refusal envelope
+charges its retained entry and callback, refusal fold, scheduler yield and
+adapter retirement tails, including endpoint release and notification work.
+The existing 11,311-byte backing-reply ceiling and all other limits remain
+unchanged. Cumulative-overflow controls reject both new cold-path branches.
