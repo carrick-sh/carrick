@@ -909,6 +909,7 @@ mod tests {
             frame_slot: 0,
             saved_lr: 0x1111,
             saved_x: [1, 2, 3, 4],
+            saved_ordinal: 64,
             saved_elr: 0x2222,
             saved_spsr: 0,
             saved_esr: 0,
