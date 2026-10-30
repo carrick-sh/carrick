@@ -194,6 +194,18 @@ red-first claim: it does not bind ring exec, external image services, the FD
 authority, nonleader promotion, or old-MM completion rejection. Those require
 production native-owner witnesses and signed execution in the subsequent work.
 
+EL1 `stage_exec_payload` (`crates/carrick-el1-linux/src/exec_stage.rs`) narrows
+partial-chunk `UserCopy::copy_in` faults logarithmically while retaining valid
+copied prefixes and resuming subsequent 256-byte chunks from the known-good
+offset. VM-free bindings
+`partial_chunk_fault_narrows_from_known_good_offset_without_recopying` and
+`long_string_at_page_boundary_and_huge_argv_stay_within_copy_budget` pin
+disjoint contiguous `copy_in` covers and linear `copy_in` call and probed-byte
+budgets across page-boundary `MAX_ARG_STRLEN` strings and `argc` scaling
+`[1, 16, 256, 2048]` (red before `#917`: 770 calls on a 64 KiB + 255B tail
+fault and 1,025 calls on `MAX_ARG_STRLEN - 1`; green: `<= 272` and `<= 528`
+calls).
+
 ## Filesystem cache cohort
 
 `kernel.fs.cache-cohort` covers cached path, directory topology, root-marker,
