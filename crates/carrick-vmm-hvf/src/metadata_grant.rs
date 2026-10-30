@@ -1628,7 +1628,7 @@ pub(crate) fn service_native_fork_stock(
                 settlement.refuse();
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
-            native_service::settle_native_descriptor_reply(custody, region, execution, settlement)
+            native_service::settle_native_descriptor_reply(custody, region, execution, settlement)?
         }
         Some(ForkStockKind::Reserve | ForkStockKind::Commit | ForkStockKind::Abort) => {
             let Some(pointer) = abi_stack_ptr::<ForkStockSettlement>(region, cpu, address) else {

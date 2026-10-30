@@ -17,6 +17,14 @@ pub(super) struct PhysicalChild {
     _inherited: RecordPin<PinVenue>,
     pub supplied: Option<carrick_hal::physical_grants::NativePhysicalGrants<SupplyBacking>>,
 }
+impl carrick_hal::physical_grants::NativeSupplyCustody for PhysicalChild {
+    type Backing = SupplyBacking;
+    fn supplied(
+        &mut self,
+    ) -> Option<&mut carrick_hal::physical_grants::NativePhysicalGrants<SupplyBacking>> {
+        self.supplied.as_mut()
+    }
+}
 pub(super) struct SupplyBacking {
     record: Arc<Mutex<CarrierStage2Record>>,
     identity: CarrierStage2RecordIdentity,
@@ -24,19 +32,43 @@ pub(super) struct SupplyBacking {
     mapping: carrick_hal::MappingId,
     early_drop: Arc<core::sync::atomic::AtomicBool>,
 }
-impl Drop for SupplyBacking {
-    fn drop(&mut self) {
+impl SupplyBacking {
+    pub(super) fn release_unused(
+        &self,
+    ) -> Result<carrick_hal::physical_grants::PhysicalGrantRelease, carrick_hal::TrapError> {
         if self.authority.live_mapping_row(self.mapping).is_some() {
             self.early_drop.store(true, Ordering::Release);
+            return Err(carrick_hal::TrapError::Hypervisor(
+                "live inventory at release".into(),
+            ));
         }
         let mut record = self.record.lock().unwrap();
-        assert!(matches!(
-            prepare_record_retirement(&mut record, self.identity),
-            RecordRetirement::Unmap { .. }
-        ));
+        let outcome = match prepare_record_retirement(&mut record, self.identity) {
+            RecordRetirement::Unmap { .. } => {
+                settle_record_retirement(&mut record, self.identity, Ok(()))
+            }
+            RecordRetirement::Complete(outcome) => outcome,
+        };
+        if outcome == CarrierStage2RetireOutcome::RetiredUnmapped {
+            Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released)
+        } else if matches!(
+            outcome,
+            CarrierStage2RetireOutcome::DeferredActivePins
+                | CarrierStage2RetireOutcome::RetryPending(_)
+        ) {
+            Ok(carrick_hal::physical_grants::PhysicalGrantRelease::RetainUntilMmRetirement)
+        } else {
+            Err(carrick_hal::TrapError::Hypervisor(format!(
+                "indeterminate release: {outcome:?}"
+            )))
+        }
+    }
+}
+impl Drop for SupplyBacking {
+    fn drop(&mut self) {
         assert_eq!(
-            settle_record_retirement(&mut record, self.identity, Ok(())),
-            CarrierStage2RetireOutcome::RetiredUnmapped
+            self.release_unused().unwrap(),
+            carrick_hal::physical_grants::PhysicalGrantRelease::Released
         );
     }
 }
@@ -138,9 +170,24 @@ impl PhysicalStock {
             KernelVa::new(base.as_ptr() as u64 + controls_offset as u64),
         )
         .unwrap();
-        self.owner
-            .install(child.into_iter().chain(parent).collect(), vec![lifecycle])
-            .unwrap();
+        let mut table_stock: Vec<_> = child.into_iter().chain(parent).collect();
+        // Composed supply appends backing beyond the original fork arena.
+        // Seed two distinct spares before admission: one per simultaneous
+        // reply in the competing-publication witness. Never install live stock.
+        if self.tables.2 > 32 * 512 {
+            for page in (32..self.tables.2 / 512).rev().take(2) {
+                let offset = page * 512;
+                // SAFETY: the fixture retains this complete atomic table arena.
+                let words =
+                    unsafe { core::slice::from_raw_parts(self.tables.0.as_ptr().add(offset), 512) };
+                assert!(words.iter().all(|word| word.load(Ordering::Acquire) == 0));
+                table_stock.push(
+                    RootGpa::page_aligned(FrameGpa::new(self.tables.1 + offset as u64 * 8))
+                        .unwrap(),
+                );
+            }
+        }
+        self.owner.install(table_stock, vec![lifecycle]).unwrap();
         let aliases = window.prepare_affinity_aliases(lifecycle).unwrap();
         let execution =
             GrantExecution::new(carrick_guest_arch::CpuId::new(0), req.binding, req.context);
@@ -271,6 +318,51 @@ impl PhysicalStock {
             mapping: carrick_hal::MappingId::from_kernel_allocation(grant.identity.mapping_id),
             early_drop: self.early_drop.clone(),
         }
+    }
+    pub fn track_backing_tables(
+        &mut self,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        txn: &mut carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) {
+        // Reserve an actual unused table from the spares seeded before loan.
+        // Existing tables are linked, so settlement returns this whole grant.
+        let reservation = self
+            .owner
+            .reserve_native_descriptor_tables(&mut NoTableLedger, owner, root, 1)
+            .unwrap();
+        txn.tables = reservation.descriptor_tables();
+        self.owner
+            .track_native_descriptor_tables(&mut NoTableLedger, reservation, *txn)
+            .unwrap();
+    }
+    pub fn settle_backing_reply(
+        &mut self,
+        owner: carrick_el1_abi::El1MmHandle,
+        generation: NonZeroU64,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+    ) {
+        let root = self.owner.child_root(owner.mm()).unwrap();
+        let grants = self
+            .owner
+            .child_physical_mut(owner.mm(), root)
+            .unwrap()
+            .supplied
+            .as_mut()
+            .unwrap();
+        let txn = grants.pending_backing_reply(slot, generation).unwrap();
+        assert!(
+            self.owner
+                .settle_native_backing_reply(
+                    &mut NoTableLedger,
+                    owner,
+                    root,
+                    slot,
+                    &txn,
+                    SupplyBacking::release_unused,
+                )
+                .unwrap()
+        );
     }
     pub fn retire(
         &mut self,

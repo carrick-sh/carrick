@@ -3,10 +3,10 @@
 use crate::completion::{CompletionCallback, CompletionCallbacks};
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// The only terminal writer, retained by the exact physical record owner.
-/// Drop never reports success. Record absence is not a completion receipt.
+/// Drop publishes abandonment, never success. Absence is not a retirement receipt.
 #[derive(Debug)]
 pub struct PhysicalRetirementCompletion<I> {
     wait: Arc<PhysicalRetirementWait<I>>,
@@ -14,11 +14,55 @@ pub struct PhysicalRetirementCompletion<I> {
 #[derive(Debug)]
 pub struct PhysicalRetirementWait<I> {
     identity: I,
-    ready: AtomicBool,
+    state: AtomicU8,
     callbacks: CompletionCallbacks,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetirementIdentityMismatch;
+
+/// Why the exact producer could no longer provide a retirement receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetirementAbandonReason {
+    ProducerDropped,
+    RecordRemoved,
+}
+
+/// Absence of the producer is terminal but cannot authorize physical reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalRetirementState<I> {
+    Pending,
+    Retired(I),
+    Abandoned(RetirementAbandonReason),
+}
+
+#[derive(Debug)]
+struct RetirementEnrollment {
+    active: Arc<AtomicBool>,
+    _registration: crate::completion::CompletionEnrollment,
+}
+impl Drop for RetirementEnrollment {
+    fn drop(&mut self) {
+        // A publication may already own a snapshot of the callback. Revoke
+        // this exact enrollment as well as removing the registry entry.
+        self.active.store(false, Ordering::Release);
+    }
+}
+impl<I> Drop for PhysicalRetirementCompletion<I> {
+    fn drop(&mut self) {
+        if matches!(
+            self.wait
+                .state
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire),
+            Ok(_) | Err(2 | 3)
+        ) {
+            // Teardown may precede an already queued abandonment publication.
+            // The same enrollment guard authenticates both notifications and
+            // permits at most one wake. Callbacks only notify their owner;
+            // they must not perform physical retirement inside producer Drop.
+            self.wait.callbacks.publish(0);
+        }
+    }
+}
 
 /// Notification effects retained by the same physical owner until its idle
 /// boundary. Creating this value records readiness but invokes no callback.
@@ -45,13 +89,38 @@ impl<I: Copy + Eq> PhysicalRetirementCompletion<I> {
         Self {
             wait: Arc::new(PhysicalRetirementWait {
                 identity,
-                ready: AtomicBool::new(false),
+                state: AtomicU8::new(0),
                 callbacks: CompletionCallbacks::default(),
             }),
         }
     }
     pub fn wait(&self) -> Arc<PhysicalRetirementWait<I>> {
         Arc::clone(&self.wait)
+    }
+    /// Record explicit producer removal while another holder may still retain
+    /// the owner. Publish the returned effects after removal guards drop.
+    pub fn abandon(
+        &self,
+        identity: I,
+        reason: RetirementAbandonReason,
+    ) -> Result<Option<RetirementPublication>, RetirementIdentityMismatch> {
+        if identity != self.wait.identity {
+            return Err(RetirementIdentityMismatch);
+        }
+        let state = match reason {
+            RetirementAbandonReason::ProducerDropped => 2,
+            RetirementAbandonReason::RecordRemoved => 3,
+        };
+        if self
+            .wait
+            .state
+            .compare_exchange(0, state, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let callbacks = self.wait.callbacks.snapshot();
+        Ok((!callbacks.is_empty()).then_some(RetirementPublication { callbacks }))
     }
     /// Called by the existing physical owner only after exact record
     /// finalization, including required allocation return, has succeeded.
@@ -65,8 +134,8 @@ impl<I: Copy + Eq> PhysicalRetirementCompletion<I> {
         }
         if self
             .wait
-            .ready
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return Ok(None);
@@ -76,19 +145,37 @@ impl<I: Copy + Eq> PhysicalRetirementCompletion<I> {
     }
 }
 impl<I: Copy> PhysicalRetirementWait<I> {
+    pub fn state(&self) -> PhysicalRetirementState<I> {
+        match self.state.load(Ordering::Acquire) {
+            0 => PhysicalRetirementState::Pending,
+            1 => PhysicalRetirementState::Retired(self.identity),
+            2 => PhysicalRetirementState::Abandoned(RetirementAbandonReason::ProducerDropped),
+            _ => PhysicalRetirementState::Abandoned(RetirementAbandonReason::RecordRemoved),
+        }
+    }
     /// Retain this exact proof across directory removal and IPA reuse.
     pub fn receipt(&self) -> Option<I> {
-        self.ready.load(Ordering::Acquire).then_some(self.identity)
+        (self.state.load(Ordering::Acquire) == 1).then_some(self.identity)
     }
 }
 impl<I: Debug + Send + Sync> carrick_guest_mem::PhysicalMemoryWait for PhysicalRetirementWait<I> {
     fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) != 0
     }
     fn enroll(&self, wake: Arc<dyn Fn() + Send + Sync>) -> (Box<dyn Debug + Send + Sync>, bool) {
         // Register before probing, including when terminal release raced with
         // enrollment. The caller either observes readiness or receives a wake.
-        let enrollment = self.callbacks.enroll(move |_| wake());
+        let active = Arc::new(AtomicBool::new(true));
+        let callback_active = active.clone();
+        let registration = self.callbacks.enroll(move |_| {
+            if callback_active.swap(false, Ordering::AcqRel) {
+                wake();
+            }
+        });
+        let enrollment = RetirementEnrollment {
+            active,
+            _registration: registration,
+        };
         (Box::new(enrollment), self.is_ready())
     }
 }
@@ -209,8 +296,101 @@ mod tests {
         let abandoned = PhysicalRetirementCompletion::new(identity());
         let pending = abandoned.wait();
         drop(abandoned);
-        assert!(!pending.is_ready());
+        assert!(pending.is_ready());
         assert_eq!(pending.receipt(), None);
+    }
+
+    #[test]
+    fn abandoned_producer_wakes_waiter_without_a_retired_receipt() {
+        let producer = PhysicalRetirementCompletion::new(identity());
+        let wait = producer.wait();
+        let count = Arc::new(AtomicUsize::new(0));
+        let (_enrollment, ready) = enroll(&wait, &count);
+        assert!(!ready);
+        drop(producer);
+        assert!(wait.is_ready(), "abandonment must settle an enrolled wait");
+        assert_eq!(wait.receipt(), None);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            wait.state(),
+            PhysicalRetirementState::Abandoned(RetirementAbandonReason::ProducerDropped)
+        );
+    }
+
+    #[test]
+    fn explicit_record_removal_wakes_even_while_producer_is_retained() {
+        let producer = PhysicalRetirementCompletion::new(identity());
+        let wait = producer.wait();
+        let count = Arc::new(AtomicUsize::new(0));
+        let (_enrollment, _) = enroll(&wait, &count);
+        let wrong = Identity {
+            generation: 4,
+            ..identity()
+        };
+        assert!(
+            producer
+                .abandon(wrong, RetirementAbandonReason::RecordRemoved)
+                .is_err()
+        );
+        assert!(!wait.is_ready());
+        let publication = producer
+            .abandon(identity(), RetirementAbandonReason::RecordRemoved)
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        publication.publish();
+        assert_eq!(
+            wait.state(),
+            PhysicalRetirementState::Abandoned(RetirementAbandonReason::RecordRemoved)
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(wait.receipt(), None);
+        assert!(producer.complete(identity()).unwrap().is_none());
+        assert!(
+            producer
+                .abandon(identity(), RetirementAbandonReason::RecordRemoved)
+                .unwrap()
+                .is_none()
+        );
+        drop(producer);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let (_late, ready) = enroll(&wait, &count);
+        assert!(ready);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn abandoned_publication_survives_producer_drop_before_idle() {
+        for reason in [
+            RetirementAbandonReason::ProducerDropped,
+            RetirementAbandonReason::RecordRemoved,
+        ] {
+            let producer = PhysicalRetirementCompletion::new(identity());
+            let wait = producer.wait();
+            let count = Arc::new(AtomicUsize::new(0));
+            let (_enrollment, ready) = enroll(&wait, &count);
+            assert!(!ready);
+            let publication = producer.abandon(identity(), reason).unwrap().unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            drop(producer); // carrier teardown can precede the queued idle turn
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert_eq!(wait.state(), PhysicalRetirementState::Abandoned(reason));
+            assert_eq!(wait.receipt(), None);
+            publication.publish();
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn cancelled_wait_drops_a_callback_captured_before_cancellation() {
+        let producer = PhysicalRetirementCompletion::new(identity());
+        let wait = producer.wait();
+        let count = Arc::new(AtomicUsize::new(0));
+        let (enrollment, _) = enroll(&wait, &count);
+        let publication = producer.complete(identity()).unwrap().unwrap();
+        drop(enrollment);
+        publication.publish();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
     #[test]

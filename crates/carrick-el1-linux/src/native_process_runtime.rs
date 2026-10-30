@@ -309,6 +309,13 @@ impl Drop for InjectTryReserveFailure {
     }
 }
 
+/// Resolve delivery against the original MM before releasing its reply pin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultReplyDisposition {
+    Apply,
+    Cancel,
+}
+
 /// Physical crossings are outside graph guards. commit_mm is only the final
 /// guest-core root publication; preparation has already performed descriptor
 /// work. A failed settlement retains the closed child and never queues it.
@@ -408,9 +415,14 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn retire_mm(&mut self, mm: Self::Mm);
     fn apply_fault_reply(
         &mut self,
-        _slot: &carrick_el1_abi::PortalGrantSlot,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+        disposition: FaultReplyDisposition,
     ) -> Result<(), carrick_core::mm::transaction::MmError> {
-        Err(carrick_core::mm::transaction::MmError::Core)
+        if disposition == FaultReplyDisposition::Cancel && slot.window().is_none() {
+            Ok(())
+        } else {
+            Err(carrick_core::mm::transaction::MmError::Core)
+        }
     }
     fn wake_effects(&mut self, effects: WakeEffects);
     /// A guest drain opened ingress capacity for an owned host admission.

@@ -702,6 +702,17 @@ impl ForkStockCrossing for TestStockCrossing {
                 let settlement = unsafe {
                     &mut *(record_gpa as *mut carrick_el1_abi::NativeDescriptorSettlement)
                 };
+                #[cfg(test)]
+                if let Some(physical) = &self.physical {
+                    let (owner, generation, address) = settlement.request().unwrap();
+                    // SAFETY: the synchronous fixture retains the ring reply slot.
+                    let reply =
+                        unsafe { &*(address.raw() as *const carrick_el1_abi::PortalGrantSlot) };
+                    physical
+                        .lock()
+                        .unwrap()
+                        .settle_backing_reply(owner, generation, reply);
+                }
                 settlement
                     .accept()
                     .then_some(())

@@ -111,6 +111,7 @@ pub use carrick_observability::compat::{
 
 #[derive(Debug, Default)]
 struct QuarantinedChild {
+    supply_indeterminate: bool,
     released: bool,
     absent: bool,
 }
@@ -1196,6 +1197,89 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Ok(())
     }
 
+    /// One neutral physical/table/transport settlement owner. Guest candidates
+    /// without an exact retained transaction return `Ok(false)` unchanged.
+    /// Uncertain undo of an authenticated transaction retains the remaining
+    /// journal and permanently closes this exact MM.
+    pub fn settle_native_backing_reply(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+        release: impl FnOnce(
+            &<C as crate::physical_grants::NativeSupplyCustody>::Backing,
+        )
+            -> Result<crate::physical_grants::PhysicalGrantRelease, crate::TrapError>,
+    ) -> Result<bool, crate::TrapError>
+    where
+        C: crate::physical_grants::NativeSupplyCustody,
+    {
+        use crate::physical_grants::{BackingReplySettlement, NativeSupplyCustody};
+        let invalid =
+            || crate::TrapError::Hypervisor("native physical/table settlement mismatch".into());
+        // A stale predecessor cannot quarantine or mutate its live successor.
+        if self.child_owner(owner.mm()) != Some(owner) || self.child_root(owner.mm()) != Some(root)
+        {
+            return Ok(false);
+        }
+        // Guest candidates carry no settlement authority. Authenticate the
+        // retained physical transaction before interpreting a missing table
+        // journal as an internal custody failure.
+        if self
+            .child_physical_mut(owner.mm(), root)
+            .and_then(NativeSupplyCustody::supplied)
+            .and_then(|grants| grants.pending_backing_reply(reply, txn.id.generation))
+            != Some(*txn)
+        {
+            return Ok(false);
+        }
+        let result = (|| {
+            // Validate table custody before any physical undo can release
+            // bytes. Both owners retain this exact transaction under one lock.
+            if self.pending_native_descriptor_transaction(owner, root, txn.id.generation)
+                != Some(*txn)
+            {
+                return Err(invalid());
+            }
+            let outcome = self
+                .child_physical_mut(owner.mm(), root)
+                .and_then(NativeSupplyCustody::supplied)
+                .ok_or_else(invalid)?
+                .settle_backing_reply(reply, txn, release)?;
+            match outcome {
+                BackingReplySettlement::Receipt(receipt) => {
+                    self.settle_native_descriptor_tables(ledger, owner, root, &receipt)
+                }
+                BackingReplySettlement::Withdrawn => self
+                    .cancel_submitted_native_descriptor_tables(
+                        ledger,
+                        owner,
+                        root,
+                        txn.id.generation,
+                    ),
+            }
+            .map_err(|_| invalid())?;
+            self.child_physical_mut(owner.mm(), root)
+                .and_then(NativeSupplyCustody::supplied)
+                .ok_or_else(invalid)?
+                .acknowledge_backing_reply(reply, txn)?;
+            Ok(true)
+        })();
+        if result.is_err() {
+            if let Some(grants) = self
+                .child_physical_mut(owner.mm(), root)
+                .and_then(NativeSupplyCustody::supplied)
+            {
+                grants.fail_backing_reply();
+            }
+            self.quarantine_native_supply(owner, root)
+                .map_err(|_| invalid())?;
+        }
+        result
+    }
+
     /// Return all grants after the guest withdrew an unclaimed submission.
     pub fn cancel_submitted_native_descriptor_tables(
         &mut self,
@@ -1511,6 +1595,23 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
     pub fn is_quarantined(&self, mm: ReservationMm) -> bool {
         MmKey::of(mm).is_some_and(|key| self.quarantine.contains_key(&key))
+    }
+
+    /// A publication undo is unknown. Preserve all pending table and physical
+    /// journals and close this exact incarnation before the carrier fails.
+    /// This is not an ordinary retirement or permission to reclaim anything.
+    pub fn quarantine_native_supply(
+        &mut self,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+    ) -> Result<(), ForkStockServiceError> {
+        let key = MmKey::of(owner.mm()).ok_or(ForkStockServiceError::StaleExecution)?;
+        if self.child_owner(owner.mm()) != Some(owner) || self.child_root(owner.mm()) != Some(root)
+        {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        self.quarantine.entry(key).or_default().supply_indeterminate = true;
+        Ok(())
     }
 
     /// Pages held by quarantined children (never in the reusable stock).
@@ -2168,6 +2269,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             .quarantine
             .iter_mut()
             .filter_map(|(key, state)| {
+                if state.supply_indeterminate {
+                    return None;
+                }
                 let absence = (Some(*key) != active)
                     .then(|| key.mm().and_then(&occupancy))
                     .flatten()
