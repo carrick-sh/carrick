@@ -446,16 +446,28 @@ impl MemState {
 
     /// Record `range` resident, each piece under the owner that holds it
     /// now. O(log n + k) in the root nodes `range` touches.
-    pub(in crate::dispatch) fn record_resident(&mut self, range: carrick_vfs::GuestMemoryRange) {
+    pub(in crate::dispatch) fn record_resident(
+        &mut self,
+        range: carrick_vfs::GuestMemoryRange,
+    ) -> Result<(), RootAccessRefusal> {
         let (start, end) = (range.start().raw(), range.end().raw());
         let pieces = if self.venue_owns(start, end) {
             Vec::new()
         } else {
-            self.try_root_first_touch_pieces(start, end)
-                .unwrap_or_else(|refusal| broken_root("resident record pieces", refusal))
+            self.try_root_first_touch_pieces(start, end)?
         };
+        self.record_resident_pieces(range, &pieces);
+        Ok(())
+    }
+
+    pub(in crate::dispatch) fn record_resident_pieces(
+        &mut self,
+        range: carrick_vfs::GuestMemoryRange,
+        pieces: &[RootPiece],
+    ) {
+        let (start, end) = (range.start().raw(), range.end().raw());
         let mut cursor = start;
-        for piece in &pieces {
+        for piece in pieces {
             if let Some(host) = carrick_vfs::GuestMemoryRange::new(
                 GuestVa::new(cursor),
                 GuestVa::new(piece.range.start().raw()),
@@ -1282,7 +1294,10 @@ impl<'a> MemView<'a> {
             GuestVa::new(start),
             GuestVa::new(start.saturating_add(len)),
         ) {
-            self.mem().lock().record_resident(range);
+            self.mem()
+                .lock()
+                .record_resident(range)
+                .unwrap_or_else(|refusal| broken_root("resident range", refusal));
         }
     }
 
@@ -1700,7 +1715,8 @@ impl<'a> MemView<'a> {
         };
         let mem_authority_33 = self.mem();
         let mut mem = mem_authority_33.lock();
-        mem.record_resident(range);
+        mem.record_resident(range)
+            .unwrap_or_else(|refusal| broken_root("resident range commit", refusal));
         mem.resident_fault_ranges.disarm(range);
     }
 
@@ -1830,7 +1846,8 @@ impl<'a> MemView<'a> {
         }
         let mem_authority_35 = self.mem();
         let mut mem = mem_authority_35.lock();
-        mem.record_resident(range);
+        mem.record_resident(range)
+            .unwrap_or_else(|refusal| broken_root("resident range commit", refusal));
         mem.resident_fault_ranges.disarm(range);
         Ok(())
     }

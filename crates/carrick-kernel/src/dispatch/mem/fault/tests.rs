@@ -818,7 +818,11 @@ fn reconciled_el1_commit_joins_host_residency_and_disarms_first_touch() {
         .unwrap();
     let mut executor = dispatcher.enter_mm_executor().unwrap();
     let guard = crate::dispatch::mm_mutation::from_executor(&mut executor).unwrap();
-    assert!(dispatcher.reconcile_el1_resident_page(&guard, base + page));
+    assert!(
+        dispatcher
+            .reconcile_el1_resident_page(&guard, base + page)
+            .unwrap()
+    );
     assert_eq!(
         dispatcher.mincore_residency_vector(&memory, base, 3, page),
         Some(vec![1, 1, 0])
