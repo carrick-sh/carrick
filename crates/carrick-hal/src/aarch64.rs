@@ -96,6 +96,16 @@ pub fn is_aarch64_hvc_metadata_grant(syndrome: u64) -> bool {
     is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == AARCH64_HVC_METADATA_GRANT_IMM
 }
 
+/// HVC immediate of host-driven EL1 service returns and effect yields (`hvc #7`),
+/// distinct from `hvc #1` so exit attribution counts real TLB maintenance
+/// separately from owner-service completions.
+pub const AARCH64_HVC_SERVICE_IMM: u64 = 7;
+
+/// True for a host-driven EL1 service return or effect yield (`hvc #7`).
+pub fn is_aarch64_hvc_service(syndrome: u64) -> bool {
+    is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == AARCH64_HVC_SERVICE_IMM
+}
+
 /// True for syscall-shaped traps a host can dispatch identically: EL0 `svc #0`
 /// (`EC = 0x15`) and an EL1 vector's `hvc #2` re-trap (`EC = 0x16`). Both
 /// deliver the syscall ABI registers unchanged.
@@ -106,7 +116,8 @@ pub fn is_aarch64_syscall_exception(syndrome: u64) -> bool {
             && !is_aarch64_hvc_fault(syndrome)
             && !is_aarch64_hvc_kick(syndrome)
             && !is_aarch64_hvc_idle(syndrome)
-            && !is_aarch64_hvc_metadata_grant(syndrome))
+            && !is_aarch64_hvc_metadata_grant(syndrome)
+            && !is_aarch64_hvc_service(syndrome))
 }
 
 /// Whether a captured vCPU PC is genuine guest userspace (EL0) or inside
@@ -215,6 +226,10 @@ mod tests {
         // hvc #6 is the metadata grant marker.
         assert!(is_aarch64_hvc_metadata_grant(esr(0x16, 6)));
         assert!(!is_aarch64_syscall_exception(esr(0x16, 6)));
+        // hvc #7 is the host-driven service return / effect yield marker.
+        assert!(is_aarch64_hvc_service(esr(0x16, 7)));
+        assert!(!is_aarch64_hvc_maintenance(esr(0x16, 7)));
+        assert!(!is_aarch64_syscall_exception(esr(0x16, 7)));
         // A #3 HVC must NOT be mistaken for the maintenance marker, and vice
         // versa — the run loop dispatches on these to wholly different paths.
         assert!(!is_aarch64_hvc_maintenance(esr(0x16, 3)));

@@ -270,6 +270,7 @@ pub const LINUX_PAGE_TABLES_SIZE: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_P
 // PXN=0/UXN=1). 0x20000 (PT base) + 0x1C0000 (PT size) = 0x1E0000.
 pub const LINUX_EL1_MAINT_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x1E0000;
 pub const LINUX_EL1_MAINT_SIZE: u64 = 0x4000;
+pub const LINUX_EL1_SERVICE_RETURN_BASE: u64 = LINUX_EL1_MAINT_BASE + 20;
 pub const LINUX_EL1_ASID_MAINT_BASE: u64 = LINUX_EL1_MAINT_BASE + 0x100;
 // Layout invariant: the page tables + the maintenance trampoline must both sit
 // inside the kernel hole's first 2 MiB block (mapped kernel-only EL1-RWX by the
@@ -533,6 +534,9 @@ const AARCH64_HVC_KICK_OPCODE: u32 = AARCH64_HVC0_OPCODE | (4 << 5);
 // thread parked in the in-guest scheduler and host work arrived while the
 // vCPU idled; no thread is on the vCPU.
 const AARCH64_HVC_IDLE_OPCODE: u32 = AARCH64_HVC0_OPCODE | (5 << 5);
+// AArch64 `hvc #7` — completion/effect marker for host-driven EL1 service calls
+// so exit attribution counts real TLB maintenance (`hvc #1`) separately.
+const AARCH64_HVC_SERVICE_OPCODE: u32 = AARCH64_HVC0_OPCODE | (7 << 5);
 // AArch64 `mov x8, #139`, the Linux aarch64 rt_sigreturn syscall number.
 const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
 // AArch64 `svc #0`, used by the user-mode sigreturn trampoline.
@@ -4124,6 +4128,7 @@ pub fn el1_maintenance_bytes() -> Vec<u8> {
         AARCH64_DSB_SY_OPCODE,         // make the invalidation observable
         AARCH64_ISB_OPCODE,            // resynchronise translation
         AARCH64_HVC1_OPCODE,           // trap back to host: maintenance complete
+        AARCH64_HVC_SERVICE_OPCODE,    // trap back to host: service call complete
     ] {
         let bytes_le = opcode.to_le_bytes();
         bytes[offset..offset + bytes_le.len()].copy_from_slice(&bytes_le);
@@ -8240,6 +8245,8 @@ mod stage1_tests {
         assert_eq!(op(3), AARCH64_ISB_OPCODE);
         assert_eq!(op(4), AARCH64_HVC1_OPCODE);
         assert_eq!(AARCH64_HVC1_OPCODE, 0xd400_0022); // hvc #1
+        assert_eq!(op(5), AARCH64_HVC_SERVICE_OPCODE);
+        assert_eq!(AARCH64_HVC_SERVICE_OPCODE, 0xd400_00e2); // hvc #7
         // Trampoline stays inside the kernel hole's first 2 MiB block.
         let end_off = (LINUX_EL1_MAINT_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_EL1_MAINT_SIZE;
         assert!(end_off <= 0x200000);

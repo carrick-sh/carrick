@@ -744,7 +744,7 @@ pub fn with_hardware_cow_venue<R>(
                 || {
                     #[cfg(target_arch = "aarch64")]
                     unsafe {
-                        core::arch::asm!("hvc #1", options(nostack));
+                        core::arch::asm!("hvc #7", options(nostack));
                     }
                     #[cfg(target_arch = "x86_64")]
                     crate::isa::x86::yield_host_effect();

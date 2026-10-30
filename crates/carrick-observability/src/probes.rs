@@ -6381,7 +6381,7 @@ mod real {
         /// the carrier's exhaustive exit counters. `vcpu` is the HVF id,
         /// `class` the `carrick_el1_abi::HostExitClass` ordinal (0 canceled,
         /// 1 idle, 2 kick, 3 syscall, 4 metadata, 5 maintenance, 6 fault,
-        /// 7 other), `syndrome` the raw ESR HVF reported (authoritative only
+        /// 7 other, 8 service), `syndrome` the raw ESR HVF reported (authoritative only
         /// for EXCEPTION exits). Every return fires, including the ones the
         /// loop resumes internally, so per-class counts close to the total.
         fn vcpu__run__exit(_: u64, _: u32, _: u64) {}
