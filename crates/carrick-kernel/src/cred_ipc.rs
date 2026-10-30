@@ -41,8 +41,18 @@ const CRED_DIR: &str = "/tmp";
 /// `u64::MAX` is the sentinel for "never published yet".
 static LAST_PUBLISHED: AtomicU64 = AtomicU64::new(u64::MAX);
 
+#[cfg(not(any(test, feature = "test-support")))]
+fn cred_dir() -> PathBuf {
+    PathBuf::from(CRED_DIR)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn cred_dir() -> PathBuf {
+    test_scope::current_cred_dir().unwrap_or_else(|| PathBuf::from(CRED_DIR))
+}
+
 fn cred_path(pid: i32) -> PathBuf {
-    PathBuf::from(CRED_DIR).join(format!("carrick-cred-{pid}"))
+    cred_dir().join(format!("carrick-cred-{pid}"))
 }
 
 fn publication_key(host_pid: u32, euid: NsUid) -> u64 {
@@ -127,6 +137,106 @@ pub fn unpublish() {
     LAST_PUBLISHED.store(u64::MAX, Ordering::Relaxed);
 }
 
+#[cfg(any(test, feature = "test-support"))]
+mod test_scope {
+    use std::cell::RefCell;
+    use std::io::{self, Write as _};
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+
+    use carrick_abi::NsUid;
+
+    thread_local! {
+        static TEST_CRED_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current_cred_dir() -> Option<PathBuf> {
+        TEST_CRED_DIR.with(|slot| slot.borrow().clone())
+    }
+
+    /// Scoped test-owned directory for `cred_ipc` publications and reads on the
+    /// current thread.
+    ///
+    /// Keeps unit tests out of shared `/tmp/carrick-cred-<pid>` paths (where a
+    /// stale file left by another host uid in sticky `/tmp` cannot be unlinked
+    /// or overwritten) and removes the owned `TempDir` on every exit path.
+    #[derive(Debug)]
+    pub struct CredDirScope {
+        previous: Option<PathBuf>,
+        dir: PathBuf,
+        _tempdir: Option<tempfile::TempDir>,
+    }
+
+    impl CredDirScope {
+        /// Point `cred_ipc` on the current thread at a fresh test-owned
+        /// temporary directory removed when this guard drops.
+        pub fn tempdir() -> io::Result<Self> {
+            let tempdir = tempfile::Builder::new().prefix("carrick-cred-").tempdir()?;
+            let dir = tempdir.path().to_path_buf();
+            let previous = TEST_CRED_DIR.with(|slot| slot.replace(Some(dir.clone())));
+            super::LAST_PUBLISHED.store(u64::MAX, Ordering::Relaxed);
+            Ok(Self {
+                previous,
+                dir,
+                _tempdir: Some(tempdir),
+            })
+        }
+
+        /// Point `cred_ipc` on the current thread at caller-supplied `dir` for
+        /// the life of this guard.
+        pub fn in_dir(dir: impl Into<PathBuf>) -> Self {
+            let dir = dir.into();
+            let previous = TEST_CRED_DIR.with(|slot| slot.replace(Some(dir.clone())));
+            super::LAST_PUBLISHED.store(u64::MAX, Ordering::Relaxed);
+            Self {
+                previous,
+                dir,
+                _tempdir: None,
+            }
+        }
+
+        /// Directory backing this credential scope.
+        pub fn path(&self) -> &Path {
+            &self.dir
+        }
+
+        /// Credential projection file path for `pid` inside this scope.
+        pub fn cred_path(&self, pid: i32) -> PathBuf {
+            self.dir.join(format!("carrick-cred-{pid}"))
+        }
+
+        /// Write a mode-`0600` credential projection for `pid` inside this
+        /// scope's directory.
+        pub fn publish_for_pid(&self, pid: i32, euid: NsUid) -> io::Result<()> {
+            let path = self.cred_path(pid);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(&euid.raw().to_le_bytes())?;
+            file.sync_all()
+        }
+    }
+
+    impl Drop for CredDirScope {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            TEST_CRED_DIR.with(|slot| {
+                *slot.borrow_mut() = previous;
+            });
+            super::LAST_PUBLISHED.store(u64::MAX, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub use test_scope::CredDirScope;
+
 #[cfg(test)]
 mod tests {
     use super::publication_key;
@@ -142,5 +252,63 @@ mod tests {
             publication_key(41, NsUid::new(1000)),
             publication_key(41, NsUid::new(1001))
         );
+    }
+
+    mod serial_host {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use super::super::{CredDirScope, publish_self, read_target};
+        use carrick_abi::NsUid;
+
+        #[test]
+        fn cred_dir_scope_isolates_publications_and_cleans_up_on_unwind() {
+            let ambient = tempfile::tempdir().expect("create ambient dir");
+            let _outer = CredDirScope::in_dir(ambient.path());
+            let live_pid = std::process::id() as i32;
+            let obstructed = ambient.path().join(format!("carrick-cred-{live_pid}"));
+            std::fs::create_dir(&obstructed).expect("plant unremovable directory obstacle");
+            std::fs::set_permissions(&obstructed, std::fs::Permissions::from_mode(0o500))
+                .expect("lock obstacle directory");
+
+            assert_eq!(read_target(live_pid), None);
+
+            let inner_dir = {
+                let inner = CredDirScope::tempdir().expect("create scoped cred dir");
+                let dir = inner.path().to_path_buf();
+                inner
+                    .publish_for_pid(live_pid, NsUid::new(2000))
+                    .expect("publish into test-owned directory");
+                assert!(inner.cred_path(live_pid).exists());
+                assert_eq!(read_target(live_pid), Some(NsUid::new(2000)));
+                publish_self(NsUid::new(1000));
+                assert_eq!(read_target(live_pid), Some(NsUid::new(1000)));
+                dir
+            };
+            assert!(
+                !inner_dir.exists(),
+                "normal drop must remove scoped directory"
+            );
+            assert_eq!(read_target(live_pid), None);
+
+            let unwound_dir = std::sync::Mutex::new(None);
+            let panic_res = std::panic::catch_unwind(|| {
+                let inner = CredDirScope::tempdir().expect("create scoped cred dir");
+                *unwound_dir.lock().unwrap() = Some(inner.path().to_path_buf());
+                inner
+                    .publish_for_pid(live_pid, NsUid::new(3000))
+                    .expect("publish before unwind");
+                panic!("simulated failure");
+            });
+            assert!(panic_res.is_err());
+            let unwound_dir = unwound_dir.into_inner().unwrap().unwrap();
+            assert!(
+                !unwound_dir.exists(),
+                "unwind drop must remove scoped directory"
+            );
+            assert_eq!(read_target(live_pid), None);
+
+            std::fs::set_permissions(&obstructed, std::fs::Permissions::from_mode(0o700))
+                .expect("unlock obstacle directory for cleanup");
+        }
     }
 }

@@ -2,6 +2,9 @@
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
 # reason codes and unchanged text; retain the existing execution controls.
+# #1115: isolate cross_process_sigqueue test credential fixtures in a
+# test-owned TempDir instead of shared /tmp/carrick-cred-<ppid>; test-only
+# change with no effect on owner-wait semantics or work budgets.
 schema_version = 1
 id = "kernel.memory.owner-wait"
 title = "Owner-memory waits have one killable settlement owner"

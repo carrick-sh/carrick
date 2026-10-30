@@ -7235,7 +7235,6 @@ mod tests {
 
         #[test]
         fn cross_process_sigqueue_checks_guest_credentials_before_ring_capacity() {
-            use std::os::unix::fs::PermissionsExt as _;
             use zerocopy::IntoBytes;
 
             // `bootstrap_signal_send_as` is the subject here, and
@@ -7273,15 +7272,11 @@ mod tests {
             // retired test-only credential adapter.
             let child_pid = i64::from(unsafe { libc::getppid() });
             let target_euid = carrick_abi::NsUid::new(2000);
-            let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
-            let _ = std::fs::remove_file(&cred_path);
-            std::fs::write(&cred_path, target_euid.raw().to_le_bytes())
+            let cred_scope =
+                crate::cred_ipc::CredDirScope::tempdir().expect("create test credential directory");
+            cred_scope
+                .publish_for_pid(child_pid as i32, target_euid)
                 .expect("publish target guest euid");
-            let mut permissions = std::fs::metadata(&cred_path)
-                .expect("read target cred metadata")
-                .permissions();
-            permissions.set_mode(0o600);
-            std::fs::set_permissions(&cred_path, permissions).expect("secure target cred fixture");
             let published_euid = crate::cred_ipc::read_target(child_pid as i32);
 
             let d = SyscallDispatcher::new();
@@ -7320,7 +7315,6 @@ mod tests {
                 false,
             );
 
-            let _ = std::fs::remove_file(cred_path);
             let _ = carrick_signal_linux::xsig::xsig_drain_for_self();
 
             assert_eq!(published_euid, Some(target_euid));
@@ -7333,7 +7327,6 @@ mod tests {
 
         #[test]
         fn cross_process_sigqueue_signal_zero_checks_guest_credentials() {
-            use std::os::unix::fs::PermissionsExt as _;
             use zerocopy::IntoBytes;
 
             // `bootstrap_signal_send_as` is the subject here, and
@@ -7354,15 +7347,11 @@ mod tests {
             // no Carrick-created host child belongs in this retired adapter test.
             let child_pid = i64::from(unsafe { libc::getppid() });
             let target_euid = carrick_abi::NsUid::new(2000);
-            let cred_path = std::path::PathBuf::from(format!("/tmp/carrick-cred-{child_pid}"));
-            let _ = std::fs::remove_file(&cred_path);
-            std::fs::write(&cred_path, target_euid.raw().to_le_bytes())
+            let cred_scope =
+                crate::cred_ipc::CredDirScope::tempdir().expect("create test credential directory");
+            cred_scope
+                .publish_for_pid(child_pid as i32, target_euid)
                 .expect("publish target guest euid");
-            let mut permissions = std::fs::metadata(&cred_path)
-                .expect("read target cred metadata")
-                .permissions();
-            permissions.set_mode(0o600);
-            std::fs::set_permissions(&cred_path, permissions).expect("secure target cred fixture");
             let published_euid = crate::cred_ipc::read_target(child_pid as i32);
 
             let d = SyscallDispatcher::new();
@@ -7388,13 +7377,36 @@ mod tests {
             let outcome =
                 d.sigqueueinfo_common(&cx, child_pid, child_pid, 0, GuestPtr(0x400), false);
 
-            let _ = std::fs::remove_file(cred_path);
             assert_eq!(published_euid, Some(target_euid));
             assert_eq!(
                 outcome,
                 DispatchOutcome::errno(LINUX_EPERM),
                 "signal 0 must apply the guest credential permission check"
             );
+        }
+
+        #[test]
+        fn cross_process_sigqueue_credential_checks_ignore_obstructed_ambient_cred_path() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let ambient = tempfile::tempdir().expect("create ambient cred directory");
+            let _ambient_scope = crate::cred_ipc::CredDirScope::in_dir(ambient.path());
+            let child_pid = unsafe { libc::getppid() };
+            let obstructed = ambient.path().join(format!("carrick-cred-{child_pid}"));
+            std::fs::create_dir(&obstructed).expect("plant unremovable obstacle at cred path");
+            std::fs::set_permissions(&obstructed, std::fs::Permissions::from_mode(0o500))
+                .expect("lock obstacle directory");
+
+            cross_process_sigqueue_checks_guest_credentials_before_ring_capacity();
+            cross_process_sigqueue_signal_zero_checks_guest_credentials();
+
+            assert_eq!(
+                crate::cred_ipc::read_target(child_pid),
+                None,
+                "inner per-test credential scopes must restore the ambient scope cleanly"
+            );
+            std::fs::set_permissions(&obstructed, std::fs::Permissions::from_mode(0o700))
+                .expect("unlock obstacle directory for cleanup");
         }
 
         #[test]
