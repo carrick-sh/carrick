@@ -1115,12 +1115,7 @@ where
         };
         if let ForkMemoryAuthority::Setup(setup) = &parent_mutation {
             if let Some(engine) = (memory as &dyn std::any::Any).downcast_ref::<E>() {
-                super::signal::reconcile_guest_frame_commits(&kernel.dispatcher, engine, setup)
-                    .map_err(|busy| {
-                        RuntimeError::Dispatch(
-                            carrick_kernel::dispatch::DispatchError::ReservationBusy(busy),
-                        )
-                    })?;
+                super::signal::reconcile_guest_frame_commits(&kernel.dispatcher, engine, setup)?;
             }
             if !shares_mm {
                 let permit = setup.host_alias_permit();
