@@ -536,12 +536,25 @@ acceptance.
   the merged tree.
 - **Worktree lifecycle:** remove the worktree and `target/` on every host when
   a PR merges (`git worktree remove --force <path>` and prune).
-- **Workers prove their slice; the director gates the batch.** Workers run
-  focused tests, `just clippy` and `just lint-domains` (plus scoped signed
-  witnesses when they have HVF) and post the results on the PR. The director
+- **Workers prove their slice; CI and the director gate the rest** (owner,
+  2026-10-30, #231 items 4 and 5). Workers run the focused suites of the
+  crates they touched (regular and `serial_host` partitions),
+  `just check-contract-change <main-sha> HEAD`,
+  `just xtask authority-debt --source-only` and the pre-push clippy hook,
+  plus the checks their change calls for:
+  - `just cross-check-macos` for `cfg(target_os = "macos")` or HVF-adjacent code;
+  - `just check-linux` (aarch64-Linux KVM crates) and
+    `cargo check -p carrick-vmm-kvm` for KVM, HAL or host-linux code;
+  - a red-first witness that drives the production entry point, never a
+    test-only inner helper;
+  - scoped signed witnesses when they have HVF.
+
+  Whole-workspace `just lint-domains` and `just test-kernel` are left to CI.
+  Workers post the results on the PR. Shared-kernel changes start with a
+  design post on the issue, reviewed before code (#231 item 3). The director
   runs `just accept --profile linux-portable` and the signed gate once per
-  stack, at the top PR's SHA, in a dedicated detached worktree, never in a
-  worker's live worktree.
+  stack or batch, at the top SHA, in a dedicated detached worktree, never in
+  a worker's live worktree.
 - **Routing:** a strong design-capable worker for shared-kernel, mm, fork,
   signal, carrier and seam work; a fast instruction-following worker for
   precisely specified mechanical work. A lane refused by one provider's
