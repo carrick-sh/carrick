@@ -2119,3 +2119,11 @@ contracts = ["kernel.el1.anonymous-reservations"]
 [[surfaces]]
 path = "crates/carrick-core-abi/src/mm/residency/stock_tests.rs"
 contracts = ["kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/mm/residency/adoption.rs"
+contracts = ["kernel.el1.anonymous-reservations"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/mm/residency/adoption_tests.rs"
+contracts = ["kernel.el1.anonymous-reservations"]
