@@ -265,12 +265,48 @@ pub fn prepare_handoff<C: EntryContext>(
         record: record_binding(binding, source, record)?,
     })
 }
+/// Publication notifies the exact execution owner's release venue.
+pub trait RecordRelease<C: EntryContext> {
+    fn record_released(
+        &self,
+        source: BornInZoneSource<'_, C>,
+        record: carrick_sched_core::RecordRef,
+    );
+}
+impl<C: EntryContext, F: Fn(BornInZoneSource<'_, C>, carrick_sched_core::RecordRef)>
+    RecordRelease<C> for F
+{
+    fn record_released(
+        &self,
+        source: BornInZoneSource<'_, C>,
+        record: carrick_sched_core::RecordRef,
+    ) {
+        self(source, record);
+    }
+}
+
 impl<C: EntryContext> HandoffStart<'_, C> {
-    fn published_yield(self, published: bool) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-        published.then(|| self.published())
+    fn published_yield(
+        self,
+        published: bool,
+        release: Option<&dyn RecordRelease<C>>,
+    ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+        published.then(|| self.published(release))
     }
 
-    pub(crate) fn published(self) -> carrick_core_abi::EntryHandoffReceipt<C> {
+    pub(crate) fn published(
+        self,
+        release: Option<&dyn RecordRelease<C>>,
+    ) -> carrick_core_abi::EntryHandoffReceipt<C> {
+        if let Some(release) = release {
+            release.record_released(
+                self.source,
+                carrick_sched_core::RecordRef {
+                    id: self.record.record,
+                    incarnation: self.record.incarnation.0,
+                },
+            );
+        }
         // SAFETY: callers invoke this only after their existing exact-record
         // publication succeeds, using the captured prepublication custody.
         unsafe {
@@ -288,8 +324,9 @@ pub fn publish_handoff_park<C: EntryContext>(
     start: HandoffStart<'_, C>,
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: EntryRecordGeneration,
+    release: Option<&dyn RecordRelease<C>>,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    publish_handoff_park_with(start, guard, sequence, ParkCustody::Interruptible)
+    publish_handoff_park_with(start, guard, sequence, ParkCustody::Interruptible, release)
 }
 
 enum ParkCustody {
@@ -303,8 +340,9 @@ pub(crate) fn publish_terminal_park<C: EntryContext>(
     start: HandoffStart<'_, C>,
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: EntryRecordGeneration,
+    release: Option<&dyn RecordRelease<C>>,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    publish_handoff_park_with(start, guard, sequence, ParkCustody::Terminal)
+    publish_handoff_park_with(start, guard, sequence, ParkCustody::Terminal, release)
 }
 
 fn publish_handoff_park_with<C: EntryContext>(
@@ -312,6 +350,7 @@ fn publish_handoff_park_with<C: EntryContext>(
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: EntryRecordGeneration,
     custody: ParkCustody,
+    release: Option<&dyn RecordRelease<C>>,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     if !core::ptr::eq(start.source.zone, guard.zone())
         || record_binding(start.binding, start.source, start.record.record) != Some(start.record)
@@ -340,7 +379,7 @@ fn publish_handoff_park_with<C: EntryContext>(
             return None;
         }
     }
-    Some(start.published())
+    Some(start.published(release))
 }
 
 /// Publish a yield handoff only after the running record has left the CPU
@@ -348,6 +387,7 @@ fn publish_handoff_park_with<C: EntryContext>(
 /// pre-switch record and binding, even though the live frame names a sibling.
 pub fn publish_handoff_yield<C: EntryContext>(
     start: HandoffStart<'_, C>,
+    release: Option<&dyn RecordRelease<C>>,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let zone = start.source.zone;
     let slot = start.source.slot;
@@ -357,7 +397,7 @@ pub fn publish_handoff_yield<C: EntryContext>(
     {
         return None;
     }
-    Some(start.published())
+    Some(start.published(release))
 }
 
 /// Yield a consumed native continuation to its host execution owner. The
@@ -367,6 +407,7 @@ pub fn yield_current_to_host<C: EntryContext>(
     binding: ExecutionBinding,
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
+    release: Option<&dyn RecordRelease<C>>,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let start = prepare_handoff(binding, source, record)?;
     let retained = source.zone.record(record);
@@ -390,7 +431,7 @@ pub fn yield_current_to_host<C: EntryContext>(
     // The successful transition proves publication even if the host claims
     // the row immediately after the queue lock is released. Do not reread
     // its now independently owned custody to decide whether we handed off.
-    start.published_yield(source.zone.unswitch(source.slot, record))
+    start.published_yield(source.zone.unswitch(source.slot, record), release)
 }
 
 /// Authenticate and retire the current record through its existing owner.
@@ -398,8 +439,9 @@ pub fn retire_current<C: EntryContext>(
     binding: ExecutionBinding,
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
+    release: Option<&dyn RecordRelease<C>>,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    retire_current_with(binding, source, record, || true)
+    retire_current_with(binding, source, record, release, || true)
 }
 
 /// The terminal owner commits provenance at the scheduler's release seam.
@@ -407,6 +449,7 @@ pub(crate) fn retire_current_with<C: EntryContext>(
     binding: ExecutionBinding,
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
+    release: Option<&dyn RecordRelease<C>>,
     finish: impl carrick_sched_core::RecordRelease,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let start = prepare_handoff(binding, source, record)?;
@@ -427,7 +470,7 @@ pub(crate) fn retire_current_with<C: EntryContext>(
         return None;
     }
     source.zone.publish_terminal(source.slot, identity);
-    Some(start.published())
+    Some(start.published(release))
 }
 
 /// Terminal authentication uses retained execution custody, never a freed
@@ -479,6 +522,104 @@ const _: () = ();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_release_is_scoped_to_two_execution_owners() {
+        use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
+        use core::sync::atomic::AtomicUsize;
+        fn running() -> (
+            std::boxed::Box<ZoneTables>,
+            ExecutionBinding,
+            carrick_sched_core::RecordId,
+        ) {
+            let layout = std::alloc::Layout::new::<ZoneTables>();
+            // SAFETY: the scheduler region is zero-valid and exclusively owned.
+            let zone = unsafe {
+                let pointer = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+                assert!(!pointer.is_null());
+                std::boxed::Box::from_raw(pointer)
+            };
+            let slot = SlotId::new(0);
+            let binding = ExecutionBinding {
+                task: EntryTaskKey::from_raw(7),
+                generation: SnapshotGeneration::from_raw(11),
+                mm: EntryMmKey::from_raw(13),
+                thread_generation: EntryThreadGeneration::from_raw(17),
+            };
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 0, Some(0), 0);
+            zone.enter_guest(slot);
+            let space = zone.spaces.publish_closed(13, 0x1000, 0x1000).unwrap();
+            zone.spaces.open(space);
+            let record = zone
+                .alloc_record(ThreadIdentity {
+                    tid: 7,
+                    serial: 17,
+                    mm: 13,
+                    generation: 11,
+                    file_table: 0,
+                    affinity: 0,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            assert!(zone.mark_native_owned(record));
+            zone.requeue_preempted(slot, record);
+            assert_eq!(zone.switch_in(slot), Some(record));
+            assert!(zone.install_space(slot, 13).is_some());
+            (zone, binding, record)
+        }
+        let (first, binding, record) = running();
+        let (second, other_binding, other_record) = running();
+        let first_count = AtomicUsize::new(0);
+        let second_count = AtomicUsize::new(0);
+        let first_ref = first.record_ref(record);
+        let second_ref = second.record_ref(other_record);
+        assert_eq!(
+            first_ref, second_ref,
+            "carrier identity must distinguish reused record numbers"
+        );
+        let first_release = |source: BornInZoneSource<'_, carrick_sched_core::ThreadCtx>,
+                             released| {
+            assert!(core::ptr::eq(source.zone, &*first));
+            assert_eq!(released, first_ref);
+            first_count.fetch_add(1, Ordering::Relaxed);
+        };
+        let second_release = |source: BornInZoneSource<'_, carrick_sched_core::ThreadCtx>,
+                              released| {
+            assert!(core::ptr::eq(source.zone, &*second));
+            assert_eq!(released, second_ref);
+            second_count.fetch_add(1, Ordering::Relaxed);
+        };
+        let slot = SlotId::new(0);
+        assert!(
+            yield_current_to_host(
+                binding,
+                BornInZoneSource { zone: &first, slot },
+                record,
+                Some(&first_release)
+            )
+            .is_some()
+        );
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 0);
+        assert_eq!(second.slot(slot).current(), Some(other_record));
+        assert!(
+            yield_current_to_host(
+                other_binding,
+                BornInZoneSource {
+                    zone: &second,
+                    slot
+                },
+                other_record,
+                Some(&second_release)
+            )
+            .is_some()
+        );
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn host_claim_after_yield_does_not_revoke_publication_receipt() {
@@ -534,7 +675,7 @@ mod tests {
             zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin),
             HostClaim::Claimed
         ));
-        assert!(start.published_yield(published).is_some());
+        assert!(start.published_yield(published, None).is_some());
     }
 
     #[test]

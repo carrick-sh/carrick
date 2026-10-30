@@ -124,7 +124,14 @@ pub(super) fn admit_root(
         _ => return Err(NativeProcessError::Invalid),
     }
     let owner = NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
-        source, task, page, control, address, address, words,
+        source,
+        task,
+        page,
+        control,
+        address,
+        address,
+        words,
+        Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )?;
     REGISTRY.register_root(Arc::new(owner), source, task, address)?;
     let binding =

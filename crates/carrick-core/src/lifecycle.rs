@@ -545,6 +545,82 @@ pub fn retire_host_member(
     Ok(())
 }
 
+/// Settle a pool-born exec caller into the replacement leader under the
+/// registry write lock. The sole surviving live unit transfers to
+/// `replacement` without dropping `page.live` to zero, `entry` moves
+/// `Published -> Reaped`, and `caller` records host terminal retirement.
+pub fn retire_exec_caller_member(
+    page: &dyn Lifecycle,
+    entry: EntryRef,
+    caller: &dyn MemberControl,
+    replacement: &dyn MemberControl,
+    registry: &RegistryWriteHeld<'_>,
+) -> Result<(), TransitionError> {
+    let _caller_pin = MemberControlCustody::retain(caller)?;
+    let _replacement_pin = MemberControlCustody::retain(replacement)?;
+    if caller.member_entry() != Some(entry)
+        || replacement.member_entry().is_some()
+        || caller.host_retirement().is_some()
+        || replacement.host_retirement().is_some()
+        || page.live() != 1
+    {
+        return Err(TransitionError::StaleGeneration);
+    }
+    let mut claim = claim_member_exit(&caller.exit_custody().word)
+        .map_err(|_| TransitionError::StaleGeneration)?;
+    let _waiter = finish_member_word(
+        &caller.exit_custody().word,
+        HOST_RETIRING,
+        0,
+        Ordering::SeqCst,
+    );
+    if let Err(error) = page.retire_published(entry) {
+        if caller.member_entry() == Some(entry) {
+            caller
+                .exit_custody()
+                .word
+                .fetch_and(!HOST_RETIRING, Ordering::SeqCst);
+        }
+        return Err(error);
+    }
+    claim.committed = true;
+    caller.exit_custody().commit_host_zone_terminal(registry);
+    Ok(())
+}
+
+/// Settle an entry-less exec caller into the replacement leader under the
+/// registry write lock. The sole surviving live unit transfers to
+/// `replacement` without dropping `page.live` to zero, and `caller` records
+/// host terminal retirement.
+pub fn transfer_exec_caller_leader(
+    page: &dyn Lifecycle,
+    caller: &dyn MemberControl,
+    replacement: &dyn MemberControl,
+    registry: &RegistryWriteHeld<'_>,
+) -> Result<(), TransitionError> {
+    let _caller_pin = MemberControlCustody::retain(caller)?;
+    let _replacement_pin = MemberControlCustody::retain(replacement)?;
+    if caller.member_entry().is_some()
+        || replacement.member_entry().is_some()
+        || caller.host_retirement().is_some()
+        || replacement.host_retirement().is_some()
+        || page.live() != 1
+    {
+        return Err(TransitionError::StaleGeneration);
+    }
+    let mut claim = claim_member_exit(&caller.exit_custody().word)
+        .map_err(|_| TransitionError::StaleGeneration)?;
+    let _waiter = finish_member_word(
+        &caller.exit_custody().word,
+        HOST_RETIRING,
+        0,
+        Ordering::SeqCst,
+    );
+    claim.committed = true;
+    caller.exit_custody().commit_host_zone_terminal(registry);
+    Ok(())
+}
+
 /// Publish an exec/group-close cancellation for one exact pool member. The
 /// caller has already reserved its nonfinal live unit; this operation binds
 /// that unit to the member's in-zone receipt before making the entry reaped.

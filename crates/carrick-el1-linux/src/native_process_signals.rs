@@ -763,10 +763,15 @@ mod tests {
                 .map(|index| {
                     signals.project_member(
                         record(index),
-                        carrick_el1_abi::NativePendingCustody::try_admit(Arc::new(
-                            carrick_core::lifecycle::MemberControlCustody::retain(&controls[index])
+                        carrick_el1_abi::NativePendingCustody::try_admit(
+                            Arc::new(
+                                carrick_core::lifecycle::MemberControlCustody::retain(
+                                    &controls[index],
+                                )
                                 .unwrap(),
-                        ))
+                            ),
+                            alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+                        )
                         .unwrap(),
                     )
                 })
@@ -828,17 +833,19 @@ mod tests {
         };
         let first_projection = signals.project_member(
             record(1),
-            carrick_el1_abi::NativePendingCustody::try_admit(Arc::new(
-                carrick_core::lifecycle::MemberControlCustody::retain(&first).unwrap(),
-            ))
+            carrick_el1_abi::NativePendingCustody::try_admit(
+                Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&first).unwrap()),
+                alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+            )
             .unwrap(),
         );
         signals.enqueue(task, Signal::KILL, None).unwrap();
         let _second_projection = signals.project_member(
             record(2),
-            carrick_el1_abi::NativePendingCustody::try_admit(Arc::new(
-                carrick_core::lifecycle::MemberControlCustody::retain(&second).unwrap(),
-            ))
+            carrick_el1_abi::NativePendingCustody::try_admit(
+                Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&second).unwrap()),
+                alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+            )
             .unwrap(),
         );
         first_projection.rehome(record(3));
@@ -891,11 +898,19 @@ mod tests {
         };
         let first_projection = signals.project_member(
             record(1),
-            carrick_el1_abi::NativePendingCustody::try_admit(first_custody).unwrap(),
+            carrick_el1_abi::NativePendingCustody::try_admit(
+                first_custody,
+                alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+            )
+            .unwrap(),
         );
         let _second_projection = signals.project_member(
             record(2),
-            carrick_el1_abi::NativePendingCustody::try_admit(second_custody).unwrap(),
+            carrick_el1_abi::NativePendingCustody::try_admit(
+                second_custody,
+                alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+            )
+            .unwrap(),
         );
         signals.enqueue_thread(record(1), Signal::STOP, None);
         assert_eq!(first.pending().load().0, Signal::STOP.bit());
@@ -932,10 +947,17 @@ mod tests {
         };
         let projection = signals.project_member(
             record,
-            carrick_el1_abi::NativePendingCustody::try_admit(custody.clone()).unwrap(),
+            carrick_el1_abi::NativePendingCustody::try_admit(
+                custody.clone(),
+                alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+            )
+            .unwrap(),
         );
         signals.enqueue_thread(record, Signal::KILL, None);
-        let duplicate = carrick_el1_abi::NativePendingCustody::try_admit(custody);
+        let duplicate = carrick_el1_abi::NativePendingCustody::try_admit(
+            custody,
+            alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+        );
         assert_eq!(
             duplicate.err(),
             Some(carrick_el1_abi::NativePendingAlreadyAdmitted)

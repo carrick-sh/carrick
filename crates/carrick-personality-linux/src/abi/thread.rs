@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 19;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 20;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -359,6 +359,7 @@ impl<'a> From<&'a PendingSummary> for PendingRead<'a> {
 /// }
 /// ```
 pub struct NativePendingCustody<'a> {
+    release: ::alloc::sync::Arc<dyn NativePendingRelease + 'a>,
     control: ::alloc::sync::Arc<MemberControlCustody<'a, ThreadControlSlot>>,
 }
 #[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
@@ -367,13 +368,14 @@ pub struct NativePendingAlreadyAdmitted;
 impl<'a> NativePendingCustody<'a> {
     pub fn try_admit(
         control: ::alloc::sync::Arc<MemberControlCustody<'a, ThreadControlSlot>>,
+        release: ::alloc::sync::Arc<dyn NativePendingRelease + 'a>,
     ) -> Result<Self, NativePendingAlreadyAdmitted> {
         control
             .control()
             .native_pending_writer
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| NativePendingAlreadyAdmitted)?;
-        Ok(Self { control })
+        Ok(Self { control, release })
     }
     pub fn replace_from_locked_queue(&self, pending: PendingSignals) {
         self.control
@@ -382,6 +384,16 @@ impl<'a> NativePendingCustody<'a> {
             .replace_from_locked_queue(pending);
     }
 }
+/// An owned notification venue, retained with the exact pending writer.
+pub trait NativePendingRelease: Send + Sync {
+    fn pending_released(&self, control: &ThreadControlSlot);
+}
+impl<F: Fn(&ThreadControlSlot) + Send + Sync> NativePendingRelease for F {
+    fn pending_released(&self, control: &ThreadControlSlot) {
+        self(control);
+    }
+}
+
 impl Drop for NativePendingCustody<'_> {
     fn drop(&mut self) {
         let control = self.control.control();
@@ -389,6 +401,7 @@ impl Drop for NativePendingCustody<'_> {
             .native_pending
             .replace_from_locked_queue(PendingSignals(0));
         control.native_pending_writer.store(0, Ordering::Release);
+        self.release.pending_released(control);
     }
 }
 
@@ -508,6 +521,8 @@ impl ClearChildTidState {
 pub struct ThreadControlSlot {
     /// Namespace-visible identity, published before this incarnation is runnable.
     visible_tid: AtomicU32,
+    /// Retired predecessor caller tid for a committed host exec replacement.
+    exec_caller_tid: AtomicU32,
     blocked: AtomicU64,
     /// A forwarded temporary wait mask is restored by the native checkpoint.
     forwarded_saved_mask: AtomicU64,
@@ -556,6 +571,11 @@ pub struct ThreadControlSlot {
     // publishing this control to EL1. Never dereference the other venue's VA.
     affinity_host_alias: AtomicU64,
     affinity_guest_alias: AtomicU64,
+    /// Retired predecessor caller thread serial and replacement MM key for a
+    /// committed host exec replacement (`exec_successor_mm` last, cleared on
+    /// consumption).
+    exec_caller_thread: AtomicU64,
+    exec_successor_mm: AtomicU64,
     /// Exact native service custody survives execution-slot reuse.
     pub service: carrick_core_abi::service::ServiceCell,
 }
@@ -635,7 +655,10 @@ impl ThreadControlSlot {
             affinity: carrick_core::affinity::AffinityAuthority::new(),
             affinity_host_alias: AtomicU64::new(0),
             affinity_guest_alias: AtomicU64::new(0),
+            exec_caller_thread: AtomicU64::new(0),
+            exec_successor_mm: AtomicU64::new(0),
             visible_tid: AtomicU32::new(0),
+            exec_caller_tid: AtomicU32::new(0),
             blocked: AtomicU64::new(0),
             forwarded_saved_mask: AtomicU64::new(0),
             forwarded_mask_armed: AtomicU32::new(0),
@@ -793,6 +816,9 @@ impl ThreadControlSlot {
         if entry.is_none() {
             self.visible_tid.store(0, Ordering::Relaxed);
         }
+        self.exec_caller_tid.store(0, Ordering::Relaxed);
+        self.exec_caller_thread.store(0, Ordering::Relaxed);
+        self.exec_successor_mm.store(0, Ordering::Relaxed);
         self.zone_id.store(0, Ordering::Relaxed);
         self.retired_thread.store(0, Ordering::Relaxed);
         self.retired_task.store(0, Ordering::Relaxed);
@@ -1078,6 +1104,77 @@ impl ThreadControlSlot {
 
     pub fn host_exit_requested(&self) -> bool {
         self.host_exit_requested.custody().host_exit_requested()
+    }
+
+    pub fn native_pending_busy(&self) -> bool {
+        self.native_pending_writer.load(Ordering::Acquire) != 0
+    }
+
+    /// Publish the host exec receipt on the replacement leader's control slot.
+    /// The slot must already record `receipt.successor_leader()` as its
+    /// [`Self::host_birth_identity`].
+    pub fn publish_host_exec_receipt(
+        &self,
+        receipt: carrick_core::terminal::HostExecReceipt,
+    ) -> bool {
+        if self.host_birth_identity() != Some(receipt.successor_leader()) {
+            return false;
+        }
+        let Ok(caller_tid) = u32::try_from(receipt.predecessor_caller().task().raw()) else {
+            return false;
+        };
+        if caller_tid == 0 {
+            return false;
+        }
+        self.exec_caller_tid.store(caller_tid, Ordering::Relaxed);
+        self.exec_caller_thread.store(
+            receipt.predecessor_caller().thread().raw(),
+            Ordering::Relaxed,
+        );
+        self.exec_successor_mm
+            .store(receipt.successor_mm().raw(), Ordering::Release);
+        true
+    }
+
+    /// Observe an unconsumed host exec receipt on this replacement leader slot.
+    pub fn host_exec_receipt(&self) -> Option<carrick_core::terminal::HostExecReceipt> {
+        let mm = carrick_core_abi::entry::EntryMmKey::from_raw(
+            self.exec_successor_mm.load(Ordering::Acquire),
+        );
+        if mm.raw() == 0 {
+            return None;
+        }
+        let successor_leader = self.host_birth_identity()?;
+        let caller_tid = self.exec_caller_tid.load(Ordering::Relaxed);
+        let caller_thread = self.exec_caller_thread.load(Ordering::Relaxed);
+        let predecessor_caller = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::entry::EntryTaskKey::from_raw(u64::from(caller_tid)),
+            successor_leader.birth(),
+            carrick_core_abi::entry::EntryThreadGeneration::from_raw(caller_thread),
+        )?;
+        carrick_core::terminal::HostExecReceipt::from_parts(
+            predecessor_caller,
+            successor_leader,
+            mm,
+        )
+    }
+
+    /// Consume the exact host exec receipt after EL1 root-group rebind succeeds.
+    pub fn take_host_exec_receipt(
+        &self,
+        expected: carrick_core::terminal::HostExecReceipt,
+    ) -> bool {
+        if self.host_exec_receipt() != Some(expected) {
+            return false;
+        }
+        self.exec_successor_mm
+            .compare_exchange(
+                expected.successor_mm().raw(),
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 impl carrick_core::lifecycle::MemberControl for ThreadControlSlot {
@@ -2124,7 +2221,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 47] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 50] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, birth) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -2172,6 +2269,9 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 47] = [
     ::core::mem::size_of::<carrick_core::affinity::AffinityAuthority>() as u64,
     ::core::mem::offset_of!(ThreadControlSlot, affinity_host_alias) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, affinity_guest_alias) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, exec_caller_tid) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, exec_caller_thread) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, exec_successor_mm) as u64,
 ];
 
 #[cfg(test)]
@@ -2432,7 +2532,11 @@ mod tests {
     fn carrier_queue_cleanup_cannot_clear_native_pending_custody() {
         let control = ThreadControlSlot::new();
         let custody = Arc::new(MemberControlCustody::retain(&control).unwrap());
-        let native = NativePendingCustody::try_admit(custody.clone()).unwrap();
+        let native = NativePendingCustody::try_admit(
+            custody.clone(),
+            alloc::sync::Arc::new(|_: &ThreadControlSlot| {}),
+        )
+        .unwrap();
         native.replace_from_locked_queue(PendingSignals(0x100));
         let _ = control
             .carrier_pending()
@@ -2449,30 +2553,81 @@ mod tests {
     }
 
     #[test]
+    fn native_pending_release_is_scoped_to_two_owners() {
+        let first = ThreadControlSlot::new();
+        let second = ThreadControlSlot::new();
+        let first_count = Arc::new(AtomicU32::new(0));
+        let second_count = Arc::new(AtomicU32::new(0));
+        let first_notify = first_count.clone();
+        let second_notify = second_count.clone();
+        let first_writer = NativePendingCustody::try_admit(
+            Arc::new(MemberControlCustody::retain(&first).unwrap()),
+            Arc::new(move |control: &ThreadControlSlot| {
+                assert!(!control.native_pending_busy());
+                assert_eq!(control.pending().load(), PendingSignals(0));
+                first_notify.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+        .unwrap();
+        let second_writer = NativePendingCustody::try_admit(
+            Arc::new(MemberControlCustody::retain(&second).unwrap()),
+            Arc::new(move |control: &ThreadControlSlot| {
+                assert!(!control.native_pending_busy());
+                assert_eq!(control.pending().load(), PendingSignals(0));
+                second_notify.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+        .unwrap();
+        first_writer.replace_from_locked_queue(PendingSignals(0x100));
+        second_writer.replace_from_locked_queue(PendingSignals(0x400));
+        drop(first_writer);
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 0);
+        assert!(second.native_pending_busy());
+        assert_eq!(second.pending().load(), PendingSignals(0x400));
+        drop(second_writer);
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn native_pending_writer_admission_is_exclusive_until_drop() {
         let control = ThreadControlSlot::new();
         let custody = Arc::new(MemberControlCustody::retain(&control).unwrap());
-        let writer = NativePendingCustody::try_admit(custody.clone()).unwrap();
+        let writer = NativePendingCustody::try_admit(
+            custody.clone(),
+            alloc::sync::Arc::new(|_: &ThreadControlSlot| {}),
+        )
+        .unwrap();
         writer.replace_from_locked_queue(PendingSignals(0x100));
         // A different retain must encounter the same slot's admission claim.
         let independent = Arc::new(MemberControlCustody::retain(&control).unwrap());
         assert_eq!(
-            NativePendingCustody::try_admit(independent).err(),
+            NativePendingCustody::try_admit(
+                independent,
+                alloc::sync::Arc::new(|_: &ThreadControlSlot| {})
+            )
+            .err(),
             Some(NativePendingAlreadyAdmitted)
         );
         assert_eq!(control.pending().load(), PendingSignals(0x100));
         assert!(control.reset_for_host_birth(BlockedMask(0)).is_err());
         drop(writer);
         assert_eq!(control.pending().load(), PendingSignals(0));
-        let successor = NativePendingCustody::try_admit(custody.clone()).unwrap();
+        let successor = NativePendingCustody::try_admit(
+            custody.clone(),
+            alloc::sync::Arc::new(|_: &ThreadControlSlot| {}),
+        )
+        .unwrap();
         successor.replace_from_locked_queue(PendingSignals(0x400));
         assert_eq!(control.pending().load(), PendingSignals(0x400));
         drop(successor);
         drop(custody);
         control.reset_for_host_birth(BlockedMask(0)).unwrap();
-        let next_birth = NativePendingCustody::try_admit(Arc::new(
-            MemberControlCustody::retain(&control).unwrap(),
-        ))
+        let next_birth = NativePendingCustody::try_admit(
+            Arc::new(MemberControlCustody::retain(&control).unwrap()),
+            alloc::sync::Arc::new(|_: &ThreadControlSlot| {}),
+        )
         .unwrap();
         assert_eq!(control.pending().load(), PendingSignals(0));
         drop(next_birth);
@@ -3163,6 +3318,7 @@ mod layout_manifest {
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
                      visible_tid: _,
+                     exec_caller_tid: _,
                      blocked: _,
                      forwarded_saved_mask: _,
                      forwarded_mask_armed: _,
@@ -3192,9 +3348,12 @@ mod layout_manifest {
                      affinity: _,
                      affinity_host_alias: _,
                      affinity_guest_alias: _,
+                     exec_caller_thread: _,
+                     exec_successor_mm: _,
                      service: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
+        field!(ThreadControlSlot, exec_caller_tid, AtomicU32, 4, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
         field!(ThreadControlSlot, forwarded_saved_mask, AtomicU64, 16, 8, 8);
         field!(ThreadControlSlot, forwarded_mask_armed, AtomicU32, 24, 4, 4);
@@ -3273,6 +3432,8 @@ mod layout_manifest {
             8,
             8
         );
+        field!(ThreadControlSlot, exec_caller_thread, AtomicU64, 240, 8, 8);
+        field!(ThreadControlSlot, exec_successor_mm, AtomicU64, 248, 8, 8);
         field!(
             ThreadControlSlot,
             service,
@@ -3281,6 +3442,36 @@ mod layout_manifest {
             128,
             64
         );
+    }
+
+    #[test]
+    fn host_exec_receipt_roundtrips_and_consumes_once() {
+        let control = ThreadControlSlot::new();
+        let birth = carrick_core_abi::entry::BirthSerial::of_task(
+            carrick_sched_core::process::TaskSerial::from_raw_u64(5).unwrap(),
+        );
+        let caller = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::entry::EntryTaskKey::from_raw(42),
+            birth,
+            carrick_core_abi::entry::EntryThreadGeneration::from_raw(9),
+        )
+        .unwrap();
+        let replacement = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::entry::EntryTaskKey::from_raw(41),
+            birth,
+            carrick_core_abi::entry::EntryThreadGeneration::from_raw(10),
+        )
+        .unwrap();
+        let mm = carrick_core_abi::entry::EntryMmKey::from_raw(7);
+        let receipt =
+            carrick_core::terminal::HostExecReceipt::from_parts(caller, replacement, mm).unwrap();
+        assert!(!control.publish_host_exec_receipt(receipt));
+        control.publish_host_birth_identity(replacement);
+        assert!(control.publish_host_exec_receipt(receipt));
+        assert_eq!(control.host_exec_receipt(), Some(receipt));
+        assert!(control.take_host_exec_receipt(receipt));
+        assert_eq!(control.host_exec_receipt(), None);
+        assert!(!control.take_host_exec_receipt(receipt));
     }
 
     #[test]

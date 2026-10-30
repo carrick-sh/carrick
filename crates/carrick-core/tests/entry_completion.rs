@@ -70,7 +70,8 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
             let operation = OperationToken::new(17, generation).unwrap();
             let request = ObjectParkRequest::new(key, snapshot, operation, None);
             let mut parked =
-                park_object_record(&zone, slot, request, &|_| {}, || Ok((record, false))).unwrap();
+                park_object_record(&zone, slot, request, &|_| {}, || Ok((record, false)), None)
+                    .unwrap();
             assert!(parked.matches(&zone, slot));
             // The entry turn ends here. Its token cannot later take the
             // ordinary path; the record owns the sole remaining operation.
@@ -228,6 +229,7 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         ObjectParkRequest::new(key, snapshot, OperationToken::new(17, 13).unwrap(), None),
         &|_| {},
         || Ok((record, false)),
+        None,
     )
     .unwrap();
     assert!(parked.matches(&zone, slot));
@@ -325,7 +327,8 @@ fn ordinary_handoff_rejects_foreign_scheduler_owner() {
     second
         .enqueue(&guard, record, sequence, 7, 0x1000, u32::MAX, 0)
         .unwrap();
-    let receipt = publish_handoff_park(start, &guard, EntryRecordGeneration(sequence)).unwrap();
+    let receipt =
+        publish_handoff_park(start, &guard, EntryRecordGeneration(sequence), None).unwrap();
     assert_eq!(
         handoff(token, receipt),
         Err(CompletionError::WrongGeneration)
@@ -432,9 +435,10 @@ fn terminal_park_hands_back_only_an_exact_requested_owner() {
                 start,
                 selected_guard,
                 EntryRecordGeneration(sequence),
+                None,
             )
         } else {
-            publish_handoff_park(start, selected_guard, EntryRecordGeneration(sequence))
+            publish_handoff_park(start, selected_guard, EntryRecordGeneration(sequence), None)
         };
         let accepted = terminal && owner_continuation && !wrong_guard;
         assert_eq!(receipt.is_some(), accepted);
@@ -491,7 +495,8 @@ fn compact_born_entry_parks_with_actual_handoff_receipt() {
         0,
     )
     .unwrap();
-    let receipt = publish_handoff_park(start, &guard, EntryRecordGeneration(sequence)).unwrap();
+    let receipt =
+        publish_handoff_park(start, &guard, EntryRecordGeneration(sequence), None).unwrap();
     assert!(
         matches!(zone.record(record).claim(), carrick_sched_core::Claim::Parked { seq } if seq == sequence)
     );
@@ -517,10 +522,10 @@ fn compact_ordinary_entry_retires_with_actual_handoff_receipt() {
         )
         .is_none()
     );
-    let receipt = retire_current(binding, source, record).unwrap();
+    let receipt = retire_current(binding, source, record, None).unwrap();
     assert!(zone.slot(slot).current().is_none());
     handoff(token, receipt).unwrap();
-    assert!(retire_current(binding, source, record).is_none());
+    assert!(retire_current(binding, source, record, None).is_none());
 }
 
 #[test]
@@ -532,7 +537,7 @@ fn compact_handoff_rejects_stale_record_incarnation_receipt() {
     let source = BornInZoneSource { zone: &zone, slot };
     let first = admit_born_in_zone(binding, source).unwrap();
     let captured_record = first.record();
-    let receipt = retire_current(binding, source, record).unwrap();
+    let receipt = retire_current(binding, source, record, None).unwrap();
     handoff_born_in_zone(first, receipt).unwrap();
     let identity = ThreadIdentity {
         tid: binding.task.raw(),
@@ -683,12 +688,12 @@ fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
     };
     assert!(
         custody
-            .retire_zone_current(&member, &mut _membership, foreign, source, record)
+            .retire_zone_current(&member, &mut _membership, foreign, source, record, None)
             .is_none()
     );
     assert_eq!(classify(), MissingContinuationVerdict::InvariantViolation);
     custody
-        .retire_zone_current(&member, &mut _membership, binding, source, record)
+        .retire_zone_current(&member, &mut _membership, binding, source, record, None)
         .unwrap();
     assert!(zone.live(reference).is_none());
     assert_eq!(
@@ -953,6 +958,7 @@ fn terminal_attempt(mode: TerminalAttempt) {
             binding,
             carrick_core_abi::BornInZoneSource { zone: &zone, slot },
             record,
+            None,
         );
         assert_eq!(released.is_some(), host_home);
     }

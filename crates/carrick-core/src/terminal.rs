@@ -335,8 +335,9 @@ pub fn park_process_exit<C: carrick_core_abi::EntryContext>(
     start: crate::entry::HandoffStart<'_, C>,
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: carrick_core_abi::EntryRecordGeneration,
+    release: Option<&dyn crate::entry::RecordRelease<C>>,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    crate::entry::publish_terminal_park(start, guard, sequence)
+    crate::entry::publish_terminal_park(start, guard, sequence, release)
 }
 
 /// Raw task membership supplied by the graph that owns its registry. Core
@@ -546,6 +547,98 @@ impl HostThreadRetirementReceipt {
     /// The identity this receipt retired.
     pub fn retired(self) -> ThreadBirthIdentity {
         self.0
+    }
+}
+
+/// Core-minted receipt for one host exec transition: the retired predecessor
+/// caller's birth identity, the replacement leader's birth identity, and the
+/// replacement address-space identity (`EntryMmKey`).
+///
+/// Only [`HostExecCallerMembership`] mints this receipt after settling the
+/// predecessor caller's pool entry (if any) and transferring the sole
+/// surviving live unit to the replacement leader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostExecReceipt {
+    predecessor_caller: ThreadBirthIdentity,
+    successor_leader: ThreadBirthIdentity,
+    successor_mm: EntryMmKey,
+}
+
+impl HostExecReceipt {
+    /// Reconstruct a published receipt from shared control-slot storage.
+    pub fn from_parts(
+        predecessor_caller: ThreadBirthIdentity,
+        successor_leader: ThreadBirthIdentity,
+        successor_mm: EntryMmKey,
+    ) -> Option<Self> {
+        (predecessor_caller.birth() == successor_leader.birth() && successor_mm.raw() != 0)
+            .then_some(Self {
+                predecessor_caller,
+                successor_leader,
+                successor_mm,
+            })
+    }
+
+    pub fn predecessor_caller(self) -> ThreadBirthIdentity {
+        self.predecessor_caller
+    }
+
+    pub fn successor_leader(self) -> ThreadBirthIdentity {
+        self.successor_leader
+    }
+
+    pub fn successor_mm(self) -> EntryMmKey {
+        self.successor_mm
+    }
+}
+
+pub struct HostExecCallerMembership;
+
+impl HostExecCallerMembership {
+    /// Settle a pool-born exec caller into the replacement leader.
+    ///
+    /// Transitions `entry` from `EntryState::Published` to `EntryState::Reaped`,
+    /// records `HOST_RETIRING` on `caller`, keeps `page.live() == 1` for
+    /// `replacement`, and mints the [`HostExecReceipt`] for `replacement`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "exact caller, replacement, entry, and registry proof are distinct inputs"
+    )]
+    pub fn retire_to_replacement_leader(
+        page: &dyn Lifecycle,
+        entry: EntryRef,
+        caller: &dyn MemberControl,
+        caller_identity: ThreadBirthIdentity,
+        replacement: &dyn MemberControl,
+        replacement_identity: ThreadBirthIdentity,
+        replacement_mm: EntryMmKey,
+        registry: &crate::lifecycle::RegistryWriteHeld<'_>,
+    ) -> Result<HostExecReceipt, crate::lifecycle::TransitionError> {
+        let receipt =
+            HostExecReceipt::from_parts(caller_identity, replacement_identity, replacement_mm)
+                .ok_or(crate::lifecycle::TransitionError::StaleGeneration)?;
+        crate::lifecycle::retire_exec_caller_member(page, entry, caller, replacement, registry)?;
+        Ok(receipt)
+    }
+
+    /// Settle an entry-less exec caller into the replacement leader.
+    ///
+    /// Records `HOST_RETIRING` on `caller`, keeps `page.live() == 1` for
+    /// `replacement`, and mints the [`HostExecReceipt`] for `replacement`.
+    pub fn transfer_leader_to_replacement(
+        page: &dyn Lifecycle,
+        caller: &dyn MemberControl,
+        caller_identity: ThreadBirthIdentity,
+        replacement: &dyn MemberControl,
+        replacement_identity: ThreadBirthIdentity,
+        replacement_mm: EntryMmKey,
+        registry: &crate::lifecycle::RegistryWriteHeld<'_>,
+    ) -> Result<HostExecReceipt, crate::lifecycle::TransitionError> {
+        let receipt =
+            HostExecReceipt::from_parts(caller_identity, replacement_identity, replacement_mm)
+                .ok_or(crate::lifecycle::TransitionError::StaleGeneration)?;
+        crate::lifecycle::transfer_exec_caller_leader(page, caller, replacement, registry)?;
+        Ok(receipt)
     }
 }
 
@@ -913,12 +1006,16 @@ impl TerminalCustody<Process, Closing> {
 }
 
 impl TerminalCustody<Process, Settled> {
+    // The caller already owns this box. Moving its large custody value out
+    // overflowed the 0x600 exit-frame ceiling; retain that existing allocation.
+    #[allow(clippy::boxed_local)]
     pub fn retire_caller_zone_current<C: carrick_core_abi::EntryContext>(
-        self,
+        self: Box<Self>,
         member: &dyn MemberControl,
         binding: ExecutionBinding,
         source: carrick_core_abi::BornInZoneSource<'_, C>,
         record: carrick_sched_core::RecordId,
+        release: Option<&dyn crate::entry::RecordRelease<C>>,
     ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         if self.identity.disposition != ProcessCloseDisposition::Exit
             || binding.mm != EntryMmKey::from_raw(self.identity.address.mm.raw().get())
@@ -926,7 +1023,7 @@ impl TerminalCustody<Process, Settled> {
             return None;
         }
         let _pin = crate::lifecycle::MemberControlCustody::retain(member).ok()?;
-        crate::entry::retire_current_with(binding, source, record, || {
+        crate::entry::retire_current_with(binding, source, record, release, || {
             member
                 .exit_custody()
                 .commit_zone_terminal(crate::lifecycle::NativeExitCompletion::Member);
@@ -1060,6 +1157,7 @@ pub fn settle_losing_zone_current<C: carrick_core_abi::EntryContext>(
     binding: ExecutionBinding,
     source: carrick_core_abi::BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
+    release: Option<&dyn crate::entry::RecordRelease<C>>,
 ) -> Option<LosingMemberSettlement<C>> {
     let _pin = crate::lifecycle::MemberControlCustody::retain(member).ok()?;
     crate::entry::prepare_handoff(binding, source, record)?;
@@ -1068,7 +1166,8 @@ pub fn settle_losing_zone_current<C: carrick_core_abi::EntryContext>(
             == MemberExitKind::InZone
         || member.host_retirement().is_some()
     {
-        crate::entry::retire_current(binding, source, record).map(LosingMemberSettlement::Released)
+        crate::entry::retire_current(binding, source, record, release)
+            .map(LosingMemberSettlement::Released)
     } else {
         Some(LosingMemberSettlement::HostCustody)
     }
@@ -1300,11 +1399,12 @@ impl ZoneRetirement<'_, '_> {
         binding: ExecutionBinding,
         source: carrick_core_abi::BornInZoneSource<'_, C>,
         record: carrick_sched_core::RecordId,
+        release: Option<&dyn crate::entry::RecordRelease<C>>,
     ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         if binding != self.identity.binding() {
             return None;
         }
-        crate::entry::retire_current_with(binding, source, record, self)
+        crate::entry::retire_current_with(binding, source, record, release, self)
     }
 }
 
@@ -1362,9 +1462,10 @@ impl TerminalCustody<Thread, Terminal> {
         binding: ExecutionBinding,
         source: carrick_core_abi::BornInZoneSource<'_, C>,
         record: carrick_sched_core::RecordId,
+        release: Option<&dyn crate::entry::RecordRelease<C>>,
     ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         self.zone_retirement(member, membership, None)?
-            .retire_current(binding, source, record)
+            .retire_current(binding, source, record, release)
     }
 
     /// A losing process-close caller has irrevocably selected terminal exit.
@@ -2074,5 +2175,119 @@ mod tests {
                 .observe_members(&page, &members, &wrong_generation, &[])
                 .is_none()
         );
+    }
+
+    #[test]
+    fn host_exec_caller_membership_settles_pool_or_leader_into_replacement() {
+        use crate::lifecycle::{EntryState, RegistryWriteHeld, pack};
+        struct PoolPage {
+            terminal: ProcessExitCustody,
+            gate: AtomicU32,
+            live: AtomicU32,
+            entry: AtomicEntry,
+        }
+        impl Lifecycle for PoolPage {
+            fn process_exit_custody(&self) -> &ProcessExitCustody {
+                &self.terminal
+            }
+            fn host_birth_receipt_returned_exact(&self, _: usize, _: ThreadBirthIdentity) -> bool {
+                false
+            }
+            fn gate_word(&self) -> &AtomicU32 {
+                &self.gate
+            }
+            fn live_word(&self) -> &AtomicU32 {
+                &self.live
+            }
+            fn entry_count(&self) -> usize {
+                1
+            }
+            fn entry_word(&self, index: usize) -> Option<&AtomicEntry> {
+                (index == 0).then_some(&self.entry)
+            }
+            fn activity(&self) -> Option<&crate::lifecycle::ThreadLedgerActivity> {
+                None
+            }
+        }
+        struct Control {
+            entry: Option<EntryRef>,
+            exit: crate::lifecycle::MemberExitCustody,
+        }
+        impl MemberControl for Control {
+            fn member_entry(&self) -> Option<EntryRef> {
+                self.entry
+            }
+            fn exit_custody(&self) -> &crate::lifecycle::MemberExitCustody {
+                &self.exit
+            }
+            fn host_retirement(&self) -> Option<HostThreadRetirementReceipt> {
+                None
+            }
+        }
+
+        let entry = EntryRef::new(0, 1);
+        let page = PoolPage {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(carrick_core_abi::lifecycle::GateState::ForkClosing as u32),
+            live: AtomicU32::new(1),
+            entry: AtomicEntry::new(pack(1, EntryState::Published)),
+        };
+        let caller = Control {
+            entry: Some(entry),
+            exit: crate::lifecycle::MemberExitCustody::new(),
+        };
+        let replacement = Control {
+            entry: None,
+            exit: crate::lifecycle::MemberExitCustody::new(),
+        };
+        let caller_id = birth_receipt(42, 7, 2);
+        let replacement_id = birth_receipt(41, 7, 3);
+        let mm = EntryMmKey::from_raw(9);
+        let receipt = HostExecCallerMembership::retire_to_replacement_leader(
+            &page,
+            entry,
+            &caller,
+            caller_id,
+            &replacement,
+            replacement_id,
+            mm,
+            &RegistryWriteHeld::for_test(),
+        )
+        .expect("pool caller settles into replacement");
+        assert_eq!(page.live(), 1);
+        assert_eq!(page.state(0), Some((1, EntryState::Reaped)));
+        assert_eq!(
+            crate::lifecycle::recorded_member_exit_kind(&caller, Some(entry)),
+            MemberExitKind::HostRetiring
+        );
+        assert_eq!(receipt.predecessor_caller(), caller_id);
+        assert_eq!(receipt.successor_leader(), replacement_id);
+        assert_eq!(receipt.successor_mm(), mm);
+
+        let leader_caller = Control {
+            entry: None,
+            exit: crate::lifecycle::MemberExitCustody::new(),
+        };
+        let leader_replacement = Control {
+            entry: None,
+            exit: crate::lifecycle::MemberExitCustody::new(),
+        };
+        let leader_id = birth_receipt(41, 7, 1);
+        let leader_receipt = HostExecCallerMembership::transfer_leader_to_replacement(
+            &page,
+            &leader_caller,
+            leader_id,
+            &leader_replacement,
+            replacement_id,
+            mm,
+            &RegistryWriteHeld::for_test(),
+        )
+        .expect("entry-less leader settles into replacement");
+        assert_eq!(page.live(), 1);
+        assert_eq!(
+            crate::lifecycle::recorded_member_exit_kind(&leader_caller, None),
+            MemberExitKind::HostRetiring
+        );
+        assert_eq!(leader_receipt.predecessor_caller(), leader_id);
     }
 }

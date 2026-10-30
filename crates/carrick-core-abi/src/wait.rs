@@ -201,6 +201,18 @@ impl ObjectParkRequest {
             deadline,
         }
     }
+    /// Observe and probe readiness in `park_object_record`'s save callback,
+    /// under its object guard. A release before enrollment is detected by
+    /// that probe without retrying admission in the current execution turn.
+    pub const fn under_object_lock(key: ObjectWaitKey, operation: OperationToken) -> Self {
+        Self {
+            key,
+            snapshot: None,
+            owner_entry: None,
+            operation,
+            deadline: None,
+        }
+    }
     /// The owner checks readiness from save_context while the object guard is
     /// held. The request and its native entry remain one scheduler operation.
     pub const fn owner(

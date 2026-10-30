@@ -342,7 +342,8 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
                     .retire_current(
                         self.binding,
                         BornInZoneSource { zone, slot: SLOT },
-                        record.id
+                        record.id,
+                        None
                     )
                     .is_none()
             );
@@ -398,6 +399,7 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
                 slot: SLOT,
             },
             record.id,
+            None,
         );
         if self.handoff.is_some() {
             let slot = self.thread().unwrap().slot;

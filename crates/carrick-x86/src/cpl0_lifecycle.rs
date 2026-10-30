@@ -747,6 +747,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                 slot: self.lane.slot,
             },
             record.id,
+            None,
         );
         if self.handoff.is_some() {
             self.lane.retirements += 1;
@@ -967,6 +968,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                 start,
                 &guard.bucket,
                 carrick_core_abi::EntryRecordGeneration(seq),
+                None,
             ),
             LifecycleInvariant::WaitPublication,
         ));
@@ -1038,6 +1040,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                     slot: self.lane.slot,
                 },
                 record,
+                None,
             ),
             LifecycleInvariant::ExitRetirement,
         ));
@@ -1138,6 +1141,7 @@ impl FutexVenue for NativeLane<'_> {
             start,
             &guard,
             carrick_core_abi::EntryRecordGeneration(seq),
+            None,
         )?);
         self.zone.clear_current(self.lane.slot);
         drop(guard);

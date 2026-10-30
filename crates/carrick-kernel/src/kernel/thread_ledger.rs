@@ -377,6 +377,18 @@ impl ThreadIdentityPool {
         Some(published.swap_remove(index))
     }
 
+    #[cfg(test)]
+    pub(in crate::kernel) fn control_for_entry(
+        &self,
+        entry: carrick_el1_abi::EntryRef,
+    ) -> Option<super::objects::ThreadControlLease> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|candidate| candidate.entry == entry)
+            .map(|candidate| candidate.control.clone())
+    }
+
     fn take_births(&self) -> Vec<(PooledThreadIdentity, carrick_el1_abi::BornRecord)> {
         let mut entries = self.entries.lock();
         let mut births = Vec::new();
@@ -619,7 +631,13 @@ impl ThreadLedger {
     pub(in crate::kernel) fn reserve_native_reap(
         &self,
     ) -> Result<(), std::collections::TryReserveError> {
-        self.native_reaps.lock().try_reserve(1)
+        self.reserve_native_reaps(1)
+    }
+    pub(in crate::kernel) fn reserve_native_reaps(
+        &self,
+        count: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.native_reaps.lock().try_reserve(count)
     }
     pub(in crate::kernel) fn defer_native_reap(
         &self,
@@ -2629,6 +2647,7 @@ mod tests {
                     binding,
                     carrick_el1_abi::BornInZoneSource { zone, slot },
                     record,
+                    None,
                 )
                 .unwrap();
             // Actual raw-exit release has completed, but its ABI publication
