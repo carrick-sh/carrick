@@ -2605,10 +2605,11 @@ pub enum HostExitClass {
     Maintenance,
     Fault,
     Other,
+    Service,
 }
 
 impl HostExitClass {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     /// Every class in ordinal order: `ALL[c.ordinal() as usize] == c`. The
     /// ordinal is the wire value of the `vcpu-run-exit` USDT probe, so a
@@ -2622,6 +2623,7 @@ impl HostExitClass {
         Self::Maintenance,
         Self::Fault,
         Self::Other,
+        Self::Service,
     ];
 
     /// The stable wire ordinal (also the index of the exit counters).
@@ -2649,6 +2651,7 @@ impl HostExitClass {
             Self::Maintenance => "maintenance",
             Self::Fault => "fault",
             Self::Other => "other",
+            Self::Service => "service",
         }
     }
 
@@ -2668,6 +2671,7 @@ impl HostExitClass {
             (0x16, 2) | (0x15, _) => Self::Syscall,
             (0x16, 6) => Self::Metadata,
             (0x16, 1) => Self::Maintenance,
+            (0x16, 7) => Self::Service,
             _ => Self::Fault,
         }
     }
@@ -4584,6 +4588,7 @@ mod tests {
         assert_eq!(HostExitClass::from_hvf(false, true, hvc(2)), Syscall);
         assert_eq!(HostExitClass::from_hvf(false, true, hvc(6)), Metadata);
         assert_eq!(HostExitClass::from_hvf(false, true, hvc(1)), Maintenance);
+        assert_eq!(HostExitClass::from_hvf(false, true, hvc(7)), Service);
         assert_eq!(HostExitClass::from_hvf(false, true, 0x24_u64 << 26), Fault);
         assert_eq!(HostExitClass::from_hvf(false, false, 0), Other);
     }

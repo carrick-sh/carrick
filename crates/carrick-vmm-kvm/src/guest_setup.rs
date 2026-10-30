@@ -210,7 +210,12 @@ const ENC_ISB: u32 = 0xd503_3fdf; // isb
 /// inner-shareable domain (broadcasting to any PMR-paused sibling vCPUs), make
 /// the invalidation observable, then resynchronise translation before the store.
 pub fn el1_maintenance_sentinel_bytes() -> Vec<u8> {
-    use carrick_mem::memory::LINUX_EL1_MAINT_SIZE;
+    use carrick_mem::memory::{
+        LINUX_EL1_MAINT_BASE, LINUX_EL1_MAINT_SIZE, LINUX_EL1_SERVICE_RETURN_BASE,
+    };
+    const SERVICE_RETURN_OFF: usize =
+        (LINUX_EL1_SERVICE_RETURN_BASE - LINUX_EL1_MAINT_BASE) as usize;
+    const _: () = assert!(SERVICE_RETURN_OFF == 20);
     let size = LINUX_EL1_MAINT_SIZE as usize;
     let mut bytes = vec![0u8; size];
     let put = |b: &mut [u8], off: usize, op: u32| {
@@ -221,32 +226,38 @@ pub fn el1_maintenance_sentinel_bytes() -> Vec<u8> {
     put(&mut bytes, 4, ENC_TLBI_VMALLE1IS);
     put(&mut bytes, 8, ENC_DSB_SY);
     put(&mut bytes, 12, ENC_ISB);
+    // Offset 16 is HVF's `hvc #1` slot. Pad it with `nop` so the maintenance
+    // path falls straight through to `LINUX_EL1_SERVICE_RETURN_BASE` (+20),
+    // while `run_el1_service_call` (`X30 = LINUX_EL1_SERVICE_RETURN_BASE`)
+    // lands directly on the `movz x9` at +20 without executing the TLBI.
+    put(&mut bytes, 16, AARCH64_NOP_OPCODE);
     // movz/movk x9, MAINT_SENTINEL_GPA; str x8,[x9] — the completion MMIO store.
     put(
         &mut bytes,
-        16,
+        SERVICE_RETURN_OFF,
         enc_movz_x9((MAINT_SENTINEL_GPA & 0xFFFF) as u16, 0),
     );
     put(
         &mut bytes,
-        20,
+        SERVICE_RETURN_OFF + 4,
         enc_movk_x9(((MAINT_SENTINEL_GPA >> 16) & 0xFFFF) as u16, 1),
     );
     put(
         &mut bytes,
-        24,
+        SERVICE_RETURN_OFF + 8,
         enc_movk_x9(((MAINT_SENTINEL_GPA >> 32) & 0xFFFF) as u16, 2),
     );
     put(
         &mut bytes,
-        28,
+        SERVICE_RETURN_OFF + 12,
         enc_movk_x9(((MAINT_SENTINEL_GPA >> 48) & 0xFFFF) as u16, 3),
     );
-    put(&mut bytes, 32, ENC_STR_X8_X9); // str x8,[x9] -> KVM_EXIT_MMIO { gpa == MAINT_SENTINEL_GPA }
-    // The MMIO store IS the exit: run_el1_maintenance stops the loop on the
-    // MAINT_SENTINEL exit and never re-enters, so anything after it is dead. Pad
-    // the rest with `nop` so an accidental over-run is harmless.
-    let mut c = 36;
+    put(&mut bytes, SERVICE_RETURN_OFF + 16, ENC_STR_X8_X9); // str x8,[x9] -> KVM_EXIT_MMIO { gpa == MAINT_SENTINEL_GPA }
+    // The MMIO store IS the exit: run_el1_maintenance / run_el1_service_call
+    // stops the loop on the MAINT_SENTINEL exit and never re-enters, so
+    // anything after it is dead. Pad the rest with `nop` so an accidental
+    // over-run is harmless.
+    let mut c = SERVICE_RETURN_OFF + 20;
     while c + 4 <= size {
         put(&mut bytes, c, AARCH64_NOP_OPCODE);
         c += 4;
@@ -748,27 +759,39 @@ mod vector_tests {
         assert_eq!(op(12), ENC_ISB, "12 isb");
         assert_eq!(
             op(16),
+            AARCH64_NOP_OPCODE,
+            "16 nop (aligns service return entry at +20)"
+        );
+        let service_off = (carrick_mem::memory::LINUX_EL1_SERVICE_RETURN_BASE
+            - carrick_mem::memory::LINUX_EL1_MAINT_BASE) as usize;
+        assert_eq!(service_off, 20);
+        assert_eq!(
+            op(service_off),
             enc_movz_x9((MAINT_SENTINEL_GPA & 0xFFFF) as u16, 0),
-            "16 movz x9, MAINT_SENTINEL[0]"
+            "20 movz x9, MAINT_SENTINEL[0] (LINUX_EL1_SERVICE_RETURN_BASE entry)"
         );
         assert_eq!(
-            op(20),
+            op(service_off + 4),
             enc_movk_x9(((MAINT_SENTINEL_GPA >> 16) & 0xFFFF) as u16, 1),
-            "20 movk x9, MAINT_SENTINEL[1]"
+            "24 movk x9, MAINT_SENTINEL[1]"
         );
         assert_eq!(
-            op(24),
+            op(service_off + 8),
             enc_movk_x9(((MAINT_SENTINEL_GPA >> 32) & 0xFFFF) as u16, 2),
-            "24 movk x9, MAINT_SENTINEL[2]"
+            "28 movk x9, MAINT_SENTINEL[2]"
         );
         assert_eq!(
-            op(28),
+            op(service_off + 12),
             enc_movk_x9(((MAINT_SENTINEL_GPA >> 48) & 0xFFFF) as u16, 3),
-            "28 movk x9, MAINT_SENTINEL[3]"
+            "32 movk x9, MAINT_SENTINEL[3]"
         );
-        assert_eq!(op(32), ENC_STR_X8_X9, "32 str x8,[x9] (MMIO completion)");
+        assert_eq!(
+            op(service_off + 16),
+            ENC_STR_X8_X9,
+            "36 str x8,[x9] (MMIO completion)"
+        );
         // The tail is `nop` padding (any over-run past the exit is harmless).
-        assert_eq!(op(36), AARCH64_NOP_OPCODE, "36 nop pad");
+        assert_eq!(op(service_off + 20), AARCH64_NOP_OPCODE, "40 nop pad");
         // The three sentinels must be DISTINCT gpas so the host disambiguates a
         // syscall trap, a fault trap, and a maintenance completion by gpa alone.
         assert_ne!(MAINT_SENTINEL_GPA, SENTINEL_GPA);

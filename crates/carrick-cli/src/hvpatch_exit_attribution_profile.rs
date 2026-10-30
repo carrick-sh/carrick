@@ -69,9 +69,10 @@ impl ExitBucket {
             HostExitClass::Syscall => Self::Syscall,
             HostExitClass::Fault => Self::Fault,
             HostExitClass::Canceled | HostExitClass::Idle | HostExitClass::Kick => Self::KickIdle,
-            HostExitClass::Metadata | HostExitClass::Maintenance | HostExitClass::Other => {
-                Self::Other
-            }
+            HostExitClass::Metadata
+            | HostExitClass::Maintenance
+            | HostExitClass::Service
+            | HostExitClass::Other => Self::Other,
         }
     }
 
@@ -706,7 +707,7 @@ mod tests {
     #[test]
     fn refuses_unknown_classes_and_inconsistent_rows() {
         let mut body = BODY.to_vec();
-        body.push("HVPEXIT1|exit|class=8|count=1|guest_vns=1|guest_wall_ns=1");
+        body.push("HVPEXIT1|exit|class=9|count=1|guest_vns=1|guest_wall_ns=1");
         assert!(parse(&stream(OK, &body)).is_err());
         let mut body = BODY.to_vec();
         body.push("HVPEXIT1|host-after-exit|class=4|vns=1");

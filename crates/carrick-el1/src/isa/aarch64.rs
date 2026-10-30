@@ -51,7 +51,7 @@ pub fn hardware_live_ttbr() -> u64 {
 pub fn yield_host_effect() {
     // SAFETY: the carrier resumes this exact EL1 stack after the HVC service.
     unsafe {
-        core::arch::asm!("hvc #1", clobber_abi("C"));
+        core::arch::asm!("hvc #7", clobber_abi("C"));
     }
 }
 

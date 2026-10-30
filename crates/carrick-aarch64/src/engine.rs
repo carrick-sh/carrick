@@ -178,9 +178,10 @@ fn guest_frame_grant_submission(
     }
 }
 
-/// The maintenance trampoline's closing `hvc #1`, used as the return address
-/// of a host-driven EL1 call so its `ret` completes as `MaintenanceDone`.
-const EL1_SERVICE_CALL_RETURN: u64 = carrick_mem::memory::LINUX_EL1_MAINT_BASE + 16;
+/// The maintenance trampoline's `hvc #7` slot, used as the return address
+/// of a host-driven EL1 call so its `ret` completes as `MaintenanceDone`
+/// while exit attribution records `HostExitClass::Service` instead of TLBI.
+const EL1_SERVICE_CALL_RETURN: u64 = carrick_mem::memory::LINUX_EL1_SERVICE_RETURN_BASE;
 
 fn with_maintenance_transfer_root<C: Aarch64Vcpu, T>(
     cpu: &mut C,
@@ -9048,6 +9049,26 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 #[cfg(test)]
 mod transfer_service_tests {
     use super::*;
+    #[test]
+    fn owner_service_completion_costs_no_tlb_maintenance() {
+        // Decode the actual instruction selected as the host-driven call's
+        // return address, rather than assuming that a completion did TLBI.
+        let image = carrick_mem::memory::el1_maintenance_bytes();
+        let offset = (EL1_SERVICE_CALL_RETURN - carrick_mem::memory::LINUX_EL1_MAINT_BASE) as usize;
+        let instruction = u32::from_le_bytes(image[offset..offset + 4].try_into().unwrap());
+        let immediate = (instruction >> 5) & 0xffff;
+        let class = carrick_el1_abi::HostExitClass::from_hvf(
+            false,
+            true,
+            (0x16 << 26) | u64::from(immediate),
+        );
+        assert_eq!(class, carrick_el1_abi::HostExitClass::Service);
+        for calls in [1, 4, 16] {
+            let maintenance =
+                usize::from(class == carrick_el1_abi::HostExitClass::Maintenance) * calls;
+            assert_eq!(maintenance, 0, "{calls} owner completions counted as TLBI");
+        }
+    }
     struct Cpu {
         regs: Vec<(Reg, u64)>,
         runs: usize,

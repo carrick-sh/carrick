@@ -541,7 +541,7 @@ fn exit_breakdown(measured: &Measured) -> String {
     use carrick_el1_abi::HostExitClass as C;
     let c = &measured.exit_classes;
     format!(
-        "canceled:{} idle:{} kick:{} syscall:{} metadata:{} maintenance:{} fault:{} other:{}",
+        "canceled:{} idle:{} kick:{} syscall:{} metadata:{} maintenance:{} fault:{} other:{} service:{}",
         c[C::Canceled as usize],
         c[C::Idle as usize],
         c[C::Kick as usize],
@@ -550,6 +550,7 @@ fn exit_breakdown(measured: &Measured) -> String {
         c[C::Maintenance as usize],
         c[C::Fault as usize],
         c[C::Other as usize],
+        c[C::Service as usize],
     )
 }
 

@@ -463,7 +463,8 @@ use carrick_hal::aarch64::ExecLevel;
 pub use carrick_hal::aarch64::{
     AARCH64_HVC_EXCEPTION_CLASS, AARCH64_SVC_EXCEPTION_CLASS, aarch64_exception_class,
     is_aarch64_hvc_exception, is_aarch64_hvc_fault, is_aarch64_hvc_kick,
-    is_aarch64_hvc_maintenance, is_aarch64_svc_exception, is_aarch64_syscall_exception,
+    is_aarch64_hvc_maintenance, is_aarch64_hvc_service, is_aarch64_svc_exception,
+    is_aarch64_syscall_exception,
 };
 use carrick_hal::trap::{HostAliasBacking, HostAliasSharing};
 pub use carrick_hal::trap::{RawSyscall, SyscallTrap, TrapError};
@@ -8633,10 +8634,12 @@ impl HvfInner {
                 }
                 continue;
             }
-            // Maintenance completion is a control exit, not a syscall. It
-            // still reaches the HVC decoder below during executor load.
+            // Maintenance and host-service completions are control exits, not
+            // syscalls. They still reach the HVC decoder below during executor
+            // load and host-driven EL1 service calls.
             if !is_aarch64_syscall_exception(exception.syndrome)
                 && !is_aarch64_hvc_maintenance(exception.syndrome)
+                && !is_aarch64_hvc_service(exception.syndrome)
             {
                 return Err(TrapError::UnexpectedException {
                     syndrome: exception.syndrome,
@@ -8868,7 +8871,7 @@ pub(crate) fn decode_hvc_syscall_exit<V: VcpuTrapContext>(
             "decode_hvc_syscall_exit called with non-HVC syndrome {syndrome:#x}"
         )));
     }
-    if is_aarch64_hvc_maintenance(syndrome) {
+    if is_aarch64_hvc_maintenance(syndrome) || is_aarch64_hvc_service(syndrome) {
         return Ok(HvcExitOutcome::Maintenance);
     }
     // Fast path: for mailbox transport, if the guest published an SVC request into the
