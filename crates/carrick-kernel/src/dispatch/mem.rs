@@ -2110,7 +2110,8 @@ impl<'a> MemView<'a> {
         };
         let mem_authority_37 = self.mem();
         let mut mem = mem_authority_37.lock();
-        mem.record_resident(range);
+        mem.record_resident(range)
+            .unwrap_or_else(|refusal| anonymous::broken_root("eager resident fixture", refusal));
         locked_ranges_insert(&mut mem.locked_ranges, range);
     }
 
@@ -2405,23 +2406,23 @@ impl SyscallDispatcher {
         &self,
         guard: &super::mm_mutation::MmMutationGuard<'_>,
         page: u64,
-    ) -> bool {
+    ) -> Result<bool, RootAccessRefusal> {
         let view = self.mem_view();
         let authority = view.mm_authority();
         if authority.mm_id != guard.mm_id() || !page.is_multiple_of(view.linux_page_size()) {
-            return false;
+            return Ok(false);
         }
         let Some(end) = page.checked_add(view.linux_page_size()) else {
-            return false;
+            return Ok(false);
         };
         let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(page), GuestVa::new(end))
         else {
-            return false;
+            return Ok(false);
         };
         let mut mem = authority.mem.lock();
-        mem.record_resident(range);
+        mem.record_resident(range)?;
         mem.resident_fault_ranges.disarm(range);
-        true
+        Ok(true)
     }
 
     #[inline]

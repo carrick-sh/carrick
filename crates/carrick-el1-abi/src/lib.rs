@@ -5149,6 +5149,51 @@ mod tests {
         assert!(table.retire(successor_slot, successor));
     }
 
+    /// A refused adoption must leave this row and every unvisited row dirty.
+    #[test]
+    fn grant_residency_dirty_walk_stops_without_acknowledging() {
+        use core::ops::ControlFlow;
+        let table = FrameGrantResidencyTable::new();
+        let grant = FrameGrantResidencyIdentity {
+            mm_key: 41,
+            semantic_base: 0x4000_0000,
+            physical_ipa: 0x9000_0000,
+            len: 4096,
+            mapping_id: 17,
+            frame_id: 19,
+            owner_generation: 23,
+            inventory_revision: 29,
+        };
+        let second = FrameGrantResidencyIdentity {
+            semantic_base: grant.semantic_base + 4096,
+            physical_ipa: grant.physical_ipa + 4096,
+            ..grant
+        };
+        let first_slot = table.publish(grant).unwrap();
+        let second_slot = table.publish(second).unwrap();
+        for identity in [grant, second] {
+            assert!(table.record_commit(table.lookup(41, identity.semantic_base).unwrap()));
+        }
+        let mut visited = Vec::new();
+        let stopped = table.for_each_dirty_mm(41, |slot, _, _| {
+            visited.push(slot);
+            ControlFlow::Break("busy")
+        });
+        assert_eq!(stopped, ControlFlow::Break("busy"));
+        assert_eq!(visited, [first_slot]);
+        visited.clear();
+        let completed: ControlFlow<()> = table.for_each_dirty_mm(41, |slot, identity, bits| {
+            assert_eq!(bits[0], 1);
+            visited.push(slot);
+            assert!(table.ack_dirty(slot, identity));
+            ControlFlow::Continue(())
+        });
+        assert_eq!(completed, ControlFlow::Continue(()));
+        assert_eq!(visited, [first_slot, second_slot]);
+        let _: ControlFlow<()> =
+            table.for_each_dirty_mm(41, |_, _, _| panic!("all rows acknowledged"));
+    }
+
     #[test]
     fn grant_residency_rejects_retired_and_reused_identity() {
         let table = FrameGrantResidencyTable::new();
@@ -5170,13 +5215,15 @@ mod tests {
         assert!(table.record_commit(page));
         assert_eq!(table.committed_words(slot, first).unwrap()[0], 0b10);
         let mut dirty = 0;
-        table.for_each_dirty_mm(41, |seen, identity, bits| {
+        let _: core::ops::ControlFlow<()> = table.for_each_dirty_mm(41, |seen, identity, bits| {
             assert_eq!((seen, identity, bits[0]), (slot, first, 0b10));
             dirty += 1;
             assert!(table.ack_dirty(seen, identity));
+            core::ops::ControlFlow::Continue(())
         });
         assert_eq!(dirty, 1);
-        table.for_each_dirty_mm(41, |_, _, _| panic!("dirty bit was acknowledged"));
+        let _: core::ops::ControlFlow<()> =
+            table.for_each_dirty_mm(41, |_, _, _| panic!("dirty bit was acknowledged"));
         assert!(table.retire(slot, first));
         assert!(table.lookup(41, first.semantic_base + 4096).is_none());
         assert!(!table.record_commit(page));

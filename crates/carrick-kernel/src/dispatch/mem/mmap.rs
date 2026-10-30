@@ -3067,7 +3067,7 @@ impl<'a> MemView<'a> {
                     let mut mem = mem_authority.lock();
                     locked_ranges_insert(&mut mem.host_alias_backed_ranges, dest_range);
                     locked_ranges_insert(&mut mem.alias_vma_ranges, dest_range);
-                    mem.record_resident(dest_range);
+                    mem.record_resident(dest_range).unwrap_or_else(|refusal| super::anonymous::broken_root("host residency commit", refusal));
                     if read_only_shared_file {
                         locked_ranges_insert(&mut mem.read_only_shared_file_maps, dest_range);
                     }

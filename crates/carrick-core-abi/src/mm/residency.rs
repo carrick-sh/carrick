@@ -409,11 +409,11 @@ impl FrameGrantResidencyTable {
     /// Host: visit only records changed since their last reconciliation. The
     /// callback must validate the live leaf and update host residency before
     /// `ack_dirty` is called; exact-MM exclusion prevents same-MM new bits.
-    pub fn for_each_dirty_mm(
+    pub fn for_each_dirty_mm<B>(
         &self,
         mm_key: u64,
-        mut visit: impl FnMut(usize, FrameGrantResidencyIdentity, [u64; 8]),
-    ) {
+        mut visit: impl FnMut(usize, FrameGrantResidencyIdentity, [u64; 8]) -> core::ops::ControlFlow<B>,
+    ) -> core::ops::ControlFlow<B> {
         for (word_index, word) in self.dirty.iter().enumerate() {
             let mut pending = word.load(Ordering::Acquire);
             while pending != 0 {
@@ -428,12 +428,13 @@ impl FrameGrantResidencyTable {
                         let bits =
                             core::array::from_fn(|i| record.committed[i].load(Ordering::Acquire));
                         if record.state.load(Ordering::Acquire) == epoch {
-                            visit(slot, identity, bits);
+                            visit(slot, identity, bits)?;
                         }
                     }
                 }
             }
         }
+        core::ops::ControlFlow::Continue(())
     }
 
     pub fn ack_dirty(&self, slot: usize, identity: FrameGrantResidencyIdentity) -> bool {

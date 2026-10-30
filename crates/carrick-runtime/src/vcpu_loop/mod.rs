@@ -2164,7 +2164,14 @@ where
             SyscallMmPhase::Ordinary(mm_executor)
         };
         if let SyscallMmPhase::Mutation(ref guard) = mm_phase {
-            signal::reconcile_guest_frame_commits(&kernel.dispatcher, engine, guard);
+            if let Err(busy) =
+                signal::reconcile_guest_frame_commits(&kernel.dispatcher, engine, guard)
+            {
+                return Ok(DispatchOutcome::OwnerMemoryWait {
+                    wait: busy.wait,
+                    committed: 0,
+                });
+            }
         }
         // The parked-slice, sleep/poll deadline and child-wait trace state that
         // used to live here belonged to the in-loop compatibility wait arms.
