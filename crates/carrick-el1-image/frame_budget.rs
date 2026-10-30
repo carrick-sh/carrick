@@ -333,7 +333,8 @@ impl Frames {
             + self
                 .required("::cow_resolver::dispatch_fault::")?
                 .max(self.maximum("::dispatch::arm_signal_user_return::"))
-            + self.required("::dispatch::arm_deliver_declined_fault_signal::")?
+            + self.required("::dispatch::arm_deliver_declined_fault_signal_current::")?
+            + self.maximum("::dispatch::arm_deliver_declined_fault_signal::")
             + self.maximum("::dispatch::arm_deliver_declined_fault_signal_with::")
             + self.maximum("::aarch64_process::deliver_declined_fault_signal_with::")
             + self.required("::aarch64_process::with_process_entry::")?;
@@ -617,6 +618,7 @@ mod tests {
             "x::dispatch::dispatch_entry::h0",
             "x::dispatch::dispatch_syscall::h0",
             "x::cow_resolver::dispatch_fault::h0",
+            "x::dispatch::arm_deliver_declined_fault_signal_current::h0",
             "x::dispatch::arm_deliver_declined_fault_signal::h0",
             "x::dispatch::arm_signal_user_return::h0",
             "x::aarch64_process::with_process_entry::h0",
@@ -687,6 +689,7 @@ mod tests {
             let mut frames = small_frames();
             for method in [
                 prefix,
+                "dispatch::arm_deliver_declined_fault_signal_current",
                 "dispatch::arm_deliver_declined_fault_signal",
                 "aarch64_process::deliver_declined_fault_signal_with",
                 "aarch64_process::with_process_entry",

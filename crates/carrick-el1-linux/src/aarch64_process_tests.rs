@@ -11176,13 +11176,15 @@ fn arm_classified_fault_racing_live_sibling_exit_group_settles() {
         if !published_before_close {
             control.publish_synchronous_fault(Signal::SEGV, 1, 0x1234_5000);
         }
+        assert!(fixture.task.owns_lifecycle_page(fixture.page));
+        assert!(fixture.task.owns_control_slot(control));
         let mut frame = carrick_el1_abi::TrapFrame {
             esr: 0xfffc,
             elr: 0x40_0200,
             ..Default::default()
         };
         assert_eq!(
-            super::dispatch::arm_deliver_declined_fault_signal_with(
+            super::dispatch::arm_deliver_declined_fault_signal(
                 BornInZoneSource {
                     zone: fixture.zone,
                     slot: fixture.slot

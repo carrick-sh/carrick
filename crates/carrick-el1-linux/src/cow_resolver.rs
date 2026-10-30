@@ -370,7 +370,7 @@ pub fn dispatch_fault(
                 continue;
             }
             return settle_declined_owner_fault(venue, task, action, supply.outcome(), || {
-                crate::dispatch::arm_deliver_declined_fault_signal(frame)
+                crate::dispatch::arm_deliver_declined_fault_signal_current(frame)
             });
         }
     }
