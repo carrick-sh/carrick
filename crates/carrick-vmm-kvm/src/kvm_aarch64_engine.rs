@@ -212,16 +212,6 @@ impl Aarch64Vcpu for KvmVcpu {
             // A WFI/halt with no pending syscall.
             VcpuExit::Halt => Ok(Aarch64Exit::Halt),
             VcpuExit::Kicked => Ok(Aarch64Exit::Kicked),
-            VcpuExit::Exception { syndrome, .. }
-                if syndrome == carrick_mem::memory::AARCH64_HVC_MAINT_SYNDROME =>
-            {
-                Ok(Aarch64Exit::MaintenanceDone)
-            }
-            VcpuExit::Exception { syndrome, .. }
-                if syndrome == carrick_mem::memory::AARCH64_HVC_SERVICE_SYNDROME =>
-            {
-                Ok(Aarch64Exit::ServiceDone)
-            }
             VcpuExit::Exception { syndrome, far } => Err(TrapError::UnexpectedException {
                 syndrome,
                 virtual_address: far,
