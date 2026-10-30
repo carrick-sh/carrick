@@ -4299,7 +4299,7 @@ where
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         self.state.publish_external_ingress(&self.kernel)?;
         engine
-            .cancel_native_owner_wait(carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0)
+            .cancel_native_fault_wait()
             .map_err(RuntimeError::Trap)?;
         self.phase = HvpatchProductionPhase::Resident;
         Ok(executor::ExecutorExit::Syscall)
@@ -4709,7 +4709,7 @@ where
                     return self.resume_owner_physical(engine, control, pending, false);
                 }
                 HvpatchProductionPhase::ResumeFaultOwner { wait } => {
-                    let result = self.consume_owner_zone(control)?;
+                    let result = self.consume_fault_owner_zone(control)?;
                     use carrick_kernel::kernel::continuation::{
                         ContinuationCompletion, OwnerWaitCancellation,
                     };

@@ -2311,13 +2311,20 @@ impl BlockedContinuation {
         {
             return Err(ContinuationResumeError::PrematureVforkRelease);
         }
-        self.authorize_resume(ResumeContext {
+        if let Err(error) = self.authorize_resume(ResumeContext {
             thread: context.thread().key(),
             task: context.task().key(),
             execution: self.authority().execution_generation(),
             mm: context.shared().mm().id(),
             asid_generation: self.authority().asid_generation(),
-        })?;
+        }) {
+            if matches!(self.authority().origin, ContinuationOrigin::Fault)
+                && error.is_owner_retirement()
+            {
+                return Ok(self.cancel_retired_fault());
+            }
+            return Err(error);
+        }
         if let Some(binding) = self.state_mut().registration.take()
             && let Some(service) = binding.service.upgrade()
         {
@@ -2723,6 +2730,20 @@ impl BlockedContinuation {
         })
     }
 
+    /// The runtime still owns this exact handed-back zone record and will
+    /// consume its metadata token. Retire only the continuation here.
+    fn cancel_retired_fault(self) -> ContinuationResult {
+        if let Some(wait) = self.zone_wait() {
+            wait.mark_consumed();
+        }
+        self.cancel(CancellationCause::Exec);
+        ContinuationResult {
+            completion: ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::GroupExit),
+            restart: RestartDecision::NoRestart,
+            reserved_signal: None,
+        }
+    }
+
     pub fn cancel(mut self, cause: CancellationCause) -> CancellationReceipt {
         let id = self.id();
         if let Some(binding) = self.state_mut().registration.take()
@@ -2788,6 +2809,12 @@ pub fn resume_continuation(
     if current_mm != continuation.authority().mm()
         || current_asid != continuation.authority().asid_generation()
     {
+        if matches!(continuation.authority().origin, ContinuationOrigin::Fault) {
+            return lease
+                .take_blocked_continuation()
+                .map(BlockedContinuation::cancel_retired_fault)
+                .ok_or(ContinuationResumeError::MissingContinuation);
+        }
         return Err(ContinuationResumeError::StaleAddressSpace);
     }
     let continuation = lease
@@ -2804,6 +2831,23 @@ pub enum ContinuationResumeError {
     MissingContinuation,
     StaleFileSlot,
     PrematureVforkRelease,
+}
+
+impl ContinuationResumeError {
+    fn is_owner_retirement(self) -> bool {
+        matches!(
+            self,
+            Self::StaleAddressSpace
+                | Self::StaleTaskRevision
+                | Self::StaleThread(
+                    StaleThreadCause::KernelGone
+                        | StaleThreadCause::TaskNotLive
+                        | StaleThreadCause::ThreadNotSchedulable
+                        | StaleThreadCause::ContextUnavailable
+                        | StaleThreadCause::ContextMismatch
+                )
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

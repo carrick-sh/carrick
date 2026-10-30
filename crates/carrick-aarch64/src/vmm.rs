@@ -386,6 +386,10 @@ pub trait Aarch64Vcpu {
         Err(TrapError::UnsupportedPlatform)
     }
 
+    fn cancel_native_fault_wait(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     /// Return an ordinary syscall result still owned by a backend response
     /// mailbox. Register-return backends keep the default: x0 is already live.
     fn pending_syscall_return(&self) -> Result<Option<i64>, TrapError> {
@@ -1537,6 +1541,40 @@ pub fn enter_native_owner_cancel_el0<C: Aarch64Vcpu>(
             "native owner cancellation requires an EL0 frame".into(),
         ));
     }
+    enter_native_fatal_frame(vcpu, mailbox, pc, pstate)
+}
+
+/// A fault may stop directly at EL0 or after the fault HVC restored every
+/// user GPR and placed the user return frame in ELR_EL1/SPSR_EL1. Select that
+/// frame before entering fatal custody; the HVC PC is never a user resume PC.
+pub fn enter_native_fault_cancel<C: Aarch64Vcpu>(
+    vcpu: &mut C,
+    mailbox: carrick_guest_mem::GuestVa,
+) -> Result<(), TrapError> {
+    let stopped_pstate = vcpu.get_reg(Reg::Pstate)?;
+    let (pc, pstate) = match stopped_pstate & 0xf {
+        0 => (vcpu.get_reg(Reg::Pc)?, stopped_pstate),
+        4 | 5 => (vcpu.get_reg(Reg::ElrEl1)?, vcpu.get_reg(Reg::SpsrEl1)?),
+        _ => {
+            return Err(TrapError::Hypervisor(
+                "native fault cancellation has no user exception frame".into(),
+            ));
+        }
+    };
+    if pstate & 0xf != 0 {
+        return Err(TrapError::Hypervisor(
+            "native fault cancellation requires a saved EL0 frame".into(),
+        ));
+    }
+    enter_native_fatal_frame(vcpu, mailbox, pc, pstate)
+}
+
+fn enter_native_fatal_frame<C: Aarch64Vcpu>(
+    vcpu: &mut C,
+    mailbox: carrick_guest_mem::GuestVa,
+    pc: u64,
+    pstate: u64,
+) -> Result<(), TrapError> {
     const EL1H_DAIF_MASKED: u64 = 0x3c5;
     for (reg, value) in [
         (Reg::ElrEl1, pc),
@@ -1558,6 +1596,7 @@ mod completion_tests {
         writes: Vec<(Reg, u64)>,
         saved_x9: Option<u64>,
         el0: Option<(u64, u64)>,
+        saved_user: (u64, u64),
     }
 
     impl Aarch64Vcpu for RegisterCompletionVcpu {
@@ -1565,6 +1604,8 @@ mod completion_tests {
             Ok(match (self.el0, r) {
                 (Some((pc, _)), Reg::Pc) => pc,
                 (Some((_, pstate)), Reg::Pstate) => pstate,
+                (_, Reg::ElrEl1) => self.saved_user.0,
+                (_, Reg::SpsrEl1) => self.saved_user.1,
                 _ => 0,
             })
         }
@@ -1641,6 +1682,7 @@ mod completion_tests {
             writes: Vec::new(),
             saved_x9: None,
             el0: Some((0x4000, 0x6000_0000)),
+            saved_user: (0, 0),
         };
         enter_native_owner_cancel_el0(&mut vcpu, carrick_guest_mem::GuestVa::new(0x1000)).unwrap();
         assert_eq!(
@@ -1663,11 +1705,60 @@ mod completion_tests {
     }
 
     #[test]
+    fn native_fault_cancel_hvc_uses_saved_user_frame_without_syscall() {
+        let mut vcpu = RegisterCompletionVcpu {
+            writes: Vec::new(),
+            saved_x9: None,
+            el0: Some((0xffff_0000_1000, 0x3c5)),
+            saved_user: (0x4020, 0x6000_0000),
+        };
+        enter_native_fault_cancel(&mut vcpu, carrick_guest_mem::GuestVa::new(0x1000)).unwrap();
+        assert_eq!(
+            vcpu.writes,
+            [
+                (Reg::ElrEl1, 0x4020),
+                (Reg::SpsrEl1, 0x6000_0000),
+                (Reg::SpEl1, 0x1000),
+                (Reg::Pstate, 0x3c5),
+                (Reg::Pc, carrick_mem::memory::native_owner_cancel_entry()),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_fault_cancel_direct_preserves_user_frame_and_rejects_kernel_fault() {
+        let mut vcpu = RegisterCompletionVcpu {
+            writes: Vec::new(),
+            saved_x9: None,
+            el0: Some((0x4040, 0xa000_0000)),
+            saved_user: (0xdead, 0x3c5),
+        };
+        enter_native_fault_cancel(&mut vcpu, carrick_guest_mem::GuestVa::new(0x1000)).unwrap();
+        assert_eq!(
+            vcpu.writes,
+            [
+                (Reg::ElrEl1, 0x4040),
+                (Reg::SpsrEl1, 0xa000_0000),
+                (Reg::SpEl1, 0x1000),
+                (Reg::Pstate, 0x3c5),
+                (Reg::Pc, carrick_mem::memory::native_owner_cancel_entry()),
+            ]
+        );
+        vcpu.writes.clear();
+        vcpu.el0 = Some((0xffff_0000_1000, 0x3c5));
+        assert!(
+            enter_native_fault_cancel(&mut vcpu, carrick_guest_mem::GuestVa::new(0x1000)).is_err()
+        );
+        assert!(vcpu.writes.is_empty());
+    }
+
+    #[test]
     fn default_complete_syscall_return_preserves_register_transport() {
         let mut vcpu = RegisterCompletionVcpu {
             writes: Vec::new(),
             saved_x9: Some(0x9999),
             el0: None,
+            saved_user: (0, 0),
         };
         vcpu.complete_syscall_return(-9).expect("completion");
         assert_eq!(
