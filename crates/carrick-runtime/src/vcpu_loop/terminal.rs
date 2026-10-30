@@ -590,24 +590,13 @@ pub(crate) fn core_note_resume_pair(
 /// `svc`), when it in fact addresses an HvPatch syscall island's return
 /// branch instead of guest `.text`.
 ///
-/// `Aarch64EngineCore::aarch64_core_registers` already applies this
-/// translation for a thread the HOST parked mid-syscall (its `resume_pc`
-/// reaches here already correct). It cannot apply for a thread the in-guest
-/// scheduler (EL1) parked instead: EL1's own `ThreadCtx.pc` is filled
-/// straight from the trap frame's saved `ELR_EL1`
-/// (`carrick-el1/src/sched/hw.rs`'s `ThreadCpu::save`), which is exactly the
-/// same island-return-branch address for the identical reason (HvPatch
-/// patches every `svc #0` sitewide, and EL1's own futex dispatch traps
-/// through the same patched site as any other syscall) — with no engine
-/// access from `carrick-kernel`'s zone-record reader to decode it there.
-/// This is the one place both sources of a parked thread's resume PC are
-/// already uniform (`carrick_kernel::core_dump::ThreadState` conversion), so
-/// it is the single, correct place to apply the SAME decode
-/// (`carrick_hal::aarch64::decode_hvpatch_island_origin`) regardless of
-/// source: re-checking an already-corrected host-parked value is a safe
-/// no-op (the word before a genuine guest `svc`+4 address is the guest's own
-/// patched branch instruction, never `svc #0`, so the shape check fails and
-/// the value passes through unchanged).
+/// Both host-parked register snapshots from
+/// `Aarch64EngineCore::aarch64_core_registers` and EL1-parked `ThreadCtx.pc`
+/// values retain the raw island return address. Decode it here, when building
+/// core notes, so ordinary register capture needs no guest-memory round trip.
+/// Both sources are uniform at this point (`ThreadState` conversion).
+/// An already guest-visible PC passes through unchanged: the word before a
+/// genuine guest `svc`+4 address is the patched branch, so the shape check fails.
 pub(crate) fn guest_visible_resume_pc<E: carrick_hal::ThreadedEngine>(
     engine: &E,
     resume_pc: u64,
