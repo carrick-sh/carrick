@@ -477,6 +477,7 @@ pub struct ExecutorRegistration {
     id: ExecutorId,
     kick: Arc<dyn ExecutorKick>,
     placement: Arc<Mutex<ExecutorPlacement>>,
+    guest_idle: Arc<Mutex<Option<GuestIdleAnnouncement>>>,
     close_observation_epoch: Arc<AtomicU64>,
     control_observation_epoch: Arc<AtomicU64>,
     flush_requested: Arc<AtomicResidencyFlushRequest>,
@@ -506,6 +507,19 @@ impl ExecutorRegistration {
     pub fn clear_flush_request(&self) {
         self.flush_requested
             .store(ResidencyFlushRequest::None, Ordering::Release);
+    }
+
+    pub(super) fn clear_guest_idle(&self) -> Option<GuestCpuId> {
+        self.guest_idle
+            .lock()
+            .take()
+            .map(|announcement| announcement.cpu.id)
+    }
+
+    fn leave_guest_idle(&self, queue: &RunQueueInner) {
+        if let Some(cpu) = self.clear_guest_idle() {
+            queue.propagate_wake(cpu);
+        }
     }
 }
 
@@ -578,6 +592,7 @@ impl ExecutorDirectory {
             slot: None,
             waiting: false,
         }));
+        let guest_idle = Arc::new(Mutex::new(None));
         state.entries.insert(
             id,
             ExecutorEntry {
@@ -592,6 +607,7 @@ impl ExecutorDirectory {
             id,
             kick,
             placement,
+            guest_idle,
             close_observation_epoch,
             control_observation_epoch,
             flush_requested,
@@ -617,15 +633,15 @@ impl ExecutorDirectory {
     }
 
     fn unregister(&self, registration: &ExecutorRegistration) -> Result<(), RunQueueError> {
-        let mut state = self.state.lock();
-        let entry = state
+        let entry = self
+            .state
+            .lock()
             .entries
-            .get(&registration.id)
+            .remove(&registration.id)
             .ok_or(RunQueueError::StaleExecutor)?;
         if let Some(binding) = entry.kick.current_binding() {
             entry.kick.unbind(binding);
         }
-        state.entries.remove(&registration.id);
         Ok(())
     }
 
@@ -708,39 +724,24 @@ impl ExecutorDirectory {
         kick.is_some_and(|kick| kick.deliver_exact(token))
     }
 
-    /// Wake the executors waiting in the guest: the unbound driver on `cpu`
-    /// when one holds it, or every unbound driver that can steal the work.
+    /// Wake the unbound executors waiting in the guest on `cpu` (or all CPUs
+    /// when `cpu` is `None`).
     fn wake_guest_idle(&self, cpu: Option<GuestCpuId>) {
-        let kicks: Vec<_> = {
-            let state = self.state.lock();
-            let can_wait_in_guest = |entry: &ExecutorEntry| {
-                entry.kick.current_binding().is_none() && !entry.placement.lock().waiting
+        let entries: Vec<_> = self
+            .state
+            .lock()
+            .entries
+            .values()
+            .map(|entry| (Arc::clone(&entry.kick), Arc::clone(&entry.placement)))
+            .collect();
+        for (kick, placement) in entries {
+            let matches = {
+                let placement = placement.lock();
+                !placement.waiting && (cpu.is_none() || placement.cpu == cpu)
             };
-            let targeted: Vec<_> = cpu
-                .into_iter()
-                .flat_map(|target| {
-                    state.entries.values().filter(move |entry| {
-                        let placement = entry.placement.lock();
-                        placement.cpu == Some(target)
-                            && !placement.waiting
-                            && entry.kick.current_binding().is_none()
-                    })
-                })
-                .map(|entry| Arc::clone(&entry.kick))
-                .collect();
-            if !targeted.is_empty() {
-                targeted
-            } else {
-                state
-                    .entries
-                    .values()
-                    .filter(|entry| can_wait_in_guest(entry))
-                    .map(|entry| Arc::clone(&entry.kick))
-                    .collect()
+            if matches && kick.current_binding().is_none() {
+                kick.wake_from_guest_idle();
             }
-        };
-        for kick in kicks {
-            kick.wake_from_guest_idle();
         }
     }
 
@@ -953,6 +954,31 @@ impl GuestCpu {
     }
 }
 
+/// One executor's guest-idle announcement held across `wait_in_guest`.
+///
+/// When `try_take` returns `Ok(None)`, the executor has announced idleness on
+/// its bound CPU, completed the final steal scan, and is about to wait in the
+/// guest (`wait_in_guest`). Keeping the announcement alive in the executor's
+/// registration until it re-enters `take_row_bound`, claims zone work, parks
+/// as a spare, releases a handoff, or retires makes `cpu.idle_executors()`
+/// reflect guest-idle drivers too, so `select_cpu`, `waiter_present`,
+/// `wake_idle_cpu`, and `propagate_wake` treat host-parked and guest-idle
+/// executors identically and preserve the single-wake chain.
+#[derive(Debug)]
+struct GuestIdleAnnouncement {
+    cpu: Arc<GuestCpu>,
+}
+
+impl Drop for GuestIdleAnnouncement {
+    fn drop(&mut self) {
+        let mut guard = IdleAnnouncement {
+            cpu: &self.cpu,
+            held: true,
+        };
+        guard.release();
+    }
+}
+
 /// One executor's idle announcement on one guest CPU.
 ///
 /// A guard rather than two bare stores: `take_row` leaves the idle state
@@ -966,7 +992,22 @@ struct IdleAnnouncement<'a> {
 }
 
 impl<'a> IdleAnnouncement<'a> {
-    fn new(cpu: &'a GuestCpu) -> Self {
+    fn resume_or_new(
+        cpu: &'a Arc<GuestCpu>,
+        executor: &ExecutorRegistration,
+        queue: &RunQueueInner,
+    ) -> Self {
+        let mut guard = executor.guest_idle.lock();
+        if let Some(previous) = guard.take() {
+            if previous.cpu.id == cpu.id {
+                std::mem::forget(previous);
+                return Self { cpu, held: true };
+            }
+            let old_cpu = previous.cpu.id;
+            drop(previous);
+            drop(guard);
+            queue.propagate_wake(old_cpu);
+        }
         Self { cpu, held: false }
     }
 
@@ -977,6 +1018,15 @@ impl<'a> IdleAnnouncement<'a> {
         if !self.held {
             self.cpu.idle.fetch_add(1, Ordering::SeqCst);
             self.held = true;
+        }
+    }
+
+    fn park_in_guest(&mut self, executor: &ExecutorRegistration, cpu: &Arc<GuestCpu>) {
+        if self.held {
+            self.held = false;
+            *executor.guest_idle.lock() = Some(GuestIdleAnnouncement {
+                cpu: Arc::clone(cpu),
+            });
         }
     }
 
@@ -1616,7 +1666,7 @@ impl RunQueueInner {
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.host_queued.fetch_add(1, Ordering::SeqCst);
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
-            local.waiters > 0
+            local.waiters > 0 || cpu.idle_executors() > 0
         };
         cpu.idle_condvar.notify_one();
         self.wake_guest_idle(Some(cpu.id));
@@ -1684,7 +1734,7 @@ impl RunQueueInner {
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.host_queued.fetch_add(1, Ordering::SeqCst);
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
-            local.waiters > 0
+            local.waiters > 0 || cpu.idle_executors() > 0
         };
         cpu.idle_condvar.notify_one();
         self.wake_guest_idle(Some(cpu.id));
@@ -1833,10 +1883,10 @@ impl RunQueueInner {
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.host_queued.fetch_add(1, Ordering::SeqCst);
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
-            local.waiters > 0
+            local.waiters > 0 || cpu.idle_executors() > 0
         };
         cpu.idle_condvar.notify_one();
-        self.wake_guest_idle(None);
+        self.wake_guest_idle(Some(cpu.id));
         if !waiter_present {
             self.wake_idle_cpu(cpu.id);
         }
@@ -1872,6 +1922,7 @@ impl RunQueueInner {
             let cpu = &self.cpus[index];
             if cpu.id != origin && cpu.idle_executors() > 0 {
                 cpu.nudge();
+                self.wake_guest_idle(Some(cpu.id));
                 return;
             }
         }
@@ -2827,8 +2878,9 @@ impl RunQueue {
             .min(self.inner.cpus.len().saturating_sub(1));
         let cpu = Arc::clone(&self.inner.cpus[index]);
         // Exactly one announcement per executor, released by the guard on
-        // every path out of the idle state including the early returns.
-        let mut idle = IdleAnnouncement::new(&cpu);
+        // every path out of the idle state including the early returns, or
+        // carried across `wait_in_guest` until the next scan or claim.
+        let mut idle = IdleAnnouncement::resume_or_new(&cpu, executor, &self.inner);
         loop {
             let transferred = executor.placement.lock().slot.is_some();
             if transferred && self.inner.release_handoff(executor.id, true) {
@@ -2895,7 +2947,9 @@ impl RunQueue {
 
             if nonblocking {
                 // The caller waits in the guest, where a wake reaches it by
-                // `wake_from_guest_idle`; it re-scans when it leaves.
+                // `wake_from_guest_idle`; keep the idle announcement on `cpu`
+                // until it re-scans or claims work.
+                idle.park_in_guest(executor, &cpu);
                 return Ok(BoundTake::WouldPark);
             }
             let mut local = cpu.state.lock();
@@ -3020,6 +3074,7 @@ impl RunQueue {
     /// ([`ExecutorKick::parking_spare`], outside the lock: settling what was
     /// queued there may publish rows), then rechecks everything.
     fn park_spare(&self, executor: &ExecutorRegistration) -> Result<(), RunQueueError> {
+        executor.leave_guest_idle(&self.inner);
         let mut state = self.inner.state.lock();
         let mut slot_released = false;
         loop {
@@ -3123,6 +3178,7 @@ impl RunQueue {
         recorder: Option<&dyn DiscardRecorder>,
         auditors: Option<&crate::observe::AuditorChain>,
     ) -> Option<QueueClaim> {
+        executor.leave_guest_idle(&self.inner);
         let row = self.inner.take_zone_row(key)?;
         self.claim_row(executor, row, recorder, auditors)
     }
@@ -3264,6 +3320,7 @@ impl RunQueue {
     }
 
     fn retire_executor(&self, executor: &ExecutorRegistration) {
+        executor.clear_guest_idle();
         if executor.close_observation_epoch.swap(0, Ordering::AcqRel) == 0 {
             return;
         }
@@ -4686,6 +4743,7 @@ impl Scheduler {
         executor: &ExecutorRegistration,
         record: carrick_el1_abi::RecordRef,
     ) -> Result<Option<RunnableThread>, RunQueueError> {
+        executor.leave_guest_idle(&self.queue.inner);
         if crate::el1_zone::route_native_handback(record) {
             return Ok(None);
         }
@@ -4716,6 +4774,7 @@ impl Scheduler {
         executor: &ExecutorRegistration,
         claim: QueueClaim,
     ) -> Result<RunnableThread, RunQueueError> {
+        executor.leave_guest_idle(&self.queue.inner);
         let QueueClaim {
             row,
             lease,
@@ -9133,26 +9192,110 @@ mod tests {
         assert!(matches!(rescan, Err(RunQueueError::Closed)), "{rescan:?}");
     }
 
-    /// Issue #1071: a guest-idle executor drops its `IdleAnnouncement` when
-    /// `try_take` returns `None` before entering `wait_in_guest`, so
-    /// `cpu_loads` reports `idle: 0, bound: 1` for both a busy CPU and a
-    /// guest-idle CPU. When `release_zone_row` (or a host publication during
-    /// a handoff transition where `target`'s `placement.cpu` is `None`)
-    /// selects `CPU 0`, `wake_guest_idle(Some(CPU 0))` filtered strictly on
-    /// `placement.cpu == Some(CPU 0)`. That notified only `CPU 0`'s busy (or
-    /// absent) executor and left `CPU 1`'s guest-idle driver asleep in WFI
-    /// with stealable work on `CPU 0`.
+    /// Issue #1071: a guest-idle executor waiting in `wait_in_guest` after
+    /// `try_take` returns `None` retains its `GuestIdleAnnouncement` on its
+    /// bound CPU. Enqueuing work onto a busy CPU wakes exactly one guest-idle
+    /// stealer via `wake_idle_cpu` (never a herd), and when that stealer
+    /// claims its first row, `claim_taken` propagates the wake to the next
+    /// guest-idle CPU for the remaining backlog.
     #[test]
-    fn releasing_a_zone_row_or_handoff_wakes_a_guest_idle_driver_on_another_cpu() {
-        // Case 1: CPU 0's executor is busy running `root`; CPU 1's executor
-        // is idle in the guest after `try_take` returned `None`. Releasing a
-        // zone-held service row for `peer` lands on CPU 0 (lowest-index tie)
-        // and must wake CPU 1's guest-idle driver so it steals `peer`.
+    fn enqueuing_onto_a_busy_cpu_wakes_one_guest_idle_stealer_and_propagates() {
         let (kernel, root) = bootstrap(12_409);
-        let peer = sibling(&kernel, &root, 9_509);
+        let peer1 = sibling(&kernel, &root, 9_509);
+        let peer2 = sibling(&kernel, &root, 9_510);
         publish(&root, 52);
-        publish(&peer, 53);
-        let scheduler = scheduler_with_cpus(kernel, 2);
+        publish(&peer1, 53);
+        publish(&peer2, 54);
+        let scheduler = Arc::new(Scheduler::new_with_policy(
+            Arc::clone(&kernel),
+            Arc::new(PinToCpuZero(3)),
+        ));
+        let exec0_kick = Arc::new(GuestIdleKick::default());
+        let exec0 = scheduler
+            .register_executor_bound(exec0_kick.clone(), Some(GuestCpuId::new(0)), false)
+            .unwrap();
+        let exec1_kick = Arc::new(GuestIdleKick::default());
+        let exec1 = scheduler
+            .register_executor_bound(exec1_kick.clone(), Some(GuestCpuId::new(1)), false)
+            .unwrap();
+        let exec2_kick = Arc::new(GuestIdleKick::default());
+        let exec2 = scheduler
+            .register_executor_bound(exec2_kick.clone(), Some(GuestCpuId::new(2)), false)
+            .unwrap();
+
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        let running0 = scheduler.take(&exec0).unwrap();
+        exec0_kick.idle_wakes.store(0, Ordering::SeqCst);
+
+        assert!(scheduler.try_take(&exec1).unwrap().is_none());
+        assert!(scheduler.try_take(&exec2).unwrap().is_none());
+        assert_eq!(scheduler.queue.inner.cpus[0].idle_executors(), 0);
+        assert_eq!(scheduler.queue.inner.cpus[1].idle_executors(), 1);
+        assert_eq!(scheduler.queue.inner.cpus[2].idle_executors(), 1);
+
+        scheduler.make_runnable(peer1.thread().key()).unwrap();
+        assert_eq!(
+            exec0_kick.idle_wakes.load(Ordering::SeqCst),
+            0,
+            "busy CPU 0 executor must not receive a guest-idle wake"
+        );
+        assert_eq!(
+            exec1_kick.idle_wakes.load(Ordering::SeqCst),
+            1,
+            "wake_idle_cpu must wake the first guest-idle stealer on CPU 1"
+        );
+        assert_eq!(
+            exec2_kick.idle_wakes.load(Ordering::SeqCst),
+            0,
+            "wake_idle_cpu must wake exactly one idle CPU, never a herd"
+        );
+
+        scheduler.make_runnable(peer2.thread().key()).unwrap();
+        assert_eq!(
+            exec2_kick.idle_wakes.load(Ordering::SeqCst),
+            0,
+            "CPU 1 has not yet claimed its row, so wake_idle_cpu still targets CPU 1"
+        );
+
+        let stolen1 = scheduler
+            .try_take(&exec1)
+            .unwrap()
+            .expect("CPU 1 steals from busy CPU 0");
+        assert_eq!(
+            exec2_kick.idle_wakes.load(Ordering::SeqCst),
+            1,
+            "claiming a row on CPU 1 must propagate the wake to guest-idle CPU 2 for the remaining backlog"
+        );
+
+        let stolen2 = scheduler
+            .try_take(&exec2)
+            .unwrap()
+            .expect("CPU 2 steals the remaining row from busy CPU 0");
+        assert_eq!(
+            super::BTreeSet::from([stolen1.thread_key(), stolen2.thread_key()]),
+            super::BTreeSet::from([peer1.thread().key(), peer2.thread().key()])
+        );
+
+        scheduler.settle_exited(stolen1).unwrap();
+        scheduler.settle_exited(stolen2).unwrap();
+        scheduler.settle_exited(running0).unwrap();
+        scheduler.close();
+    }
+
+    /// Issue #1071: when `release_zone_row` falls back to a host CPU queue
+    /// whose executor is busy (`!waiter_present`), it must call
+    /// `wake_idle_cpu(cpu.id)` just like `enqueue` and `publish` so a
+    /// guest-idle stealer on another CPU wakes to steal the row.
+    #[test]
+    fn releasing_a_zone_row_onto_a_busy_cpu_wakes_a_guest_idle_stealer() {
+        let (kernel, root) = bootstrap(12_414);
+        let peer = sibling(&kernel, &root, 9_511);
+        publish(&root, 55);
+        publish(&peer, 56);
+        let scheduler = Arc::new(Scheduler::new_with_policy(
+            Arc::clone(&kernel),
+            Arc::new(PinToCpuZero(2)),
+        ));
         let exec0 = scheduler
             .register_executor_bound(
                 Arc::new(RecordingKick::default()),
@@ -9167,10 +9310,7 @@ mod tests {
 
         scheduler.make_runnable(root.thread().key()).unwrap();
         let running0 = scheduler.take(&exec0).unwrap();
-        assert!(
-            scheduler.try_take(&exec1).unwrap().is_none(),
-            "exec1 scans empty queues before entering wait_in_guest"
-        );
+        assert!(scheduler.try_take(&exec1).unwrap().is_none());
         assert_eq!(exec1_kick.idle_wakes.load(Ordering::SeqCst), 0);
 
         let inner = &scheduler.queue.inner;
@@ -9192,66 +9332,89 @@ mod tests {
         }
         inner.place_zone_row(peer.thread(), peer_key);
 
-        assert!(
-            exec1_kick.idle_wakes.load(Ordering::SeqCst) > 0,
-            "releasing a zone row onto busy CPU 0 failed to wake the guest-idle driver on CPU 1"
+        assert_eq!(
+            exec1_kick.idle_wakes.load(Ordering::SeqCst),
+            1,
+            "release_zone_row onto busy CPU 0 must wake the guest-idle stealer on CPU 1"
         );
         let stolen = scheduler
             .try_take(&exec1)
             .unwrap()
             .expect("CPU 1 steals the released zone row from CPU 0");
         assert_eq!(stolen.thread_key(), peer.thread().key());
-        scheduler.settle_exited(stolen).unwrap();
 
-        // Case 2: CPU 0's owner is in a host wait (`placement.cpu == None`)
-        // while a borrower spare releases its handoff, leaving a runnable row
-        // on CPU 0 with no executor matching `placement.cpu == Some(CPU 0)`.
-        // CPU 1's guest-idle driver must be woken to steal it.
-        let sibling2 = sibling(scheduler.kernel(), &root, 9_510);
-        publish(&sibling2, 54);
-        let borrower = scheduler
-            .register_executor_bound(Arc::new(RecordingKick::default()), None, true)
+        scheduler.settle_exited(stolen).unwrap();
+        scheduler.settle_exited(running0).unwrap();
+        scheduler.close();
+    }
+
+    /// Issue #1071: when a row is enqueued onto `CPU 0` while a borrowed spare
+    /// is guest-idle on `CPU 0`, `enqueue` sees `waiter_present == true` on
+    /// `CPU 0` and wakes only the borrower on `CPU 0`. If that borrower then
+    /// releases its handoff (`release_handoff`) before claiming the row,
+    /// `CPU 0` goes offline with the row still queued (`host_queued > 0`);
+    /// `release_handoff` must call `wake_idle_cpu(cpu)` so a guest-idle
+    /// stealer on another CPU wakes to steal the stranded row.
+    #[test]
+    fn releasing_a_handoff_with_a_row_already_host_queued_wakes_a_guest_idle_stealer() {
+        let (kernel, root) = bootstrap(12_415);
+        let peer = sibling(&kernel, &root, 9_512);
+        publish(&root, 57);
+        publish(&peer, 58);
+        let scheduler = scheduler_with_cpus(kernel, 2);
+        let exec0 = scheduler
+            .register_executor_bound(
+                Arc::new(RecordingKick::default()),
+                Some(GuestCpuId::new(0)),
+                false,
+            )
             .unwrap();
+        let borrower_kick = Arc::new(GuestIdleKick::default());
+        let borrower = scheduler
+            .register_executor_bound(borrower_kick.clone(), None, true)
+            .unwrap();
+        let exec1_kick = Arc::new(GuestIdleKick::default());
+        let exec1 = scheduler
+            .register_executor_bound(exec1_kick.clone(), Some(GuestCpuId::new(1)), false)
+            .unwrap();
+
+        scheduler.make_runnable(root.thread().key()).unwrap();
+        let running0 = scheduler.take(&exec0).unwrap();
         let token = scheduler.begin_host_wait(&running0, &exec0).unwrap();
+
+        // Both the borrower on CPU 0 and exec1 on CPU 1 enter wait_in_guest.
         assert!(scheduler.try_take(&borrower).unwrap().is_none());
         assert_eq!(borrower.bound_cpu(), Some(GuestCpuId::new(0)));
         assert!(scheduler.try_take(&exec1).unwrap().is_none());
+        borrower_kick.idle_wakes.store(0, Ordering::SeqCst);
         exec1_kick.idle_wakes.store(0, Ordering::SeqCst);
 
-        let sib2_key = QueueKey {
-            thread: sibling2.thread().key(),
-            generation: sibling2.thread().execution_state().generation().unwrap(),
-        };
-        {
-            let mut shard = inner.shard(sib2_key).lock();
-            shard.queued.insert(sib2_key);
-            shard.zone_held.insert(
-                sib2_key,
-                inner.retain_queued_row(super::QueueRow {
-                    key: sib2_key,
-                    thread: Arc::clone(sibling2.thread()),
-                    closing_authorized: false,
-                }),
-            );
-        }
-        assert!(
-            inner.release_handoff(borrower.id(), false),
-            "borrower releases its lent CPU before parking"
-        );
-        inner.release_zone_row(sib2_key);
+        // Enqueue `peer`: both CPUs have `queued: 0, idle: 1, bound: 1`, so
+        // `select_cpu` picks CPU 0 and `waiter_present` is true on CPU 0.
+        // Only the borrower on CPU 0 is woken; CPU 1 is not woken yet.
+        scheduler.make_runnable(peer.thread().key()).unwrap();
+        assert_eq!(borrower_kick.idle_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(exec1_kick.idle_wakes.load(Ordering::SeqCst), 0);
 
+        // The borrower releases its lent CPU before claiming `peer`, leaving
+        // `peer` host-queued on CPU 0 with no driver on CPU 0.
         assert!(
-            exec1_kick.idle_wakes.load(Ordering::SeqCst) > 0,
-            "releasing a zone row while CPU 0 has placement.cpu == None failed to wake CPU 1"
+            scheduler.queue.inner.release_handoff(borrower.id(), false),
+            "borrower releases its lent CPU while peer is still host-queued on CPU 0"
         );
-        let stolen2 = scheduler
+        assert_eq!(
+            exec1_kick.idle_wakes.load(Ordering::SeqCst),
+            1,
+            "release_handoff with a row still host-queued on CPU 0 must wake CPU 1"
+        );
+        let stolen = scheduler
             .try_take(&exec1)
             .unwrap()
-            .expect("CPU 1 steals the row queued during CPU 0's handoff transition");
-        assert_eq!(stolen2.thread_key(), sibling2.thread().key());
+            .expect("CPU 1 steals the row stranded on CPU 0 when the handoff released");
+        assert_eq!(stolen.thread_key(), peer.thread().key());
 
         drop(token);
-        scheduler.settle_exited(stolen2).unwrap();
+        scheduler.settle_exited(stolen).unwrap();
         scheduler.settle_exited(running0).unwrap();
         scheduler.close();
     }

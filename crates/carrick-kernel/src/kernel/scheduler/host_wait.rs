@@ -553,6 +553,7 @@ impl RunQueueInner {
         let owner = slot.owner.take().unwrap_or_else(|| {
             carrick_fatal!("scheduler::host_wait", "slot owner vanished under its lock")
         });
+        owner.clear_guest_idle();
         *owner.placement.lock() = ExecutorPlacement {
             cpu: None,
             slot: (owner.id == slot.root.id).then_some(id),
@@ -574,7 +575,7 @@ impl RunQueueInner {
         drop(state);
         self.cpus[cpu.as_usize()].nudge();
         if self.host_queued.load(Ordering::Acquire) > 0 {
-            self.wake_guest_idle(None);
+            self.wake_idle_cpu(cpu);
         }
         true
     }
