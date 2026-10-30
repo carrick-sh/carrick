@@ -1,6 +1,6 @@
 //! Neutral exact-incarnation lifecycle transitions over retained storage.
 pub use carrick_core_abi::lifecycle::*;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub mod stock;
 
@@ -146,6 +146,7 @@ pub enum MemberMembershipError {
 
 struct MemberExitClaim<'a, W: crate::cancellation::CancellationWord> {
     word: &'a W,
+    waiter: Option<&'a MemberReleaseWaiter>,
     committed: bool,
 }
 fn claim_member_exit<W: crate::cancellation::CancellationWord>(
@@ -171,6 +172,7 @@ fn claim_member_exit<W: crate::cancellation::CancellationWord>(
             Ok(_) => {
                 return Ok(MemberExitClaim {
                     word,
+                    waiter: None,
                     committed: false,
                 });
             }
@@ -189,18 +191,22 @@ fn finish_member_word<W: crate::cancellation::CancellationWord>(
 ) -> bool {
     let mut observed = word.load(Ordering::Acquire);
     loop {
-        let next = ((observed | set) & !MEMBER_WAITER) - subtract;
+        let clear_waiter =
+            if subtract & REFERENCES == 0 || observed & REFERENCES <= subtract & REFERENCES {
+                MEMBER_WAITER
+            } else {
+                0
+            };
+        let next = ((observed | set) & !clear_waiter) - subtract;
         match word.compare_exchange(observed, next, order, Ordering::Acquire) {
-            Ok(previous) => return previous & MEMBER_WAITER != 0,
+            Ok(previous) => return previous & clear_waiter != 0,
             Err(actual) => observed = actual,
         }
     }
 }
 impl<W: crate::cancellation::CancellationWord> Drop for MemberExitClaim<'_, W> {
     fn drop(&mut self) {
-        // Layer 2 will turn this observation into retained wake debt. Arming
-        // is deliberately absent from this layer, so no wake can be owed yet.
-        let _waiter = finish_member_word(
+        if finish_member_word(
             self.word,
             0,
             GRAPH_REFERENCE
@@ -210,7 +216,10 @@ impl<W: crate::cancellation::CancellationWord> Drop for MemberExitClaim<'_, W> {
                     MEMBERSHIP_CLAIMED
                 },
             Ordering::AcqRel,
-        );
+        ) && let Some(waiter) = self.waiter
+        {
+            waiter.notify();
+        }
     }
 }
 
@@ -332,11 +341,152 @@ pub trait MemberControlRelease: Send + Sync {
     fn released(&self);
 }
 
+unsafe fn finish_member_release<R: MemberControlRelease>(ptr: *const (), notify: bool) {
+    // SAFETY: `ptr` was produced by `Arc::into_raw` in `arm_member_release` and
+    // claimed exclusively by atomic swap on `MemberReleaseWaiter::finish`.
+    let release = unsafe { alloc::sync::Arc::from_raw(ptr.cast::<R>()) };
+    if notify {
+        release.released();
+    }
+}
+
+/// Atomic waiter slot for a control storage owner's final-reference wake.
+#[repr(C)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
+pub struct MemberReleaseWaiter {
+    data: AtomicU64,
+    finish: AtomicU64,
+}
+impl MemberReleaseWaiter {
+    pub const fn new() -> Self {
+        Self {
+            data: AtomicU64::new(0),
+            finish: AtomicU64::new(0),
+        }
+    }
+    pub(crate) fn notify(&self) {
+        self.take(true);
+    }
+    fn take(&self, notify: bool) {
+        loop {
+            match self.finish.load(Ordering::Acquire) {
+                0 => return,
+                1 => core::hint::spin_loop(),
+                old_finish => {
+                    if self
+                        .finish
+                        .compare_exchange(old_finish, 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let old_data = self.data.swap(0, Ordering::Relaxed);
+                        self.finish.store(0, Ordering::Release);
+                        // SAFETY: `old_data` and `old_finish` were installed by `arm_member_release`.
+                        unsafe {
+                            let finish: unsafe fn(*const (), bool) =
+                                core::mem::transmute(old_finish as usize);
+                            finish(old_data as usize as *const (), notify);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Arm `MEMBER_WAITER` on an occupied control so the final reference drop wakes `release` once.
+/// Returns `false` when the control is already unreferenced or resetting.
+pub fn arm_member_release<'a, R: MemberControlRelease + 'a>(
+    member: &'a (impl MemberControl + ?Sized),
+    release: alloc::sync::Arc<R>,
+) -> bool {
+    let Some(waiter) = member.release_waiter() else {
+        return false;
+    };
+    let word = &member.exit_custody().word;
+    let init = word.load(Ordering::Acquire);
+    if init & RESETTING != 0 || init & REFERENCES == 0 {
+        return false;
+    }
+    let raw_data = alloc::sync::Arc::into_raw(release) as usize as u64;
+    let raw_finish = finish_member_release::<R> as *const () as usize as u64;
+    let old = loop {
+        match waiter.finish.load(Ordering::Acquire) {
+            0 => {
+                if waiter
+                    .finish
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break None;
+                }
+            }
+            1 => core::hint::spin_loop(),
+            old_finish => {
+                if word.load(Ordering::Acquire) & MEMBER_WAITER == 0 {
+                    core::hint::spin_loop();
+                    continue;
+                }
+                if waiter
+                    .finish
+                    .compare_exchange(old_finish, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let old_data = waiter.data.swap(0, Ordering::Relaxed);
+                    break Some((old_data, old_finish));
+                }
+            }
+        }
+    };
+    let mut observed = word.load(Ordering::Acquire);
+    loop {
+        if observed & RESETTING != 0 || observed & REFERENCES == 0 {
+            waiter.finish.store(0, Ordering::Release);
+            if let Some((old_data, old_finish)) = old {
+                // SAFETY: `old_data` and `old_finish` were installed by a prior `arm_member_release`.
+                unsafe {
+                    let finish: unsafe fn(*const (), bool) =
+                        core::mem::transmute(old_finish as usize);
+                    finish(old_data as usize as *const (), true);
+                }
+            }
+            // SAFETY: `raw_data` was produced by `Arc::into_raw` above and never published.
+            unsafe {
+                drop(alloc::sync::Arc::from_raw(raw_data as usize as *const R));
+            }
+            return false;
+        }
+        match word.compare_exchange(
+            observed,
+            observed | MEMBER_WAITER,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                waiter.data.store(raw_data, Ordering::Relaxed);
+                waiter.finish.store(raw_finish, Ordering::Release);
+                if let Some((old_data, old_finish)) = old {
+                    // SAFETY: `old_data` and `old_finish` were installed by a prior `arm_member_release`.
+                    unsafe {
+                        let finish: unsafe fn(*const (), bool) =
+                            core::mem::transmute(old_finish as usize);
+                        finish(
+                            old_data as usize as *const (),
+                            observed & MEMBER_WAITER == 0,
+                        );
+                    }
+                }
+                return true;
+            }
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
 /// An owned control reference that prevents allocation reuse. A committed
 /// registration publishes its unregister receipt when every reference drops.
 pub struct MemberControlCustody<'a, T: MemberControl + ?Sized> {
     control: &'a T,
-    release: Option<alloc::sync::Arc<dyn MemberControlRelease + 'a>>,
 }
 impl<'a, T: MemberControl + ?Sized> MemberControlCustody<'a, T> {
     pub fn retain(control: &'a T) -> Result<Self, TransitionError> {
@@ -351,25 +501,7 @@ impl<'a, T: MemberControl + ?Sized> MemberControlCustody<'a, T> {
                 }
             })
             .map_err(|_| TransitionError::StaleGeneration)?;
-        Ok(Self {
-            control,
-            release: None,
-        })
-    }
-    /// Attach the storage owner's admitted progress source. All independently
-    /// retained references which can outlive this lease must inherit it.
-    pub fn with_release(
-        mut self,
-        release: alloc::sync::Arc<dyn MemberControlRelease + 'a>,
-    ) -> Self {
-        self.release = Some(release);
-        self
-    }
-    /// Retain the same incarnation and its notification authority together.
-    pub fn retained(&self) -> Result<Self, TransitionError> {
-        let mut retained = Self::retain(self.control)?;
-        retained.release = self.release.clone();
-        Ok(retained)
+        Ok(Self { control })
     }
     /// Commit a retained reference into the graph or terminal receipt set.
     /// Speculative retains must drop without manufacturing an unregister receipt.
@@ -398,15 +530,14 @@ impl<T: MemberControl + ?Sized> core::ops::Deref for MemberControlCustody<'_, T>
 }
 impl<T: MemberControl + ?Sized> Drop for MemberControlCustody<'_, T> {
     fn drop(&mut self) {
-        let previous = self
-            .control
-            .exit_custody()
-            .word
-            .fetch_sub(GRAPH_REFERENCE, Ordering::AcqRel);
-        if previous & REFERENCES == GRAPH_REFERENCE
-            && let Some(release) = self.release.as_ref()
+        if finish_member_word(
+            &self.control.exit_custody().word,
+            0,
+            GRAPH_REFERENCE,
+            Ordering::AcqRel,
+        ) && let Some(waiter) = self.control.release_waiter()
         {
-            release.released();
+            waiter.notify();
         }
     }
 }
@@ -417,6 +548,9 @@ pub trait MemberControl {
     fn member_entry(&self) -> Option<EntryRef>;
     fn exit_custody(&self) -> &MemberExitCustody;
     fn host_retirement(&self) -> Option<crate::terminal::HostThreadRetirementReceipt>;
+    fn release_waiter(&self) -> Option<&MemberReleaseWaiter> {
+        None
+    }
 }
 
 pub(crate) fn reserve_member_exit<'a>(
@@ -426,7 +560,8 @@ pub(crate) fn reserve_member_exit<'a>(
     if member.host_retirement().is_some() {
         return Err(MemberMembershipError::AlreadyTerminal);
     }
-    let claim = claim_member_exit(&member.exit_custody().word)?;
+    let mut claim = claim_member_exit(&member.exit_custody().word)?;
+    claim.waiter = member.release_waiter();
     let mut membership = crate::terminal::reserve_thread_exit_membership(page)
         .map_err(|_| MemberMembershipError::Floor)?;
     membership.member = Some(claim);

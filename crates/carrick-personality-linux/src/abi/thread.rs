@@ -556,6 +556,7 @@ pub struct ThreadControlSlot {
     // publishing this control to EL1. Never dereference the other venue's VA.
     affinity_host_alias: AtomicU64,
     affinity_guest_alias: AtomicU64,
+    release_waiter: carrick_core::lifecycle::MemberReleaseWaiter,
     /// Exact native service custody survives execution-slot reuse.
     pub service: carrick_core_abi::service::ServiceCell,
 }
@@ -635,6 +636,7 @@ impl ThreadControlSlot {
             affinity: carrick_core::affinity::AffinityAuthority::new(),
             affinity_host_alias: AtomicU64::new(0),
             affinity_guest_alias: AtomicU64::new(0),
+            release_waiter: carrick_core::lifecycle::MemberReleaseWaiter::new(),
             visible_tid: AtomicU32::new(0),
             blocked: AtomicU64::new(0),
             forwarded_saved_mask: AtomicU64::new(0),
@@ -1091,6 +1093,10 @@ impl carrick_core::lifecycle::MemberControl for ThreadControlSlot {
 
     fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
         ThreadControlSlot::host_retirement(self)
+    }
+
+    fn release_waiter(&self) -> Option<&carrick_core::lifecycle::MemberReleaseWaiter> {
+        Some(&self.release_waiter)
     }
 }
 impl Default for ThreadControlSlot {
@@ -3204,6 +3210,7 @@ mod layout_manifest {
                      affinity: _,
                      affinity_host_alias: _,
                      affinity_guest_alias: _,
+                     release_waiter: _,
                      service: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
@@ -3283,6 +3290,14 @@ mod layout_manifest {
             AtomicU64,
             232,
             8,
+            8
+        );
+        field!(
+            ThreadControlSlot,
+            release_waiter,
+            carrick_core::lifecycle::MemberReleaseWaiter,
+            240,
+            16,
             8
         );
         field!(

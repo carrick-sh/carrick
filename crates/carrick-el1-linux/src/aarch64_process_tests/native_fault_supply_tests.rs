@@ -365,6 +365,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             );
         }
         let mut pins = Vec::new();
+        let mut transient_pins = Vec::new();
         for _ in 0..count + 1 {
             if page.live() == 1 {
                 break;
@@ -401,6 +402,11 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                         &owner, record,
                     ),
                 );
+                transient_pins.push(
+                    crate::native_process_runtime::thread_stock::retain_transient_control_pin(
+                        &owner, record,
+                    ),
+                );
             }
             frame.x[8] = 93;
             frame.x[0] = 0;
@@ -424,6 +430,10 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
         );
         if case == ChildStockCase::Pinned {
             assert_eq!(pins.len(), 7);
+            assert_eq!(transient_pins.len(), 7);
+            // Drop the signal projection first so only the release-less transient
+            // pin remains on the 7th exited slot when the clone parks.
+            drop(pins.pop());
             frame.x[8] = 220;
             frame.x[..6].copy_from_slice(&[0x50f00, VA + 0x12000, 0, 0, 0, 0]);
             let caller = fixture
@@ -444,7 +454,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                 claims_pinned.thread_claims, 9,
                 "retain all seven retired namespace claims until pins return"
             );
-            drop(pins.pop());
+            drop(transient_pins.pop());
             let mut handoff = None;
             let mut zone = crate::dispatch::Zone {
                 tables: fixture.zone,
@@ -484,6 +494,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             assert!((frame.x[0] as i64) > 0);
             assert_eq!(page.live(), 2);
             drop(pins);
+            drop(transient_pins);
             let mut handoff = None;
             let mut zone = crate::dispatch::Zone {
                 tables: fixture.zone,

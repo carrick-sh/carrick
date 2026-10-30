@@ -787,27 +787,6 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     usage: TaskRusage,
     file_table: u64,
 }
-impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
-    fn retain_control(
-        &self,
-        control: &'a ThreadControlSlot,
-    ) -> Result<
-        Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
-        NativeProcessError,
-    > {
-        if let Some(member) = self
-            .members
-            .iter()
-            .find(|member| core::ptr::eq(member.control.control(), control))
-        {
-            return Ok(member.control.clone());
-        }
-        match self.thread_stock.as_ref() {
-            Some(stock) => stock.retain(control).map(Arc::new),
-            None => retain_member_control(control),
-        }
-    }
-}
 pub type NativeForkPreparation<'a, M, P, C> = PreparedFork<
     VisibleNamespace,
     carrick_personality_linux::identity::TaskUid,
@@ -2505,7 +2484,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     resources.map_stash.remove(&old_record);
                 }
             } else {
-                let retained = row.native().resources().retain_control(control)?;
+                let retained = retain_member_control(control)?;
                 let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
                     .map_err(|_| NativeProcessError::Busy)?;
                 retained.commit_registration();
@@ -2534,15 +2513,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process,
                 address,
                 record: source.zone.record_ref(record),
-                control: runtime
-                    .graph
-                    .lock()
-                    .owner
-                    .task(process)
-                    .map_err(|_| NativeProcessError::Stale)?
-                    .native()
-                    .resources()
-                    .retain_control(control)?,
+                control: retain_member_control(control)?,
             },
         );
         state
@@ -3336,14 +3307,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             record: source.zone.record_ref(record),
             control,
             _control_custody: Some(
-                self.graph
-                    .lock()
-                    .owner
-                    .task(key)
-                    .map_err(|_| NativeProcessError::Stale)?
-                    .native()
-                    .resources()
-                    .retain_control(control)?,
+                carrick_core::lifecycle::MemberControlCustody::retain(control)
+                    .map_err(|_| NativeProcessError::Stale)?,
             ),
             key,
             caller_address,
@@ -3384,14 +3349,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             record,
             control: member_control,
             _control_custody: Some(
-                self.graph
-                    .lock()
-                    .owner
-                    .task(process)
-                    .map_err(|_| NativeProcessError::Stale)?
-                    .native()
-                    .resources()
-                    .retain_control(member_control)?,
+                carrick_core::lifecycle::MemberControlCustody::retain(member_control)
+                    .map_err(|_| NativeProcessError::Stale)?,
             ),
             key: process,
             caller_address: address,
@@ -3634,8 +3593,7 @@ pub struct NativeProcessEntry<
     binding: ExecutionBinding,
     record: RecordRef,
     control: &'a ThreadControlSlot,
-    _control_custody:
-        Option<Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>>,
+    _control_custody: Option<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
     key: TaskKey,
     caller_address: AddressContext<RootGpa>,
     words: Box<C>,
@@ -5534,13 +5492,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     pool.push(entry);
                     outstanding.push(OutstandingExitReceipt::Pool {
                         entry,
-                        control: graph
-                            .owner
-                            .task(self.key)
-                            .map_err(|_| NativeProcessError::Stale)?
-                            .native()
-                            .resources()
-                            .retain_control(control)?,
+                        control: retain_member_control(control)?,
                         expected_host,
                     });
                 }
@@ -5587,14 +5539,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         {
                             continue;
                         }
-                        let retained = match graph
-                            .owner
-                            .task(self.key)
-                            .map_err(|_| NativeProcessError::Stale)?
-                            .native()
-                            .resources()
-                            .retain_control(control)
-                        {
+                        let retained = match retain_member_control(control) {
                             Ok(retained) => retained,
                             Err(error) => {
                                 // Retirement can win after the state/address
@@ -5637,13 +5582,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 for (birth, control, _) in &adopted {
                     outstanding.push(OutstandingExitReceipt::Adopted {
                         birth: *birth,
-                        control: graph
-                            .owner
-                            .task(self.key)
-                            .map_err(|_| NativeProcessError::Stale)?
-                            .native()
-                            .resources()
-                            .retain_control(control)?,
+                        control: retain_member_control(control)?,
                     });
                 }
                 for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
@@ -5652,7 +5591,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     };
                     if page.host_birth_receipt_returned(index) {
                         continue;
-                    }
+                    };
                     if self.control.host_birth_identity() == Some(identity) {
                         continue;
                     }
@@ -5678,13 +5617,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // Every fallible retain precedes consumption. A refusal
                 // drops preparation with admission still closed and no begun
                 // claim or caller live unit consumed.
-                let caller = graph
-                    .owner
-                    .task(self.key)
-                    .map_err(|_| NativeProcessError::Stale)?
-                    .native()
-                    .resources()
-                    .retain_control(self.control)?;
+                let caller = retain_member_control(self.control)?;
                 let custody = match (&operation, admission) {
                     (
                         PendingCloseOperation::Exit { status, .. },
