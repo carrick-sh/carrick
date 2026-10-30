@@ -66,17 +66,6 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
         }
         Err(NativeProcessError::Exhausted)
     }
-    pub(super) fn retain(
-        &self,
-        control: &'a ThreadControlSlot,
-    ) -> Result<
-        carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>,
-        NativeProcessError,
-    > {
-        carrick_core::lifecycle::MemberControlCustody::retain(control)
-            .map(|custody| custody.with_release(self.release.clone()))
-            .map_err(|_| NativeProcessError::Stale)
-    }
     fn settle(&mut self, page: &ThreadLifecyclePage) -> Result<(), NativeProcessError> {
         let mut index = 0;
         while index < self.identities.len() {
@@ -332,8 +321,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }) {
                         return Err(ObjectWaitError::Changed);
                     }
-                    let pinned_exit = stock.identities.iter().any(|(entry, _)| {
-                        resources
+                    let mut pinned_exit = false;
+                    for (entry, _) in &stock.identities {
+                        if resources
                             .page
                             .state(entry.index())
                             .is_some_and(|(generation, state)| {
@@ -345,7 +335,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                             | EntryState::Revoked
                                     )
                             })
-                    });
+                        {
+                            if !carrick_core::lifecycle::arm_member_release(
+                                &stock.controls[entry.index() + 1],
+                                release.clone(),
+                            ) {
+                                return Err(ObjectWaitError::Changed);
+                            }
+                            pinned_exit = true;
+                        }
+                    }
                     if !pinned_exit {
                         limit = true;
                         return Err(ObjectWaitError::Changed);
@@ -485,4 +484,20 @@ pub(crate) fn retain_signal_snapshot<'a, M: Clone, C: ProcessContext>(
         .find(|member| member.record == record)
         .and_then(|member| member.signal_projection.clone())
         .expect("registered signal projection")
+}
+#[cfg(test)]
+pub(crate) fn retain_transient_control_pin<'a, M: Clone, C: ProcessContext>(
+    runtime: &NativeProcessRuntime<'a, M, C>,
+    record: carrick_el1_abi::RecordRef,
+) -> carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot> {
+    let graph = runtime.graph.lock();
+    let control = graph
+        .owner
+        .tasks()
+        .values()
+        .flat_map(|task| task.native().resources().members.iter())
+        .find(|member| member.record == record)
+        .map(|member| member.control.control())
+        .expect("registered member control");
+    carrick_core::lifecycle::MemberControlCustody::retain(control).expect("transient control pin")
 }
