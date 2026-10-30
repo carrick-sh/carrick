@@ -138,7 +138,13 @@ pub struct ObjectWaitKey {
 }
 
 /// A storage owner's release queue, separate from service and IPC readiness.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct MemberReleaseIndex(usize);
 impl MemberReleaseIndex {
     pub const fn new(index: usize) -> Option<Self> {
@@ -151,7 +157,13 @@ impl MemberReleaseIndex {
 }
 
 /// Incarnation allocated by the carrier's existing monotone serial issuer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct MemberReleaseGeneration(core::num::NonZeroU64);
 impl MemberReleaseGeneration {
     pub const fn from_issued(serial: core::num::NonZeroU64) -> Self {
