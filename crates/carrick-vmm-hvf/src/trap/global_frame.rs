@@ -3288,13 +3288,18 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             continue;
         }
         finalize_global_frame_owner_record_using(custody, &owner, release_ipa)?;
-        let mut owners = custody.global_frame_host_owners.lock();
-        if owners
-            .get(&key)
-            .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.owner(), &owner))
-        {
-            owners.remove(&key);
-        }
+        let removed = {
+            let mut owners = custody.global_frame_host_owners.lock();
+            if owners
+                .get(&key)
+                .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.owner(), &owner))
+            {
+                owners.remove(&key)
+            } else {
+                None
+            }
+        };
+        drop(removed);
         report.retired += 1;
     }
 
@@ -3582,33 +3587,39 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
         // publication: readers and successor registration reject it until this
         // transaction either removes the exact Arc or records a retryable failure.
         let mut owners = custody.global_frame_host_owners.lock();
-        let owner = match owners.get(&key) {
-            Some(GlobalFrameOwnerEntry::Live(owner))
-            | Some(GlobalFrameOwnerEntry::RetirementPending {
-                owner,
-                in_flight: false,
-                ..
-            }) => std::sync::Arc::clone(owner),
-            Some(entry) => {
-                return GlobalFrameRetirementOutcome::RetryPending {
-                    ipa,
-                    length,
-                    generation: entry.owner().generation(),
-                    error: "global frame owner retirement is already claimed".to_owned(),
-                };
-            }
-            None => return GlobalFrameRetirementOutcome::NotFound { ipa, length },
+        let Some(entry) = owners.get(&key) else {
+            return GlobalFrameRetirementOutcome::NotFound { ipa, length };
         };
         if let Some(expected) = expected_generation {
-            if owner.generation() != expected {
+            if entry.owner().generation() != expected {
                 return GlobalFrameRetirementOutcome::MismatchedGeneration {
                     ipa,
                     length,
-                    current_generation: owner.generation(),
+                    current_generation: entry.owner().generation(),
                     expected_generation: expected,
                 };
             }
         }
+        let owner = match entry {
+            GlobalFrameOwnerEntry::Live(owner)
+            | GlobalFrameOwnerEntry::RetirementPending {
+                owner,
+                in_flight: false,
+                ..
+            } => std::sync::Arc::clone(owner),
+            GlobalFrameOwnerEntry::RetirementPending {
+                owner,
+                in_flight: true,
+                ..
+            } => {
+                return GlobalFrameRetirementOutcome::RetryPending {
+                    ipa,
+                    length,
+                    generation: owner.generation(),
+                    error: "global frame owner retirement is already claimed".to_owned(),
+                };
+            }
+        };
         let generation = owner.generation();
         if owner.mapping.pin_count() != 0 {
             let outcome = custody.request_stage2_record_retirement(owner.record_identity);
@@ -3684,7 +3695,10 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
                         error: error.to_string(),
                     };
                 }
-                owners.remove(&key);
+                let removed = owners.remove(&key);
+                drop(owners);
+                drop(removed);
+                drop(owner);
                 if terminalized {
                     GlobalFrameRetirementOutcome::TerminalizedByVmDestroy {
                         ipa,
@@ -4017,10 +4031,11 @@ fn finish_pending_global_frame_owner(
         custody.enqueue_detached_global_frame_retirement(record_id);
         return;
     }
-    custody
+    let removed = custody
         .pending_global_frame_owners
         .lock()
         .remove(&record_id);
+    drop(removed);
     custody
         .pending_global_frame_detached_retries
         .lock()

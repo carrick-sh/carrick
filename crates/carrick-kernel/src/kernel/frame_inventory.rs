@@ -3641,16 +3641,7 @@ mod physical_projection_tests {
                     }
                     RecordRetirement::Complete(outcome) => outcome,
                 };
-                match outcome {
-                    CarrierStage2RetireOutcome::DeferredActivePins
-                    | CarrierStage2RetireOutcome::RetryPending(_) => {
-                        Ok(PhysicalGrantRelease::RetainUntilMmRetirement)
-                    }
-                    CarrierStage2RetireOutcome::RetiredUnmapped => {
-                        Ok(PhysicalGrantRelease::Released)
-                    }
-                    other => panic!("unexpected release: {other:?}"),
-                }
+                PhysicalGrantRelease::from_stage2_retire_outcome(outcome)
             }
         }
         impl Drop for Backing {

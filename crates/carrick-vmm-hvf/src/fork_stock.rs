@@ -62,15 +62,15 @@ pub(crate) struct NativeFrameBacking {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl NativeFrameBacking {
     /// Pins retain unused bytes in their issuing MM, without claiming a
-    /// physical-retirement receipt. Only indeterminate release fails closed.
+    /// physical-retirement receipt. Absence (carrier already torn down, or
+    /// exact owner generation already retired by reconcile, drain, or an
+    /// earlier release) is a completed release, not an invariant failure.
     pub(crate) fn release_unused(
         &self,
     ) -> Result<carrick_hal::physical_grants::PhysicalGrantRelease, carrick_hal::TrapError> {
-        let carrier = self.carrier.upgrade().ok_or_else(|| {
-            carrick_hal::TrapError::Hypervisor(
-                "native backing carrier absent during rollback".into(),
-            )
-        })?;
+        let Some(carrier) = self.carrier.upgrade() else {
+            return Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released);
+        };
         // Keep the exact immutable owner, not merely its weak carrier token.
         // The pin-drop idle turn may unmap stage-2 before MM retirement, but
         // retained custody still owns the host bytes and owner generation.
@@ -80,35 +80,35 @@ impl NativeFrameBacking {
             .get(&(self.ipa, self.length))
             .filter(|entry| entry.owner().generation() == self.generation)
             .map(|entry| std::sync::Arc::clone(entry.owner()));
-        let outcome = crate::trap::retire_global_frame_host_owner_if_generation_in(
+        let Some(owner) = owner else {
+            carrier
+                .native_frame_backings
+                .lock()
+                .remove(&(self.ipa, self.generation));
+            return Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released);
+        };
+        match crate::trap::retire_global_frame_host_owner_if_generation_in(
             &carrier,
             self.ipa,
             self.length,
             self.generation,
-        );
-        if matches!(
-            outcome,
-            crate::trap::GlobalFrameRetirementOutcome::DeferredActivePins { .. }
-                | crate::trap::GlobalFrameRetirementOutcome::RetryPending { .. }
         ) {
-            let owner = owner.ok_or_else(|| {
-                carrick_hal::TrapError::Hypervisor(
-                    "contended native release lost its authenticated backing".into(),
-                )
-            })?;
-            let _ = self.retained_owner.set(owner);
-            return Ok(carrick_hal::physical_grants::PhysicalGrantRelease::RetainUntilMmRetirement);
+            crate::trap::GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+            | crate::trap::GlobalFrameRetirementOutcome::RetryPending { .. } => {
+                let _ = self.retained_owner.set(owner);
+                Ok(carrick_hal::physical_grants::PhysicalGrantRelease::RetainUntilMmRetirement)
+            }
+            crate::trap::GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+            | crate::trap::GlobalFrameRetirementOutcome::TerminalizedByVmDestroy { .. }
+            | crate::trap::GlobalFrameRetirementOutcome::NotFound { .. }
+            | crate::trap::GlobalFrameRetirementOutcome::MismatchedGeneration { .. } => {
+                carrier
+                    .native_frame_backings
+                    .lock()
+                    .remove(&(self.ipa, self.generation));
+                Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released)
+            }
         }
-        if !outcome.is_retired() {
-            return Err(carrick_hal::TrapError::Hypervisor(format!(
-                "native backing exact-generation release indeterminate: {outcome:?}"
-            )));
-        }
-        carrier
-            .native_frame_backings
-            .lock()
-            .remove(&(self.ipa, self.generation));
-        Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released)
     }
 }
 impl Drop for NativeFrameBacking {

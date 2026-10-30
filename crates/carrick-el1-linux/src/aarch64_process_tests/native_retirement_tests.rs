@@ -49,19 +49,7 @@ impl SupplyBacking {
             }
             RecordRetirement::Complete(outcome) => outcome,
         };
-        if outcome == CarrierStage2RetireOutcome::RetiredUnmapped {
-            Ok(carrick_hal::physical_grants::PhysicalGrantRelease::Released)
-        } else if matches!(
-            outcome,
-            CarrierStage2RetireOutcome::DeferredActivePins
-                | CarrierStage2RetireOutcome::RetryPending(_)
-        ) {
-            Ok(carrick_hal::physical_grants::PhysicalGrantRelease::RetainUntilMmRetirement)
-        } else {
-            Err(carrick_hal::TrapError::Hypervisor(format!(
-                "indeterminate release: {outcome:?}"
-            )))
-        }
+        carrick_hal::physical_grants::PhysicalGrantRelease::from_stage2_retire_outcome(outcome)
     }
 }
 impl Drop for SupplyBacking {
@@ -429,6 +417,206 @@ impl PhysicalStock {
 #[test]
 fn native_child_exit_reclaims_stock_before_carrier_structural_shutdown() {
     super::arm_child_wait_wake_with_stock(false, false, true);
+}
+
+#[test]
+fn native_backing_release_already_retired_owner_is_clean_absence_without_quarantine() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
+    };
+
+    for scenario in [
+        "vm_destroy_terminalized",
+        "owner_generation_advanced",
+        "record_removed",
+    ] {
+        let tables = crate::mm_portal::test_support::Tables::new(0x10000, 0x10000, 64);
+        let mut stock = PhysicalStock::new(&tables);
+        let child_mm = ReservationMm::new(41).unwrap();
+        let parent_ctx_root = RootGpa::page_aligned(FrameGpa::new(0x10000)).unwrap();
+        let child_root = RootGpa::page_aligned(FrameGpa::new(0x11000)).unwrap();
+        let parent_table = RootGpa::page_aligned(FrameGpa::new(0x12000)).unwrap();
+        let spare_table = RootGpa::page_aligned(FrameGpa::new(0x13000)).unwrap();
+        let parent_exec = GrantExecution::new(
+            carrick_guest_arch::CpuId::new(0),
+            carrick_el1_abi::ExecutionBinding {
+                task: carrick_el1_abi::EntryTaskKey::from_raw(1),
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(1),
+                mm: carrick_el1_abi::EntryMmKey::from_raw(1),
+                generation: carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            },
+            carrick_guest_arch::AddressContext {
+                root: parent_ctx_root,
+                mm: MmGeneration::new(NonZeroU64::MIN),
+                generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+            },
+        );
+        let request = carrick_el1_abi::ForkStockRequest {
+            binding: parent_exec.binding,
+            context: parent_exec.context,
+            operation: carrick_el1_abi::PortalOperation {
+                carrier: NonZeroU64::MIN,
+                mm: ReservationMm::new(1).unwrap(),
+                incarnation: NonZeroU64::MIN,
+                sequence: NonZeroU64::MIN,
+            },
+            parent_generation: carrick_el1_abi::ReservationGeneration::INITIAL,
+            child_mm,
+            child_bytes: 4096,
+            parent_bytes: 4096,
+        };
+        let mut exchange = ForkStockExchange::new(request).unwrap();
+        let loan = stock.loan(
+            request,
+            &mut exchange,
+            vec![child_root],
+            vec![parent_table, spare_table],
+        );
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                NonZeroU64::MIN,
+                child_mm,
+                NonZeroU64::MIN,
+            )
+        };
+        let completion = carrick_el1_abi::PortalForkCompletion {
+            request: loan.request,
+            child: handle,
+            parent_generation: carrick_el1_abi::ReservationGeneration::INITIAL,
+            child_tables_used: 4096,
+            parent_tables_used: 4096,
+        };
+        let mut reserve = carrick_el1_abi::ForkStockSettlement::reserve(
+            loan,
+            completion,
+            KernelVa::new(0x1000),
+            0,
+        )
+        .unwrap();
+        stock.reserve(loan, &mut reserve);
+        let mut commit =
+            carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+        stock.commit(loan, &mut commit);
+
+        let physical_owner = carrick_hal::GuestFrameOwner {
+            native_mm: MmGeneration::new(NonZeroU64::new(child_mm.raw()).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let rollback = Arc::new(carrick_hal::physical_grants::PhysicalGrantRollback::default());
+        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+            rollback.clone(),
+            stock.inventory.clone(),
+            [FrameGpa::new(0xa0020000)],
+            0,
+            16384,
+            physical_owner,
+        )
+        .unwrap();
+        let row = staged.grants()[0];
+        let retained = stock.backing(&staged, 16384, NonZeroU64::new(7).unwrap());
+        let backing_record = retained.record.clone();
+        match scenario {
+            "vm_destroy_terminalized" => {
+                backing_record
+                    .lock()
+                    .unwrap()
+                    .snapshot
+                    .terminalized_by_vm_destroy = true;
+                backing_record.lock().unwrap().snapshot.mapped = false;
+            }
+            "owner_generation_advanced" => {
+                backing_record.lock().unwrap().snapshot.logical_owner = Some(CarrierLogicalOwner {
+                    id: row.gpa.raw(),
+                    generation: 8,
+                });
+                backing_record.lock().unwrap().snapshot.mapped = false;
+            }
+            "record_removed" => {
+                backing_record.lock().unwrap().snapshot.record_id = CarrierStage2RecordId(99);
+                backing_record.lock().unwrap().snapshot.mapped = false;
+            }
+            _ => unreachable!(),
+        }
+        let window = carrick_el1_abi::PortalGrantWindow {
+            operation: carrick_el1_abi::PortalOperation {
+                carrier: NonZeroU64::MIN,
+                mm: child_mm,
+                incarnation: NonZeroU64::MIN,
+                sequence: NonZeroU64::MIN,
+            },
+            mapping_incarnation: carrick_el1_abi::ReservationIncarnation::new(1).unwrap(),
+            range: carrick_el1_abi::ReservationRange::new(super::VA, super::VA + 4096).unwrap(),
+            protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
+            fault_page: super::VA,
+            host_backing: None,
+            fork_sequence: None,
+        };
+        let mut txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(child_mm.raw()).unwrap(),
+                generation: window.operation.sequence,
+            },
+            root: carrick_mmu_core::aarch64::SubstrateGpa(child_root.address().raw()),
+            op: DescriptorOp::Prepare {
+                publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                    va: window.range.start(),
+                    ipa: row.gpa.raw(),
+                    len: 4096,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(window.fault_page, 4096),
+                backing: row.identity,
+            },
+            tables: TableGrants::NONE,
+        };
+        stock.track_backing_tables(handle, child_root, &mut txn);
+        let reply = carrick_el1_abi::PortalGrantSlot::new();
+        {
+            let grants = stock
+                .owner
+                .child_physical_mut(child_mm, child_root)
+                .unwrap()
+                .supplied
+                .get_or_insert_with(|| {
+                    carrick_hal::physical_grants::NativePhysicalGrants::new(physical_owner)
+                });
+            grants
+                .stage_backing_reply(
+                    &reply,
+                    window,
+                    txn,
+                    staged.with_backing(retained),
+                    SupplyBacking::release_unused,
+                )
+                .unwrap();
+            assert!(grants.offer_backing_reply(&reply, &txn));
+        }
+        let settled = stock
+            .owner
+            .settle_native_backing_reply(
+                &mut NoTableLedger,
+                handle,
+                child_root,
+                &reply,
+                &txn,
+                SupplyBacking::release_unused,
+            )
+            .unwrap_or_else(|err| {
+                panic!("scenario {scenario} must settle as clean absence without carrier error: {err:?}")
+            });
+        assert!(settled);
+        assert!(
+            !stock.owner.is_quarantined(child_mm),
+            "scenario {scenario} must not quarantine the child MM"
+        );
+        assert_eq!(
+            rollback.retained_count(),
+            0,
+            "scenario {scenario} must not retain already-retired backing until MM exit"
+        );
+        assert!(!rollback.failed());
+    }
 }
 
 #[test]

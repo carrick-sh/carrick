@@ -73,6 +73,33 @@ pub enum PhysicalGrantRelease {
     RetainUntilMmRetirement,
 }
 
+impl PhysicalGrantRelease {
+    /// Classify a stage-2 record retirement outcome for an unused native backing
+    /// release. Absence (record already retired by VM teardown, unreplayed
+    /// reconcile/drain, or an earlier release that advanced the owner or VM
+    /// generation) means the caller's mapping is already unmapped at stage 2
+    /// and needs no MM-lifetime retention or carrier failure. Contention
+    /// (`DeferredActivePins` or `RetryPending`) transfers allocation custody to
+    /// MM retirement. Only `OwnerIdentityMismatch` is a broken invariant.
+    pub fn from_stage2_retire_outcome(
+        outcome: carrick_core_abi::mm::custody::CarrierStage2RetireOutcome,
+    ) -> Result<Self, TrapError> {
+        use carrick_core_abi::mm::custody::CarrierStage2RetireOutcome;
+        match outcome {
+            CarrierStage2RetireOutcome::RetiredUnmapped
+            | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
+            | CarrierStage2RetireOutcome::NotFound
+            | CarrierStage2RetireOutcome::OwnerGenerationMismatch
+            | CarrierStage2RetireOutcome::VmGenerationMismatch => Ok(Self::Released),
+            CarrierStage2RetireOutcome::DeferredActivePins
+            | CarrierStage2RetireOutcome::RetryPending(_) => Ok(Self::RetainUntilMmRetirement),
+            CarrierStage2RetireOutcome::OwnerIdentityMismatch => Err(TrapError::Hypervisor(
+                "stage-2 record owner identity mismatch".into(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PhysicalFrameGrant {
     pub gpa: FrameGpa,

@@ -846,6 +846,32 @@ impl NativeDescriptorTableReservation {
         &self.pages
     }
 }
+
+/// Outcome of atomic native backing supply under one [`ForkStock`] borrow.
+#[derive(Debug, Eq, PartialEq)]
+pub enum NativeBackingSupplyOutcome<D, O, E> {
+    /// The reply was staged, offered to the guest slot, and prepared for
+    /// delivery under the same [`ForkStock`] borrow.
+    Delivered {
+        output: O,
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    },
+    /// Prepared delivery was cancelled or refused after staging; both the
+    /// staged reply and tracked descriptor tables were settled under the same
+    /// [`ForkStock`] borrow before returning.
+    Cancelled {
+        delivery: D,
+        reason: E,
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    },
+    /// Descriptor-table stock was temporarily exhausted. The unpublished
+    /// physical grant was rolled back cleanly; the caller completes the fault
+    /// turn as a retryable empty supply rather than a `SIGSEGV` refusal.
+    DescriptorTableCapacity(D),
+    /// Stale or invalid child MM state refused table reservation before
+    /// staging; the unpublished physical grant was rolled back cleanly.
+    Refused(D),
+}
 impl NativeForkStockResources {
     /// True when both resource bundles name the same carrier's reserved
     /// fork-table arenas and physical frame inventory.
@@ -1195,6 +1221,151 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         }
         self.tables.extend(unused);
         Ok(())
+    }
+
+    /// Reserve descriptor tables, stage a backing reply, and offer it through
+    /// `publish` under one continuous `&mut ForkStock` borrow. If `publish`
+    /// cancels or refuses delivery, the staged reply and descriptor tables are
+    /// settled under the same borrow before returning.
+    #[allow(clippy::too_many_arguments)]
+    pub fn supply_native_backing_reply<D, O, E>(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+        window: carrick_el1_abi::PortalGrantWindow,
+        publication_len: u64,
+        executable: bool,
+        table_count: usize,
+        unpublished: crate::physical_grants::UnpublishedPhysicalGrant<
+            <C as crate::physical_grants::NativeSupplyCustody>::Backing,
+        >,
+        delivery: D,
+        release: impl Fn(
+            &<C as crate::physical_grants::NativeSupplyCustody>::Backing,
+        )
+            -> Result<crate::physical_grants::PhysicalGrantRelease, crate::TrapError>,
+        publish: impl FnOnce(D, &mut dyn FnMut() -> bool) -> Result<O, (D, E)>,
+    ) -> Result<NativeBackingSupplyOutcome<D, O, E>, crate::TrapError>
+    where
+        C: crate::physical_grants::NativeSupplyCustody,
+    {
+        use crate::physical_grants::NativeSupplyCustody;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan,
+        };
+        use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+
+        let invalid =
+            || crate::TrapError::Hypervisor("native physical/table supply mismatch".into());
+        let Some(data) = unpublished.grants().first().copied() else {
+            if let Err(error) = unpublished.abort_with_release(&release) {
+                let _ = self.quarantine_native_supply(owner, root);
+                return Err(error);
+            }
+            return Err(invalid());
+        };
+        let table_reservation =
+            match self.reserve_native_descriptor_tables(ledger, owner, root, table_count) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    if let Err(release_error) = unpublished.abort_with_release(&release) {
+                        self.quarantine_native_supply(owner, root)
+                            .map_err(|_| invalid())?;
+                        return Err(release_error);
+                    }
+                    return match error {
+                        ForkStockServiceError::DescriptorTableCapacity => Ok(
+                            NativeBackingSupplyOutcome::DescriptorTableCapacity(delivery),
+                        ),
+                        _ => Ok(NativeBackingSupplyOutcome::Refused(delivery)),
+                    };
+                }
+            };
+        let Some(mm_key) = core::num::NonZeroU64::new(owner.mm().raw()) else {
+            self.cancel_native_descriptor_tables(ledger, table_reservation);
+            if let Err(error) = unpublished.abort_with_release(&release) {
+                let _ = self.quarantine_native_supply(owner, root);
+                return Err(error);
+            }
+            return Ok(NativeBackingSupplyOutcome::Refused(delivery));
+        };
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key,
+                generation: window.operation.sequence,
+            },
+            root: SubstrateGpa(root.address().raw()),
+            op: DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: window.range.start(),
+                    ipa: data.gpa.raw(),
+                    len: publication_len,
+                    writable: window
+                        .protection
+                        .permits(carrick_el1_abi::ReservationProtection::WRITE),
+                    executable,
+                },
+                resident: PageSpan::new(window.fault_page, 4096),
+                backing: data.identity,
+            },
+            tables: table_reservation.descriptor_tables(),
+        };
+        if self
+            .track_native_descriptor_tables(ledger, table_reservation, txn)
+            .is_err()
+        {
+            if let Err(error) = unpublished.abort_with_release(&release) {
+                self.quarantine_native_supply(owner, root)
+                    .map_err(|_| invalid())?;
+                return Err(error);
+            }
+            return Ok(NativeBackingSupplyOutcome::Refused(delivery));
+        }
+        let staged = self
+            .child_physical_mut(owner.mm(), root)
+            .and_then(NativeSupplyCustody::supplied)
+            .ok_or_else(invalid)
+            .and_then(|grants| {
+                grants.stage_backing_reply(reply, window, txn, unpublished, &release)
+            });
+        if let Err(error) = staged {
+            self.quarantine_native_supply(owner, root)
+                .map_err(|_| invalid())?;
+            return Err(error);
+        }
+        let mut offered = false;
+        let published = {
+            let grants = self
+                .child_physical_mut(owner.mm(), root)
+                .and_then(NativeSupplyCustody::supplied)
+                .ok_or_else(invalid)?;
+            publish(delivery, &mut || {
+                offered = grants.offer_backing_reply(reply, &txn);
+                offered
+            })
+        };
+        match published {
+            Ok(output) => {
+                if !offered {
+                    let _ = self
+                        .settle_native_backing_reply(ledger, owner, root, reply, &txn, &release)?;
+                    return Err(invalid());
+                }
+                Ok(NativeBackingSupplyOutcome::Delivered { output, txn })
+            }
+            Err((delivery, reason)) => {
+                if !self.settle_native_backing_reply(ledger, owner, root, reply, &txn, &release)? {
+                    return Err(invalid());
+                }
+                Ok(NativeBackingSupplyOutcome::Cancelled {
+                    delivery,
+                    reason,
+                    txn,
+                })
+            }
+        }
     }
 
     /// One neutral physical/table/transport settlement owner. Guest candidates
