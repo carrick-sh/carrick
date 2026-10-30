@@ -1723,7 +1723,10 @@ where
         mm_executor: &mut carrick_kernel::dispatch::MmExecutorParticipation,
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
-        self.service_kernel_context = None;
+        // Retain the admitted member's exact context until recapture succeeds.
+        // A racing exit_group can remove it from the graph before recapture;
+        // its executor-failure settlement still owns host withdrawal and the
+        // retirement receipt. Dispatch below always uses a fresh capture.
         if !self.syscall_completion.is_idle() {
             return Err(RuntimeError::Configuration(
                 "new syscall trapped while a completion token is still live".to_owned(),

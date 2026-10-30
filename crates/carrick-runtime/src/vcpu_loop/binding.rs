@@ -7658,6 +7658,167 @@ mod tests {
     }
 
     #[test]
+    fn executor_failure_after_exit_group_keeps_thread_done_and_finishes_owner() {
+        use carrick_core::terminal::{
+            HostMemberObservation, Live, Process, RetirementVerdict, TerminalCustody,
+        };
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        use std::num::NonZeroU64;
+
+        let (_runtime, scheduler, kernel, root, process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_435, SyscallDispatcher::new());
+        root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+        let tid = ThreadId::synthetic_for_tests(72_436);
+        let sibling = root
+            .kernel()
+            .reserve_thread_clone(
+                &root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::VM
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::THREAD,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(tid)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_context()
+            .unwrap();
+        let registry = Arc::new(ThreadRegistry::new(ThreadId::synthetic_for_tests(72_435)));
+        registry.register_child_with_tid(tid, 0);
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            registry.clone(),
+            Arc::new(FutexTable::new()),
+            Arc::new(NoopPlatformFutex),
+            Arc::new(|_| Arc::new(NoopPlatformFutex)),
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(sibling.thread())),
+            Some(process.pid()),
+            sibling.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            tid,
+            Arc::new(Mutex::new(Vec::new())),
+            kicker.clone(),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(sibling.retain_exact());
+        let mut participation = kernel
+            .dispatcher
+            .enter_mm_executor_for_thread(
+                Some(Arc::clone(sibling.thread())),
+                kicker,
+                tid,
+                test_execution_slot(),
+            )
+            .unwrap();
+        let page = root.lifecycle_page();
+        let member = sibling.thread().control_slot();
+        let birth = member.host_birth_identity().unwrap();
+        let closing = TerminalCustody::<Process, Live>::begin_exit(
+            TerminalCustody::<Process, Live>::close_admission(&*page),
+            root.task().key(),
+            AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x10000)).unwrap(),
+                mm: MmGeneration::new(NonZeroU64::new(root.shared().mm().id().raw()).unwrap()),
+                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+            },
+            carrick_sched_core::process::TerminationStatus::SUCCESS,
+        )
+        .unwrap();
+        let RetirementVerdict::CancelMembers { members, .. } =
+            closing.cancel_members(vec![], vec![birth])
+        else {
+            panic!("exit_group owns member cancellation");
+        };
+        assert_eq!(
+            kernel
+                .try_claim_persistent_process_exit(ThreadId::synthetic_for_tests(72_435))
+                .unwrap()
+                .claim,
+            ProcessExitClaim::Owner
+        );
+        // The exit owner retires the member's graph/lifecycle membership, then
+        // removes the task. Its host job still owes withdrawal and a receipt.
+        root.kernel().exit_thread(&sibling, None).unwrap();
+        root.kernel()
+            .exit_task(
+                root.task().key().id,
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        assert!(
+            kernel
+                .dispatcher
+                .capture_kernel_context(sibling.thread().key().tid)
+                .is_err()
+        );
+        let failure = state
+            .service_threaded_syscall_for_executor_inner(
+                &kernel,
+                &mut CrashCaptureTestEngine::default(),
+                carrick_hal::RawSyscall {
+                    current_guest_sp: None,
+                    number: carrick_abi::syscall::nr::GETPID,
+                    args: [0; 6],
+                    guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                    native_number: carrick_abi::NativeNr(carrick_abi::syscall::nr::GETPID.raw()),
+                },
+                &mut participation,
+                None,
+            )
+            .expect_err("exit_group removed the syscall caller before recapture");
+        assert!(
+            failure
+                .to_string()
+                .contains("capture mandatory syscall kernel context")
+        );
+        drop(participation);
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let result = job.terminal_settlement.result.clone();
+        assert_eq!(
+            job.after_executor_failure_settlement(failure.to_string()),
+            continuation::ExecutorFailureSettlement::PublishCurrent
+        );
+        assert!(
+            matches!(
+                result.take_published(),
+                Some(Ok(VcpuLoopOutcome::ThreadDone))
+            ),
+            "exit_group capture loser must settle as ThreadDone"
+        );
+        assert!(!registry.is_live(tid));
+        assert!(
+            member
+                .host_retirement()
+                .is_some_and(|receipt| receipt.acknowledges(birth))
+        );
+        let receipts = closing
+            .observe_members(
+                &*page,
+                &members,
+                &[],
+                &[HostMemberObservation::Adopted { birth, member }],
+            )
+            .expect("exit_group owner must observe the losing member's retirement");
+        assert!(
+            closing.settle(&*page, receipts).is_ok(),
+            "exit_group owner must complete"
+        );
+        scheduler.close();
+    }
+
+    #[test]
     fn lost_claim_without_context_publishes_configuration_error() {
         for executor_failed in [false, true] {
             let (_runtime, scheduler, kernel, root, process, _generation) =
