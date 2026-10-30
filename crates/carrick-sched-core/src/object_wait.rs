@@ -34,7 +34,8 @@ const IPC_OPERATION_SLOT_WAIT_INDEX: usize = RESERVATION_POOL_WAIT_INDEX + 1;
 pub const EXTRA_CAUSE_QUEUES: usize = 5 * spaces::ADDRESS_SPACES;
 const DELEGATED_FILE_WAIT_BASE: usize = ORIGINAL_OBJECT_WAIT_QUEUES + EXTRA_CAUSE_QUEUES;
 const NATIVE_SERVICE_WAIT_BASE: usize = DELEGATED_FILE_WAIT_BASE + DELEGATED_FILE_WAIT_QUEUES;
-pub const OBJECT_WAIT_QUEUES: usize = NATIVE_SERVICE_WAIT_BASE + ZONE_RECORDS;
+const MEMBER_RELEASE_WAIT_BASE: usize = NATIVE_SERVICE_WAIT_BASE + ZONE_RECORDS;
+pub const OBJECT_WAIT_QUEUES: usize = MEMBER_RELEASE_WAIT_BASE + ZONE_RECORDS;
 
 // Every producer owns one disjoint index range. Keep this a compile-time gate
 // so adding a queue cannot silently alias another owner or its generation.
@@ -51,7 +52,8 @@ const _: () = {
         ),
         (ORIGINAL_OBJECT_WAIT_QUEUES, DELEGATED_FILE_WAIT_BASE),
         (DELEGATED_FILE_WAIT_BASE, NATIVE_SERVICE_WAIT_BASE),
-        (NATIVE_SERVICE_WAIT_BASE, OBJECT_WAIT_QUEUES),
+        (NATIVE_SERVICE_WAIT_BASE, MEMBER_RELEASE_WAIT_BASE),
+        (MEMBER_RELEASE_WAIT_BASE, OBJECT_WAIT_QUEUES),
     ];
     let mut i = 0;
     while i < domains.len() {
@@ -101,6 +103,8 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(crate::ZoneTables, space_cause_waits) as u64,
         core::mem::offset_of!(crate::ZoneTables, native_service_waits) as u64,
         NATIVE_SERVICE_WAIT_BASE as u64,
+        MEMBER_RELEASE_WAIT_BASE as u64,
+        core::mem::offset_of!(crate::ZoneTables, member_release_waits) as u64,
         crate::spaces::SPACE_NOTIFICATION_LAYOUT_HASH,
         core::mem::size_of::<ObjectQueue>() as u64,
         core::mem::offset_of!(ObjectQueue, generation) as u64,
@@ -133,7 +137,39 @@ pub struct ObjectWaitKey {
     generation: u64,
 }
 
+/// A storage owner's release queue, separate from service and IPC readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemberReleaseIndex(usize);
+impl MemberReleaseIndex {
+    pub const fn new(index: usize) -> Option<Self> {
+        if index < ZONE_RECORDS {
+            Some(Self(index))
+        } else {
+            None
+        }
+    }
+}
+
+/// Incarnation allocated by the carrier's existing monotone serial issuer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemberReleaseGeneration(core::num::NonZeroU64);
+impl MemberReleaseGeneration {
+    pub const fn from_issued(serial: core::num::NonZeroU64) -> Self {
+        Self(serial)
+    }
+}
+
 impl ObjectWaitKey {
+    pub const fn member_release(
+        index: MemberReleaseIndex,
+        serial: MemberReleaseGeneration,
+    ) -> Self {
+        Self {
+            index: (MEMBER_RELEASE_WAIT_BASE + index.0) as u32,
+            generation: serial.0.get(),
+        }
+    }
+
     pub const fn new(index: u32, generation: u64) -> Option<Self> {
         if index == 0 || index as usize >= ORIGINAL_OBJECT_WAIT_QUEUES || generation == 0 {
             None
@@ -1716,8 +1752,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             &self.space_cause_waits[index - ORIGINAL_OBJECT_WAIT_QUEUES]
         } else if index < NATIVE_SERVICE_WAIT_BASE {
             &self.delegated_file_waits[index - DELEGATED_FILE_WAIT_BASE]
-        } else {
+        } else if index < MEMBER_RELEASE_WAIT_BASE {
             &self.native_service_waits[index - NATIVE_SERVICE_WAIT_BASE]
+        } else {
+            &self.member_release_waits[index - MEMBER_RELEASE_WAIT_BASE]
         }
     }
 
@@ -1945,6 +1983,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<(), ObjectWaitError> {
         let guard = self.lock_completion_index(key, wait, completion)?;
+        self.bind_completion_queue(&guard, key)
+    }
+    fn bind_completion_queue(
+        &self,
+        guard: &ObjectWaitGuard<'_, C>,
+        key: ObjectWaitKey,
+    ) -> Result<(), ObjectWaitError> {
         let queue = guard.queue();
         if queue.generation.load(Ordering::Acquire) >= key.generation {
             return Err(ObjectWaitError::Stale);
@@ -1958,6 +2003,31 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         queue.generation.store(key.generation, Ordering::Release);
         queue.epoch.store(1, Ordering::SeqCst);
         Ok(())
+    }
+    /// Bind new storage and retain its publication source under one queue
+    /// guard. Another allocator cannot rebind between publication and retain.
+    pub fn bind_object_notification_source<'a>(
+        &'a self,
+        key: ObjectWaitKey,
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+    ) -> Result<ObjectNotificationSource<'a, C>, ObjectWaitError> {
+        if !self.completion_handbacks.initialize() {
+            return Err(ObjectWaitError::Busy);
+        }
+        let guard = self.lock_completion_index(key, wait, completion)?;
+        self.bind_completion_queue(&guard, key)?;
+        assert!(
+            self.object_admission_handbacks[key.index as usize].initialize(),
+            "admission chain initializes under its exclusive object guard"
+        );
+        guard.queue().publishers.store(1, Ordering::Release);
+        Ok(ObjectNotificationTicket {
+            zone: self,
+            key,
+            retained: true,
+        }
+        .into_source())
     }
     fn lock_completion_index<'a>(
         &'a self,
