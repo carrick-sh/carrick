@@ -3611,6 +3611,7 @@ fn portal_wait_cancellation_resumes_exact_native_service_waiter() {
     );
 }
 
+#[cfg(test)]
 #[test]
 fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
     use carrick_personality_linux::signal::{
