@@ -1,5 +1,5 @@
 # #1044 diagnostic follow-up: preserve native-service admission/dispatch
-# error codes and the saved syscall ordinal in the existing fatal record.
+# error codes in the existing fatal record.
 # No service refusal or retry policy changes; signed attribution is pending.
 # #1044: owned-yield replies are typed separately from memory preparation.
 # The retained IPC/CarrierWork seam bindings below cover that API change;
