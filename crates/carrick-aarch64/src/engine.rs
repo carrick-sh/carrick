@@ -5322,6 +5322,11 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
+    fn cancel_native_fault_wait(&mut self) -> Result<(), TrapError> {
+        self.pending_resume_pc = None;
+        self.vcpu.get_mut().cancel_native_fault_wait()
+    }
+
     fn cancel_native_owner_wait(
         &mut self,
         origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
