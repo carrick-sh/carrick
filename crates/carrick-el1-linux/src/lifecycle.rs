@@ -443,9 +443,29 @@ impl<
         if rec.incarnation() != record.incarnation {
             return;
         }
+        let caller_address = self
+            .frame
+            .slot()
+            .and_then(|slot| {
+                let lane = zone.tables.slot(slot);
+                lane.current().or_else(|| lane.host_record())
+            })
+            .filter(|&caller| caller != record.id)
+            .and_then(|caller| {
+                // SAFETY: the running/host record on this slot is exclusively
+                // owned by the current trap frame during clone preparation.
+                unsafe { (*zone.tables.record(caller).ctx_mut()).address_context() }
+            })
+            .filter(|address| address.mm.raw().get() == rec.identity().mm);
         let record = rec;
         // SAFETY: this exact new record is unpublished and exclusively owned by this birth.
         let ctx = unsafe { record.ctx_mut() };
+        *ctx = match caller_address {
+            Some(address) => {
+                Aarch64ParkedContext::from_parts(carrick_sched_core::ThreadCtx::ZERO, address)
+            }
+            None => Aarch64ParkedContext::ZERO,
+        };
         let Some(frame) = self.frame.arm_frame() else {
             super::dispatch::invalid_completion(
                 super::dispatch::NativeInvariant::MissingNativeFrame,

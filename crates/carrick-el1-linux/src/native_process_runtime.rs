@@ -7502,12 +7502,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         {
             return Err(NativeProcessError::Stale.errno());
         }
-        // This unpublished record may retain a predecessor's saved MM. Copy
-        // the caller's complete neutral context before ISA register setup.
-        // SAFETY: clone exclusively owns this exact unpublished incarnation.
-        unsafe {
-            *self.source.zone.record(record.id).ctx_mut() = *self.words;
-        }
         let mm = self
             .runtime
             .graph
