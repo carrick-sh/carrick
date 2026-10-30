@@ -2118,6 +2118,32 @@ fn refused_backing_receipt(
 }
 
 #[test]
+fn empty_native_descriptor_demand_does_not_touch_unrelated_stock() {
+    for population in [16, 256, 4096] {
+        let mut stock = stock(UntaggedRoots, population, 1);
+        let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+        commit(&mut stock, parent(), granted, 1, 0).unwrap();
+        let child = child_of(granted, 44);
+        let owner = stock.child_owner(granted.request.child_mm).unwrap();
+        // Returned spare pages need not be sorted. An empty demand has no
+        // authority or work reason to visit/reorder this unrelated population.
+        stock.tables.reverse();
+        let before = stock.table_stock().to_vec();
+        let reservation = stock
+            .reserve_native_descriptor_tables(&mut NoTableLedger, owner, child.context.root, 0)
+            .unwrap();
+        assert!(reservation.descriptor_tables().as_slice().is_empty());
+        assert_eq!(
+            stock.table_stock(),
+            before,
+            "empty demand touched spare population={population}"
+        );
+        stock.cancel_native_descriptor_tables(&mut NoTableLedger, reservation);
+        assert_eq!(stock.table_stock(), before);
+    }
+}
+
+#[test]
 fn many_native_backing_supplies_return_unused_tables_across_two_children() {
     use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
 
