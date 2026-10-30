@@ -2637,3 +2637,30 @@ The signed `el1_tlb_mm_edit_window_excludes_sibling_allocations` and
 `el1_tlb_running_thread_mm_edits_cost_no_maintenance` bindings, native oracle
 comparison and exact-artifact acceptance remain director-owned. This Linux
 worker has neither HVF nor Docker.
+
+
+### Already-retired native backing (#1099)
+
+`process.native.terminal-child` includes unused backing whose exact stage-2
+owner has already retired through replay, teardown or generation replacement.
+The neutral retirement owner classifies that state; the release adapter must
+not turn clean absence into carrier failure or MM-lifetime retention. Live
+pins and exact-generation retirement contention keep the existing interim
+retention, and an owner-identity mismatch remains an invariant failure.
+
+The VM-free binding
+`native_backing_release_already_retired_owner_is_clean_absence_without_quarantine`
+settles the original physical/table journal with zero retained rollback entries,
+no quarantine and no failed rollback. It covers VM destruction, a later VM
+generation, a later owner generation and an absent record. Its pre-fix failure
+was `indeterminate release: TerminalizedByVmDestroy`. The assertions cover
+exact-record settlement and resource recovery; they do not measure a runtime
+ratio. HVF adapter and signed runtime verification remain director-owned.
+The macOS-only
+`native_backing_absence_does_not_claim_a_retiring_successor` binding drives a
+real successor retirement callback with a second live backing owner, checking
+absent predecessor release before and during that claim and after carrier
+teardown.
+Its red/green run is pending on macOS. Descriptor-capacity waiting,
+the staging/offer lock gap and callback lock scopes are tracked in #1149;
+an immediate empty-success retry is not an accepted capacity wait.

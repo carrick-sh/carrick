@@ -427,6 +427,7 @@ fn native_backing_release_already_retired_owner_is_clean_absence_without_quarant
 
     for scenario in [
         "vm_destroy_terminalized",
+        "vm_generation_advanced",
         "owner_generation_advanced",
         "record_removed",
     ] {
@@ -524,6 +525,10 @@ fn native_backing_release_already_retired_owner_is_clean_absence_without_quarant
                     .terminalized_by_vm_destroy = true;
                 backing_record.lock().unwrap().snapshot.mapped = false;
             }
+            "vm_generation_advanced" => {
+                backing_record.lock().unwrap().snapshot.vm_generation = CarrierVmGeneration(2);
+                backing_record.lock().unwrap().snapshot.mapped = false;
+            }
             "owner_generation_advanced" => {
                 backing_record.lock().unwrap().snapshot.logical_owner = Some(CarrierLogicalOwner {
                     id: row.gpa.raw(),
@@ -570,6 +575,7 @@ fn native_backing_release_already_retired_owner_is_clean_absence_without_quarant
             },
             tables: TableGrants::NONE,
         };
+        let table_stock_before = stock.owner.table_stock().len();
         stock.track_backing_tables(handle, child_root, &mut txn);
         let reply = carrick_el1_abi::PortalGrantSlot::new();
         {
@@ -606,6 +612,17 @@ fn native_backing_release_already_retired_owner_is_clean_absence_without_quarant
                 panic!("scenario {scenario} must settle as clean absence without carrier error: {err:?}")
             });
         assert!(settled);
+        assert_eq!(stock.owner.table_stock().len(), table_stock_before);
+        assert!(
+            stock
+                .owner
+                .pending_native_descriptor_transaction(
+                    handle,
+                    child_root,
+                    window.operation.sequence
+                )
+                .is_none()
+        );
         assert!(
             !stock.owner.is_quarantined(child_mm),
             "scenario {scenario} must not quarantine the child MM"
