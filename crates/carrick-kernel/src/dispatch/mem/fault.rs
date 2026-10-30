@@ -495,28 +495,34 @@ impl MemState {
         let Some(root) = self.delegated_root() else {
             return Ok(Vec::new());
         };
+        root.with_root(|model| Self::root_first_touch_pieces(model, self.layout, start, end))
+    }
+
+    pub(in crate::dispatch::mem) fn root_first_touch_pieces(
+        model: &mut Reservations<'_>,
+        layout: MemoryLayout,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<RootPiece>, Refusal> {
         let Some(range) = ReservationRange::new(start, end) else {
             return Ok(Vec::new());
         };
-        let layout = self.layout;
         let mut pieces = Vec::new();
-        root.with_root(|model| {
-            model.observe_nodes(range, &mut |mapping, incarnation| {
-                let (node_start, node_end) = (mapping.range.start(), mapping.range.end());
-                if !mapping.anonymous || super::anonymous::in_heap(node_start, node_end, layout) {
-                    return;
-                }
-                if let Some(clipped) = carrick_vfs::GuestMemoryRange::new(
-                    GuestVa::new(node_start.max(start)),
-                    GuestVa::new(node_end.min(end)),
-                ) {
-                    pieces.push(RootPiece {
-                        range: clipped,
-                        protection: mapping.protection,
-                        incarnation,
-                    });
-                }
-            })
+        model.observe_nodes(range, &mut |mapping, incarnation| {
+            let (node_start, node_end) = (mapping.range.start(), mapping.range.end());
+            if !mapping.anonymous || super::anonymous::in_heap(node_start, node_end, layout) {
+                return;
+            }
+            if let Some(clipped) = carrick_vfs::GuestMemoryRange::new(
+                GuestVa::new(node_start.max(start)),
+                GuestVa::new(node_end.min(end)),
+            ) {
+                pieces.push(RootPiece {
+                    range: clipped,
+                    protection: mapping.protection,
+                    incarnation,
+                });
+            }
         })?;
         Ok(pieces)
     }
@@ -733,10 +739,7 @@ impl MemState {
 
     /// Facts the host venue recorded for a range its own pending proposal
     /// held now belong to the node incarnations the completion committed.
-    pub(in crate::dispatch) fn adopt_completed_residency(&mut self, start: u64, end: u64) {
-        let pieces = self
-            .try_root_first_touch_pieces(start, end)
-            .unwrap_or_else(|refusal| broken_root("completed residency pieces", refusal));
+    pub(in crate::dispatch) fn adopt_completed_residency(&mut self, pieces: Vec<RootPiece>) {
         for piece in pieces {
             self.resident
                 .hand_over(piece.range, ResidencyOwner::Host, piece.owner());
