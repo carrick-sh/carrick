@@ -349,7 +349,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }) {
                         return Err(ObjectWaitError::Changed);
                     }
-                    let mut pinned_exit = resources.page.claimed_count() != 0;
+                    // Only native pool births have the admission-settled
+                    // notifier. The process-close census also includes host
+                    // claims and external work, which cannot release this stock.
+                    let mut pending_release = (0..resources.page.entry_count()).any(|index| {
+                        resources
+                            .page
+                            .state(index)
+                            .is_some_and(|(_, state)| state == EntryState::Claimed)
+                    });
                     for (entry, _) in &stock.identities {
                         if resources
                             .page
@@ -358,7 +366,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 generation == entry.generation()
                                     && matches!(
                                         state,
-                                        EntryState::ExitedInZone
+                                        EntryState::ExitingBorn
+                                            | EntryState::ExitingPublished
+                                            | EntryState::ExitedInZone
                                             | EntryState::Reaped
                                             | EntryState::Revoked
                                     )
@@ -367,6 +377,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             // SAFETY: the process stock owns this source and
                             // retains the control extent through final-pin
                             // settlement; its zone outlives these members.
+                            // Fork-loan member/projection pins are dropped in
+                            // the shared supervisor mapping, never by the host.
                             if !unsafe {
                                 carrick_core::lifecycle::arm_member_release(
                                     &stock.controls[entry.index() + 1],
@@ -375,10 +387,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             } {
                                 return Err(ObjectWaitError::Changed);
                             }
-                            pinned_exit = true;
+                            pending_release = true;
                         }
                     }
-                    if !pinned_exit {
+                    if !pending_release {
                         limit = true;
                         return Err(ObjectWaitError::Changed);
                     }

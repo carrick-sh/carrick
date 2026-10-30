@@ -53,3 +53,14 @@ subsequent clone. These VM-free bindings do not establish that the signed
 clone-storm, spawn-slope or scheduler populations complete without hangs;
 the signed comparison and physical artifact acceptance remain director-owned.
 The fixed lifecycle-page ceiling and graph-wide UID scan are tracked in #1142.
+
+The ordinary-exit binding
+`native_fork_child_exiting_sibling_wakes_parked_clone` keeps the native child
+leader and its last worker live while six retired worker controls remain pinned.
+The existing raw-exit hook pauses that worker after production membership and
+scheduler release, with its ABI entry still `ExitingBorn`. The leader enrolls a
+clone wait through `prepare_thread_birth`; completing the original raw exit must
+notify, resume the preserved clone and create its thread. An empty runnable
+population reaches the fixture's immediate WFI refusal, bounding a missing wake
+without a timer or polling. This extends `kernel.el1.thread-lifecycle` with the
+ordinary sibling-exit interleaving; signed execution remains director-owned.
