@@ -1,4 +1,4 @@
-e1e359af115fa5ec
+df6c73569685b40b
 getrandom_resolved=true
 query_ret_zero=true
 query_size=144
@@ -6,3 +6,4 @@ query_prot=3
 query_flags=40
 state_mmap_ok=true
 generate_ret_32=true
+generate_null_zero_ret_0=true

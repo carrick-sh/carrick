@@ -76,5 +76,8 @@ pub mod pml4;
 pub mod protections;
 pub mod shared_aperture;
 pub mod vdso;
+#[cfg(test)]
+#[path = "../../carrick-runtime/tools/vdso_getrandom_blob.rs"]
+mod vdso_getrandom_blob;
 mod vdso_getrandom_chacha;
 pub mod x86_initial_image;

@@ -119,6 +119,7 @@ fn main() {
             println!("query_flags=0");
             println!("state_mmap_ok=false");
             println!("generate_ret_32=false");
+            println!("generate_null_zero_ret_0=false");
             return;
         }
         let f: GrFn = std::mem::transmute(addr);
@@ -164,5 +165,19 @@ fn main() {
             -1
         };
         println!("generate_ret_32={}", gret == 32);
+
+        // GENERATE: request 0 bytes with a NULL buffer through the vDSO fast path.
+        let zret = if state_ok {
+            f(
+                ptr::null_mut(),
+                0,
+                0,
+                state as *mut u8,
+                params.size as usize,
+            )
+        } else {
+            -1
+        };
+        println!("generate_null_zero_ret_0={}", zret == 0);
     }
 }
