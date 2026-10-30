@@ -1284,6 +1284,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT,
         2,                          // control encoding: zero is strict; bit 3 opts out.
         SERVED_FORWARD_WORK as u64, // effect-free retry differs from an owed commit.
+        PortalGrantSlot::PREPARED_SELECTION_STATE,
     ];
     let mut a = 0;
     while a < boundary_facts.len() {
@@ -4344,7 +4345,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x52cb3bfbb9fd6a32);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xf3ff85e189b79717);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

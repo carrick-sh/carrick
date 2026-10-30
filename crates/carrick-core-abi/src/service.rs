@@ -58,6 +58,8 @@ pub struct ServiceIdentity {
 pub enum ServiceFaultSupply {
     Cow(crate::PortalGrantWindow),
     Backing(crate::PortalGrantWindow),
+    /// Publish an inherited output; never allocate replacement zero backing.
+    Prepared(crate::PortalGrantWindow),
 }
 
 /// EL0 synchronous exception selected by the ISA boundary. The Linux
@@ -2331,6 +2333,45 @@ mod tests {
             first.consume(a_request.identity),
             Ok(ServiceResult::Cancelled)
         );
+    }
+
+    #[test]
+    fn prepared_supply_transfer_retains_exact_owner_across_lane_reuse() {
+        let slot = crate::PortalGrantSlot::new();
+        let cell = ServiceCell::new();
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        let window = supply_window(owner);
+        assert!(slot.publish_prepared_fault_selection(1, window));
+        assert!(
+            slot.pending_fault_selection(owner.mm.mm().raw(), window.fault_page)
+                .is_none()
+        );
+        let request = cell
+            .publish(
+                owner,
+                SnapshotGeneration::INITIAL,
+                fault(),
+                Some(NonZeroU64::MIN),
+            )
+            .unwrap();
+        let mut ticket = cell.claim(request).unwrap();
+        assert_eq!(
+            ticket.take_fault_selection(&slot),
+            Ok(Some(ServiceFaultSupply::Prepared(window)))
+        );
+        assert!(!slot.has_outstanding_for(owner.mm.mm().raw()));
+        let mut successor = window;
+        successor.operation.sequence = NonZeroU64::new(2).unwrap();
+        assert!(slot.publish_prepared_fault_selection(2, successor));
+        assert_eq!(ticket.take_fault_selection(&slot), Err(ServiceError::Stale));
+        assert_eq!(
+            slot.pending_prepared_fault_selection(owner.mm.mm().raw(), window.fault_page),
+            Some((2, successor))
+        );
+        assert!(!cell.cancel(request.identity).unwrap());
+        assert!(ticket.complete(true).is_ok());
+        assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Cancelled));
     }
 
     #[test]
