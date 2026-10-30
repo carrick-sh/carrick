@@ -120,7 +120,7 @@ enum HostVenue {
 
 /// Shared by metadata projections, consumed once by the exact MM's settlement.
 /// Contains no borrowed guard, root lock, mailbox slot, or executor authority.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct CompletedHostVenue {
     request: ReservationRequest,
     binding: HostVenueBinding,
@@ -130,7 +130,7 @@ struct CompletedHostVenue {
     outcome: Option<Result<DispatchOutcome, DispatchError>>,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct HostVenueBinding {
     kernel: std::sync::Weak<crate::kernel::Kernel>,
     task: crate::kernel::objects::TaskKey,
@@ -2670,7 +2670,8 @@ mod tests {
         use carrick_guest_mem::GuestMemory;
         memory.zero_backing(base, 4096).unwrap();
         view.mark_range_resident(base, 4096);
-        let outcome = Ok(DispatchOutcome::Returned { value: base as i64 });
+        let outcome =
+            Ok(DispatchOutcome::returned_ptr(crate::dispatch::GuestPtr::new(base)).unwrap());
         let context = dispatcher.capture_one_task_context().unwrap();
         let syscall = crate::dispatch::SyscallRequest::new(
             222,
