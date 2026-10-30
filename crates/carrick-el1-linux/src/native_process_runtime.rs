@@ -2562,6 +2562,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn unregister_root_for_test(&self, runtime: &NativeProcessRuntime<'a, M, C>) {
+        let key = runtime.graph.lock().root_key;
+        self.unregister_process(runtime, key);
+    }
+
     fn unregister_process(&self, runtime: &NativeProcessRuntime<'a, M, C>, process: TaskKey) {
         let mut state = self.state.lock();
         let carrier = core::ptr::from_ref(runtime.zone).addr();
@@ -3780,7 +3786,7 @@ pub struct NativeProcessEntry<
     root_exit: Option<LinuxWaitStatus>,
     run_failure: Option<carrick_core_abi::NativeRunFailureReason>,
     #[cfg(test)]
-    publication_wait_probe: Option<&'r (dyn Fn(u32) + Sync)>,
+    pub(crate) publication_wait_probe: Option<&'r (dyn Fn(u32) + Sync)>,
     #[cfg(test)]
     exit_notification_probe: Option<&'r (dyn Fn() + Sync)>,
     calling_tid: u32,

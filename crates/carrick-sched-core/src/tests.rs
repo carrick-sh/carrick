@@ -3809,3 +3809,65 @@ fn interrupt_parked_futex_preserves_a_resumed_waiters_new_timer() {
     assert_eq!(selected.record, record);
     assert_eq!(selected.result, Some(0xbeef));
 }
+
+#[test]
+fn interrupt_parked_futex_rechecks_claim_after_futex_enrollment() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    struct PublicationWait {
+        ready: mpsc::SyncSender<()>,
+        notified: AtomicBool,
+    }
+    impl ShortLockWait for PublicationWait {
+        fn wait_short(&self, _: u32) {
+            if !self.notified.swap(true, Ordering::AcqRel) {
+                self.ready.send(()).unwrap();
+            }
+            core::hint::spin_loop();
+        }
+    }
+    let zone: Arc<ZoneTables> = Arc::from(zone());
+    enter(&zone, SLOT, 0);
+    let record = zone.current_or_new(SLOT, identity(41)).unwrap();
+    zone.requeue_preempted(SLOT, record);
+    assert_eq!(zone.switch_in_full(SLOT).unwrap().record, record);
+    let guard = zone.short_lock(ZoneTables::bucket_of(MM, 0x7000), &ShortLockSpin);
+    let seq = zone.next_seq(record);
+    zone.enqueue(&guard, record, seq, MM, 0x7000, u32::MAX, 0)
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let waker = zone.clone();
+    let sender = std::thread::spawn(move || {
+        let wait = PublicationWait {
+            ready: ready_tx,
+            notified: AtomicBool::new(false),
+        };
+        let interrupted = waker.interrupt_parked_futex(
+            waker.record_ref(record),
+            SLOT,
+            (-4i64) as u64,
+            &wait,
+            &mut WakeEffects::default(),
+        );
+        // On the bad implementation, OnCpu is read before the bucket lock.
+        if !wait.notified.swap(true, Ordering::AcqRel) {
+            wait.ready.send(()).unwrap();
+        }
+        done_tx.send(interrupted).unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(zone.publish_guest_park(&guard, SLOT, record, seq));
+    zone.clear_current(SLOT);
+    drop(guard);
+    let interrupted = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    sender.join().unwrap();
+    assert!(
+        interrupted,
+        "sender must observe park publication under the bucket lock"
+    );
+    assert_eq!(zone.record(record).entry_count(), 0);
+    let selected = zone.switch_in_full(SLOT).unwrap();
+    assert_eq!(selected.record, record);
+    assert_eq!(selected.result.map(|value| value as i64), Some(-4));
+}
