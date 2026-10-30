@@ -305,15 +305,21 @@ fn agent_auth_provisions_all_worker_credentials_and_only_agy_for_loop() {
 }
 
 #[test]
-fn rejected_director_token_stops_bootstrap_before_downloads() {
+fn bootstrap_without_a_controller_token_stops_before_downloads() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
+    // An inherited GH_TOKEN would satisfy these stubs; bootstrap must not
+    // fall back to it when the controller mints nothing (#1034).
     for (name, source) in [
         (
             "gh",
-            "#!/bin/sh\ntest \"$1 $2\" = 'api repos/carrick-sh/agy-director' || exit 91\necho 'HTTP 401: expired fixture-only-secret' >&2\nexit 1\n",
+            "#!/bin/sh\ntouch \"$RUNNER_TEMP/inherited-token-used\"\nexit 0\n",
+        ),
+        (
+            "git",
+            "#!/bin/sh\ntouch \"$RUNNER_TEMP/inherited-token-used\"\nexit 0\n",
         ),
         (
             "curl",
@@ -336,8 +342,13 @@ fn rejected_director_token_stops_bootstrap_before_downloads() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(stderr.contains("host/infra"), "{stderr}");
-    assert!(stderr.contains("AGENT_DIRECTOR_TOKEN"), "{stderr}");
+    assert!(
+        stderr.contains("no controller-minted bootstrap token"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("uses no other token"), "{stderr}");
     assert!(!stderr.contains("fixture-only-secret"));
+    assert!(!temp.path().join("inherited-token-used").exists());
     assert!(!temp.path().join("download-started").exists());
     assert!(!temp.path().join("carrick-agent-42-1").exists());
 }

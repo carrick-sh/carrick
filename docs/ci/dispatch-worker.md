@@ -174,15 +174,19 @@ and `redaction-secrets.json`. Model processes get `private_environment`, no
 GitHub tokens, Actions command files or runner environment. The Unix tool socket
 accepts only the loop uid through Linux `SO_PEERCRED`, refusing the worker uid.
 
-`AGENT_DIRECTOR_TOKEN` is used only to bootstrap the pinned launcher from
-private `carrick-sh/agy-director`. The workflow provisions every available
+Bootstrap fetches the pinned launcher from private `carrick-sh/agy-director`
+with a `bootstrap` App token that the ctb controller mints on demand, like
+publish and board tokens (#1034). Its fixed grant is `contents: read` on that
+one repository, one mint per job, held in the controller ledger and revoked
+when the clone is reaped. A refused or unanswered request fails bootstrap; no
+other token is tried. The workflow provisions every available
 worker credential: `CODEX_AUTH_JSON` and `AGY_OAUTH_TOKEN`. Worker-private homes
 contain only the selected backend’s credential subtree. The runner-private
 capacity-query home retains both; the separate loop home holds only agy auth.
 Codex can be absent; agy is required for the loop. These repository secrets are referenced only by
-`dispatch-worker.yml`, enforced by workflow tests. The owner's Mac refreshes
-them every 15 minutes; the director token is a read-only one-hour App token.
-The App private key never leaves the Mac.
+`dispatch-worker.yml`, enforced by workflow tests. The owner's Mac still
+pushes these two long-lived secrets; it no longer supplies any App token to
+the workflow.
 
 A model can read its own provider credential, including its refresh token,
 and the pinned launcher. This is residual exposure, not a hardened secret
