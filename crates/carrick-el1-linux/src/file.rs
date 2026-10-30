@@ -219,6 +219,11 @@ impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, 
             None => carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation),
         }
     }
+    fn interrupt_pending_wait(&mut self) -> bool {
+        self.owner
+            .as_deref_mut()
+            .is_some_and(|owner| owner.interrupt_pending_wait())
+    }
 }
 
 #[cfg(test)]

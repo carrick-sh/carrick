@@ -390,7 +390,7 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 );
             };
             if op.task != task_key(sched.task) || op.mm != mm_key(sched.task) {
-                if native_sigpipe {
+                if native_signals {
                     retain_native_operation(sched, token);
                     crate::dispatch::invalid_completion(
                         crate::dispatch::NativeInvariant::EntryBinding,
@@ -405,8 +405,8 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 .current()
                 .and_then(|id| sched.zone.record(id).handback());
             if native_signals {
-                let interrupted =
-                    reason == Some(carrick_sched_core::Handback::Signal) && interrupt();
+                let interrupted = reason == Some(carrick_sched_core::Handback::Signal)
+                    && (user.interrupt_pending_wait() || interrupt());
                 let timed_out = reason == Some(carrick_sched_core::Handback::Timeout)
                     && op.kind == IpcOpKind::EpollWait;
                 if interrupted || timed_out {
@@ -461,7 +461,7 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
             Admission::Forward => return (IpcServed::Forward, false),
             Admission::Restart(token, op) => {
-                if native_sigpipe {
+                if native_signals {
                     finish_native(sched, token, &venue.region);
                     return (IpcServed::Forward, false);
                 }
@@ -694,7 +694,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                             venue,
                             IpcLeave::FlagsRefused,
                             copy.user,
-                            native_sigpipe,
+                            native_signals,
                         ) {
                             Ok(served) => served,
                             Err(retry) => {
@@ -731,7 +731,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         venue,
                         why,
                         copy.user,
-                        native_sigpipe,
+                        native_signals,
                     ) {
                         Ok(served) => served,
                         Err(retry) => {
@@ -757,7 +757,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         venue,
                         IpcLeave::TransferRefused,
                         copy.user,
-                        native_sigpipe,
+                        native_signals,
                     ) {
                         Ok(served) => served,
                         Err(retry) => {
@@ -844,7 +844,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                             venue,
                             why,
                             copy.user,
-                            native_sigpipe,
+                            native_signals,
                         ) {
                             Ok(served) => served,
                             Err(retry) => {
@@ -861,7 +861,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                             crate::dispatch::NativeInvariant::EntryBinding,
                         )
                     });
-                    if native_sigpipe {
+                    if native_signals {
                         if op.progress.written == 0 {
                             // A structural refusal supplies no valid execution
                             // authority. Busy takes the owned yield arm above;
@@ -887,7 +887,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                             venue,
                             IpcLeave::FaultFirst,
                             copy.user,
-                            native_sigpipe,
+                            native_signals,
                         ) {
                             Ok(served) => served,
                             Err(retry) => {
@@ -928,6 +928,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 op,
                 enrollment.key(),
                 enrollment.observed_snapshot(),
+                None,
                 None,
             ) {
                 Parked::Done(served) => return (served, false),
@@ -970,7 +971,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                             venue,
                             IpcLeave::ParkRefused,
                             copy.user,
-                            native_sigpipe,
+                            native_signals,
                         ) {
                             Ok(served) => served,
                             Err(retry) => {
@@ -982,7 +983,16 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     );
                 };
                 match park(
-                    sched, frame, region, token, op, object, lane, snap, None, interrupt,
+                    sched,
+                    frame,
+                    region,
+                    token,
+                    op,
+                    object,
+                    lane,
+                    snap,
+                    None,
+                    &mut || copy.user.interrupt_pending_wait() || interrupt(),
                 ) {
                     Parked::Done(served) => return (served, false),
                     Parked::Retry(t) => {
@@ -1000,7 +1010,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                                 venue,
                                 IpcLeave::ParkRefused,
                                 copy.user,
-                                native_sigpipe,
+                                native_signals,
                             ) {
                                 Ok(served) => served,
                                 Err(retry) => {
@@ -1040,7 +1050,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 let served = handback(frame, token, op, IpcHandback::Sigpipe, result, venue);
                 return (leave(sched, IpcLeave::SigpipeHandback, served), false);
             }
-            StepStatus::Fault if native_sigpipe => {
+            StepStatus::Fault if native_signals => {
                 // Native owners cannot transfer this token to the host-only
                 // handback ABI. Genuine faults settle here, including a
                 // zero-byte read that already parked on readiness or memory.
@@ -1073,7 +1083,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         venue,
                         IpcLeave::FaultFirst,
                         copy.user,
-                        native_sigpipe,
+                        native_signals,
                     ) {
                         Ok(served) => served,
                         Err(retry) => {
@@ -1190,7 +1200,17 @@ fn park<C: ThreadCpu, U: UserWord>(
     let Some(key) = wait_key(object, lane) else {
         return Parked::Refused(token);
     };
-    park_key(sched, frame, region, token, op, key, snap, deadline)
+    park_key(
+        sched,
+        frame,
+        region,
+        token,
+        op,
+        key,
+        snap,
+        deadline,
+        Some(interrupt),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1203,6 +1223,7 @@ fn park_key<C: ThreadCpu, U: UserWord>(
     key: carrick_sched_core::object_wait::ObjectWaitKey,
     snap: ObjectWaitSnapshot,
     deadline: Option<u64>,
+    interrupt: Option<&mut dyn FnMut() -> bool>,
 ) -> Parked {
     let Some(resume) = OperationResumePc::new(frame.elr.wrapping_sub(linux::SVC_LEN)) else {
         return Parked::Refused(token);
@@ -1218,7 +1239,7 @@ fn park_key<C: ThreadCpu, U: UserWord>(
         Ok(parked) => {
             // Enrollment precedes the single pending-signal probe. A signal
             // before enrollment is seen here; a later one owns queue intake.
-            if interrupt() {
+            if interrupt.is_some_and(|interrupt| interrupt()) {
                 sched.task.linux.mark_pending_host_work();
             }
             let served = if sched.task.linux.has_pending_host_work() {
@@ -1858,7 +1879,7 @@ mod tests {
                 task: &self.task,
                 mem: &self.mem,
             };
-            serve_ipc_with_sigpipe(&mut sched, frame, &venue, &mut user, native).0
+            serve_ipc_with_signals(&mut sched, frame, &venue, &mut user, native, &mut || false).0
         }
         /// Queue thread `tid` of `mm`, runnable on the slot, about to issue
         /// the syscall in `frame` (its SVC at `svc`).
@@ -2982,7 +3003,15 @@ mod tests {
                 tables: &w.tables,
             };
             assert_eq!(
-                serve_ipc_with_sigpipe(&mut sched, &mut frame, &venue, &mut user, true).0,
+                serve_ipc_with_signals(
+                    &mut sched,
+                    &mut frame,
+                    &venue,
+                    &mut user,
+                    true,
+                    &mut || false,
+                )
+                .0,
                 RETURNED
             );
             assert_eq!(user.preparations, 1);
@@ -3157,7 +3186,15 @@ mod tests {
                 tables: &w.tables,
             };
             assert_eq!(
-                serve_ipc_with_sigpipe(&mut sched, &mut frame, &venue, &mut user, true).0,
+                serve_ipc_with_signals(
+                    &mut sched,
+                    &mut frame,
+                    &venue,
+                    &mut user,
+                    true,
+                    &mut || false,
+                )
+                .0,
                 RETURNED
             );
             assert_eq!(user.yields, 1);

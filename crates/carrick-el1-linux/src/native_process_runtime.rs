@@ -1452,6 +1452,7 @@ impl<'a, M: Clone, C: ProcessContext> Drop for Graph<'a, M, C> {
 pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     graph: SpinLock<Graph<'a, M, C>>,
     zone: &'a ZoneTables<C>,
+    exec_capability: Arc<carrick_core_abi::service::ExecCapabilityId>,
     ipc_channels: IpcWaitChannels,
     #[cfg(test)]
     signal_check_hook: SpinLock<Option<Box<dyn FnOnce() + Send + 'a>>>,
@@ -3380,7 +3381,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         } else {
             1
         };
-        NonZeroU64::new(file_table).ok_or(NativeProcessError::Stale)?;
+        let exec_capability = Arc::new(carrick_core_abi::service::ExecCapabilityId::new(
+            NonZeroU64::new(file_table).ok_or(NativeProcessError::Stale)?,
+        ));
         let mut members = vec![NativeMember {
             thread: execution,
             process: key,
@@ -3488,6 +3491,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 vfork_parents: BTreeMap::new(),
             }),
             zone: source.zone,
+            exec_capability,
             ipc_channels,
             #[cfg(test)]
             signal_check_hook: SpinLock::new(None),
@@ -3823,13 +3827,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         Some(row.parent())
     }
     /// Capability retained by this native process tree at root admission.
-    /// Fork changes descriptor-table identity, but inherits this root-owned
-    /// file/loader capability without introducing a second lifetime table.
+    /// Fork changes descriptor-table identity, but inherits this tree-owned
+    /// file/loader capability without consulting a live root task row.
     pub fn exec_capability(&self) -> Option<carrick_core_abi::service::ExecCapabilityId> {
-        let graph = self.graph.lock();
-        let root = graph.owner.task(graph.root_key).ok()?;
-        let raw = NonZeroU64::new(root.native().resources().file_table)?;
-        Some(carrick_core_abi::service::ExecCapabilityId::new(raw))
+        Some(*self.exec_capability)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn weak_exec_capability(
+        &self,
+    ) -> alloc::sync::Weak<carrick_core_abi::service::ExecCapabilityId> {
+        Arc::downgrade(&self.exec_capability)
     }
 }
 /// What a fork reserves and captures from its parent before preparing the
