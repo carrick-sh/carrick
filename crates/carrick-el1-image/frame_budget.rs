@@ -330,12 +330,28 @@ impl Frames {
             (
                 "native admission",
                 native
-                    + self.required("::admit_entry_runtime::")?
-                    + self.sum(&[
-                        "::admit_fresh_root::",
-                        "::process_owner::GuestTask$LT$C$C$U$C$N$GT$::new::",
-                        "::process_owner::GuestThreads::new::",
-                    ])
+                    + (self.required("::admit_entry_runtime::")?
+                        + self
+                            .sum(&[
+                                "::admit_fresh_root::",
+                                "::process_owner::GuestTask$LT$C$C$U$C$N$GT$::new::",
+                                "::process_owner::GuestThreads::new::",
+                            ])
+                            .max(
+                                self.required("::rebind_host_exec::")?
+                                    + self.maximum("::init_leader::")
+                                    + self.maximum("::spawn_thread::"),
+                            )
+                        + self.maximum("::prepare_root_group::")
+                        + self.maximum("::validate_root_leader::")
+                        + self.maximum("::imported_members::")
+                        + self.maximum("::allocate_process::")
+                        + self.maximum("::install_root_group_locked::"))
+                    .max(
+                        self.maximum("::park_host_exec_rebind_wait::")
+                            + self.qualified("HostExecRebindWaiters", "::park::")
+                            + self.maximum("::cleanup_rebind_source::"),
+                    )
                     + allocation,
             ),
             (
