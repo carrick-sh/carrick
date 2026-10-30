@@ -147,13 +147,16 @@ impl HostVenueBinding {
             mm: context.shared().mm().id(),
         }
     }
-    fn authenticates(&self, context: &crate::kernel::KernelContext) -> bool {
+    fn shares_mm(&self, context: &crate::kernel::KernelContext) -> bool {
         self.kernel
             .upgrade()
             .is_some_and(|kernel| Arc::ptr_eq(&kernel, context.kernel()))
+            && self.mm == context.shared().mm().id()
+    }
+    fn authenticates(&self, context: &crate::kernel::KernelContext) -> bool {
+        self.shares_mm(context)
             && self.task == context.task().key()
             && self.thread == context.thread().key()
-            && self.mm == context.shared().mm().id()
     }
 }
 
@@ -2006,15 +2009,32 @@ impl MemView<'_> {
         let completed = Arc::clone(completed);
         let root = delegated.root.clone();
         let mut completed = completed.lock();
-        if !completed.binding.authenticates(cx.kernel) || completed.syscall != cx.request {
+        // The metadata lock keeps adoption from clearing Completed between
+        // observing this producer and checking its custody predicate. A peer
+        // root release may wake a sibling early; its retry observes again.
+        let release = root.observe_release();
+        if !completed.binding.shares_mm(cx.kernel) {
             return Some(Err(root_refusal(Refusal::Stale)));
         }
-        if root.handle().ok() != Some(completed.root) {
-            mem.take_venue();
-            completed.outcome.take();
-            return Some(Ok(DispatchOutcome::OwnerCancelled(
-                crate::kernel::continuation::OwnerWaitCancellation::GroupExit,
-            )));
+        let release = match release {
+            Ok(release) if release.handle() == completed.root => release,
+            _ => {
+                mem.take_venue();
+                completed.outcome.take();
+                return Some(Ok(DispatchOutcome::OwnerCancelled(
+                    crate::kernel::continuation::OwnerWaitCancellation::GroupExit,
+                )));
+            }
+        };
+        if !completed.binding.authenticates(cx.kernel) || completed.syscall != cx.request {
+            // An exact-MM sibling owns a different syscall. Keep both owned
+            // operations: only the issuer consumes the completed outcome.
+            // Adoption releases the root before clearing the venue under this
+            // metadata lock, so enrolling then probing cannot miss its wake.
+            return Some(Ok(DispatchOutcome::OwnerMemoryWait {
+                wait: release,
+                committed: 0,
+            }));
         }
         let request = completed.request;
         let layout = mem.layout;
@@ -2726,6 +2746,16 @@ mod tests {
             ),
             "a shared-MM sibling must wait for completed venue adoption: {sibling_refused:?}"
         );
+        let Ok(DispatchOutcome::OwnerMemoryWait {
+            wait: sibling_wait, ..
+        }) = sibling_refused
+        else {
+            unreachable!("sibling wait checked above");
+        };
+        assert_eq!(
+            sibling_wait.cause(),
+            carrick_el1_abi::PortalWaitCause::Reservations
+        );
         assert!(dispatcher.mem().lock().has_owner_proposal());
         assert_eq!(memory.zero_backing_calls.get(), 1);
         let foreign = SyscallDispatcher::new();
@@ -2790,6 +2820,18 @@ mod tests {
             "root adoption cannot replay backend effects"
         );
         assert!(!dispatcher.mem().lock().has_owner_proposal());
+        let adopted_release = dispatcher
+            .mem()
+            .lock()
+            .delegated_root()
+            .unwrap()
+            .observe_release()
+            .unwrap();
+        assert_eq!(adopted_release.handle(), sibling_wait.handle());
+        assert!(
+            adopted_release.revision() > sibling_wait.revision(),
+            "adoption must publish the sibling's exact release source"
+        );
         let (_, incarnation) = root.lock().node(base).unwrap();
         assert!(
             dispatcher

@@ -187,6 +187,13 @@ impl DelegatedRoot {
             holder: std::cell::Cell::new(None),
         })
     }
+    /// Observe before checking MM-owned proposal custody. Its adoption drops
+    /// the root guard and publishes this same Reservations release source.
+    pub(in crate::dispatch) fn observe_release(
+        &self,
+    ) -> Result<carrick_el1_abi::PortalOwnerWait, Refusal> {
+        self.observe_probe().map(|probe| probe.observed)
+    }
     pub(in crate::dispatch) fn handle(&self) -> Result<carrick_el1_abi::El1MmHandle, Refusal> {
         self.observe_probe().map(|probe| probe.observed.handle())
     }
