@@ -76,10 +76,23 @@ impl carrick_el1::memory::AnonymousBackingProbe for FixtureMapping<'_> {
 impl carrick_el1::memory::AnonymousPermissionEditor for FixtureMapping<'_> {
     fn protect_and_invalidate(
         &mut self,
-        _: carrick_guest_arch::AddressSpaceRegister,
-        _: carrick_mmu_core::aarch64::GuestPermissionEdit,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
     ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
-        panic!("new mapping has no resident permission work")
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, InlineJournal, TableGrants, execute_descriptor_op,
+        };
+        assert!(matches!(
+            execute_descriptor_op(
+                self.words,
+                carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
+                DescriptorOp::Protect(edit),
+                &TableGrants::NONE,
+                &mut InlineJournal::new(),
+            ),
+            DescriptorOutcome::Applied(_)
+        ));
+        Ok(())
     }
 }
 impl carrick_el1::memory::AnonymousRetirementEditor for FixtureMapping<'_> {
@@ -252,6 +265,13 @@ fn native_backing_table_failure_retains_applied_receipt_without_ack() {
     composed_native_supply(false, None, false, SupplyEnd::FailTables);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparedScenario {
+    None,
+    UntouchedGrant,
+    ProtNoneAcrossFork,
+}
+
 fn composed_native_supply(
     competing_publication: bool,
     absent_page: Option<usize>,
@@ -263,13 +283,30 @@ fn composed_native_supply(
         absent_page,
         replace_cow,
         end,
-        false,
+        PreparedScenario::None,
     );
 }
 
 #[test]
 fn native_child_first_touch_of_inherited_prepared_leaf_makes_progress() {
-    composed_native_supply_with_prepared(false, None, false, SupplyEnd::Resume, true);
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::UntouchedGrant,
+    );
+}
+
+#[test]
+fn native_child_prot_none_across_fork_preserves_parent_bytes() {
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::ProtNoneAcrossFork,
+    );
 }
 
 fn composed_native_supply_with_prepared(
@@ -277,7 +314,7 @@ fn composed_native_supply_with_prepared(
     absent_page: Option<usize>,
     replace_cow: bool,
     end: SupplyEnd,
-    prepared_page: bool,
+    prepared: PreparedScenario,
 ) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     // Keep descriptor grants disjoint from the original 32-page fork arena.
@@ -285,17 +322,34 @@ fn composed_native_supply_with_prepared(
     let mut table_words = core::mem::take(&mut fixture.tables.words).into_vec();
     table_words.extend((0..32 * 512).map(|_| core::sync::atomic::AtomicU64::new(0)));
     fixture.tables.words = table_words.into_boxed_slice();
-    if prepared_page {
-        // Untouched private anonymous stock has an output but is invalid.
-        // Keep the non-identity IPA and Linux RW intent from the parent leaf.
-        let descriptor = fixture.tables.words[1536].load(Ordering::Relaxed);
-        fixture.tables.words[1536]
-            .store((descriptor & !1) | (1 << 56) | (1 << 57), Ordering::Relaxed);
-        assert!(
-            carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private(
-                fixture.tables.words[1536].load(Ordering::Relaxed)
-            )
-        );
+    match prepared {
+        PreparedScenario::None => {}
+        PreparedScenario::UntouchedGrant => {
+            // Untouched private anonymous stock has an output but is invalid.
+            // Keep the non-identity IPA and Linux RW intent from the parent leaf.
+            let descriptor = fixture.tables.words[1536].load(Ordering::Relaxed);
+            fixture.tables.words[1536]
+                .store((descriptor & !1) | (1 << 56) | (1 << 57), Ordering::Relaxed);
+            assert!(
+                carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private(
+                    fixture.tables.words[1536].load(Ordering::Relaxed)
+                )
+            );
+        }
+        PreparedScenario::ProtNoneAcrossFork => {
+            crate::mm_portal::test_support::change_policy(
+                &fixture.region,
+                crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+                ReservationMm::new(1).unwrap(),
+                &fixture.tables,
+                Some(carrick_el1_abi::ReservationProtection::NONE),
+            );
+            assert!(
+                carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private(
+                    fixture.tables.words[1536].load(Ordering::Relaxed)
+                )
+            );
+        }
     }
     if let Some(absent_page) = absent_page {
         // Parent's two-page reservation has only one page resident.
@@ -414,42 +468,163 @@ fn composed_native_supply_with_prepared(
         .unwrap();
     let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
     let supply = OwnerFaultSupply::new(portal).with_handle(handle);
-    if prepared_page {
-        frame.esr = 0x92000006;
-        frame.far = VA;
-        let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
-        assert!(residency.lookup(identity.mm, VA).is_none());
-        let action = carrick_el1::fault::dispatch_fault_with_prepared(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            access,
-            crate::cow_resolver::native_fault_supply(
-                true,
-                carrick_el1::fault::GrantMailboxes::own(&mailbox),
-                &supply,
-            ),
-            Some(carrick_el1::fault::PreparedFaultPath {
-                residency,
-                resolver: &mut SelectionWords(words),
-                roots: Some(fixture.region.table()),
-                file_slots: Some(portal),
-            }),
-            &mut resolver,
-        );
-        let root = access
-            .grant(access.find(identity.mm).unwrap(), identity.mm)
-            .unwrap()
-            .ttbr0;
-        assert!(
-            action == carrick_el1_abi::Action::Forward
-                && supply.outcome() == OwnerFaultSupplyOutcome::Selected
-                || leaf(words, root, VA) & 1 != 0,
-            "first-touch must publish a usable translation or request backing, not retry the same invalid leaf: action={action:?} supply={:?} leaf={:#x}",
-            supply.outcome(),
-            leaf(words, root, VA),
-        );
-        return;
+    match prepared {
+        PreparedScenario::None => {}
+        PreparedScenario::UntouchedGrant => {
+            frame.esr = 0x92000006;
+            frame.far = VA;
+            let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+            assert!(residency.lookup(identity.mm, VA).is_none());
+            let action = carrick_el1::fault::dispatch_fault_with_prepared(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                access,
+                crate::cow_resolver::native_fault_supply(
+                    true,
+                    carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                    &supply,
+                ),
+                Some(carrick_el1::fault::PreparedFaultPath {
+                    residency,
+                    resolver: &mut SelectionWords(words),
+                    roots: Some(fixture.region.table()),
+                    file_slots: Some(portal),
+                }),
+                &mut resolver,
+            );
+            let root = access
+                .grant(access.find(identity.mm).unwrap(), identity.mm)
+                .unwrap()
+                .ttbr0;
+            assert!(
+                action == carrick_el1_abi::Action::Forward
+                    && supply.outcome() == OwnerFaultSupplyOutcome::Selected
+                    || leaf(words, root, VA) & 1 != 0,
+                "first-touch must publish a usable translation or request backing, not retry the same invalid leaf: action={action:?} supply={:?} leaf={:#x}",
+                supply.outcome(),
+                leaf(words, root, VA),
+            );
+            return;
+        }
+        PreparedScenario::ProtNoneAcrossFork => {
+            let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+            frame.x[8] = 226;
+            frame.x[..3].copy_from_slice(&[VA, 4096, 1]);
+            assert_eq!(
+                carrick_el1::memory::serve_delegated_anonymous(
+                    &mut frame,
+                    &counters,
+                    &fixture.task,
+                    access,
+                    fixture.region.table(),
+                    &mut FixtureMapping { words, residency },
+                    None,
+                ),
+                carrick_el1::memory::DelegatedAnonymous::Served,
+            );
+            assert_eq!(frame.x[0], 0);
+            let root = access
+                .grant(access.find(identity.mm).unwrap(), identity.mm)
+                .unwrap()
+                .ttbr0;
+            if leaf(words, root, VA) & 1 == 0 {
+                frame.esr = 0x92000006;
+                frame.far = VA;
+                let action = carrick_el1::fault::dispatch_fault_with_prepared(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    access,
+                    crate::cow_resolver::native_fault_supply(
+                        true,
+                        carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                        &supply,
+                    ),
+                    Some(carrick_el1::fault::PreparedFaultPath {
+                        residency,
+                        resolver: &mut SelectionWords(words),
+                        roots: Some(fixture.region.table()),
+                        file_slots: Some(portal),
+                    }),
+                    &mut resolver,
+                );
+                if action == carrick_el1_abi::Action::Forward
+                    && supply.outcome() == OwnerFaultSupplyOutcome::Selected
+                {
+                    let (_, window) = portal
+                        .grant(0)
+                        .unwrap()
+                        .pending_fault_selection(identity.mm, VA)
+                        .unwrap();
+                    memory.pages.borrow_mut().insert(0xa0020000, vec![0; 4096]);
+                    let id = NonZeroU64::MIN;
+                    let txn = carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn {
+                        id: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxnId {
+                            mm_key: NonZeroU64::new(identity.mm).unwrap(),
+                            generation: window.operation.sequence,
+                        },
+                        root: carrick_mmu_core::aarch64::SubstrateGpa(
+                            root & AARCH64_ROOT_ADDRESS_MASK,
+                        ),
+                        op: carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::Prepare {
+                            publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                                va: window.range.start(),
+                                ipa: 0xa0020000,
+                                len: 4096,
+                                writable: false,
+                                executable: false,
+                            },
+                            resident: carrick_mmu_core::aarch64::descriptor_txn::PageSpan::new(
+                                VA, 4096,
+                            ),
+                            backing: carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                                frame_id: id,
+                                mapping_id: id,
+                                owner_generation: id,
+                                inventory_revision: id,
+                            },
+                        },
+                        tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants::NONE,
+                    };
+                    let slot = portal.grant(0).unwrap();
+                    assert!(slot.submit(window, &txn));
+                    let mm_owner = crate::mm_portal::MmPortal::<
+                        crate::mm_portal::test_support::NoPin,
+                    >::for_zone(
+                        NonZeroU64::MIN, fixture.region.table(), fixture.zone
+                    );
+                    let receipt = carrick_core::mm::frames::serve_grant(
+                        &mm_owner,
+                        slot,
+                        words,
+                        residency,
+                        u32::from(fixture.slot.raw()),
+                        || {},
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert!(matches!(
+                        receipt.outcome,
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+                    ));
+                    assert!(slot.take_receipt(window, &txn).is_some());
+                }
+            }
+            let child_leaf = leaf(words, root, VA);
+            assert_ne!(
+                child_leaf & 1,
+                0,
+                "child page must be readable after mprotect(PROT_READ): leaf={child_leaf:#x}"
+            );
+            let child_ipa = child_leaf & AARCH64_ROOT_ADDRESS_MASK;
+            assert_eq!(
+                memory.pages.borrow()[&child_ipa],
+                vec![17; 4096],
+                "PROT_NONE across fork must preserve parent's written bytes, not replace with zeros (child_ipa={child_ipa:#x})"
+            );
+            return;
+        }
     }
     if let Some(absent_page) = absent_page {
         let fault_page = VA + absent_page as u64 * 4096;
