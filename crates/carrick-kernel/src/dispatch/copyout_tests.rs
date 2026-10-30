@@ -1339,3 +1339,492 @@ fn directory_shared_output_preserves_internal_preparation_error() {
     assert!(g.memory.commits.is_empty());
     assert_eq!(directory_cursor(&mut g, fd), 0);
 }
+
+// #986: readiness is terminal before output publication begins. Neither
+// readiness sampling nor input decoding may be replayed after a refusal.
+#[test]
+fn select_large_output_retains_selection_across_later_window_refusal() {
+    const SET: u64 = BASE + 0x1000;
+    const SET_LEN: usize = 8192;
+    let mut g = Guest::new();
+    let (read, write) = g.pipe();
+    let (empty, _) = g.pipe();
+    g.memory.seed(PATH, b"x");
+    assert_eq!(g.ok(nr::WRITE.raw(), [write as u64, PATH, 1, 0, 0, 0]), 1);
+    let mut input = vec![0; SET_LEN];
+    for fd in [read, empty] {
+        input[fd as usize / 8] |= 1 << (fd as usize % 8);
+    }
+    g.memory.seed(SET, &input);
+    let wait = g.memory.refuse_after_prepares(1);
+    let before_prepares = g.memory.prepares;
+    let before_commits = g.memory.commits.len();
+    let outcome = g.call(nr::PSELECT6.raw(), [(SET_LEN * 8) as u64, SET, 0, 0, 0, 0]);
+    let DispatchOutcome::OutputSuspended(pending) = outcome else {
+        panic!("select must retain the frozen output on refusal: {outcome:?}");
+    };
+    assert_eq!(
+        pending.wait(),
+        &carrick_guest_mem::MemoryReadWait::Owner(wait)
+    );
+    assert_eq!(g.memory.prepares - before_prepares, 2);
+    assert_eq!(g.memory.commits.len() - before_commits, 1);
+    assert_eq!(g.memory.commits.last().unwrap().1.len(), 4096);
+    let context = g.dispatcher.capture_one_task_context().unwrap();
+    // Remove readiness and replace input while output is suspended. Resume
+    // must publish the original selection without reading any input again.
+    assert_eq!(g.ok(nr::READ.raw(), [read as u64, OUT, 1, 0, 0, 0]), 1);
+    g.memory.seed(SET + 4096, &vec![0xff; 4096]);
+    let reads = g.memory.reads.get();
+    let outcome = pending
+        .resume(
+            &context,
+            &mut g.memory,
+            (context.shared().mm().id(), 41),
+            &g.dispatcher.fs_view(),
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 1 });
+    assert_eq!(g.memory.reads.get(), reads);
+    let mut expected = vec![0; SET_LEN];
+    expected[read as usize / 8] |= 1 << (read as usize % 8);
+    assert_eq!(g.memory.inner.read_bytes(SET, SET_LEN).unwrap(), expected);
+    assert_eq!(g.memory.commits.len() - before_commits, 3); // read payload + tail
+}
+
+#[test]
+fn retained_poll_output_refusal_keeps_terminal_selection_and_edited_inputs() {
+    use crate::kernel::continuation::{ContinuationCompletion, fold_continuation_completion};
+    let mut g = Guest::new();
+    let (read, write) = g.stream_pair();
+    let mut record = Vec::new();
+    record.extend(read.to_ne_bytes());
+    record.extend(libc::POLLIN.to_ne_bytes());
+    record.extend(0i16.to_ne_bytes());
+    g.memory.seed(OUT, &record);
+    g.memory.seed(LEN_ADDR, &60i64.to_ne_bytes());
+    g.memory.seed(LEN_ADDR + 8, &0i64.to_ne_bytes());
+    let outcome = g.call(nr::PPOLL.raw(), [OUT, 1, LEN_ADDR, 0, 0, 0]);
+    let DispatchOutcome::BlockingFdWait { wait, sig_mask } = outcome else {
+        panic!("empty in-zone socket poll must retain its admitted wait: {outcome:?}");
+    };
+    let description = g.dispatcher.open_file(read).unwrap().description.clone();
+    let deadline = wait.caller_deadline();
+    let context = g.dispatcher.capture_one_task_context().unwrap();
+    let mm = (context.shared().mm().id(), 41);
+    let outcome = fold_continuation_completion(
+        ContinuationCompletion::FdWait { wait, sig_mask },
+        &g.dispatcher,
+        &context,
+        &mut g.memory,
+        mm,
+    )
+    .unwrap()
+    .unwrap();
+    let DispatchOutcome::BlockingFdWait { wait, sig_mask } = outcome else {
+        panic!("must repark");
+    };
+    assert_eq!(wait.caller_deadline(), deadline);
+    g.memory.seed(PATH, b"x");
+    assert_eq!(g.ok(nr::SENDTO.raw(), [write as u64, PATH, 1, 0, 0, 0]), 1);
+    g.memory.seed(OUT, &[0xf0; 6]);
+    let dependency = g.memory.refuse_next();
+    let commits = g.memory.commits.len();
+    let outcome = fold_continuation_completion(
+        ContinuationCompletion::FdWait { wait, sig_mask },
+        &g.dispatcher,
+        &context,
+        &mut g.memory,
+        mm,
+    )
+    .unwrap()
+    .unwrap();
+    let DispatchOutcome::OutputSuspended(pending) = outcome else {
+        panic!("retained poll must suspend output, retaining terminal readiness: {outcome:?}");
+    };
+    assert_eq!(
+        pending.wait(),
+        &carrick_guest_mem::MemoryReadWait::Owner(dependency)
+    );
+    assert_eq!(g.memory.commits.len(), commits);
+    assert_eq!(g.ok(nr::RECVFROM.raw(), [read as u64, OUT2, 1, 0, 0, 0]), 1);
+    assert_eq!(g.ok(nr::CLOSE.raw(), [read as u64, 0, 0, 0, 0, 0]), 0);
+    let (replacement, _) = g.stream_pair();
+    assert_eq!(replacement, read, "reuse the watched numeric slot");
+    assert!(
+        description.fd_ref_count() > 0,
+        "output suspension retains the original source"
+    );
+    let reads = g.memory.reads.get();
+    assert_eq!(
+        pending
+            .resume(&context, &mut g.memory, mm, &g.dispatcher.fs_view())
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    assert_eq!(g.memory.reads.get(), reads);
+    assert_eq!(
+        description.fd_ref_count(),
+        0,
+        "terminal publication releases original source leases"
+    );
+    assert_eq!(g.memory.inner.read_bytes(OUT, 6).unwrap(), [0xf0; 6]);
+    assert_eq!(
+        g.memory.inner.read_bytes(OUT + 6, 2).unwrap(),
+        libc::POLLIN.to_ne_bytes()
+    );
+}
+
+#[test]
+fn select_large_output_retained_on_initial_owner_refusal() {
+    const SET: u64 = BASE + 0x1000;
+    let mut g = Guest::new();
+    let (_, write) = g.pipe();
+    let mut input = vec![0; 8192];
+    input[write as usize / 8] |= 1 << (write as usize % 8);
+    g.memory.seed(SET, &input);
+    let wait = g.memory.refuse_next();
+    let commits = g.memory.commits.len();
+    let outcome = g.call(nr::PSELECT6.raw(), [65536, 0, SET, 0, 0, 0]);
+    let DispatchOutcome::OutputSuspended(pending) = outcome else {
+        panic!("large select must retain initial refused output: {outcome:?}");
+    };
+    assert_eq!(
+        pending.wait(),
+        &carrick_guest_mem::MemoryReadWait::Owner(wait)
+    );
+    assert_eq!(g.memory.commits.len(), commits);
+    assert_eq!(g.memory.inner.read_bytes(SET, 8192).unwrap(), input);
+}
+
+#[test]
+fn retained_select_timeout_suspends_between_large_set_windows() {
+    use crate::dispatch::fd_wait::{BlockingFdWait, BlockingFdWaitKind, RetainedFdSet};
+    use crate::kernel::continuation::{ContinuationCompletion, fold_continuation_completion};
+    let mut g = Guest::new();
+    let context = g.dispatcher.capture_one_task_context().unwrap();
+    let mm = g.lease.as_ref().unwrap().task_state_authority().unwrap();
+    let wait = BlockingFdWait::new(
+        BlockingFdWaitKind::Select {
+            entries: Vec::new(),
+            read: Some(RetainedFdSet {
+                address: BASE + 0x1000,
+                input: vec![0; 8192],
+            }),
+            write: Some(RetainedFdSet {
+                address: OUT,
+                input: vec![0; 8],
+            }),
+            except: None,
+        },
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        WaitFds::empty(),
+    )
+    .unwrap();
+    let dependency = g.memory.refuse_after_prepares(1);
+    let outcome = fold_continuation_completion(
+        ContinuationCompletion::FdWait {
+            wait,
+            sig_mask: carrick_abi::WaitSigMask::NONE,
+        },
+        &g.dispatcher,
+        &context,
+        &mut g.memory,
+        mm,
+    )
+    .unwrap()
+    .unwrap();
+    let DispatchOutcome::OutputSuspended(pending) = outcome else {
+        panic!("retained select timeout must suspend: {outcome:?}");
+    };
+    assert_eq!(
+        pending.wait(),
+        &carrick_guest_mem::MemoryReadWait::Owner(dependency)
+    );
+    let (operation, dependency) = pending.into_parts();
+    assert!(operation.is_completed_wait());
+    drop(dependency);
+    g.memory.seed(BASE + 0x2000, &vec![0xff; 4096]);
+    assert_eq!(
+        operation
+            .resume(&context, &mut g.memory, mm, &g.dispatcher.fs_view())
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(g.memory.prepares, 4);
+    assert_eq!(
+        g.memory.inner.read_bytes(BASE + 0x1000, 8192).unwrap(),
+        vec![0; 8192]
+    );
+    assert_eq!(g.memory.inner.read_bytes(OUT, 8).unwrap(), [0; 8]);
+    assert_eq!(g.memory.reads.get(), 0);
+}
+
+#[test]
+fn select_output_fault_keeps_the_committed_prefix() {
+    const SET: u64 = BASE + 0x1000;
+    let mut g = Guest::new();
+    let (_, write) = g.pipe();
+    let mut input = vec![0; 8192];
+    input[write as usize / 8] |= 1 << (write as usize % 8);
+    g.memory.seed(SET, &input);
+    g.memory.protect_readonly(SET + 4096, 4096);
+    let commits = g.memory.commits.len();
+    assert_eq!(
+        g.call(nr::PSELECT6.raw(), [65536, 0, SET, 0, 0, 0]),
+        DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+    );
+    assert_eq!(g.memory.commits.len(), commits + 1);
+    assert_eq!(
+        g.memory.commits.last().unwrap(),
+        &(SET, input[..4096].to_vec())
+    );
+}
+
+#[test]
+fn select_output_rejects_stale_resume_and_cancellation_before_access() {
+    use crate::kernel::continuation::CompletionFoldError;
+    use carrick_el1_abi::Lifecycle;
+    for failure in 0..4 {
+        let mut g = Guest::new();
+        let (_, write) = g.pipe();
+        let mut input = vec![0; 8];
+        input[write as usize / 8] |= 1 << (write as usize % 8);
+        g.memory.seed(OUT, &input);
+        g.memory.refuse_next();
+        let DispatchOutcome::OutputSuspended(pending) =
+            g.call(nr::PSELECT6.raw(), [64, 0, OUT, 0, 0, 0])
+        else {
+            panic!("must suspend");
+        };
+        let context = g.dispatcher.capture_one_task_context().unwrap();
+        let other = Guest::new();
+        let other_context = other.dispatcher.capture_one_task_context().unwrap();
+        let mm = g.lease.as_ref().unwrap().task_state_authority().unwrap();
+        if failure >= 2 {
+            context
+                .lifecycle_page()
+                .process_exit_custody()
+                .cancellation_authority()
+                .publish(
+                    if failure == 2 {
+                        carrick_core::cancellation::ProcessCancellation::FatalSignal
+                    } else {
+                        carrick_core::cancellation::ProcessCancellation::GroupExit
+                    },
+                    || panic!("no admitted effect"),
+                );
+        }
+        let before = (
+            g.memory.prepares,
+            g.memory.reads.get(),
+            g.memory.commits.len(),
+        );
+        let result = pending.resume(
+            if failure == 0 {
+                &other_context
+            } else {
+                &context
+            },
+            &mut g.memory,
+            if failure == 1 { (mm.0, mm.1 + 1) } else { mm },
+            &g.dispatcher.fs_view(),
+        );
+        assert_eq!(
+            (
+                g.memory.prepares,
+                g.memory.reads.get(),
+                g.memory.commits.len()
+            ),
+            before
+        );
+        match failure {
+            0 => assert!(matches!(result, Err(DispatchError::CompletionInvariant(_)))),
+            1 => assert!(matches!(
+                result,
+                Err(DispatchError::CompletionInvariant(
+                    CompletionFoldError::AddressSpace
+                ))
+            )),
+            _ => assert!(matches!(result, Ok(DispatchOutcome::OwnerCancelled(_)))),
+        }
+    }
+}
+
+#[test]
+fn select_owner_output_requires_exact_execution_authority() {
+    assert!(syscall_requires_execution_lease(
+        nr::PSELECT6.raw(),
+        SyscallArgs::from([0; 6])
+    ));
+    assert!(syscall_requires_execution_lease(
+        carrick_abi::CARRICK_PRIVATE_X86_SELECT,
+        SyscallArgs::from([0; 6])
+    ));
+    let mut g = Guest::new();
+    let (_, write) = g.pipe();
+    let mut input = vec![0; 8];
+    input[write as usize / 8] |= 1 << (write as usize % 8);
+    g.memory.seed(OUT, &input);
+    let context = g.dispatcher.capture_one_task_context().unwrap();
+    let before = (g.memory.prepares, g.memory.reads.get());
+    let result = g.dispatcher.dispatch_with_lease(
+        &context,
+        SyscallRequest::new(nr::PSELECT6.raw(), SyscallArgs::from([64, 0, OUT, 0, 0, 0])),
+        &mut g.memory,
+        &g.reporter,
+        None,
+    );
+    assert!(matches!(result, Err(DispatchError::CompletionInvariant(_))));
+    assert_eq!((g.memory.prepares, g.memory.reads.get()), before);
+}
+
+#[test]
+fn retained_poll_sparse_output_keeps_prefix_across_owner_supply_and_physical() {
+    use crate::dispatch::fd_wait::{
+        BlockingFdWait, BlockingFdWaitKind, RetainedFdSource, RetainedPollFd,
+    };
+    use crate::kernel::continuation::{ContinuationCompletion, fold_continuation_completion};
+    use carrick_guest_mem::{
+        GuestWriteRange, MemoryPrepareError, OwnedMemoryWait, PhysicalMemoryWait,
+        PreparedGuestWrite,
+    };
+    #[derive(Debug)]
+    struct Dependency;
+    impl PhysicalMemoryWait for Dependency {
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn enroll(
+            &self,
+            _: Arc<dyn Fn() + Send + Sync>,
+        ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+            (Box::new(()), true)
+        }
+    }
+    struct Physical<'a> {
+        inner: &'a mut OwnerRefusingMemory,
+        dependency: std::sync::Weak<Dependency>,
+        refuse: bool,
+    }
+    impl GuestMemory for Physical<'_> {
+        fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+            carrick_guest_mem::UserMemoryVenue::Owner
+        }
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            panic!("no input replay")
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            panic!("prepared writes only")
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            if self.refuse {
+                self.refuse = false;
+                self.inner.prepares += 1;
+                return Err(MemoryPrepareError::Physical(OwnedMemoryWait(
+                    self.dependency.upgrade().unwrap(),
+                )));
+            }
+            assert_eq!(
+                self.dependency.strong_count(),
+                1,
+                "physical custody released before fresh preparation"
+            );
+            self.inner.prepare_write(ranges)
+        }
+    }
+    impl CurrentMmMemory for Physical<'_> {}
+    for count in [1, 8, 512] {
+        let mut g = Guest::new();
+        let context = g.dispatcher.capture_one_task_context().unwrap();
+        let mm = g.lease.as_ref().unwrap().task_state_authority().unwrap();
+        // The first revents field straddles a page; it remains one 2-byte unit.
+        let base = BASE + 0xff9;
+        let entries = (0..count)
+            .map(|index| RetainedPollFd {
+                guest_fd: -1,
+                events: libc::POLLIN,
+                address: base + index as u64 * 8,
+                source: RetainedFdSource::Negative,
+            })
+            .collect();
+        let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let wait = BlockingFdWait::new(
+            BlockingFdWaitKind::Poll { entries },
+            Some(deadline),
+            WaitFds::empty(),
+        )
+        .unwrap();
+        let dependency = g.memory.refuse_after_prepares(count / 2);
+        let outcome = fold_continuation_completion(
+            ContinuationCompletion::FdWait {
+                wait,
+                sig_mask: carrick_abi::WaitSigMask::NONE,
+            },
+            &g.dispatcher,
+            &context,
+            &mut g.memory,
+            mm,
+        )
+        .unwrap()
+        .unwrap();
+        let DispatchOutcome::OutputSuspended(first) = outcome else {
+            panic!("owner refusal must retain output: {outcome:?}");
+        };
+        assert_eq!(
+            first.wait(),
+            &carrick_guest_mem::MemoryReadWait::Owner(dependency)
+        );
+        assert_eq!(g.memory.commits.len(), count / 2);
+        let request = g.memory.refuse_next_supply_grant();
+        let DispatchOutcome::OutputSuspended(second) = first
+            .resume(&context, &mut g.memory, mm, &g.dispatcher.fs_view())
+            .unwrap()
+        else {
+            panic!("supply refusal");
+        };
+        assert_eq!(
+            second.wait(),
+            &carrick_guest_mem::MemoryReadWait::Supply(request)
+        );
+        assert_eq!(g.memory.commits.len(), count / 2);
+        let dependency = Arc::new(Dependency);
+        let mut memory = Physical {
+            inner: &mut g.memory,
+            dependency: Arc::downgrade(&dependency),
+            refuse: true,
+        };
+        let DispatchOutcome::OutputSuspended(third) = second
+            .resume(&context, &mut memory, mm, &g.dispatcher.fs_view())
+            .unwrap()
+        else {
+            panic!("physical refusal");
+        };
+        assert!(matches!(
+            third.wait(),
+            carrick_guest_mem::MemoryReadWait::Physical(_)
+        ));
+        assert_eq!(Arc::strong_count(&dependency), 2);
+        assert_eq!(
+            third
+                .resume(&context, &mut memory, mm, &g.dispatcher.fs_view())
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(Arc::strong_count(&dependency), 1);
+        assert_eq!(g.memory.prepares, count + 3);
+        assert_eq!(g.memory.commits.len(), count);
+        assert_eq!(g.memory.reads.get(), 0);
+        for (index, (address, bytes)) in g.memory.commits.iter().enumerate() {
+            assert_eq!(*address, base + index as u64 * 8 + 6);
+            assert_eq!(bytes, &[0; 2]);
+            assert_eq!(
+                g.memory.inner.read_bytes(*address - 6, 6).unwrap(),
+                [FILL; 6]
+            );
+        }
+    }
+}

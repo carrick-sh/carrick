@@ -2136,3 +2136,15 @@ contracts = ["kernel.el1.ipc-two-process"]
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/ipc/epoll.rs"
 contracts = ["kernel.el1.ipc-two-process"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/net.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fd_wait.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fd_wait/tests.rs"
+contracts = ["kernel.memory.owner-wait"]

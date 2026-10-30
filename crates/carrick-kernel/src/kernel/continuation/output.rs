@@ -9,7 +9,8 @@ use crate::dispatch::{
 use crate::kernel::objects::{ThreadExecutionLease, ThreadKey};
 use crate::kernel::{KernelContext, KernelTaskBinding, MmId};
 use carrick_abi::{LINUX_EFAULT, LINUX_EINVAL, LinuxErrno};
-use carrick_guest_mem::{MemoryError, MemoryReadWait, OwnedReadContinuation};
+use carrick_guest_mem::{GuestVa, MemoryError, MemoryReadWait, OwnedReadContinuation};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Exact task incarnation, thread incarnation, MM and independent ASID.
@@ -31,7 +32,10 @@ impl PartialEq for ExactCompletionBinding {
 impl Eq for ExactCompletionBinding {}
 
 impl ExactCompletionBinding {
-    fn new(context: &KernelContext, mm: (MmId, u64)) -> Result<Self, CompletionFoldError> {
+    pub(crate) fn new(
+        context: &KernelContext,
+        mm: (MmId, u64),
+    ) -> Result<Self, CompletionFoldError> {
         if mm.0 != context.shared().mm().id() {
             return Err(CompletionFoldError::AddressSpace);
         }
@@ -96,6 +100,7 @@ struct CompletedWaitOutput {
 #[derive(Debug, PartialEq, Eq)]
 enum OutputOperation {
     CompletedWait(CompletedWaitOutput),
+    FdWait(FdWaitOutput),
     RecvfromAddress(RecvfromAddress),
     DirectoryRead(DirectoryReadOutput),
 }
@@ -190,7 +195,14 @@ impl RetainedOutputCompletion {
     }
     /// Only completed waits carry a previously settled restart disposition.
     pub fn is_completed_wait(&self) -> bool {
-        matches!(self.operation, OutputOperation::CompletedWait(_))
+        matches!(
+            self.operation,
+            OutputOperation::CompletedWait(_)
+                | OutputOperation::FdWait(FdWaitOutput {
+                    retained_wait: Some(_),
+                    ..
+                })
+        )
     }
     pub fn resume(
         self,
@@ -242,6 +254,9 @@ impl RetainedOutputCompletion {
             OutputOperation::CompletedWait(output) => {
                 Ok(output.copyout(self.binding, context, memory))
             }
+            OutputOperation::FdWait(output) => output
+                .publish(Some(self.binding), context, memory)
+                .map_err(DispatchError::CompletionInvariant),
             OutputOperation::RecvfromAddress(address) => {
                 Ok(address.resume(self.binding, context, memory))
             }
@@ -249,6 +264,149 @@ impl RetainedOutputCompletion {
     }
     pub(crate) fn suspend(self, wait: MemoryReadWait) -> DispatchOutcome {
         DispatchOutcome::OutputSuspended(Box::new(SuspendedOutputCompletion::new(self, wait)))
+    }
+}
+
+/// A terminal readiness selection. The original wait remains owned until
+/// publication finishes, including its leases, registrations and deadline.
+/// None of that state is consulted again during publication.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FdWaitOutput {
+    ready: i64,
+    writes: FdWaitWrites,
+    retained_wait: Option<crate::dispatch::fd_wait::BlockingFdWait>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FdWaitWrites {
+    Select {
+        sets: VecDeque<(GuestVa, Vec<u8>)>,
+        offset: usize,
+    },
+    /// Input record addresses, with only the result field retained for output.
+    Poll(VecDeque<(GuestVa, [u8; 2])>),
+}
+
+impl FdWaitWrites {
+    fn next_unit(&self) -> Result<Option<(GuestVa, &[u8])>, LinuxErrno> {
+        use crate::dispatch::copyout::COPYOUT_MAX_BYTES;
+        match self {
+            Self::Select { sets, offset } => {
+                let Some((base, bytes)) = sets.front() else {
+                    return Ok(None);
+                };
+                let address = base.raw().checked_add(*offset as u64).ok_or(LINUX_EFAULT)?;
+                let len = (bytes.len() - offset)
+                    .min(COPYOUT_MAX_BYTES - address as usize % COPYOUT_MAX_BYTES);
+                Ok(Some((
+                    GuestVa::new(address),
+                    &bytes[*offset..*offset + len],
+                )))
+            }
+            Self::Poll(entries) => {
+                let Some((base, bytes)) = entries.front() else {
+                    return Ok(None);
+                };
+                let address = base
+                    .raw()
+                    .checked_add(core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64)
+                    .ok_or(LINUX_EFAULT)?;
+                // A field is one complete unit, even when it crosses a page.
+                Ok(Some((GuestVa::new(address), bytes)))
+            }
+        }
+    }
+
+    fn advance(&mut self, len: usize) {
+        match self {
+            Self::Select { sets, offset } => {
+                *offset += len;
+                if sets
+                    .front()
+                    .is_some_and(|(_, bytes)| *offset == bytes.len())
+                {
+                    sets.pop_front();
+                    *offset = 0;
+                }
+            }
+            Self::Poll(entries) => {
+                entries.pop_front();
+            }
+        }
+    }
+}
+
+impl FdWaitOutput {
+    pub(crate) fn select(
+        ready: i64,
+        sets: Vec<(GuestVa, Vec<u8>)>,
+        retained_wait: Option<crate::dispatch::fd_wait::BlockingFdWait>,
+    ) -> Self {
+        Self {
+            ready,
+            writes: FdWaitWrites::Select {
+                sets: sets
+                    .into_iter()
+                    .filter(|(_, bytes)| !bytes.is_empty())
+                    .collect(),
+                offset: 0,
+            },
+            retained_wait,
+        }
+    }
+
+    pub(crate) fn poll(
+        ready: i64,
+        entries: Vec<(GuestVa, i16)>,
+        retained_wait: crate::dispatch::fd_wait::BlockingFdWait,
+    ) -> Self {
+        Self {
+            ready,
+            writes: FdWaitWrites::Poll(
+                entries
+                    .into_iter()
+                    .map(|(address, revents)| (address, revents.to_ne_bytes()))
+                    .collect(),
+            ),
+            retained_wait: Some(retained_wait),
+        }
+    }
+
+    /// Both memory venues use this publisher. Legacy memory cannot suspend;
+    /// owner memory must have exact authority captured before its inputs.
+    pub(crate) fn publish(
+        mut self,
+        binding: Option<ExactCompletionBinding>,
+        context: &KernelContext,
+        memory: &mut impl CurrentMmMemory,
+    ) -> Result<DispatchOutcome, CompletionFoldError> {
+        use crate::dispatch::copyout::{UserSlot, prepare};
+        if let Some(binding) = &binding {
+            binding.authenticate(context, binding.memory_identity())?;
+        } else if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+            return Err(CompletionFoldError::ExecutionAuthority);
+        }
+        loop {
+            let (address, bytes) = match self.writes.next_unit() {
+                Ok(Some(unit)) => unit,
+                Ok(None) => return Ok(DispatchOutcome::Returned { value: self.ready }),
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            let len = bytes.len();
+            let output = match prepare(context, memory, [Some(UserSlot::new(address.raw(), len))]) {
+                Ok(output) => output,
+                Err(refusal) => {
+                    return Ok(refusal.retain(RetainedOutputCompletion {
+                        binding: binding.ok_or(CompletionFoldError::ExecutionAuthority)?,
+                        operation: OutputOperation::FdWait(self),
+                    }));
+                }
+            };
+            if let Err(fault) = output.commit([bytes]) {
+                return Ok(fault.outcome());
+            }
+            self.writes.advance(len);
+        }
     }
 }
 
@@ -372,6 +530,81 @@ mod tests {
     use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
     use carrick_guest_mem::GuestVa;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn fd_wait_initial_publication_authenticates_before_preparing() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let other = SyscallDispatcher::new();
+        let other = other.capture_one_task_context().unwrap();
+        let mm = (context.shared().mm().id(), 41);
+        let mut memory = OwnerRefusingMemory::new(0x7000, 8, 0xa5);
+        let output = || FdWaitOutput::select(1, vec![(GuestVa::new(0x7000), vec![1; 8])], None);
+        assert_eq!(
+            output().publish(None, &context, &mut memory),
+            Err(CompletionFoldError::ExecutionAuthority)
+        );
+        assert!(
+            output()
+                .publish(
+                    Some(ExactCompletionBinding::new(&context, mm).unwrap()),
+                    &other,
+                    &mut memory
+                )
+                .is_err()
+        );
+        assert_eq!(memory.prepares, 0);
+        assert_eq!(memory.reads.get(), 0);
+        assert!(memory.commits.is_empty());
+    }
+
+    #[test]
+    fn fd_wait_output_retains_original_deadline_and_wait_authority() {
+        use crate::dispatch::fd_wait::{BlockingFdWait, BlockingFdWaitKind};
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let deadline = std::time::Instant::now();
+        let wait = BlockingFdWait::new(
+            BlockingFdWaitKind::Poll {
+                entries: Vec::new(),
+            },
+            Some(deadline),
+            crate::dispatch::WaitFds::empty(),
+        )
+        .unwrap();
+        let authority = wait.authority().clone();
+        let registrations = wait.registrations().clone();
+        let mm = (context.shared().mm().id(), 41);
+        let mut memory = OwnerRefusingMemory::new(0x7000, 8, 0xa5);
+        memory.refuse_next();
+        let outcome = FdWaitOutput::poll(0, vec![(GuestVa::new(0x7000), 0)], wait)
+            .publish(
+                Some(ExactCompletionBinding::new(&context, mm).unwrap()),
+                &context,
+                &mut memory,
+            )
+            .unwrap();
+        let DispatchOutcome::OutputSuspended(pending) = outcome else {
+            panic!("must suspend")
+        };
+        let (operation, dependency) = pending.into_parts();
+        let OutputOperation::FdWait(output) = &operation.operation else {
+            panic!("fd output")
+        };
+        let wait = output.retained_wait.as_ref().unwrap();
+        assert_eq!(wait.caller_deadline(), Some(deadline));
+        assert_eq!(wait.authority(), &authority);
+        assert!(Arc::ptr_eq(wait.registrations(), &registrations));
+        drop(dependency);
+        assert_eq!(
+            operation
+                .resume(&context, &mut memory, mm, &dispatcher.fs_view())
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(memory.prepares, 2);
+        assert_eq!(memory.commits, [(0x7006, vec![0; 2])]);
+    }
 
     #[test]
     fn retained_output_authenticates_task_even_when_thread_key_matches() {

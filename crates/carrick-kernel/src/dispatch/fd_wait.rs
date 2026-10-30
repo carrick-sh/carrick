@@ -15,11 +15,10 @@ use carrick_vfs::errno::HostSyscallResult;
 
 use super::{DispatchOutcome, SyscallDispatcher, WaitFdAuthority, WaitFds};
 use crate::dispatch::format_time::{TimerFdPollSource, timerfd_poll_source_from_lease};
+use crate::kernel::continuation::output::{ExactCompletionBinding, FdWaitOutput};
 use crate::kernel::objects::FileDescriptionFdLease;
-use crate::linux_abi::{LINUX_EFAULT, LinuxErrno};
-
-const LINUX_POLLFD_REVENTS_OFFSET: u64 =
-    core::mem::offset_of!(carrick_abi::LinuxPollFd, revents) as u64;
+use crate::linux_abi::LinuxErrno;
+use carrick_guest_mem::GuestVa;
 
 #[derive(Clone, Debug)]
 pub struct RetainedPollFd {
@@ -194,6 +193,7 @@ impl BlockingFdWait {
         context: &crate::kernel::KernelContext,
         memory: &mut impl CurrentMmMemory,
         dispatcher: &SyscallDispatcher,
+        current_mm: (crate::kernel::MmId, u64),
     ) -> BlockingFdWaitStep {
         match self.kind.as_ref() {
             BlockingFdWaitKind::PipeRead(pending) => {
@@ -223,7 +223,7 @@ impl BlockingFdWait {
                     if revents != 0 {
                         ready += 1;
                     }
-                    output.push((entry.address, revents));
+                    output.push((GuestVa::new(entry.address), revents));
                 }
                 if ready == 0
                     && self
@@ -232,22 +232,17 @@ impl BlockingFdWait {
                 {
                     return BlockingFdWaitStep::Wait(self);
                 }
-                for (address, revents) in output {
-                    // `pollfd.fd` and `.events` are inputs. Linux writes only
-                    // `.revents` on completion, so a parked call must not
-                    // restore stale input fields over guest memory.
-                    let Some(revents_address) = address.checked_add(LINUX_POLLFD_REVENTS_OFFSET)
-                    else {
-                        return BlockingFdWaitStep::Done(DispatchOutcome::errno(LINUX_EFAULT));
-                    };
-                    if memory
-                        .write_bytes(revents_address, &revents.to_ne_bytes())
-                        .is_err()
-                    {
-                        return BlockingFdWaitStep::Done(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
+                let Ok(binding) = ExactCompletionBinding::new(context, current_mm) else {
+                    return BlockingFdWaitStep::InvalidExecution;
+                };
+                match FdWaitOutput::poll(ready, output, self).publish(
+                    Some(binding),
+                    context,
+                    memory,
+                ) {
+                    Ok(outcome) => BlockingFdWaitStep::Done(outcome),
+                    Err(_) => BlockingFdWaitStep::InvalidExecution,
                 }
-                BlockingFdWaitStep::Done(DispatchOutcome::Returned { value: ready })
             }
             BlockingFdWaitKind::Select {
                 entries,
@@ -298,14 +293,23 @@ impl BlockingFdWait {
                 {
                     return BlockingFdWaitStep::Wait(self);
                 }
-                for (set, output) in [(read, read_out), (write, write_out), (except, except_out)] {
-                    if let (Some(set), Some(output)) = (set, output)
-                        && memory.write_bytes(set.address, &output).is_err()
-                    {
-                        return BlockingFdWaitStep::Done(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
+                let sets = [(read, read_out), (write, write_out), (except, except_out)]
+                    .into_iter()
+                    .filter_map(|(set, output)| {
+                        Some((GuestVa::new(set.as_ref()?.address), output?))
+                    })
+                    .collect();
+                let Ok(binding) = ExactCompletionBinding::new(context, current_mm) else {
+                    return BlockingFdWaitStep::InvalidExecution;
+                };
+                match FdWaitOutput::select(ready, sets, Some(self)).publish(
+                    Some(binding),
+                    context,
+                    memory,
+                ) {
+                    Ok(outcome) => BlockingFdWaitStep::Done(outcome),
+                    Err(_) => BlockingFdWaitStep::InvalidExecution,
                 }
-                BlockingFdWaitStep::Done(DispatchOutcome::Returned { value: ready })
             }
         }
     }
