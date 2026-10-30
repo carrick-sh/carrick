@@ -1996,6 +1996,13 @@ impl MemView<'_> {
         let Some(HostVenue::Completed(completed)) = &delegated.venue else {
             return None;
         };
+        let exact_mm = self.mm_authority();
+        if !cx
+            .mm_mutation
+            .authorizes(&exact_mm.mutation_coordinator, exact_mm.mm_id)
+        {
+            return Some(Err(root_refusal(Refusal::Stale)));
+        }
         let completed = Arc::clone(completed);
         let root = delegated.root.clone();
         let mut completed = completed.lock();
