@@ -1306,7 +1306,7 @@ where
     {
         return Ok(Action::Forward);
     }
-    super::aarch64_process::deliver_declined_fault_signal_with(
+    declined_fault_admission_result(super::aarch64_process::deliver_declined_fault_signal_with(
         source,
         task,
         native,
@@ -1316,7 +1316,63 @@ where
         service,
         frame.far,
         |process| deliver(process, frame),
-    )
+    ))
+}
+
+/// Admission refusals precede signal publication; the loaded host executor
+/// retains the fault on Forward. Only a broken binding is a carrier invariant.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn declined_fault_admission_result(
+    result: Result<Action, super::native_process_runtime::NativeProcessError>,
+) -> Result<Action, super::native_process_runtime::NativeProcessError> {
+    use super::native_process_runtime::NativeProcessError;
+    match result {
+        Ok(action) => Ok(action),
+        Err(
+            error @ (NativeProcessError::Invalid
+            | NativeProcessError::Stale
+            | NativeProcessError::Quarantined),
+        ) => Err(error),
+        Err(
+            NativeProcessError::Busy
+            | NativeProcessError::Exhausted
+            | NativeProcessError::Fault
+            | NativeProcessError::ForkRefused(_)
+            | NativeProcessError::Unsupported
+            | NativeProcessError::GroupExitCustody
+            | NativeProcessError::NoChild,
+        ) => Ok(Action::Forward),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn declined_fault_admission_busy_once_then_success() {
+    use super::native_process_runtime::NativeProcessError;
+    for error in [
+        NativeProcessError::Busy,
+        NativeProcessError::Exhausted,
+        NativeProcessError::Fault,
+        NativeProcessError::Unsupported,
+        NativeProcessError::GroupExitCustody,
+        NativeProcessError::NoChild,
+    ] {
+        assert_eq!(
+            declined_fault_admission_result(Err(error)),
+            Ok(Action::Forward)
+        );
+    }
+    for error in [
+        NativeProcessError::Invalid,
+        NativeProcessError::Stale,
+        NativeProcessError::Quarantined,
+    ] {
+        assert_eq!(declined_fault_admission_result(Err(error)), Err(error));
+    }
+    assert_eq!(
+        declined_fault_admission_result(Ok(Action::Served)),
+        Ok(Action::Served)
+    );
 }
 
 /// Deliver a synchronous `SIGSEGV` (`SEGV_ACCERR`) in-ring when an admitted
@@ -1399,6 +1455,9 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         if fatal_owner_cancel {
             invalid_completion(NativeInvariant::EntryBinding)
         }
+        return Action::Served;
+    }
+    if !fatal_owner_cancel && !carrick_el1_abi::Lifecycle::gate(page).serves_ring() {
         return Action::Served;
     }
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };

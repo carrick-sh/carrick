@@ -201,7 +201,7 @@ pub(crate) fn native_entry_owned(
     control: &ThreadControlSlot,
     entry: OwnerEntry,
 ) -> bool {
-    let venue = carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
+    let venue = carrick_el1::substrate::sched::NativeEntryVenue::select_service_with_lifecycle(
         source.zone,
         source.slot,
         current,
