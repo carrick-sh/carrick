@@ -1045,7 +1045,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
         let mm = owner.mm();
         let key = MmKey::of(mm).ok_or(ForkStockServiceError::StaleExecution)?;
-        if count > MAX_TABLE_GRANTS
+        if count == 0
+            || count > MAX_TABLE_GRANTS
             || self.child_owner(mm) != Some(owner)
             || self.child_root(mm) != Some(root)
             || self.quarantine.contains_key(&key)

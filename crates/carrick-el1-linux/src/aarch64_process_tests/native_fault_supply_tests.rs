@@ -234,11 +234,17 @@ enum SupplyEnd {
     Resume,
     Cancel,
     FailTables,
+    EarlyApplyError,
 }
 
 #[test]
 fn native_backing_cancel_after_delivery_restores_private_supply() {
     composed_native_supply(false, None, false, SupplyEnd::Cancel);
+}
+
+#[test]
+fn native_backing_early_apply_error_settles_the_reply_before_returning() {
+    composed_native_supply(false, None, false, SupplyEnd::EarlyApplyError);
 }
 
 #[test]
@@ -1322,6 +1328,23 @@ fn composed_native_supply(
         // MMs; no retirement/ACK is manufactured to make this failure pass.
         return;
     }
+    if end == SupplyEnd::EarlyApplyError {
+        // The native target is valid, but the host-portable adapter has no
+        // live words. This error used to bypass the settlement crossing.
+        service.words = None;
+        assert_eq!(
+            NativeProcessService::apply_fault_reply(
+                &mut service,
+                reply_slot,
+                crate::native_process_runtime::FaultReplyDisposition::Apply,
+            ),
+            Err(carrick_core::mm::transaction::MmError::Core)
+        );
+        assert!(
+            reply_slot.window().is_none(),
+            "early apply error stranded the supplied lane"
+        );
+    }
     let delivered_request = ticket.request();
     {
         let queue = fixture
@@ -1371,7 +1394,7 @@ fn composed_native_supply(
     );
     assert_eq!(
         leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK,
-        if end == SupplyEnd::Cancel {
+        if matches!(end, SupplyEnd::Cancel | SupplyEnd::EarlyApplyError) {
             0
         } else if competing_publication {
             0xb0020000
