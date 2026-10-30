@@ -37,18 +37,51 @@ impl NativeEntryVenue {
         page: &carrick_el1_abi::ThreadLifecyclePage,
         control: &carrick_el1_abi::ThreadControlSlot,
     ) -> Self {
-        Self::select_for_slot(zone, slot, task, Some((page, control)))
+        Self::select_for_slot(
+            zone,
+            slot,
+            task,
+            zone.slot(slot).current(),
+            Some((page, control)),
+        )
     }
 
     /// Select the execution venue from the published task metadata.
     pub fn select(zone: &ZoneTables, slot: SlotId, task: &CurrentTask) -> Self {
-        Self::select_for_slot(zone, slot, task, task.lifecycle_refs())
+        Self::select_for_slot(
+            zone,
+            slot,
+            task,
+            zone.slot(slot).current(),
+            task.lifecycle_refs(),
+        )
+    }
+
+    /// Native service exit may resume a retained host home before switching it
+    /// into the scheduler. IRQ and fault entry must use only the current record.
+    pub fn select_service_with_lifecycle(
+        zone: &ZoneTables,
+        slot: SlotId,
+        task: &CurrentTask,
+        page: &carrick_el1_abi::ThreadLifecyclePage,
+        control: &carrick_el1_abi::ThreadControlSlot,
+    ) -> Self {
+        Self::select_for_slot(
+            zone,
+            slot,
+            task,
+            zone.slot(slot)
+                .current()
+                .or_else(|| zone.slot(slot).host_record()),
+            Some((page, control)),
+        )
     }
 
     fn select_for_slot(
         zone: &ZoneTables,
         slot: SlotId,
         task: &CurrentTask,
+        record: Option<RecordId>,
         lifecycle: Option<(
             &carrick_el1_abi::ThreadLifecyclePage,
             &carrick_el1_abi::ThreadControlSlot,
@@ -56,12 +89,7 @@ impl NativeEntryVenue {
     ) -> Self {
         // Execution custody survives exec/group-exit admission closing. These
         // records have no loaded host task to receive a forwarded exception.
-        if let Some(record) = zone
-            .slot(slot)
-            .current()
-            .or_else(|| zone.slot(slot).host_record())
-            .filter(|record| zone.record(*record).is_native_owned())
-        {
+        if let Some(record) = record.filter(|record| zone.record(*record).is_native_owned()) {
             return Self::NativeProcess(record);
         }
         let Some((page, control)) = lifecycle else {

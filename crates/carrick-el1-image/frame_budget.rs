@@ -326,6 +326,15 @@ impl Frames {
                 self.maximum("::ipc::release_native_description::")
                     + fd_release.max(fd_notify).max(fd_deliver),
             );
+        // Fault delivery retains the resolver and declined-fault admission
+        // wrappers, rather than the syscall/user-return prefix in `native`.
+        // Optional frames may be inlined and are then charged by their caller.
+        let declined = entry
+            + self.required("::cow_resolver::dispatch_fault::")?
+            + self.required("::dispatch::arm_deliver_declined_fault_signal::")?
+            + self.maximum("::dispatch::arm_deliver_declined_fault_signal_with::")
+            + self.maximum("::aarch64_process::deliver_declined_fault_signal_with::")
+            + self.required("::aarch64_process::with_process_entry::")?;
         let chains = [
             (
                 "native admission",
@@ -404,6 +413,31 @@ impl Frames {
                     + self.required("::wait_query::")?
                     + self.maximum("::copy_with::")
                     + write,
+            ),
+            (
+                "declined fault signal",
+                declined
+                    + (self.required("::admit_entry_runtime::")?
+                        + self.sum(&[
+                            "::admit_fresh_root::",
+                            "::process_owner::GuestTask$LT$C$C$U$C$N$GT$::new::",
+                            "::process_owner::GuestThreads::new::",
+                        ])
+                        + allocation)
+                        .max(delivery
+                            + self.required("::setup_arm_signal_frame::")?
+                            + self.maximum("::signal_delivery::deliver_signal_on_syscall_return::_$u7b$$u7b$closure")
+                            + write)
+                        .max(delivery
+                            + self.sum(&[
+                                "::exit_with_signal::",
+                                "::exit_with_status::",
+                                "::native_process_entry::publish_exit::",
+                                "::finish_exit::",
+                                "::publish_exit_receipt::",
+                                "::insert_recursing::",
+                            ])
+                            + allocation),
             ),
             (
                 "signal delivery copy",
@@ -580,6 +614,8 @@ mod tests {
             "carrick_el1_syscall",
             "x::dispatch::dispatch_entry::h0",
             "x::dispatch::dispatch_syscall::h0",
+            "x::cow_resolver::dispatch_fault::h0",
+            "x::dispatch::arm_deliver_declined_fault_signal::h0",
             "x::dispatch::arm_signal_user_return::h0",
             "x::aarch64_process::with_process_entry::h0",
             "x::copy_signal_bytes::h0",
@@ -638,6 +674,22 @@ mod tests {
                 .unwrap_err()
                 .contains("individual frame")
         );
+    }
+
+    #[test]
+    fn declined_fault_prefix_is_charged() {
+        let mut frames = small_frames();
+        for method in [
+            "cow_resolver::dispatch_fault",
+            "dispatch::arm_deliver_declined_fault_signal",
+            "aarch64_process::deliver_declined_fault_signal_with",
+            "aarch64_process::with_process_entry",
+        ] {
+            frames.0.insert(format!("x::{method}::h0"), 3000);
+        }
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("declined fault signal"), "{error}");
+        assert!(!error.contains("individual frame"), "{error}");
     }
 
     fn reject_fd_chain(chain: &str, methods: &[&str]) {
