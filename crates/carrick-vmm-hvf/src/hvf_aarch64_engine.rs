@@ -966,6 +966,27 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         result
     }
 
+    fn cancel_native_fault_wait(&mut self) -> Result<(), TrapError> {
+        let live = self.live_mut()?;
+        if live.mailbox.transport() != HvfSyscallTransport::Mailbox {
+            return Err(TrapError::UnsupportedPlatform);
+        }
+        let mailbox = live.mailbox.slot().guest_address();
+        // A fault owns an Idle mailbox, independently of whether the stopped
+        // CPU is directly at EL0 or at the HVC fault exit in EL1.
+        live.mailbox
+            .publish_native_owner_cancel(carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "native fault cancellation publication failed: {error}"
+                ))
+            })?;
+        carrick_aarch64::vmm::enter_native_fault_cancel(
+            self,
+            carrick_guest_mem::GuestVa::new(mailbox),
+        )
+    }
+
     fn cancel_native_owner_wait(
         &mut self,
         origin: carrick_hal::threaded::NativeOwnerWaitOrigin,

@@ -4010,6 +4010,18 @@ pub(crate) mod tests {
     }
 
     impl ThreadedEngine for CrashCaptureTestEngine {
+        fn cancel_native_fault_wait(&mut self) -> Result<(), TrapError> {
+            if let Some(carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu)) = &self.snapshot_cpu {
+                assert!(cpu.syscall_continuation.is_none());
+                assert_eq!(cpu.pstate & 0xf, 0);
+            }
+            self.native_owner
+                .as_ref()
+                .expect("real native signal owner")
+                .cancel_root();
+            self.native_owner_cancellations += 1;
+            Ok(())
+        }
         fn cancel_native_owner_wait(
             &mut self,
             origin: carrick_hal::threaded::NativeOwnerWaitOrigin,

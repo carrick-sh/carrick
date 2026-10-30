@@ -1059,13 +1059,41 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
     ) -> Result<carrick_kernel::kernel::continuation::ContinuationResult, ProductionHvpatchPollError>
     {
-        let context = self
-            .kernel
-            .dispatcher
-            .capture_kernel_context(self.state.linux_tid)
-            .map_err(|error| {
-                RuntimeError::Configuration(format!("owner wait resume lost context: {error}"))
-            })?;
+        self.consume_owner_zone_for(control, false)
+    }
+
+    pub(super) fn consume_fault_owner_zone(
+        &mut self,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+    ) -> Result<carrick_kernel::kernel::continuation::ContinuationResult, ProductionHvpatchPollError>
+    {
+        self.consume_owner_zone_for(control, true)
+    }
+
+    fn consume_owner_zone_for(
+        &mut self,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        fault: bool,
+    ) -> Result<carrick_kernel::kernel::continuation::ContinuationResult, ProductionHvpatchPollError>
+    {
+        let context = if fault {
+            // Keep the original exact owner. Looking it up by a reused TID
+            // could authenticate a successor before retirement is classified.
+            self.state
+                .service_kernel_context
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::Configuration("fault wait lost original owner".into())
+                })?
+                .retain_exact()
+        } else {
+            self.kernel
+                .dispatcher
+                .capture_kernel_context(self.state.linux_tid)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!("owner wait resume lost context: {error}"))
+                })?
+        };
         let lease = control.execution_lease_mut().map_err(RuntimeError::Trap)?;
         let continuation = lease.blocked_continuation().ok_or_else(|| {
             RuntimeError::Configuration("owner wait resume lost continuation".to_owned())
@@ -1079,10 +1107,14 @@ where
         let event = continuation
             .ready_event()
             .map_err(|error| RuntimeError::Configuration(format!("owner wait event: {error:?}")))?;
-        let fresh = context
-            .task_binding()
-            .capture(self.state.linux_tid)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let fresh = if fault {
+            context.retain_exact()
+        } else {
+            context
+                .task_binding()
+                .capture(self.state.linux_tid)
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?
+        };
         let result =
             carrick_kernel::kernel::continuation::resume_continuation(lease, event, &fresh)
                 .map_err(|error| {
@@ -1091,9 +1123,21 @@ where
         let zone = carrick_kernel::el1_zone::zone().ok_or_else(|| {
             RuntimeError::Configuration("owner wait resume without zone".to_owned())
         })?;
-        let rec = zone.live(record).ok_or_else(|| {
-            RuntimeError::Configuration(format!("owner wait record {record:?} is gone"))
-        })?;
+        let Some(rec) = zone.live(record) else {
+            if fault
+                && matches!(
+                    result.completion,
+                    carrick_kernel::kernel::continuation::ContinuationCompletion::OwnerCancelled(_)
+                )
+            {
+                self.state.service_kernel_context = Some(context.retain_exact());
+                return Ok(result);
+            }
+            return Err(RuntimeError::Configuration(format!(
+                "owner wait record {record:?} is gone"
+            ))
+            .into());
+        };
         // SAFETY: the host owns this handed-back record and has consumed its
         // exact completion event. The token is the metadata-form receipt
         // installed by owner_memory_park, not an IPC operation.

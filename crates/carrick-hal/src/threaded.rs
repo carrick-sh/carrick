@@ -3290,6 +3290,13 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
+    /// Transfer a stopped user fault to its native fatal-signal owner.
+    /// Preserve the faulting user frame and all general registers. The engine
+    /// may be stopped directly in user mode or at its kernel fault boundary;
+    /// no syscall completion token or return value exists for this operation.
+    fn cancel_native_fault_wait(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
     /// Commit a host-loaded in-kernel home only after exact MM occupancy has
     /// been published. Engines without a guest process owner have no home.
     fn commit_prepared_home(&mut self) -> Result<(), TrapError> {

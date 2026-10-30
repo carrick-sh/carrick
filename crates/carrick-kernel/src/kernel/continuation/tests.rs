@@ -8788,3 +8788,33 @@ fn interrupted_sleep_completion_rejects_stale_resume_before_preparation() {
         assert_eq!(memory.inner.read_bytes(0x7000, 16).unwrap(), vec![0xa5; 16]);
     }
 }
+
+#[test]
+fn fault_owner_resume_after_exec_cancels_once_without_syscall_completion() {
+    let (kernel, context) = bootstrap(15_812);
+    publish(&context, 0x1812);
+    let executor =
+        crate::kernel::objects::ExecutorId::for_transitional_thread(context.thread().registry_id())
+            .unwrap();
+    let lease = context.thread().claim_runnable(executor).unwrap();
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    wait.mark_consumed();
+    let mut continuation =
+        BlockedContinuation::from_fault_owner_zone_park(&context, &lease, wait).unwrap();
+    let cleanups = Arc::new(AtomicUsize::new(0));
+    continuation.install_cleanup_probe(cleanups.clone());
+    drop(lease);
+    let prepared = kernel.prepare_exec(&context, None).unwrap();
+    let successor = kernel.commit_exec(prepared, None).unwrap();
+    assert_ne!(successor.shared().mm().id(), context.shared().mm().id());
+    let result = continuation
+        .resume(ContinuationEvent::Ready, &context)
+        .expect("an old fault is cancelled after exec, never a configuration failure");
+    assert_eq!(
+        result.completion,
+        ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::GroupExit,)
+    );
+    assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+    assert_eq!(result.restart(), RestartDecision::NoRestart);
+    assert!(result.reserved_signal().is_none());
+}
