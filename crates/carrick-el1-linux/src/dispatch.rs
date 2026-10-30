@@ -1250,8 +1250,10 @@ fn arm_native_service_exit(
             process.settle_service_exit(result, exit)
         },
     )
-    .and_then(core::convert::identity)
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    // Keep entry admission separate from dispatch/settlement: these source
+    // locations and the exact error survive the existing fatal transport.
+    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)))
+    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
     Some(match result {
         NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
         NativeResume::NoPending => arm_signal_user_return(frame),
@@ -1895,6 +1897,7 @@ impl PhysicalCustodyInvariant {
 /// fail-stop transport; a completed effect must never be replayed by forwarding.
 pub enum NativeInvariant {
     EntryBinding,
+    NativeService(carrick_el1_abi::EntryBindingFatalReason),
     PhysicalCustody(PhysicalCustodyInvariant),
     MissingNativeFrame,
     RevisionCredit,
@@ -1906,6 +1909,7 @@ impl core::fmt::Debug for NativeInvariant {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::EntryBinding => f.write_str("EntryBinding"),
+            Self::NativeService(error) => f.debug_tuple("NativeService").field(error).finish(),
             Self::PhysicalCustody(reason) => f
                 .debug_tuple("PhysicalCustody")
                 .field(&reason.as_str())
@@ -1927,6 +1931,7 @@ impl NativeInvariant {
         use carrick_el1_abi::EntryBindingFatalReason as Fatal;
         match self {
             NativeInvariant::EntryBinding => Fatal::EntryBinding,
+            NativeInvariant::NativeService(reason) => *reason,
             NativeInvariant::PhysicalCustody(reason) => match reason {
                 PhysicalCustodyInvariant::RootExitRefused => Fatal::RootExitRefused,
                 PhysicalCustodyInvariant::ForkCustodyRefused => Fatal::ForkCustodyRefused,
@@ -1958,6 +1963,37 @@ impl NativeInvariant {
                 }
             }
         }
+    }
+}
+
+/// Encode before constructing the fatal envelope: an OwnerWait contains a
+/// dependency, which must not enlarge every EL1 invariant's by-value frame.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_service_invariant(
+    error: super::native_process_runtime::NativeProcessError,
+) -> NativeInvariant {
+    NativeInvariant::NativeService(native_service_fatal_reason(error))
+}
+
+/// Preserve the refused operation's error without changing refusal policy.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_service_fatal_reason(
+    error: super::native_process_runtime::NativeProcessError,
+) -> carrick_el1_abi::EntryBindingFatalReason {
+    use super::native_process_runtime::NativeProcessError as Error;
+    use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+    match error {
+        Error::Invalid => Fatal::NativeServiceInvalid,
+        Error::Stale => Fatal::NativeServiceStale,
+        Error::Exhausted => Fatal::NativeServiceExhausted,
+        Error::Fault => Fatal::NativeServiceFault,
+        Error::Unsupported => Fatal::NativeServiceUnsupported,
+        Error::GroupExitCustody => Fatal::NativeServiceGroupExitCustody,
+        Error::Busy => Fatal::NativeServiceBusy,
+        Error::Quarantined => Fatal::NativeServiceQuarantined,
+        Error::NoChild => Fatal::NativeServiceNoChild,
+        Error::OwnerWait(_) => Fatal::NativeServiceOwnerWait,
+        Error::ForkRefused(refusal) => native_service_fatal_reason(refusal.error()),
     }
 }
 
@@ -3844,6 +3880,35 @@ mod tests {
         assert_eq!(frame.x[0] as i64, -22);
         assert_eq!(counters.served[73].load(Ordering::Relaxed), 1);
         assert_eq!(counters.refused[73].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn native_service_refusals_keep_the_error_in_the_fatal_transport() {
+        use super::super::native_process_runtime::NativeProcessError as Error;
+        use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+        for (error, expected) in [
+            (Error::Invalid, Fatal::NativeServiceInvalid),
+            (Error::Stale, Fatal::NativeServiceStale),
+            (Error::Exhausted, Fatal::NativeServiceExhausted),
+            (Error::Fault, Fatal::NativeServiceFault),
+            (Error::Unsupported, Fatal::NativeServiceUnsupported),
+            (
+                Error::GroupExitCustody,
+                Fatal::NativeServiceGroupExitCustody,
+            ),
+            (Error::Busy, Fatal::NativeServiceBusy),
+            (Error::Quarantined, Fatal::NativeServiceQuarantined),
+            (Error::NoChild, Fatal::NativeServiceNoChild),
+        ] {
+            let invariant = native_service_invariant(error);
+            let reason = invariant.fatal_reason();
+            assert_eq!(reason, expected);
+            assert_eq!(Fatal::from_raw(reason as u64), Some(expected));
+            assert_eq!(
+                std::format!("{invariant:?}"),
+                std::format!("NativeService({expected:?})")
+            );
+        }
     }
 
     #[test]

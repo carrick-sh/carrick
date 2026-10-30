@@ -1,3 +1,6 @@
+# #1044 diagnostic follow-up: preserve native-service admission/dispatch
+# error codes and the saved syscall ordinal in the existing fatal record.
+# No service refusal or retry policy changes; signed attribution is pending.
 # #1044: owned-yield replies are typed separately from memory preparation.
 # The retained IPC/CarrierWork seam bindings below cover that API change;
 # existing fork, lifecycle, file and inotify acceptance remains unchanged.
@@ -52,6 +55,9 @@ ISA adapter. The existing return-work and x86 context witnesses still apply.
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::dispatch::tests::native_service_refusals_keep_the_error_in_the_fatal_transport",
+  "carrick-el1-abi::entry_binding_fatal::tests::{fatal_detail_round_trip_and_formatter,entry_binding_fatal_capture_keeps_two_slot_identities_and_saved_registers}",
+  "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::arm_native_fork_child_stdout_service_keeps_exact_entry (real fork-child host-file bridge, no injected refusal and no claim to reproduce the signed abort)",
   "carrick-el1-linux::native_process_runtime::host_test_support::ipc_busy_yield_retains_operation_and_pin_through_carrier_work (owned-yield reply typing and exact token/pin custody only)",
   "carrick-core::entry_completion::{requeued_terminal_attempt_restores_membership_and_admission_before_return,losing_requeue_cas_keeps_membership_and_admission_for_commit,refused_requeue_lock_keeps_membership_and_admission_for_commit,host_home_terminal_release_commits_the_same_exit_ownership}",
   "carrick-el1-linux::dispatch::tests::physical_custody_reasons_preserve_fatal_codes_and_debug_text (diagnostic reason selection and host Debug compatibility)",
