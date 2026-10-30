@@ -6476,27 +6476,13 @@ where
             "prepared HVPatch logical job rejected Kernel/CPU/MM identity".to_owned(),
         ));
     }
-    if context
-        .thread()
-        .control_lease()
-        .lifecycle()
-        .serves_threads()
-    {
-        let factory =
-            super::thread_adoption::ProcessThreadAdoptionFactory::capture(&kernel, &state)
-                .ok_or_else(|| {
-                    TrapError::Hypervisor("thread adoption factory has no owner process".into())
-                })?
-                .with_cpu_template(&context, cpu.clone())?
-                .with_backend_template(&context, task_backend.thread_birth_template(&cpu.cpu)?);
-        context
-            .task()
-            .install_thread_adoption_factory(Arc::new(factory))
-            .map_err(|_| {
-                TrapError::Hypervisor("thread adoption factory rejected foreign task owner".into())
-            })?;
-        context.kernel().prepare_executable_thread_births(&context);
-    }
+    super::thread_adoption::bind_executable_thread_births(
+        &kernel,
+        &state,
+        &context,
+        cpu.clone(),
+        task_backend.thread_birth_template(&cpu.cpu)?,
+    )?;
     let result = HvpatchLoopResult::pending();
     let completion = continuation::LogicalJobCompletion::pending();
     let terminal_settlement =

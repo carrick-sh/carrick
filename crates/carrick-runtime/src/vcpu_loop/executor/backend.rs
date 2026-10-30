@@ -208,18 +208,24 @@ impl HvpatchTaskEngineBindingState {
     pub(crate) fn thread_birth_template(
         &mut self,
         cpu: &carrick_hal::threaded::GuestCpuState,
-    ) -> Result<Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchThreadBirthTemplate>, TrapError>
-    {
+    ) -> Result<Option<crate::vcpu_loop::thread_adoption::BackendBirthTemplate>, TrapError> {
         match &mut self.payload {
             HvpatchTaskEngineBindingPayload::Resident(state) => {
-                carrick_vmm_hvf::hvf_aarch64_engine::resident_thread_birth_template(state, cpu)
-                    .map(Some)
+                carrick_vmm_hvf::hvf_aarch64_engine::resident_thread_birth_template(state, cpu).map(
+                    |template| {
+                        Some(crate::vcpu_loop::thread_adoption::BackendBirthTemplate::Hvf(template))
+                    },
+                )
             }
             HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
-                state.thread_birth_template().map(Some)
+                state.thread_birth_template().map(|template| {
+                    Some(crate::vcpu_loop::thread_adoption::BackendBirthTemplate::Hvf(template))
+                })
             }
             #[cfg(test)]
-            HvpatchTaskEngineBindingPayload::Test => Ok(None),
+            HvpatchTaskEngineBindingPayload::Test => Ok(Some(
+                crate::vcpu_loop::thread_adoption::BackendBirthTemplate::Test,
+            )),
         }
     }
 
