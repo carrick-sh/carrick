@@ -1513,7 +1513,12 @@ impl<'a> MemView<'a> {
             // the sparse hole the page-cache view needs into live pages and
             // force the eager snapshot. The lowering block below scrubs on its
             // fallback path instead, before the `pread` lands.
-            let reuse_scrub_needed = (reused || fixed_anonymous) && !address_uses_alias;
+            // A shared file snapshot initializes the entire rounded range,
+            // including its zero tail. It owns that initialization; anonymous
+            // maintenance has no authority over an admitted owner's file map.
+            let reuse_scrub_needed = (reused || fixed_anonymous) && !address_uses_alias
+                && (map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                    || map_sharing == MmapSharing::Private);
             if reuse_scrub_needed && !lowering_candidate && !owner_file_backed {
                 // Scrub the reused region's PHYSICAL backing. MUST bypass the
                 // guest-visible permission: a region just reclaimed from munmap

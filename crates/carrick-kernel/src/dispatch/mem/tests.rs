@@ -67,6 +67,8 @@ fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
 }
 
 pub struct CountingMmapMemory {
+    shared_scrub_calls: Cell<usize>,
+    pub(crate) refuse_shared_scrub: bool,
     pub(crate) defer_anon: bool,
     pub(crate) discard_anon: bool,
     pub(crate) fail_protect_non_zero: Cell<bool>,
@@ -129,6 +131,8 @@ fn hvpatch_sparse_semantic_arena_stays_identity_while_low_fixed_hole_aliases() {
 impl CountingMmapMemory {
     pub(crate) fn new(base: u64, len: usize) -> Self {
         Self {
+            shared_scrub_calls: Cell::new(0),
+            refuse_shared_scrub: false,
             defer_anon: false,
             discard_anon: false,
             fail_protect_non_zero: Cell::new(false),
@@ -340,6 +344,24 @@ impl GuestMemory for CountingMmapMemory {
         // counted separately and must not be invoked after this succeeds.
         self.bytes[offset..offset + len].fill(0);
         Ok(true)
+    }
+
+    fn zero_anonymous_reuse(
+        &mut self,
+        address: u64,
+        len: usize,
+        sharing: carrick_guest_mem::MappingSharing,
+    ) -> Result<(), MemoryError> {
+        // Model the admitted ARM owner's refusal of unauthenticated shared
+        // backing maintenance, without weakening ordinary anonymous tests.
+        if sharing == carrick_guest_mem::MappingSharing::Shared {
+            self.shared_scrub_calls
+                .set(self.shared_scrub_calls.get() + 1);
+            if self.refuse_shared_scrub {
+                return Err(MemoryError::Unsupported);
+            }
+        }
+        self.zero_backing(address, len)
     }
 
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
@@ -4890,6 +4912,135 @@ fn reused_private_anonymous_mmap_zeroes_backing_without_zero_write() {
         "reused mapping installs the requested guest protection, then arms the \
          first-touch residency fault (the second call, PROT_NONE)"
     );
+}
+
+/// #1104: file initialization must not use anonymous maintenance authority.
+/// A real anonymous mmap/munmap creates the reused grant. The affinity syscall
+/// changes the guest's policy, but this VM-free test makes no CPU-migration claim.
+#[test]
+fn shared_file_reuse_after_affinity_change_needs_no_anonymous_scrub() {
+    const SYS_MMAP: u64 = 222;
+    const SYS_MUNMAP: u64 = 215;
+    const SYS_SCHED_SETAFFINITY: u64 = 122;
+    const FILE_FD: i32 = 40;
+
+    for pages in [1, 7, 32] {
+        let length = pages * LINUX_PAGE_SIZE;
+        let file_len = if pages == 7 {
+            0x6994
+        } else {
+            length as usize - 13
+        };
+        let payload = vec![0x39; file_len];
+        let mut dispatcher = SyscallDispatcher::new();
+        let open = OpenFile::from_open_description_with_status_flags(
+            Arc::new(parking_lot::RwLock::new(OpenDescription::File {
+                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                path: "/shared-reuse".into(),
+                metadata: RootFsMetadata {
+                    path: "/shared-reuse".into(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o444,
+                    size: payload.len(),
+                },
+                contents: FileContents::dense(payload.clone()),
+                offset: 0,
+                writable: false,
+            })),
+            crate::linux_abi::LINUX_O_RDONLY,
+            0,
+        );
+        open.description.retain_fd_ref();
+        dispatcher
+            .captured_file_table()
+            .write_open_files(None)
+            .insert(FILE_FD, open);
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, length as usize + 4096);
+        memory.refuse_shared_scrub = true;
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let mut call = |number, args, memory: &mut CountingMmapMemory| {
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs(args)),
+                    memory,
+                    &reporter,
+                )
+                .expect("bounded memory/affinity dispatch")
+        };
+        assert_eq!(
+            returned(call(
+                SYS_MMAP,
+                [
+                    0,
+                    length,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                    u64::MAX,
+                    0
+                ],
+                &mut memory
+            )),
+            LINUX_MMAP_BASE as i64
+        );
+        memory.bytes[..length as usize].fill(0x5a);
+        let mask = LINUX_MMAP_BASE + length;
+        memory.write_bytes(mask, &1u64.to_ne_bytes()).unwrap();
+        assert_eq!(
+            returned(call(
+                SYS_SCHED_SETAFFINITY,
+                [0, 8, mask, 0, 0, 0],
+                &mut memory
+            )),
+            0
+        );
+        assert_eq!(
+            returned(call(
+                SYS_MUNMAP,
+                [LINUX_MMAP_BASE, length, 0, 0, 0, 0],
+                &mut memory
+            )),
+            0
+        );
+        let writes = memory.write_calls.get();
+        let copied = memory.write_bytes_total.get();
+        let scrubs = memory.zero_backing_calls.get();
+        let mapped = call(
+            SYS_MMAP,
+            [
+                0,
+                file_len as u64,
+                LINUX_PROT_READ,
+                LINUX_MAP_SHARED,
+                FILE_FD as u64,
+                0,
+            ],
+            &mut memory,
+        );
+        assert_eq!(
+            mapped,
+            DispatchOutcome::Returned {
+                value: LINUX_MMAP_BASE as i64
+            },
+            "shared file initialization must bypass unsupported anonymous maintenance"
+        );
+        assert_eq!(&memory.bytes[..payload.len()], payload.as_slice());
+        assert!(
+            memory.bytes[payload.len()..length as usize]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(memory.shared_scrub_calls.get(), 0);
+        assert_eq!(memory.zero_backing_calls.get() - scrubs, 0);
+        assert_eq!(memory.write_calls.get() - writes, 1);
+        assert_eq!(memory.write_bytes_total.get() - copied, length as usize);
+        assert!(
+            dispatcher
+                .mem_view()
+                .range_is_read_only_shared_file(LINUX_MMAP_BASE, length)
+        );
+    }
 }
 
 #[test]

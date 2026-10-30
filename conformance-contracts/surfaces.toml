@@ -1043,7 +1043,7 @@ contracts = ["kernel.mm.user-va-ceiling"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs"
-contracts = ["kernel.mm.user-va-ceiling", "kernel.mm.private-file-fixed-replacement"]
+contracts = ["kernel.mm.user-va-ceiling", "kernel.mm.private-file-fixed-replacement", "kernel.mm.shared-file-reuse"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs"
