@@ -341,7 +341,9 @@ pub(super) enum HvpatchProductionPhase {
         resume: OwnedSyscallResume,
         origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
     },
-    ResumeFaultOwner,
+    ResumeFaultOwner {
+        wait: carrick_el1_abi::PortalOwnerWait,
+    },
     ResumeRetainedOwner {
         action: Box<RetainedMemoryAction>,
     },
@@ -527,7 +529,7 @@ impl HvpatchProductionPhase {
             Self::ResumeRetainedPhysical { .. } => 20,
             Self::RetainedMemoryRetry { .. } => 21,
             Self::ResumeFaultPhysical { .. } => 22,
-            Self::ResumeFaultOwner => 23,
+            Self::ResumeFaultOwner { .. } => 23,
         }
     }
 }
@@ -3390,9 +3392,8 @@ where
         use carrick_kernel::kernel::continuation::OwnerWaitCancellation;
         match super::owner_wait::OwnerWait::new((), ()).settle(
             || {
-                cancellation.or_else(|| {
-                    carrick_kernel::kernel::continuation::owner_wait_cancellation(context)
-                })
+                carrick_kernel::kernel::continuation::owner_wait_cancellation(context)
+                    .or(cancellation)
             },
             |()| true,
         ) {
@@ -3404,8 +3405,7 @@ where
                 self.drive_thread_exit(engine, control, 0)
             }
             super::owner_wait::Settlement::Cancelled(OwnerWaitCancellation::NativeFatal) => {
-                let origin = self.state.owner_wait_origin()?;
-                self.cancel_native_owner_wait(engine, origin)
+                self.cancel_native_fault_wait(engine)
             }
             super::owner_wait::Settlement::Cancelled(OwnerWaitCancellation::Carrier) => {
                 let result = assemble_run_result(
@@ -4317,6 +4317,20 @@ where
         })
     }
 
+    /// Cancel a fault at its EL0 boundary. The saved faulting CPU state owns
+    /// this handoff; there is no syscall completion token to inspect or retire.
+    fn cancel_native_fault_wait(
+        &mut self,
+        engine: &mut E,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        self.state.publish_external_ingress(&self.kernel)?;
+        engine
+            .cancel_native_owner_wait(carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0)
+            .map_err(RuntimeError::Trap)?;
+        self.phase = HvpatchProductionPhase::Resident;
+        Ok(executor::ExecutorExit::Syscall)
+    }
+
     /// A native owner selected fatal cancellation. Transfer the obligation,
     /// not a syscall result: another member may already be draining the group.
     pub(super) fn cancel_native_owner_wait(
@@ -4720,7 +4734,7 @@ where
                 HvpatchProductionPhase::ResumeOwnerPhysical(pending) => {
                     return self.resume_owner_physical(engine, control, pending, false);
                 }
-                HvpatchProductionPhase::ResumeFaultOwner => {
+                HvpatchProductionPhase::ResumeFaultOwner { wait } => {
                     let result = self.consume_owner_zone(control)?;
                     use carrick_kernel::kernel::continuation::{
                         ContinuationCompletion, OwnerWaitCancellation,
@@ -4736,6 +4750,9 @@ where
                         _ => None,
                     };
                     drop(result);
+                    let retired = self.fault_wait_receipt_cancelled(wait);
+                    let cancellation =
+                        cancellation.or(retired.then_some(OwnerWaitCancellation::GroupExit));
                     return self.resume_fault_owner_ready(engine, control, cancellation);
                 }
                 HvpatchProductionPhase::ResumeFaultPhysical {
