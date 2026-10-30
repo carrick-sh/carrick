@@ -63,6 +63,39 @@ including renames and capped comparisons, as in #799. Comment YAML comes from
 main. Issue/comment events serialize by webhook issue/PR number; reviews by
 head ref. The expected-tip push lease closes cross-key races.
 
+### Adopting a director PR (#1175)
+
+Dispatch can also continue a PR it did not open, such as a director session's
+`work/986-slice4`. The owner adopts it for one round by commenting `/agent` on
+the PR, with the same unedited-owner-comment rules as above. Adoption needs
+all of these, checked against the live PR when the comment is admitted:
+
+- The PR is open, its head branch is in this repository, and it targets
+  `main`.
+- The head branch is a valid `work/*` name that is not a
+  `work/dispatch-<issue>-<run>` name. Dispatch-named branches always take
+  the owned-PR path above.
+- The PR was opened by the owner or by the carrick-workers App.
+- GitHub lists exactly one closing issue for the PR (`Closes #N` in the body
+  or a sidebar link), and that issue is open and owner-authored. It becomes
+  the run's issue: the loop reads it, the board updates it, and commits may
+  close only it.
+
+The PR head the hosted guard sees becomes the admitted tip. Clone admission
+and the controller refuse a different head, as for owned PRs. The run can push
+only to the adopted branch, with `--force-with-lease` set to that tip, and it
+cannot call `select_branch`. If someone pushes to the PR meanwhile, the run
+pushes nothing, reports why and ends blocked; comment `/agent` again to
+continue from the new head.
+
+On an adopted PR dispatch pushes commits and nothing else. It never creates a
+PR, edits the body or changes draft status; a worker's proposed PR body is
+refused and the outcome says so. The outcome comment goes on the PR with the
+usual run footer. One predicate, `adopted_pr` in
+`crates/carrick-xtask/src/dispatch_worker.rs`, makes this decision for the
+guard, clone admission, the controller and the loop. Owner reviews
+(`changes_requested`) on adopted PRs are not supported yet.
+
 ## Accounts and credentials
 
 The runner holds the job-scoped `GITHUB_TOKEN` with exactly `contents: write`,
