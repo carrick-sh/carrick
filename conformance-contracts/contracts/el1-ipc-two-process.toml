@@ -11,7 +11,7 @@ guest_surfaces = [
   "vmm:hvf",
 ]
 semantic_authority = [
-  "man 2 pipe / man 7 pipe: a read on an empty pipe with a live writer blocks until data is written; writes of at most PIPE_BUF bytes are atomic",
+  "man 2 pipe / man 7 pipe: a read on an empty pipe with a live writer blocks until data is written, and returns EOF after every writer closes; writes of at most PIPE_BUF bytes are atomic",
   "man 2 eventfd: a read blocks while the counter is zero and returns the counter value once it is nonzero",
   "man 2 fork: parent and child hold independent descriptor tables over the same open descriptions",
 ]
@@ -20,10 +20,10 @@ scale_points = [1, 8, 64]
 rationale = "Request/response IPC between forked processes (`pairs` concurrent pairs, 128 rounds each) must be carried by the in-guest scheduler: each read and write is served at EL1, and a read that would block parks the thread in the guest and is woken by the peer's write without a host exit. `el1_ipc_two_processes_blocking` asserts, per kind and pair count, served read[63] and write[64] each at least 2 * pairs * rounds, at least pairs * rounds guest parks, and fewer forwarded reads than pairs * rounds (a continuation that fell back forwards one read per round). Forwarding every blocking read instead would cost one host park and wake per round, growing with the loop."
 
 [bindings]
+vm_free = "carrick-el1-linux::aarch64_process_tests::native_ipc_wake_tests::{serial_host_two_native_children_pipe_eof_wake_without_a_guest_executor,serial_host_two_native_children_pipe_eof_wake_with_the_executor_away} (two production fork children, inherited descriptions, scalar read parks, final host writer close while the sole slot is stopped, exact token retention and EOF completion; no signed instruction or throughput claim)"
 embed = "carrick-embed::el1_sched::el1_ipc_two_processes_blocking"
 
 [bindings.unresolved]
-vm_free = "VM-free scheduler tests cover continuation park and wake, but not forked-process descriptor sharing through live EL1 trap frames."
 docker = "Linux semantics of pipe and eventfd blocking are fixed by man pages; the fixture checks the completed round count itself. Same-source Docker differential binding remains open."
 embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts served[63]/[64] >= 2*pairs*rounds, zero-fallback parks >= pairs*rounds, and forwarded read[63] < pairs*rounds outside the contract evaluator."
 
