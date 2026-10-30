@@ -169,7 +169,10 @@ impl carrick_guest_arch::ThreadContext for Aarch64ParkedContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
+    use carrick_guest_arch::{
+        ContextGeneration, FrameGpa, MmGeneration, ProcessContext, ThreadContext,
+        ThreadPointerRegister,
+    };
     use core::num::NonZeroU64;
 
     #[test]
@@ -244,5 +247,112 @@ mod tests {
 
         // Child REFUSES parent's binding
         assert!(!child_ctx.authenticates(parent_binding));
+    }
+
+    #[test]
+    fn aarch64_context_set_user_stack_updates_only_sp_el0() {
+        const OLD_STACK: u64 = 0x0000_ffff_d000_1000;
+        const NEW_STACK: u64 = 0x0000_ffff_e000_ff00;
+        const TLS_TPIDR_EL0: u64 = 0x0000_ffff_cc00_0710;
+        const TLS_X18: u64 = 0x0000_ffff_ee18_0018;
+
+        let mut native = ThreadCtx::ZERO;
+        native.x = core::array::from_fn(|i| 0x1000_0000_0000_0000 | ((i as u64 + 1) * 0x101));
+        native.pc = 0x0000_aaaa_bbbb_0040;
+        native.pstate = 0x6000_0000;
+        native.sp_el0 = OLD_STACK;
+        native.tpidrro_el0 = 0x0000_ffff_cc00_0720;
+        native.contextidr_el1 = 0x0000_0000_cafe_0001;
+        native.v = core::array::from_fn(|i| {
+            ((0x2000_0000_0000_0000_u128 | (i as u128 + 1)) << 64)
+                | (0x3000_0000_0000_0000_u128 | (i as u128 + 1))
+        });
+        native.fpsr = 0x0800_0010;
+        native.fpcr = 0x0100_0000;
+
+        let binding = test_address(0x3000, 7, 11);
+        let initial_contexts = [
+            Aarch64ParkedContext::from_parts(native, binding),
+            Aarch64ParkedContext::from_register(native, 0xabcd_0000_0000_3000, 7, 11),
+        ];
+
+        for mut ctx in initial_contexts {
+            ctx.set_thread_pointer(ThreadPointerRegister::TPIDR_EL0, TLS_TPIDR_EL0);
+            ctx.set_thread_pointer(ThreadPointerRegister::X18, TLS_X18);
+            let before = ctx;
+            assert_eq!(before.native.sp_el0, OLD_STACK);
+            assert_ne!(OLD_STACK, NEW_STACK);
+
+            ProcessContext::set_user_stack(&mut ctx, NEW_STACK);
+
+            assert_eq!(ctx.native.sp_el0, NEW_STACK);
+
+            // Every other saved register and FP/SIMD word keeps its exact value.
+            assert_eq!(ctx.native.x, before.native.x);
+            assert_eq!(
+                ProcessContext::syscall_return(&ctx),
+                before.syscall_return()
+            );
+            assert_eq!(ctx.native.pc, before.native.pc);
+            assert_eq!(ctx.native.pstate, before.native.pstate);
+            assert_eq!(ctx.native.tpidr_el0, TLS_TPIDR_EL0);
+            assert_eq!(ctx.native.tpidrro_el0, before.native.tpidrro_el0);
+            assert_eq!(ctx.native.contextidr_el1, before.native.contextidr_el1);
+            assert_eq!(ctx.native.v, before.native.v);
+            assert_eq!(ctx.native.fpsr, before.native.fpsr);
+            assert_eq!(ctx.native.fpcr, before.native.fpcr);
+
+            // Both AArch64 TLS thread-pointer registers remain intact.
+            assert_eq!(
+                ctx.thread_pointer(ThreadPointerRegister::TPIDR_EL0),
+                TLS_TPIDR_EL0
+            );
+            assert_eq!(ctx.thread_pointer(ThreadPointerRegister::X18), TLS_X18);
+
+            // Address binding (including upper ASID bits in root) remains intact.
+            assert_eq!(ctx.address_context(), Some(binding));
+            assert!(ProcessContext::authenticates(&ctx, binding));
+            assert!(!ProcessContext::authenticates(
+                &ctx,
+                test_address(0x4000, 7, 11)
+            ));
+            assert!(!ProcessContext::authenticates(
+                &ctx,
+                test_address(0x3000, 8, 11)
+            ));
+            assert!(!ProcessContext::authenticates(
+                &ctx,
+                test_address(0x3000, 7, 12)
+            ));
+            assert_eq!(ctx.root(), before.root());
+            assert_eq!(ctx.mm(), before.mm());
+            assert_eq!(ctx.generation(), before.generation());
+
+            // Exhaustive whole-struct equality (including private padding/binding fields).
+            let mut expected = before;
+            expected.native.sp_el0 = NEW_STACK;
+            assert_eq!(ctx, expected);
+
+            // Composed fork_child + set_user_stack (vfork/clone child setup).
+            let child_binding = test_address(0x5000, 9, 13);
+            let mut child = ProcessContext::fork_child(before, child_binding);
+            ProcessContext::set_user_stack(&mut child, NEW_STACK);
+            assert_eq!(child.native.sp_el0, NEW_STACK);
+            assert_eq!(ProcessContext::syscall_return(&child), 0);
+            assert_eq!(&child.native.x[1..], &before.native.x[1..]);
+            assert_eq!(child.native.pc, before.native.pc);
+            assert_eq!(child.native.pstate, before.native.pstate);
+            assert_eq!(child.native.v, before.native.v);
+            assert_eq!(child.native.fpsr, before.native.fpsr);
+            assert_eq!(child.native.fpcr, before.native.fpcr);
+            assert_eq!(
+                child.thread_pointer(ThreadPointerRegister::TPIDR_EL0),
+                TLS_TPIDR_EL0
+            );
+            assert_eq!(child.thread_pointer(ThreadPointerRegister::X18), TLS_X18);
+            assert_eq!(child.address_context(), Some(child_binding));
+            assert!(ProcessContext::authenticates(&child, child_binding));
+            assert!(!ProcessContext::authenticates(&child, binding));
+        }
     }
 }
