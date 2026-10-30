@@ -258,12 +258,45 @@ fn composed_native_supply(
     replace_cow: bool,
     end: SupplyEnd,
 ) {
+    composed_native_supply_with_prepared(
+        competing_publication,
+        absent_page,
+        replace_cow,
+        end,
+        false,
+    );
+}
+
+#[test]
+fn native_child_first_touch_of_inherited_prepared_leaf_makes_progress() {
+    composed_native_supply_with_prepared(false, None, false, SupplyEnd::Resume, true);
+}
+
+fn composed_native_supply_with_prepared(
+    competing_publication: bool,
+    absent_page: Option<usize>,
+    replace_cow: bool,
+    end: SupplyEnd,
+    prepared_page: bool,
+) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     // Keep descriptor grants disjoint from the original 32-page fork arena.
     // No live-word venue or raw table pointer has been formed yet.
     let mut table_words = core::mem::take(&mut fixture.tables.words).into_vec();
     table_words.extend((0..32 * 512).map(|_| core::sync::atomic::AtomicU64::new(0)));
     fixture.tables.words = table_words.into_boxed_slice();
+    if prepared_page {
+        // Untouched private anonymous stock has an output but is invalid.
+        // Keep the non-identity IPA and Linux RW intent from the parent leaf.
+        let descriptor = fixture.tables.words[1536].load(Ordering::Relaxed);
+        fixture.tables.words[1536]
+            .store((descriptor & !1) | (1 << 56) | (1 << 57), Ordering::Relaxed);
+        assert!(
+            carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private(
+                fixture.tables.words[1536].load(Ordering::Relaxed)
+            )
+        );
+    }
     if let Some(absent_page) = absent_page {
         // Parent's two-page reservation has only one page resident.
         // Actual native fork must carry that descriptor into the child even
@@ -381,6 +414,43 @@ fn composed_native_supply(
         .unwrap();
     let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
     let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    if prepared_page {
+        frame.esr = 0x92000006;
+        frame.far = VA;
+        let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+        assert!(residency.lookup(identity.mm, VA).is_none());
+        let action = carrick_el1::fault::dispatch_fault_with_prepared(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            access,
+            crate::cow_resolver::native_fault_supply(
+                true,
+                carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                &supply,
+            ),
+            Some(carrick_el1::fault::PreparedFaultPath {
+                residency,
+                resolver: &mut SelectionWords(words),
+                roots: Some(fixture.region.table()),
+                file_slots: Some(portal),
+            }),
+            &mut resolver,
+        );
+        let root = access
+            .grant(access.find(identity.mm).unwrap(), identity.mm)
+            .unwrap()
+            .ttbr0;
+        assert!(
+            action == carrick_el1_abi::Action::Forward
+                && supply.outcome() == OwnerFaultSupplyOutcome::Selected
+                || leaf(words, root, VA) & 1 != 0,
+            "first-touch must publish a usable translation or request backing, not retry the same invalid leaf: action={action:?} supply={:?} leaf={:#x}",
+            supply.outcome(),
+            leaf(words, root, VA),
+        );
+        return;
+    }
     if let Some(absent_page) = absent_page {
         let fault_page = VA + absent_page as u64 * 4096;
         let neighbor = VA + (1 - absent_page) as u64 * 4096;
