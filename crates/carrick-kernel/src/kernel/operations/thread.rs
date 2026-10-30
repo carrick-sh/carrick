@@ -322,8 +322,7 @@ impl PreparedThreadClone {
         if let Some(owed) = owed {
             super::super::thread_ledger::deliver_owed_exit_wake(&page, owed);
         }
-        let publication = publication?;
-        let published = publication.finish();
+        let published = publication.finish()?;
         #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
         if let Some(context) = published.context() {
             crate::schedule_point!(
@@ -386,7 +385,7 @@ impl PreparedThreadClone {
         self,
         state: &mut RegistryState,
         mut lane: PublicationLane<'_>,
-    ) -> Result<ReservedThreadPublication, KernelOperationError> {
+    ) -> DeferredThreadPublication {
         let Self {
             reservation,
             thread,
@@ -395,183 +394,212 @@ impl PreparedThreadClone {
             start_wait,
             start_release,
         } = self;
-        let ThreadCloneReservation {
-            kernel,
-            task,
-            caller,
-            shared,
-            parent_resources,
-            seed: _,
-            plan: _,
-            identity,
-            failpoint,
-        } = reservation;
-        let ClaimedThreadIdentity {
-            identity,
-            credit,
-            control: _,
-        } = identity;
-        let ThreadIdentity {
-            key,
-            reservation,
-            pid_identity,
-        } = identity;
-        let tid = key.tid;
-        let visible_tid = pid_identity
-            .as_ref()
-            .map_or(tid.raw(), |identity| identity.visible_id() as i32);
-        if matches!(lane, PublicationLane::HostClone { .. }) {
-            if let Some(publication) = publication.as_ref() {
-                publication.validate(state)?;
-            } else {
-                ensure_task_unreserved(state, task.key().id)?;
-            }
-        }
-        let Some(record) = state.tasks.get_mut(&task.key().id) else {
-            return Err(KernelOperationError::ParentExited);
-        };
-        if record.task.key() != task.key() {
-            return Err(KernelOperationError::ParentExited);
-        }
-        if matches!(lane, PublicationLane::HostClone { .. }) {
-            let current_shared = task.shared();
-            let current_caller = task
-                .thread(caller.key().tid)
-                .ok_or(KernelOperationError::StaleContext)?;
-            if !Arc::ptr_eq(&current_shared, &shared)
-                || current_caller.key() != caller.key()
-                || !Arc::ptr_eq(&current_caller, &caller)
-                || !Arc::ptr_eq(&current_caller.resources(), &parent_resources)
-            {
-                return Err(KernelOperationError::StaleContext);
-            }
-        }
-        let published_revision = match lane {
-            PublicationLane::AbiBorn(ref mut reservation) => record
-                .task
-                .consume_reserved_revision(reservation, record.revision),
-            _ => next_revision(&record.task, record.revision)?,
-        };
-        let membership_revision = state
-            .reservations
-            .get(&task.key().id)
-            .map(|reservation| {
-                reservation.prepare_membership_revision(
-                    record.task.key(),
-                    record.revision,
-                    published_revision,
-                )
-            })
-            .transpose()?
-            .flatten();
-        check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
-        let host_birth = if let PublicationLane::HostClone {
-            host_birth: Some(owed),
-        } = &mut lane
-        {
-            match thread.control_lease().lifecycle().reserve_host_birth() {
-                Ok(index) => Some(index),
-                Err(refusal) => {
-                    if let carrick_el1_abi::HostBirthRefusal::Closed(wake) = refusal {
-                        **owed = Some(wake);
-                    }
-                    return Err(KernelOperationError::HostBirthCapacity);
+        // The body borrows publication custody. Every early error must return
+        // that custody to the caller: dropping it here would reacquire the
+        // registry write lock that the caller still holds.
+        let outcome = (|| {
+            let ThreadCloneReservation {
+                kernel,
+                task,
+                caller,
+                shared,
+                parent_resources,
+                seed: _,
+                plan: _,
+                identity,
+                failpoint,
+            } = reservation;
+            let ClaimedThreadIdentity {
+                identity,
+                credit,
+                control: _,
+            } = identity;
+            let ThreadIdentity {
+                key,
+                reservation,
+                pid_identity,
+            } = identity;
+            let tid = key.tid;
+            let visible_tid = pid_identity
+                .as_ref()
+                .map_or(tid.raw(), |identity| identity.visible_id() as i32);
+            if matches!(lane, PublicationLane::HostClone { .. }) {
+                if let Some(publication) = publication.as_ref() {
+                    publication.validate(state)?;
+                } else {
+                    ensure_task_unreserved(state, task.key().id)?;
                 }
             }
-        } else {
-            None
-        };
-        if pid_identity.is_some_and(|identity| !identity.commit()) {
-            if let (
-                Some(index),
-                PublicationLane::HostClone {
-                    host_birth: Some(owed),
-                },
-            ) = (host_birth, &mut lane)
+            let Some(record) = state.tasks.get_mut(&task.key().id) else {
+                return Err(KernelOperationError::ParentExited);
+            };
+            if record.task.key() != task.key() {
+                return Err(KernelOperationError::ParentExited);
+            }
+            if matches!(lane, PublicationLane::HostClone { .. }) {
+                let current_shared = task.shared();
+                let current_caller = task
+                    .thread(caller.key().tid)
+                    .ok_or(KernelOperationError::StaleContext)?;
+                if !Arc::ptr_eq(&current_shared, &shared)
+                    || current_caller.key() != caller.key()
+                    || !Arc::ptr_eq(&current_caller, &caller)
+                    || !Arc::ptr_eq(&current_caller.resources(), &parent_resources)
+                {
+                    return Err(KernelOperationError::StaleContext);
+                }
+            }
+            let published_revision = match lane {
+                PublicationLane::AbiBorn(ref mut reservation) => record
+                    .task
+                    .consume_reserved_revision(reservation, record.revision),
+                _ => next_revision(&record.task, record.revision)?,
+            };
+            let membership_revision = state
+                .reservations
+                .get(&task.key().id)
+                .map(|reservation| {
+                    reservation.prepare_membership_revision(
+                        record.task.key(),
+                        record.revision,
+                        published_revision,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
+            let host_birth = if let PublicationLane::HostClone {
+                host_birth: Some(owed),
+            } = &mut lane
             {
-                **owed = thread
+                match thread.control_lease().lifecycle().reserve_host_birth() {
+                    Ok(index) => Some(index),
+                    Err(refusal) => {
+                        if let carrick_el1_abi::HostBirthRefusal::Closed(wake) = refusal {
+                            **owed = Some(wake);
+                        }
+                        return Err(KernelOperationError::HostBirthCapacity);
+                    }
+                }
+            } else {
+                None
+            };
+            if pid_identity.is_some_and(|identity| !identity.commit()) {
+                if let (
+                    Some(index),
+                    PublicationLane::HostClone {
+                        host_birth: Some(owed),
+                    },
+                ) = (host_birth, &mut lane)
+                {
+                    **owed = thread
+                        .control_lease()
+                        .lifecycle()
+                        .cancel_host_birth_claim(index);
+                }
+                return Err(KernelOperationError::PidNamespaceMembership(task.key().id));
+            }
+            let claim = reservation.commit();
+            // The task, key and unique numeric claim were validated while the
+            // registry write lock was held. Publication has no recoverable
+            // failure left after namespace membership commits; treating an
+            // invariant violation as an ordinary error would leave a ghost
+            // namespace member behind.
+            let mut publication_valid = task.publish_thread(Arc::clone(&thread)).is_ok();
+            if matches!(lane, PublicationLane::HostClone { .. }) {
+                thread
                     .control_lease()
                     .lifecycle()
-                    .cancel_host_birth_claim(index);
-            }
-            return Err(KernelOperationError::PidNamespaceMembership(task.key().id));
-        }
-        let claim = reservation.commit();
-        // The task, key and unique numeric claim were validated while the
-        // registry write lock was held. Publication has no recoverable
-        // failure left after namespace membership commits; treating an
-        // invariant violation as an ordinary error would leave a ghost
-        // namespace member behind.
-        let mut publication_valid = task.publish_thread(Arc::clone(&thread)).is_ok();
-        if matches!(lane, PublicationLane::HostClone { .. }) {
-            thread
-                .control_lease()
-                .lifecycle()
-                .thread_born()
-                .unwrap_or_else(|| {
-                    carrick_fatal!("kernel::thread_publication", "thread live count overflow");
-                });
-            let page = thread.control_lease().lifecycle();
-            if let Some(index) = host_birth {
-                thread.control_lease().pin_host_birth(index);
-                if let Some(identity) = thread.control_slot().host_birth_identity() {
-                    publication_valid &= page.publish_host_birth(index, identity);
-                } else {
+                    .thread_born()
+                    .unwrap_or_else(|| {
+                        carrick_fatal!("kernel::thread_publication", "thread live count overflow");
+                    });
+                let page = thread.control_lease().lifecycle();
+                if let Some(index) = host_birth {
+                    thread.control_lease().pin_host_birth(index);
+                    if let Some(identity) = thread.control_slot().host_birth_identity() {
+                        publication_valid &= page.publish_host_birth(index, identity);
+                    } else {
+                        publication_valid = false;
+                    }
+                } else if matches!(
+                    lane,
+                    PublicationLane::HostClone {
+                        host_birth: Some(_)
+                    }
+                ) {
                     publication_valid = false;
                 }
-            } else if matches!(
-                lane,
-                PublicationLane::HostClone {
-                    host_birth: Some(_)
+                if page.gate().is_terminal() {
+                    thread.control_slot().request_host_exit();
                 }
-            ) {
-                publication_valid = false;
             }
-            if page.gate().is_terminal() {
-                thread.control_slot().request_host_exit();
+            if !publication_valid {
+                carrick_fatal!(
+                    "kernel::thread_publication",
+                    "thread or host birth publication lost its exact claim"
+                );
             }
+            record.thread_claims.insert(tid, claim);
+            if let Some(membership_revision) = membership_revision {
+                membership_revision.publish();
+            }
+            record.revision = published_revision;
+            // The thread claim inserted above now carries this thread in the
+            // `RLIMIT_NPROC` count; release the in-flight charge in the same
+            // critical section so no admission sees it twice or not at all.
+            drop(credit);
+            kernel.observe_thread_publication(&thread, &resources, published_revision);
+            let pending = match publication.as_mut() {
+                Some(publication) => Some(publication.commit(state)?),
+                None => None,
+            };
+            let task_key = task.key();
+            Ok(ReservedThreadPublication {
+                published: PublishedThreadClone {
+                    started: Some(StartedThreadClone {
+                        context: KernelContext::from_parts(
+                            Arc::clone(&kernel),
+                            task,
+                            thread,
+                            shared,
+                            resources,
+                            published_revision,
+                        ),
+                    }),
+                    visible_tid,
+                    start_wait,
+                    start_release,
+                },
+                pending,
+                kernel,
+                task: task_key,
+            })
+        })();
+        DeferredThreadPublication {
+            outcome,
+            reservation: publication,
         }
-        if !publication_valid {
-            carrick_fatal!(
-                "kernel::thread_publication",
-                "thread or host birth publication lost its exact claim"
-            );
-        }
-        record.thread_claims.insert(tid, claim);
-        if let Some(membership_revision) = membership_revision {
-            membership_revision.publish();
-        }
-        record.revision = published_revision;
-        // The thread claim inserted above now carries this thread in the
-        // `RLIMIT_NPROC` count; release the in-flight charge in the same
-        // critical section so no admission sees it twice or not at all.
-        drop(credit);
-        kernel.observe_thread_publication(&thread, &resources, published_revision);
-        let pending = match publication.as_mut() {
-            Some(publication) => Some(publication.commit(state)?),
-            None => None,
-        };
-        let task_key = task.key();
-        Ok(ReservedThreadPublication {
-            published: PublishedThreadClone {
-                started: Some(StartedThreadClone {
-                    context: KernelContext::from_parts(
-                        Arc::clone(&kernel),
-                        task,
-                        thread,
-                        shared,
-                        resources,
-                        published_revision,
-                    ),
-                }),
-                visible_tid,
-                start_wait,
-                start_release,
-            },
-            pending,
-            kernel,
-            task: task_key,
-        })
+    }
+}
+
+/// Publication outcome and rollback custody retained across the caller's
+/// registry and ledger guards. Both success notifications and failed-clone
+/// reservation rollback can re-enter the registry.
+#[must_use = "finish outside the registry lock and ledger settlement gate"]
+pub(crate) struct DeferredThreadPublication {
+    outcome: Result<ReservedThreadPublication, KernelOperationError>,
+    reservation: Option<TaskSetReservation>,
+}
+
+impl DeferredThreadPublication {
+    pub(crate) fn error(&self) -> Option<&KernelOperationError> {
+        self.outcome.as_ref().err()
+    }
+
+    pub(crate) fn finish(self) -> Result<PublishedThreadClone, KernelOperationError> {
+        drop(self.reservation);
+        self.outcome.map(ReservedThreadPublication::finish)
     }
 }
 
@@ -1109,6 +1137,138 @@ mod tests {
     use crate::kernel::operations::tests::bootstrap;
     use crate::kernel::operations::{ChildStartOutcome, WaitMode, WaitOutcome};
     use crate::kernel::{Credentials, FileTable, FsContext, Mm, Sighand};
+
+    #[test]
+    fn refused_reserved_thread_birth_failpoint_releases_context_readers() {
+        assert_refused_reserved_birth(Some(KernelFailpoint::BeforePublish), false);
+    }
+
+    #[test]
+    fn refused_reserved_thread_birth_closed_gate_releases_context_readers() {
+        assert_refused_reserved_birth(None, false);
+    }
+
+    #[test]
+    fn refused_reserved_thread_birth_ledger_failure_releases_context_readers() {
+        assert_refused_reserved_birth(Some(KernelFailpoint::BeforePublish), true);
+    }
+
+    fn assert_refused_reserved_birth(failpoint: Option<KernelFailpoint>, ledger: bool) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (kernel, root) = bootstrap(193);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .unwrap();
+        let peer = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(8_970), None)
+            .unwrap();
+        let prepared = kernel
+            .reserve_thread_clone(&root, plan, failpoint)
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(8_971))
+            .unwrap()
+            .reserve_publication_eventually()
+            .unwrap();
+        if failpoint.is_none() {
+            // The production host-birth refusal must also roll back the
+            // publication reservation while the two existing threads live.
+            root.lifecycle_page().close();
+        }
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let callback_kernel = Arc::clone(&kernel);
+        let task = root.task().key().id;
+        let tid = peer.thread().key().tid;
+        let subscription = kernel
+            .subscribe_reservation_change(
+                kernel.reservation_epoch(),
+                Arc::new(move || {
+                    // Notification must run after releasing the registry:
+                    // scheduler wake subscribers capture this same context.
+                    let context = callback_kernel.context(task, tid).unwrap();
+                    wake_tx.send(context.thread().key()).unwrap();
+                }),
+            )
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let publisher_kernel = Arc::clone(&kernel);
+        let publisher = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = if ledger {
+                prepared.record_birth();
+                // Context capture settles this recorded birth through the
+                // same publication body and the ledger's settling gate.
+                publisher_kernel.context(task, tid).unwrap();
+                Ok(())
+            } else {
+                prepared.commit_for_el1().map(|_| ())
+            };
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (reader_tx, reader_rx) = mpsc::channel();
+        let reader_kernel = Arc::clone(&kernel);
+        let reader = std::thread::spawn(move || {
+            reader_tx
+                .send(reader_kernel.context(task, tid).map(|_| ()))
+                .unwrap();
+        });
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("refused clone deadlocked while dropping its reservation");
+        assert_eq!(result.is_ok(), ledger, "unexpected publication outcome");
+        if failpoint.is_none() {
+            assert!(matches!(
+                result,
+                Err(KernelOperationError::HostBirthCapacity)
+            ));
+        } else if !ledger {
+            assert!(matches!(
+                result,
+                Err(KernelOperationError::Injected(
+                    KernelFailpoint::BeforePublish
+                ))
+            ));
+        }
+        reader_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("clone rollback stranded a context reader")
+            .unwrap();
+        assert_eq!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            peer.thread().key()
+        );
+        publisher.join().unwrap();
+        reader.join().unwrap();
+        drop(subscription);
+        assert_eq!(root.task().thread_count_for_test(), 2);
+        assert_eq!(root.lifecycle_page().host_birth_claimed_count(), 0);
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+        // A failed publication relinquishes the exact task reservation.
+        drop(
+            kernel
+                .prepare_task_exit(task, LinuxWaitStatus::from_wait_encoding(0), None)
+                .unwrap(),
+        );
+        if failpoint.is_some() {
+            let retry = kernel
+                .reserve_thread_clone(&root, plan, None)
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(8_972))
+                .unwrap()
+                .reserve_publication_eventually()
+                .unwrap()
+                .commit()
+                .unwrap()
+                .into_context()
+                .unwrap();
+            assert_eq!(retry.task().thread_count_for_test(), 3);
+            assert_eq!(kernel.validate_invariants(), Ok(()));
+        }
+    }
 
     #[test]
     fn host_birth_capacity_refuses_before_publication_without_leaking_slot() {
