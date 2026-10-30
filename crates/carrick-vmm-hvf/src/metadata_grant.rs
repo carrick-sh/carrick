@@ -377,6 +377,7 @@ pub struct MetadataGrantStats {
     pub returns_completed: u64,
     pub bytes_granted: u64,
     pub bytes_returned: u64,
+    /// Synchronous allocator ALLOC/FREE traps, excluding process crossings.
     pub inline_hvc_traps: u64,
 }
 
@@ -1056,8 +1057,12 @@ fn publish_backing_using(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn note_inline_metadata_trap(_op: u64) {
-    INLINE_HVC_TRAPS.fetch_add(1, Ordering::Relaxed);
+fn note_inline_metadata_trap(op: u64) {
+    // Process custody shares HVC #6 with the legacy allocator operations.
+    // Only synchronous allocator operations violate the mailbox contract.
+    if matches!(op, METADATA_GRANT_OP_ALLOC | METADATA_GRANT_OP_FREE) {
+        INLINE_HVC_TRAPS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Return a snapshot of metadata grant counters.
