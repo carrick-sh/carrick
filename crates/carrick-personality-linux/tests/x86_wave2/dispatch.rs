@@ -1005,6 +1005,7 @@ fn allocator_control_with_pending_host_work_and_no_token_enrolls_three_waiters()
                         ObjectParkRequest::new(key, snapshot, operation, None),
                         &|_| {},
                         || Ok((self.record, false)),
+                        None,
                     )
                 {
                     self.handoff = parked.take_receipt();
