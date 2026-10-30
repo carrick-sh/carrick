@@ -3,6 +3,11 @@
 # The component ownership/counter witnesses are registered under
 # kernel.el1.metadata-allocation; retain every existing family binding below.
 # These VM-free component checks do not confer signed acceptance for this family.
+# #1106: mixed host fallback and guest-service rows share the scheduler's
+# enqueue ordering. A compute successor must yield to already-waiting work
+# across the two queues; reversing permanent priority is also a failure.
+# VM-free bounded selection witnesses require progress within two picks and
+# at most two service placements. Signed host-compute 10/10 remains required.
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
@@ -56,6 +61,7 @@ vm_free = [
   "carrick-runtime::vcpu_loop::executor::tests::native_service_waits_do_not_exhaust_the_default_executor_pool (four actual native fork children park through real service custody on the physical-idle adapter with the default three-worker pool; all requests coexist before acknowledgment, exactly three workers are created and joined, no host child bindings; guest fault supply and signed behavior remain outside this witness)",
   "carrick-runtime::vcpu_loop::executor::tests::{insufficient_bound_workers_cannot_strand_a_pinned_task,pool_admission_covers_overrides_ceilings_reserves_and_small_hosts} (pool admission: zero worker creations and no driver/resolver publication on refusal; bounded CPU-3 strand witness with two workers/four CPUs; highest-CPU execution on valid and corrected topologies)",
   "carrick-runtime::vcpu_loop::executor::tests::{self_affinity_syscall_migrates_before_the_next_guest_entry,remote_affinity_change_migrates_a_compute_task_without_a_tick_or_syscall,affinity_change_after_claim_migrates_before_the_first_guest_entry,exec_replacement_keeps_worker_identity_and_swaps_thread_mm_asid_binding} (zero excluded entries, exact exec successor capability and retired predecessor no-op)",
+  "carrick-runtime::vcpu_loop::executor::tests::{serial_host_fallback_reader_is_not_starved_by_compute_services,serial_host_zone_service_is_not_starved_by_host_compute_rows} (real scheduler publication and production next_runnable, one CPU and two live threads, fallback admission before affinity mapping; sibling progress within two picks and at most two service placements, with no timer or VM; signed integration remains required)",
   "carrick-runtime::vcpu_loop::zone::affinity_tests::affinity_reentry_preserves_retired_terminal_custody",
   "carrick-runtime::vcpu_loop::zone::affinity_tests::{production_venue_remote_set_prompts_a_record_without_host_residency,production_venue_host_route_migrates_running_sibling_without_tick,production_venue_remote_affinity_migrates_running_sibling_without_tick,production_venue_switched_self_exclusion_migrates_before_return_without_irq,production_venue_affinity_survives_host_affinity_round_trip} (real entry authority, both kick transports; self exclusion retains Completed host boundary and host claims migrate before guest reentry)",
   "carrick-sched-core::affinity::tests (exact residency epochs and bounded notification)",

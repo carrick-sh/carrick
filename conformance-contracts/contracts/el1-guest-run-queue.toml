@@ -1,3 +1,8 @@
+# #1106: mixed host fallback and guest-service rows share the scheduler's
+# enqueue ordering. A compute successor must yield to already-waiting work
+# across the two queues; reversing permanent priority is also a failure.
+# VM-free bounded selection witnesses require progress within two picks and
+# at most two service placements. Signed host-compute 10/10 remains required.
 # #898 diagnostic-only: entry_binding fatals now retain their invariant
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:
@@ -47,6 +52,7 @@ structural_budgets = []
 # carrick-sched-core::tests and carrick-kernel::kernel::scheduler::tests
 # confirm EL1 run queue and scheduling invariants remain intact.
 vm_free = [
+  "carrick-runtime::vcpu_loop::executor::tests::{serial_host_fallback_reader_is_not_starved_by_compute_services,serial_host_zone_service_is_not_starved_by_host_compute_rows} (real scheduler publication and production next_runnable, one CPU and two live threads, fallback admission before affinity mapping; sibling progress within two picks and at most two service placements, with no timer or VM; signed integration remains required)",
   "carrick-embed::host_wait_policy::host_read_witness_requires_a_live_enrolled_registration (real production wait service: absent/unattached registrations rejected, enrolled read accepted, dropped service rejected; malformed diagnostic states rejected)",
   "carrick-el1-linux::ipc::tests::resumed_pipe_read_copy_refusal_preserves_the_byte_and_operation (copy refusal after real park/wake/resume retains the byte and operation, never false EOF)",
   "carrick-sched-core::tests (a_host_wake_queues_the_waiter_in_the_guest_directly, relocation_moves_queued_threads_between_run_queues_without_host_ownership, host_claims_parked_but_is_refused_by_el1_held, concurrent_el1_wakes_and_host_claims_give_each_record_one_owner, a_cancelled_record_is_discarded_not_run)",

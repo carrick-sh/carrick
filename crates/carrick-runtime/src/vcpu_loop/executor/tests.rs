@@ -8556,6 +8556,104 @@ fn shutdown_kick_stays_set_when_a_closing_worker_claims_a_row() {
         .expect("unregister worker");
 }
 
+/// #1106: fairness must reach a host fallback row even while a compute
+/// thread replenishes the same CPU's guest-service queue every quantum.
+/// This uses real queue publication and selection, with no VM or clock wait.
+#[test]
+fn serial_host_fallback_reader_is_not_starved_by_compute_services() {
+    serial_host_mixed_queue_progress(true);
+}
+
+#[test]
+fn serial_host_zone_service_is_not_starved_by_host_compute_rows() {
+    serial_host_mixed_queue_progress(false);
+}
+
+fn serial_host_mixed_queue_progress(compute_in_zone: bool) {
+    use carrick_el1_abi::SlotId;
+
+    struct RestoreRegion(usize);
+    impl Drop for RestoreRegion {
+        fn drop(&mut self) {
+            carrick_el1_abi::record_el1_region_host_ptr(self.0);
+        }
+    }
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let _restore = RestoreRegion(carrick_el1_abi::get_el1_region_host_ptr());
+    carrick_el1_abi::record_el1_region_host_ptr(region.as_mut_ptr() as usize);
+    let zone = carrick_el1_abi::zone_tables().unwrap();
+    zone.publish_carrier_cpu_count(1);
+    let slot = SlotId::new(0);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, 3, Some(0), 0);
+
+    let (kernel, compute) = bootstrap(19_746);
+    compute
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let reader = sibling(&kernel, &compute, 19_747);
+    publish(&compute, 101);
+    publish(&reader, 102);
+    let mapped = if compute_in_zone { &compute } else { &reader };
+    let control = mapped.thread().control_slot();
+    // SAFETY: the retained control is directly mapped for this VM-free owner.
+    unsafe {
+        control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+            core::ptr::from_ref(control).expose_provenance() as u64,
+        ));
+    }
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let kick = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+    let executor = scheduler
+        .register_executor_bound(
+            kick.clone() as Arc<dyn ExecutorKick>,
+            Some(GuestCpuId::new(0)),
+            false,
+        )
+        .unwrap();
+    let mut backend = FakeFactory::default().create(&executor).unwrap();
+    backend.idle_slot = Some(slot);
+    carrick_kernel::el1_zone::with_test_zone(zone, || {
+        // One owner can be placed in the guest. The other cannot yet:
+        // its control authority has not been mapped, so publication retains
+        // it in the host fallback queue. Exercise both priority directions.
+        scheduler.make_runnable(compute.thread().key()).unwrap();
+        scheduler.make_runnable(reader.thread().key()).unwrap();
+        assert_eq!(zone.slot(slot).queued(), 1);
+        assert_eq!(scheduler.scheduler_summary().host_queued, 1);
+        let mut progressed = false;
+        let mut picks = 0;
+        for _ in 0..4 {
+            picks += 1;
+            let running = super::next_runnable(&scheduler, &mut backend, &executor, &kick)
+                .unwrap_or_else(|_| panic!("queue selection refused"))
+                .expect("one of two runnable threads must be selected");
+            if running.thread_key() == reader.thread().key() {
+                scheduler.settle_exited(running).unwrap();
+                progressed = true;
+                break;
+            }
+            assert_eq!(running.thread_key(), compute.thread().key());
+            scheduler.settle_runnable_successor(running).unwrap();
+        }
+        let placements = zone
+            .counters
+            .host_service_placements
+            .load(Ordering::Relaxed);
+        assert!(
+            progressed && picks == 2 && placements <= 2,
+            "mixed queue FIFO/progress budget failed: placements={placements}, picks={picks}, progressed={progressed}"
+        );
+        let running = super::next_runnable(&scheduler, &mut backend, &executor, &kick)
+            .unwrap_or_else(|_| panic!("compute service refused"))
+            .unwrap();
+        assert_eq!(running.thread_key(), compute.thread().key());
+        scheduler.settle_exited(running).unwrap();
+        assert_eq!(zone.slot(slot).queued(), 0);
+        assert_eq!(scheduler.queued_len(), 0);
+    });
+}
+
 /// A host-returned service must wake the executor's CURRENT idle mailbox,
 /// even after the executor relinquished its creation-time mailbox. The wake
 /// lands after next_runnable's last scan and before effective guest entry:
