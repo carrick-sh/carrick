@@ -267,7 +267,7 @@ impl Server<'_> {
         board_token()?;
         // Re-resolve ownership before using any PR as a board destination.
         let pr = if self.pr.is_some() {
-            let pr = require_owned_pr(self.root, &self.dispatch)?;
+            let pr = require_target_pr(self.root, &self.dispatch)?;
             let number = pr["number"]
                 .as_u64()
                 .ok_or(ScalerError::Guard("invalid board PR"))?;
@@ -1287,6 +1287,19 @@ fn issue_artifact_runs(
 fn prior_artifact(root: &Path, issue: u64, id: RunId, name: &str) -> Result<String, ScalerError> {
     RunCache::default().prior_artifact(root, issue, id, name)
 }
+fn pr_endpoints(number: u64) -> [(&'static str, String, bool); 5] {
+    [
+        ("commit", format!("pulls/{number}/commits"), true),
+        ("pr", format!("pulls/{number}"), false),
+        ("review", format!("pulls/{number}/reviews"), true),
+        (
+            "inline_review_comment",
+            format!("pulls/{number}/comments"),
+            true,
+        ),
+        ("pr_comment", format!("issues/{number}/comments"), true),
+    ]
+}
 #[derive(Clone)]
 pub(super) struct BranchTarget {
     pr: Option<u64>,
@@ -1601,10 +1614,13 @@ impl Server<'_> {
         if matches!(applied.body, AppliedBody::Failed(_)) {
             observations.push("PR body publication failed");
         }
-        let status = if observations.is_empty() {
-            status
-        } else {
+        let status = if !observations.is_empty() {
             ContractStatus::Failed
+        } else if applied.lease_refused.is_some() && status == ContractStatus::Done {
+            // An adopted PR moved under this run: nothing was overwritten.
+            ContractStatus::Blocked
+        } else {
+            status
         };
         let applied = if observations.is_empty() {
             applied.report()
@@ -1737,6 +1753,9 @@ impl Server<'_> {
     fn select_branch(&mut self, branch: &str) -> Result<Value, ScalerError> {
         if self.dispatch.review {
             return Err(ScalerError::Guard("review must continue the reviewed PR"));
+        }
+        if self.dispatch.continuation != Continuation::Owned {
+            return Err(ScalerError::Guard("an adopted run must continue its PR"));
         }
         if self.used.workers != 0 || self.used.publishes != 0 {
             return Err(ScalerError::Guard("select branch before invoking workers"));
@@ -1907,17 +1926,12 @@ impl Server<'_> {
                 }
             }
 
-            endpoints.extend([
-                ("commit", format!("pulls/{number}/commits"), true),
-                ("pr", format!("pulls/{number}"), false),
-                ("review", format!("pulls/{number}/reviews"), true),
-                (
-                    "inline_review_comment",
-                    format!("pulls/{number}/comments"),
-                    true,
-                ),
-                ("pr_comment", format!("issues/{number}/comments"), true),
-            ]);
+            endpoints.extend(pr_endpoints(number));
+        }
+        // The adopted PR is not a dispatch-named branch, so linked_prs omits
+        // it; its reviews and comments are this round's context.
+        if let Continuation::Adopted { pr, .. } = &self.dispatch.continuation {
+            endpoints.extend(pr_endpoints(*pr));
         }
         for (kind, endpoint, many) in endpoints {
             let endpoint = format!("repos/{REPOSITORY}/{endpoint}");
@@ -2160,7 +2174,9 @@ impl Server<'_> {
                     self.check_worker(&selection)?;
                     let capacity = self.capacity()?;
                     available_worker(&capacity, &selection.backend, &selection.model)?;
-                    if self.dispatch.resume {
+                    if self.dispatch.continuation != Continuation::Owned {
+                        require_target_pr(self.root, &self.dispatch)?;
+                    } else if self.dispatch.resume {
                         verified_branch_cached(
                             self.root,
                             self.dispatch.issue,
@@ -2561,7 +2577,7 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
     }
     let pr = if dispatch.resume {
         Some(
-            require_owned_pr(root, &dispatch)?["number"]
+            require_target_pr(root, &dispatch)?["number"]
                 .as_u64()
                 .ok_or(ScalerError::Guard("invalid PR number"))?,
         )
@@ -2763,6 +2779,7 @@ mod tests {
                 base: "a".repeat(40),
                 review: true,
                 review_text: String::new(),
+                continuation: Continuation::Owned,
                 worker_seconds: None,
                 loop_deadline: None,
                 harvest_deadline: None,
@@ -2784,6 +2801,35 @@ mod tests {
             capacity: None,
             resume_fetched: false,
         }
+    }
+    #[test]
+    fn adopted_run_keeps_its_pr_and_a_lease_refusal_ends_blocked() {
+        shared_fixture(|root| {
+            let mut s = server(root);
+            s.dispatch.review = false;
+            s.dispatch.branch = "work/986-slice4".into();
+            s.dispatch.continuation = Continuation::Adopted {
+                pr: 800,
+                branch: "work/986-slice4".into(),
+                tip: "a".repeat(40),
+            };
+            let error = s
+                .select_branch("work/dispatch-799-42")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("adopted"), "{error}");
+            std::fs::create_dir_all(crate::agent_runner::state().unwrap()).unwrap();
+            Applied::record(|a| {
+                a.lease_refused = Some("Adopted PR #800 moved after admission".into())
+            })
+            .unwrap();
+            s.outcome(ContractStatus::Done, "pushed").unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(
+                posted.contains("Dispatch outcome: Blocked") && posted.contains("Push refused"),
+                "{posted}"
+            );
+        });
     }
     #[test]
     fn rev3_outcome_mentions_include_summary_and_choices() {

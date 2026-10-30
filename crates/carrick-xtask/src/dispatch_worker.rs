@@ -71,12 +71,114 @@ pub struct Dispatch {
     pub base: String,
     pub review: bool,
     pub review_text: String,
+    pub continuation: Continuation,
     #[serde(skip)]
     pub worker_seconds: Option<u64>,
     #[serde(skip)]
     pub loop_deadline: Option<std::time::Instant>,
     #[serde(skip)]
     pub harvest_deadline: Option<std::time::Instant>,
+}
+
+/// Which branch this run may write, and under which lease. The push target of
+/// an adopted PR comes only from here, never from issue, comment or model text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Continuation {
+    /// A run-named `work/dispatch-<issue>-<run>` branch: a creation run or
+    /// the continuation of a PR an earlier dispatch run opened.
+    #[default]
+    Owned,
+    /// A director PR adopted for one round by an owner `/agent` comment.
+    /// `tip` is the head admitted by the guard and the only push lease.
+    Adopted {
+        pr: u64,
+        branch: String,
+        tip: String,
+    },
+}
+
+/// Proof that a live PR passed [`adopted_pr`]. Fields stay private, so only
+/// that predicate can create one.
+pub(crate) struct Adoption {
+    number: u64,
+    branch: String,
+    tip: String,
+    issue: Value,
+}
+impl Adoption {
+    fn continuation(&self) -> Continuation {
+        Continuation::Adopted {
+            pr: self.number,
+            branch: self.branch.clone(),
+            tip: self.tip.clone(),
+        }
+    }
+}
+/// Server reads [`adopted_pr`] needs; each caller supplies its own transport.
+pub(crate) enum AdoptionRead {
+    /// GraphQL response for [`CLOSING_REFERENCES_QUERY`] on this PR number.
+    ClosingReferences(u64),
+    /// REST issue object.
+    Issue(u64),
+}
+
+/// The one adoption predicate, shared by the hosted guard, clone admission,
+/// the controller and the loop. A same-repository `work/*` PR into main that
+/// no dispatch run named, authored by the owner or the publish App, closing
+/// exactly one open owner-authored issue. Head freshness is the caller's
+/// expected-tip check, exactly as for owned PRs.
+pub(crate) fn adopted_pr(
+    pr: &Value,
+    mut read: impl FnMut(AdoptionRead) -> Result<Value, ScalerError>,
+) -> Result<Option<Adoption>, ScalerError> {
+    let branch = pr["head"]["ref"].as_str().unwrap_or_default();
+    let author = &pr["user"];
+    let (Some(number), Some(tip)) = (
+        pr["number"].as_u64().filter(|n| *n > 0),
+        pr["head"]["sha"].as_str().filter(|s| sha(s)),
+    ) else {
+        return Ok(None);
+    };
+    if pr["state"] != "open"
+        || pr["head"]["repo"]["full_name"] != REPOSITORY
+        || pr["base"]["repo"]["full_name"] != REPOSITORY
+        || pr["base"]["ref"] != "main"
+        || !valid_branch(branch)
+        || dispatch_branch(branch).is_some()
+        || !((author["login"] == "tjfontaine" && author["type"] == "User")
+            || publish_app_author(author))
+    {
+        return Ok(None);
+    }
+    let references = parse_closing_references(&read(AdoptionRead::ClosingReferences(number))?)?;
+    let [reference] = references.all.iter().collect::<Vec<_>>()[..] else {
+        return Ok(None);
+    };
+    if reference.repository != REPOSITORY {
+        return Ok(None);
+    }
+    let issue = read(AdoptionRead::Issue(reference.number))?;
+    if issue["number"].as_u64() != Some(reference.number)
+        || issue["state"] != "open"
+        || issue["user"]["login"] != "tjfontaine"
+        || issue["user"]["type"] != "User"
+        || issue.get("pull_request").is_some()
+    {
+        return Ok(None);
+    }
+    Ok(Some(Adoption {
+        number,
+        branch: branch.to_owned(),
+        tip: tip.to_owned(),
+        issue,
+    }))
+}
+fn adoption_read(root: &Path, read: AdoptionRead) -> Result<Value, ScalerError> {
+    match read {
+        AdoptionRead::ClosingReferences(number) => closing_references_response(root, number),
+        AdoptionRead::Issue(number) => api(root, &format!("repos/{REPOSITORY}/issues/{number}")),
+    }
 }
 
 /// Runner-private result of credentialed admission; provider setup and the
@@ -152,12 +254,13 @@ pub(crate) fn comment_digest(comment: &Value) -> String {
 }
 
 pub fn validate_event(event: &Value, triggering_actor: &str) -> Result<Dispatch, ScalerError> {
-    validate_event_with_publication(event, triggering_actor, None)
+    validate_event_with_publication(event, triggering_actor, None, None)
 }
 fn validate_event_with_publication(
     event: &Value,
     triggering_actor: &str,
     publication: Option<&PublishedPr>,
+    adoption: Option<&Adoption>,
 ) -> Result<Dispatch, ScalerError> {
     let review = event.get("review").is_some();
     let comment = event.get("comment").is_some();
@@ -201,19 +304,38 @@ fn validate_event_with_publication(
         return Err(ScalerError::Guard("not a dispatch label event"));
     }
     let resume = event.get("pull_request").is_some();
-    let branch = if resume {
+    let (branch, continuation) = if resume {
         let pr = &event["pull_request"];
         let branch = pr["head"]["ref"].as_str().unwrap_or_default();
-        if event["issue"]["state"] != "open"
-            || !owned_pr(pr, &event["dispatch_run"], issue, branch, publication)
-        {
+        if event["issue"]["state"] != "open" {
+            return Err(ScalerError::Guard("trigger requires an open issue"));
+        }
+        if let Some(adoption) = adoption {
+            // Adoption is an owner /agent comment only; reviews stay owned.
+            if !comment
+                || review
+                || adoption.issue["number"].as_u64() != Some(issue)
+                || pr["number"].as_u64() != Some(adoption.number)
+                || branch != adoption.branch
+                || pr["head"]["sha"] != adoption.tip.as_str()
+            {
+                return Err(ScalerError::Guard(
+                    "adoption proof does not match the triggering PR",
+                ));
+            }
+            (branch.to_owned(), adoption.continuation())
+        } else if owned_pr(pr, &event["dispatch_run"], issue, branch, publication) {
+            (branch.to_owned(), Continuation::Owned)
+        } else {
             return Err(ScalerError::Guard(
                 "trigger requires an open issue and owned dispatch PR",
             ));
         }
-        branch.to_owned()
     } else {
-        format!("work/dispatch-{issue}-pending")
+        (
+            format!("work/dispatch-{issue}-pending"),
+            Continuation::Owned,
+        )
     };
     Ok(Dispatch {
         issue,
@@ -234,6 +356,7 @@ fn validate_event_with_publication(
         base: String::new(),
         review,
         review_text: String::new(),
+        continuation,
         worker_seconds: None,
         loop_deadline: None,
         harvest_deadline: None,
@@ -1593,6 +1716,28 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
     ))
 }
 
+/// The PR this run continues, re-resolved from the server: an owned dispatch
+/// PR, or the adopted PR re-checked against the one adoption predicate. The
+/// head is not compared here: it moves when this run publishes, and the push
+/// lease is what protects the admitted tip.
+pub(crate) fn require_target_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerError> {
+    let Continuation::Adopted { pr, branch, .. } = &dispatch.continuation else {
+        return require_owned_pr(root, dispatch);
+    };
+    let live = api(root, &format!("repos/{REPOSITORY}/pulls/{pr}"))?;
+    let adoption = adopted_pr(&live, |read| adoption_read(root, read))?.ok_or(
+        ScalerError::Guard("adopted PR no longer qualifies for adoption"),
+    )?;
+    if adoption.number != *pr
+        || adoption.branch != *branch
+        || dispatch.branch != *branch
+        || adoption.issue["number"].as_u64() != Some(dispatch.issue)
+    {
+        return Err(ScalerError::Guard("adopted PR scope changed"));
+    }
+    Ok(live)
+}
+
 fn regular_text(path: &Path) -> Result<String, ScalerError> {
     Ok(crate::safe_copy::text(path, 20 * 1024 * 1024)?)
 }
@@ -1752,8 +1897,27 @@ fn api(root: &Path, endpoint: &str) -> Result<Value, ScalerError> {
     Ok(serde_json::from_str(&response)?)
 }
 
+/// The head the hosted guard observed (`CARRICK_DISPATCH_HEAD` on the clone),
+/// else the event's own PR head. Admission refuses any other live head.
+fn admitted_head(event: &Value) -> Option<String> {
+    std::env::var("CARRICK_DISPATCH_HEAD")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            event["pull_request"]["head"]["sha"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .filter(|s| sha(s))
+}
+
 /// Resolve only server-owned scope. Model text is never parsed for branches.
-pub(crate) fn load_event(root: &Path, path: &Path) -> Result<Value, ScalerError> {
+/// An `/agent` comment on a PR no dispatch run named also returns the
+/// adoption proof that `validate_event_with_publication` requires.
+pub(crate) fn load_event(
+    root: &Path,
+    path: &Path,
+) -> Result<(Value, Option<Adoption>), ScalerError> {
     let mut event: Value = serde_json::from_slice(&std::fs::read(path)?)?;
     if !trusted_actor(event["sender"]["login"].as_str().unwrap_or_default()) {
         return Err(ScalerError::Guard("untrusted event actor"));
@@ -1782,23 +1946,28 @@ pub(crate) fn load_event(root: &Path, path: &Path) -> Result<Value, ScalerError>
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        let issue =
-            dispatch_branch(&branch).ok_or(ScalerError::Guard("not a dispatch head ref"))?;
-        let id = branch_run(issue, &branch)?;
         let number = event["pull_request"]["number"]
             .as_u64()
             .ok_or(ScalerError::Guard("missing PR number"))?;
+        let Some(issue) = dispatch_branch(&branch) else {
+            // Only an owner /agent comment adopts; reviews need a dispatch ref.
+            if event.get("comment").is_none() {
+                return Err(ScalerError::Guard("not a dispatch head ref"));
+            }
+            let live = api(root, &format!("repos/{REPOSITORY}/pulls/{number}"))?;
+            if !admitted_head(&event).is_some_and(|expected| live["head"]["sha"] == expected) {
+                return Err(ScalerError::Guard("stale PR head"));
+            }
+            let adoption = adopted_pr(&live, |read| adoption_read(root, read))?.ok_or(
+                ScalerError::Guard("PR is neither an owned dispatch PR nor adoptable"),
+            )?;
+            event["pull_request"] = live;
+            event["issue"] = adoption.issue.clone();
+            return Ok((event, Some(adoption)));
+        };
+        let id = branch_run(issue, &branch)?;
         let live = api(root, &format!("repos/{REPOSITORY}/pulls/{number}"))?;
-        let expected = std::env::var("CARRICK_DISPATCH_HEAD")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                event["pull_request"]["head"]["sha"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned()
-            });
-        if !sha(&expected) || live["head"]["sha"] != expected {
+        if !admitted_head(&event).is_some_and(|expected| live["head"]["sha"] == expected) {
             return Err(ScalerError::Guard("stale PR head"));
         }
         event["pull_request"] = live;
@@ -1807,7 +1976,7 @@ pub(crate) fn load_event(root: &Path, path: &Path) -> Result<Value, ScalerError>
         // private admission. validate_event receives that proof separately.
         event["issue"] = api(root, &format!("repos/{REPOSITORY}/issues/{issue}"))?;
     }
-    Ok(event)
+    Ok((event, None))
 }
 
 /// Select a single open owned PR, authenticating the original branch run.
@@ -1885,8 +2054,8 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         } => return agent_loop::run(&root, &event, &setup_status),
         DispatchAction::Guard { event, admit, .. } => (event, admit),
     };
-    let event = load_event(&root, &event_path)?;
-    let publication = if publish_app_author(&event["pull_request"]["user"]) {
+    let (event, adoption) = load_event(&root, &event_path)?;
+    let publication = if adoption.is_none() && publish_app_author(&event["pull_request"]["user"]) {
         let branch = event["pull_request"]["head"]["ref"]
             .as_str()
             .unwrap_or_default();
@@ -1905,16 +2074,19 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         &event,
         &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
         publication.as_ref(),
+        adoption.as_ref(),
     )?;
     dispatch.base = admitted_base(dispatch.review || event.get("comment").is_some())?;
     if admit {
         cleanup_agent_user()?;
     }
     assigned_branch(&mut dispatch)?;
-    branch_run(dispatch.issue, &dispatch.branch)?;
+    if dispatch.continuation == Continuation::Owned {
+        branch_run(dispatch.issue, &dispatch.branch)?;
+    }
     if admit {
         if dispatch.resume {
-            require_owned_pr(&root, &dispatch)?;
+            require_target_pr(&root, &dispatch)?;
         }
         persist_admission(&dispatch, &event, &event_path)?;
     }
@@ -2364,8 +2536,25 @@ fn push_command(
     id: &str,
     expected: &str,
 ) -> Result<Command, ScalerError> {
-    let branch = format!("work/dispatch-{}-{id}", dispatch.issue);
-    branch_run(dispatch.issue, &branch)?;
+    let branch = match &dispatch.continuation {
+        Continuation::Owned => {
+            let branch = format!("work/dispatch-{}-{id}", dispatch.issue);
+            branch_run(dispatch.issue, &branch)?;
+            branch
+        }
+        // The adopted ref and its lease come only from the admitted type.
+        Continuation::Adopted { branch, tip, .. } => {
+            if !valid_branch(branch) || dispatch_branch(branch).is_some() {
+                return Err(ScalerError::Guard("invalid adopted branch"));
+            }
+            if expected != tip {
+                return Err(ScalerError::Guard(
+                    "adopted push lease must be the admitted PR tip",
+                ));
+            }
+            branch.clone()
+        }
+    };
     if dispatch.branch != branch
         || git(root, &["symbolic-ref", "--short", "HEAD"])?.trim() != branch
     {
@@ -2526,6 +2715,9 @@ struct Applied {
     ci_requires_owner: bool,
     #[serde(default)]
     token_fallback: Option<TokenFallback>,
+    /// An adopted PR moved after admission; the round ends blocked.
+    #[serde(default)]
+    lease_refused: Option<String>,
 }
 impl Applied {
     fn load() -> Result<Self, ScalerError> {
@@ -2547,7 +2739,11 @@ impl Applied {
     }
     fn report(&self) -> String {
         format!(
-            "- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}",
+            "{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}",
+            self.lease_refused
+                .as_ref()
+                .map(|reason| format!("- Push refused: {reason}.\n"))
+                .unwrap_or_default(),
             if self.commits.is_empty() {
                 "none".into()
             } else {
@@ -2899,13 +3095,21 @@ fn issue_reference(issue: u64) -> ClosingIssue {
 /// GitHub supplies the body-derived view, so manual sidebar links do not depend
 /// on our approximation of GitHub's Markdown closing-keyword parser.
 fn read_closing_references(root: &Path, number: u64) -> Result<ClosingReferences, ScalerError> {
+    parse_closing_references(&closing_references_response(root, number)?)
+}
+pub(crate) const CLOSING_REFERENCES_QUERY: &str = r#"query($number:Int!){repository(owner:"carrick-sh",name:"carrick"){pullRequest(number:$number){closingIssuesReferences(first:100){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage}} bodyReferences:closingIssuesReferences(first:100,excludeUserLinked:true){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage}}}}}"#;
+/// The controller sends the same query through its own POST transport.
+pub(crate) fn closing_references_request(number: u64) -> Value {
+    json!({"query":CLOSING_REFERENCES_QUERY,"variables":{"number":number}})
+}
+fn closing_references_response(root: &Path, number: u64) -> Result<Value, ScalerError> {
     let response = gh(
         root,
         &[
             "api",
             "graphql",
             "-f",
-            r#"query=query($number:Int!){repository(owner:"carrick-sh",name:"carrick"){pullRequest(number:$number){closingIssuesReferences(first:100){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage}} bodyReferences:closingIssuesReferences(first:100,excludeUserLinked:true){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage}}}}}"#,
+            &format!("query={CLOSING_REFERENCES_QUERY}"),
             "-F",
             &format!("number={number}"),
         ],
@@ -2915,7 +3119,9 @@ fn read_closing_references(root: &Path, number: u64) -> Result<ClosingReferences
             "closing-reference response exceeds 64 KiB",
         ));
     }
-    let value: Value = serde_json::from_str(&response)?;
+    Ok(serde_json::from_str(&response)?)
+}
+fn parse_closing_references(value: &Value) -> Result<ClosingReferences, ScalerError> {
     if value.get("errors").is_some() {
         return Err(ScalerError::Guard(
             "closing-reference query returned errors",
@@ -3195,6 +3401,16 @@ fn live_publication_main(work: &Path, token: &str) -> Result<String, ScalerError
     Ok((*main).to_owned())
 }
 
+/// Someone pushed to an adopted PR after admission. Nothing is overwritten;
+/// the round ends blocked and the owner re-runs `/agent` on the new head.
+fn adopted_lease_refused(number: u64, tip: &str, why: &str) -> Result<ScalerError, ScalerError> {
+    let reason = format!(
+        "Adopted PR #{number} moved after admission ({why}; admitted tip `{tip}`). Nothing was pushed or overwritten; comment `/agent` again to continue from the new head"
+    );
+    Applied::record(|a| a.lease_refused = Some(reason.clone()))?;
+    Ok(ScalerError::Usage(reason))
+}
+
 fn publication_body(body: &str, source: &str, issue: u64) -> Result<String, ScalerError> {
     let closing = format!("\n\nCloses #{issue}\n");
     let (human, footer) = body.rsplit_once(&closing).ok_or(ScalerError::Guard(
@@ -3303,26 +3519,49 @@ fn publish_commits(
     // Push, snapshot and write share the primary window; recovery alone may
     // use its reserved thirty seconds, without extending the caller's budget.
     let _primary_window = CommandWindow::until(check.deadline());
-    if dispatch.resume {
+    let adopted = match &dispatch.continuation {
+        Continuation::Adopted { pr, tip, .. } => Some((*pr, tip.as_str())),
+        Continuation::Owned => None,
+    };
+    if adopted.is_some() {
+        require_target_pr(root, dispatch)?;
+    } else if dispatch.resume {
         agent_loop::verified_branch_cached(root, dispatch.issue, &dispatch.branch, runs)?;
     } else {
         branch_prs(root, &dispatch.branch, "all")?;
     }
     let state = crate::agent_runner::state()?;
     let work = state.join("work");
-    let id = branch_run(dispatch.issue, &dispatch.branch)?;
+    let id = if adopted.is_some() {
+        ""
+    } else {
+        branch_run(dispatch.issue, &dispatch.branch)?
+    };
     // Invalid prose cannot consume the run's only chance to publish commits.
-    let proposal = match proposed_pr_body(receipt.pr_body.as_deref(), dispatch.issue, id, token) {
-        Ok(body) => body,
-        Err(error) => {
-            let reason = agent_loop::masked(&error.to_string(), token);
+    let proposal = if adopted.is_some() {
+        // An adopted PR belongs to its author: push commits, never the body.
+        if receipt.pr_body.is_some() {
             Applied::record(|a| {
                 a.body = AppliedBody::Refused {
-                    reason,
+                    reason: "dispatch never edits the body of an adopted PR".into(),
                     template_created: false,
                 }
             })?;
-            None
+        }
+        None
+    } else {
+        match proposed_pr_body(receipt.pr_body.as_deref(), dispatch.issue, id, token) {
+            Ok(body) => body,
+            Err(error) => {
+                let reason = agent_loop::masked(&error.to_string(), token);
+                Applied::record(|a| {
+                    a.body = AppliedBody::Refused {
+                        reason,
+                        template_created: false,
+                    }
+                })?;
+                None
+            }
         }
     };
     if work.is_dir()
@@ -3444,6 +3683,16 @@ fn publish_commits(
             PublishEvent::BranchPush
         };
         let existing = tip.split_whitespace().next();
+        if let Some((number, admitted)) = adopted
+            && existing != Some(admitted)
+            && existing != Some(head.trim())
+        {
+            return Err(adopted_lease_refused(
+                number,
+                admitted,
+                "the live head differs",
+            )?);
+        }
         let retained =
             existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim());
         if existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim()) {
@@ -3509,6 +3758,11 @@ fn publish_commits(
                     let mut push = push_command(&work, dispatch, id, &receipt.expected_tip)?;
                     push.env("GH_TOKEN", token).env_remove("GITHUB_TOKEN");
                     output(&mut push)
+                }).or_else(|error| match adopted {
+                    Some((number, tip)) if error.to_string().contains("stale info") => {
+                        Err(adopted_lease_refused(number, tip, "the push lease was rejected")?)
+                    }
+                    _ => Err(error),
                 }).map_err(|error| {
                     if credential.app.is_some() && publish_permission_failure(&error.to_string()) {
                         ScalerError::Usage(format!("App token push refused (requires contents write; workflow files are not permitted): {error}"))
@@ -3524,6 +3778,10 @@ fn publish_commits(
         }
         if !retained {
             std::fs::write(state.join("published-tip"), head.trim())?;
+        }
+        if let Some((number, _)) = adopted {
+            // Commits only: no PR creation, body edit or draft change.
+            return Ok(Some(number));
         }
         if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
             let pr = require_owned_pr(root, dispatch)?;
@@ -4225,6 +4483,18 @@ mod tests {
         publication_fixture("publish-token-recovery-create");
     }
     #[test]
+    fn adopted_publication_pushes_commits_only() {
+        publication_fixture("adopted");
+    }
+    #[test]
+    fn adopted_publication_refuses_a_moved_head_without_pushing() {
+        publication_fixture("adopted-moved");
+    }
+    #[test]
+    fn adopted_publication_lease_rejection_ends_blocked() {
+        publication_fixture("adopted-race");
+    }
+    #[test]
     fn publish_auth_failure_on_push_falls_back_once() {
         publication_fixture("publish-token-auth-push");
     }
@@ -4428,6 +4698,8 @@ def conn(ns):return {"nodes":[{"number":n,"repository":{"nameWithOwner":"carrick
 print(json.dumps({"data":{"repository":{"pullRequest":{"closingIssuesReferences":conn(all_refs),"bodyReferences":conn(body_refs)}}}}))
 REFS
  ;;
+ */pulls/800) cat "$RUNNER_TEMP/adopted-pr.json" ;;
+ */issues/634) cat "$RUNNER_TEMP/adopted-issue.json" ;;
  */actions/runs/42) cat "$RUNNER_TEMP/original.json" ;;
  */actions/runs/42/jobs*) echo '{"jobs":[{"name":"worker","status":"completed","runner_name":"carrick-agent-123","steps":[{"name":"Run actions/upload-artifact@v4","status":"completed","conclusion":"success"}]}]}' ;;
  *'/pulls?'*) if test -f "$RUNNER_TEMP/created"; then cat "$RUNNER_TEMP/pr.json"; else echo '[]'; fi ;;
@@ -4587,6 +4859,122 @@ fi
         }
         let report = state.join("report.md");
         std::fs::write(&report, "").unwrap();
+        if witness.starts_with("adopted") {
+            let branch = "work/634-slice";
+            git(&work, &["checkout", "-B", branch, &receipt.base]).unwrap();
+            git(
+                &work,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "refactor(core): director slice",
+                ],
+            )
+            .unwrap();
+            let tip = git(&work, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            let live = if witness == "adopted-moved" {
+                "d".repeat(40)
+            } else {
+                tip.clone()
+            };
+            std::fs::write(
+                outer.join("remote-tip"),
+                format!("{live}\trefs/heads/{branch}\n"),
+            )
+            .unwrap();
+            git(
+                &work,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fix(core): continue the slice",
+                ],
+            )
+            .unwrap();
+            if witness == "adopted-race" {
+                std::fs::write(outer.join("publish-mode"), "publish-token-lease").unwrap();
+            }
+            dispatch.branch = branch.into();
+            dispatch.resume = true;
+            dispatch.continuation = Continuation::Adopted {
+                pr: 800,
+                branch: branch.into(),
+                tip: tip.clone(),
+            };
+            let adopted = json!({"state":"open","number":800,"draft":true,"user":{"login":"carrick-workers[bot]","type":"Bot"},
+                "head":{"ref":branch,"sha":live,"repo":{"full_name":REPOSITORY}},
+                "base":{"ref":"main","repo":{"full_name":REPOSITORY}},"body":"Director body\n\nCloses #634"});
+            std::fs::write(outer.join("adopted-pr.json"), adopted.to_string()).unwrap();
+            std::fs::write(
+                outer.join("adopted-issue.json"),
+                json!({"number":634,"state":"open","user":{"login":"tjfontaine","type":"User"}})
+                    .to_string(),
+            )
+            .unwrap();
+            std::fs::write(outer.join("pr.json"), json!([adopted]).to_string()).unwrap();
+            std::fs::write(outer.join("created"), "").unwrap();
+            receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            receipt.branch = branch.into();
+            receipt.expected_tip = tip.clone();
+            receipt.pr_body = Some("A worker's rewrite of the director's body.".into());
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            let calls = regular_text(&outer.join("gh.args")).unwrap_or_default();
+            assert!(
+                !calls.contains("create") && !calls.contains("PATCH") && !calls.contains("edit"),
+                "adopted publication wrote PR metadata: {calls}"
+            );
+            let applied = Applied::load().unwrap();
+            assert_eq!(applied.publication_pr, None);
+            if witness == "adopted" {
+                assert_eq!(result.unwrap(), Some(800));
+                let push = regular_text(&outer.join("push.args")).unwrap();
+                assert!(
+                    push.contains(&format!("HEAD:refs/heads/{branch}\n")),
+                    "{push}"
+                );
+                assert!(
+                    push.contains(&format!("--force-with-lease=refs/heads/{branch}:{tip}\n")),
+                    "{push}"
+                );
+                assert!(
+                    matches!(&applied.body, AppliedBody::Refused { reason, template_created: false } if reason.contains("adopted PR")),
+                    "{}",
+                    applied.report()
+                );
+                assert_eq!(applied.lease_refused, None);
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("moved after admission"), "{error}");
+                assert!(
+                    applied.report().contains("Push refused"),
+                    "{}",
+                    applied.report()
+                );
+                assert!(applied.lease_refused.is_some());
+                assert!(applied.commits.is_empty());
+                assert!(!state.join("published-tip").exists());
+                if witness == "adopted-moved" {
+                    assert!(
+                        !outer.join("push-attempts").exists(),
+                        "pushed over a moved head"
+                    );
+                }
+            }
+            return;
+        }
         if matches!(
             witness,
             "publish-token-auth-push"
@@ -6137,6 +6525,253 @@ fi
             validate_event(&event, "tjfontaine").is_err(),
             "unowned PR admitted"
         );
+    }
+    #[test]
+    fn agent_comment_adopts_a_director_pr_through_guard_admission() {
+        const CHILD: &str = "CARRICK_TEST_DISPATCH_ADOPTION";
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            crate::lock_file::tests::write_test_executable(
+                bin.join("gh"),
+                r#"#!/bin/sh
+test "$1" = api || exit 93
+if test "$2" = graphql; then cat "$ADOPTION_FIXTURE/graphql.json"; exit 0; fi
+file="$ADOPTION_FIXTURE/$(printf '%s' "$2" | tr '/' '_')"
+test -f "$file" || { echo "unexpected endpoint $2" >&2; exit 91; }
+cat "$file"
+"#,
+                std::fs::Permissions::from_mode(0o700),
+            );
+            for head in [None, Some("b".repeat(40))] {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        std::thread::current().name().unwrap(),
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("ADOPTION_FIXTURE", temp.path())
+                    .env("GH_TOKEN", "fixture-token")
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env_remove("CARRICK_DISPATCH_HEAD");
+                if let Some(head) = &head {
+                    command.env("CARRICK_DISPATCH_HEAD", head);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let fixture = PathBuf::from(std::env::var_os("ADOPTION_FIXTURE").unwrap());
+        let tip = "a".repeat(40);
+        let comment = json!({"id":123,"user":{"login":"tjfontaine","type":"User"},"body":"/agent continue the slice","created_at":"2026-10-30T00:00:00Z","updated_at":"2026-10-30T00:00:00Z"});
+        let event = json!({"action":"created","repository":{"full_name":REPOSITORY},
+            "sender":{"login":"tjfontaine","type":"User"},
+            "issue":{"number":1150,"state":"open","title":"refactor: slice 4","body":"","user":{"login":"carrick-workers[bot]","type":"Bot"},"pull_request":{"url":"pr"}},
+            "comment":comment});
+        let pr = json!({"number":1150,"state":"open","draft":false,"user":{"login":"carrick-workers[bot]","type":"Bot"},
+            "head":{"ref":"work/986-slice4","sha":tip,"repo":{"full_name":REPOSITORY}},
+            "base":{"ref":"main","repo":{"full_name":REPOSITORY}},"body":"Closes #986"});
+        let issue = json!({"number":986,"state":"open","title":"Slice the kernel","body":"## Brief\nDo it","user":{"login":"tjfontaine","type":"User"}});
+        let references = |numbers: &[u64]| {
+            let nodes: Vec<_> = numbers
+                .iter()
+                .map(|n| json!({"number":n,"repository":{"nameWithOwner":REPOSITORY}}))
+                .collect();
+            let connection = json!({"nodes":nodes,"pageInfo":{"hasNextPage":false}});
+            json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":connection,"bodyReferences":connection}}}})
+        };
+        let write = |name: &str, value: &Value| {
+            std::fs::write(
+                fixture.join(format!("repos/{REPOSITORY}/{name}").replace('/', "_")),
+                value.to_string(),
+            )
+            .unwrap();
+        };
+        let event_path = fixture.join("event.json");
+        let admit =
+            |event: &Value, pr: &Value, issue: &Value, live_comment: &Value, refs: &[u64]| {
+                write("issues/comments/123", live_comment);
+                write("pulls/1150", pr);
+                write("issues/986", issue);
+                std::fs::write(fixture.join("graphql.json"), references(refs).to_string()).unwrap();
+                std::fs::write(&event_path, event.to_string()).unwrap();
+                let (loaded, adoption) = load_event(&fixture, &event_path)?;
+                validate_event_with_publication(&loaded, "tjfontaine", None, adoption.as_ref())
+            };
+        if std::env::var_os("CARRICK_DISPATCH_HEAD").is_some() {
+            let error = admit(&event, &pr, &issue, &comment, &[986]).unwrap_err();
+            assert!(error.to_string().contains("stale PR head"), "{error}");
+            return;
+        }
+        let dispatch = admit(&event, &pr, &issue, &comment, &[986])
+            .expect("owner /agent on a director PR must adopt it");
+        assert_eq!(dispatch.issue, 986);
+        assert_eq!(dispatch.branch, "work/986-slice4");
+        assert!(dispatch.resume);
+        assert_eq!(dispatch.selected_tip.as_deref(), Some(tip.as_str()));
+        assert_eq!(
+            dispatch.continuation,
+            Continuation::Adopted {
+                pr: 1150,
+                branch: "work/986-slice4".into(),
+                tip: tip.clone()
+            }
+        );
+        let mut owner_pr = pr.clone();
+        owner_pr["user"] = json!({"login":"tjfontaine","type":"User"});
+        assert!(admit(&event, &owner_pr, &issue, &comment, &[986]).is_ok());
+
+        let mut admitted = Vec::new();
+        let mut refuse = |case: &str, result: Result<Dispatch, ScalerError>| {
+            if result.is_ok() {
+                admitted.push(case.to_owned());
+            }
+        };
+        for (pointer, value) in [
+            ("/head/repo/full_name", json!("outsider/carrick")),
+            ("/base/repo/full_name", json!("outsider/carrick")),
+            ("/head/ref", json!("main")),
+            ("/head/ref", json!("feature/slice4")),
+            ("/head/ref", json!("work/../main")),
+            ("/base/ref", json!("release")),
+            ("/user/login", json!("outsider")),
+            ("/user/type", json!("User")),
+            ("/state", json!("closed")),
+        ] {
+            let mut bad = pr.clone();
+            *bad.pointer_mut(pointer).unwrap() = value.clone();
+            refuse(
+                &format!("pr {pointer}={value}"),
+                admit(&event, &bad, &issue, &comment, &[986]),
+            );
+        }
+        for refs in [&[][..], &[986, 987][..]] {
+            refuse(
+                &format!("references {refs:?}"),
+                admit(&event, &pr, &issue, &comment, refs),
+            );
+        }
+        for (pointer, value) in [
+            ("/state", json!("closed")),
+            ("/user/login", json!("outsider")),
+            ("/number", json!(987)),
+        ] {
+            let mut bad = issue.clone();
+            *bad.pointer_mut(pointer).unwrap() = value.clone();
+            refuse(
+                &format!("issue {pointer}={value}"),
+                admit(&event, &pr, &bad, &comment, &[986]),
+            );
+        }
+        let mut edited = comment.clone();
+        edited["updated_at"] = "2026-10-30T00:01:00Z".into();
+        refuse(
+            "live comment edited",
+            admit(&event, &pr, &issue, &edited, &[986]),
+        );
+        for (pointer, value) in [
+            ("/comment/user/login", json!("outsider")),
+            ("/comment/updated_at", json!("2026-10-30T00:01:00Z")),
+            ("/sender/login", json!("outsider")),
+        ] {
+            let mut bad = event.clone();
+            *bad.pointer_mut(pointer).unwrap() = value.clone();
+            let mut live = comment.clone();
+            if let Some(field) = pointer.strip_prefix("/comment") {
+                *live.pointer_mut(field).unwrap() = value.clone();
+            }
+            refuse(
+                &format!("event {pointer}={value}"),
+                admit(&bad, &pr, &issue, &live, &[986]),
+            );
+        }
+        assert!(admitted.is_empty(), "unsafe adoptions: {admitted:?}");
+        // A dispatch-named ref is never adopted: it takes the owned path,
+        // which needs the run that created the branch.
+        let mut named = pr.clone();
+        named["head"]["ref"] = "work/dispatch-986-42".into();
+        let error = admit(&event, &named, &issue, &comment, &[986])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("actions/runs/42"), "{error}");
+        // The proof binds to the PR it was made for.
+        let (loaded, adoption) = {
+            write("pulls/1150", &pr);
+            std::fs::write(&event_path, event.to_string()).unwrap();
+            load_event(&fixture, &event_path).unwrap()
+        };
+        let mut moved = loaded.clone();
+        moved["pull_request"]["head"]["sha"] = "c".repeat(40).into();
+        assert!(
+            validate_event_with_publication(&moved, "tjfontaine", None, adoption.as_ref()).is_err()
+        );
+        let mut review = loaded;
+        review["review"] =
+            json!({"state":"changes_requested","user":{"login":"tjfontaine","type":"User"}});
+        review["action"] = "submitted".into();
+        assert!(
+            validate_event_with_publication(&review, "tjfontaine", None, adoption.as_ref())
+                .is_err()
+        );
+    }
+    #[test]
+    fn adopted_push_targets_only_the_adopted_ref_under_the_admitted_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        fixture_repository(temp.path());
+        let tip = "a".repeat(40);
+        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
+        dispatch.issue = 986;
+        dispatch.branch = "work/986-slice4".into();
+        dispatch.resume = true;
+        dispatch.continuation = Continuation::Adopted {
+            pr: 1150,
+            branch: dispatch.branch.clone(),
+            tip: tip.clone(),
+        };
+        git(temp.path(), &["checkout", "-b", &dispatch.branch]).unwrap();
+        let command = push_command(temp.path(), &dispatch, "", &tip).unwrap();
+        let args: Vec<_> = command.get_args().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(args.last(), Some(&"HEAD:refs/heads/work/986-slice4"));
+        assert_eq!(args.iter().filter(|s| s.starts_with("HEAD:")).count(), 1);
+        let lease = format!("--force-with-lease=refs/heads/work/986-slice4:{tip}");
+        assert!(args.contains(&lease.as_str()), "{args:?}");
+        // Any lease but the admitted tip, including none, is refused.
+        assert!(push_command(temp.path(), &dispatch, "", "").is_err());
+        assert!(push_command(temp.path(), &dispatch, "", &"b".repeat(40)).is_err());
+        // The run id of an owned branch never redirects an adopted push.
+        assert!(push_command(temp.path(), &dispatch, "42", &tip).is_ok());
+        // Any other checked-out or requested branch is refused.
+        for branch in ["work/dispatch-986-42", "work/another-lane", "main"] {
+            git(temp.path(), &["checkout", "-B", branch]).unwrap();
+            assert!(
+                push_command(temp.path(), &dispatch, "42", &tip).is_err(),
+                "{branch}"
+            );
+            let mut other = dispatch.clone();
+            other.branch = branch.into();
+            assert!(
+                push_command(temp.path(), &other, "42", &tip).is_err(),
+                "{branch}"
+            );
+        }
+        git(temp.path(), &["checkout", "-B", "work/dispatch-986-42"]).unwrap();
+        let mut forged = dispatch.clone();
+        forged.branch = "work/dispatch-986-42".into();
+        forged.continuation = Continuation::Adopted {
+            pr: 1150,
+            branch: forged.branch.clone(),
+            tip: tip.clone(),
+        };
+        assert!(push_command(temp.path(), &forged, "42", &tip).is_err());
     }
     #[test]
     fn review_base_uses_admitted_main_and_never_the_merge_sha() {

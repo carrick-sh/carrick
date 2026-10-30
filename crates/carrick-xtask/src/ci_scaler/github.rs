@@ -505,16 +505,6 @@ impl Github {
                 false,
             )?;
             let branch = pr["head"]["ref"].as_str().unwrap_or_default();
-            let Some(issue_number) = crate::dispatch_worker::dispatch_branch(branch) else {
-                return Ok(false);
-            };
-            let original_id = crate::dispatch_worker::branch_run(issue_number, branch)?;
-            let original = request(
-                "GET",
-                &format!("repos/{REPOSITORY}/actions/runs/{original_id}"),
-                None,
-                false,
-            )?;
             let heads: Vec<_> = steps
                 .iter()
                 .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch head "))
@@ -523,19 +513,47 @@ impl Github {
                 || !full_sha(heads[0])
                 || pr["head"]["sha"] != heads[0]
                 || pr["state"] != "open"
-                || !crate::dispatch_worker::owned_pr(
-                    &pr,
-                    &original,
-                    issue_number,
-                    branch,
-                    (if pr["user"]["login"] == "carrick-workers[bot]" {
-                        publication(&pr, &original, issue_number, branch)
-                    } else {
-                        None
-                    })
-                    .as_ref(),
-                )
             {
+                return Ok(false);
+            }
+            let Some(issue_number) = crate::dispatch_worker::dispatch_branch(branch) else {
+                // The same adoption predicate the guard and clone admission use.
+                use crate::dispatch_worker::AdoptionRead;
+                let adoption = crate::dispatch_worker::adopted_pr(&pr, |read| match read {
+                    AdoptionRead::ClosingReferences(number) => request(
+                        "POST",
+                        "graphql",
+                        Some(crate::dispatch_worker::closing_references_request(number)),
+                        false,
+                    ),
+                    AdoptionRead::Issue(number) => request(
+                        "GET",
+                        &format!("repos/{REPOSITORY}/issues/{number}"),
+                        None,
+                        false,
+                    ),
+                })?;
+                return Ok(adoption.is_some());
+            };
+            let original_id = crate::dispatch_worker::branch_run(issue_number, branch)?;
+            let original = request(
+                "GET",
+                &format!("repos/{REPOSITORY}/actions/runs/{original_id}"),
+                None,
+                false,
+            )?;
+            if !crate::dispatch_worker::owned_pr(
+                &pr,
+                &original,
+                issue_number,
+                branch,
+                (if pr["user"]["login"] == "carrick-workers[bot]" {
+                    publication(&pr, &original, issue_number, branch)
+                } else {
+                    None
+                })
+                .as_ref(),
+            ) {
                 return Ok(false);
             }
             issue = request(
@@ -880,6 +898,87 @@ mod tests {
         assert!(
             unsafe_cases.is_empty(),
             "controller unsafe cases: {unsafe_cases:?}"
+        );
+    }
+    #[test]
+    fn agent_comment_controller_admits_only_an_adoptable_director_pr() {
+        let mut run = review_run(99);
+        run["event"] = "issue_comment".into();
+        run["head_branch"] = "main".into();
+        let tip = "a".repeat(40);
+        let mut unsafe_cases = Vec::new();
+        for (case, allowed) in [
+            ("adopted", true),
+            ("owner_authored", true),
+            ("fork", false),
+            ("head_main", false),
+            ("non_work_ref", false),
+            ("dispatch_ref", false),
+            ("third_party_author", false),
+            ("no_reference", false),
+            ("two_references", false),
+            ("closed_issue", false),
+            ("other_issue_author", false),
+            ("stale", false),
+            ("edited", false),
+            ("outsider", false),
+            ("closed_pr", false),
+        ] {
+            let mut comment = json!({"id":123,"issue_url":format!("https://api.github.com/repos/{REPOSITORY}/issues/1150"),"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-30T00:00:00Z","updated_at":"2026-10-30T00:00:00Z","body":"/agent continue"});
+            let digest = crate::dispatch_worker::comment_digest(&comment);
+            if case == "edited" {
+                comment["updated_at"] = "2026-10-30T00:01:00Z".into();
+            }
+            if case == "outsider" {
+                comment["user"]["login"] = "outsider".into();
+            }
+            let mut pr = json!({"number":1150,"state":"open","draft":false,"user":{"login":"carrick-workers[bot]","type":"Bot"},
+                "head":{"ref":"work/986-slice4","sha":tip,"repo":{"full_name":REPOSITORY}},
+                "base":{"ref":"main","repo":{"full_name":REPOSITORY}},"body":"Closes #986"});
+            let mut issue =
+                json!({"number":986,"state":"open","user":{"login":"tjfontaine","type":"User"}});
+            let mut references = vec![986];
+            match case {
+                "owner_authored" => pr["user"] = json!({"login":"tjfontaine","type":"User"}),
+                "fork" => pr["head"]["repo"]["full_name"] = "outsider/carrick".into(),
+                "head_main" => pr["head"]["ref"] = "main".into(),
+                "non_work_ref" => pr["head"]["ref"] = "feature/slice4".into(),
+                "dispatch_ref" => pr["head"]["ref"] = "work/dispatch-986-42".into(),
+                "third_party_author" => pr["user"] = json!({"login":"outsider","type":"User"}),
+                "no_reference" => references.clear(),
+                "two_references" => references.push(987),
+                "closed_issue" => issue["state"] = "closed".into(),
+                "other_issue_author" => issue["user"]["login"] = "outsider".into(),
+                "stale" => pr["head"]["sha"] = "b".repeat(40).into(),
+                "closed_pr" => pr["state"] = "closed".into(),
+                _ => {}
+            }
+            let nodes: Vec<_> = references
+                .iter()
+                .map(|n| json!({"number":n,"repository":{"nameWithOwner":REPOSITORY}}))
+                .collect();
+            let connection = json!({"nodes":nodes,"pageInfo":{"hasNextPage":false}});
+            let admitted = Github::admits_run(&Admission::Agent, &run, &mut |method, endpoint, body, _| {
+                Ok(if endpoint.contains("/jobs?") {
+                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success","steps":[{"name":format!("Dispatch comment 1150 123 {digest}"),"conclusion":"success"},{"name":format!("Dispatch head {tip}"),"conclusion":"success"}]}]}])
+                } else if endpoint == "graphql" {
+                    assert_eq!(method, "POST");
+                    assert_eq!(body.unwrap()["variables"]["number"], 1150);
+                    json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":connection,"bodyReferences":connection}}}})
+                } else if endpoint.ends_with("/issues/comments/123") { comment.clone() }
+                else if endpoint.ends_with("/issues/1150") { json!({"pull_request":{}}) }
+                else if endpoint.ends_with("/pulls/1150") { pr.clone() }
+                else if endpoint.ends_with("/issues/986") { issue.clone() }
+                else if endpoint.ends_with("/actions/runs/42") { Err(ScalerError::Guard("owned path"))? }
+                else { panic!("unexpected endpoint {endpoint}") })
+            }, &mut |_, _, _, _| None).unwrap();
+            if admitted != allowed {
+                unsafe_cases.push(case);
+            }
+        }
+        assert!(
+            unsafe_cases.is_empty(),
+            "controller adoption cases decided wrongly: {unsafe_cases:?}"
         );
     }
     #[test]
