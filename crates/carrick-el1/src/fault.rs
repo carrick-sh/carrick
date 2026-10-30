@@ -1568,9 +1568,26 @@ fn dispatch_classified_fault<
             {
                 Ok(window) => window,
                 Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied) => {
-                    // Same verdict as an occupied reply at application: a
-                    // concurrent publication invalidates the observed fault,
-                    // not the instruction. Re-enter without physical supply.
+                    // The output exists but is still invalid. The child's
+                    // inherited physical custody, not fresh zero backing, must
+                    // authorize this page's first publication.
+                    let mut page = window;
+                    page.host_backing = match window.host_backing {
+                        Some(source) => {
+                            Some(source.advance(window.fault_page - window.range.start())?)
+                        }
+                        None => None,
+                    };
+                    page.range = carrick_el1_abi::ReservationRange::new(
+                        window.fault_page,
+                        window.fault_page.checked_add(4096)?,
+                    )?;
+                    let slot = owner.slots.grant(slot as usize)?;
+                    return slot
+                        .publish_prepared_fault_selection(window.operation.sequence.get(), page)
+                        .then_some(());
+                }
+                Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::AlreadyValid) => {
                     retry = true;
                     return None;
                 }

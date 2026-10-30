@@ -655,6 +655,7 @@ impl NativeService {
             let (phase, window) = match selection {
                 ServiceFaultSupply::Cow(window) => (HvpatchNativeFaultPhase::Cow, window),
                 ServiceFaultSupply::Backing(window) => (HvpatchNativeFaultPhase::Backing, window),
+                ServiceFaultSupply::Prepared(window) => (HvpatchNativeFaultPhase::Backing, window),
             };
             carrick_observability::probes::hvpatch_native_fault_supply(
                 self.request().identity.birth.mm.mm().raw(),
@@ -678,6 +679,9 @@ impl NativeService {
             Some(carrick_core_abi::service::ServiceFaultSupply::Cow(window)) => window,
             Some(carrick_core_abi::service::ServiceFaultSupply::Backing(window)) => {
                 return self.supply_backing(window);
+            }
+            Some(carrick_core_abi::service::ServiceFaultSupply::Prepared(window)) => {
+                return self.supply_prepared(window);
             }
             None => return self.refuse(),
         };
@@ -782,6 +786,39 @@ impl NativeService {
         drop(exclusion);
         drop(source);
         self.complete(supplied)
+    }
+
+    fn supply_prepared(
+        self,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let Some(NativeServiceReply::Fault(reply)) = self.reply else {
+            return self.refuse();
+        };
+        let custody = Arc::clone(&self.custody);
+        let handle = self.request().identity.birth.mm;
+        let mut stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()) != Some(handle)
+            || stock.owner.is_quarantined(handle.mm())
+        {
+            return self.refuse();
+        }
+        let root = stock.owner.child_root(handle.mm()).ok_or_else(stale)?;
+        // SAFETY: intake retains this authenticated request-owned reply.
+        let reply = unsafe { reply.as_ref() };
+        let Some(txn) = stock.owner.stage_native_prepared_reply(
+            &mut crate::fork_stock::fork_table_accounting(&custody),
+            handle,
+            root,
+            reply,
+            window,
+        )?
+        else {
+            drop(stock);
+            return self.refuse();
+        };
+        drop(stock);
+        self.finish_backing_supply(handle, root, reply, &txn)
     }
 
     fn supply_backing(

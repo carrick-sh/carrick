@@ -401,6 +401,21 @@ pub trait NativeSupplyCustody {
     type Backing: Send + 'static;
     fn supplied(&mut self) -> Option<&mut NativePhysicalGrants<Self::Backing>>;
 }
+/// Backend storage hooks for publishing inherited backing. Exact MM/root
+/// admission, reply construction and settlement belong to ForkStock.
+pub trait NativePreparedSupplyCustody: NativeSupplyCustody {
+    fn retained_prepared_frame(
+        &self,
+        address: carrick_guest_arch::UserVa,
+    ) -> Option<carrick_el1_abi::PortalForkCustody>;
+    fn prepared_supply(
+        &mut self,
+        owner: GuestFrameOwner,
+    ) -> (
+        &mut NativePhysicalGrants<Self::Backing>,
+        Arc<PhysicalGrantRollback>,
+    );
+}
 /// One exact-MM, exact-root backing publication. Offered custody is never
 /// rolled back by Drop: only authenticated withdrawal or the ring's completed
 /// undo receipt can authorize release. A failed transaction stays here intact.
@@ -462,6 +477,89 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
     }
     fn reply_key(slot: &carrick_el1_abi::PortalGrantSlot) -> usize {
         core::ptr::from_ref(slot).addr()
+    }
+    /// Retain a one-page publication of already-owned fork backing. The
+    /// caller borrows `selected` from the exact MM's live physical retention;
+    /// that retention outlives this reply through the existing MM retirement.
+    /// No allocation, inventory change or writable permission is introduced.
+    pub fn stage_prepared_reply(
+        &mut self,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+        window: carrick_el1_abi::PortalGrantWindow,
+        root: carrick_guest_arch::RootGpa,
+        selected: carrick_el1_abi::PortalForkCustody,
+        rollback: Arc<PhysicalGrantRollback>,
+    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn, TrapError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
+        };
+        let carrick_el1_abi::PortalForkCustody::Frame {
+            va,
+            ipa,
+            len,
+            shared: false,
+        } = selected
+        else {
+            return Err(Self::reply_failure());
+        };
+        let offset = window
+            .fault_page
+            .checked_sub(va)
+            .filter(|offset| offset.checked_add(4096).is_some_and(|end| end <= len));
+        let output = offset.and_then(|offset| ipa.checked_add(offset));
+        if !window.valid()
+            || self.failed
+            || window.operation.mm.raw() != self.owner.native_mm.raw().get()
+            || window.operation.incarnation != self.owner.root_generation.raw()
+            || self.replies.contains_key(&Self::reply_key(slot))
+            || window.range.start() != window.fault_page
+            || window.range.len() != 4096
+            || output.is_none_or(|output| !output.is_multiple_of(4096))
+        {
+            return Err(Self::reply_failure());
+        }
+        // Unlike fresh backing this uses no residency slot. Its journal is
+        // bounded by live request-owned reply allocations, one per retained
+        // native service, rather than by the fresh-grant residency capacity.
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(self.owner.native_mm.raw().get())
+                    .ok_or_else(Self::reply_failure)?,
+                generation: window.operation.sequence,
+            },
+            root: carrick_mmu_core::aarch64::SubstrateGpa(root.address().raw()),
+            op: DescriptorOp::Publish {
+                span: PageSpan::new(window.fault_page, 4096),
+                expected_ipa: carrick_mmu_core::aarch64::SubstrateGpa(
+                    output.ok_or_else(Self::reply_failure)?,
+                ),
+                access: if window
+                    .protection
+                    .permits(carrick_core_abi::ReservationProtection::READ)
+                    || window
+                        .protection
+                        .permits(carrick_core_abi::ReservationProtection::WRITE)
+                {
+                    carrick_mmu_core::aarch64::LeafAccess::Read
+                } else {
+                    carrick_mmu_core::aarch64::LeafAccess::Execute
+                },
+            },
+            tables: TableGrants::NONE,
+        };
+        self.replies.insert(
+            Self::reply_key(slot),
+            PrivateSupplyTransaction {
+                txn,
+                window,
+                physical: None,
+                settlement: None,
+                offered: false,
+                release: None,
+                rollback,
+            },
+        );
+        Ok(txn)
     }
     /// Couple the exact transaction, inventory undo and allocation BEFORE
     /// submit makes it consumable. No wider reservation authority is created.
@@ -608,8 +706,8 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
             };
             if !matches!(outcome, BackingReplySettlement::Receipt(receipt)
                 if matches!(receipt.outcome, DescriptorOutcome::Applied(_)))
+                && let Some(physical) = pending.physical.as_mut()
             {
-                let physical = pending.physical.as_mut().ok_or_else(Self::reply_failure)?;
                 physical
                     .custody
                     .receipt
@@ -650,7 +748,12 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
             {
                 return Err(Self::reply_failure());
             }
-            let physical = pending.physical.take().ok_or_else(Self::reply_failure)?;
+            let Some(physical) = pending.physical.take() else {
+                // Existing fork custody remains with the MM on apply,
+                // cancellation and refusal; there are no new bytes to undo.
+                self.replies.remove(&Self::reply_key(slot));
+                return Ok(());
+            };
             if matches!(outcome, BackingReplySettlement::Receipt(receipt)
                 if matches!(receipt.outcome, carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)))
             {
@@ -758,5 +861,117 @@ impl<R: Send + 'static> NativePhysicalGrants<R> {
             count += 1;
         }
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod prepared_reply_tests {
+    use super::*;
+    use carrick_el1_abi::{PortalForkCustody, PortalGrantSlot, PortalGrantWindow};
+    use carrick_guest_arch::{ContextGeneration, MmGeneration, RootGpa};
+
+    fn fixture() -> (
+        NativePhysicalGrants<()>,
+        PortalGrantWindow,
+        PortalForkCustody,
+        RootGpa,
+    ) {
+        let owner = GuestFrameOwner {
+            native_mm: MmGeneration::new(NonZeroU64::MIN),
+            root_generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let window =
+            PortalGrantWindow::decode([1, 1, 1, 1, 1, 0x5000, 0x6000, 3, 0x5000, 0, 0, 0, 0])
+                .unwrap();
+        let selected = PortalForkCustody::Frame {
+            va: 0x4000,
+            ipa: 0xa0000,
+            len: 8192,
+            shared: false,
+        };
+        let root = RootGpa::page_aligned(FrameGpa::new(0x10000)).unwrap();
+        (NativePhysicalGrants::new(owner), window, selected, root)
+    }
+
+    #[test]
+    fn prepared_reply_cancellation_and_refusal_never_release_inherited_bytes() {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, DescriptorRefusal,
+        };
+        for phase in 0..3 {
+            let (mut grants, window, selected, root) = fixture();
+            let slot = PortalGrantSlot::new();
+            let txn = grants
+                .stage_prepared_reply(&slot, window, root, selected, Arc::default())
+                .unwrap();
+            assert!(
+                matches!(txn.op, DescriptorOp::Publish { expected_ipa, .. } if expected_ipa.raw() == 0xa1000)
+            );
+            assert!(grants.grants.is_empty());
+            if phase != 0 {
+                assert!(grants.offer_backing_reply(&slot, &txn));
+            }
+            if phase == 2 {
+                slot.descriptor().claim_for_mm(1).unwrap().complete(
+                    DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking),
+                    || {},
+                );
+            }
+            let outcome = grants
+                .settle_backing_reply(&slot, &txn, |_| {
+                    panic!("inherited bytes cannot be released")
+                })
+                .unwrap();
+            assert!(if phase == 2 {
+                matches!(outcome, BackingReplySettlement::Receipt(_))
+            } else {
+                outcome == BackingReplySettlement::Withdrawn
+            });
+            grants.acknowledge_backing_reply(&slot, &txn).unwrap();
+            assert!(grants.replies.is_empty());
+            assert!(grants.grants.is_empty());
+            assert!(!grants.failed());
+            assert!(
+                grants
+                    .stage_prepared_reply(&slot, window, root, selected, Arc::default())
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_reply_rejects_foreign_mm_shared_or_uncovered_custody() {
+        let (mut grants, window, selected, root) = fixture();
+        let slot = PortalGrantSlot::new();
+        let mut foreign = window;
+        foreign.operation.incarnation = NonZeroU64::new(2).unwrap();
+        assert!(
+            grants
+                .stage_prepared_reply(&slot, foreign, root, selected, Arc::default())
+                .is_err()
+        );
+        for selected in [
+            PortalForkCustody::Frame {
+                va: 0x4000,
+                ipa: 0xa0000,
+                len: 4096,
+                shared: false,
+            },
+            PortalForkCustody::Frame {
+                va: 0x4000,
+                ipa: 0xa0000,
+                len: 8192,
+                shared: true,
+            },
+        ] {
+            assert!(
+                grants
+                    .stage_prepared_reply(&slot, window, root, selected, Arc::default())
+                    .is_err()
+            );
+        }
+        assert!(grants.replies.is_empty());
+        assert!(!grants.failed());
     }
 }
