@@ -1183,6 +1183,59 @@ fn admitted_proc_executable_private_mmap_avoids_its_own_gate() {
     assert!(tail[37..].iter().all(|byte| *byte == 0));
 }
 
+/// Eager population cannot use lazy owner custody yet. A refusal must keep
+/// main's syscall errno rather than ending the carrier (#1133 review).
+#[test]
+fn admitted_private_host_file_populate_self_held_gate_is_not_fatal() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause};
+    use std::num::NonZeroU64;
+
+    for extra_flags in [LinuxMmapFlags::POPULATE, LinuxMmapFlags::LOCKED] {
+        let mut dispatcher = SyscallDispatcher::new();
+        install_host_file_fd(&dispatcher, FILE_FD, b"file payload");
+        let root = Root::admit(&dispatcher);
+        let mut memory = arena_memory();
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let index = spaces.publish_closed(root.mm.raw(), 0x1000, 0).unwrap();
+        let excluded = spaces.raise_and_wait_for_editor(index, || {});
+        let held = carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
+        // SAFETY: the scripted backend models this exact locally held gate.
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    root.mm,
+                    NonZeroU64::new(1).unwrap(),
+                ),
+                PortalWaitCause::Gate,
+                15,
+            )
+        };
+        memory.write_refusal.set(Some(wait));
+        let address = LINUX_MMAP_BASE + 14 * PAGE;
+        let outcome = host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            address,
+            PAGE,
+            LINUX_PROT_READ | LINUX_PROT_WRITE,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | extra_flags.bits(),
+            FILE_FD,
+        );
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM
+            }
+        );
+        assert_eq!(memory.write_calls.get(), 1);
+        assert_eq!(memory.write_bytes_total.get(), 0);
+        assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
+        drop(held);
+        spaces.lower(index);
+    }
+}
+
 #[test]
 fn admitted_private_file_mmap_keeps_partial_last_page_in_owner_root() {
     let mut dispatcher = SyscallDispatcher::new();

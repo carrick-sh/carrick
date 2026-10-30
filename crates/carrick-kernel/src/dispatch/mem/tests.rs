@@ -8017,7 +8017,7 @@ fn remap_file_pages_and_mincore_wait_for_owner_refused_copyout_without_mutating_
 }
 
 #[test]
-fn private_file_mmap_self_held_gate_is_an_invariant() {
+fn private_file_mmap_self_held_gate_is_an_invariant_only_with_custody() {
     use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
     use std::num::NonZeroU64;
     let mut dispatcher = SyscallDispatcher::new();
@@ -8071,9 +8071,14 @@ fn private_file_mmap_self_held_gate_is_an_invariant() {
     );
     let reporter = CompatReporter::default();
     let outcome = dispatcher.dispatch(&context, request, &mut memory, &reporter);
-    assert!(
-        matches!(&outcome, Err(DispatchError::MmapSelfHeldOwnerGate(observed)) if *observed == wait),
-        "self-held Gate must be its typed invariant error: {outcome:?}"
+    // SyntheticFile has no owner source lease. A self-held refusal in this
+    // still-eager path is the outstanding #1141 defect, not proof of a broken
+    // custody invariant. Preserve main's syscall outcome until it is repaired.
+    assert_eq!(
+        outcome.unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOMEM
+        },
     );
     assert_eq!(memory.write_calls.get(), 1);
     assert_eq!(memory.write_bytes_total.get(), 0);

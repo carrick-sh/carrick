@@ -2617,10 +2617,14 @@ source bytes and the zero-filled partial EOF page. Existing HostFile bindings
 remain behavior-preservation controls.
 
 The `kernel.memory.owner-wait` VM-free binding registers the real HAL
-editor-exclusion witness for the calling thread and exact MM. An attempted
-copy through that self-held Gate is an invariant violation, never a dependency
-to park on or errno 12.
-This invalid reacquisition is distinct from contention with another holder.
+editor-exclusion witness for the calling thread and exact MM. A self-held
+Gate is a typed invariant only after owner source custody has been secured;
+that venue must never eagerly copy. A registration alone is insufficient:
+POPULATE/LOCKED HostFile maps and SyntheticFile/InMemoryFile/VFS File maps
+still take the eager path. Their existing errno 12 outcome is preserved,
+rather than promoted to a run-fatal error. The admitted POPULATE/LOCKED and
+SyntheticFile witnesses characterize that boundary; they do not claim Linux
+conformance for the outstanding eager self-reacquisition repair (#1141).
 The existing owner-wait venue remains the only producer enrollment mechanism.
 
 A genuinely foreign refusal during eager initialization remains #1124:

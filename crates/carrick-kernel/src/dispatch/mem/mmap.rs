@@ -1420,7 +1420,9 @@ impl<'a> MemView<'a> {
                 Ok(length) => length,
                 Err(error) => return Ok(request.refused_by(
                     MmapRefusal::Internal("executable length could not be read during mmap"),
-                    linux_errno::EIO,
+                    error.raw_os_error()
+                        .map(crate::host_to_linux_errno)
+                        .unwrap_or(linux_errno::EIO),
                     format_args!("{error}"),
                 )),
             };
@@ -2358,7 +2360,11 @@ impl<'a> MemView<'a> {
                     ));
                 }
                 if let Err(error) = memory.write_bytes_unchecked(address, &bytes) {
-                    if let MemoryError::OwnerWait(wait) = &error
+                    // Only retained source custody promises that this mapping
+                    // never initializes through UserWrite. The still-eager
+                    // paths do not have that guarantee (#1141).
+                    if owner_source_lease.is_some()
+                        && let MemoryError::OwnerWait(wait) = &error
                         && wait.cause() == carrick_el1_abi::PortalWaitCause::Gate
                         && carrick_hal::el1_editor_exclusion::with_held_exclusion(
                             wait.handle().mm().raw(), |held| held.is_some(),
@@ -2368,8 +2374,9 @@ impl<'a> MemView<'a> {
                         // redispatch would close our gate again before copying.
                         return Err(DispatchError::MmapSelfHeldOwnerGate(*wait));
                     }
-                    // Foreign waits here require retained address/source custody,
-                    // not numeric syscall redispatch (follow-up #1124).
+                    // Eager self-reacquisition needs the excluded editor (#1141);
+                    // foreign waits need retained address/source custody, not
+                    // numeric syscall redispatch (#1124).
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("file content could not be copied into the mapping"),
