@@ -348,8 +348,16 @@ fn running_compact(
     zone: &ZoneTables<carrick_sched_core::ParkedContextWords>,
     generation: u64,
 ) -> (SlotId, carrick_sched_core::RecordId, ExecutionBinding) {
+    running_compact_with_identity(zone, generation, |_| {})
+}
+
+fn running_compact_with_identity(
+    zone: &ZoneTables<carrick_sched_core::ParkedContextWords>,
+    generation: u64,
+    edit: impl FnOnce(&mut ThreadIdentity),
+) -> (SlotId, carrick_sched_core::RecordId, ExecutionBinding) {
     let slot = SlotId::new(1);
-    let identity = ThreadIdentity {
+    let mut identity = ThreadIdentity {
         tid: 71,
         serial: 113,
         mm: 29,
@@ -360,6 +368,7 @@ fn running_compact(
         lifecycle_page: 0x1000,
         control_slot: 0x2000,
     };
+    edit(&mut identity);
     zone.drive(slot, 3);
     zone.publish_slot(slot, identity.mm, None, 0);
     let here = ExecutionSlot::zone(slot);
@@ -684,7 +693,7 @@ fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
     assert!(
         custody
             .retire_zone_current(&member, &mut _membership, foreign, source, record)
-            .is_none()
+            .is_err()
     );
     assert_eq!(classify(), MissingContinuationVerdict::InvariantViolation);
     custody
