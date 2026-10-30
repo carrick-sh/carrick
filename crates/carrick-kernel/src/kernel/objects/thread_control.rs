@@ -505,6 +505,10 @@ impl ThreadControlLease {
         (self.0.owner, self.0.thread)
     }
 
+    pub fn birth_identity(&self) -> Option<carrick_core::terminal::ThreadBirthIdentity> {
+        host_birth_identity(self.0.owner, self.0.thread)
+    }
+
     /// Same process authority for every slot issued by this arena. Numeric
     /// task keys, including equal keys in distinct kernels, cannot alias it.
     pub fn lifecycle(&self) -> ThreadLifecycleLease {

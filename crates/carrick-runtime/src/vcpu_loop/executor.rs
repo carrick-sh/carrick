@@ -448,7 +448,8 @@ where
                 continue;
             }
             if let crate::trap::TrapError::ZoneContinuationMissing { record, .. } = &error {
-                let member = running.thread().control_slot();
+                let control = running.thread().control_lease();
+                let member = &*control;
                 let birth = carrick_kernel::kernel::objects::host_birth_identity(
                     running.thread().task_key(),
                     thread,
@@ -457,7 +458,7 @@ where
                     carrick_core::terminal::missing_zone_continuation(
                         member,
                         birth,
-                        member.host_birth_identity(),
+                        control.birth_identity(),
                         *record,
                         member.zone_record(),
                     )
