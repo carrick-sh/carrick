@@ -9396,3 +9396,302 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     service.retire_fd_table(children[1]);
     assert_eq!(owner.drain_retired_tables().unwrap(), 2);
 }
+
+/// #887 (`at=618:9` in `el1_sched_exec_from_a_sibling_with_parked_threads`):
+/// When a non-leader sibling in a root process registered in `REGISTRY` calls
+/// `execve`, the host drains the parked siblings, retires the pre-exec
+/// `ThreadControlSlot` identities (`visible_tid = 0`), and promotes the
+/// calling sibling in place on the shared `ThreadLifecyclePage` to a fresh
+/// replacement leader `ThreadControlSlot` (`entry() == None`, `visible_tid ==
+/// pid`, new `mm`, new `root_generation`). The next EL1 syscall on the
+/// post-exec leader must rebind the root group in `REGISTRY` and reap the
+/// retired predecessor pool entry instead of failing `with_process_entry` with
+/// `Stale` and aborting in `refuse_owner_process_call` (`618:9`, `record=none`).
+#[test]
+fn arm_host_exec_from_sibling_with_parked_threads_rebinds_root_entry() {
+    use carrick_core::terminal::ThreadBirthIdentity;
+    use carrick_core_abi::entry::{BirthSerial, EntryTaskKey, EntryThreadGeneration};
+    use carrick_el1_abi::Lifecycle;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+
+    // Two pooled sibling threads (tid 42 parked, tid 43 calling execve), both
+    // published on `fixture.page` and registered in `REGISTRY`.
+    let (parked_sibling, parked_record) = imported_thread_with_identity(fixture, |identity| {
+        identity.tid = 42;
+        identity.serial = 102;
+    });
+    let parked_entry = parked_sibling.entry().unwrap();
+    fixture.page.publish(parked_entry).unwrap();
+    run_as(fixture, 42, 12, 102, parked_sibling);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        parked_record.id
+    );
+    registry()
+        .register_thread(
+            source,
+            &fixture.task,
+            fixture.address,
+            fixture.page,
+            parked_sibling,
+        )
+        .unwrap();
+    fixture.zone.unswitch(fixture.slot, parked_record.id);
+
+    let exec_sibling = Box::leak(Box::new(ThreadControlSlot::new()));
+    let exec_entry = fixture
+        .page
+        .stock(
+            1,
+            carrick_el1_abi::EntryIdentity {
+                tid: 43,
+                visible_tid: 43,
+                thread_serial: 103,
+                birth: BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(exec_entry, exec_sibling as *const _ as u64)
+        .unwrap();
+    let exec_identity = carrick_sched_core::ThreadIdentity {
+        tid: 43,
+        serial: 103,
+        mm: 1,
+        file_table: 5,
+        generation: 12,
+        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+        affinity: 1,
+        lifecycle_page: fixture.page as *const _ as u64,
+        control_slot: exec_sibling as *const _ as u64,
+    };
+    let exec_record_id = fixture.zone.alloc_record(exec_identity).unwrap();
+    let exec_record = fixture.zone.record_ref(exec_record_id);
+    unsafe {
+        *fixture.zone.record(exec_record_id).ctx_mut() =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    }
+    exec_sibling
+        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, exec_entry)
+        .unwrap();
+    assert!(exec_sibling.publish_visible_tid(43));
+    exec_sibling.bind_zone_record(exec_record);
+    let exec_claim = fixture.page.claim_any().unwrap();
+    fixture.page.thread_born().unwrap();
+    fixture
+        .page
+        .record_born(
+            exec_claim,
+            carrick_el1_abi::BornRecord {
+                caller_task: 41,
+                caller_serial: 101,
+                clone_flags: 0x0001_0000,
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+    fixture.zone.requeue_preempted(fixture.slot, exec_record_id);
+    fixture.page.publish(exec_entry).unwrap();
+    // Dequeue `parked_record` first so `exec_record` switches in on `fixture.slot`.
+    let _ = fixture.zone.claim_for_host(
+        parked_record,
+        None,
+        carrick_el1_abi::Handback::Cancelled,
+        &carrick_sched_core::ShortLockSpin,
+    );
+    run_as(fixture, 43, 12, 103, exec_sibling);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        exec_record.id
+    );
+    registry()
+        .register_thread(
+            source,
+            &fixture.task,
+            fixture.address,
+            fixture.page,
+            exec_sibling,
+        )
+        .unwrap();
+    fixture.zone.unswitch(fixture.slot, exec_record.id);
+    assert_eq!(fixture.page.live(), 3);
+
+    // Host `execve` from `exec_sibling` (tid 43) drains `parked_sibling` (tid 42)
+    // and leader (tid 41), then `commit_exec_transition` retires all pre-exec
+    // control slot identities and promotes `exec_sibling` in place to the
+    // replacement leader (tid 41, mm 2, root_generation 102, serial 104).
+    let parked_membership = fixture.page.reserve_nonfinal_exit().unwrap();
+    fixture
+        .page
+        .retire_published_host_member(parked_entry, parked_sibling, parked_membership)
+        .unwrap();
+    let parked_receipt = ThreadBirthIdentity::from_parts(
+        EntryTaskKey::from_raw(42),
+        BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+        EntryThreadGeneration::from_raw(102),
+    )
+    .unwrap();
+    fixture
+        .page
+        .publish_exact_host_retirement(parked_sibling, parked_receipt.retirement());
+    let leader_membership = fixture.page.reserve_nonfinal_exit().unwrap();
+    leader_membership.publish();
+    assert_eq!(fixture.page.live(), 1);
+
+    let _ = fixture.zone.claim_for_host(
+        parked_record,
+        None,
+        carrick_el1_abi::Handback::Cancelled,
+        &carrick_sched_core::ShortLockSpin,
+    );
+    let _ = fixture.zone.claim_for_host(
+        exec_record,
+        None,
+        carrick_el1_abi::Handback::Cancelled,
+        &carrick_sched_core::ShortLockSpin,
+    );
+    fixture.zone.clear_current(fixture.slot);
+    if let Some(prev) = fixture.zone.slot(fixture.slot).host_record() {
+        fixture.zone.discard_unpublished(fixture.slot, prev);
+    }
+
+    fixture.control.retire_identity();
+    parked_sibling.retire_identity();
+    exec_sibling.retire_identity();
+
+    let replacement_control: &'static ThreadControlSlot =
+        Box::leak(Box::new(ThreadControlSlot::new()));
+    let replacement_birth = ThreadBirthIdentity::from_parts(
+        EntryTaskKey::from_raw(41),
+        BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap()),
+        EntryThreadGeneration::from_raw(104),
+    )
+    .unwrap();
+    replacement_control.publish_host_birth_identity(replacement_birth);
+    replacement_control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[1]));
+    unsafe {
+        replacement_control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+            core::ptr::from_ref(replacement_control).expose_provenance() as u64,
+        ));
+    }
+
+    let new_root_gpa = 0x20000;
+    let new_asid = asid(2);
+    let new_ttbr0 = (u64::from(new_asid.raw()) << 48) | new_root_gpa;
+    let new_mm_gen = MmGeneration::new(NonZeroU64::new(2).unwrap());
+    fixture.zone.mm_issuer().observe_existing(new_mm_gen);
+    let space = fixture
+        .zone
+        .spaces
+        .publish_closed(2, new_ttbr0, new_ttbr0)
+        .unwrap();
+    fixture.zone.spaces.open(space);
+    let new_index = fixture.zone.spaces.find(2).unwrap();
+    let new_mm = ReservationMm::new(2).unwrap();
+    fixture
+        .region
+        .table()
+        .publish(
+            new_index.index(),
+            new_mm,
+            carrick_el1_abi::Layout {
+                heap: carrick_el1_abi::ReservationRange::new(4096, VA).unwrap(),
+                arena: carrick_el1_abi::ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
+                policy: carrick_el1_abi::ReservationPolicyPayload::new([
+                    4096,
+                    u64::MAX,
+                    u64::MAX,
+                    0,
+                    0,
+                ]),
+            },
+        )
+        .unwrap();
+    super::aarch64_process::Portal::for_zone(NonZeroU64::MIN, fixture.region.table(), fixture.zone)
+        .root_any(new_mm, 0)
+        .unwrap()
+        .finish_import()
+        .unwrap();
+    fixture.zone.drive(fixture.slot, 2);
+    fixture.zone.publish_slot(fixture.slot, 2, Some(0), 1);
+    fixture.zone.enter_guest(fixture.slot);
+    fixture.zone.install_space(fixture.slot, 2).unwrap();
+
+    fixture.task.set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(13),
+        6,
+    );
+    fixture.task.mm.key.store(2, Ordering::Release);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(104, Ordering::Release);
+    fixture.task.publish_visible_pid(41);
+    fixture
+        .task
+        .publish_root_generation(ContextGeneration::new(NonZeroU64::new(102).unwrap()));
+    fixture.task.publish_lifecycle(
+        fixture.page as *const _ as u64,
+        replacement_control as *const _ as u64,
+    );
+
+    assert_eq!(
+        registry().thread_group_owner(fixture.zone, fixture.page, 41),
+        super::native_process_runtime::NativeThreadGroupOwner::Root,
+    );
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 0;
+    frame.x[8] = 94; // exit_group(0)
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut cpu = crate::sched::FakeCpu::default();
+    let route = super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        fixture.page,
+        replacement_control,
+        &ThreadCtx::ZERO,
+        new_ttbr0,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .expect("post-exec replacement leader must rebind root entry without Stale/EntryBinding");
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    );
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 0);
+}
