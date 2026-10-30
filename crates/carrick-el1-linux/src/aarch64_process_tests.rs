@@ -1298,6 +1298,7 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
 
@@ -1379,6 +1380,7 @@ fn plain_fork_owns_an_independent_fd_table() {
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
 
@@ -1478,6 +1480,7 @@ fn test_fork_private_pages_cow_armed_in_both() {
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
 
@@ -1600,6 +1603,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
 
@@ -1945,6 +1949,7 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
             fixture.address,
             fixture.address,
             parked,
+            std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
         )
         .unwrap(),
     );
@@ -2314,6 +2319,7 @@ fn test_stock_loan_requested_and_settled_once() {
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
 
@@ -2443,6 +2449,7 @@ fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
 
@@ -2694,7 +2701,7 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
     };
     let old = super::common_entry::execution_binding(&fixture.task);
     let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
-    assert!(carrick_core::entry::retire_current(old, source, record).is_some());
+    assert!(carrick_core::entry::retire_current(old, source, record, None).is_some());
     let phase = carrick_sched_core::TerminalPhase::PendingRetirement;
     assert!(carrick_core::entry::terminal_matches(old, source, phase));
     // Global record storage can be reissued before the terminal crossing.
@@ -2716,7 +2723,7 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
         .unwrap();
     assert_eq!(current, record);
     assert!(!carrick_core::entry::terminal_matches(old, source, phase));
-    assert!(carrick_core::entry::retire_current(old, source, current).is_none());
+    assert!(carrick_core::entry::retire_current(old, source, current, None).is_none());
     assert_eq!(fixture.zone.slot(fixture.slot).host_record(), Some(current));
     assert_eq!(fixture.zone.record(current).identity(), replacement);
     let next = carrick_el1_abi::ExecutionBinding {
@@ -2724,7 +2731,7 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
         thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(replacement.serial),
         ..old
     };
-    assert!(carrick_core::entry::retire_current(next, source, current).is_some());
+    assert!(carrick_core::entry::retire_current(next, source, current, None).is_some());
     // Each stale control differs from the retained custody in exactly one
     // field, so no single comparison can be dropped without admitting it.
     for stale in [
@@ -2795,6 +2802,7 @@ pub fn with_native_terminal_host_handback(
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
     let sibling = ThreadControlSlot::new();
@@ -3001,6 +3009,7 @@ pub fn with_native_file_fork(
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
     let crossing = Crossing {
@@ -3572,7 +3581,8 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                         .unwrap();
                 let terminal_entry = control.entry();
                 fixture.page.try_exit().unwrap();
-                carrick_core::entry::retire_current(process.binding(), source, record.id).unwrap();
+                carrick_core::entry::retire_current(process.binding(), source, record.id, None)
+                    .unwrap();
                 admission.commit_with_member(control).unwrap();
                 if notified {
                     let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
@@ -4202,6 +4212,7 @@ fn native_child_sigsuspend_wakes_from_parent_signal() {
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
     let crossing = TestStockCrossing::new(&[
@@ -7543,6 +7554,7 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
             fixture.address,
             fixture.address,
             initial,
+            std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
         )
         .unwrap(),
     );
@@ -8075,6 +8087,7 @@ fn native_child_resources(mapping_last: Option<bool>) {
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
     let owner = Arc::new(
@@ -8492,6 +8505,7 @@ fn serial_host_native_fork_unpublished_parent_ipc_table_succeeds_without_einval(
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
     let owner = Arc::new(HostIpc::with_limits(1 << 20, IpcLimits::ZONE).unwrap());
@@ -8659,6 +8673,7 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
     let owner = Arc::new(
@@ -9096,6 +9111,7 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
         fixture.address,
         fixture.address,
         parked,
+        std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )
     .unwrap();
     let owner = Arc::new(

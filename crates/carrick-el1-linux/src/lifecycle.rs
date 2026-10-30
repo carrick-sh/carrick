@@ -512,6 +512,7 @@ impl<
                 slot,
             },
             record.id,
+            None,
         );
         #[cfg(test)]
         if self.handoff.is_some() {

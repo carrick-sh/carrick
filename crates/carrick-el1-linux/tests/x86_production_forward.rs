@@ -559,6 +559,7 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
             address,
             address,
             context_words(address),
+            std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
         )
         .unwrap(),
     );

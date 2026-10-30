@@ -2647,6 +2647,7 @@ mod tests {
                     binding,
                     carrick_el1_abi::BornInZoneSource { zone, slot },
                     record,
+                    None,
                 )
                 .unwrap();
             // Actual raw-exit release has completed, but its ABI publication

@@ -359,6 +359,7 @@ impl<'a> From<&'a PendingSummary> for PendingRead<'a> {
 /// }
 /// ```
 pub struct NativePendingCustody<'a> {
+    release: ::alloc::sync::Arc<dyn NativePendingRelease + 'a>,
     control: ::alloc::sync::Arc<MemberControlCustody<'a, ThreadControlSlot>>,
 }
 #[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
@@ -367,13 +368,14 @@ pub struct NativePendingAlreadyAdmitted;
 impl<'a> NativePendingCustody<'a> {
     pub fn try_admit(
         control: ::alloc::sync::Arc<MemberControlCustody<'a, ThreadControlSlot>>,
+        release: ::alloc::sync::Arc<dyn NativePendingRelease + 'a>,
     ) -> Result<Self, NativePendingAlreadyAdmitted> {
         control
             .control()
             .native_pending_writer
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| NativePendingAlreadyAdmitted)?;
-        Ok(Self { control })
+        Ok(Self { control, release })
     }
     pub fn replace_from_locked_queue(&self, pending: PendingSignals) {
         self.control
@@ -382,15 +384,14 @@ impl<'a> NativePendingCustody<'a> {
             .replace_from_locked_queue(pending);
     }
 }
-pub type NativePendingReleaseHook = fn(&ThreadControlSlot);
-
-static NATIVE_PENDING_RELEASE_HOOK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-/// Install the notification hook invoked after `NativePendingCustody` clears
-/// `native_pending_writer` on a `ThreadControlSlot`.
-pub fn set_native_pending_release_hook(hook: NativePendingReleaseHook) {
-    NATIVE_PENDING_RELEASE_HOOK.store(hook as *const () as usize, Ordering::Release);
+/// An owned notification venue, retained with the exact pending writer.
+pub trait NativePendingRelease: Send + Sync {
+    fn pending_released(&self, control: &ThreadControlSlot);
+}
+impl<F: Fn(&ThreadControlSlot) + Send + Sync> NativePendingRelease for F {
+    fn pending_released(&self, control: &ThreadControlSlot) {
+        self(control);
+    }
 }
 
 impl Drop for NativePendingCustody<'_> {
@@ -400,12 +401,7 @@ impl Drop for NativePendingCustody<'_> {
             .native_pending
             .replace_from_locked_queue(PendingSignals(0));
         control.native_pending_writer.store(0, Ordering::Release);
-        let raw = NATIVE_PENDING_RELEASE_HOOK.load(Ordering::Acquire);
-        if raw != 0 {
-            // SAFETY: `set_native_pending_release_hook` only stores valid `NativePendingReleaseHook` function pointers.
-            let hook = unsafe { core::mem::transmute::<usize, NativePendingReleaseHook>(raw) };
-            hook(control);
-        }
+        self.release.pending_released(control);
     }
 }
 
@@ -2536,7 +2532,11 @@ mod tests {
     fn carrier_queue_cleanup_cannot_clear_native_pending_custody() {
         let control = ThreadControlSlot::new();
         let custody = Arc::new(MemberControlCustody::retain(&control).unwrap());
-        let native = NativePendingCustody::try_admit(custody.clone()).unwrap();
+        let native = NativePendingCustody::try_admit(
+            custody.clone(),
+            alloc::sync::Arc::new(|_: &ThreadControlSlot| {}),
+        )
+        .unwrap();
         native.replace_from_locked_queue(PendingSignals(0x100));
         let _ = control
             .carrier_pending()
@@ -2553,30 +2553,81 @@ mod tests {
     }
 
     #[test]
+    fn native_pending_release_is_scoped_to_two_owners() {
+        let first = ThreadControlSlot::new();
+        let second = ThreadControlSlot::new();
+        let first_count = Arc::new(AtomicU32::new(0));
+        let second_count = Arc::new(AtomicU32::new(0));
+        let first_notify = first_count.clone();
+        let second_notify = second_count.clone();
+        let first_writer = NativePendingCustody::try_admit(
+            Arc::new(MemberControlCustody::retain(&first).unwrap()),
+            Arc::new(move |control: &ThreadControlSlot| {
+                assert!(!control.native_pending_busy());
+                assert_eq!(control.pending().load(), PendingSignals(0));
+                first_notify.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+        .unwrap();
+        let second_writer = NativePendingCustody::try_admit(
+            Arc::new(MemberControlCustody::retain(&second).unwrap()),
+            Arc::new(move |control: &ThreadControlSlot| {
+                assert!(!control.native_pending_busy());
+                assert_eq!(control.pending().load(), PendingSignals(0));
+                second_notify.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+        .unwrap();
+        first_writer.replace_from_locked_queue(PendingSignals(0x100));
+        second_writer.replace_from_locked_queue(PendingSignals(0x400));
+        drop(first_writer);
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 0);
+        assert!(second.native_pending_busy());
+        assert_eq!(second.pending().load(), PendingSignals(0x400));
+        drop(second_writer);
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn native_pending_writer_admission_is_exclusive_until_drop() {
         let control = ThreadControlSlot::new();
         let custody = Arc::new(MemberControlCustody::retain(&control).unwrap());
-        let writer = NativePendingCustody::try_admit(custody.clone()).unwrap();
+        let writer = NativePendingCustody::try_admit(
+            custody.clone(),
+            alloc::sync::Arc::new(|_: &ThreadControlSlot| {}),
+        )
+        .unwrap();
         writer.replace_from_locked_queue(PendingSignals(0x100));
         // A different retain must encounter the same slot's admission claim.
         let independent = Arc::new(MemberControlCustody::retain(&control).unwrap());
         assert_eq!(
-            NativePendingCustody::try_admit(independent).err(),
+            NativePendingCustody::try_admit(
+                independent,
+                alloc::sync::Arc::new(|_: &ThreadControlSlot| {})
+            )
+            .err(),
             Some(NativePendingAlreadyAdmitted)
         );
         assert_eq!(control.pending().load(), PendingSignals(0x100));
         assert!(control.reset_for_host_birth(BlockedMask(0)).is_err());
         drop(writer);
         assert_eq!(control.pending().load(), PendingSignals(0));
-        let successor = NativePendingCustody::try_admit(custody.clone()).unwrap();
+        let successor = NativePendingCustody::try_admit(
+            custody.clone(),
+            alloc::sync::Arc::new(|_: &ThreadControlSlot| {}),
+        )
+        .unwrap();
         successor.replace_from_locked_queue(PendingSignals(0x400));
         assert_eq!(control.pending().load(), PendingSignals(0x400));
         drop(successor);
         drop(custody);
         control.reset_for_host_birth(BlockedMask(0)).unwrap();
-        let next_birth = NativePendingCustody::try_admit(Arc::new(
-            MemberControlCustody::retain(&control).unwrap(),
-        ))
+        let next_birth = NativePendingCustody::try_admit(
+            Arc::new(MemberControlCustody::retain(&control).unwrap()),
+            alloc::sync::Arc::new(|_: &ThreadControlSlot| {}),
+        )
         .unwrap();
         assert_eq!(control.pending().load(), PendingSignals(0));
         drop(next_birth);

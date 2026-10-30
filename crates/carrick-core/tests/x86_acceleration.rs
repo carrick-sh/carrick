@@ -1995,7 +1995,8 @@ fn x4_shared_wait_records() {
     let op_token = OperationToken::new(tid, 1).unwrap();
 
     let request = carrick_core_abi::ObjectParkRequest::new(key, snapshot, op_token, None);
-    let parked = park_object_record(&zone, slot, request, &|_| {}, || Ok((record, false))).unwrap();
+    let parked =
+        park_object_record(&zone, slot, request, &|_| {}, || Ok((record, false)), None).unwrap();
     assert!(parked.matches(&zone, slot));
     assert!(zone.slot(slot).current().is_none());
 
@@ -2026,10 +2027,17 @@ fn x4_shared_wait_records() {
         bad_token,
         Some(5000),
     );
-    let res = park_object_record(&zone, slot, concurrent_request, &|_| {}, || {
-        context_saved.set(true);
-        Ok((concurrent, false))
-    })
+    let res = park_object_record(
+        &zone,
+        slot,
+        concurrent_request,
+        &|_| {},
+        || {
+            context_saved.set(true);
+            Ok((concurrent, false))
+        },
+        None,
+    )
     .unwrap();
     assert!(res.matches(&zone, slot));
     assert!(
@@ -2043,10 +2051,17 @@ fn x4_shared_wait_records() {
     let stale_token = OperationToken::new(tid, 3).unwrap();
     let stale_request =
         carrick_core_abi::ObjectParkRequest::new(stale_key, snapshot, stale_token, None);
-    let res_stale = park_object_record(&zone, slot, stale_request, &|_| {}, || {
-        context_saved.set(true);
-        Ok((record, false))
-    });
+    let res_stale = park_object_record(
+        &zone,
+        slot,
+        stale_request,
+        &|_| {},
+        || {
+            context_saved.set(true);
+            Ok((record, false))
+        },
+        None,
+    );
     assert!(res_stale.is_err());
     assert!(
         !context_saved.get(),

@@ -257,6 +257,7 @@ fn with_pair(run: impl FnOnce(Pair<'_, '_>)) {
             address,
             address,
             words,
+            std::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
         )
         .unwrap(),
     );

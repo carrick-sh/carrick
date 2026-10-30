@@ -465,6 +465,7 @@ impl NativeSignalFixture {
                 address,
                 address,
                 words(address),
+                alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
             )
             .unwrap(),
         );
@@ -987,6 +988,7 @@ impl NativeOwnerSignalFixture {
                 address,
                 address,
                 words,
+                alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
             )
             .unwrap(),
         );

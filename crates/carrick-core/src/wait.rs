@@ -55,6 +55,7 @@ pub fn park_object_record<'a, S, C: carrick_core_abi::EntryContext>(
     request: ObjectParkRequest,
     completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     save_context: S,
+    release: Option<&dyn crate::entry::RecordRelease<C>>,
 ) -> Result<ObjectParked<'a, C>, (ObjectWaitError, OperationToken)>
 where
     S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
@@ -121,7 +122,7 @@ where
     Ok(ObjectParked::new(
         zone,
         slot,
-        start.map(crate::entry::HandoffStart::published),
+        start.map(|start| start.published(release)),
     ))
 }
 

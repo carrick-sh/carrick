@@ -16,6 +16,12 @@ pub mod object_wait;
 
 /// The CPU state and the per-vCPU hardware the in-guest scheduler uses.
 pub trait ThreadCpu {
+    /// The execution context's retained record-release venue, if subscribed.
+    fn record_release(
+        &self,
+    ) -> Option<&'static dyn carrick_core::entry::RecordRelease<Aarch64ParkedContext>> {
+        None
+    }
     /// Save the running thread's `frame` and live state into `ctx`.
     fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext);
     /// Make `ctx` the running thread: fill `frame` and load live state.
@@ -315,6 +321,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             start,
             &guard,
             carrick_el1_abi::EntryRecordGeneration(seq),
+            self.cpu.record_release(),
         );
         if receipt.is_none() {
             drop(guard);
@@ -426,7 +433,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if self.zone.slot(self.slot).current() == Some(record) {
             return Some(Served::Returned { switched: false });
         }
-        let receipt = carrick_core::entry::publish_handoff_yield(start);
+        let receipt = carrick_core::entry::publish_handoff_yield(start, self.cpu.record_release());
         self.record_handoff(receipt);
         if loaded {
             self.program_timer(true);

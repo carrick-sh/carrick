@@ -971,6 +971,7 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
                     start,
                     &guard,
                     carrick_core_abi::EntryRecordGeneration(sequence),
+                    None,
                 )
                 .unwrap(),
             );

@@ -447,7 +447,14 @@ fn admit_entry_runtime(
         address.generation.raw().get(),
     );
     let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source, task, page, control, address, address, words,
+        source,
+        task,
+        page,
+        control,
+        address,
+        address,
+        words,
+        alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
     )?);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
     Ok((runtime, address))
