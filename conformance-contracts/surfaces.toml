@@ -934,7 +934,7 @@ contracts = ["core.entry.completion", "kernel.el1.futex-handoff"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/lifecycle.rs"
-contracts = ["kernel.scheduler.runnable-progress", "core.entry.completion", "kernel.el1.thread-lifecycle"]
+contracts = ["kernel.el1.ipc-two-process", "kernel.scheduler.runnable-progress", "core.entry.completion", "kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/pending_file.rs"
@@ -1065,7 +1065,7 @@ contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wai
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_runtime.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child", "process.native.arm-admission", "kernel.copyout.owner-refusal", "kernel.vcpu.shutdown-entry"]
+contracts = ["kernel.el1.ipc-two-process", "kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child", "process.native.arm-admission", "kernel.copyout.owner-refusal", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs"
@@ -1425,7 +1425,7 @@ contracts = ["process.native.short-lock"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/ipc.rs"
-contracts = ["process.native.short-lock", "kernel.el1.ipc-lifecycle"]
+contracts = ["kernel.el1.ipc-two-process", "process.native.short-lock", "kernel.el1.ipc-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-x86/src/segments.rs"
@@ -1545,7 +1545,7 @@ contracts = ["core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/dispatch.rs"
-contracts = ["process.native.arm-admission", "core.entry.completion", "core.personality.files", "kernel.el1.ipc-fd-authority", "process.exec.custody"]
+contracts = ["kernel.el1.ipc-two-process", "process.native.arm-admission", "core.entry.completion", "core.personality.files", "kernel.el1.ipc-fd-authority", "process.exec.custody"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/trap.rs"
@@ -1847,7 +1847,7 @@ contracts = ["kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation/ipc.rs"
-contracts = ["kernel.memory.owner-wait"]
+contracts = ["kernel.el1.ipc-two-process", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs"
@@ -1975,7 +1975,7 @@ contracts = ["process.exec.custody"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child", "process.exec.custody"]
+contracts = ["kernel.el1.ipc-two-process", "kernel.scheduler.runnable-progress", "process.native.terminal-child", "process.exec.custody"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs"
@@ -2123,4 +2123,12 @@ contracts = ["core.lifecycle.publication"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_ipc_wake_tests.rs"
+contracts = ["kernel.el1.ipc-two-process"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/object_wait.rs"
+contracts = ["kernel.el1.ipc-two-process"]
+
+[[surfaces]]
+path = "crates/carrick-el1-linux/src/ipc/epoll.rs"
 contracts = ["kernel.el1.ipc-two-process"]

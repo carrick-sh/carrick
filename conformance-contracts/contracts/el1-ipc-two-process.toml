@@ -7,6 +7,8 @@ guest_surfaces = [
   "syscall:eventfd2",
   "syscall:pipe2",
   "syscall:clone",
+  "syscall:kill",
+  "syscall:epoll_pwait",
   "kernel:continuation",
   "vmm:hvf",
 ]
@@ -14,18 +16,20 @@ semantic_authority = [
   "man 2 pipe / man 7 pipe: a read on an empty pipe with a live writer blocks until data is written, and returns EOF after every writer closes; writes of at most PIPE_BUF bytes are atomic",
   "man 2 eventfd: a read blocks while the counter is zero and returns the counter value once it is nonzero",
   "man 2 fork: parent and child hold independent descriptor tables over the same open descriptions",
+  "man 7 signal / man 2 read: a caught signal interrupts a blocked pipe read with EINTR (4), or the read restarts after the handler under SA_RESTART; transferred bytes are returned",
+  "man 7 signal / man 2 epoll_wait: an interrupted epoll wait returns EINTR regardless of SA_RESTART",
 ]
 fixture = "embed:el1-sched ipc-processes pipe|eventfd 1|8|64 128"
 scale_points = [1, 8, 64]
 rationale = "Request/response IPC between forked processes (`pairs` concurrent pairs, 128 rounds each) must be carried by the in-guest scheduler: each read and write is served at EL1, and a read that would block parks the thread in the guest and is woken by the peer's write without a host exit. `el1_ipc_two_processes_blocking` asserts, per kind and pair count, served read[63] and write[64] each at least 2 * pairs * rounds, at least pairs * rounds guest parks, and fewer forwarded reads than pairs * rounds (a continuation that fell back forwards one read per round). Forwarding every blocking read instead would cost one host park and wake per round, growing with the loop."
 
 [bindings]
-vm_free = "carrick-el1-linux::aarch64_process_tests::native_ipc_wake_tests::{serial_host_two_native_children_pipe_eof_wake_without_a_guest_executor,serial_host_two_native_children_pipe_eof_wake_with_the_executor_away} (two production fork children, inherited descriptions, scalar read parks, final host writer close while the sole slot is stopped, exact token retention and EOF completion; no signed instruction or throughput claim)"
+vm_free = "carrick-el1-linux::aarch64_process_tests::native_ipc_wake_tests::{serial_host_two_native_children_pipe_eof_wake_without_a_guest_executor,serial_host_two_native_children_pipe_eof_wake_with_the_executor_away,serial_host_two_native_children_pipe_signal_with_the_executor_away,serial_host_two_native_children_pipe_signal_sa_restart_with_the_executor_away,serial_host_two_native_children_pipe_signal_without_executor_release,serial_host_two_native_children_pipe_signal_before_enrollment,serial_host_two_native_children_timed_epoll_signal_never_restarts,serial_host_two_native_children_pipe_partial_read_preserves_committed_byte,serial_host_two_native_children_pipe_signal_races_peer_eof_exactly_once} (production forks and descriptor custody, two reader children and a sender on a separate live driver; exactly two parks, exact token retention and one publication, EINTR/handler frames, decoded SA_RESTART read completing after peer write, committed-byte preservation, and bounded peer EOF race; no signed instruction or throughput claim)"
 embed = "carrick-embed::el1_sched::el1_ipc_two_processes_blocking"
 
 [bindings.unresolved]
 docker = "Linux semantics of pipe and eventfd blocking are fixed by man pages; the fixture checks the completed round count itself. Same-source Docker differential binding remains open."
-embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts served[63]/[64] >= 2*pairs*rounds, zero-fallback parks >= pairs*rounds, and forwarded read[63] < pairs*rounds outside the contract evaluator."
+embed_structural = "Not yet a registered WorkObservation binding: the signed test asserts served[63]/[64] >= 2*pairs*rounds, zero-fallback parks >= pairs*rounds, and forwarded read[63] < pairs*rounds outside the contract evaluator. Native scalar pipe signal/SA_RESTART execution and timed-epoll signal integration remain director-owned signed acceptance; the VM-free signal-frame witness does not execute guest handler instructions."
 
 # Integer-expressible form of "forwarded reads < rounds per pair": every scale
 # unit is one pair, and the fixture may forward fewer than `rounds` (128) reads

@@ -8599,7 +8599,7 @@ fn activate_target(
         AddressContext<RootGpa>,
         Aarch64ParkedContext,
     >,
-) {
+) -> carrick_sched_core::SwitchedIn {
     let zone = source.zone;
     for _ in 0..8 {
         let switched = zone.switch_in_full(source.slot).unwrap();
@@ -8620,7 +8620,7 @@ fn activate_target(
                 .store(identity.serial, Ordering::Release);
             task.publish_visible_pid(binding.visible_pid);
             task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
-            return;
+            return switched;
         }
         zone.requeue_preempted(source.slot, switched.record);
     }

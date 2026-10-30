@@ -379,25 +379,27 @@ pub fn interrupted(op: &IpcOperation, cause: IpcCause, clock: CounterClock) -> I
             },
         };
     }
-    let written = op.progress.written;
-    if written > 0 {
-        return IpcHostOutcome::Complete {
-            result: written as i64,
+    use carrick_signal_core::wait::{
+        RestartClass, TransferredBytes, WaitDecision, WaitProgress, interrupted_wait,
+    };
+    let progress = usize::try_from(op.progress.written)
+        .ok()
+        .and_then(TransferredBytes::new)
+        .map_or(WaitProgress::Blocked, WaitProgress::Transferred);
+    let restart = match cause {
+        IpcCause::Signal { restart } => Some(restart),
+        IpcCause::Stop | IpcCause::Control | IpcCause::Timeout => None,
+    };
+    match interrupted_wait(RestartClass::IfSaRestart, progress, restart) {
+        WaitDecision::CompletePartial(bytes) => IpcHostOutcome::Complete {
+            result: bytes.get() as i64,
             sigpipe: false,
-        };
-    }
-    match cause {
-        IpcCause::Signal { restart: false } => IpcHostOutcome::Complete {
+        },
+        WaitDecision::Eintr => IpcHostOutcome::Complete {
             result: LINUX_EINTR.guest_retval(),
             sigpipe: false,
         },
-        // A read/write never parks with a deadline: a timeout claim is a
-        // control action for it. A stop is not in man 7 signal's list for
-        // read/write: after SIGCONT the call continues (here: re-runs).
-        IpcCause::Signal { restart: true }
-        | IpcCause::Stop
-        | IpcCause::Control
-        | IpcCause::Timeout => IpcHostOutcome::Restart {
+        _ => IpcHostOutcome::Restart {
             x0: op.orig_x0,
             nr: op.nr,
             timeout_ms: None,

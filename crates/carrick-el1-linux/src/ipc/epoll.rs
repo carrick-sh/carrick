@@ -86,6 +86,7 @@ pub(super) fn resume<C: ThreadCpu, U: UserWord, M: UserCopy>(
     user: &mut M,
     token: IpcOpToken,
     op: IpcOperation,
+    interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
     let wait = if sched.object_wait_expired() {
         Wait::Poll
@@ -93,7 +94,7 @@ pub(super) fn resume<C: ThreadCpu, U: UserWord, M: UserCopy>(
         op.deadline.get().map_or(Wait::Forever, Wait::Until)
     };
     finish(sched, token, &venue.region);
-    serve_with(sched, frame, venue, user, Some(wait))
+    serve_with(sched, frame, venue, user, Some(wait), interrupt)
 }
 
 /// Serve a fresh `epoll_pwait` (see the module docs for what forwards).
@@ -102,8 +103,9 @@ pub(super) fn serve<C: ThreadCpu, U: UserWord, M: UserCopy>(
     frame: &mut TrapFrame,
     venue: &IpcVenue<'_>,
     user: &mut M,
+    interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
-    serve_with(sched, frame, venue, user, None)
+    serve_with(sched, frame, venue, user, None, interrupt)
 }
 
 /// `wait`: what is left of a resumed call's wait (`None`: a fresh call,
@@ -114,6 +116,7 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
     venue: &IpcVenue<'_>,
     user: &mut M,
     wait: Option<Wait>,
+    interrupt: &mut dyn FnMut() -> bool,
 ) -> IpcServed {
     if frame.x[4] != 0 {
         return leave(sched, IpcLeave::EpollSigmask, IpcServed::Forward);
@@ -278,6 +281,7 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
             WaitFor::Readable,
             snap,
             deadline,
+            interrupt,
         ) {
             Parked::Done(served) => return served,
             // Readiness moved before the park: retire the record (the pin

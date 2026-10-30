@@ -3012,7 +3012,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
-        let native_sigpipe = self.process.is_some();
+        let native_signals = self.process.is_some();
         let Some(frame) = self.frame.arm_frame() else {
             self.frame.record_isa_unsupported_forward();
             return FamilyCompletion::Forward;
@@ -3031,8 +3031,18 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 task,
                 validator: &file::HardwareValidator,
             };
-            let (disposition, sigpipe_owed) =
-                ipc::serve_ipc_with_sigpipe(&mut sched, frame, venue, &mut user, native_sigpipe);
+            let (disposition, sigpipe_owed) = ipc::serve_ipc_with_signals(
+                &mut sched,
+                frame,
+                venue,
+                &mut user,
+                native_signals,
+                &mut || {
+                    self.process
+                        .as_deref_mut()
+                        .is_some_and(|process| process.interrupt_pending_wait())
+                },
+            );
             let result = frame.x[0] as i64;
             if sigpipe_owed {
                 raise_native_sigpipe(self.process.as_deref_mut());
