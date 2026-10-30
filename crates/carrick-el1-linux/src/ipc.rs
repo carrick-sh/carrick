@@ -347,18 +347,19 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
     venue: &IpcVenue<'_>,
     user: &mut M,
 ) -> IpcServed {
-    serve_ipc_with_sigpipe(sched, frame, venue, user, false).0
+    serve_ipc_with_signals(sched, frame, venue, user, false, &mut || false).0
 }
 
-/// Serve IPC transfers in EL1, returning `(served, sigpipe_owed)` so tasks
-/// whose signal authority lives in the ring can raise `SIGPIPE` without
-/// forwarding or handing back to a host task.
-pub fn serve_ipc_with_sigpipe<C: ThreadCpu, U: UserWord, M: UserCopy>(
+/// Serve IPC with the native signal owner. The pending-interruption probe
+/// runs after enrollment and before settling an interrupted retained operation.
+/// `sigpipe_owed` lets that same owner raise SIGPIPE without a host task.
+pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
     sched: &mut Sched<'_, C, U>,
     frame: &mut TrapFrame,
     venue: &IpcVenue<'_>,
     user: &mut M,
-    native_sigpipe: bool,
+    native_signals: bool,
+    interrupt: &mut dyn FnMut() -> bool,
 ) -> (IpcServed, bool) {
     let nr = frame.x[8] as usize;
     if nr != SYS_READ && nr != SYS_WRITE && nr != SYS_EPOLL_PWAIT {
@@ -389,13 +390,55 @@ pub fn serve_ipc_with_sigpipe<C: ThreadCpu, U: UserWord, M: UserCopy>(
                 let served = handback(frame, token, op, IpcHandback::Continue, 0, venue);
                 return (leave(sched, IpcLeave::ForeignOperation, served), false);
             }
+            let reason = sched
+                .zone
+                .slot(sched.slot)
+                .current()
+                .and_then(|id| sched.zone.record(id).handback());
+            if native_signals {
+                let interrupted =
+                    reason == Some(carrick_sched_core::Handback::Signal) && interrupt();
+                let timed_out = reason == Some(carrick_sched_core::Handback::Timeout)
+                    && op.kind == IpcOpKind::EpollWait;
+                if interrupted || timed_out {
+                    finish(sched, token, &venue.region);
+                    if timed_out {
+                        frame.x[0] = 0;
+                    } else {
+                        use carrick_signal_core::wait::{
+                            RestartClass, TransferredBytes, WaitDecision, WaitProgress,
+                            interrupted_wait,
+                        };
+                        let progress = usize::try_from(op.progress.written)
+                            .ok()
+                            .and_then(TransferredBytes::new)
+                            .map_or(WaitProgress::Blocked, WaitProgress::Transferred);
+                        frame.x[0] =
+                            match interrupted_wait(RestartClass::Never, progress, Some(false)) {
+                                WaitDecision::CompletePartial(bytes) => bytes.get() as u64,
+                                _ => carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+                            };
+                        // The shared native signal checkpoint already owns
+                        // SA_RESTART frame publication. Preserve arg0 in its
+                        // existing mailbox marker, only before any progress.
+                        if op.progress.written == 0 && op.kind != IpcOpKind::EpollWait {
+                            frame.esr = 0xfffe;
+                            frame.far = op.orig_x0;
+                        }
+                    }
+                    return (IpcServed::Returned { switched: false }, false);
+                }
+            }
             if op.kind == IpcOpKind::EpollWait {
-                return (epoll::resume(sched, frame, venue, user, token, op), false);
+                return (
+                    epoll::resume(sched, frame, venue, user, token, op, interrupt),
+                    false,
+                );
             }
             (token, op, true)
         }
         Ok(None) if nr == SYS_EPOLL_PWAIT => {
-            return (epoll::serve(sched, frame, venue, user), false);
+            return (epoll::serve(sched, frame, venue, user, interrupt), false);
         }
         Ok(None) => match admit(sched, frame, venue, user) {
             Admission::Admitted(token, op) => (token, op, false),
@@ -418,7 +461,8 @@ pub fn serve_ipc_with_sigpipe<C: ThreadCpu, U: UserWord, M: UserCopy>(
         token,
         op,
         resumed,
-        native_sigpipe,
+        native_signals,
+        interrupt,
     )
 }
 
@@ -605,7 +649,8 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
     mut token: IpcOpToken,
     mut op: IpcOperation,
     resumed: bool,
-    native_sigpipe: bool,
+    native_signals: bool,
+    interrupt: &mut dyn FnMut() -> bool,
 ) -> (IpcServed, bool) {
     let region = &venue.region;
     let object = IpcObjectHandle::from_raw(op.object);
@@ -716,7 +761,9 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                         false,
                     );
                 };
-                match park(sched, frame, region, token, op, object, lane, snap, None) {
+                match park(
+                    sched, frame, region, token, op, object, lane, snap, None, interrupt,
+                ) {
                     Parked::Done(served) => return (served, false),
                     Parked::Retry(t) => {
                         token = t;
@@ -730,7 +777,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     }
                 }
             }
-            StepStatus::Broken if native_sigpipe => {
+            StepStatus::Broken if native_signals => {
                 let result = if written > 0 {
                     written as i64
                 } else {
@@ -884,6 +931,7 @@ fn park<C: ThreadCpu, U: UserWord>(
     lane: WaitFor,
     snap: ObjectWaitSnapshot,
     deadline: Option<u64>,
+    interrupt: &mut dyn FnMut() -> bool,
 ) -> Parked {
     let (Some(key), Some(resume)) = (
         wait_key(object, lane),
@@ -900,6 +948,11 @@ fn park<C: ThreadCpu, U: UserWord>(
     };
     match sched.park_object(frame, key, snap, resume, sched_token, deadline) {
         Ok(parked) => {
+            // Enrollment precedes the single pending-signal probe. A signal
+            // before enrollment is seen here; a later one owns queue intake.
+            if interrupt() {
+                sched.task.linux.mark_pending_host_work();
+            }
             let served = if sched.task.linux.has_pending_host_work() {
                 sched.leave_after_object_park(parked)
             } else {

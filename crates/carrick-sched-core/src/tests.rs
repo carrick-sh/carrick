@@ -1191,8 +1191,8 @@ fn el1_honours_affinity_for_floating_threads() {
     );
 }
 
-/// Readiness goes back to the native owner; a host continuation and native
-/// signal/control settlement keep their existing publication routes.
+/// Readiness and interruption return to the native owner; host continuations
+/// and native control settlement keep their existing publication routes.
 #[test]
 fn native_readiness_handback_preserves_the_execution_owner() {
     for native in [false, true] {
@@ -1200,6 +1200,10 @@ fn native_readiness_handback_preserves_the_execution_owner() {
             Handback::Resumed,
             Handback::Woken,
             Handback::Signal,
+            Handback::Timeout,
+            Handback::Control,
+            Handback::GroupStop,
+            Handback::Cancelled,
             Handback::Service,
         ] {
             let zone = zone();
@@ -1214,7 +1218,11 @@ fn native_readiness_handback_preserves_the_execution_owner() {
                 zone.claim_for_host(exact, None, kind, &HostWait),
                 HostClaim::Claimed
             );
-            let native_ready = native && matches!(kind, Handback::Resumed | Handback::Woken);
+            let native_ready = native
+                && matches!(
+                    kind,
+                    Handback::Resumed | Handback::Woken | Handback::Signal | Handback::Timeout
+                );
             assert_eq!(zone.record(record).needs_native_handback(), native_ready);
             let stale = RecordRef {
                 incarnation: exact.incarnation + 1,

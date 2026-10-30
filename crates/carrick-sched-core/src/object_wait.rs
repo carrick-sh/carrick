@@ -995,7 +995,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
     }
 }
 
-impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
+impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
     fn drain_completion(&self, waker: Waker, effects: &mut WakeEffects, handed: &mut u32) {
         let mut cursor = self.queue().head.load(Ordering::Relaxed);
         while let Some(record) = RecordId::from_raw(cursor) {
@@ -1321,31 +1321,64 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
         rec.object.queue.store(0, Ordering::Release);
     }
 
-    /// Cancel exactly one owned operation without fabricating a producer edge
-    /// or visiting other waiters on this MM resource.
+    /// End exactly one owned park under its queue authority. Readiness keeps
+    /// the existing guest placement; interruption retains an owned handback
+    /// for publication after unlock through the carrier completion boundary.
     pub fn wake_owner_operation(
         &self,
         record: RecordRef,
         operation: &OperationToken,
         waker: SlotId,
-        effects: &mut WakeEffects,
-    ) -> bool {
-        if self.zone.record_ref(record.id) != record {
-            return false;
-        }
-        let rec = self.zone.record(record.id);
-        if rec.object.queue.load(Ordering::Acquire) != self.key.index + 1
+        kind: Handback,
+    ) -> Option<OwnedObjectWakeEffects<'a, C>> {
+        let rec = self.zone.live(record)?;
+        if rec.object.queue.load(Ordering::Acquire) != self.key.index
             || rec.object.generation.load(Ordering::Relaxed) != self.key.generation
             || rec.object.operation.load(Ordering::Acquire) != operation.index()
             || rec.object.operation_generation.load(Ordering::Relaxed) != operation.generation()
         {
-            return false;
+            return None;
         }
-        let Claim::Parked { seq } = rec.claim() else {
-            return false;
+        let from @ Claim::Parked { seq } = rec.claim() else {
+            return None;
         };
-        self.zone
-            .claim_for_el1(record.id, seq, 0, waker, effects, || self.unlink(record.id))
+        let mut effects = WakeEffects::default();
+        let handed = match kind {
+            Handback::Resumed => {
+                if !self
+                    .zone
+                    .claim_for_el1(record.id, seq, 0, waker, &mut effects, || {
+                        self.unlink(record.id)
+                    })
+                {
+                    return None;
+                }
+                0
+            }
+            Handback::Signal | Handback::Timeout => {
+                // Initialization has no resource dependency and cannot wait on
+                // this queue. Retain the interruption through its short race.
+                while !self.zone.completion_handbacks.initialize() {
+                    core::hint::spin_loop();
+                }
+                let transfer = self.zone.begin_host_transfer(record, from)?;
+                self.unlink(record.id);
+                rec.handback.store(kind as u32, Ordering::Release);
+                self.zone.counters.host_claims[kind as usize].fetch_add(1, Ordering::Relaxed);
+                rec.object.next.store(0, Ordering::Relaxed);
+                // The returned completion receipt owns this detached transfer.
+                let _ = transfer;
+                record.id.raw()
+            }
+            _ => return None,
+        };
+        Some(OwnedObjectWakeEffects {
+            zone: self.zone,
+            key: self.key,
+            waker: Waker::El1 { slot: waker },
+            effects,
+            handed,
+        })
     }
 
     /// Publish a readiness change, even with no waiters. Called by a running

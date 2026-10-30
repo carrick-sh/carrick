@@ -257,6 +257,12 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn take_map_source(&mut self, _key: crate::native_host_file::NativeMapKey) -> MapSourceTake {
         MapSourceTake::default()
     }
+    /// Probe interruption at owned-wait enrollment or resumption. After
+    /// enrollment, the existing signal/queue owners cancel the exact park.
+    /// Resumption reports pending delivery without claiming the OnCpu record.
+    fn interrupt_pending_wait(&mut self) -> bool {
+        false
+    }
     fn binding(&self) -> ExecutionBinding;
     fn pid_exists(&self, _pid: u32) -> Option<bool> {
         None

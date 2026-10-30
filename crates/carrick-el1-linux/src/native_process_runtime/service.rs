@@ -136,6 +136,51 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .service_wait(&record)
             .map(|pending| (pending.request, pending.control.clone()));
         let Some((request, control)) = pending else {
+            // Scalar IPC has a retained adapter token, not a host-service cell.
+            // Its queue owns cancellation and the existing deferred handback.
+            let Some(member) = self
+                .zone
+                .live(record)
+                .filter(|member| member.is_native_owned() && member.has_adapter_operation())
+            else {
+                return Ok(());
+            };
+            let Some(census) = member.object_wait_census() else {
+                return Ok(());
+            };
+            let Some(key) = ObjectWaitKey::new(census.queue, census.generation) else {
+                return Ok(());
+            };
+            let Some(operation) =
+                OperationToken::new(census.operation, census.operation_generation)
+            else {
+                return Ok(());
+            };
+            let completion =
+                |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
+                    crate::sched::object_wait::deliver_completion(self.zone, slot, owned)
+                };
+            let queue = if self.zone.completion_enabled(key) {
+                self.zone.object_wait_with_completion(
+                    key,
+                    &carrick_sched_core::ShortLockSpin,
+                    &completion,
+                )
+            } else {
+                self.zone
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            };
+            let queue = match queue {
+                Ok(queue) => queue,
+                // A completed/rebound park no longer needs cancellation.
+                Err(carrick_sched_core::object_wait::ObjectWaitError::Stale) => return Ok(()),
+                Err(_) => return Err(NativeProcessError::Quarantined),
+            };
+            let owned = queue.wake_owner_operation(record, &operation, slot, Handback::Signal);
+            drop(queue);
+            if let Some(owned) = owned {
+                crate::sched::object_wait::deliver_completion(self.zone, slot, owned);
+            }
             return Ok(());
         };
         let key = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
@@ -198,9 +243,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     request.identity.sequence.get(),
                 )
                 .ok_or(NativeProcessError::Stale)?;
-                queue.wake_owner_operation(record, &operation, slot, &mut effects);
+                let owned = queue.wake_owner_operation(record, &operation, slot, Handback::Resumed);
+                drop(queue);
+                if let Some(owned) = owned {
+                    let (_, wake) = owned.into_parts();
+                    effects = wake;
+                }
+            } else {
+                drop(queue);
             }
-            drop(queue);
         } else {
             guard
                 .notify_object(slot, &mut effects)

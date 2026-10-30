@@ -6804,6 +6804,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
+    fn interrupt_pending_wait(&mut self) -> bool {
+        let pending = self.signal_interrupts_current();
+        if pending
+            && self.source.zone.live(self.record).is_some_and(|record| {
+                matches!(record.claim(), carrick_sched_core::Claim::Parked { .. })
+            })
+        {
+            self.interrupt_signal_record(self.record);
+        }
+        pending
+    }
     fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
         core::mem::take(&mut self.owner_continuation)
             .then(|| self.resume_pending_lifecycle())

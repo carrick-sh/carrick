@@ -907,14 +907,18 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         ) && !self.requires_native_entry()
     }
 
-    /// A native exception or ordinary readiness completion has no host
-    /// syscall continuation. Its existing ring owner must retain publication,
-    /// even when every execution driver is outside the guest. Signal/control
-    /// handbacks keep their own cancellation and settlement protocols.
+    /// Native readiness and wait interruption have no host syscall continuation.
+    /// Retain the existing ring owner even when every driver is away. Control
+    /// and terminal handbacks retain their separate settlement protocols.
     pub fn needs_native_handback(&self) -> bool {
         self.requires_native_entry()
             || (self.is_native_owned()
-                && matches!(self.handback(), Some(Handback::Resumed | Handback::Woken)))
+                && matches!(
+                    self.handback(),
+                    Some(
+                        Handback::Resumed | Handback::Woken | Handback::Signal | Handback::Timeout
+                    )
+                ))
     }
 
     /// Adopted exception owners may predate the native-owned allocation hint.
@@ -930,6 +934,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
             || self.host_wanted()
             || (!self.is_cancelled()
                 && self.has_object_operation()
+                && !(self.is_native_owned()
+                    && matches!(self.handback(), Some(Handback::Signal | Handback::Timeout)))
                 && matches!(
                     self.handback(),
                     Some(
@@ -3567,6 +3573,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.counters.el1_switches.fetch_add(1, Ordering::Relaxed);
         let result = match rec.handback() {
             Some(Handback::Resumed) => None,
+            Some(Handback::Signal | Handback::Timeout)
+                if rec.is_native_owned() && rec.has_adapter_operation() =>
+            {
+                None
+            }
             _ => Some(rec.result()),
         };
         Some(SwitchedIn {
@@ -4393,6 +4404,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             self.counters.el1_switches.fetch_add(1, Ordering::Relaxed);
             let result = match rec.handback() {
                 Some(Handback::Resumed) => None,
+                Some(Handback::Signal | Handback::Timeout)
+                    if rec.is_native_owned() && rec.has_adapter_operation() =>
+                {
+                    None
+                }
                 _ => Some(rec.result()),
             };
             return Some(SwitchedIn {
