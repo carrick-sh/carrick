@@ -326,6 +326,12 @@ pub trait UserCopy {
         None
     }
 
+    /// Probe and consume a pending native signal interruption after queue
+    /// enrollment or on a Signal handback.
+    fn interrupt_pending_wait(&mut self) -> bool {
+        false
+    }
+
     /// Copy `src` to the user buffer at `dst_va`.
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool;
     /// Fill `dst` from the user buffer at `src_va`.

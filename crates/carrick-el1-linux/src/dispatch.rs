@@ -3404,11 +3404,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 venue,
                 &mut user,
                 native_signals,
-                &mut || {
-                    self.process
-                        .as_deref_mut()
-                        .is_some_and(|process| process.interrupt_pending_wait())
-                },
+                &mut || false,
             );
             let result = frame.x[0] as i64;
             if sigpipe_owed {
