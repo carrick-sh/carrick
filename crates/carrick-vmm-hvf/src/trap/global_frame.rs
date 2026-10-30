@@ -3194,6 +3194,23 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
         .collect::<Vec<_>>();
     for owner in detached {
         let Some(snapshot) = custody.stage2_record_snapshot(owner.record_identity.record_id) else {
+            // No record is not a successful retirement receipt. Notify the
+            // exact producer's waiters even if pins still retain this owner.
+            let publication = owner
+                .retirement
+                .abandon(
+                    owner.record_identity,
+                    carrick_thread::physical_retirement::RetirementAbandonReason::RecordRemoved,
+                )
+                .map_err(|_| {
+                    TrapError::Hypervisor("physical abandonment identity mismatch".into())
+                })?;
+            if let Some(publication) = publication {
+                // Reconciliation can still have an outer ForkStock guard.
+                // Use the same owner and idle publication boundary as Retired.
+                *owner.retirement_publication.lock() = Some(publication);
+                retain_pending_global_frame_owner(custody, std::sync::Arc::clone(&owner));
+            }
             finish_pending_global_frame_owner(custody, &owner);
             continue;
         };
