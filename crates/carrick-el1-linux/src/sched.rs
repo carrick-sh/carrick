@@ -17,6 +17,13 @@ pub struct HardwareCpu;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl ThreadCpu for HardwareCpu {
+    fn record_release(
+        &self,
+    ) -> Option<
+        &'static dyn carrick_core::entry::RecordRelease<carrick_el1_abi::Aarch64ParkedContext>,
+    > {
+        Some(super::aarch64_process::registry())
+    }
     fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
         carrick_el1::substrate::sched::hw::HardwareCpu.save(frame, ctx);
     }

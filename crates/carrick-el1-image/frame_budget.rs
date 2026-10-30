@@ -330,12 +330,28 @@ impl Frames {
             (
                 "native admission",
                 native
-                    + self.required("::admit_entry_runtime::")?
-                    + self.sum(&[
-                        "::admit_fresh_root::",
-                        "::process_owner::GuestTask$LT$C$C$U$C$N$GT$::new::",
-                        "::process_owner::GuestThreads::new::",
-                    ])
+                    + (self.required("::admit_entry_runtime::")?
+                        + self
+                            .sum(&[
+                                "::admit_fresh_root::",
+                                "::process_owner::GuestTask$LT$C$C$U$C$N$GT$::new::",
+                                "::process_owner::GuestThreads::new::",
+                            ])
+                            .max(
+                                self.required("::rebind_host_exec::")?
+                                    + self.maximum("::init_leader::")
+                                    + self.maximum("::spawn_thread::"),
+                            )
+                        + self.maximum("::prepare_root_group::")
+                        + self.maximum("::validate_root_leader::")
+                        + self.maximum("::imported_members::")
+                        + self.maximum("::allocate_process::")
+                        + self.maximum("::install_root_group_locked::"))
+                    .max(
+                        self.maximum("::park_host_exec_rebind_wait::")
+                            + self.qualified("HostExecRebindWaiters", "::park::")
+                            + self.maximum("::cleanup_rebind_source::"),
+                    )
                     + allocation,
             ),
             (
@@ -397,6 +413,21 @@ impl Frames {
                     + self.required("::apply_fault_reply::")?
                     + (self.sum(&["::grant_target::", "::root_for::"]) + root)
                         .max(self.maximum("::apply_grant::") + descriptors),
+            ),
+            (
+                "native release notification",
+                (native.max(resume) + self.maximum("::exit_with_status::")).max(service)
+                    + self.maximum("::record_release::")
+                    + 2 * self
+                        .maximum("::record_released::")
+                        .max(self.maximum("::pending_released::"))
+                    + self.qualified("NativePendingCustody", "::drop::")
+                    + self.maximum("::release_rebind_waiters::")
+                    + self.maximum("::deliver_completion::")
+                    + self.maximum("::deliver_wake_effects::")
+                    + self.maximum("::notify_object::")
+                    + self.maximum("::cleanup_rebind_source::")
+                    + allocation,
             ),
             (
                 "native wait copy",

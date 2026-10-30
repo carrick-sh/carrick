@@ -444,7 +444,8 @@ where
         slot: service.slot,
     };
     let task = service.task;
-    super::aarch64_process::with_process_entry(
+    let mut zone = zone;
+    match super::aarch64_process::with_process_entry(
         source,
         service.task,
         native,
@@ -462,7 +463,11 @@ where
                 open_table,
                 inotify_table,
                 name_cache,
-                zone,
+                zone.as_mut().map(|z| Zone {
+                    tables: z.tables,
+                    cpu: &mut *z.cpu,
+                    user: z.user,
+                }),
                 ipc,
                 lifecycle,
                 Some(&mut *process),
@@ -481,7 +486,18 @@ where
             let _ = task;
             route
         },
-    )
+    ) {
+        Ok(route) => Ok(route),
+        Err(super::native_process_runtime::NativeProcessError::ParkedRebind) => {
+            counters.exit_reasons[carrick_el1_abi::El1ExitReason::IdleHostWork as usize]
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(zone) = zone {
+                sched::leave_space(zone.tables, service.slot, zone.cpu);
+            }
+            Ok(carrick_personality_linux::dispatch::CompletionRoute::Suspended)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]

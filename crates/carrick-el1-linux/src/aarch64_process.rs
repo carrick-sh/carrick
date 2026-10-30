@@ -446,6 +446,23 @@ fn admit_entry_runtime(
         address.mm.raw().get(),
         address.generation.raw().get(),
     );
+    if control.entry().is_none()
+        && control.host_exec_receipt().is_some()
+        && REGISTRY.has_pre_exec_root_group(
+            source.zone,
+            address,
+            page,
+            task.visible_pid().ok_or(NativeProcessError::Stale)?,
+        )
+    {
+        // SAFETY: the EL1 caller owns `record` exclusively on `source.slot`.
+        unsafe {
+            source.zone.record(record).consume_metadata_operation();
+        }
+        let runtime = REGISTRY
+            .rebind_host_exec::<Aarch64Mmu>(source, task, page, control, address, address, words)?;
+        return Ok((runtime, address));
+    }
     let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source,
         task,
@@ -454,10 +471,43 @@ fn admit_entry_runtime(
         address,
         address,
         words,
-        alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+        REGISTRY.host_exec_waiters(),
     )?);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
     Ok((runtime, address))
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
+pub(super) fn park_host_exec_rebind_wait(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    native: &carrick_sched_core::ThreadCtx,
+    record: RecordId,
+    wait: super::native_process_runtime::HostExecRebindWait,
+) -> Result<(), NativeProcessError> {
+    let resume = carrick_core::wait::OperationResumePc::new(native.pc.wrapping_sub(4))
+        .ok_or(NativeProcessError::Stale)?;
+    // SAFETY: this entry owns the exact running/home record until handoff.
+    let address = unsafe { source.zone.record(record).ctx_mut() }
+        .address_context()
+        .ok_or(NativeProcessError::Stale)?;
+    let mut saved = Box::new(Aarch64ParkedContext::from_parts(*native, address));
+    saved.native.pc = resume.raw();
+    // SAFETY: with_process_entry retains the lifecycle admission that
+    // produced `wait`; its pending control is live until the shared bridge
+    // retains it. Fixture callers retain their source controls likewise.
+    unsafe {
+        REGISTRY.host_exec_waiters().park(
+            source,
+            record,
+            wait,
+            &saved,
+            &|effects| {
+                crate::sched::object_wait::deliver_completion(source.zone, source.slot, effects)
+            },
+            crate::sched::object_wait::deliver_wake_effects,
+        )
+    }
 }
 
 /// Unpublished admission custody is scoped to this call: a home left in a
@@ -514,7 +564,14 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         record: source.zone.record_ref(record),
     };
     let (runtime, address) =
-        admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
+        match admit_entry_runtime(source, task, native, ttbr0, record, page, control) {
+            Ok(admitted) => admitted,
+            Err(NativeProcessError::RebindWait(wait)) => {
+                park_host_exec_rebind_wait(source, native, record, wait)?;
+                return Err(NativeProcessError::ParkedRebind);
+            }
+            Err(err) => return Err(err),
+        };
     task.publish_root_generation(address.generation);
     let (result, root_exit) = {
         let mut process = {
