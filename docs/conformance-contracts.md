@@ -2748,3 +2748,31 @@ still fail closed. Channels bound the fixture's coordination, without adding
 production waits, polling or retries. Hardware execution remains scripted;
 `el1_sched_exit_group_with_parked_threads` supplies the director-owned signed
 binding and its 20/20 single-artifact acceptance.
+
+### Frozen select and retained poll/select publication (#986 slice 4)
+
+`kernel.memory.owner-wait` covers immediate select and the terminal output
+of retained poll/select waits on the shared retained-output transport.
+Readiness or deadline expiry freezes the return count and all result bytes.
+A memory refusal transfers the dependency and the output cursor; resumption
+never samples readiness, reads input sets, resolves numeric fds, or starts a
+new relative timeout. The retained wait keeps its original descriptions,
+registrations and absolute deadline until publication completes or is dropped.
+Temporary signal-mask restoration remains in readiness completion and is not
+repeated by output resumption.
+
+Select writes page-contained units of at most 4096 bytes across all three
+sets, preserving the committed prefix on a later genuine fault (errno 14).
+Poll writes only its two-byte `revents` fields, preserving edited `fd` and
+`events` fields. Its field remains one prepared unit across a page boundary.
+The 1/8/512-entry VM-free schedules require exactly `n + 3` preparations and
+`n` commits across one owner, one supply and one physical refusal, with no
+input reads and no repeated commits. Physical dependency custody is released
+before the next preparation. An 8192-byte select set requires one committed
+4096-byte prefix before the second-window refusal and one suffix commit on
+resume. Stale task/ASID and fatal/group-exit rejection access no guest memory.
+
+These bindings exercise the production dispatcher and completion fold. They
+do not establish signed scheduler/VMM or Docker differential acceptance.
+Those gates remain director-owned. Immediate ppoll publication and the other
+operation families still listed on #986 remain outside this slice.

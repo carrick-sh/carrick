@@ -348,7 +348,8 @@ impl<M: CurrentMmMemory> SyscallCtx<'_, M> {
 /// `sync_file_range`, `syncfs`) and scalar `write` also borrow it for host-wait
 /// handoff. `recvfrom` borrows it to capture exact retained-output identity
 /// before payload consumption. `getdents64` borrows it before owner-memory
-/// publication to bind a retained directory selection. Other ordinary syscalls
+/// publication to bind a retained directory selection. `select` captures it
+/// before reading its input/output bitmaps. Other ordinary syscalls
 /// and non-memory ptrace requests execute without acquiring or consulting the
 /// execution lease lock.
 #[inline]
@@ -356,7 +357,9 @@ pub const fn syscall_requires_execution_lease(nr: u64, args: SyscallArgs) -> boo
     match nr {
         number
             if number == carrick_abi::syscall::nr::RECVFROM.raw()
-                || number == carrick_abi::syscall::nr::GETDENTS64.raw() =>
+                || number == carrick_abi::syscall::nr::GETDENTS64.raw()
+                || number == carrick_abi::syscall::nr::PSELECT6.raw()
+                || number == carrick_abi::CARRICK_PRIVATE_X86_SELECT =>
         {
             true
         }

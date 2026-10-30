@@ -6286,7 +6286,12 @@ fn controller_mixed_ppoll_netlink_real_service_wake() {
         panic!("mixed ppoll must complete its retained operation: {completion:?}");
     };
     assert!(matches!(
-        wait.complete(&context, &mut memory, &dispatcher),
+        wait.complete(
+            &context,
+            &mut memory,
+            &dispatcher,
+            (context.shared().mm().id(), 0)
+        ),
         crate::dispatch::fd_wait::BlockingFdWaitStep::Done(DispatchOutcome::Returned { value: 1 })
     ));
     assert_eq!(context.signal_authority().blocked(), persistent);

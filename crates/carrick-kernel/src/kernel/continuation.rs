@@ -3026,7 +3026,7 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
             }
         }
         ContinuationCompletion::FdWait { wait, sig_mask } => {
-            match wait.complete(context, memory, dispatcher) {
+            match wait.complete(context, memory, dispatcher, current_mm) {
                 crate::dispatch::fd_wait::BlockingFdWaitStep::InvalidExecution => {
                     return Err(CompletionFoldError::ExecutionAuthority);
                 }

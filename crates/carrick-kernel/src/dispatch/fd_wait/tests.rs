@@ -34,7 +34,16 @@ fn pending_poll_does_not_write_guest_pollfd_before_terminal_completion() {
         negative_poll_wait(None).complete(
             &dispatcher.capture_one_task_context().unwrap(),
             &mut memory,
-            &dispatcher
+            &dispatcher,
+            (
+                dispatcher
+                    .capture_one_task_context()
+                    .unwrap()
+                    .shared()
+                    .mm()
+                    .id(),
+                41
+            )
         ),
         BlockingFdWaitStep::Wait(_)
     ));
@@ -54,7 +63,16 @@ fn terminal_poll_updates_only_revents_not_saved_input_fields() {
         negative_poll_wait(Some(Instant::now() - Duration::from_secs(1))).complete(
             &dispatcher.capture_one_task_context().unwrap(),
             &mut memory,
-            &dispatcher
+            &dispatcher,
+            (
+                dispatcher
+                    .capture_one_task_context()
+                    .unwrap()
+                    .shared()
+                    .mm()
+                    .id(),
+                41
+            )
         ),
         BlockingFdWaitStep::Done(DispatchOutcome::Returned { value: 0 })
     ));
@@ -106,6 +124,15 @@ fn repark_preserves_the_original_absolute_caller_deadline() {
         &dispatcher.capture_one_task_context().unwrap(),
         &mut memory,
         &dispatcher,
+        (
+            dispatcher
+                .capture_one_task_context()
+                .unwrap()
+                .shared()
+                .mm()
+                .id(),
+            41,
+        ),
     ) {
         BlockingFdWaitStep::Wait(wait) => wait,
         other => panic!("expected pending negative poll, got {other:?}"),
@@ -116,6 +143,15 @@ fn repark_preserves_the_original_absolute_caller_deadline() {
         &dispatcher.capture_one_task_context().unwrap(),
         &mut memory,
         &dispatcher,
+        (
+            dispatcher
+                .capture_one_task_context()
+                .unwrap()
+                .shared()
+                .mm()
+                .id(),
+            41,
+        ),
     ) {
         BlockingFdWaitStep::Wait(wait) => wait,
         other => panic!("expected second pending negative poll, got {other:?}"),

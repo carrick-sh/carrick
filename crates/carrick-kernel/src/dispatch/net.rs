@@ -3043,6 +3043,16 @@ impl<'a> NetView<'a> {
                 }
             };
 
+            let output_binding = if memory.user_memory_venue()
+                == carrick_guest_mem::UserMemoryVenue::Owner
+            {
+                Some(crate::kernel::continuation::output::ExactCompletionBinding::capture(
+                    kernel, cx.execution_lease,
+                ).map_err(DispatchError::CompletionInvariant)?)
+            } else {
+                None
+            };
+
             // Pull each fd_set into memory.
             let read_set = this.read_optional_fd_set(memory, readfds_addr, nfds)??;
             let write_set = this.read_optional_fd_set(memory, writefds_addr, nfds)??;
@@ -3276,22 +3286,16 @@ impl<'a> NetView<'a> {
                     ready += 1;
                 }
             }
-            if let Some(s) = &new_read
-                && memory.write_bytes(readfds_addr, s).is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
-            if let Some(s) = &new_write
-                && memory.write_bytes(writefds_addr, s).is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
-            if let Some(s) = &new_except
-                && memory.write_bytes(exceptfds_addr, s).is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
-            Ok(DispatchOutcome::Returned { value: ready })
+            let sets = [
+                (readfds_addr, new_read),
+                (writefds_addr, new_write),
+                (exceptfds_addr, new_except),
+            ].into_iter().filter_map(|(address, bytes)| {
+                bytes.map(|bytes| (carrick_guest_mem::GuestVa::new(address), bytes))
+            }).collect();
+            crate::kernel::continuation::output::FdWaitOutput::select(ready, sets, None)
+                .publish(output_binding, kernel, memory)
+                .map_err(DispatchError::CompletionInvariant)
 
         }
 

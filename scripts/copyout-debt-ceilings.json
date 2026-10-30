@@ -2,10 +2,6 @@
   "schema": 1,
   "counters": [
     {
-      "path": "crates/carrick-kernel/src/dispatch/fd_wait.rs",
-      "ceiling": 2
-    },
-    {
       "path": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
       "ceiling": 2
     },
@@ -48,10 +44,6 @@
     {
       "path": "crates/carrick-kernel/src/dispatch/mqueue.rs",
       "ceiling": 2
-    },
-    {
-      "path": "crates/carrick-kernel/src/dispatch/net.rs",
-      "ceiling": 3
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
