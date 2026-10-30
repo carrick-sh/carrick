@@ -88,6 +88,9 @@ pub trait ThreadCpu {
     /// Host-test rendezvous at the last idle boundary before WFI.
     #[cfg(any(test, feature = "host-test"))]
     fn before_idle_wfi(&mut self) {}
+    /// Host-test rendezvous after futex enrollment, while its bucket is held.
+    #[cfg(any(test, feature = "host-test"))]
+    fn after_wait_enqueue(&mut self) {}
     /// One iteration of an idle poll.
     fn spin(&mut self);
     /// This vCPU's `ICC_SGI1R_EL1` routing bits, from `MPIDR_EL1`.
@@ -310,6 +313,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             return None;
         }
+        #[cfg(any(test, feature = "host-test"))]
+        self.cpu.after_wait_enqueue();
         zone.set_deadline(record, deadline.unwrap_or(0));
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
@@ -965,6 +970,7 @@ pub fn leave_space(zone: &ZoneTables, slot: SlotId, cpu: &mut impl ThreadCpu) {
 #[cfg(any(test, feature = "host-test"))]
 #[derive(Clone, Debug)]
 pub struct FakeCpu {
+    pub after_wait_enqueue: Option<fn()>,
     pub resume_once: Option<ResumeAction>,
     pub host_work_once: Option<carrick_el1_abi::Action>,
     pub host_work_boundaries: std::vec::Vec<RecordId>,
@@ -998,6 +1004,7 @@ pub struct FakeCpu {
 impl Default for FakeCpu {
     fn default() -> Self {
         Self {
+            after_wait_enqueue: None,
             resume_once: None,
             host_work_once: None,
             host_work_boundaries: std::vec::Vec::new(),
@@ -1021,6 +1028,11 @@ impl Default for FakeCpu {
 
 #[cfg(any(test, feature = "host-test"))]
 impl ThreadCpu for FakeCpu {
+    fn after_wait_enqueue(&mut self) {
+        if let Some(hook) = self.after_wait_enqueue.take() {
+            hook();
+        }
+    }
     fn before_idle_wfi(&mut self) {
         if let Some(gate) = self.idle_gate.take() {
             gate.wait();

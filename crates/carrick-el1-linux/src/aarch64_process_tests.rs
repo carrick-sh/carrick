@@ -9439,3 +9439,236 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     service.retire_fd_table(children[1]);
     assert_eq!(owner.drain_retired_tables().unwrap(), 2);
 }
+
+#[cfg(test)]
+std::thread_local! {
+    static FUTEX_ENROLLED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[test]
+fn tgkill_during_futex_enrollment_returns_eintr() {
+    use crate::sched::LinuxSchedEntry;
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalRequest, SignalThreadSelector,
+    };
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture: &'static Fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let initial = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            initial,
+        )
+        .unwrap(),
+    );
+    let owner_registry = registry();
+    owner_registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let waiter = fixture
+        .zone
+        .record_ref(fixture.zone.slot(fixture.slot).host_record().unwrap());
+    fixture.zone.requeue_preempted(fixture.slot, waiter.id);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        waiter.id
+    );
+    let mut service = fixture.process_service();
+    {
+        let mut entry = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                &initial,
+                &mut service,
+            )
+            .unwrap();
+        entry
+            .rt_sigaction(
+                Signal::from_number(10).unwrap(),
+                Some(Action {
+                    disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+    }
+    let control = host_born_sibling(fixture, 42);
+    run_as_leader(fixture);
+    let sender_task: &'static CurrentTask = Box::leak(Box::new(CurrentTask::new()));
+    sender_task.set(
+        El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+        5,
+    );
+    sender_task.mm.key.store(1, Ordering::Release);
+    sender_task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    sender_task.publish_visible_pid(41);
+    sender_task.publish_root_generation(fixture.address.generation);
+    sender_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    let sender_slot = SlotId::new(1);
+    fixture.zone.drive(sender_slot, 2);
+    fixture.zone.publish_slot(sender_slot, 1, Some(0), 1);
+    fixture.zone.enter_guest(sender_slot);
+    fixture.zone.install_space(sender_slot, 1).unwrap();
+    let sender_record = fixture
+        .zone
+        .current_or_new(
+            sender_slot,
+            ThreadIdentity {
+                tid: 42,
+                serial: 102,
+                mm: 1,
+                file_table: 5,
+                generation: 12,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: fixture.page as *const _ as u64,
+                control_slot: control as *const _ as u64,
+            },
+        )
+        .unwrap();
+    control.bind_zone_record(fixture.zone.record_ref(sender_record));
+    let sender_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: sender_slot,
+    };
+    owner_registry
+        .register_thread(
+            sender_source,
+            sender_task,
+            fixture.address,
+            fixture.page,
+            control,
+        )
+        .unwrap();
+    fixture.zone.requeue_preempted(sender_slot, sender_record);
+    assert_eq!(
+        fixture.zone.switch_in_full(sender_slot).unwrap().record,
+        sender_record
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    let (go_tx, go_rx) = mpsc::sync_channel(1);
+    let (sent_tx, sent_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let sender_runtime = runtime.clone();
+    let sender_address = fixture.address;
+    let sender_zone = fixture.zone;
+    let sender_table = fixture.region.table();
+    let sender = std::thread::spawn(move || {
+        go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, sender_address);
+        let mut service = Aarch64NativeProcessService::with_crossing(
+            sender_task,
+            sender_slot,
+            sender_zone,
+            sender_table,
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&[]),
+        );
+        let mut entry = sender_runtime
+            .enter_registered(
+                owner_registry,
+                sender_source,
+                sender_task,
+                sender_address,
+                &words,
+                &mut service,
+            )
+            .unwrap();
+        // Once the signal is queued, the fixed sender waits for the waiter's bucket.
+        // The old sender instead returns immediately while the target is OnCpu.
+        let notified = core::sync::atomic::AtomicBool::new(false);
+        let probe = |_: u32| {
+            if !notified.swap(true, Ordering::AcqRel) {
+                sent_tx.send(()).unwrap();
+            }
+        };
+        entry.publication_wait_probe = Some(&probe);
+        entry
+            .tgkill(
+                SignalThreadSelector::from_abi(41),
+                SignalThreadSelector::from_abi(41),
+                SignalRequest::Deliver(Signal::from_number(10).unwrap()),
+                SignalInfo::Generated(None),
+            )
+            .unwrap();
+        entry.publication_wait_probe = None;
+        if !notified.swap(true, Ordering::AcqRel) {
+            sent_tx.send(()).unwrap();
+        }
+        assert!(entry.take_run_failure().is_none());
+        done_tx.send(()).unwrap();
+    });
+    FUTEX_ENROLLED.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert_eq!(fixture.zone.record(waiter.id).entry_count(), 1);
+            assert!(matches!(
+                fixture.zone.record(waiter.id).claim(),
+                carrick_sched_core::Claim::OnCpu { .. }
+            ));
+            go_tx.send(()).unwrap();
+            sent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Bound the bad implementation's observation: its idle boundary exits
+            // with the waiter still parked, rather than executing an endless WFI.
+            fixture.task.linux.mark_pending_host_work();
+        }))
+    });
+    let mut cpu = crate::sched::FakeCpu {
+        after_wait_enqueue: Some(|| {
+            FUTEX_ENROLLED.with(|hook| hook.borrow_mut().take().unwrap()())
+        }),
+        ..Default::default()
+    };
+    let word = core::sync::atomic::AtomicU32::new(0);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = crate::sched::SYS_FUTEX as u64;
+    frame.x[0] = word.as_ptr() as u64;
+    frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
+    let counters = carrick_el1_abi::Counters::new();
+    let result = (crate::sched::Sched {
+        handoff: None,
+        zone: fixture.zone,
+        slot: fixture.slot,
+        task: &fixture.task,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+        counters: &counters,
+    })
+    .serve_futex(&mut frame);
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    sender.join().unwrap();
+    assert_eq!(
+        result,
+        Some(crate::sched::Served::Returned { switched: false }),
+        "a deliverable signal after enrollment must prevent futex park"
+    );
+    assert_eq!(
+        frame.x[0] as i64, -4,
+        "futex enrollment signal returns EINTR"
+    );
+    assert_eq!(fixture.zone.record(waiter.id).entry_count(), 0);
+    assert_eq!(fixture.zone.record(waiter.id).deadline(), None);
+    assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+    owner_registry.unregister_root_for_test(&runtime);
+}
