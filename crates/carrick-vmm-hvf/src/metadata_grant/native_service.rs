@@ -788,18 +788,15 @@ impl NativeService {
         self,
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
-        use carrick_hal::fork_stock::NativeBackingSupplyOutcome;
-        use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorTxn, DescriptorTxnId, MAX_TABLE_GRANTS, PageSpan,
+        };
+        use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
         let Some(NativeServiceReply::Fault(reply)) = self.reply else {
             return self.refuse();
         };
         let custody = Arc::clone(&self.custody);
-        let request = self.request();
-        let handle = request.identity.birth.mm;
-        let cpu = carrick_guest_arch::CpuId::new(u32::from(self.slot.raw()));
-        let region = retained_abi_region(&custody).ok_or_else(stale)?;
-        let (_, zone) = stopped_records(region, cpu).ok_or_else(stale)?;
-        let key = ObjectWaitKey::native_service(request.identity.birth.record).ok_or_else(stale)?;
+        let handle = self.request().identity.birth.mm;
         let mut stock = custody.fork_stock.lock();
         if stock.owner.child_owner(handle.mm()) != Some(handle)
             || stock.owner.is_quarantined(handle.mm())
@@ -850,16 +847,6 @@ impl NativeService {
             || stock.owner.is_quarantined(handle.mm())
         {
             return self.refuse();
-        }
-        if stock.owner.has_quarantine() {
-            let _ = super::reclaim_fork_stock(
-                &custody,
-                &mut stock,
-                &mut crate::fork_stock::fork_table_accounting(&custody),
-                region,
-                cpu,
-                handle.mm().into(),
-            );
         }
         let physical = stock
             .owner
@@ -970,85 +957,175 @@ impl NativeService {
             }
         };
         let unpublished = staged.with_backing(retained);
-        let slot = self.slot;
-        let outcome = stock.owner.supply_native_backing_reply(
+        let data = *unpublished.grants().first().ok_or_else(|| stale())?;
+        let table_reservation = match stock.owner.reserve_native_descriptor_tables(
             &mut crate::fork_stock::fork_table_accounting(&custody),
             handle,
             root,
-            reply_slot,
-            window,
-            publication_len,
-            executable,
             MAX_TABLE_GRANTS,
-            unpublished,
-            Box::new(self),
-            |backing| backing.release_unused(),
-            |mut service, offer| {
-                // Acquire the host mutex before the guest queue, never beneath it.
-                // No native-service queue holder acquires ForkStock. This queue spans
-                // only the bounded ServiceCell/descriptor publication and notification;
-                // cancellation releases it before physical/table undo or backing drop.
-                let queue = match zone.object_wait(key, &carrick_sched_core::ShortLockSpin) {
-                    Ok(queue) => queue,
-                    Err(_) => return Err((service, None)),
-                };
-                match service
-                    .ticket
-                    .publish_prepared((), |()| if offer() { Ok(()) } else { Err(()) })
+        ) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                if let Err(error) =
+                    unpublished.abort_with_release(|backing| backing.release_unused())
                 {
-                    Ok(()) => Ok((queue, service._reply_pin)),
-                    Err((reason, ticket, ())) => {
-                        drop(queue);
-                        service.ticket = ticket;
-                        Err((service, Some(reason)))
-                    }
+                    stock
+                        .owner
+                        .quarantine_native_supply(handle, root)
+                        .map_err(|_| stale())?;
+                    return Err(error);
                 }
-            },
-        )?;
-        drop(stock);
-        match outcome {
-            NativeBackingSupplyOutcome::Delivered {
-                output: (queue, _reply_pin),
-                ..
-            } => {
-                let mut effects = carrick_sched_core::WakeEffects::default();
-                queue
-                    .notify_object(slot, &mut effects)
-                    .map_err(|_| stale())?;
-                drop(queue);
-                carrick_observability::probes::hvpatch_native_fault_supply(
-                    handle.mm().raw(),
-                    request.identity.sequence.get(),
-                    carrick_observability::probes::HvpatchNativeFaultPhase::Supplied,
-                    0,
-                    0,
-                );
-                Ok(effects)
+                drop(stock);
+                return self.refuse();
             }
-            NativeBackingSupplyOutcome::Cancelled {
-                delivery: service,
-                reason,
-                ..
-            } => {
+        };
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(|| stale())?,
+                generation: window.operation.sequence,
+            },
+            root: SubstrateGpa(root.address().raw()),
+            op: DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: window.range.start(),
+                    ipa: data.gpa.raw(),
+                    len: publication_len,
+                    writable: window
+                        .protection
+                        .permits(carrick_el1_abi::ReservationProtection::WRITE),
+                    executable,
+                },
+                resident: PageSpan::new(window.fault_page, 4096),
+                backing: data.identity,
+            },
+            tables: table_reservation.descriptor_tables(),
+        };
+        if stock
+            .owner
+            .track_native_descriptor_tables(
+                &mut crate::fork_stock::fork_table_accounting(&custody),
+                table_reservation,
+                txn,
+            )
+            .is_err()
+        {
+            if let Err(error) = unpublished.abort_with_release(|backing| backing.release_unused()) {
+                stock
+                    .owner
+                    .quarantine_native_supply(handle, root)
+                    .map_err(|_| stale())?;
+                return Err(error);
+            }
+            drop(stock);
+            return self.refuse();
+        }
+        let staged = stock
+            .owner
+            .child_physical_mut(handle.mm(), root)
+            .ok_or_else(|| stale())?
+            .supplied
+            .as_mut()
+            .ok_or_else(|| stale())?
+            .stage_backing_reply(reply_slot, window, txn, unpublished, |backing| {
+                backing.release_unused()
+            });
+        if let Err(error) = staged {
+            stock
+                .owner
+                .quarantine_native_supply(handle, root)
+                .map_err(|_| stale())?;
+            return Err(error);
+        }
+        drop(stock);
+        self.finish_backing_supply(handle, root, reply_slot, &txn)
+    }
+    /// Reserve delivery against cancellation before making the physical reply
+    /// consumable. Cancellation before delivery rolls back while retaining the
+    /// ticket; cancellation after delivery belongs to the ring continuation.
+    fn finish_backing_supply(
+        self,
+        handle: carrick_el1_abi::El1MmHandle,
+        root: carrick_guest_arch::RootGpa,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let custody = Arc::clone(&self.custody);
+        let request = self.request();
+        let region = retained_abi_region(&custody).ok_or_else(stale)?;
+        let (_, zone) = stopped_records(
+            region,
+            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+        )
+        .ok_or_else(stale)?;
+        let key = ObjectWaitKey::native_service(request.identity.birth.record).ok_or_else(stale)?;
+        let mut stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()) != Some(handle)
+            || stock.owner.child_root(handle.mm()) != Some(root)
+            || stock.owner.is_quarantined(handle.mm())
+        {
+            return Err(stale());
+        }
+        let grants = stock
+            .owner
+            .child_physical_mut(handle.mm(), root)
+            .and_then(|physical| physical.supplied.as_mut())
+            .ok_or_else(stale)?;
+        // Acquire the host mutex before the guest queue, never beneath it.
+        // No native-service queue holder acquires ForkStock. This queue spans
+        // only the bounded ServiceCell/descriptor publication and notification;
+        // cancellation releases it before physical/table undo or backing drop.
+        let queue = zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| stale())?;
+        let mut offered = false;
+        let delivery = self.ticket.publish_prepared((), |()| {
+            offered = grants.offer_backing_reply(reply, txn);
+            if offered { Ok(()) } else { Err(()) }
+        });
+        let queue = match delivery {
+            Ok(()) => {
+                drop(stock);
+                queue
+            }
+            Err((reason, ticket, ())) => {
+                drop(queue);
+                // The returned ticket keeps the service BUSY and reply pinned
+                // until rollback settles. No queue guard spans this release.
+                if !settle_backing_and_tables(&custody, &mut stock, handle, root, reply, txn)? {
+                    return Err(stale());
+                }
                 if !matches!(
                     reason,
-                    Some(
-                        carrick_core_abi::service::PreparedDeliveryError::Cancelled
-                            | carrick_core_abi::service::PreparedDeliveryError::Refused
-                    )
+                    carrick_core_abi::service::PreparedDeliveryError::Cancelled
+                        | carrick_core_abi::service::PreparedDeliveryError::Refused
                 ) {
                     return Err(stale());
                 }
-                (*service).refuse()
+                drop(stock);
+                let queue = zone
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .map_err(|_| stale())?;
+                ticket.complete(false).map_err(|_| stale())?;
+                queue
             }
-            NativeBackingSupplyOutcome::DescriptorTableCapacity(service) => {
-                // Descriptor-table stock is a bounded shared resource. Complete
-                // with an unoffered reply slot (`slot.window().is_none()`) so
-                // the guest retries the fault/syscall instead of receiving SIGSEGV.
-                (*service).complete(true)
-            }
-            NativeBackingSupplyOutcome::Refused(service) => (*service).refuse(),
-        }
+        };
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        queue
+            .notify_object(self.slot, &mut effects)
+            .map_err(|_| stale())?;
+        drop(queue);
+        carrick_observability::probes::hvpatch_native_fault_supply(
+            handle.mm().raw(),
+            request.identity.sequence.get(),
+            if offered {
+                carrick_observability::probes::HvpatchNativeFaultPhase::Supplied
+            } else {
+                carrick_observability::probes::HvpatchNativeFaultPhase::Refused
+            },
+            0,
+            0,
+        );
+        Ok(effects)
     }
     fn complete_wait(
         self,

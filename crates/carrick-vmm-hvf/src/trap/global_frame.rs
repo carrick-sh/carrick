@@ -538,6 +538,100 @@ mod allocator_stats_tests {
     }
 
     #[test]
+    fn native_backing_absence_does_not_claim_a_retiring_successor() {
+        use carrick_hal::physical_grants::PhysicalGrantRelease;
+        let _guard = global_frame_allocator_test_lock().lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let (base, predecessor) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(41).unwrap());
+        let (peer_base, peer) = grant_owned_for_mm(&custody, El1FrameGrantMm::new(42).unwrap());
+        let peer_before = peer.snapshot();
+        let generation = predecessor.generation();
+        let length = predecessor.length();
+        let backing = crate::fork_stock::NativeFrameBacking {
+            carrier: std::sync::Arc::downgrade(&custody),
+            ipa: base,
+            generation,
+            length,
+            retained_owner: Default::default(),
+        };
+        assert!(
+            retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                base,
+                length,
+                generation,
+                &mut |_, _| Ok(()),
+            )
+            .is_retired()
+        );
+        assert_eq!(
+            backing.release_unused().unwrap(),
+            PhysicalGrantRelease::Released
+        );
+        let mut lease = GlobalFrameStage2Lease::fixed(base, length);
+        lease.mark_mapped();
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            length as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .unwrap();
+        let successor = register_global_frame_host_owner_in(&custody, lease, host, 3).unwrap();
+        assert_ne!(successor, generation);
+        assert_eq!(
+            backing.release_unused().unwrap(),
+            PhysicalGrantRelease::Released
+        );
+        // Enter the actual successor retirement. Its backend callback runs
+        // after the directory publishes in_flight and releases its mutex.
+        assert!(
+            retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                base,
+                length,
+                successor,
+                &mut |_, _| {
+                    assert!(matches!(
+                        retire_global_frame_host_owner_if_generation_in_using(
+                            &custody,
+                            base,
+                            length,
+                            generation,
+                            &mut |_, _| panic!("predecessor must not unmap successor"),
+                        ),
+                        GlobalFrameRetirementOutcome::MismatchedGeneration {
+                            current_generation,
+                            expected_generation,
+                            ..
+                        } if current_generation == successor && expected_generation == generation
+                    ));
+                    assert_eq!(
+                        backing.release_unused().unwrap(),
+                        PhysicalGrantRelease::Released
+                    );
+                    Ok(())
+                },
+            )
+            .is_retired()
+        );
+        assert_eq!(peer.snapshot(), peer_before);
+        assert!(
+            retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                peer_base,
+                peer.length(),
+                peer.generation(),
+                &mut |_, _| Ok(()),
+            )
+            .is_retired()
+        );
+        drop(custody);
+        assert_eq!(
+            backing.release_unused().unwrap(),
+            PhysicalGrantRelease::Released
+        );
+    }
+
+    #[test]
     fn physical_retirement_enrollment_and_last_pin_use_the_existing_idle_owner() {
         use carrick_guest_mem::PhysicalMemoryWait;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3288,18 +3382,13 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             continue;
         }
         finalize_global_frame_owner_record_using(custody, &owner, release_ipa)?;
-        let removed = {
-            let mut owners = custody.global_frame_host_owners.lock();
-            if owners
-                .get(&key)
-                .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.owner(), &owner))
-            {
-                owners.remove(&key)
-            } else {
-                None
-            }
-        };
-        drop(removed);
+        let mut owners = custody.global_frame_host_owners.lock();
+        if owners
+            .get(&key)
+            .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.owner(), &owner))
+        {
+            owners.remove(&key);
+        }
         report.retired += 1;
     }
 
@@ -3695,10 +3784,7 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
                         error: error.to_string(),
                     };
                 }
-                let removed = owners.remove(&key);
-                drop(owners);
-                drop(removed);
-                drop(owner);
+                owners.remove(&key);
                 if terminalized {
                     GlobalFrameRetirementOutcome::TerminalizedByVmDestroy {
                         ipa,
@@ -4031,11 +4117,10 @@ fn finish_pending_global_frame_owner(
         custody.enqueue_detached_global_frame_retirement(record_id);
         return;
     }
-    let removed = custody
+    custody
         .pending_global_frame_owners
         .lock()
         .remove(&record_id);
-    drop(removed);
     custody
         .pending_global_frame_detached_retries
         .lock()
