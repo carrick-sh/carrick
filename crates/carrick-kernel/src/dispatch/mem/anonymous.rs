@@ -2683,6 +2683,51 @@ mod tests {
             "completed backend outcome lost its root proposal on Busy"
         );
         assert_eq!(memory.zero_backing_calls.get(), 1);
+        let sibling = context
+            .kernel()
+            .clone_thread(
+                &context,
+                crate::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                carrick_hal::ThreadId::synthetic_for_tests(160_068),
+                None,
+            )
+            .unwrap();
+        assert_ne!(context.thread().key(), sibling.thread().key());
+        assert_eq!(context.shared().mm().id(), sibling.shared().mm().id());
+        let sibling_syscall = crate::dispatch::SyscallRequest::new(
+            222,
+            crate::compat::SyscallArgs([base + 4096, 4096, 3, 0x32, u64::MAX, 0]),
+        );
+        let sibling_refused = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    dispatcher
+                        .dispatch_normalized_mutation_for_test(
+                            &sibling,
+                            sibling_syscall,
+                            &mut memory,
+                            &reporter,
+                            None,
+                        )
+                        .unwrap()
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(
+            matches!(
+                sibling_refused,
+                Ok(DispatchOutcome::OwnerMemoryWait { committed: 0, .. })
+            ),
+            "a shared-MM sibling must wait for completed venue adoption: {sibling_refused:?}"
+        );
+        assert!(dispatcher.mem().lock().has_owner_proposal());
+        assert_eq!(memory.zero_backing_calls.get(), 1);
         let foreign = SyscallDispatcher::new();
         let wrong_guard = crate::dispatch::mm_mutation::test_support::with_guard(
             foreign.mm_mutation_coordinator(),
@@ -2753,6 +2798,23 @@ mod tests {
                 .resident
                 .contains(base, super::super::fault::ResidencyOwner::Root(incarnation))
         );
+        let sibling_resumed = dispatcher
+            .dispatch_normalized_mutation_for_test(
+                &sibling,
+                sibling_syscall,
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sibling_resumed,
+            DispatchOutcome::Returned {
+                value: (base + 4096) as i64
+            }
+        );
+        assert!(!dispatcher.mem().lock().has_owner_proposal());
     }
 
     #[test]
