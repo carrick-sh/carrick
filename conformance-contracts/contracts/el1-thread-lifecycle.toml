@@ -75,6 +75,8 @@ embed_structural = "Not yet a registered WorkObservation binding: el1_thread_lif
 # projection followed by a release-less transient pin, owned clone resumes on final release).
 # native_fork_child_clone_storm_recycles_exited_pinned_controls (32 rounds, 256 births);
 # native_fork_child_claimed_sibling_birth_parks_until_settlement (multiple live child threads);
+# native_fork_child_exiting_sibling_wakes_parked_clone (real ExitingBorn exit,
+# enrolled sibling clone, final-pin wake and successful preserved clone);
 # managed_clone_copyout_fault_unbinds_birth_before_retry (errno 14, exact unbind and retry);
 # unmanaged_thread_birth_reusing_freed_record_does_not_observe_stale_mm (MM 1, not 99).
 # Fork alone reserves no spare thread identities. See contract documentation.

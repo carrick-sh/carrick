@@ -196,6 +196,11 @@ fn native_fork_child_claimed_sibling_birth_parks_until_settlement() {
     child_thread_admission(6, 1, ChildStockCase::Claimed);
 }
 
+#[test]
+fn native_fork_child_exiting_sibling_wakes_parked_clone() {
+    child_thread_admission(7, 1, ChildStockCase::Exiting);
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ChildStockCase {
     FirstBirth,
@@ -203,6 +208,7 @@ enum ChildStockCase {
     Capacity,
     Pinned,
     Claimed,
+    Exiting,
 }
 
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
@@ -513,7 +519,9 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             // process venue before retaining its signal publisher's snapshot.
             frame.x[8] = 178;
             loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters);
-            if case == ChildStockCase::Pinned {
+            if case == ChildStockCase::Pinned
+                || (case == ChildStockCase::Exiting && page.live() > 2)
+            {
                 pins.push(
                     crate::native_process_runtime::thread_stock::retain_signal_snapshot(
                         &owner, record,
@@ -523,6 +531,102 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                     crate::native_process_runtime::thread_stock::retain_transient_control_pin(
                         &owner, record,
                     ),
+                );
+            }
+            if case == ChildStockCase::Exiting && page.live() == 2 {
+                let exiting = fixture.zone.record(current).identity();
+                let fixture_address = fixture as *const Fixture as usize;
+                let crossing_address = core::ptr::from_ref(&*crossing) as usize;
+                super::super::lifecycle::install_raw_exit_before_commit_hook(
+                    page,
+                    Box::new(move || {
+                        // SAFETY: the leaked fixture is used sequentially by this
+                        // hook while the outer exit is paused after record release.
+                        let fixture = unsafe { &*(fixture_address as *const Fixture) };
+                        let crossing = unsafe { &*(crossing_address as *const TestStockCrossing) };
+                        let control =
+                            unsafe { &*(exiting.control_slot as *const ThreadControlSlot) };
+                        let entry = control.entry().unwrap();
+                        assert_eq!(
+                            page.state(entry.index()),
+                            Some((entry.generation(), carrick_el1_abi::EntryState::ExitingBorn)),
+                            "the real sibling exit must be paused in ExitingBorn"
+                        );
+                        // The membership reservation has consumed the exiting
+                        // sibling's live unit; its ABI admission is still in flight.
+                        assert_eq!(page.live(), 1);
+                        fixture.zone.clear_current(fixture.slot);
+                        // A separate CPU-local execution snapshot keeps the
+                        // paused exit's identity and boundary flags untouched.
+                        let task: &'static CurrentTask = Box::leak(Box::new(CurrentTask::new()));
+                        let mut cpu = crate::sched::FakeCpu::default();
+                        let mut frame = carrick_el1_abi::TrapFrame::default();
+                        let counters = carrick_el1_abi::Counters::new();
+                        let mut handoff = None;
+                        let mut zone = crate::dispatch::Zone {
+                            tables: fixture.zone,
+                            cpu: &mut cpu,
+                            user: &crate::sched::HardwareUserWord,
+                        };
+                        assert_eq!(
+                            crate::dispatch::native_scheduler(
+                                &mut zone,
+                                task,
+                                &counters,
+                                fixture.slot,
+                                &mut handoff,
+                            )
+                            .idle_entry(&mut frame, 0),
+                            carrick_el1_abi::Action::Served
+                        );
+                        let caller = fixture
+                            .zone
+                            .record_ref(fixture.zone.slot(fixture.slot).current().unwrap());
+                        assert_eq!(fixture.zone.record(caller.id).identity().tid, identity.tid);
+                        frame.x[8] = 220;
+                        frame.x[..6].copy_from_slice(&[0x50f00, VA + 0x12000, 0, 0, 0, 0]);
+                        let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+                        let mut service = Aarch64NativeProcessService::with_crossing(
+                            task,
+                            fixture.slot,
+                            fixture.zone,
+                            fixture.region.table(),
+                            NonZeroU64::MIN,
+                            crossing,
+                        )
+                        .with_words(words);
+                        let owner = registry().for_record(fixture.zone, caller).unwrap();
+                        assert!(matches!(
+                            resume_selected(
+                                &owner,
+                                registry(),
+                                BornInZoneSource {
+                                    zone: fixture.zone,
+                                    slot: fixture.slot
+                                },
+                                task,
+                                caller.id,
+                                &mut service,
+                            ),
+                            crate::native_process_runtime::NativeResume::NoPending
+                        ));
+                        assert_ne!(
+                            loan_call_for_task(
+                                fixture,
+                                task,
+                                &mut frame,
+                                &mut cpu,
+                                &mut service,
+                                &counters
+                            ),
+                            carrick_personality_linux::dispatch::CompletionRoute::Forward
+                        );
+                        assert!(
+                            fixture.zone.slot(fixture.slot).current().is_none(),
+                            "clone must park on the exiting sibling, never return EAGAIN"
+                        );
+                        assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+                    }),
                 );
             }
             frame.x[8] = 93;
@@ -545,6 +649,32 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                 .tid),
             Some(identity.tid)
         );
+        if case == ChildStockCase::Exiting {
+            let caller = fixture.zone.slot(fixture.slot).current().unwrap();
+            assert_eq!(
+                fixture.zone.record(caller).identity().tid,
+                identity.tid,
+                "ordinary sibling exit must notify the parked cloner"
+            );
+            assert!(matches!(
+                crate::aarch64_process::resume_production_with_service(
+                    fixture.zone,
+                    &fixture.task,
+                    fixture.slot,
+                    caller,
+                    &mut service,
+                ),
+                crate::sched::ResumeAction::RetrySyscall
+            ));
+            assert_eq!(frame.x[8], 220);
+            assert_ne!(
+                loan_call(fixture, &mut frame, &mut cpu, &mut service, &counters),
+                carrick_personality_linux::dispatch::CompletionRoute::Forward
+            );
+            assert!((frame.x[0] as i64) > 0, "resumed clone must succeed");
+            assert_eq!(page.live(), 2);
+            return;
+        }
         if case == ChildStockCase::Pinned {
             assert_eq!(pins.len(), 7);
             assert_eq!(transient_pins.len(), 7);
@@ -718,6 +848,17 @@ fn loan_call(
     service: &mut Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
     counters: &carrick_el1_abi::Counters,
 ) -> carrick_personality_linux::dispatch::CompletionRoute {
+    loan_call_for_task(fixture, &fixture.task, frame, cpu, service, counters)
+}
+
+fn loan_call_for_task(
+    fixture: &'static Fixture,
+    task: &'static CurrentTask,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    cpu: &mut crate::sched::FakeCpu,
+    service: &mut Aarch64NativeProcessService<'static, &'static TestStockCrossing>,
+    counters: &carrick_el1_abi::Counters,
+) -> carrick_personality_linux::dispatch::CompletionRoute {
     let current = fixture.zone.slot(fixture.slot).current().unwrap();
     let identity = fixture.zone.record(current).identity();
     let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
@@ -758,7 +899,7 @@ fn loan_call(
             zone: fixture.zone,
             slot: fixture.slot,
         },
-        &fixture.task,
+        task,
         &saved.native,
         child_root,
         page,
@@ -768,7 +909,7 @@ fn loan_call(
             let route = crate::dispatch::dispatch_syscall_with_native(
                 frame,
                 counters,
-                core::slice::from_ref(&fixture.task),
+                core::slice::from_ref(task),
                 &[],
                 &[],
                 &[],
