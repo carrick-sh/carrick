@@ -107,6 +107,9 @@ pub(crate) struct Adoption {
     issue: Value,
 }
 impl Adoption {
+    pub(crate) fn issue_number(&self) -> Option<u64> {
+        self.issue["number"].as_u64()
+    }
     fn continuation(&self) -> Continuation {
         Continuation::Adopted {
             pr: self.number,
@@ -653,10 +656,21 @@ fn agent_lease() -> Result<
 }
 
 fn worker_prompt(dispatch: &Dispatch) -> String {
+    let history = match &dispatch.continuation {
+        Continuation::Owned => format!(
+            "Rebase onto admitted main {} (refs/carrick/dispatch-main) before working.\n\
+            Resolve any conflicts in this isolated checkout; preserve earlier workers' commits.\n",
+            dispatch.base
+        ),
+        Continuation::Adopted { pr, tip, .. } => format!(
+            "This continues PR #{pr}, which the director owns. Add commits on top of the admitted PR head {tip};\n\
+            do not rebase or rewrite existing commits; the director owns keeping the branch current with main.\n\
+            Publication refuses any HEAD that does not descend from {tip}. The PR body is not yours to change.\n"
+        ),
+    };
     format!(
         "Work issue {REPOSITORY}#{} on branch {}. Read AGENTS.md in full.\n\
-        Rebase onto admitted main {} (refs/carrick/dispatch-main) before working.\n\
-        Resolve any conflicts in this isolated checkout; preserve earlier workers' commits.\n\
+        {history}\
         Implement and verify this brief. Commit your work with a Why/What/Verified body and\n\
         Co-Authored-By: {}\nDo not push, open a PR, or post comments; the workflow publishes those.\n\
         Never use --no-verify, git stash or git add -A. Keep conformance-probes/target out of commits.\n\
@@ -672,7 +686,6 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
         dispatch.issue,
         dispatch.branch,
-        dispatch.base,
         dispatch.worker.coauthor,
         dispatch.base,
         dispatch.body,
@@ -2032,6 +2045,54 @@ pub(crate) fn dispatch_branch(branch: &str) -> Option<u64> {
     issue.parse::<u64>().ok().filter(|n| *n > 0)
 }
 
+/// Hosted guard (`admit == false`) and clone admission (`admit == true`):
+/// resolve the event, validate it, and on the clone re-check the target PR
+/// and persist the private admission the loop reads.
+fn guard_admission(
+    root: &Path,
+    event_path: &Path,
+    admit: bool,
+    retire_previous_agent: impl FnOnce() -> Result<(), ScalerError>,
+) -> Result<(Value, Dispatch), ScalerError> {
+    let (event, adoption) = load_event(root, event_path)?;
+    let publication = if adoption.is_none() && publish_app_author(&event["pull_request"]["user"]) {
+        let branch = event["pull_request"]["head"]["ref"]
+            .as_str()
+            .unwrap_or_default();
+        let issue = event["issue"]["number"].as_u64().unwrap_or_default();
+        agent_loop::RunCache::for_guard(admit).publication(
+            root,
+            &event["pull_request"],
+            &event["dispatch_run"],
+            issue,
+            branch,
+        )
+    } else {
+        None
+    };
+    let mut dispatch = validate_event_with_publication(
+        &event,
+        &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
+        publication.as_ref(),
+        adoption.as_ref(),
+    )?;
+    dispatch.base = admitted_base(dispatch.review || event.get("comment").is_some())?;
+    if admit {
+        retire_previous_agent()?;
+    }
+    assigned_branch(&mut dispatch)?;
+    if dispatch.continuation == Continuation::Owned {
+        branch_run(dispatch.issue, &dispatch.branch)?;
+    }
+    if admit {
+        if dispatch.resume {
+            require_target_pr(root, &dispatch)?;
+        }
+        persist_admission(&dispatch, &event, event_path)?;
+    }
+    Ok((event, dispatch))
+}
+
 pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     if let DispatchAction::Tool { name } = &args.action {
         return agent_loop::client(name);
@@ -2054,42 +2115,7 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         } => return agent_loop::run(&root, &event, &setup_status),
         DispatchAction::Guard { event, admit, .. } => (event, admit),
     };
-    let (event, adoption) = load_event(&root, &event_path)?;
-    let publication = if adoption.is_none() && publish_app_author(&event["pull_request"]["user"]) {
-        let branch = event["pull_request"]["head"]["ref"]
-            .as_str()
-            .unwrap_or_default();
-        let issue = event["issue"]["number"].as_u64().unwrap_or_default();
-        agent_loop::RunCache::for_guard(admit).publication(
-            &root,
-            &event["pull_request"],
-            &event["dispatch_run"],
-            issue,
-            branch,
-        )
-    } else {
-        None
-    };
-    let mut dispatch = validate_event_with_publication(
-        &event,
-        &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
-        publication.as_ref(),
-        adoption.as_ref(),
-    )?;
-    dispatch.base = admitted_base(dispatch.review || event.get("comment").is_some())?;
-    if admit {
-        cleanup_agent_user()?;
-    }
-    assigned_branch(&mut dispatch)?;
-    if dispatch.continuation == Continuation::Owned {
-        branch_run(dispatch.issue, &dispatch.branch)?;
-    }
-    if admit {
-        if dispatch.resume {
-            require_target_pr(&root, &dispatch)?;
-        }
-        persist_admission(&dispatch, &event, &event_path)?;
-    }
+    let (event, dispatch) = guard_admission(&root, &event_path, admit, cleanup_agent_user)?;
     if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
         use std::io::Write;
         writeln!(
@@ -2715,9 +2741,9 @@ struct Applied {
     ci_requires_owner: bool,
     #[serde(default)]
     token_fallback: Option<TokenFallback>,
-    /// An adopted PR moved after admission; the round ends blocked.
+    /// An adopted PR moved or its history was rewritten; the round ends blocked.
     #[serde(default)]
-    lease_refused: Option<String>,
+    adoption_blocked: Option<String>,
 }
 impl Applied {
     fn load() -> Result<Self, ScalerError> {
@@ -2740,7 +2766,7 @@ impl Applied {
     fn report(&self) -> String {
         format!(
             "{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}",
-            self.lease_refused
+            self.adoption_blocked
                 .as_ref()
                 .map(|reason| format!("- Push refused: {reason}.\n"))
                 .unwrap_or_default(),
@@ -3401,14 +3427,26 @@ fn live_publication_main(work: &Path, token: &str) -> Result<String, ScalerError
     Ok((*main).to_owned())
 }
 
-/// Someone pushed to an adopted PR after admission. Nothing is overwritten;
-/// the round ends blocked and the owner re-runs `/agent` on the new head.
-fn adopted_lease_refused(number: u64, tip: &str, why: &str) -> Result<ScalerError, ScalerError> {
-    let reason = format!(
-        "Adopted PR #{number} moved after admission ({why}; admitted tip `{tip}`). Nothing was pushed or overwritten; comment `/agent` again to continue from the new head"
-    );
-    Applied::record(|a| a.lease_refused = Some(reason.clone()))?;
+/// An adopted PR moved after admission, or the worker rewrote its history.
+/// Nothing is overwritten and the round ends blocked with the reason.
+fn adopted_publication_blocked(number: u64, why: &str) -> Result<ScalerError, ScalerError> {
+    let reason = format!("Adopted PR #{number}: {why}");
+    Applied::record(|a| a.adoption_blocked = Some(reason.clone()))?;
     Ok(ScalerError::Usage(reason))
+}
+/// `ls-remote` output for one branch; empty when the branch is absent.
+fn live_branch_tip(work: &Path, branch: &str) -> Result<String, ScalerError> {
+    git(
+        work,
+        &[
+            "-c",
+            "credential.helper=!gh auth git-credential",
+            "ls-remote",
+            "--heads",
+            "https://github.com/carrick-sh/carrick",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
 }
 
 fn publication_body(body: &str, source: &str, issue: u64) -> Result<String, ScalerError> {
@@ -3567,19 +3605,38 @@ fn publish_commits(
     if work.is_dir()
         && (dispatch.resume || git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base)
     {
-        // Keep the commits on any later refusal, even before main is known.
-        *preserve = Some(receipt.base.clone());
-        git(
-            &work,
-            &["merge-base", "--is-ancestor", &receipt.base, "HEAD"],
-        )
-        .map_err(|_| {
-            ScalerError::Guard("worker must rebase onto admitted main before publication")
-        })?;
+        if let Some((number, admitted)) = adopted {
+            // The director owns the adopted history: the run may only add
+            // commits on top of the admitted tip, never rebase or rewrite it.
+            *preserve = Some(admitted.to_owned());
+            if git(&work, &["merge-base", "--is-ancestor", admitted, "HEAD"]).is_err() {
+                return Err(adopted_publication_blocked(
+                    number,
+                    &format!(
+                        "the worker rewrote history: HEAD does not descend from the admitted tip `{admitted}`. Nothing was pushed"
+                    ),
+                )?);
+            }
+        } else {
+            // Keep the commits on any later refusal, even before main is known.
+            *preserve = Some(receipt.base.clone());
+            git(
+                &work,
+                &["merge-base", "--is-ancestor", &receipt.base, "HEAD"],
+            )
+            .map_err(|_| {
+                ScalerError::Guard("worker must rebase onto admitted main before publication")
+            })?;
+        }
         let live_main = live_publication_main(&work, token)?;
-        let mut base = git(&work, &["merge-base", &live_main, "HEAD"])?
-            .trim()
-            .to_owned();
+        // An adopted run is measured from its admitted tip, so the
+        // director's own commits are never charged to it.
+        let mut base = match adopted {
+            Some((_, admitted)) => admitted.to_owned(),
+            None => git(&work, &["merge-base", &live_main, "HEAD"])?
+                .trim()
+                .to_owned(),
+        };
         *preserve = Some(base.clone());
         // Main and the branch tip admitted before this run are trusted history.
         // A worker may rebase across either without owning their messages.
@@ -3619,7 +3676,9 @@ fn publish_commits(
         // from the default branch, even if none of the pushed commits touch
         // them. A base that is merely behind such a change is not a blocker:
         // replay the run's commits onto current main.
-        if base != live_main && !workflow_files(&base, &live_main)?.is_empty() {
+        // Never on an adopted PR: keeping it current with main is the director's.
+        if adopted.is_none() && base != live_main && !workflow_files(&base, &live_main)?.is_empty()
+        {
             let rebase = output(&mut git_invocation(
                 &work,
                 &["rebase", "--rebase-merges", "--onto", &live_main, &base],
@@ -3652,17 +3711,7 @@ fn publish_commits(
             base = live_main.clone();
             *preserve = Some(base.clone());
         }
-        let tip = git(
-            &work,
-            &[
-                "-c",
-                "credential.helper=!gh auth git-credential",
-                "ls-remote",
-                "--heads",
-                "https://github.com/carrick-sh/carrick",
-                &format!("refs/heads/{}", dispatch.branch),
-            ],
-        )?;
+        let tip = live_branch_tip(&work, &dispatch.branch)?;
         let head = git(&work, &["rev-parse", "HEAD"])?;
         let source = neutralize_mentions(&agent_loop::masked(
             &format!(
@@ -3687,10 +3736,11 @@ fn publish_commits(
             && existing != Some(admitted)
             && existing != Some(head.trim())
         {
-            return Err(adopted_lease_refused(
+            return Err(adopted_publication_blocked(
                 number,
-                admitted,
-                "the live head differs",
+                &format!(
+                    "the PR moved after admission (live head differs from the admitted tip `{admitted}`). Nothing was pushed or overwritten; comment `/agent` again to continue from the new head"
+                ),
             )?);
         }
         let retained =
@@ -3759,8 +3809,19 @@ fn publish_commits(
                     push.env("GH_TOKEN", token).env_remove("GITHUB_TOKEN");
                     output(&mut push)
                 }).or_else(|error| match adopted {
-                    Some((number, tip)) if error.to_string().contains("stale info") => {
-                        Err(adopted_lease_refused(number, tip, "the push lease was rejected")?)
+                    // Decide from the server, never from git's localized text.
+                    Some((number, admitted))
+                        if live_branch_tip(&work, &dispatch.branch)?
+                            .split_whitespace()
+                            .next()
+                            != Some(admitted) =>
+                    {
+                        Err(adopted_publication_blocked(
+                            number,
+                            &format!(
+                                "the PR moved after admission (the push lease on `{admitted}` was rejected). Nothing was overwritten; comment `/agent` again to continue from the new head"
+                            ),
+                        )?)
                     }
                     _ => Err(error),
                 }).map_err(|error| {
@@ -4495,6 +4556,14 @@ mod tests {
         publication_fixture("adopted-race");
     }
     #[test]
+    fn adopted_publication_refuses_a_rewritten_history() {
+        publication_fixture("adopted-rewrite");
+    }
+    #[test]
+    fn adopted_publication_is_not_charged_for_director_history() {
+        publication_fixture("adopted-director-history");
+    }
+    #[test]
     fn publish_auth_failure_on_push_falls_back_once() {
         publication_fixture("publish-token-auth-push");
     }
@@ -4634,7 +4703,7 @@ for arg do
  if test -f "$RUNNER_TEMP/publish-mode"; then
   mode=$(cat "$RUNNER_TEMP/publish-mode")
   if test "$mode" = publish-token-auth-push && test "$kind" = app; then touch "$RUNNER_TEMP/publish-fallback"; echo 'fatal: Authentication failed' >&2; exit 87; fi
-  if test "$mode" = publish-token-lease; then echo 'rejected: stale info (lease rejection)' >&2; exit 86; fi
+  if test "$mode" = publish-token-lease; then test ! -f "$RUNNER_TEMP/race-tip" || cp "$RUNNER_TEMP/race-tip" "$RUNNER_TEMP/remote-tip"; echo 'rejected: stale info (lease rejection)' >&2; exit 86; fi
   if test "$mode" = publish-token-network; then echo 'fatal: unable to access remote: Could not resolve host' >&2; exit 85; fi
  fi
  if test -f "$RUNNER_TEMP/publish-fallback"; then expected=fixture-token; else expected=${DISPATCH_TEST_WRITE_TOKEN:-fixture-token}; fi
@@ -4862,6 +4931,18 @@ fi
         if witness.starts_with("adopted") {
             let branch = "work/634-slice";
             git(&work, &["checkout", "-B", branch, &receipt.base]).unwrap();
+            if witness == "adopted-director-history" {
+                // Director history below the tip: a closing reference to
+                // another issue and a workflow change main does not have.
+                std::fs::create_dir_all(work.join(".github/workflows")).unwrap();
+                std::fs::write(work.join(".github/workflows/director.yml"), "on: push\n").unwrap();
+                git(&work, &["add", ".github/workflows/director.yml"]).unwrap();
+                git(
+                    &work,
+                    &["commit", "-m", "ci: director workflow\n\nFixes #999"],
+                )
+                .unwrap();
+            }
             git(
                 &work,
                 &[
@@ -4896,8 +4977,28 @@ fi
                 ],
             )
             .unwrap();
+            if witness == "adopted-rewrite" {
+                // The worker rewrote the director's tip instead of adding to it.
+                git(&work, &["reset", "--hard", &receipt.base]).unwrap();
+                git(
+                    &work,
+                    &[
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "refactor(core): rewritten slice",
+                    ],
+                )
+                .unwrap();
+            }
             if witness == "adopted-race" {
+                // Someone pushes while ours is in flight: the lease rejects it.
                 std::fs::write(outer.join("publish-mode"), "publish-token-lease").unwrap();
+                std::fs::write(
+                    outer.join("race-tip"),
+                    format!("{}\trefs/heads/{branch}\n", "e".repeat(40)),
+                )
+                .unwrap();
             }
             dispatch.branch = branch.into();
             dispatch.resume = true;
@@ -4938,8 +5039,13 @@ fi
             );
             let applied = Applied::load().unwrap();
             assert_eq!(applied.publication_pr, None);
-            if witness == "adopted" {
+            if matches!(witness, "adopted" | "adopted-director-history") {
                 assert_eq!(result.unwrap(), Some(800));
+                assert_eq!(
+                    applied.commits,
+                    vec![receipt.head.clone()],
+                    "director commits charged to the run"
+                );
                 let push = regular_text(&outer.join("push.args")).unwrap();
                 assert!(
                     push.contains(&format!("HEAD:refs/heads/{branch}\n")),
@@ -4954,19 +5060,24 @@ fi
                     "{}",
                     applied.report()
                 );
-                assert_eq!(applied.lease_refused, None);
+                assert_eq!(applied.adoption_blocked, None);
             } else {
                 let error = result.unwrap_err().to_string();
-                assert!(error.contains("moved after admission"), "{error}");
+                let expected = if witness == "adopted-rewrite" {
+                    "rewrote history"
+                } else {
+                    "moved after admission"
+                };
+                assert!(error.contains(expected), "{error}");
                 assert!(
                     applied.report().contains("Push refused"),
                     "{}",
                     applied.report()
                 );
-                assert!(applied.lease_refused.is_some());
+                assert!(applied.adoption_blocked.is_some());
                 assert!(applied.commits.is_empty());
                 assert!(!state.join("published-tip").exists());
-                if witness == "adopted-moved" {
+                if matches!(witness, "adopted-moved" | "adopted-rewrite") {
                     assert!(
                         !outer.join("push-attempts").exists(),
                         "pushed over a moved head"
@@ -6544,7 +6655,11 @@ cat "$file"
 "#,
                 std::fs::Permissions::from_mode(0o700),
             );
-            for head in [None, Some("b".repeat(40))] {
+            for (head, admission) in [
+                (None, false),
+                (Some("b".repeat(40)), false),
+                (Some("a".repeat(40)), true),
+            ] {
                 let mut command = Command::new(std::env::current_exe().unwrap());
                 command
                     .args([
@@ -6559,6 +6674,16 @@ cat "$file"
                     .env_remove("CARRICK_DISPATCH_HEAD");
                 if let Some(head) = &head {
                     command.env("CARRICK_DISPATCH_HEAD", head);
+                }
+                if admission {
+                    let runner = tempfile::tempdir_in(temp.path()).unwrap().keep();
+                    command
+                        .env("ADOPTION_ADMIT", "1")
+                        .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+                        .env("CARRICK_DISPATCH_BASE", "f".repeat(40))
+                        .env("RUNNER_TEMP", runner)
+                        .env("GITHUB_RUN_ID", "77")
+                        .env("GITHUB_RUN_ATTEMPT", "1");
                 }
                 let output = command.output().unwrap();
                 assert!(
@@ -6607,6 +6732,41 @@ cat "$file"
                 let (loaded, adoption) = load_event(&fixture, &event_path)?;
                 validate_event_with_publication(&loaded, "tjfontaine", None, adoption.as_ref())
             };
+        if std::env::var_os("ADOPTION_ADMIT").is_some() {
+            // The production guard, then clone admission: require_target_pr
+            // re-checks the PR and the private admission round-trips the type.
+            admit(&event, &pr, &issue, &comment, &[986]).unwrap();
+            let (_, hosted) = guard_admission(&fixture, &event_path, false, || {
+                panic!("the hosted guard never retires an agent")
+            })
+            .unwrap();
+            let mut retired = false;
+            let (_, admitted) = guard_admission(&fixture, &event_path, true, || {
+                retired = true;
+                Ok(())
+            })
+            .unwrap();
+            assert!(retired);
+            let expected = Continuation::Adopted {
+                pr: 1150,
+                branch: "work/986-slice4".into(),
+                tip: tip.clone(),
+            };
+            assert_eq!(hosted.continuation, expected);
+            assert_eq!(admitted.continuation, expected);
+            assert_eq!(admitted.base, "f".repeat(40));
+            let stored = read_admission(&event_path).unwrap();
+            assert_eq!(stored.dispatch.continuation, expected);
+            assert_eq!(stored.dispatch.issue, 986);
+            assert_eq!(stored.dispatch.branch, "work/986-slice4");
+            assert_eq!(stored.trigger["id"], 123);
+            // A PR that stops qualifying is refused at clone admission.
+            let mut closed = issue.clone();
+            closed["state"] = "closed".into();
+            write("issues/986", &closed);
+            assert!(guard_admission(&fixture, &event_path, true, || Ok(())).is_err());
+            return;
+        }
         if std::env::var_os("CARRICK_DISPATCH_HEAD").is_some() {
             let error = admit(&event, &pr, &issue, &comment, &[986]).unwrap_err();
             assert!(error.to_string().contains("stale PR head"), "{error}");
@@ -6722,6 +6882,17 @@ cat "$file"
             validate_event_with_publication(&review, "tjfontaine", None, adoption.as_ref())
                 .is_err()
         );
+    }
+    #[test]
+    fn adoption_predicate_refuses_dispatch_named_refs_before_any_read() {
+        let pr = json!({"number":1150,"state":"open","user":{"login":"tjfontaine","type":"User"},
+            "head":{"ref":"work/dispatch-986-42","sha":"a".repeat(40),"repo":{"full_name":REPOSITORY}},
+            "base":{"ref":"main","repo":{"full_name":REPOSITORY}}});
+        let refused = adopted_pr(&pr, |_| -> Result<Value, ScalerError> {
+            panic!("a dispatch-named ref must be refused before any server read")
+        })
+        .unwrap();
+        assert!(refused.is_none());
     }
     #[test]
     fn adopted_push_targets_only_the_adopted_ref_under_the_admitted_lease() {
