@@ -192,6 +192,91 @@ const _: () = {
     assert!(EL1_STACK_GUARD_TABLES_OFFSET.is_multiple_of(4096));
 };
 
+/// Every occupant of the counters area (`EL1_COUNTERS_OFFSET` up to
+/// [`EL1_STACKS_OFFSET`]), as `(name, region offset, size)`. The maintenance
+/// root's stack-guard level-3 tables sit from `counters+0xA_4000` (one page
+/// per table, within `..0xA_A000`) in the gap after the COW copy window,
+/// with no struct field of their own: a
+/// future counters field placed by bare offset could silently overlap them.
+/// The entries are in bounds and pairwise disjoint (asserted below, at
+/// compile time, via [`first_region_overlap`]).
+pub const EL1_COUNTERS_AREA_OCCUPANTS: [(&str, u64, u64); 8] = [
+    (
+        "counters",
+        EL1_COUNTERS_OFFSET,
+        core::mem::size_of::<Counters>() as u64,
+    ),
+    (
+        "reservations",
+        EL1_RESERVATIONS_OFFSET,
+        EL1_RESERVATIONS_END - EL1_RESERVATIONS_OFFSET,
+    ),
+    (
+        "descriptor transactions",
+        EL1_DESCRIPTOR_TXN_OFFSET,
+        core::mem::size_of::<DescriptorTxnSlots>() as u64,
+    ),
+    ("COW copy window", EL1_COW_COPY_OFFSET, EL1_COW_COPY_SIZE),
+    (
+        "stack-guard level-3 tables",
+        EL1_STACK_GUARD_TABLES_OFFSET,
+        EL1_STACK_GUARD_TABLES_SIZE,
+    ),
+    (
+        "service copy table",
+        EL1_SERVICE_COPY_TABLE_OFFSET,
+        core::mem::size_of::<ServiceCopyTable>() as u64,
+    ),
+    (
+        "aperture control",
+        EL1_APERTURE_CONTROL_OFFSET,
+        core::mem::size_of::<ApertureControl>() as u64,
+    ),
+    (
+        "mm portal",
+        EL1_MM_PORTAL_OFFSET,
+        core::mem::size_of::<MmPortalSlots>() as u64,
+    ),
+];
+
+/// The first pair of `(name, offset, size)` regions (as indices) that is
+/// empty, escapes `[floor, ceiling)` or overlaps an earlier region, or
+/// `None` when the table is a valid disjoint layout. Reports the first
+/// offending index twice for an empty or out-of-bounds entry.
+pub const fn first_region_overlap(
+    regions: &[(&str, u64, u64)],
+    floor: u64,
+    ceiling: u64,
+) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < regions.len() {
+        let (_, a, a_len) = regions[i];
+        if a_len == 0 || a < floor || a > ceiling || a_len > ceiling - a {
+            return Some((i, i));
+        }
+        let mut j = i + 1;
+        while j < regions.len() {
+            let (_, b, b_len) = regions[j];
+            if !(a + a_len <= b || b + b_len <= a) {
+                return Some((i, j));
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    None
+}
+
+const _: () = assert!(
+    first_region_overlap(
+        &EL1_COUNTERS_AREA_OCCUPANTS,
+        EL1_COUNTERS_OFFSET,
+        EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE,
+    )
+    .is_none(),
+    "counters area occupants overlap or escape the area"
+);
+
 /// Lowest address of `slot`'s unmapped guard.
 #[inline(always)]
 pub const fn stack_slot_guard_base(slot: usize) -> u64 {

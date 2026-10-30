@@ -79,3 +79,43 @@ fn enlarged_image_and_shared_arm_x86_regions_do_not_overlap() {
         ));
     }
 }
+
+#[test]
+fn counters_area_occupants_include_guard_tables_and_detect_overlap() {
+    let end = EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE;
+    assert_eq!(
+        first_region_overlap(&EL1_COUNTERS_AREA_OCCUPANTS, EL1_COUNTERS_OFFSET, end),
+        None
+    );
+    // The static guard tables are enumerated at their documented place:
+    // from counters+0xA_4000, one page per level-3 table, within the
+    // counters+0xA_4000..0xA_A000 gap the layout reserves for them.
+    let guard = EL1_COUNTERS_AREA_OCCUPANTS
+        .iter()
+        .find(|(name, ..)| *name == "stack-guard level-3 tables")
+        .expect("guard tables are declared");
+    assert_eq!(guard.1, EL1_COUNTERS_OFFSET + 0xA_4000);
+    assert_eq!(guard.2, EL1_STACK_TABLE_PAGES as u64 * 4096);
+    assert!(guard.1 + guard.2 <= EL1_COUNTERS_OFFSET + 0xA_A000);
+
+    // A new field squatting on any byte of the guard tables is refused, as
+    // is an empty or out-of-area entry.
+    let mut occupants = [("new field", 0, 0x100); 9];
+    occupants[..8].copy_from_slice(&EL1_COUNTERS_AREA_OCCUPANTS);
+    for squat in [guard.1, guard.1 + 0x1000, guard.1 + guard.2 - 1] {
+        occupants[8] = ("new field", squat, 1);
+        assert!(first_region_overlap(&occupants, EL1_COUNTERS_OFFSET, end).is_some());
+    }
+    occupants[8] = ("new field", guard.1 - 0x100, 0x200);
+    assert!(first_region_overlap(&occupants, EL1_COUNTERS_OFFSET, end).is_some());
+    occupants[8] = ("empty", end - 0x10, 0);
+    assert!(first_region_overlap(&occupants, EL1_COUNTERS_OFFSET, end).is_some());
+    occupants[8] = ("escapes", end - 0x10, 0x20);
+    assert!(first_region_overlap(&occupants, EL1_COUNTERS_OFFSET, end).is_some());
+    // A neighbour exactly adjacent to the guard tables is fine.
+    occupants[8] = ("adjacent", guard.1 + guard.2, 0x10);
+    assert_eq!(
+        first_region_overlap(&occupants, EL1_COUNTERS_OFFSET, end),
+        None
+    );
+}
