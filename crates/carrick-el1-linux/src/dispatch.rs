@@ -1402,11 +1402,43 @@ fn declined_fault_admission_busy_once_then_success() {
     );
 }
 
+/// Production fault entry after ISA register capture and lifecycle address
+/// binding. Admission composition is shared with the VM-free witnesses.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn arm_deliver_declined_fault_signal<X: super::aarch64_process::ForkStockCrossing, F>(
+    source: carrick_el1_abi::BornInZoneSource<'static, carrick_el1_abi::Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: &carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    deliver: F,
+) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
+where
+    F: FnOnce(
+        &mut super::native_process_runtime::NativeProcessEntry<
+            '_,
+            'static,
+            super::aarch64_process::Mm,
+            carrick_el1_abi::Aarch64ParkedContext,
+            super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+        >,
+        &mut TrapFrame,
+    ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
+{
+    arm_deliver_declined_fault_signal_with(
+        source, task, native, ttbr0, page, control, service, frame, deliver,
+    )
+}
+
 /// The in-ring synchronous fault venue for declined reservation permissions
 /// and host-classified faults on a `SignalOwner` thread.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
-pub(crate) fn arm_deliver_declined_fault_signal(frame: &mut TrapFrame) -> Action {
+pub(crate) fn arm_deliver_declined_fault_signal_current(frame: &mut TrapFrame) -> Action {
     let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
         unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
     let Some(task) = current_tasks.get(frame.slot as usize) else {
@@ -1419,20 +1451,12 @@ pub(crate) fn arm_deliver_declined_fault_signal(frame: &mut TrapFrame) -> Action
         return Action::Forward;
     };
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
-    if !matches!(
-        carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
-            zone, slot, task, page, control
-        ),
-        carrick_el1::substrate::sched::NativeEntryVenue::SignalOwner
-    ) {
-        return Action::Forward;
-    }
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    arm_deliver_declined_fault_signal_with(
+    arm_deliver_declined_fault_signal(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
         &saved.native,
@@ -1476,7 +1500,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         if !classified_fault_entry_permitted(frame.esr) {
             invalid_completion(NativeInvariant::EntryBinding);
         }
-        return arm_deliver_declined_fault_signal(frame);
+        return arm_deliver_declined_fault_signal_current(frame);
     }
     let fatal_owner_cancel = frame.esr == 0xfffc;
     let Some(task) = current_tasks.get(frame.slot as usize) else {
