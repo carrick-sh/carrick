@@ -407,7 +407,11 @@ fn losing_pool_exit_group_does_not_reserve_membership_twice() {
         carrick_core::terminal::reserve_host_thread_exit_membership(page, sibling.control)
             .expect("losing caller already consumed its exact membership");
     graph_cleanup
-        .retire_published(sibling.control.entry().unwrap(), sibling.control)
+        .retire_published(
+            sibling.control.entry().unwrap(),
+            sibling.control,
+            &carrick_core::lifecycle::RegistryWriteHeld::for_test(),
+        )
         .unwrap();
     assert_eq!(page.live(), 0);
 }
@@ -484,8 +488,12 @@ fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
     assert!(fixture.zone.live(sibling.record).is_some());
     assert_eq!(page.live(), 0);
     assert!(
-        host.commit_zone_retirement()
-            .retire_published(sibling.control.entry().unwrap(), sibling.control)
+        host.commit_zone_retirement(&carrick_core::lifecycle::RegistryWriteHeld::for_test())
+            .retire_published(
+                sibling.control.entry().unwrap(),
+                sibling.control,
+                &carrick_core::lifecycle::RegistryWriteHeld::for_test()
+            )
             .unwrap()
             .is_none()
     );

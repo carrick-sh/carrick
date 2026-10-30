@@ -713,7 +713,8 @@ fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
         1,
         "host must not reserve native membership twice"
     );
-    host.commit_zone_retirement().publish();
+    host.commit_zone_retirement(&carrick_core::lifecycle::RegistryWriteHeld::for_test())
+        .publish();
     assert_eq!(page.live(), 1, "native page retirement is still pending");
     let again = carrick_core::terminal::reserve_host_thread_exit_membership(&page, &member)
         .unwrap_or_else(|_| panic!("graph cleanup must preserve native provenance"));
@@ -732,7 +733,7 @@ fn committed_host_zone_retirement_never_refunds_or_borrows_native_membership() {
     assert_eq!(page.live(), 2, "uncommitted preparation refunds membership");
     let committed = reserve_host_thread_exit_membership(&page, &member)
         .unwrap_or_else(|_| panic!("reserve"))
-        .commit_zone_retirement();
+        .commit_zone_retirement(&carrick_core::lifecycle::RegistryWriteHeld::for_test());
     assert_eq!(page.live(), 1);
     assert!(
         reserve_host_thread_exit_membership(&page, &member).is_err(),
@@ -744,4 +745,277 @@ fn committed_host_zone_retirement_never_refunds_or_borrows_native_membership() {
         1,
         "committed terminal ownership cannot refund live"
     );
+}
+
+/// Two live scheduler members share a lifecycle page. Keep both exit tokens
+/// alive across the attempted release: destructor timing must not hide the
+/// queue-publication window.
+#[test]
+fn requeued_terminal_attempt_restores_membership_and_admission_before_return() {
+    terminal_attempt(TerminalAttempt::Requeue);
+}
+#[test]
+fn refused_requeue_lock_keeps_membership_and_admission_for_commit() {
+    terminal_attempt(TerminalAttempt::LockRefused);
+}
+#[test]
+fn host_home_terminal_release_commits_the_same_exit_ownership() {
+    terminal_attempt(TerminalAttempt::HostHome);
+}
+
+#[test]
+fn losing_requeue_cas_keeps_membership_and_admission_for_commit() {
+    terminal_attempt(TerminalAttempt::CasLost);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalAttempt {
+    Requeue,
+    LockRefused,
+    HostHome,
+    CasLost,
+}
+
+fn terminal_attempt(mode: TerminalAttempt) {
+    let refuse_lock = mode == TerminalAttempt::LockRefused;
+    let host_home = mode == TerminalAttempt::HostHome;
+    let lose_cas = mode == TerminalAttempt::CasLost;
+    use carrick_core::lifecycle::{EntryRef, MemberControl, MemberExitCustody};
+    use carrick_core::terminal::{Live, TerminalCustody, Thread, ThreadTerminalIdentity};
+    use carrick_el1_abi::{Lifecycle, ThreadLifecyclePage};
+    use carrick_sched_core::{BoundedSpin, Claim, WakeEffects};
+    struct Member(MemberExitCustody, EntryRef);
+    impl MemberControl for Member {
+        fn member_entry(&self) -> Option<EntryRef> {
+            Some(self.1)
+        }
+        fn exit_custody(&self) -> &MemberExitCustody {
+            &self.0
+        }
+        fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+            None
+        }
+    }
+    let zone = compact_zone();
+    let (slot, record, binding) = running_compact(&zone, 19);
+    let mut peer_identity = zone.record(record).identity();
+    peer_identity.tid += 1;
+    peer_identity.serial += 1;
+    let peer = zone.alloc_record(peer_identity).unwrap();
+    zone.requeue_preempted(SlotId::new(2), peer);
+    let page = ThreadLifecyclePage::new();
+    assert_eq!(page.thread_born(), Some(2));
+    let entry = page.reserve_stock(0).unwrap();
+    page.transition(
+        entry,
+        &[carrick_core::lifecycle::EntryState::Stocking],
+        carrick_core::lifecycle::EntryState::Reserved,
+        std::sync::atomic::Ordering::Release,
+    )
+    .unwrap();
+    let claim = page.claim(entry).unwrap();
+    page.complete_birth(claim).unwrap();
+    page.publish(entry).unwrap();
+    let member = Member(MemberExitCustody::new(), entry);
+    let record = if host_home {
+        let id = zone.record(record).identity();
+        assert_eq!(
+            zone.release_current(slot, record, &BoundedSpin(1024)),
+            carrick_sched_core::CurrentRelease::Released
+        );
+        zone.current_or_new(slot, id).unwrap()
+    } else {
+        let key = ObjectWaitKey::new(41, 1).unwrap();
+        zone.bind_object_wait(key, &BoundedSpin(1024)).unwrap();
+        {
+            let guard = zone.object_wait(key, &BoundedSpin(1024)).unwrap();
+            guard
+                .park(
+                    guard.snapshot(),
+                    record,
+                    OperationToken::new(41, 1).unwrap(),
+                )
+                .unwrap();
+        }
+        zone.clear_current(slot);
+        {
+            let guard = zone.object_wait(key, &BoundedSpin(1024)).unwrap();
+            assert_eq!(
+                guard
+                    .notify_object(slot, &mut WakeEffects::default())
+                    .unwrap()
+                    .queued,
+                1
+            );
+        }
+        assert_eq!(zone.switch_in(slot), Some(record));
+        record
+    };
+    let identity = ThreadTerminalIdentity::from_exit(
+        binding,
+        Some(entry),
+        carrick_sched_core::process::TerminationStatus::SUCCESS,
+    )
+    .unwrap();
+    let (custody, mut membership) = TerminalCustody::<Thread, Live>::admitted(identity)
+        .begin()
+        .reserve_member(&page, &member)
+        .unwrap_or_else(|_| panic!("member reservation"));
+    let mut admission = page.begin_exit(entry).unwrap();
+    let retirement = custody
+        .zone_retirement(&member, &mut membership, Some(&mut admission))
+        .unwrap();
+    if lose_cas {
+        // Keep the real member/admission tokens on this lane. The peer pauses
+        // the actual slot-lock acquisition, then parks/wakes the record through
+        // a fresh claim generation using production scheduler operations.
+        struct Pause {
+            reached: std::sync::mpsc::SyncSender<()>,
+            resume: std::sync::mpsc::Receiver<()>,
+            once: std::sync::atomic::AtomicBool,
+        }
+        impl carrick_sched_core::LockWait<carrick_sched_core::ParkedContextWords> for Pause {
+            fn wait(&self, _: u32) -> bool {
+                if !self.once.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    self.reached.send(()).unwrap();
+                    self.resume
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+                true
+            }
+        }
+        let (held, held_rx) = std::sync::mpsc::sync_channel(1);
+        let (reached, blocked) = std::sync::mpsc::sync_channel(1);
+        let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+        let wait = Pause {
+            reached,
+            resume: resumed,
+            once: std::sync::atomic::AtomicBool::new(false),
+        };
+        let zone = &*zone;
+        std::thread::scope(|scope| {
+            let actor = scope.spawn(move || {
+                let guard = zone.slot_lock(slot, &BoundedSpin(1024)).unwrap();
+                let before = zone.record(record).claim();
+                held.send(()).unwrap();
+                blocked
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(guard);
+                // SAFETY: the release lane is paused before its claim CAS;
+                // this actor exclusively advances the fixture's native record.
+                assert!(unsafe { zone.record(record).take_object_operation() }.is_some());
+                let key = ObjectWaitKey::new(42, 1).unwrap();
+                zone.bind_object_wait(key, &BoundedSpin(1024)).unwrap();
+                {
+                    let guard = zone.object_wait(key, &BoundedSpin(1024)).unwrap();
+                    guard
+                        .park(
+                            guard.snapshot(),
+                            record,
+                            OperationToken::new(42, 1).unwrap(),
+                        )
+                        .unwrap();
+                }
+                zone.clear_current(slot);
+                {
+                    let guard = zone.object_wait(key, &BoundedSpin(1024)).unwrap();
+                    assert_eq!(
+                        guard
+                            .notify_object(slot, &mut WakeEffects::default())
+                            .unwrap()
+                            .queued,
+                        1
+                    );
+                }
+                assert_eq!(zone.switch_in(slot), Some(record));
+                assert_ne!(zone.record(record).claim().seq(), before.seq());
+                resume.send(()).unwrap();
+            });
+            held_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(
+                zone.release_current_with(slot, record, &wait, retirement),
+                Some(carrick_sched_core::CurrentRelease::Released)
+            );
+            actor.join().unwrap();
+        });
+    } else if refuse_lock {
+        let _guard = zone.slot_lock(slot, &BoundedSpin(1024)).unwrap();
+        assert_eq!(
+            zone.release_current_with(slot, record, &BoundedSpin(0), retirement),
+            Some(carrick_sched_core::CurrentRelease::Released)
+        );
+    } else {
+        let released = retirement.retire_current(
+            binding,
+            carrick_core_abi::BornInZoneSource { zone: &zone, slot },
+            record,
+        );
+        assert_eq!(released.is_some(), host_home);
+    }
+    if refuse_lock || host_home || lose_cas {
+        assert_eq!(
+            page.live(),
+            1,
+            "committing release lost its live reservation"
+        );
+        assert_eq!(
+            page.state(0),
+            Some((
+                entry.generation(),
+                carrick_core::lifecycle::EntryState::ExitingPublished
+            )),
+            "committing release rolled admission back"
+        );
+        admission.commit_with_member(&member).unwrap();
+        membership.publish();
+        assert_eq!(page.live(), 1);
+        assert_eq!(
+            page.state(0),
+            Some((
+                entry.generation(),
+                carrick_core::lifecycle::EntryState::ExitedInZone
+            ))
+        );
+        assert!(zone.live(zone.record_ref(peer)).is_some());
+        return;
+    }
+    assert!(matches!(zone.record(record).claim(), Claim::Queued { .. }));
+    assert_eq!(
+        page.live(),
+        2,
+        "requeued record exposed a reserved live unit"
+    );
+    assert_eq!(
+        page.state(0),
+        Some((
+            entry.generation(),
+            carrick_core::lifecycle::EntryState::Published
+        )),
+        "requeued record exposed exit admission"
+    );
+    // A fresh owner can reserve immediately, while the old tokens still live.
+    drop(
+        carrick_core::terminal::reserve_host_thread_exit_membership(&page, &member)
+            .unwrap_or_else(|_| panic!("requeued record exposed a native claim")),
+    );
+    let next_admission = page.begin_exit(entry).unwrap();
+    assert!(
+        admission.commit_with_member(&member).is_err(),
+        "old rollback token published a later owner's exit"
+    );
+    assert_eq!(
+        page.state(0),
+        Some((
+            entry.generation(),
+            carrick_core::lifecycle::EntryState::ExitingPublished
+        ))
+    );
+    drop(next_admission);
+    drop(membership);
+    assert_eq!(page.live(), 2);
+    assert!(zone.live(zone.record_ref(peer)).is_some());
 }

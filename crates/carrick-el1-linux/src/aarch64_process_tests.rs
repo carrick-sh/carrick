@@ -4931,7 +4931,12 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
             }
             fixture
                 .page
-                .retire_published_host_member(control.entry().unwrap(), control, retirement)
+                .retire_published_host_member(
+                    control.entry().unwrap(),
+                    control,
+                    retirement,
+                    &carrick_core::lifecycle::RegistryWriteHeld::for_test(),
+                )
                 .unwrap();
             let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 carrick_core_abi::entry::EntryTaskKey::from_raw(42),
@@ -5268,7 +5273,12 @@ fn arm_non_graph_retired_pool_member(reallocate: bool, resetting: bool) {
     let membership = fixture.page.reserve_nonfinal_exit().unwrap();
     fixture
         .page
-        .retire_published_host_member(entry, control, membership)
+        .retire_published_host_member(
+            entry,
+            control,
+            membership,
+            &carrick_core::lifecycle::RegistryWriteHeld::for_test(),
+        )
         .unwrap();
     let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
         carrick_core_abi::EntryTaskKey::from_raw(42),
@@ -5385,8 +5395,13 @@ fn arm_pool_retirement_during_scan(restock: bool) {
     let zone = fixture.zone;
     let retirement: Box<dyn FnOnce() + Send> = Box::new(move || {
         let membership = page.reserve_nonfinal_exit().unwrap();
-        page.retire_published_host_member(entry, control, membership)
-            .unwrap();
+        page.retire_published_host_member(
+            entry,
+            control,
+            membership,
+            &carrick_core::lifecycle::RegistryWriteHeld::for_test(),
+        )
+        .unwrap();
         let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::EntryTaskKey::from_raw(42),
             carrick_core_abi::entry::BirthSerial::of_task(
@@ -5584,7 +5599,12 @@ fn arm_non_graph_pool_member_uses_page_identity_after_zone_release() {
     let membership = fixture.page.reserve_cancelled_member_exit().unwrap();
     fixture
         .page
-        .retire_published_host_member(entry, control, membership)
+        .retire_published_host_member(
+            entry,
+            control,
+            membership,
+            &carrick_core::lifecycle::RegistryWriteHeld::for_test(),
+        )
         .unwrap();
     let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
         carrick_core_abi::EntryTaskKey::from_raw(42),
@@ -5686,7 +5706,12 @@ fn arm_graph_pool_host_retirement(unbound: bool) {
     let retirement = fixture.page.reserve_nonfinal_exit().unwrap();
     fixture
         .page
-        .retire_published_host_member(entry, control, retirement)
+        .retire_published_host_member(
+            entry,
+            control,
+            retirement,
+            &carrick_core::lifecycle::RegistryWriteHeld::for_test(),
+        )
         .unwrap();
     let _ = fixture.zone.claim_for_host(
         record,
@@ -6778,7 +6803,12 @@ fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
         let membership = fixture.page.reserve_cancelled_member_exit().unwrap();
         fixture
             .page
-            .retire_published_host_member(entry, sibling, membership)
+            .retire_published_host_member(
+                entry,
+                sibling,
+                membership,
+                &carrick_core::lifecycle::RegistryWriteHeld::for_test(),
+            )
             .unwrap();
         let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::EntryTaskKey::from_raw(42),

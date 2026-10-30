@@ -4,6 +4,7 @@
 //! non-final thread retirement (`exit_thread`), child reparenting / subreaper adoption,
 //! exit subscription notification, and unreferenced file table and MM I/O retirement.
 
+use crate::kernel::registry::RegistryWriteGuardExt;
 use carrick_el1_abi::Lifecycle;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -72,20 +73,47 @@ impl carrick_sched_core::process::exit::ExitLive<crate::kernel::container::Conta
     }
 }
 pub(in crate::kernel) struct HostExitMember(crate::kernel::objects::ThreadRef);
-impl carrick_sched_core::process::exit::ExitMember for HostExitMember {
-    fn exit_task(&self) -> TaskKey {
+impl carrick_sched_core::process::exit::ExitMemberIdentity for HostExitMember {
+    fn member_task(&self) -> TaskKey {
         self.0.task_key()
+    }
+}
+struct HostExitMemberWithRegistry<'a> {
+    member: HostExitMember,
+    registry: &'a crate::kernel::registry::Registry,
+}
+impl carrick_sched_core::process::exit::ExitMember for HostExitMemberWithRegistry<'_> {
+    fn exit_task(&self) -> TaskKey {
+        self.member.0.task_key()
     }
     fn commit_terminal_retirement(
         &self,
         retirement: carrick_sched_core::process::exit::ExitMemberRetirement,
     ) -> Result<(), carrick_sched_core::process::exit::ExitMemberRetirementRefused> {
-        carrick_core::terminal::commit_process_member_retirement(
+        self.commit_with_observer(retirement, || {})
+    }
+}
+impl HostExitMemberWithRegistry<'_> {
+    fn commit_with_observer(
+        &self,
+        retirement: carrick_sched_core::process::exit::ExitMemberRetirement,
+        observe: impl FnOnce(),
+    ) -> Result<(), carrick_sched_core::process::exit::ExitMemberRetirementRefused> {
+        // after_release owns only detached effect values here. No topology,
+        // scheduler, object, wait-queue or ledger-settling guard is retained.
+        // Drop this guard before cancel_members invokes a reentrant callback.
+        let guard = self.registry.settled().write();
+        let result = carrick_core::terminal::commit_process_member_retirement(
             retirement,
-            self.0.task_key(),
-            self.0.control_slot(),
+            self.member.0.task_key(),
+            self.member.0.control_slot(),
+            &guard.retiring_capability(),
         )
-        .ok_or(carrick_sched_core::process::exit::ExitMemberRetirementRefused)
+        .ok_or(carrick_sched_core::process::exit::ExitMemberRetirementRefused);
+        // Production passes a no-op; deterministic tests inspect publication
+        // before this guard drops, without running cancellation callbacks.
+        observe();
+        result
     }
 }
 impl carrick_sched_core::process::exit::ExitEffectSource<crate::kernel::container::ContainerId>
@@ -519,7 +547,7 @@ impl Kernel {
     pub(in crate::kernel) fn retire_thread_in_registry(
         &self,
         context: &KernelContext,
-        state: &mut RegistryState,
+        state: &mut parking_lot::RwLockWriteGuard<'_, RegistryState>,
         mut lane: ThreadRetirementLane,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<TaskRevision, KernelOperationError> {
@@ -618,7 +646,8 @@ impl Kernel {
         // Every fallible reservation is complete. Commit exact terminal intent
         // before graph removal can drop a kernel-owned ZoneWait and free the
         // continuation an already queued executor is about to restore.
-        live_membership = live_membership.map(|membership| membership.commit_zone_retirement());
+        live_membership = live_membership
+            .map(|membership| membership.commit_zone_retirement(&state.retiring_capability()));
         let thread = context
             .task
             .retire_thread(context.thread.key())
@@ -665,7 +694,11 @@ impl Kernel {
                                 "host retirement lost membership custody"
                             )
                         })
-                        .retire_published(owned.entry, &*owned.control)
+                        .retire_published(
+                            owned.entry,
+                            &*owned.control,
+                            &state.retiring_capability(),
+                        )
                         .unwrap_or_else(|error| {
                             carrick_fatal!(
                                 "kernel::thread_retirement",
@@ -1032,8 +1065,12 @@ impl Kernel {
                 // registry. Never invoke it while holding the topology write lock.
                 let parent_permit = effects
                     .after_release(released)?
+                    .map_members(|member| HostExitMemberWithRegistry {
+                        member,
+                        registry: kernel.registry(),
+                    })
                     .cancel_members(|thread| {
-                        let _ = thread.0.cancel_kernel_owned_continuation(
+                        let _ = thread.member.0.cancel_kernel_owned_continuation(
                             crate::kernel::continuation::CancellationCause::ProcessExit,
                         );
                     })
@@ -1234,6 +1271,95 @@ mod tests {
                 None,
             )
             .expect("clone sibling")
+    }
+
+    #[test]
+    fn process_member_terminal_publication_excludes_registry_readers() {
+        use carrick_core::lifecycle::{MemberExitKind, recorded_member_exit_kind};
+        use carrick_sched_core::process::exit::{
+            ExitMember, ExitMemberRetirement, ExitMemberRetirementRefused,
+        };
+        use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+        struct Observed<'a> {
+            member: HostExitMemberWithRegistry<'a>,
+            published: &'a SyncSender<()>,
+            checked: &'a Receiver<()>,
+        }
+        impl ExitMember for Observed<'_> {
+            fn exit_task(&self) -> TaskKey {
+                self.member.member.0.task_key()
+            }
+            fn commit_terminal_retirement(
+                &self,
+                retirement: ExitMemberRetirement,
+            ) -> Result<(), ExitMemberRetirementRefused> {
+                self.member.commit_with_observer(retirement, || {
+                    self.published.send(()).unwrap();
+                    self.checked
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                })
+            }
+        }
+        let (kernel, leader) = bootstrap(19_431);
+        let sibling = clone_sibling(&kernel, &leader, 19_432);
+        assert!(leader.exact_thread_is_live() && sibling.exact_thread_is_live());
+        let mut prepared = kernel
+            .prepare_task_exit_key(
+                leader.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        let mut state = kernel.registry().settled().write();
+        let effects = state
+            .begin_exit_effects(
+                prepared.task,
+                &prepared.topology,
+                &prepared.reservation.permit,
+            )
+            .unwrap();
+        let release = prepared.reservation.commit(&mut state).unwrap();
+        drop(state);
+        let ready = effects.after_release(release.publish()).unwrap();
+        let (published, publication) = sync_channel(1);
+        let (checked, checks) = sync_channel(1);
+        std::thread::scope(|scope| {
+            let observed_kernel = &kernel;
+            let observed_leader = &leader;
+            let observed_sibling = &sibling;
+            let reader = scope.spawn(move || {
+                for _ in 0..2 {
+                    publication
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    assert!(
+                        !observed_kernel.registry().test_reader_can_enter(),
+                        "terminal retirement published outside the registry write lock"
+                    );
+                    let kinds = [observed_leader, observed_sibling]
+                        .map(|ctx| recorded_member_exit_kind(ctx.thread().control_slot(), None));
+                    assert!(kinds.contains(&MemberExitKind::HostRetiring));
+                    checked.send(()).unwrap();
+                }
+            });
+            ready
+                .map_members(|member| Observed {
+                    member: HostExitMemberWithRegistry {
+                        member,
+                        registry: kernel.registry(),
+                    },
+                    published: &published,
+                    checked: &checks,
+                })
+                .cancel_members(|_| {
+                    // Cancellation callbacks may reenter the registry. The short
+                    // publication guard must already be gone.
+                    assert!(kernel.registry().test_reader_can_enter());
+                })
+                .unwrap();
+            reader.join().unwrap();
+        });
     }
 
     #[test]

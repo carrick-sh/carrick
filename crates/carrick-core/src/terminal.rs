@@ -1039,12 +1039,13 @@ pub fn commit_process_member_retirement(
     retirement: carrick_sched_core::process::exit::ExitMemberRetirement,
     task: TaskKey,
     member: &dyn MemberControl,
+    registry: &crate::lifecycle::RegistryWriteHeld<'_>,
 ) -> Option<()> {
     if !retirement.authorizes(task) {
         return None;
     }
     let _pin = crate::lifecycle::MemberControlCustody::retain(member).ok()?;
-    member.exit_custody().commit_host_zone_terminal();
+    member.exit_custody().commit_host_zone_terminal(registry);
     Some(())
 }
 
@@ -1087,10 +1088,15 @@ impl HostThreadExitMembership<'_> {
     /// Commit the admitted host retirement before graph removal can drop its
     /// saved continuation. Fallible preparation must precede this point. A
     /// committed token never refunds live membership, even if its owner drops.
-    pub fn commit_zone_retirement(mut self) -> Self {
+    pub fn commit_zone_retirement(
+        mut self,
+        registry: &crate::lifecycle::RegistryWriteHeld<'_>,
+    ) -> Self {
         if let Some(reserved) = self.reserved.as_mut() {
             reserved.commit_irrevocable();
-            self.member.exit_custody().commit_host_zone_terminal();
+            self.member
+                .exit_custody()
+                .commit_host_zone_terminal(registry);
         }
         self
     }
@@ -1099,6 +1105,7 @@ impl HostThreadExitMembership<'_> {
         self,
         entry: EntryRef,
         member: &dyn MemberControl,
+        registry: &crate::lifecycle::RegistryWriteHeld<'_>,
     ) -> Result<Option<NativeAbiReap>, NativeAbiReapError> {
         use crate::lifecycle::{EntryState, TransitionError};
         if !core::ptr::addr_eq(self.member.control(), member)
@@ -1108,7 +1115,7 @@ impl HostThreadExitMembership<'_> {
             return Err(TransitionError::StaleGeneration.into());
         }
         if let Some(reserved) = self.reserved {
-            crate::lifecycle::retire_host_member(self.page, entry, member, reserved)?;
+            crate::lifecycle::retire_host_member(self.page, entry, member, reserved, registry)?;
             return Ok(None);
         }
         if member.exit_custody().abi_exit_pending()
@@ -1297,17 +1304,31 @@ impl ZoneRetirement<'_, '_> {
         if binding != self.identity.binding() {
             return None;
         }
-        crate::entry::retire_current_with(binding, source, record, || {
-            let completion = if let Some(admission) = self.admission {
-                admission.commit_irrevocable();
-                crate::lifecycle::NativeExitCompletion::AbiExit
-            } else {
-                crate::lifecycle::NativeExitCompletion::Member
-            };
-            self.membership.commit_irrevocable();
-            self.member.exit_custody().commit_zone_terminal(completion);
-            true
-        })
+        crate::entry::retire_current_with(binding, source, record, self)
+    }
+}
+
+impl carrick_sched_core::RecordRelease for ZoneRetirement<'_, '_> {
+    fn commit(&mut self) -> bool {
+        let completion = if let Some(admission) = self.admission.as_deref_mut() {
+            admission.commit_irrevocable();
+            crate::lifecycle::NativeExitCompletion::AbiExit
+        } else {
+            crate::lifecycle::NativeExitCompletion::Member
+        };
+        self.membership.commit_irrevocable();
+        self.member.exit_custody().commit_zone_terminal(completion);
+        true
+    }
+
+    fn rollback(&mut self) {
+        // This is under the scheduler slot lock. Both operations only touch
+        // retained atomic cells; admission is restored before releasing the
+        // member claim so the next owner cannot inherit our exit window.
+        if let Some(admission) = self.admission.as_deref_mut() {
+            admission.rollback();
+        }
+        self.membership.rollback();
     }
 }
 
