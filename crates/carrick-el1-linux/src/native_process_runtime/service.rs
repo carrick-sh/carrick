@@ -138,13 +138,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let Some((request, control)) = pending else {
             // Scalar IPC has a retained adapter token, not a host-service cell.
             // Its queue owns cancellation and the existing deferred handback.
-            let Some(member) = self
-                .zone
-                .live(record)
-                .filter(|member| member.is_native_owned() && member.has_adapter_operation())
-            else {
+            // This is only a snapshot. The queue owner authenticates the
+            // exact record incarnation and operation under its guard below.
+            let member = self.zone.record(record.id);
+            if !member.is_native_owned() || !member.has_adapter_operation() {
                 return Ok(());
-            };
+            }
             let Some(census) = member.object_wait_census() else {
                 return Ok(());
             };
@@ -173,7 +172,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             let queue = match queue {
                 Ok(queue) => queue,
                 // A completed/rebound park no longer needs cancellation.
-                Err(carrick_sched_core::object_wait::ObjectWaitError::Stale) => return Ok(()),
+                // A mode-changing rebind reports Occupied before checking
+                // generation; it cannot pass a still-linked old waiter.
+                Err(
+                    carrick_sched_core::object_wait::ObjectWaitError::Stale
+                    | carrick_sched_core::object_wait::ObjectWaitError::Occupied,
+                ) => return Ok(()),
                 Err(_) => return Err(NativeProcessError::Quarantined),
             };
             let owned = queue.wake_owner_operation(record, &operation, slot, Handback::Signal);

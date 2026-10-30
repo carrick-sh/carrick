@@ -6807,9 +6807,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn interrupt_pending_wait(&mut self) -> bool {
         let pending = self.signal_interrupts_current();
         if pending
-            && self.source.zone.live(self.record).is_some_and(|record| {
-                matches!(record.claim(), carrick_sched_core::Claim::Parked { .. })
-            })
+            && matches!(
+                self.source.zone.record(self.record.id).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            )
         {
             self.interrupt_signal_record(self.record);
         }
