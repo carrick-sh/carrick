@@ -230,6 +230,54 @@ pub struct ResidentFacts {
 }
 
 impl ResidentFacts {
+    fn try_publication_snapshot<'permit>(
+        &self,
+        exclusion: super::HostAliasDispatchGuard<'permit>,
+        span: ReservationRange,
+        page: u64,
+    ) -> Result<FrameGrantPublicationSnapshot<'permit>, RootAccessRefusal> {
+        let capture = |mut model: Option<&mut Reservations<'_>>| {
+            let owner = if self.delegated_root().is_none()
+                || self.venue_owns(page, page.saturating_add(1))
+            {
+                FirstTouchOwner::Host
+            } else {
+                let node = model.as_mut().ok_or(Refusal::Stale)?.node(page);
+                self.first_touch_owner_from_node(page, node)?
+            };
+            let mut retired = Vec::new();
+            let mut stock = false;
+            if let Some(model) = model.as_mut() {
+                model.observe_deferred_returns(&mut |entry| {
+                    if let Some(range) = ReservationRange::new(
+                        span.start().max(entry.range.start()),
+                        span.end().min(entry.range.end()),
+                    ) {
+                        retired.push(range);
+                    }
+                });
+                if matches!(owner, FirstTouchOwner::Root(..)) {
+                    stock = !root_holes(model, span)?.is_empty();
+                }
+            }
+            Ok(FrameGrantPublicationSnapshot {
+                owner,
+                retired,
+                stock,
+                span,
+                page,
+                host_protection: self.resident_fault_ranges.prot_for_page(page),
+                bus_fault: bus_fault_contains(&self.bus_fault_ranges, page),
+                exclusion,
+            })
+        };
+        if let Some(root) = self.delegated_root() {
+            root.with_root(|model| capture(Some(model)))
+        } else {
+            capture(None).map_err(RootAccessRefusal::Refused)
+        }
+    }
+
     /// Record `range` resident under `owner`, replacing any fact it covers.
     pub(crate) fn insert(&mut self, range: carrick_vfs::GuestMemoryRange, owner: ResidencyOwner) {
         self.remove(range);
@@ -422,6 +470,15 @@ impl MemState {
             return Ok(FirstTouchOwner::Host);
         }
         let node = root.with_root(|model| Ok(model.node(page)))?;
+        self.first_touch_owner_from_node(page, node)
+            .map_err(RootAccessRefusal::Refused)
+    }
+
+    fn first_touch_owner_from_node(
+        &self,
+        page: u64,
+        node: Option<(Mapping, ReservationIncarnation)>,
+    ) -> Result<FirstTouchOwner, Refusal> {
         Ok(match node {
             None if self.resident_fault_ranges.prot_for_page(page).is_some()
                 && (self.shared.guest_range_has_owner(page, 1)
@@ -880,7 +937,21 @@ impl MmapGrowdownFaultPlan<'_> {
 pub struct ResidentFaultPlan<'permit> {
     pub(crate) page: u64,
     pub(crate) prot: u64,
+    owner: ResidencyOwner,
     pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
+}
+
+/// One pre-publication root observation, valid only while its MM guard is
+/// borrowed through `exclusion`. Publication settlement performs no root read.
+pub struct FrameGrantPublicationSnapshot<'permit> {
+    owner: FirstTouchOwner,
+    retired: Vec<ReservationRange>,
+    stock: bool,
+    span: ReservationRange,
+    page: u64,
+    host_protection: Option<LinuxProtFlags>,
+    bus_fault: bool,
+    exclusion: super::HostAliasDispatchGuard<'permit>,
 }
 
 /// Why a verified publication cannot settle against this MM's current facts.
@@ -909,7 +980,7 @@ pub enum PublishedFrameGrantPlan<'permit> {
 pub struct RetiredFrameGrantPlan<'permit> {
     span: ReservationRange,
     retired: Vec<ReservationRange>,
-    fault: Option<(GuestVa, LinuxProtFlags)>,
+    fault: Option<(GuestVa, LinuxProtFlags, ResidencyOwner)>,
     exclusion: super::HostAliasDispatchGuard<'permit>,
 }
 
@@ -969,7 +1040,77 @@ impl GrantResidencyPublication {
 
 impl<'permit> From<ResidentFrameGrantPlan<'permit>> for PublishedFrameGrantPlan<'permit> {
     fn from(plan: ResidentFrameGrantPlan<'permit>) -> Self {
-        Self::Resident(plan)
+        plan.publication
+            .classify(LinuxProtFlags::from_bits_truncate(plan.prot), None)
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "dispatch::resident_frame_grant",
+                    "invalid pinned publication snapshot: {error:?}"
+                )
+            })
+    }
+}
+
+impl<'permit> FrameGrantPublicationSnapshot<'permit> {
+    fn classify(
+        self,
+        protection: LinuxProtFlags,
+        live: Option<LinuxProtFlags>,
+    ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
+        if matches!(self.owner, FirstTouchOwner::Host) && self.bus_fault {
+            return Err(PublishedFrameGrantRefusal::BusFault);
+        }
+        if self
+            .retired
+            .iter()
+            .any(|range| range.start() <= self.page && self.page < range.end())
+        {
+            return Ok(PublishedFrameGrantPlan::Retired(RetiredFrameGrantPlan {
+                span: self.span,
+                retired: self.retired,
+                fault: None,
+                exclusion: self.exclusion,
+            }));
+        }
+        let (prot, root_incarnation, owner) = match self.owner {
+            FirstTouchOwner::Root(mapping, incarnation) => (
+                LinuxProtFlags::from_bits_truncate(mapping.protection.bits()),
+                Some(incarnation),
+                ResidencyOwner::Root(incarnation),
+            ),
+            FirstTouchOwner::Host => (
+                self.host_protection
+                    .ok_or(PublishedFrameGrantRefusal::HostUnarmed)?,
+                None,
+                ResidencyOwner::Host,
+            ),
+            FirstTouchOwner::Unmapped => return Err(PublishedFrameGrantRefusal::Unmapped),
+        };
+        if live.is_some_and(|current| current != prot) || (prot != protection && live != Some(prot))
+        {
+            return Err(PublishedFrameGrantRefusal::ProtectionChanged {
+                published: protection,
+                current: prot,
+            });
+        }
+        if !self.retired.is_empty() {
+            return Ok(PublishedFrameGrantPlan::Retired(RetiredFrameGrantPlan {
+                span: self.span,
+                retired: self.retired,
+                fault: Some((GuestVa::new(self.page), prot, owner)),
+                exclusion: self.exclusion,
+            }));
+        }
+        Ok(PublishedFrameGrantPlan::Resident(ResidentFrameGrantPlan {
+            root_owned: root_incarnation.is_some(),
+            root_incarnation,
+            stock: self.stock,
+            fault_page: self.page,
+            start: self.span.start(),
+            len: self.span.len(),
+            prot: prot.bits(),
+            publication: self,
+        }))
     }
 }
 
@@ -986,7 +1127,7 @@ pub struct ResidentFrameGrantPlan<'permit> {
     pub(crate) root_incarnation: Option<ReservationIncarnation>,
     /// The span covers root holes: its grant holds first-touch stock.
     pub(crate) stock: bool,
-    pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
+    publication: FrameGrantPublicationSnapshot<'permit>,
 }
 
 /// One prepared root span before its descriptor publication settles. The
@@ -1345,7 +1486,12 @@ impl<'a> MemView<'a> {
             Ok(false) => {}
             Err(refusal) => broken_root("a resident fault predecessor observation", refusal),
         }
-        let prot = match mem.try_first_touch_owner(page) {
+        let observed = mem.try_first_touch_owner(page);
+        let owner = match &observed {
+            Ok(FirstTouchOwner::Root(_, incarnation)) => ResidencyOwner::Root(*incarnation),
+            _ => ResidencyOwner::Host,
+        };
+        let prot = match observed {
             Ok(FirstTouchOwner::Host) => {
                 if bus_fault_contains(&mem.bus_fault_ranges, page) {
                     return Ok(None);
@@ -1369,6 +1515,7 @@ impl<'a> MemView<'a> {
         Ok(Some(ResidentFaultPlan {
             page,
             prot,
+            owner,
             exclusion,
         }))
     }
@@ -1447,21 +1594,14 @@ impl<'a> MemView<'a> {
         if start >= end {
             return Ok(None);
         }
-        let stock = if root_owned {
-            if let (Some(root), Some(span)) =
-                (mem.delegated_root(), ReservationRange::new(start, end))
-            {
-                match root.with_root(|model| root_holes(model, span)) {
-                    Ok(holes) => !holes.is_empty(),
-                    Err(RootAccessRefusal::Busy(busy)) => return Err(busy),
-                    Err(refusal) => broken_root("a first-touch stock plan", refusal),
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+        let span = ReservationRange::new(start, end)
+            .unwrap_or_else(|| broken_root("first-touch span", Refusal::Invalid));
+        let publication = match mem.try_publication_snapshot(exclusion, span, page) {
+            Ok(snapshot) => snapshot,
+            Err(RootAccessRefusal::Busy(busy)) => return Err(busy),
+            Err(refusal) => broken_root("first-touch publication snapshot", refusal),
         };
+        let stock = publication.stock;
         Ok(Some(ResidentFrameGrantPlan {
             root_owned,
             root_incarnation,
@@ -1470,7 +1610,7 @@ impl<'a> MemView<'a> {
             start,
             len: end - start,
             prot: grant.prot.bits(),
-            exclusion,
+            publication,
         }))
     }
 
@@ -1482,7 +1622,7 @@ impl<'a> MemView<'a> {
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
     ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
-        if !self.owns_host_alias_dispatch(&original.exclusion) {
+        if !self.owns_host_alias_dispatch(&original.publication.exclusion) {
             return Err(PublishedFrameGrantRefusal::Identity);
         }
         if (original.start, original.len, original.fault_page)
@@ -1492,7 +1632,7 @@ impl<'a> MemView<'a> {
         }
         self.classify_published_frame_grant(
             permit,
-            original.exclusion,
+            original.publication,
             grant,
             protection,
             receipt,
@@ -1503,6 +1643,7 @@ impl<'a> MemView<'a> {
     pub(crate) fn reprotected_frame_grant_plan<'permit>(
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        snapshot: FrameGrantPublicationSnapshot<'permit>,
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
@@ -1510,7 +1651,7 @@ impl<'a> MemView<'a> {
     ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
         self.classify_published_frame_grant(
             permit,
-            self.begin_host_alias_dispatch(permit),
+            snapshot,
             grant,
             protection,
             receipt,
@@ -1521,7 +1662,7 @@ impl<'a> MemView<'a> {
     fn classify_published_frame_grant<'permit>(
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
-        exclusion: super::HostAliasDispatchGuard<'permit>,
+        snapshot: FrameGrantPublicationSnapshot<'permit>,
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
@@ -1565,96 +1706,37 @@ impl<'a> MemView<'a> {
         {
             return Err(PublishedFrameGrantRefusal::PublicationProtection);
         }
-        let mem_authority = self.mem();
-        let mem = mem_authority.lock();
-        let owner = mem
-            .try_first_touch_owner(resident.va)
-            .unwrap_or_else(|refusal| broken_root("published grant first-touch owner", refusal));
-        if matches!(owner, FirstTouchOwner::Host)
-            && bus_fault_contains(&mem.bus_fault_ranges, resident.va)
+        if snapshot.span.start() != publication.va
+            || snapshot.span.end() != end
+            || snapshot.page != resident.va
+            || !self.owns_host_alias_dispatch(&snapshot.exclusion)
         {
-            return Err(PublishedFrameGrantRefusal::BusFault);
+            return Err(PublishedFrameGrantRefusal::Identity);
         }
-        let mut retired = Vec::new();
-        if let Some(root) = mem.delegated_root() {
-            root.with_root(|model| {
-                model.observe_deferred_returns(&mut |entry| {
-                    if let Some(range) = ReservationRange::new(
-                        publication.va.max(entry.range.start()),
-                        end.min(entry.range.end()),
-                    ) {
-                        retired.push(range);
-                    }
-                });
-                Ok(())
-            })
-            .unwrap_or_else(|refusal| broken_root("published grant retirement partition", refusal));
+        snapshot.classify(protection, live_protection)
+    }
+
+    pub(crate) fn frame_grant_publication_snapshot<'permit>(
+        &self,
+        permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+        page: u64,
+    ) -> Result<FrameGrantPublicationSnapshot<'permit>, RootAccessRefusal> {
+        if grant.mm_key != permit.mm().raw() {
+            return Err(Refusal::Stale.into());
         }
-        if retired
-            .iter()
-            .any(|range| range.start() <= resident.va && resident.va < range.end())
-        {
-            return Ok(PublishedFrameGrantPlan::Retired(RetiredFrameGrantPlan {
-                span: ReservationRange::new(publication.va, end)
-                    .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?,
-                retired,
-                fault: None,
-                exclusion,
-            }));
+        let span = grant
+            .semantic_base
+            .checked_add(grant.len)
+            .and_then(|end| ReservationRange::new(grant.semantic_base, end))
+            .ok_or(Refusal::Invalid)?;
+        if !(span.start()..span.end()).contains(&page) {
+            return Err(Refusal::Invalid.into());
         }
-        // The authenticated publication is not a fresh allocation. EL1's
-        // residency reconciliation may already have committed this page.
-        let (prot, root_owned) = match owner {
-            FirstTouchOwner::Root(mapping, _) => (
-                LinuxProtFlags::from_bits_truncate(mapping.protection.bits()),
-                true,
-            ),
-            FirstTouchOwner::Host => (
-                mem.resident_fault_ranges
-                    .prot_for_page(resident.va)
-                    .ok_or(PublishedFrameGrantRefusal::HostUnarmed)?,
-                false,
-            ),
-            FirstTouchOwner::Unmapped => return Err(PublishedFrameGrantRefusal::Unmapped),
-        };
-        if live_protection.is_some_and(|live| live != prot)
-            || (prot != protection && live_protection != Some(prot))
-        {
-            return Err(PublishedFrameGrantRefusal::ProtectionChanged {
-                published: protection,
-                current: prot,
-            });
-        }
-        if !retired.is_empty() {
-            return Ok(PublishedFrameGrantPlan::Retired(RetiredFrameGrantPlan {
-                span: ReservationRange::new(publication.va, end)
-                    .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?,
-                retired,
-                fault: Some((GuestVa::new(resident.va), prot)),
-                exclusion,
-            }));
-        }
-        let stock = root_owned
-            && mem.delegated_root().is_some_and(|root| {
-                ReservationRange::new(publication.va, end).is_some_and(|span| {
-                    !root
-                        .with_root(|model| root_holes(model, span))
-                        .unwrap_or_else(|refusal| {
-                            broken_root("a published grant stock observation", refusal)
-                        })
-                        .is_empty()
-                })
-            });
-        Ok(PublishedFrameGrantPlan::Resident(ResidentFrameGrantPlan {
-            root_owned,
-            root_incarnation: None,
-            stock,
-            fault_page: resident.va,
-            start: publication.va,
-            len: publication.len,
-            prot: prot.bits(),
-            exclusion,
-        }))
+        let exclusion = self.begin_host_alias_dispatch(permit);
+        self.mem()
+            .lock()
+            .try_publication_snapshot(exclusion, span, page)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1718,8 +1800,7 @@ impl<'a> MemView<'a> {
         };
         let mem_authority_33 = self.mem();
         let mut mem = mem_authority_33.lock();
-        mem.record_resident(range)
-            .unwrap_or_else(|refusal| broken_root("resident range commit", refusal));
+        mem.resident.insert(range, plan.owner);
         mem.resident_fault_ranges.disarm(range);
     }
 
@@ -1758,11 +1839,12 @@ impl<'a> MemView<'a> {
                 // The owed journal returns the retired pages. The stock
                 // list returns every remaining hole in this exact grant.
                 self.mem().lock().first_touch_stock.push(plan.span);
-                let resident = plan.fault.map(|(page, _)| page);
-                if let Some((page, prot)) = plan.fault {
+                let resident = plan.fault.map(|(page, _, _)| page);
+                if let Some((page, prot, owner)) = plan.fault {
                     self.commit_resident_fault(ResidentFaultPlan {
                         page: page.raw(),
                         prot: prot.bits(),
+                        owner,
                         exclusion: plan.exclusion,
                     });
                 }
@@ -1775,7 +1857,7 @@ impl<'a> MemView<'a> {
     }
 
     pub(crate) fn commit_resident_frame_grant(&self, plan: ResidentFrameGrantPlan<'_>) {
-        if !self.owns_host_alias_dispatch(&plan.exclusion) {
+        if !self.owns_host_alias_dispatch(&plan.publication.exclusion) {
             carrick_fatal!(
                 "dispatch::resident_frame_grant",
                 "caller lacks host alias dispatch exclusion during commit_resident_frame_grant"
@@ -1795,7 +1877,10 @@ impl<'a> MemView<'a> {
         self.commit_resident_fault(ResidentFaultPlan {
             page: plan.fault_page,
             prot: plan.prot,
-            exclusion: plan.exclusion,
+            owner: plan
+                .root_incarnation
+                .map_or(ResidencyOwner::Host, ResidencyOwner::Root),
+            exclusion: plan.publication.exclusion,
         });
     }
 
@@ -1808,7 +1893,7 @@ impl<'a> MemView<'a> {
         &self,
         plan: &ResidentFrameGrantPlan<'_>,
     ) -> Option<PreparedRootGrant> {
-        if !plan.root_owned || !self.owns_host_alias_dispatch(&plan.exclusion) {
+        if !plan.root_owned || !self.owns_host_alias_dispatch(&plan.publication.exclusion) {
             return None;
         }
         let incarnation = plan.root_incarnation?;
