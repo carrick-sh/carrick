@@ -246,6 +246,15 @@ fn test_shard_2_cache_freshness() {
     );
     assert!(mmap_oracle.unwrap().contains("file_saw_parent_post=true"));
 
+    for libc in ["musl", "gnu"] {
+        let getrandom_oracle = cached_probe_oracle(&repo_root, libc, "getrandomvdso")
+            .expect("getrandomvdso oracle must be fresh for arm64 lane");
+        assert!(
+            getrandom_oracle.contains("generate_null_zero_ret_0=true"),
+            "getrandomvdso ({libc}) oracle must assert getrandom(NULL, 0, 0) == 0"
+        );
+    }
+
     // Verify missing cache error behavior
     let missing = cached_probe_oracle(&repo_root, "musl", "nonexistent_probe_xyz");
     assert!(missing.is_err());
