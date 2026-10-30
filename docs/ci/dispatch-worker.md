@@ -108,6 +108,60 @@ usual run footer. One predicate, `adopted_pr` in
 guard, clone admission, the controller and the loop. Owner reviews
 (`changes_requested`) on adopted PRs are not supported yet.
 
+### Reactor (#1193)
+
+`carrick-xtask dispatch-worker reactor once|run` runs on the owner's Mac as the
+owner's user and watches PR conversation so the owner does not have to type
+every `/agent`. Each cycle (`run` repeats every 60 s) reads open PRs, issue
+comments, PR review comments and reviews newer than a cursor, then asks a
+local agent (`claude -p`, model `--model`, default `sonnet`) for one JSON
+decision per PR with new events: `ignore`, `reply` or `round`.
+
+The agent only proposes; code decides what is posted, as the owner's `gh`
+login, with the hidden marker `<!-- carrick-reactor -->`:
+
+- A `round` posts `/agent <brief>`, which the dispatch guard admits as an
+  unedited owner comment. It is posted only when the PR passes `adopted_pr`
+  or is an owned dispatch PR, no `dispatch-worker.yml` run is queued or in
+  progress for that PR, and fewer than four dispatch runs are in flight.
+- A `reply` posts plain text; text starting with `/agent` is refused.
+- Comments from bots, comments carrying the marker and owner `/agent`
+  commands are not events. PRs labelled `agent:hold` are skipped.
+- A director PR without exactly one closing reference gets one reply asking
+  for `Closes #N`, once per PR. An adoptable PR with no push for 15 minutes
+  and no reactor round yet counts as one event per head.
+- The reactor never merges, pushes, edits, labels or closes anything.
+
+State (cursor and per-PR memory) lives in
+`~/Library/Application Support/carrick-reactor/state.json`, or `--state`.
+`--dry-run` prints decisions and would-be comments, posts nothing and leaves
+the state unchanged. A launchd agent keeps it running:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>sh.carrick.reactor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Volumes/CaseSensitive/carrick/target/debug/carrick-xtask</string>
+    <string>dispatch-worker</string><string>reactor</string><string>run</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Volumes/CaseSensitive/carrick</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/Users/tjfontaine/.local/bin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/tjfontaine/Library/Logs/carrick-reactor.log</string>
+  <key>StandardErrorPath</key><string>/Users/tjfontaine/Library/Logs/carrick-reactor.log</string>
+</dict>
+</plist>
+```
+
+Save it as `~/Library/LaunchAgents/sh.carrick.reactor.plist` and load it with
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/sh.carrick.reactor.plist`.
+
 ## Accounts and credentials
 
 The runner holds the job-scoped `GITHUB_TOKEN` with exactly `contents: write`,
