@@ -28,6 +28,14 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
         zone: &'a ZoneTables<C>,
         record: carrick_el1_abi::RecordRef,
     ) -> Result<Self, NativeProcessError> {
+        Self::new_with_wait(controls, zone, record, &carrick_sched_core::ShortLockSpin)
+    }
+    fn new_with_wait(
+        controls: &'a [ThreadControlSlot],
+        zone: &'a ZoneTables<C>,
+        record: carrick_el1_abi::RecordRef,
+        wait: &impl carrick_sched_core::LockWait<C>,
+    ) -> Result<Self, NativeProcessError> {
         use carrick_sched_core::object_wait::{
             MemberReleaseGeneration, MemberReleaseIndex, ObjectWaitError, ObjectWaitKey,
         };
@@ -42,11 +50,9 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
                 index,
                 MemberReleaseGeneration::from_issued(generation),
             );
-            match zone.bind_object_notification_source(
-                key,
-                &carrick_sched_core::ShortLockSpin,
-                &|owned| crate::sched::object_wait::deliver_host_completion(zone, owned),
-            ) {
+            match zone.bind_object_notification_source(key, wait, &|owned| {
+                crate::sched::object_wait::deliver_host_completion(zone, owned)
+            }) {
                 Ok(ticket) => {
                     return Ok(Self {
                         controls,
@@ -58,7 +64,8 @@ impl<'a, C: ProcessContext> NativeThreadStock<'a, C> {
                         }),
                     });
                 }
-                Err(ObjectWaitError::Busy | ObjectWaitError::Occupied | ObjectWaitError::Stale) => {
+                Err(ObjectWaitError::Busy) => return Err(NativeProcessError::Busy),
+                Err(ObjectWaitError::Occupied | ObjectWaitError::Stale) => {
                     continue;
                 }
                 Err(_) => return Err(NativeProcessError::Stale),
@@ -261,6 +268,27 @@ pub(super) fn replenish<'a, M: Clone, C: ProcessContext>(
     Ok(())
 }
 
+/// Birth settlement owns the Claimed transition; notify only after its graph
+/// and lifecycle publication have finished. Pin release uses this same source.
+pub(super) fn admission_settled<M: Clone, C: ProcessContext>(
+    runtime: &NativeProcessRuntime<'_, M, C>,
+    key: TaskKey,
+) {
+    let release = {
+        let graph = runtime.graph.lock();
+        graph
+            .owner
+            .task(key)
+            .ok()
+            .and_then(|task| task.native().resources().thread_stock.as_ref())
+            .filter(|stock| !stock.waiters.is_empty())
+            .map(|stock| stock.release.clone())
+    };
+    if let Some(release) = release {
+        carrick_core::lifecycle::MemberControlRelease::released(&*release);
+    }
+}
+
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
@@ -321,7 +349,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }) {
                         return Err(ObjectWaitError::Changed);
                     }
-                    let mut pinned_exit = false;
+                    let mut pinned_exit = resources.page.claimed_count() != 0;
                     for (entry, _) in &stock.identities {
                         if resources
                             .page
@@ -336,10 +364,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                     )
                             })
                         {
-                            if !carrick_core::lifecycle::arm_member_release(
-                                &stock.controls[entry.index() + 1],
-                                release.clone(),
-                            ) {
+                            // SAFETY: the process stock owns this source and
+                            // retains the control extent through final-pin
+                            // settlement; its zone outlives these members.
+                            if !unsafe {
+                                carrick_core::lifecycle::arm_member_release(
+                                    &stock.controls[entry.index() + 1],
+                                    release.clone(),
+                                )
+                            } {
                                 return Err(ObjectWaitError::Changed);
                             }
                             pinned_exit = true;
@@ -500,4 +533,79 @@ pub(crate) fn retain_transient_control_pin<'a, M: Clone, C: ProcessContext>(
         .map(|member| member.control.control())
         .expect("registered member control");
     carrick_core::lifecycle::MemberControlCustody::retain(control).expect("transient control pin")
+}
+
+#[cfg(test)]
+pub(crate) fn claim_sibling_births<M: Clone, C: ProcessContext>(
+    runtime: &NativeProcessRuntime<'_, M, C>,
+    record: RecordRef,
+) -> Vec<carrick_core::lifecycle::ClaimedEntry> {
+    let mut graph = runtime.graph.lock();
+    let task = graph
+        .owner
+        .tasks()
+        .values()
+        .find(|task| {
+            task.native()
+                .resources()
+                .members
+                .iter()
+                .any(|member| member.record == record)
+        })
+        .unwrap();
+    let key = task.key();
+    let tid = runtime.zone.record(record.id).identity().tid as u32;
+    let page = task.native().resources().page;
+    let mut claims = Vec::new();
+    for _ in 0..=page.entry_count() {
+        replenish(runtime, &mut graph, key, tid).unwrap();
+        match page.claim_any() {
+            Ok(claim) => claims.push(claim),
+            Err(carrick_core::lifecycle::TransitionError::PoolEmpty) => return claims,
+            Err(error) => panic!("unexpected claim failure: {error:?}"),
+        }
+    }
+    panic!("stock claims exceeded the lifecycle capacity")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn notification_source_busy_is_not_exhaustion_and_release_allows_admission() {
+        let layout = std::alloc::Layout::new::<ZoneTables<carrick_el1_abi::Aarch64ParkedContext>>();
+        // SAFETY: exact aligned, zero-valid scheduler allocation owned by Box.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout)
+                .cast::<ZoneTables<carrick_el1_abi::Aarch64ParkedContext>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
+        let id = zone.alloc_record(ThreadIdentity::default()).unwrap();
+        let record = zone.record_ref(id);
+        let first = NativeThreadStock::new(&controls, &zone, record).unwrap();
+        let key = first.release.source.key();
+        let completion: &dyn Fn(
+            carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >,
+        ) = &|owned| crate::sched::object_wait::deliver_host_completion(&zone, owned);
+        let held = zone
+            .object_wait_with_completion(key, &carrick_sched_core::ShortLockSpin, completion)
+            .unwrap();
+        assert!(matches!(
+            NativeThreadStock::new_with_wait(
+                &controls,
+                &zone,
+                record,
+                &carrick_sched_core::BoundedSpin(0)
+            ),
+            Err(NativeProcessError::Busy)
+        ));
+        drop(held);
+        drop(first);
+        assert!(NativeThreadStock::new(&controls, &zone, record).is_ok());
+    }
 }
