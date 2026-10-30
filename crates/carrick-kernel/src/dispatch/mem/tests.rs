@@ -69,6 +69,7 @@ fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
 pub struct CountingMmapMemory {
     shared_scrub_calls: Cell<usize>,
     pub(crate) refuse_shared_scrub: bool,
+    pub(crate) write_refusal: Cell<Option<carrick_el1_abi::PortalOwnerWait>>,
     pub(crate) defer_anon: bool,
     pub(crate) discard_anon: bool,
     pub(crate) fail_protect_non_zero: Cell<bool>,
@@ -133,6 +134,7 @@ impl CountingMmapMemory {
         Self {
             shared_scrub_calls: Cell::new(0),
             refuse_shared_scrub: false,
+            write_refusal: Cell::new(None),
             defer_anon: false,
             discard_anon: false,
             fail_protect_non_zero: Cell::new(false),
@@ -323,6 +325,9 @@ impl GuestMemory for CountingMmapMemory {
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let offset = self.range_offset(address, bytes.len())?;
         self.write_calls.set(self.write_calls.get() + 1);
+        if let Some(wait) = self.write_refusal.take() {
+            return Err(MemoryError::OwnerWait(wait));
+        }
         self.write_bytes_total
             .set(self.write_bytes_total.get() + bytes.len());
         self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
@@ -8009,4 +8014,70 @@ fn remap_file_pages_and_mincore_wait_for_owner_refused_copyout_without_mutating_
         DispatchOutcome::Returned { value: 0 },
     );
     assert_eq!(memory.read_bytes(vec_addr, 2).unwrap(), vec![0u8, 0u8]);
+}
+
+#[test]
+fn private_file_mmap_self_held_gate_is_an_invariant() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use std::num::NonZeroU64;
+    let mut dispatcher = SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let address = LINUX_MMAP_BASE + LINUX_PAGE_SIZE;
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, (4 * LINUX_PAGE_SIZE) as usize);
+    dispatcher
+        .captured_file_table()
+        .write_open_files(None)
+        .insert(
+            40,
+            OpenFile::from_open_description_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                    base: OpenDescriptionBase::new(0),
+                    path: "/source".into(),
+                    contents: b"file payload".to_vec(),
+                    offset: 0,
+                })),
+                0,
+                0,
+            ),
+        );
+    let mm = dispatcher.mm_authority().mm_id;
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let index = spaces.publish_closed(mm.raw(), 0x1000, 0).unwrap();
+    let excluded = spaces.raise_and_wait_for_editor(index, || {});
+    let held = carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
+    // SAFETY: this scripted backend models the exact locally held gate.
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(mm.raw()).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            ),
+            PortalWaitCause::Gate,
+            7,
+        )
+    };
+    memory.write_refusal.set(Some(wait));
+    let request = SyscallRequest::new(
+        222,
+        SyscallArgs([
+            address,
+            LINUX_PAGE_SIZE,
+            LINUX_PROT_READ | LINUX_PROT_WRITE,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+            40,
+            0,
+        ]),
+    );
+    let reporter = CompatReporter::default();
+    let outcome = dispatcher.dispatch(&context, request, &mut memory, &reporter);
+    assert!(
+        matches!(&outcome, Err(DispatchError::MmapSelfHeldOwnerGate(observed)) if *observed == wait),
+        "self-held Gate must be its typed invariant error: {outcome:?}"
+    );
+    assert_eq!(memory.write_calls.get(), 1);
+    assert_eq!(memory.write_bytes_total.get(), 0);
+    assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
+    drop(held);
+    spaces.lower(index);
 }

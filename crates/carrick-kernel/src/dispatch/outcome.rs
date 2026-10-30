@@ -1151,6 +1151,8 @@ pub enum DispatchError {
     SourceKernelAuthorityTransferred,
     #[error("owner memory preparation failed: {0}")]
     MemoryPreparation(String),
+    #[error("file mmap attempted to reacquire its own owner gate: {0:?}")]
+    MmapSelfHeldOwnerGate(carrick_el1_abi::PortalOwnerWait),
     #[error("host wait requires the exact outer resource scope")]
     HostWaitResourceScope,
     #[error("host wait completed after its exact thread retired")]

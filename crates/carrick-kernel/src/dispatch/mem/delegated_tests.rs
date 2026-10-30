@@ -1093,6 +1093,96 @@ fn admitted_private_file_mmap_publishes_owner_backing_before_fork() {
     );
 }
 
+/// The proc-executable description must use the same owner source custody as
+/// HostFile. An eager copy here asks UserWrite to enter the mutation's own gate.
+#[test]
+fn admitted_proc_executable_private_mmap_avoids_its_own_gate() {
+    use crate::dispatch::executable_authority::ExecSource;
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause};
+    use std::num::NonZeroU64;
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let payload = vec![0x5a; PAGE as usize + 37];
+    let source = ExecSource::shared(
+        Arc::from(payload.clone()),
+        carrick_vfs::fs_backend::fresh_file_object_id(),
+        "/opt/carrick/el1-sched".into(),
+        0o755,
+        carrick_abi::NsUid::ROOT,
+        carrick_abi::NsGid::ROOT,
+    );
+    dispatcher.set_executable_identity_with_source(
+        "/opt/carrick/el1-sched",
+        vec![],
+        vec![],
+        source,
+    );
+    let executable = dispatcher.proc.lock().current_executable.clone().unwrap();
+    let fd = returned(dispatcher.fs_view().install_proc_executable_source(
+        "/proc/self/exe",
+        executable,
+        0,
+        &mut None,
+    ));
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    // SAFETY: the backend models this exact MM's already-held mutation gate.
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                root.mm,
+                NonZeroU64::new(1).unwrap(),
+            ),
+            PortalWaitCause::Gate,
+            15,
+        )
+    };
+    memory.write_refusal.set(Some(wait));
+    let address = LINUX_MMAP_BASE + 14 * PAGE;
+    assert_eq!(
+        host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            address,
+            2 * PAGE,
+            LINUX_PROT_READ | LINUX_PROT_WRITE,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+            fd as i32,
+        ),
+        DispatchOutcome::Returned {
+            value: address as i64
+        }
+    );
+    assert_eq!(
+        memory.write_calls.get(),
+        0,
+        "no owner copy under the closed gate"
+    );
+    // A mapping retains the selected object after the numeric fd closes.
+    dispatcher
+        .captured_file_table()
+        .write_open_files(None)
+        .remove(&(fd as i32));
+    let mapping = root.lock().mapping(address).unwrap();
+    let backing = mapping
+        .host_backing
+        .expect("proc executable has owner source");
+    assert_eq!(
+        dispatcher
+            .mem_view()
+            .read_host_backing(backing, PAGE as usize)
+            .unwrap(),
+        payload[..PAGE as usize]
+    );
+    let tail = dispatcher
+        .mem_view()
+        .read_host_backing(backing.advance(PAGE).unwrap(), PAGE as usize)
+        .unwrap();
+    assert_eq!(&tail[..37], &payload[PAGE as usize..]);
+    assert!(tail[37..].iter().all(|byte| *byte == 0));
+}
+
 #[test]
 fn admitted_private_file_mmap_keeps_partial_last_page_in_owner_root() {
     let mut dispatcher = SyscallDispatcher::new();

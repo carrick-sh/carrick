@@ -2605,3 +2605,31 @@ reuse retain their existing paths. Eager owner-copy contention and eager-shape
 repairs remain #1124/#1141. Signed 10/10 affinity-handoff acceptance, the
 Linux oracle and runtime ratios remain director-owned; this worker has
 neither HVF nor Docker.
+### Private proc-executable mmap under owner exclusion (#1103)
+
+`kernel.mm.private-file-fixed-replacement` includes the `ProcExecutable`
+description used by `/proc/self/exe`. The admitted private mapping retains
+that exact executable source through the existing private-source custody;
+map-time initialization must perform zero eager owner writes. The VM-free
+binding uses an admitted dispatcher and a backend that refuses the otherwise
+eager copy. It checks a fixed two-page mapping, source retention after fd close,
+source bytes and the zero-filled partial EOF page. Existing HostFile bindings
+remain behavior-preservation controls.
+
+The `kernel.memory.owner-wait` VM-free binding registers the real HAL
+editor-exclusion witness for the calling thread and exact MM. An attempted
+copy through that self-held Gate is an invariant violation, never a dependency
+to park on or errno 12.
+This invalid reacquisition is distinct from contention with another holder.
+The existing owner-wait venue remains the only producer enrollment mechanism.
+
+A genuinely foreign refusal during eager initialization remains #1124:
+address and source snapshot have already been selected, so resumption needs
+retained custody rather than numeric syscall redispatch. This stabilization
+slice does not change that residual main behavior or the indeterminate and
+post-repoint fail-stop boundaries.
+
+The signed `el1_tlb_mm_edit_window_excludes_sibling_allocations` and
+`el1_tlb_running_thread_mm_edits_cost_no_maintenance` bindings, native oracle
+comparison and exact-artifact acceptance remain director-owned. This Linux
+worker has neither HVF nor Docker.
