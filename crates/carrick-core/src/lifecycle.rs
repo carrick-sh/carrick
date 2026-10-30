@@ -192,7 +192,7 @@ fn finish_member_word<W: crate::cancellation::CancellationWord>(
     let mut observed = word.load(Ordering::Acquire);
     loop {
         let clear_waiter =
-            if subtract & REFERENCES == 0 || observed & REFERENCES <= subtract & REFERENCES {
+            if subtract & REFERENCES != 0 && observed & REFERENCES == subtract & REFERENCES {
                 MEMBER_WAITER
             } else {
                 0
@@ -385,14 +385,15 @@ impl MemberReleaseWaiter {
                         .compare_exchange(old_finish, 1, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        let old_data = self.data.swap(0, Ordering::Relaxed);
-                        self.finish.store(0, Ordering::Release);
+                        let old_data = self.data.load(Ordering::Relaxed);
                         // SAFETY: `old_data` and `old_finish` were installed by `arm_member_release`.
                         unsafe {
                             let finish: unsafe fn(*const (), bool) =
                                 core::mem::transmute(old_finish as usize);
                             finish(old_data as usize as *const (), notify);
                         }
+                        self.data.store(0, Ordering::Relaxed);
+                        self.finish.store(0, Ordering::Release);
                         return;
                     }
                 }
@@ -403,7 +404,14 @@ impl MemberReleaseWaiter {
 
 /// Arm `MEMBER_WAITER` on an occupied control so the final reference drop wakes `release` once.
 /// Returns `false` when the control is already unreferenced or resetting.
-pub fn arm_member_release<'a, R: MemberControlRelease + 'a>(
+///
+/// # Safety
+/// The storage owner must keep `release`'s captured borrows valid until the
+/// final control-reference drop and its synchronous notification finish. The
+/// ABI slot erases that lifetime; a temporary observer is insufficient. The
+/// owner excludes control reuse during this call, and repeated arms of the
+/// same incarnation must name the same broadcast notification source.
+pub unsafe fn arm_member_release<'a, R: MemberControlRelease + 'a>(
     member: &'a (impl MemberControl + ?Sized),
     release: alloc::sync::Arc<R>,
 ) -> bool {
@@ -415,9 +423,9 @@ pub fn arm_member_release<'a, R: MemberControlRelease + 'a>(
     if init & RESETTING != 0 || init & REFERENCES == 0 {
         return false;
     }
-    let raw_data = alloc::sync::Arc::into_raw(release) as usize as u64;
-    let raw_finish = finish_member_release::<R> as *const () as usize as u64;
-    let old = loop {
+    // One control has one storage-owner release source. Its notification
+    // wakes every enrolled operation; repeated probes must keep that target.
+    loop {
         match waiter.finish.load(Ordering::Acquire) {
             0 => {
                 if waiter
@@ -425,42 +433,31 @@ pub fn arm_member_release<'a, R: MemberControlRelease + 'a>(
                     .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    break None;
+                    break;
                 }
             }
             1 => core::hint::spin_loop(),
-            old_finish => {
-                if word.load(Ordering::Acquire) & MEMBER_WAITER == 0 {
-                    core::hint::spin_loop();
-                    continue;
+            _ => {
+                let observed = word.load(Ordering::Acquire);
+                if observed & MEMBER_WAITER != 0 {
+                    return true;
                 }
-                if waiter
-                    .finish
-                    .compare_exchange(old_finish, 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    let old_data = waiter.data.swap(0, Ordering::Relaxed);
-                    break Some((old_data, old_finish));
-                }
+                // Publication is in flight, or the final drop has consumed
+                // the bit and is about to clear the target.
+                core::hint::spin_loop();
             }
         }
-    };
+    }
+    let raw_data = alloc::sync::Arc::into_raw(release) as usize as u64;
+    let raw_finish = finish_member_release::<R> as *const () as usize as u64;
+    waiter.data.store(raw_data, Ordering::Relaxed);
+    waiter.finish.store(raw_finish, Ordering::Release);
+    // Publish the target BEFORE arming the bit. A final drop before this
+    // CAS leaves no debt: admission probes again instead of parking.
     let mut observed = word.load(Ordering::Acquire);
     loop {
         if observed & RESETTING != 0 || observed & REFERENCES == 0 {
-            waiter.finish.store(0, Ordering::Release);
-            if let Some((old_data, old_finish)) = old {
-                // SAFETY: `old_data` and `old_finish` were installed by a prior `arm_member_release`.
-                unsafe {
-                    let finish: unsafe fn(*const (), bool) =
-                        core::mem::transmute(old_finish as usize);
-                    finish(old_data as usize as *const (), true);
-                }
-            }
-            // SAFETY: `raw_data` was produced by `Arc::into_raw` above and never published.
-            unsafe {
-                drop(alloc::sync::Arc::from_raw(raw_data as usize as *const R));
-            }
+            waiter.take(false);
             return false;
         }
         match word.compare_exchange(
@@ -469,22 +466,7 @@ pub fn arm_member_release<'a, R: MemberControlRelease + 'a>(
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => {
-                waiter.data.store(raw_data, Ordering::Relaxed);
-                waiter.finish.store(raw_finish, Ordering::Release);
-                if let Some((old_data, old_finish)) = old {
-                    // SAFETY: `old_data` and `old_finish` were installed by a prior `arm_member_release`.
-                    unsafe {
-                        let finish: unsafe fn(*const (), bool) =
-                            core::mem::transmute(old_finish as usize);
-                        finish(
-                            old_data as usize as *const (),
-                            observed & MEMBER_WAITER == 0,
-                        );
-                    }
-                }
-                return true;
-            }
+            Ok(_) => return true,
             Err(actual) => observed = actual,
         }
     }
@@ -1431,6 +1413,31 @@ impl BirthRefusal {
 
 #[cfg(test)]
 mod membership_tests {
+    #[test]
+    fn terminal_publication_preserves_final_reference_wake_debt() {
+        let word = AtomicU32::new((GRAPH_REFERENCE * 2) | MEMBER_WAITER);
+        assert!(!finish_member_word(
+            &word,
+            ZONE_TERMINAL,
+            0,
+            Ordering::AcqRel
+        ));
+        assert!(!finish_member_word(
+            &word,
+            0,
+            GRAPH_REFERENCE,
+            Ordering::AcqRel
+        ));
+        assert_ne!(word.load(Ordering::Acquire) & MEMBER_WAITER, 0);
+        assert!(finish_member_word(
+            &word,
+            0,
+            GRAPH_REFERENCE,
+            Ordering::AcqRel
+        ));
+        assert_eq!(word.load(Ordering::Acquire), ZONE_TERMINAL);
+    }
+
     use super::*;
 
     struct Page {
@@ -1469,9 +1476,9 @@ mod membership_tests {
     }
 
     #[test]
-    fn terminal_rmw_consumes_reserved_waiter_bit_before_claim_drop() {
-        // Layer 1 allocates this bit but has no production arming operation.
-        // Inject only in the fixture, while a genuine claim pins reset.
+    fn terminal_rmw_preserves_waiter_bit_until_final_claim_drop() {
+        // Terminal publication cannot consume a final-reference wake debt.
+        // Inject the bit while a genuine claim pins reset.
         let member = MemberControlAuthority::new();
         let mut claim = claim_member_exit(&member.custody.word).unwrap();
         member.custody.word.fetch_or(1024, Ordering::AcqRel);
@@ -1480,11 +1487,12 @@ mod membership_tests {
             .commit_zone_terminal(NativeExitCompletion::Member);
         assert_eq!(
             member.custody.word.load(Ordering::Acquire) & 1024,
-            0,
-            "terminal RMW left the waiter bit armed"
+            1024,
+            "terminal RMW consumed the final-reference wake debt"
         );
         claim.committed = true;
         drop(claim);
+        assert_eq!(member.custody.word.load(Ordering::Acquire) & 1024, 0);
         assert!(!member.custody.referenced());
         assert!(member.reserve_reset().is_ok());
     }

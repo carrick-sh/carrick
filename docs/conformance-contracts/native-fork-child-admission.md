@@ -28,3 +28,28 @@ policy while the carrier's completion queue finishes its bounded initialization.
 `busy_initializer_finishes_through_the_supplied_wait_policy` forces Busy once,
 then publishes initialization and succeeds; an explicitly refusing wait policy
 retains Busy. Native initialization contention cannot become pool exhaustion.
+
+The #1100 review bindings require lazy stock priming at the first clone:
+fork itself reserves no spare visible thread IDs, and process-only recovery
+and nested-fork witnesses retain exact contiguous-PID assertions. A sibling's
+Claimed entry is temporary contention, so its clone waiter enrols on the stock
+release source and birth settlement publishes the wake after returning the
+claim. A refusing short-lock admission preserves typed Busy, rather than
+scanning it into capacity exhaustion.
+
+`native_fork_child_clone_storm_recycles_exited_pinned_controls` cycles seven
+workers over 32 rounds while the parent remains live. Every round drops the
+signal projection before a release-less final control pin. A missing wake
+bounded-fails at the fixture's WFI trap, with no timer or retry. The control
+publishes its release target before arming MEMBER_WAITER; only the final
+reference decrement consumes that bit and notifies, then clears the target.
+Terminal publication and nonfinal decrements must preserve the wake debt.
+The exhaustive control manifest keeps the waiter at bytes 240..256 and the
+slot at 384 bytes, with the service cell still starting at byte 256.
+
+The managed clone copyout binding requires errno 14, rollback of unpublished
+service, object-wait and record bindings, no Born enqueue, and a successful
+subsequent clone. These VM-free bindings do not establish that the signed
+clone-storm, spawn-slope or scheduler populations complete without hangs;
+the signed comparison and physical artifact acceptance remain director-owned.
+The fixed lifecycle-page ceiling and graph-wide UID scan are tracked in #1142.

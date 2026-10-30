@@ -428,6 +428,29 @@ impl<
                 && zone.tables.mark_native_owned(record.id)
         })
     }
+    fn release_native_birth(&mut self, record: RecordRef, control: &ThreadControlSlot) -> bool {
+        let Some(zone) = &self.zone else {
+            return false;
+        };
+        let Some(key) = carrick_sched_core::object_wait::ObjectWaitKey::native_service(record)
+        else {
+            return false;
+        };
+        if zone.tables.record(record.id).incarnation() != record.incarnation
+            || control.zone_record() != Some(record)
+        {
+            return false;
+        }
+        // This exact record has never been enqueued or executed. No request
+        // or waiter can retain either binding yet.
+        control
+            .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+            .is_ok()
+            && zone
+                .tables
+                .unbind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .is_ok()
+    }
     fn free_record(&mut self, record: RecordRef) {
         if let Some(zone) = &self.zone
             && zone.tables.record(record.id).incarnation() == record.incarnation
