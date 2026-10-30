@@ -1859,7 +1859,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         wait: &impl LockWait<C>,
         completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<ObjectNotificationSource<'a, C>, ObjectWaitError> {
-        if !self.completion_handbacks.initialize() {
+        if !self
+            .completion_handbacks
+            .initialize_with_wait(|attempt| wait.wait(attempt))
+        {
             return Err(ObjectWaitError::Busy);
         }
         let guard = self.lock_completion_index(key, wait, completion)?;
@@ -2648,7 +2651,7 @@ mod host_tests {
         );
         assert_eq!(
             core::mem::offset_of!(ZoneTables, object_admission_handbacks),
-            core::mem::offset_of!(ZoneTables, native_service_waits)
+            core::mem::offset_of!(ZoneTables, member_release_waits)
                 + core::mem::size_of::<ObjectQueue>() * ZONE_RECORDS
         );
         assert_eq!(
@@ -2656,7 +2659,7 @@ mod host_tests {
                 - core::mem::offset_of!(ZoneTables, object_admission_handbacks),
             16 * OBJECT_WAIT_QUEUES
         );
-        assert_eq!(16 * OBJECT_WAIT_QUEUES, 166_912 + 16 * ZONE_RECORDS);
+        assert_eq!(16 * OBJECT_WAIT_QUEUES, 166_912 + 32 * ZONE_RECORDS);
         assert_eq!(DELEGATED_FILE_WAIT_QUEUES.div_ceil(64), 2);
     }
 
