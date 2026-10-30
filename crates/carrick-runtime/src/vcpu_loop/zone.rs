@@ -738,6 +738,27 @@ where
         self.park_owner_memory_action(engine, control, OwnerMemoryAction::Retained, wait)
     }
 
+    /// A receipt belongs to one root incarnation. Retirement while parked
+    /// cancels that fault; it cannot authorize a fault against its successor.
+    pub(super) fn fault_wait_receipt_cancelled(
+        &self,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    ) -> bool {
+        let Some((zone, _)) = zone_for(self.state.zone_mm) else {
+            return true;
+        };
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return true;
+        }
+        // SAFETY: the engine retains this carrier region across suspension.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        slots.authenticate_wait(zone, wait).is_err()
+    }
+
     pub(super) fn park_owner_memory_action(
         &mut self,
         engine: &mut E,
@@ -801,9 +822,22 @@ where
             lifecycle_page: 0,
             control_slot: 0,
         };
-        let enrollment = slots.authenticate_wait(zone, wait).map_err(|error| {
-            RuntimeError::Configuration(format!("owner wait receipt rejected: {error:?}"))
-        })?;
+        let enrollment = match slots.authenticate_wait(zone, wait) {
+            Ok(enrollment) => enrollment,
+            Err(ObjectWaitError::Stale) if matches!(action, OwnerMemoryAction::Fault) => {
+                return self.resume_fault_owner_ready(
+                    engine,
+                    control,
+                    Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::GroupExit),
+                );
+            }
+            Err(error) => {
+                return Err(RuntimeError::Configuration(format!(
+                    "owner wait receipt rejected: {error:?}"
+                ))
+                .into());
+            }
+        };
         let token = OperationToken::metadata_request(context.thread().key().serial.raw())
             .ok_or_else(|| RuntimeError::Configuration("owner wait serial is zero".to_owned()))?;
         let record = zone.alloc_record(identity).map_err(|error| {
@@ -878,18 +912,18 @@ where
                         ))
                     }
                     (OwnerMemoryAction::Fault, None) => {
-                        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
+                        let zone_wait = carrick_kernel::kernel::continuation::ZoneWait::new(
                             zone.record_ref(record),
                             seq,
                         );
-                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_retained_memory_zone_park(
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_fault_owner_zone_park(
                             context,
                             control.execution_lease_mut().map_err(RuntimeError::Trap)?,
-                            wait,
+                            zone_wait,
                         ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
                         // The CPU snapshot owns the uncompleted fault. No MM,
                         // root, descriptor editor or vCPU-slot claim survives.
-                        self.phase = HvpatchProductionPhase::ResumeFaultOwner;
+                        self.phase = HvpatchProductionPhase::ResumeFaultOwner { wait };
                         Ok(self.suspend(
                             HvpatchLoopSuspension::BlockedContinuation,
                             executor::ExecutorExit::BlockedContinuation {
@@ -907,7 +941,7 @@ where
                     }
                 }
             }
-            Err((ObjectWaitError::Changed | ObjectWaitError::Stale, _token)) => {
+            Err((error @ (ObjectWaitError::Changed | ObjectWaitError::Stale), _token)) => {
                 zone.free_record(record);
                 match action {
                     OwnerMemoryAction::Syscall { frame, resume } => {
@@ -917,9 +951,13 @@ where
                         let action = self.take_retained_memory_action()?;
                         self.drive_retained_memory(engine, control, action)
                     }
-                    OwnerMemoryAction::Fault => {
-                        self.resume_fault_owner_ready(engine, control, None)
-                    }
+                    OwnerMemoryAction::Fault => self.resume_fault_owner_ready(
+                        engine,
+                        control,
+                        matches!(error, ObjectWaitError::Stale).then_some(
+                            carrick_kernel::kernel::continuation::OwnerWaitCancellation::GroupExit,
+                        ),
+                    ),
                 }
             }
             Err((error, _token)) => {

@@ -4394,6 +4394,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn serial_host_native_fault_owner_wait_cancellation_without_syscall() {
+        exercise_owner_wait_completion_at_fault(
+            carrick_abi::syscall::nr::FSTAT,
+            Some(carrick_abi::LINUX_SIGKILL),
+            true,
+            false,
+            false,
+            false,
+            (None, Some(false)),
+        );
+    }
+
+    #[test]
+    fn serial_host_native_fault_owner_wait_retired_receipt_cancels_after_wake() {
+        exercise_owner_wait_completion_at_fault(
+            carrick_abi::syscall::nr::FSTAT,
+            Some(carrick_abi::LINUX_SIGKILL),
+            true,
+            false,
+            false,
+            false,
+            (None, Some(true)),
+        );
+    }
+
+    #[test]
     fn serial_host_native_ipc_owner_wait_cancellation_from_el0() {
         exercise_owner_wait_schedule_at(
             carrick_abi::syscall::nr::READ,
@@ -4739,6 +4765,29 @@ pub(crate) mod tests {
         completion_copyout: bool,
         saved_output_schedule: Option<bool>,
     ) {
+        exercise_owner_wait_completion_at_fault(
+            nr,
+            signum,
+            native,
+            release_wins,
+            physical,
+            completion_copyout,
+            (saved_output_schedule, None),
+        );
+    }
+
+    fn exercise_owner_wait_completion_at_fault(
+        nr: carrick_abi::CanonicalNr,
+        signum: Option<i32>,
+        native: bool,
+        release_wins: bool,
+        physical: bool,
+        completion_copyout: bool,
+        schedule: (Option<bool>, Option<bool>),
+    ) {
+        let (saved_output_schedule, fault_wait) = schedule;
+        let retire_receipt = fault_wait == Some(true);
+        let fault_wait = fault_wait.is_some();
         let immediate = saved_output_schedule.unwrap_or(false);
         let recvfrom = nr == carrick_abi::syscall::nr::RECVFROM;
         let interrupted_sleep = saved_output_schedule.is_some() && !recvfrom;
@@ -5156,7 +5205,7 @@ pub(crate) mod tests {
                         }
                     }
                     let _release_on_failure = ReleaseOnDrop(&release_tx);
-                    let peer = scope.spawn(move || {
+                    let mut peer = Some(scope.spawn(move || {
                         let access = carrick_el1_linux::sched::object_wait::space_access(
                             zone,
                             carrick_sched_core::SlotId::new(1),
@@ -5190,7 +5239,7 @@ pub(crate) mod tests {
                         } else {
                             drop(editor);
                         }
-                    });
+                    }));
                     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                     let wait = portal
                         .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
@@ -5207,7 +5256,13 @@ pub(crate) mod tests {
                     let registration = scheduler
                         .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
                         .unwrap();
-                    let (first, resume) = if let Some((owner, object, _, raw)) = &ipc {
+                    let (first, resume) = if fault_wait {
+                        state.service_kernel_context = Some(root.retain_exact());
+                        (
+                            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                            binding::OwnedSyscallResume::CopyoutRedispatch,
+                        )
+                    } else if let Some((owner, object, _, raw)) = &ipc {
                         use carrick_kernel::kernel::continuation::ipc as host_ipc;
                         let request = SyscallRequest::new(
                             63,
@@ -5448,7 +5503,7 @@ pub(crate) mod tests {
                             resume_x16: 0x1616,
                             resume_x17: 0x1717,
                         });
-                    if ipc_read {
+                    if ipc_read || fault_wait {
                         assert!(
                             state.syscall_completion.is_idle(),
                             "IPC read has no guest syscall completion"
@@ -5546,9 +5601,17 @@ pub(crate) mod tests {
                             )
                             .unwrap();
                     } else {
-                        let parked = job
-                            .owner_memory_park(&mut engine, &mut control, frame, wait, resume)
-                            .unwrap();
+                        let parked = if fault_wait {
+                            job.park_owner_memory_action(
+                                &mut engine,
+                                &mut control,
+                                zone::OwnerMemoryAction::Fault,
+                                wait,
+                            )
+                        } else {
+                            job.owner_memory_park(&mut engine, &mut control, frame, wait, resume)
+                        }
+                        .unwrap();
                         let executor::ExecutorExit::BlockedContinuation {
                             continuation,
                             vfork_activation: None,
@@ -5664,7 +5727,7 @@ pub(crate) mod tests {
                     let killing = signum == Some(carrick_abi::LINUX_SIGKILL);
                     if !killing {
                         release_tx.send(()).unwrap();
-                        peer.join().unwrap();
+                        peer.take().unwrap().join().unwrap();
                         if (completion_copyout || recvfrom) && physical {
                             physical_backing
                                 .ready
@@ -5684,11 +5747,39 @@ pub(crate) mod tests {
                         "owner release did not wake the production continuation before the bound",
                     );
 
+                    if retire_receipt {
+                        release_tx.send(()).unwrap();
+                        peer.take().unwrap().join().unwrap();
+                        let entry = zone
+                            .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+                            .unwrap();
+                        zone.spaces.close(entry.index());
+                        use carrick_sched_core::spaces::notification::{
+                            SpaceReleaseVenue, SpaceWakeDelivery,
+                        };
+                        entry.retire_entry(SpaceReleaseVenue {
+                            zone,
+                            waker: carrick_sched_core::Waker::Host,
+                            deliver: SpaceWakeDelivery::Function(|zone, _, effects| {
+                                carrick_sched_core::LockWait::complete_object_wake(
+                                    &carrick_kernel::el1_zone::HostLockWait,
+                                    zone,
+                                    effects,
+                                );
+                            }),
+                        });
+                        assert!(
+                            portal
+                                .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
+                                .is_err()
+                        );
+                    }
+
                     let mut resumed = scheduler
                         .try_take(&registration)
                         .unwrap()
                         .expect("owner wake must reach the registered host executor");
-                    if !physical {
+                    if !physical && !fault_wait {
                         let saved = binding
                             .take_zone_save()
                             .expect("owner park saves residency");
@@ -5785,7 +5876,7 @@ pub(crate) mod tests {
                                 Some(carrick_guest_mem::OwnedMemoryWait(physical_backing.clone()));
                         }
                     }
-                    let mut completed = if physical {
+                    let mut completed = if physical || fault_wait {
                         job.poll_with_engine(&mut engine, &mut resumed_control)
                             .unwrap()
                     } else {
@@ -5870,12 +5961,16 @@ pub(crate) mod tests {
                             )
                             .caller_reserved()
                         );
-                        assert!(
-                            engine.copyout_owner_probe.unwrap().wait_if_busy().is_some(),
-                            "editor stays held through native fatal custody"
-                        );
+                        if !retire_receipt {
+                            assert!(
+                                engine.copyout_owner_probe.unwrap().wait_if_busy().is_some(),
+                                "editor stays held through native fatal custody"
+                            );
+                        }
                         assert_eq!(engine.prepared_commits, 0);
-                        release_tx.send(()).unwrap();
+                        if !retire_receipt {
+                            release_tx.send(()).unwrap();
+                        }
                     } else if killing {
                         assert!(
                             matches!(
