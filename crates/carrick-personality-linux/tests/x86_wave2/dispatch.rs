@@ -826,3 +826,312 @@ fn test_inotify_cache_miss_forwards() {
     assert_eq!(counters.forwarded[27].load(Ordering::Relaxed), 1);
     assert_eq!(counters.served[27].load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn allocator_control_with_pending_host_work_and_no_token_enrolls_three_waiters() {
+    use carrick_core::wait::{
+        notify_object, observe_object, park_object_record, take_object_operation,
+    };
+    use carrick_core_abi::{
+        BornInZoneSource, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        ObjectParkRequest, SnapshotGeneration,
+    };
+    use carrick_el1_abi::{
+        LinuxTaskState, METADATA_GRANT_OP_ALLOC, METADATA_MAILBOX_HOST_WORKING,
+        METADATA_MAILBOX_REQUESTED, METADATA_WAIT_QUEUE_INDEX, MetadataGrantMailbox,
+        MetadataGrantRequest, SYS_CARRICK_EL1_CONTROL, ServedBoundary,
+    };
+    use carrick_guest_arch::GuestIsa;
+    use carrick_personality_linux::crossing::HostCrossingSet;
+    use carrick_personality_linux::dispatch::{
+        CompletionRoute, FamilyCompletion, PendingFamilies, allocator_effect, dispatch,
+    };
+    use carrick_personality_linux::entry::SyscallResult;
+    use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+    use carrick_sched_core::{
+        AffinitySource, BoundedSpin, ExecutionSlot, RecordId, SlotId, ThreadIdentity, ZoneTables,
+    };
+    use core::sync::atomic::AtomicU64;
+
+    let zone = {
+        let layout = std::alloc::Layout::new::<ZoneTables>();
+        // SAFETY: ZoneTables is valid when zero-initialized and Box owns the allocation.
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        }
+    };
+    let mailbox = MetadataGrantMailbox::new();
+    let spin = BoundedSpin(1024);
+
+    // Owner publishes a 10 MiB metadata allocation request and host claims it
+    // (delayed owner in METADATA_MAILBOX_HOST_WORKING).
+    assert!(
+        mailbox.try_publish_request_prepared(
+            MetadataGrantRequest {
+                op: METADATA_GRANT_OP_ALLOC,
+                arg1: 10 * 1024 * 1024,
+                arg2: 4096,
+                arg3: 0,
+                cookie: 1,
+            },
+            |generation| {
+                let Some(key) = ObjectWaitKey::metadata_request(generation) else {
+                    return false;
+                };
+                zone.bind_object_wait(key, &spin).is_ok()
+            },
+        ),
+        "owner publishes metadata grant request"
+    );
+    let generation = mailbox.request_generation();
+    assert_eq!(generation, 1);
+    assert_eq!(
+        mailbox.claim_request().expect("host claims request").op,
+        METADATA_GRANT_OP_ALLOC
+    );
+    assert_eq!(
+        mailbox.state.load(Ordering::Acquire),
+        METADATA_MAILBOX_HOST_WORKING
+    );
+
+    let mm = 7u64;
+    let space = zone.spaces.publish_closed(mm, 0x7000, 0x7000).unwrap();
+    zone.spaces.open(space);
+
+    struct ParticipantVenue<'a> {
+        zone: &'a ZoneTables,
+        mailbox: &'a MetadataGrantMailbox,
+        slot: SlotId,
+        record: RecordId,
+        identity: ThreadIdentity,
+        state: LinuxTaskState,
+        arg0: u64,
+        result: i64,
+        handoff: Option<carrick_core_abi::EntryHandoffReceipt>,
+        forwarded: AtomicU64,
+        served: AtomicU64,
+        refused: [AtomicU64; 513],
+    }
+
+    impl<'a> PendingFamilies<'a> for ParticipantVenue<'a> {
+        fn guest_isa(&self) -> GuestIsa {
+            GuestIsa::Aarch64
+        }
+        fn crossing_set(&self) -> HostCrossingSet {
+            HostCrossingSet::Aarch64
+        }
+        fn ring_first_strict(&self) -> bool {
+            true
+        }
+        fn binding(&self) -> Option<ExecutionBinding> {
+            Some(ExecutionBinding {
+                task: EntryTaskKey::from_raw(self.identity.tid),
+                generation: SnapshotGeneration::from_raw(self.identity.generation),
+                mm: EntryMmKey::from_raw(self.identity.mm),
+                thread_generation: EntryThreadGeneration::from_raw(self.identity.serial),
+            })
+        }
+        fn record_source(&self) -> Option<BornInZoneSource<'a>> {
+            Some(BornInZoneSource {
+                zone: self.zone,
+                slot: self.slot,
+            })
+        }
+        fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt> {
+            self.handoff.take()
+        }
+        fn task_state(&self) -> Option<&LinuxTaskState> {
+            Some(&self.state)
+        }
+        fn host_work(&self) -> bool {
+            self.state.has_pending_host_work()
+        }
+        fn resumes_operation(&self) -> bool {
+            self.zone
+                .slot(self.slot)
+                .current()
+                .is_some_and(|rec| self.zone.record(rec).has_object_operation())
+        }
+        fn refused_counters(&self) -> Option<&'a [AtomicU64]> {
+            None
+        }
+        fn original_argument0(&self) -> u64 {
+            self.arg0
+        }
+        fn install_result(&mut self, result: SyscallResult) {
+            self.result = result.raw();
+        }
+        fn record_served(&self, _nr: u64) {
+            self.served.fetch_add(1, Ordering::Relaxed);
+        }
+        fn record_forwarded(&self, _nr: u64) {
+            self.forwarded.fetch_add(1, Ordering::Relaxed);
+        }
+        fn publish_work(&self, commit_owed: bool) {
+            if commit_owed {
+                self.state.record_commit_owed(self.arg0);
+            } else {
+                self.state.record_completed_with_work();
+            }
+        }
+        fn publish_forward_work(&self, original_x0: u64) {
+            self.state.record_forward_work(original_x0);
+        }
+        fn allocator_control(&mut self) -> FamilyCompletion {
+            if let Ok(Some(operation)) = take_object_operation(self.zone, self.slot, self.identity)
+                && operation.metadata_generation().is_none()
+            {
+                return FamilyCompletion::Handback;
+            }
+            if matches!(
+                self.mailbox.state.load(Ordering::Acquire),
+                METADATA_MAILBOX_REQUESTED | METADATA_MAILBOX_HOST_WORKING
+            ) {
+                let req_gen = self.mailbox.request_generation();
+                if let (Some(key), Some(operation)) = (
+                    ObjectWaitKey::metadata_request(req_gen),
+                    OperationToken::metadata_request(req_gen),
+                ) && let Ok(snapshot) = observe_object(self.zone, self.slot, key, &|_| {})
+                    && matches!(
+                        self.mailbox.state.load(Ordering::Acquire),
+                        METADATA_MAILBOX_REQUESTED | METADATA_MAILBOX_HOST_WORKING
+                    )
+                    && self.mailbox.request_generation() == req_gen
+                    && let Ok(mut parked) = park_object_record(
+                        self.zone,
+                        self.slot,
+                        ObjectParkRequest::new(key, snapshot, operation, None),
+                        &|_| {},
+                        || Ok((self.record, false)),
+                    )
+                {
+                    self.handoff = parked.take_receipt();
+                    return FamilyCompletion::AccountedSuspended;
+                }
+            }
+            let res = 0u64;
+            self.result = res as i64;
+            allocator_effect(Some(&self.state), self.arg0, SyscallResult::new(res as i64))
+        }
+    }
+
+    let mut participants: Vec<ParticipantVenue<'_>> = (0..3)
+        .map(|idx| {
+            let slot = SlotId::new(1 + idx as u8);
+            let tid = 41 + idx as u64;
+            let identity = ThreadIdentity {
+                tid,
+                serial: 100 + idx as u64,
+                mm,
+                file_table: 5,
+                generation: 1,
+                affinity_source: AffinitySource::UNBOUND,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            };
+            zone.drive(slot, 3);
+            zone.publish_slot(slot, mm, None, 0);
+            let here = ExecutionSlot::zone(slot);
+            zone.occupancy.vacate_any(here);
+            assert!(zone.occupancy.replace(here, 0, mm));
+            zone.enter_guest(slot);
+            assert!(zone.install_space(slot, mm).is_some());
+            let record = zone.current_or_new(slot, identity).unwrap();
+            let state = LinuxTaskState::new();
+            // Pending host work (e.g. from barrier futex wake placement) with
+            // no operation token before entering SYS_CARRICK_EL1_CONTROL.
+            state.mark_pending_host_work();
+            ParticipantVenue {
+                zone: &zone,
+                mailbox: &mailbox,
+                slot,
+                record,
+                identity,
+                state,
+                arg0: 1,
+                result: -38,
+                handoff: None,
+                forwarded: AtomicU64::new(0),
+                served: AtomicU64::new(0),
+                refused: [const { AtomicU64::new(0) }; 513],
+            }
+        })
+        .collect();
+
+    for (idx, participant) in participants.iter_mut().enumerate() {
+        assert!(participant.host_work());
+        assert!(!participant.resumes_operation());
+        let route = dispatch(
+            SYS_CARRICK_EL1_CONTROL,
+            SYS_CARRICK_EL1_CONTROL,
+            participant,
+        );
+        assert_eq!(
+            route,
+            CompletionRoute::Suspended,
+            "participant {idx} with pending host work and no operation token must reach enrollment, not forward to host ENOSYS"
+        );
+        assert_eq!(
+            participant.state.take_served_boundary(),
+            None,
+            "suspended participant {idx} must not publish ForwardOriginal"
+        );
+        assert_eq!(participant.forwarded.load(Ordering::Relaxed), 0);
+        assert_eq!(participant.refused[0].load(Ordering::Relaxed), 0);
+        assert!(
+            zone.slot(participant.slot).current().is_none(),
+            "participant {idx} must release its execution slot when parked"
+        );
+    }
+
+    let census = zone
+        .object_queue_census(METADATA_WAIT_QUEUE_INDEX)
+        .expect("metadata wait queue census");
+    assert_eq!(
+        census.waiters, 3,
+        "all three participants must park on the metadata request wait queue"
+    );
+
+    // Owner finishes the grant and wakes all three parked participants.
+    mailbox.publish_response(0, 0x8000_0000, 10 * 1024 * 1024, 0);
+    assert!(mailbox.claim_response().is_some());
+    mailbox.finish_response();
+    let key = ObjectWaitKey::metadata_request(generation).unwrap();
+    let (wake, _) = notify_object(&zone, SlotId::new(0), key).expect("wake metadata wait queue");
+    assert_eq!(wake.queued, 3);
+    assert_eq!(
+        zone.object_queue_census(METADATA_WAIT_QUEUE_INDEX)
+            .unwrap()
+            .waiters,
+        0
+    );
+
+    // Each woken participant now carries OperationToken::metadata_request(generation)
+    // and completes its resumed control call while settling pending host work.
+    for (idx, participant) in participants.iter_mut().enumerate() {
+        assert_eq!(
+            zone.switch_in(participant.slot),
+            Some(participant.record),
+            "participant {idx} switches back onto its slot"
+        );
+        assert!(
+            participant.resumes_operation(),
+            "woken participant {idx} must carry the metadata request operation token"
+        );
+        let route = dispatch(
+            SYS_CARRICK_EL1_CONTROL,
+            SYS_CARRICK_EL1_CONTROL,
+            participant,
+        );
+        assert_eq!(route, CompletionRoute::WithWork);
+        assert_eq!(participant.result, 0);
+        assert_eq!(
+            participant.state.take_served_boundary(),
+            Some(ServedBoundary::Completed)
+        );
+        assert!(!participant.resumes_operation());
+    }
+}

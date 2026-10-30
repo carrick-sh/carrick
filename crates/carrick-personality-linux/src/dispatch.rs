@@ -1103,6 +1103,11 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     // Yield has no host replay. Its in-ring result completes before the
     // ordinary pending-work handback, even when no sibling is runnable.
     let owned_yield = family == Family::Sched(SchedCall::Yield);
+    // Allocator control has no host implementation: replaying it on the host
+    // returns ENOSYS. Serve it in ring so a metadata capacity miss enrolls on
+    // the request wait queue and a completed step settles pending work via
+    // CompleteWithWork.
+    let owned_allocator_control = family == Family::AllocatorControl;
     // The execution venue, not its ISA, owns the settlement guarantee.
     let owned_continuation = pending.settles_owed_work_at_continuation_boundary()
         && matches!(
@@ -1117,6 +1122,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && !owned_descriptor
         && !owned_identity
         && !owned_yield
+        && !owned_allocator_control
         && !owned_continuation
     {
         pending.declined_for_work(ordinal);
