@@ -1833,6 +1833,24 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         Ok(())
     }
 
+    /// Undo an unpublished object's admission. The owner excludes users;
+    /// retain the generation tombstone so stale keys cannot be readmitted.
+    pub fn unbind_object_wait(
+        &self,
+        key: ObjectWaitKey,
+        wait: &impl LockWait<C>,
+    ) -> Result<(), ObjectWaitError> {
+        let guard = self.object_wait(key, wait)?;
+        let queue = guard.queue();
+        if queue.head.load(Ordering::Relaxed) != NIL
+            || queue.publishers.load(Ordering::Acquire) != 0
+        {
+            return Err(ObjectWaitError::Occupied);
+        }
+        queue.epoch.store(0, Ordering::Release);
+        Ok(())
+    }
+
     /// Generic admission. Rebinding cannot pass an admitted publisher or a
     /// holder responsible for its deferred effects.
     pub fn bind_object_wait_with_completion(
@@ -2044,7 +2062,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if guard.queue().completion_mode.load(Ordering::Acquire) != 0 {
             return Err(ObjectWaitError::Occupied);
         }
-        if guard.queue().generation.load(Ordering::Relaxed) != key.generation {
+        if guard.queue().generation.load(Ordering::Relaxed) != key.generation
+            || guard.queue().epoch.load(Ordering::Relaxed) == 0
+        {
             return Err(ObjectWaitError::Stale);
         }
         Ok(guard)

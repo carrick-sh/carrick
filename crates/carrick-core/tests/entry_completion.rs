@@ -1175,10 +1175,14 @@ mod member_release {
             count: AtomicUsize::new(0),
             member: &member,
         });
-        assert!(!arm_member_release(&member, release.clone()));
+        // SAFETY: the member and release target outlive every pin in this test.
+        assert!(!unsafe { arm_member_release(&member, release.clone()) });
         let entry = MemberControlCustody::retain(&member).unwrap();
         let transient = MemberControlCustody::retain(&member).unwrap();
-        assert!(arm_member_release(&member, release.clone()));
+        // SAFETY: all retained pins are returned below, before either borrow ends.
+        assert!(unsafe { arm_member_release(&member, release.clone()) });
+        // SAFETY: all retained pins are returned below, before either borrow ends.
+        assert!(unsafe { arm_member_release(&member, release.clone()) });
         drop(entry);
         assert!(member.exit_custody().referenced());
         assert_eq!(release.count.load(Ordering::SeqCst), 0);
