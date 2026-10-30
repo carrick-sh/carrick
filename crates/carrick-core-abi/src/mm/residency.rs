@@ -1,5 +1,11 @@
 //! Exact live residency and retained grant-window custody for either ISA.
 use core::sync::atomic::{AtomicU64, Ordering};
+mod stock;
+pub use stock::{
+    FrameGrantResidencyLease, STOCK_CHUNKS_PER_CARRIER, STOCK_CHUNKS_PER_MM,
+    STOCK_CHUNKS_PER_REFILL, StockCapacityLease, StockChunkReservation, StockPageMask,
+    StockResidencyOwner, StockResidencyRecord,
+};
 pub const FRAME_GRANT_RESIDENCY_SLOTS: usize = 4096;
 /// Requested bulk extent: 512 Linux pages, clamped by the supplying adapter
 /// at the exact VMA or alignment edge.
@@ -9,7 +15,8 @@ const GRANT_EMPTY: u64 = 0;
 const GRANT_RETIRED: u64 = 1;
 const GRANT_WRITING: u64 = 2;
 const GRANT_LIVE: u64 = 3;
-const GRANT_STATE_MASK: u64 = 3;
+const GRANT_RESERVED: u64 = 4;
+const GRANT_STATE_MASK: u64 = 7;
 pub const GRANT_PAGE_SIZE: u64 = 4096;
 const GRANT_PROBES: usize = 64;
 pub const TRANSFER_PIN_RETIRED: u64 = 1 << 63;
@@ -58,6 +65,32 @@ pub struct FrameGrantResidencyPage {
     pub expected_ipa: u64,
     epoch: u64,
     bit: usize,
+    retained: Option<StockPageMask>,
+}
+
+impl FrameGrantResidencyPage {
+    /// Contiguous retained run containing this page, never a retired hole.
+    /// The captured page is an observation; mutation still needs the editor.
+    pub fn retained_span(self) -> Option<carrick_guest_arch::UserRange> {
+        let (mut first, mut end) = (0, (self.identity.len / GRANT_PAGE_SIZE) as usize);
+        if let Some(mask) = self.retained {
+            first = self.bit;
+            end = self.bit + 1;
+            while first > 0 && mask.contains(first - 1) {
+                first -= 1;
+            }
+            while end < 4 && mask.contains(end) {
+                end += 1;
+            }
+        }
+        // Identity validation establishes the complete non-wrapping range.
+        carrick_guest_arch::UserRange::checked(
+            carrick_guest_arch::UserVa::new(
+                self.identity.semantic_base + first as u64 * GRANT_PAGE_SIZE,
+            ),
+            carrick_guest_arch::GuestLen::new((end - first) as u64 * GRANT_PAGE_SIZE),
+        )
+    }
 }
 
 /// One grant's identity and 512 per-page residency bits. `GRANT_LIVE` is
@@ -77,12 +110,16 @@ pub struct FrameGrantResidencyRecord {
     inventory_revision: AtomicU64,
     committed: [AtomicU64; 8],
     transfer_pins: AtomicU64,
-    // Keep the existing 192-byte wire record fully initialized. This occupies
-    // the former tail padding without moving any published field.
-    _reserved: [u64; 6],
+    // Consume reserved wire words without moving the commit or pin fields.
+    // Zero root denotes an ordinary mapping-bound row.
+    stock_root: AtomicU64,
+    stock_retained: AtomicU64,
+    _reserved: [u64; 4],
 }
 
 impl FrameGrantResidencyRecord {
+    pub const STOCK_ROOT_OFFSET: usize = core::mem::offset_of!(Self, stock_root);
+    pub const STOCK_RETAINED_OFFSET: usize = core::mem::offset_of!(Self, stock_retained);
     pub const COMMITTED_OFFSET: usize = core::mem::offset_of!(Self, committed);
     pub const TRANSFER_PINS_OFFSET: usize = core::mem::offset_of!(Self, transfer_pins);
     pub const fn new() -> Self {
@@ -98,7 +135,9 @@ impl FrameGrantResidencyRecord {
             inventory_revision: AtomicU64::new(0),
             committed: [const { AtomicU64::new(0) }; 8],
             transfer_pins: AtomicU64::new(TRANSFER_PIN_RETIRED),
-            _reserved: [0; 6],
+            stock_root: AtomicU64::new(0),
+            stock_retained: AtomicU64::new(0),
+            _reserved: [0; 4],
         }
     }
 
@@ -115,7 +154,7 @@ impl FrameGrantResidencyRecord {
         }
     }
 
-    fn publish(&self, identity: FrameGrantResidencyIdentity) {
+    fn store_identity(&self, identity: FrameGrantResidencyIdentity) {
         self.mm_key.store(identity.mm_key, Ordering::Relaxed);
         self.semantic_base
             .store(identity.semantic_base, Ordering::Relaxed);
@@ -129,6 +168,10 @@ impl FrameGrantResidencyRecord {
             .store(identity.owner_generation, Ordering::Relaxed);
         self.inventory_revision
             .store(identity.inventory_revision, Ordering::Relaxed);
+    }
+
+    fn publish(&self, identity: FrameGrantResidencyIdentity) {
+        self.store_identity(identity);
         for word in &self.committed {
             word.store(0, Ordering::Relaxed);
         }
@@ -138,6 +181,27 @@ impl FrameGrantResidencyRecord {
             (writing & !GRANT_STATE_MASK) | GRANT_LIVE,
             Ordering::Release,
         );
+    }
+
+    fn retained_overlaps(&self, start: u64, end: u64) -> bool {
+        let base = self.semantic_base.load(Ordering::Relaxed);
+        let len = self.len.load(Ordering::Relaxed);
+        if start >= end || base >= end || start >= base.saturating_add(len) {
+            return false;
+        }
+        if self.stock_root.load(Ordering::Relaxed) == 0 {
+            return true;
+        }
+        let mask = self.stock_retained.load(Ordering::Acquire);
+        (0..4).any(|bit| {
+            let page = base + bit * GRANT_PAGE_SIZE;
+            mask & (1 << bit) != 0 && page < end && start < page + GRANT_PAGE_SIZE
+        })
+    }
+
+    fn retains(&self, bit: usize) -> bool {
+        self.stock_root.load(Ordering::Relaxed) == 0
+            || bit < 4 && self.stock_retained.load(Ordering::Acquire) & (1 << bit) != 0
     }
 }
 
@@ -201,6 +265,8 @@ impl Drop for FrameGrantResidencyRetirement<'_> {
 pub struct FrameGrantResidencyTable {
     slots: [FrameGrantResidencyRecord; FRAME_GRANT_RESIDENCY_SLOTS],
     dirty: [AtomicU64; FRAME_GRANT_RESIDENCY_SLOTS / 64],
+    stock_records: AtomicU64,
+    _stock_reserved: [u64; 7],
 }
 
 impl FrameGrantResidencyTable {
@@ -216,6 +282,8 @@ impl FrameGrantResidencyTable {
         Self {
             slots: [const { Self::initial_slot() }; FRAME_GRANT_RESIDENCY_SLOTS],
             dirty: [const { Self::initial_dirty() }; FRAME_GRANT_RESIDENCY_SLOTS / 64],
+            stock_records: AtomicU64::new(0),
+            _stock_reserved: [0; 7],
         }
     }
 
@@ -237,6 +305,8 @@ impl FrameGrantResidencyTable {
             for index in 0..FRAME_GRANT_RESIDENCY_SLOTS / 64 {
                 dirty.add(index).write(Self::initial_dirty());
             }
+            core::ptr::addr_of_mut!((*ptr).stock_records).write(AtomicU64::new(0));
+            core::ptr::addr_of_mut!((*ptr)._stock_reserved).write([0; 7]);
         }
     }
 
@@ -254,61 +324,21 @@ impl FrameGrantResidencyTable {
     /// Host: publish an authenticated grant while the exact-MM mutation guard
     /// excludes a guest editor. Failure leaves ordinary host first touch live.
     pub fn publish(&self, identity: FrameGrantResidencyIdentity) -> Option<usize> {
-        if !identity.valid() {
-            return None;
-        }
-        // All size classes share one table. Check every covered page before
-        // admission so unlike classes cannot publish overlapping grants.
-        // Exact-MM editors serialize publications for this MM.
-        for page in (identity.semantic_base..identity.semantic_base + identity.len)
-            .step_by(GRANT_PAGE_SIZE as usize)
-        {
-            if self.lookup(identity.mm_key, page).is_some() {
-                return None;
-            }
-        }
-        let class = (identity.len / GRANT_PAGE_SIZE)
-            .next_power_of_two()
-            .trailing_zeros();
-        let bucket = identity.semantic_base / (GRANT_PAGE_SIZE << class);
-        let mut available = None;
-        for probe in 0..GRANT_PROBES {
-            let slot = Self::probe(identity.mm_key, bucket, class, probe);
-            let record = &self.slots[slot];
-            let state = record.state.load(Ordering::Acquire);
-            if state & GRANT_STATE_MASK == GRANT_LIVE {
-                let prior = record.identity();
-                if prior.mm_key == identity.mm_key
-                    && prior.semantic_base < identity.semantic_base + identity.len
-                    && identity.semantic_base < prior.semantic_base + prior.len
-                {
-                    return None;
-                }
-            } else if state == GRANT_EMPTY {
-                available.get_or_insert(slot);
-                break;
-            } else if state & GRANT_STATE_MASK == GRANT_RETIRED {
-                available.get_or_insert(slot);
-            }
-        }
-        let slot = available?;
-        let record = &self.slots[slot];
-        let state = record.state.load(Ordering::Acquire);
-        record
-            .state
-            .compare_exchange(
-                state,
-                (state & !GRANT_STATE_MASK).wrapping_add(4) | GRANT_WRITING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok()?;
-        record.publish(identity);
-        Some(slot)
+        self.reserve_record(identity.mm_key, identity.semantic_base, identity.len, None)?
+            .publish(identity)
     }
 
     /// Guest: find the exact live grant covering a prepared leaf.
     pub fn lookup(&self, mm_key: u64, va: u64) -> Option<FrameGrantResidencyPage> {
+        self.lookup_inner(mm_key, va, false)
+    }
+
+    fn lookup_inner(
+        &self,
+        mm_key: u64,
+        va: u64,
+        include_reserved: bool,
+    ) -> Option<FrameGrantResidencyPage> {
         let page = va & !(GRANT_PAGE_SIZE - 1);
         for class in 0..=EL1_FRAME_GRANT_TARGET_SIZE
             .div_ceil(GRANT_PAGE_SIZE)
@@ -325,7 +355,9 @@ impl FrameGrantResidencyTable {
                     let epoch = record.state.load(Ordering::Acquire);
                     match epoch & GRANT_STATE_MASK {
                         GRANT_EMPTY => break,
-                        GRANT_LIVE => {
+                        GRANT_LIVE | GRANT_RESERVED
+                            if epoch & GRANT_STATE_MASK == GRANT_LIVE || include_reserved =>
+                        {
                             let identity = record.identity();
                             if identity.mm_key == mm_key
                                 && page >= identity.semantic_base
@@ -334,6 +366,16 @@ impl FrameGrantResidencyTable {
                             {
                                 let bit =
                                     ((page - identity.semantic_base) / GRANT_PAGE_SIZE) as usize;
+                                if !record.retains(bit) {
+                                    continue;
+                                }
+                                let retained = if record.stock_root.load(Ordering::Relaxed) != 0 {
+                                    StockPageMask::new(
+                                        record.stock_retained.load(Ordering::Acquire) as u8,
+                                    )
+                                } else {
+                                    None
+                                };
                                 return Some(FrameGrantResidencyPage {
                                     slot,
                                     identity,
@@ -341,6 +383,7 @@ impl FrameGrantResidencyTable {
                                         + bit as u64 * GRANT_PAGE_SIZE,
                                     epoch,
                                     bit,
+                                    retained,
                                 });
                             }
                         }
@@ -357,7 +400,9 @@ impl FrameGrantResidencyTable {
     /// this pin and refuses; stale page tokens cannot pin a successor.
     pub fn pin_transfer(&self, page: FrameGrantResidencyPage) -> Option<FrameGrantTransferPin<'_>> {
         let record = self.slots.get(page.slot)?;
-        if record.state.load(Ordering::Acquire) != page.epoch || record.identity() != page.identity
+        if record.state.load(Ordering::Acquire) != page.epoch
+            || record.identity() != page.identity
+            || !record.retains(page.bit)
         {
             return None;
         }
@@ -368,7 +413,9 @@ impl FrameGrantResidencyTable {
             })
             .ok()?;
         let pin = FrameGrantTransferPin { record };
-        if record.state.load(Ordering::Acquire) != page.epoch || record.identity() != page.identity
+        if record.state.load(Ordering::Acquire) != page.epoch
+            || record.identity() != page.identity
+            || !record.retains(page.bit)
         {
             drop(pin);
             return None;
@@ -383,6 +430,7 @@ impl FrameGrantResidencyTable {
         };
         if record.state.load(Ordering::Acquire) != page.epoch
             || record.identity() != page.identity
+            || !record.retains(page.bit)
             || page.bit >= (page.identity.len / GRANT_PAGE_SIZE) as usize
             || page.expected_ipa != page.identity.physical_ipa + page.bit as u64 * GRANT_PAGE_SIZE
         {
@@ -484,7 +532,7 @@ impl FrameGrantResidencyTable {
             .state
             .compare_exchange(
                 epoch,
-                (epoch & !GRANT_STATE_MASK) | GRANT_RETIRED,
+                (epoch & !GRANT_STATE_MASK) | GRANT_WRITING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -494,6 +542,13 @@ impl FrameGrantResidencyTable {
             return false;
         }
         self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        if record.stock_root.load(Ordering::Relaxed) != 0 {
+            self.stock_records.fetch_sub(1, Ordering::AcqRel);
+        }
+        record.state.store(
+            (epoch & !GRANT_STATE_MASK) | GRANT_RETIRED,
+            Ordering::Release,
+        );
         true
     }
 
@@ -520,7 +575,27 @@ impl FrameGrantResidencyTable {
                 && start < grant_end
                 && record.state.load(Ordering::Acquire) == state
             {
-                visit(identity.semantic_base, grant_end);
+                if record.stock_root.load(Ordering::Relaxed) == 0 {
+                    visit(identity.semantic_base, grant_end);
+                } else {
+                    let mask = record.stock_retained.load(Ordering::Acquire);
+                    let mut bit = 0;
+                    while bit < 4 {
+                        if mask & (1 << bit) == 0 {
+                            bit += 1;
+                            continue;
+                        }
+                        let first = bit;
+                        while bit < 4 && mask & (1 << bit) != 0 {
+                            bit += 1;
+                        }
+                        let lo = identity.semantic_base + first * GRANT_PAGE_SIZE;
+                        let hi = identity.semantic_base + bit * GRANT_PAGE_SIZE;
+                        if lo < end && start < hi {
+                            visit(lo, hi);
+                        }
+                    }
+                }
             }
         }
     }
@@ -543,8 +618,7 @@ impl FrameGrantResidencyTable {
             }
             let identity = record.identity();
             if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < identity.semantic_base.saturating_add(identity.len)
+                && record.retained_overlaps(start, end)
                 && !self.retire_fragment(slot, identity, start, end)
             {
                 return false;
@@ -573,8 +647,7 @@ impl FrameGrantResidencyTable {
             }
             let identity = record.identity();
             if identity.mm_key != mm_key
-                || identity.semantic_base >= end
-                || start >= identity.semantic_base.saturating_add(identity.len)
+                || !record.retained_overlaps(start, end)
                 || record.state.load(Ordering::Acquire) != state
             {
                 continue;
@@ -615,8 +688,7 @@ impl FrameGrantResidencyTable {
             }
             let identity = record.identity();
             if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < identity.semantic_base.saturating_add(identity.len)
+                && record.retained_overlaps(start, end)
                 && record.state.load(Ordering::Acquire) == state
             {
                 let _ = record.transfer_pins.compare_exchange(
@@ -637,8 +709,7 @@ impl FrameGrantResidencyTable {
             }
             let identity = record.identity();
             if identity.mm_key == mm_key
-                && identity.semantic_base < end
-                && start < identity.semantic_base.saturating_add(identity.len)
+                && record.retained_overlaps(start, end)
                 && !self.retire_claimed_fragment(slot, identity, start, end)
             {
                 return false;
@@ -676,6 +747,13 @@ impl FrameGrantResidencyTable {
         start: u64,
         end: u64,
     ) -> bool {
+        if self
+            .slots
+            .get(slot)
+            .is_some_and(|record| record.stock_root.load(Ordering::Relaxed) != 0)
+        {
+            return self.retire_stock_fragment(slot, identity, start, end, false);
+        }
         let Some(bits) = self.committed_words(slot, identity) else {
             return false;
         };
@@ -696,6 +774,9 @@ impl FrameGrantResidencyTable {
         let Some(record) = self.slots.get(slot) else {
             return false;
         };
+        if record.stock_root.load(Ordering::Relaxed) != 0 {
+            return self.retire_stock_fragment(slot, identity, start, end, true);
+        }
         let state = record.state.load(Ordering::Acquire);
         if state & GRANT_STATE_MASK != GRANT_LIVE
             || record.identity() != identity
@@ -708,7 +789,7 @@ impl FrameGrantResidencyTable {
             .state
             .compare_exchange(
                 state,
-                (state & !GRANT_STATE_MASK) | GRANT_RETIRED,
+                (state & !GRANT_STATE_MASK) | GRANT_WRITING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -717,6 +798,10 @@ impl FrameGrantResidencyTable {
             return false;
         }
         self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        record.state.store(
+            (state & !GRANT_STATE_MASK) | GRANT_RETIRED,
+            Ordering::Release,
+        );
         self.publish_retirement_fragments(identity, bits, start, end);
         true
     }
@@ -774,7 +859,7 @@ mod tests {
 
     use super::*;
 
-    fn table() -> std::boxed::Box<FrameGrantResidencyTable> {
+    pub(super) fn table() -> std::boxed::Box<FrameGrantResidencyTable> {
         let layout = std::alloc::Layout::new::<FrameGrantResidencyTable>();
         // SAFETY: allocation uses the table layout and is initialized before
         // the owning Box is constructed.
@@ -786,7 +871,7 @@ mod tests {
         }
     }
 
-    fn identity() -> FrameGrantResidencyIdentity {
+    pub(super) fn identity() -> FrameGrantResidencyIdentity {
         FrameGrantResidencyIdentity {
             mm_key: 7,
             semantic_base: 0x10_0000,
@@ -886,7 +971,7 @@ mod tests {
         assert_eq!(core::mem::align_of::<FrameGrantResidencyRecord>(), 64);
         assert_eq!(FrameGrantResidencyRecord::COMMITTED_OFFSET, 72);
         assert_eq!(FrameGrantResidencyRecord::TRANSFER_PINS_OFFSET, 136);
-        assert_eq!(core::mem::size_of::<FrameGrantResidencyTable>(), 786_944);
+        assert_eq!(core::mem::size_of::<FrameGrantResidencyTable>(), 787_008);
         assert_eq!(core::mem::align_of::<FrameGrantResidencyTable>(), 64);
 
         let layout = std::alloc::Layout::new::<FrameGrantResidencyTable>();
@@ -906,3 +991,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod stock_tests;

@@ -1152,6 +1152,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::size_of::<FrameGrantResidencyTable>() as u64,
         FrameGrantResidencyRecord::COMMITTED_OFFSET as u64,
         FrameGrantResidencyRecord::TRANSFER_PINS_OFFSET as u64,
+        FrameGrantResidencyRecord::STOCK_ROOT_OFFSET as u64,
+        FrameGrantResidencyRecord::STOCK_RETAINED_OFFSET as u64,
         TRANSFER_PIN_RETIRED,
         EL1_ZONE_OFFSET,
         carrick_sched_core::CLAIM_WORD_PROTOCOL,
@@ -4327,7 +4329,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x661ef1c57f329093);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xbcffce7e6fca609b);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

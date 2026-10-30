@@ -766,10 +766,7 @@ impl AnonymousBackingProbe for HardwareAnonymousEditor {
         let mm_key = mm_key.raw();
         let va = va.raw();
         let page = crate::isa::frame_grant_residency_guest().lookup(mm_key, va)?;
-        carrick_guest_arch::UserRange::checked(
-            carrick_guest_arch::UserVa::new(page.identity.semantic_base),
-            carrick_guest_arch::GuestLen::new(page.identity.len),
-        )
+        page.retained_span()
     }
 }
 

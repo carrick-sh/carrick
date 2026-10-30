@@ -169,10 +169,7 @@ impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
         let mm = mm.raw();
         let va = va.raw();
         let page = carrick_el1::isa::frame_grant_residency_guest().lookup(mm, va)?;
-        UserRange::checked(
-            UserVa::new(page.identity.semantic_base),
-            GuestLen::new(page.identity.len),
-        )
+        page.retained_span()
     }
 }
 impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
