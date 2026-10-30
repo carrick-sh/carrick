@@ -330,7 +330,9 @@ impl Frames {
         // wrappers, rather than the syscall/user-return prefix in `native`.
         // Optional frames may be inlined and are then charged by their caller.
         let declined = entry
-            + self.required("::cow_resolver::dispatch_fault::")?
+            + self
+                .required("::cow_resolver::dispatch_fault::")?
+                .max(self.maximum("::dispatch::arm_signal_user_return::"))
             + self.required("::dispatch::arm_deliver_declined_fault_signal::")?
             + self.maximum("::dispatch::arm_deliver_declined_fault_signal_with::")
             + self.maximum("::aarch64_process::deliver_declined_fault_signal_with::")
@@ -678,18 +680,23 @@ mod tests {
 
     #[test]
     fn declined_fault_prefix_is_charged() {
-        let mut frames = small_frames();
-        for method in [
+        for prefix in [
             "cow_resolver::dispatch_fault",
-            "dispatch::arm_deliver_declined_fault_signal",
-            "aarch64_process::deliver_declined_fault_signal_with",
-            "aarch64_process::with_process_entry",
+            "dispatch::arm_signal_user_return",
         ] {
-            frames.0.insert(format!("x::{method}::h0"), 3000);
+            let mut frames = small_frames();
+            for method in [
+                prefix,
+                "dispatch::arm_deliver_declined_fault_signal",
+                "aarch64_process::deliver_declined_fault_signal_with",
+                "aarch64_process::with_process_entry",
+            ] {
+                frames.0.insert(format!("x::{method}::h0"), 3000);
+            }
+            let error = frames.check(16384, 288).unwrap_err();
+            assert!(error.contains("declined fault signal"), "{error}");
+            assert!(!error.contains("individual frame"), "{error}");
         }
-        let error = frames.check(16384, 288).unwrap_err();
-        assert!(error.contains("declined fault signal"), "{error}");
-        assert!(!error.contains("individual frame"), "{error}");
     }
 
     fn reject_fd_chain(chain: &str, methods: &[&str]) {

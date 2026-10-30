@@ -186,7 +186,7 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.metadata-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/engine.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.native.arm-admission", "kernel.mm.private-file-fixed-replacement"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.native.arm-admission", "kernel.mm.private-file-fixed-replacement"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/descriptor_drain.rs"
@@ -431,7 +431,7 @@ contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain", "ke
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/signal.rs"
-contracts = ["kernel.el1.stage1-publication"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-thread/src/physical_grant.rs"
@@ -1010,7 +1010,7 @@ contracts = ["core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/linux_personality.rs"
-contracts = ["core.entry.completion", "kernel.x86.file-region"]
+contracts = ["kernel.el1.signal-delivery-owner", "core.entry.completion", "kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/fixture_personality.rs"
@@ -1153,7 +1153,7 @@ contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_fork_refusal.rs"
@@ -1169,7 +1169,7 @@ contracts = ["kernel.el1.fork-cow", "kernel.el1.mm-exclusive-owner", "process.na
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission", "kernel.el1.ipc-fd-authority"]
+contracts = ["kernel.el1.ipc-two-process", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission", "kernel.el1.ipc-fd-authority", "kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/native_execution.rs"
@@ -1481,7 +1481,7 @@ contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-chil
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "process.native.terminal-child", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "process.native.terminal-child", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/internal_read.rs"
@@ -1549,7 +1549,7 @@ contracts = ["kernel.el1.ipc-two-process", "process.native.arm-admission", "core
 
 [[surfaces]]
 path = "crates/carrick-hal/src/trap.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.native.arm-admission", "kernel.vcpu.shutdown-entry"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.scheduler.runnable-progress", "process.native.arm-admission", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
@@ -1803,7 +1803,7 @@ contracts = ["kernel.scheduler.runnable-progress"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/abi/thread.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.memory.owner-wait", "kernel.scheduler.runnable-progress"]
 
 [[surfaces]]
 path = "crates/carrick-guest-arch/src/lib.rs"

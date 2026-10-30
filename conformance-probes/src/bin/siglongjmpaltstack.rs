@@ -66,8 +66,222 @@ unsafe fn query_onstack() -> Option<bool> {
     Some((old.ss_flags & libc::SS_ONSTACK) != 0)
 }
 
+static FAULT_SIGNAL: AtomicI32 = AtomicI32::new(0);
+static FAULT_CODE: AtomicI32 = AtomicI32::new(0);
+static FAULT_ADDRESS: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn fault_handler(signal: i32, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    unsafe {
+        FAULT_SIGNAL.store(signal, Ordering::SeqCst);
+        FAULT_CODE.store((*info).si_code, Ordering::SeqCst);
+        FAULT_ADDRESS.store((*info).si_addr() as usize, Ordering::SeqCst);
+        siglongjmp(core::ptr::addr_of_mut!(JUMP_BUF).cast(), 1);
+    }
+}
+
+/// Real faulting instruction, with no Rust reference to inaccessible storage.
+unsafe fn fault_read(address: *mut libc::c_void) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("ldr xzr, [{address}]", address = in(reg) address, options(nostack));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mov al, byte ptr [{address}]", address = in(reg) address, out("al") _, options(nostack));
+    }
+}
+
+/// The root handles MAPERR and a file-backed BUS_ADRERR, then returns through
+/// libc siglongjmp. Default/blocked termination is covered by the native-owner
+/// component bindings and the signed crash/core fixture.
+static REAP_CHILD: AtomicI32 = AtomicI32::new(0);
+extern "C" fn reap_deadline(_: i32) {
+    unsafe {
+        let child = REAP_CHILD.load(Ordering::SeqCst);
+        if child > 0 {
+            libc::kill(child, libc::SIGKILL);
+        }
+        libc::_exit(124);
+    }
+}
+
+extern "C" fn unexpected_fault_handler(_: i32) {
+    unsafe {
+        libc::_exit(99);
+    }
+}
+
+unsafe fn fault_termination(blocked: bool) -> i32 {
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let address = libc::mmap(
+            core::ptr::null_mut(),
+            page,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if address == libc::MAP_FAILED || libc::munmap(address, page) != 0 {
+            return -errno();
+        }
+        let mut pipe = [-1; 2];
+        if libc::pipe(pipe.as_mut_ptr()) != 0 {
+            return -errno();
+        }
+        let child = libc::fork();
+        if child == 0 {
+            libc::close(pipe[0]);
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = if blocked {
+                unexpected_fault_handler as *const () as usize
+            } else {
+                libc::SIG_DFL
+            };
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(libc::SIGSEGV, &action, core::ptr::null_mut()) != 0 {
+                libc::_exit(98);
+            }
+            if blocked {
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut mask);
+                libc::sigaddset(&mut mask, libc::SIGSEGV);
+                if libc::sigprocmask(libc::SIG_BLOCK, &mask, core::ptr::null_mut()) != 0 {
+                    libc::_exit(97);
+                }
+            }
+            fault_read(address);
+            libc::_exit(96);
+        }
+        libc::close(pipe[1]);
+        if child < 0 {
+            libc::close(pipe[0]);
+            return -errno();
+        }
+        let mut pfd = libc::pollfd {
+            fd: pipe[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let completed = libc::poll(&mut pfd, 1, 5000) > 0 && pfd.revents & libc::POLLHUP != 0;
+        libc::close(pipe[0]);
+        if !completed {
+            libc::kill(child, libc::SIGKILL);
+        }
+        // The pipe bounds fault completion. Independently bound reaping too:
+        // a broken guest exit path must fail the fixture rather than hang it.
+        REAP_CHILD.store(child, Ordering::SeqCst);
+        let mut deadline: libc::sigaction = std::mem::zeroed();
+        deadline.sa_sigaction = reap_deadline as *const () as usize;
+        libc::sigemptyset(&mut deadline.sa_mask);
+        if libc::sigaction(libc::SIGALRM, &deadline, core::ptr::null_mut()) != 0 {
+            libc::kill(child, libc::SIGKILL);
+            libc::_exit(125);
+        }
+        libc::alarm(5);
+        let mut status = 0;
+        let waited = libc::waitpid(child, &mut status, 0) == child;
+        libc::alarm(0);
+        REAP_CHILD.store(0, Ordering::SeqCst);
+        if completed && waited && libc::WIFSIGNALED(status) {
+            libc::WTERMSIG(status)
+        } else if waited && libc::WIFEXITED(status) {
+            1000 + libc::WEXITSTATUS(status)
+        } else {
+            -1
+        }
+    }
+}
+
+unsafe fn classified_faults() {
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = fault_handler as *const () as usize;
+        action.sa_flags = libc::SA_SIGINFO;
+        libc::sigemptyset(&mut action.sa_mask);
+        let installed = libc::sigaction(libc::SIGSEGV, &action, core::ptr::null_mut()) == 0
+            && libc::sigaction(libc::SIGBUS, &action, core::ptr::null_mut()) == 0;
+        let mapped = libc::mmap(
+            core::ptr::null_mut(),
+            page,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        let unmapped = mapped != libc::MAP_FAILED && libc::munmap(mapped, page) == 0;
+        let maperr_returned = if installed
+            && unmapped
+            && c_sigsetjmp(core::ptr::addr_of_mut!(JUMP_BUF).cast(), 1) == 0
+        {
+            fault_read(mapped);
+            false
+        } else {
+            installed && unmapped
+        };
+        report!(
+            maperr_siglongjmp = maperr_returned,
+            maperr_signal = FAULT_SIGNAL.load(Ordering::SeqCst),
+            maperr_si_code = FAULT_CODE.load(Ordering::SeqCst),
+            maperr_si_addr_matches = FAULT_ADDRESS.load(Ordering::SeqCst) == mapped as usize,
+        );
+        let mut name = *b"/tmp/carrick-fault-XXXXXX\0";
+        let fd = libc::mkstemp(name.as_mut_ptr().cast());
+        let mut mapping = libc::MAP_FAILED;
+        if fd >= 0 {
+            libc::unlink(name.as_ptr().cast());
+            if libc::ftruncate(fd, page as libc::off_t) == 0 {
+                mapping = libc::mmap(
+                    core::ptr::null_mut(),
+                    2 * page,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+            }
+            libc::close(fd);
+        }
+        let setup_errno = if mapping == libc::MAP_FAILED {
+            errno()
+        } else {
+            0
+        };
+        let address = mapping.wrapping_byte_add(page);
+        FAULT_SIGNAL.store(0, Ordering::SeqCst);
+        FAULT_CODE.store(0, Ordering::SeqCst);
+        let bus_returned = if installed
+            && mapping != libc::MAP_FAILED
+            && c_sigsetjmp(core::ptr::addr_of_mut!(JUMP_BUF).cast(), 1) == 0
+        {
+            fault_read(address);
+            false
+        } else {
+            installed && mapping != libc::MAP_FAILED
+        };
+        report!(
+            bus_setup_errno = setup_errno,
+            bus_siglongjmp = bus_returned,
+            bus_signal = FAULT_SIGNAL.load(Ordering::SeqCst),
+            bus_si_code = FAULT_CODE.load(Ordering::SeqCst),
+            bus_si_addr_matches = FAULT_ADDRESS.load(Ordering::SeqCst) == address as usize,
+        );
+        if mapping != libc::MAP_FAILED {
+            libc::munmap(mapping, 2 * page);
+        }
+    }
+}
+
 fn main() {
     unsafe {
+        classified_faults();
+        let default_signal = fault_termination(false);
+        let blocked_signal = fault_termination(true);
+        report!(
+            default_fault_signal = default_signal,
+            blocked_fault_signal = blocked_signal
+        );
         let alt1 = core::ptr::addr_of_mut!(ALT1).cast::<u8>();
         let alt2 = core::ptr::addr_of_mut!(ALT2).cast::<u8>();
         let ss1 = libc::stack_t {

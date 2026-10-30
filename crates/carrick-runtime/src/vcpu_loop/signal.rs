@@ -176,6 +176,18 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     this_tid: ThreadId,
     fault: &mut FaultSignal,
 ) -> Result<FaultSignalDisposition, RuntimeError> {
+    // This is a completed owner verdict, not another fault admission. In
+    // particular it must not generate a second ptrace stop or reclassify VMA.
+    let control = context.thread().control_slot();
+    if control.native_signal_owner()
+        && let Some((signal, code, address, true)) = control.synchronous_fault()
+    {
+        fault.signum = signal.number();
+        fault.si_code = code;
+        fault.si_addr = address;
+        control.clear_synchronous_fault();
+        return Ok(FaultSignalDisposition::Terminate(signal.number()));
+    }
     // This is the single synchronous-signal admission point, including a
     // ptrace-resumed fault. Classify before ptrace, disposition and injection
     // so none of those exits can bypass the file BUS range.
@@ -214,11 +226,13 @@ pub(crate) fn inject_fault_signal<T: SyscallTrap>(
     if !super::carrier_signal_selection_permitted(
         context.thread().control_slot().native_signal_owner(),
     ) {
-        // Host VMA resolution and ptrace stops have already settled. A root
-        // MAPERR or SIGBUS can still arrive here with a native signal table.
-        // Use its default fatal disposition rather than a stale carrier action;
-        // deliver_fault_signal records the signal for the normal core/exit path.
-        return Ok(FaultSignalDisposition::Terminate(fault.signum));
+        let control = context.thread().control_slot();
+        let signal =
+            carrick_personality_linux::signal::policy::Signal::from_number(fault.signum)
+                .ok_or_else(|| RuntimeError::Configuration("invalid native fault signal".into()))?;
+        control.publish_synchronous_fault(signal, fault.si_code, fault.si_addr);
+        trap.enter_native_fault_signal()?;
+        return Ok(FaultSignalDisposition::Injected);
     }
 
     let action = dispatcher.registered_signal_handler(context, fault.signum);
@@ -1834,6 +1848,7 @@ mod tests {
     #[derive(Default)]
     struct NoopTrap {
         restart: bool,
+        native_fault_checkpoints: usize,
         delivered_signum: i32,
         delivered_handler: u64,
         delivered_interrupted_pc: Option<u64>,
@@ -1858,6 +1873,11 @@ mod tests {
             _new_image: &crate::memory::AddressSpace,
         ) -> Result<(), TrapError> {
             Err(TrapError::UnsupportedPlatform)
+        }
+
+        fn enter_native_fault_signal(&mut self) -> Result<(), TrapError> {
+            self.native_fault_checkpoints += 1;
+            Ok(())
         }
 
         fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
@@ -2267,11 +2287,9 @@ mod tests {
                     tid,
                     &mut native_fault,
                 ),
-                Ok(FaultSignalDisposition::Terminate(
-                    crate::linux_abi::LINUX_SIGBUS
-                ))
+                Ok(FaultSignalDisposition::Injected)
             ),
-            "native-owned SIGBUS must terminate through the normal signal/core path"
+            "native-owned SIGBUS must reach the in-ring owner after classification"
         );
         assert_eq!(
             native_fault.signum,
@@ -2281,7 +2299,7 @@ mod tests {
     }
 
     #[test]
-    fn native_signal_owner_root_maperr_and_bus_terminate() {
+    fn native_signal_owner_root_maperr_and_bus_checkpoint_then_default_terminates() {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.exact_signal_context_for_test();
         let custody =
@@ -2314,10 +2332,35 @@ mod tests {
                 },
             );
             assert!(
-                matches!(disposition, Ok(FaultSignalDisposition::Terminate(signal)) if signal == signum),
-                "native root fault must terminate with signal {signum}: {disposition:?}"
+                matches!(disposition, Ok(FaultSignalDisposition::Injected)),
+                "native root fault must enter its owner: {disposition:?}"
             );
             assert_eq!(trap.delivered_signum, 0);
+            assert_eq!(trap.native_fault_checkpoints, 1);
+            let control = context.thread().control_slot();
+            assert_eq!(
+                control
+                    .synchronous_fault()
+                    .map(|(signal, code, address, default)| (
+                        signal.number(),
+                        code,
+                        address,
+                        default
+                    )),
+                Some((signum, 1, 0, false))
+            );
+            control.synchronous_fault_default();
+            let mut fault = FaultSignal {
+                signum,
+                si_code: 1,
+                si_addr: 0,
+                interrupted_pc: Some(0x4000),
+            };
+            assert!(
+                matches!(inject_fault_signal(&mut trap, &dispatcher, &context, ThreadId::main_from_host_pid(), &mut fault), Ok(FaultSignalDisposition::Terminate(signal)) if signal == signum)
+            );
+            assert!(control.synchronous_fault().is_none());
+            assert_eq!(trap.native_fault_checkpoints, 1);
         }
     }
 

@@ -4907,6 +4907,9 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
         )
         .unwrap()
         .unwrap();
+    fixture
+        .control
+        .publish_synchronous_fault(Signal::SEGV, 2, frame.far);
     let refused = super::dispatch::arm_deliver_declined_fault_signal_with(
         source,
         &fixture.task,
@@ -4919,6 +4922,10 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
         |_, _| panic!("Busy admission must not publish or deliver a signal"),
     );
     assert_eq!(refused, Ok(carrick_el1_abi::Action::Forward));
+    assert_eq!(
+        fixture.control.synchronous_fault(),
+        Some((Signal::SEGV, 2, frame.far, false))
+    );
     assert_eq!(frame.elr, 0x40_0200);
     assert!(fixture.zone.release_host_home(other, retained));
 
@@ -10842,4 +10849,283 @@ fn native_process_venue_survives_host_only_and_closed_admission() {
         assert_eq!(action, carrick_el1_abi::Action::Idle);
         assert_eq!(cpu.host_work_boundaries, [record]);
     }
+}
+
+#[test]
+fn arm_classified_maperr_and_bus_use_signal_owner() {
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    use zerocopy::{FromBytes, IntoBytes};
+    for (signal, code) in [(Signal::SEGV, 1), (Signal::BUS, 2)] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let mut service = fixture.process_service();
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |process| {
+                    process
+                        .signal_venue()
+                        .unwrap()
+                        .rt_sigaction(
+                            signal,
+                            Some(Action {
+                                disposition: Disposition::Handler(HandlerAddress(0x40_0100)),
+                                ..Default::default()
+                            }),
+                        )
+                        .unwrap();
+                },
+            )
+            .unwrap();
+        let address = 0x1234_5000;
+        fixture
+            .control
+            .publish_synchronous_fault(signal, code, address);
+        let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
+        let mut machine = ArmWaitSignalMachine {
+            user_sp: UserVa::new(stack.0.as_mut_ptr() as u64 + stack.0.len() as u64),
+            backend: ArmWaitSignalBackend,
+        };
+        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+        let mut frame = carrick_el1_abi::TrapFrame {
+            slot: u64::from(fixture.slot.raw()),
+            esr: 0xfffc,
+            elr: 0x40_0200,
+            spsr: 0x3c0,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::dispatch::arm_deliver_declined_fault_signal_with(
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot
+                },
+                &fixture.task,
+                &ThreadCtx::ZERO,
+                fixture_ttbr0(fixture),
+                fixture.page,
+                fixture.control,
+                &mut service,
+                &mut frame,
+                |process, frame| super::arm_signal::deliver_on_user_return_with(
+                    &fixture.task,
+                    fixture.control,
+                    process,
+                    frame,
+                    fp.as_bytes(),
+                    &mut machine,
+                ),
+            )
+            .unwrap(),
+            carrick_el1_abi::Action::Served
+        );
+        assert_eq!(frame.elr, 0x40_0100);
+        assert!(fixture.control.synchronous_fault().is_none());
+        let offset = frame.x[1] as usize - stack.0.as_ptr() as usize;
+        let built = carrick_personality_linux::signal::arm::SignalFrame::ref_from_bytes(
+            &stack.0[offset
+                ..offset
+                    + core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()],
+        )
+        .unwrap();
+        let info = built.rt.siginfo;
+        let actual = (info.si_signo, info.si_code, info.si_addr);
+        assert_eq!(actual, (signal.number(), code, address));
+        let pc = built.rt.ucontext.uc_mcontext.pc;
+        assert_eq!(pc, 0x40_0200);
+    }
+}
+
+#[test]
+fn arm_classified_fault_default_ignored_and_blocked_return_to_host_core_path() {
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    for (signal, disposition, blocked) in [
+        (Signal::SEGV, Disposition::Default, false),
+        (Signal::BUS, Disposition::Default, false),
+        (Signal::SEGV, Disposition::Ignore, false),
+        (
+            Signal::SEGV,
+            Disposition::Handler(HandlerAddress(0x40_0100)),
+            true,
+        ),
+        (
+            Signal::SEGV,
+            Disposition::Handler(HandlerAddress(0x40_0100)),
+            false,
+        ),
+    ] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let mut service = fixture.process_service();
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |process| {
+                    process
+                        .signal_venue()
+                        .unwrap()
+                        .rt_sigaction(
+                            signal,
+                            Some(Action {
+                                disposition,
+                                ..Default::default()
+                            }),
+                        )
+                        .unwrap();
+                },
+            )
+            .unwrap();
+        if blocked {
+            fixture.control.init_blocked(carrick_el1_abi::BlockedMask(
+                carrick_signal_core::SignalSet::EMPTY.with(signal).bits(),
+            ));
+        }
+        fixture
+            .control
+            .publish_synchronous_fault(signal, 1, 0x1234_5000);
+        let mut frame = carrick_el1_abi::TrapFrame {
+            slot: u64::from(fixture.slot.raw()),
+            esr: 0xfffc,
+            elr: 0x40_0200,
+            spsr: 0x3c0,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::dispatch::arm_deliver_declined_fault_signal_with(
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot
+                },
+                &fixture.task,
+                &ThreadCtx::ZERO,
+                fixture_ttbr0(fixture),
+                fixture.page,
+                fixture.control,
+                &mut service,
+                &mut frame,
+                |process, frame| {
+                    // A sibling changes disposition after fault publication, before
+                    // the shared delivery operation selects it.
+                    if matches!(disposition, Disposition::Handler(_)) && !blocked {
+                        process
+                            .signal_venue()
+                            .unwrap()
+                            .rt_sigaction(signal, Some(Action::default()))
+                            .unwrap();
+                    }
+                    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+                    use zerocopy::IntoBytes;
+                    super::arm_signal::deliver_on_user_return_with(
+                        &fixture.task,
+                        fixture.control,
+                        process,
+                        frame,
+                        fp.as_bytes(),
+                        &mut ArmWaitSignalMachine {
+                            user_sp: UserVa::new(0x7000),
+                            backend: ArmWaitSignalBackend,
+                        },
+                    )
+                },
+            )
+            .unwrap(),
+            carrick_el1_abi::Action::Forward
+        );
+        assert_eq!(
+            fixture.control.synchronous_fault(),
+            Some((signal, 1, 0x1234_5000, true))
+        );
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |process| {
+                    assert_eq!(
+                        process
+                            .signal_venue()
+                            .unwrap()
+                            .rt_sigaction(signal, None)
+                            .unwrap()
+                            .disposition,
+                        Disposition::Default
+                    );
+                },
+            )
+            .unwrap();
+        assert_eq!(frame.elr, 0x40_0200);
+    }
+}
+
+#[test]
+fn arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path() {
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    use zerocopy::IntoBytes;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(
+                        Signal::BUS,
+                        Some(Action {
+                            disposition: Disposition::Handler(HandlerAddress(0x40_0100)),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    fixture
+        .control
+        .publish_synchronous_fault(Signal::BUS, 2, 0x1234_5000);
+    let mut frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        esr: 0xfffc,
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    assert_eq!(
+        super::dispatch::arm_deliver_declined_fault_signal_with(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot
+            },
+            &fixture.task,
+            &ThreadCtx::ZERO,
+            fixture_ttbr0(fixture),
+            fixture.page,
+            fixture.control,
+            &mut service,
+            &mut frame,
+            |process, frame| super::arm_signal::deliver_on_user_return_with(
+                &fixture.task,
+                fixture.control,
+                process,
+                frame,
+                fp.as_bytes(),
+                &mut ArmWaitSignalMachine {
+                    user_sp: UserVa::new(0),
+                    backend: ArmWaitSignalBackend
+                },
+            ),
+        )
+        .unwrap(),
+        carrick_el1_abi::Action::Forward
+    );
+    assert_eq!(
+        fixture.control.synchronous_fault(),
+        Some((Signal::SEGV, 2, 0x1234_5000, true))
+    );
 }

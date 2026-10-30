@@ -4468,7 +4468,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         self.force_fault_info(carrick_signal_core::policy::Signal::SEGV, blocked, info)
     }
-    fn force_fault_info(
+    pub fn force_fault_info(
         &mut self,
         signal: carrick_signal_core::policy::Signal,
         blocked: carrick_signal_core::policy::SigBlockMask,

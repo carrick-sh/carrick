@@ -430,10 +430,13 @@ pub fn signal_user_return(
             let blocked = SigBlockMask::blocking_all_of(
                 carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0),
             );
-            if process.force_sigsegv_info(blocked, info).is_err() {
+            let Some(signal) = Signal::from_number(info.si_signo) else {
+                return false;
+            };
+            if process.force_fault_info(signal, blocked, info).is_err() {
                 return false;
             }
-            let mask = blocked.signals().without(Signal::SEGV);
+            let mask = blocked.signals().without(signal);
             let _ = thread.slot.store_blocked_then_read_pending(
                 carrick_el1_abi::BlockedMask(mask.bits()),
                 thread.slot.pending(),

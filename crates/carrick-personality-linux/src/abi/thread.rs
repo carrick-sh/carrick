@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 19;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 20;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -508,6 +508,11 @@ impl ClearChildTidState {
 pub struct ThreadControlSlot {
     /// Namespace-visible identity, published before this incarnation is runnable.
     visible_tid: AtomicU32,
+    fault_address: AtomicU64,
+    fault_code: AtomicU32,
+    /// 0 = empty, signal number = awaiting owner, high bit = default verdict.
+    fault_signal: AtomicU32,
+
     blocked: AtomicU64,
     /// A forwarded temporary wait mask is restored by the native checkpoint.
     forwarded_saved_mask: AtomicU64,
@@ -571,6 +576,37 @@ pub struct ThreadControlSlot {
 pub struct AffinitySeedRefused;
 
 impl ThreadControlSlot {
+    /// The stopped execution owner publishes once; migration retains this exact
+    /// member allocation. No asynchronous sender can overwrite this payload.
+    pub fn publish_synchronous_fault(
+        &self,
+        signal: crate::signal::policy::Signal,
+        code: i32,
+        address: u64,
+    ) {
+        self.fault_address.store(address, Ordering::Relaxed);
+        self.fault_code.store(code as u32, Ordering::Relaxed);
+        self.fault_signal
+            .store(signal.number() as u32, Ordering::Release);
+    }
+    pub fn synchronous_fault(&self) -> Option<(crate::signal::policy::Signal, i32, u64, bool)> {
+        let word = self.fault_signal.load(Ordering::Acquire);
+        let signal = crate::signal::policy::Signal::from_number((word & 0x7fff_ffff) as i32)?;
+        Some((
+            signal,
+            self.fault_code.load(Ordering::Relaxed) as i32,
+            self.fault_address.load(Ordering::Relaxed),
+            word >> 31 != 0,
+        ))
+    }
+    /// Called only by the admitted native signal owner after action selection.
+    pub fn synchronous_fault_default(&self) {
+        self.fault_signal.fetch_or(1 << 31, Ordering::Release);
+    }
+    pub fn clear_synchronous_fault(&self) {
+        self.fault_signal.store(0, Ordering::Release);
+    }
+
     pub fn affinity(&self) -> carrick_core::affinity::CpuAffinity {
         carrick_core::affinity::CpuAffinity::from_words(&[self.affinity.load()])
     }
@@ -636,6 +672,10 @@ impl ThreadControlSlot {
             affinity_host_alias: AtomicU64::new(0),
             affinity_guest_alias: AtomicU64::new(0),
             visible_tid: AtomicU32::new(0),
+            fault_address: AtomicU64::new(0),
+            fault_code: AtomicU32::new(0),
+            fault_signal: AtomicU32::new(0),
+
             blocked: AtomicU64::new(0),
             forwarded_saved_mask: AtomicU64::new(0),
             forwarded_mask_armed: AtomicU32::new(0),
@@ -793,6 +833,7 @@ impl ThreadControlSlot {
         if entry.is_none() {
             self.visible_tid.store(0, Ordering::Relaxed);
         }
+        self.fault_signal.store(0, Ordering::Relaxed);
         self.zone_id.store(0, Ordering::Relaxed);
         self.retired_thread.store(0, Ordering::Relaxed);
         self.retired_task.store(0, Ordering::Relaxed);
@@ -3163,6 +3204,9 @@ mod layout_manifest {
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
                      visible_tid: _,
+                     fault_address: _,
+                     fault_code: _,
+                     fault_signal: _,
                      blocked: _,
                      forwarded_saved_mask: _,
                      forwarded_mask_armed: _,
@@ -3195,56 +3239,59 @@ mod layout_manifest {
                      service: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
-        field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
-        field!(ThreadControlSlot, forwarded_saved_mask, AtomicU64, 16, 8, 8);
-        field!(ThreadControlSlot, forwarded_mask_armed, AtomicU32, 24, 4, 4);
-        field!(ThreadControlSlot, alt_seq, AtomicU64, 32, 8, 8);
-        field!(ThreadControlSlot, alt_sp, AtomicU64, 40, 8, 8);
-        field!(ThreadControlSlot, alt_size, AtomicU64, 48, 8, 8);
-        field!(ThreadControlSlot, alt_flags, AtomicU32, 56, 4, 4);
-        field!(ThreadControlSlot, robust_len, AtomicU32, 60, 4, 4);
-        field!(ThreadControlSlot, robust_head, AtomicU64, 64, 8, 8);
-        field!(ThreadControlSlot, clear_child_tid, AtomicU64, 72, 8, 8);
-        field!(ThreadControlSlot, entry, AtomicU64, 80, 8, 8);
-        field!(ThreadControlSlot, pending, PendingSummary, 88, 8, 8);
-        field!(ThreadControlSlot, zone_seq, AtomicU64, 96, 8, 8);
-        field!(ThreadControlSlot, zone_incarnation, AtomicU64, 104, 8, 8);
-        field!(ThreadControlSlot, zone_id, AtomicU32, 112, 4, 4);
+        field!(ThreadControlSlot, fault_address, AtomicU64, 8, 8, 8);
+        field!(ThreadControlSlot, fault_code, AtomicU32, 16, 4, 4);
+        field!(ThreadControlSlot, fault_signal, AtomicU32, 20, 4, 4);
+        field!(ThreadControlSlot, blocked, AtomicU64, 24, 8, 8);
+        field!(ThreadControlSlot, forwarded_saved_mask, AtomicU64, 32, 8, 8);
+        field!(ThreadControlSlot, forwarded_mask_armed, AtomicU32, 40, 4, 4);
+        field!(ThreadControlSlot, alt_seq, AtomicU64, 48, 8, 8);
+        field!(ThreadControlSlot, alt_sp, AtomicU64, 56, 8, 8);
+        field!(ThreadControlSlot, alt_size, AtomicU64, 64, 8, 8);
+        field!(ThreadControlSlot, alt_flags, AtomicU32, 72, 4, 4);
+        field!(ThreadControlSlot, robust_len, AtomicU32, 76, 4, 4);
+        field!(ThreadControlSlot, robust_head, AtomicU64, 80, 8, 8);
+        field!(ThreadControlSlot, clear_child_tid, AtomicU64, 88, 8, 8);
+        field!(ThreadControlSlot, entry, AtomicU64, 96, 8, 8);
+        field!(ThreadControlSlot, pending, PendingSummary, 104, 8, 8);
+        field!(ThreadControlSlot, zone_seq, AtomicU64, 112, 8, 8);
+        field!(ThreadControlSlot, zone_incarnation, AtomicU64, 120, 8, 8);
+        field!(ThreadControlSlot, zone_id, AtomicU32, 128, 4, 4);
         field!(
             ThreadControlSlot,
             host_exit_requested,
             carrick_core::lifecycle::MemberControlAuthority,
-            116,
+            132,
             4,
             4
         );
-        field!(ThreadControlSlot, retired_task, AtomicU64, 120, 8, 8);
+        field!(ThreadControlSlot, retired_task, AtomicU64, 136, 8, 8);
         field!(
             ThreadControlSlot,
             retired_birth,
             carrick_core_abi::entry::AtomicBirthSerial,
-            128,
+            144,
             8,
             8
         );
-        field!(ThreadControlSlot, retired_thread, AtomicU64, 136, 8, 8);
-        field!(ThreadControlSlot, birth_task, AtomicU64, 144, 8, 8);
+        field!(ThreadControlSlot, retired_thread, AtomicU64, 152, 8, 8);
+        field!(ThreadControlSlot, birth_task, AtomicU64, 160, 8, 8);
         field!(
             ThreadControlSlot,
             birth_serial,
             carrick_core_abi::entry::AtomicBirthSerial,
-            152,
+            168,
             8,
             8
         );
-        field!(ThreadControlSlot, birth_thread, AtomicU64, 160, 8, 8);
-        field!(ThreadControlSlot, non_interrupting, AtomicU64, 168, 8, 8);
-        field!(ThreadControlSlot, native_pending, PendingSummary, 176, 8, 8);
+        field!(ThreadControlSlot, birth_thread, AtomicU64, 176, 8, 8);
+        field!(ThreadControlSlot, non_interrupting, AtomicU64, 184, 8, 8);
+        field!(ThreadControlSlot, native_pending, PendingSummary, 192, 8, 8);
         field!(
             ThreadControlSlot,
             native_pending_writer,
             AtomicU32,
-            184,
+            200,
             4,
             4
         );
@@ -3252,7 +3299,7 @@ mod layout_manifest {
             ThreadControlSlot,
             in_zone_standard_pending,
             InZoneStandardPending,
-            188,
+            204,
             4,
             4
         );
@@ -3260,16 +3307,16 @@ mod layout_manifest {
             ThreadControlSlot,
             affinity,
             carrick_core::affinity::AffinityAuthority,
-            192,
+            208,
             32,
             8
         );
-        field!(ThreadControlSlot, affinity_host_alias, AtomicU64, 224, 8, 8);
+        field!(ThreadControlSlot, affinity_host_alias, AtomicU64, 240, 8, 8);
         field!(
             ThreadControlSlot,
             affinity_guest_alias,
             AtomicU64,
-            232,
+            248,
             8,
             8
         );

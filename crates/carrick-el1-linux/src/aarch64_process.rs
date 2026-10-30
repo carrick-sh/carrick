@@ -655,8 +655,8 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
     Ok(result)
 }
 
-/// Deliver a synchronous `SIGSEGV` (`SEGV_ACCERR`) for a permission fault
-/// declined by an admitted anonymous reservation on a `SignalOwner` thread.
+/// Deliver a synchronous fault through the admitted `SignalOwner`: the host
+/// may have classified its payload, otherwise a declined reservation is ACCERR.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver_declined_fault_signal_with<X: ForkStockCrossing, F>(
@@ -690,15 +690,24 @@ where
         control,
         service,
         |process| {
+            let classified = control.synchronous_fault();
+            let (signal, code, address) = classified
+                .map(|(signal, code, address, _)| (signal, code, address))
+                .unwrap_or((
+                    carrick_signal_core::policy::Signal::SEGV,
+                    carrick_syscall_abi::LINUX_SEGV_ACCERR,
+                    far,
+                ));
             process
-                .force_sigsegv_info(
+                .force_fault_info(
+                    signal,
                     carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                         carrick_signal_core::SignalSet::from_bits(control.blocked().0),
                     ),
                     carrick_syscall_abi::LinuxSiginfo {
                         si_signo: carrick_syscall_abi::LINUX_SIGSEGV,
-                        si_code: carrick_syscall_abi::LINUX_SEGV_ACCERR,
-                        si_addr: far,
+                        si_code: code,
+                        si_addr: address,
                         ..carrick_syscall_abi::LinuxSiginfo::empty()
                     },
                 )
@@ -706,6 +715,12 @@ where
             Ok(deliver(process))
         },
     )??;
+    if control
+        .synchronous_fault()
+        .is_some_and(|(_, _, _, default)| default)
+    {
+        return Ok(carrick_el1_abi::Action::Forward);
+    }
     match delivered {
         None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => {
             Ok(carrick_el1_abi::Action::Served)

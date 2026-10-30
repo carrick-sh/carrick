@@ -218,6 +218,12 @@ pub trait SyscallTrap {
     /// See [`SignalInjection`] and the macOS `HvfTrapEngine` impl for the full
     /// per-field contract.
     fn inject_signal(&mut self, signal: SignalInjection) -> Result<(), TrapError>;
+    /// Re-enter the native signal owner for an exact-thread classified fault.
+    /// The payload is retained by the thread control, never by carrier actions.
+    fn enter_native_fault_signal(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     /// The Linux syscall number of the most recently dispatched `svc`, used to
     /// decide whether an interrupted syscall is in the SA_RESTART-restartable
     /// set. `None` before the first syscall / on traps with no vCPU.
