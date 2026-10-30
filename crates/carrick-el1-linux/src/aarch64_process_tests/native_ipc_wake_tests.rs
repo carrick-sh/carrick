@@ -675,7 +675,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             let control = fixture.task.lifecycle_refs().unwrap().1;
             let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
             assert_eq!(
-                crate::signal_delivery::deliver_signal_with_control(
+                crate::signal_delivery::deliver_signal_on_syscall_return(
                     &fixture.task,
                     control,
                     &mut entry,
