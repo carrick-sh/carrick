@@ -1721,8 +1721,9 @@ impl ThreadLifecyclePage {
         entry: EntryRef,
         control: &ThreadControlSlot,
         membership: carrick_core::lifecycle::NonfinalExitMembership<'_>,
+        registry: &carrick_core::lifecycle::RegistryWriteHeld<'_>,
     ) -> Result<(), TransitionError> {
-        carrick_core::lifecycle::retire_host_member(self, entry, control, membership)
+        carrick_core::lifecycle::retire_host_member(self, entry, control, membership, registry)
     }
 
     /// What a Closing owner's readiness check would see, from page state and

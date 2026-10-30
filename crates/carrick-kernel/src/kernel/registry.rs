@@ -295,6 +295,11 @@ impl Registry {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn test_reader_can_enter(&self) -> bool {
+        self.state.inner.try_read().is_some()
+    }
+
     /// Settle pending thread births, then hand out the task graph.
     pub(super) fn settled(&self) -> SettledRegistryView<'_> {
         self.ledger.settle(&self.state);
@@ -305,6 +310,18 @@ impl Registry {
     /// `RLIMIT_NPROC` credits of in-flight thread clones.
     pub(crate) const fn thread_ledger(&self) -> &ThreadLedger {
         &self.ledger
+    }
+}
+
+/// The only safe production mint for neutral host-retirement publication.
+pub(in crate::kernel) trait RegistryWriteGuardExt {
+    fn retiring_capability(&self) -> carrick_core::lifecycle::RegistryWriteHeld<'_>;
+}
+impl RegistryWriteGuardExt for RwLockWriteGuard<'_, RegistryState> {
+    fn retiring_capability(&self) -> carrick_core::lifecycle::RegistryWriteHeld<'_> {
+        // SAFETY: this borrow retains the exclusive authoritative registry
+        // guard. The token cannot outlive it or permit its mutable replacement.
+        unsafe { carrick_core::lifecycle::RegistryWriteHeld::from_write_guard(self) }
     }
 }
 

@@ -407,20 +407,20 @@ pub(crate) fn retire_current_with<C: EntryContext>(
     binding: ExecutionBinding,
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
-    commit: impl FnOnce() -> bool,
+    finish: impl carrick_sched_core::RecordRelease,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let start = prepare_handoff(binding, source, record)?;
     let identity = source.zone.record(record).identity();
     let released = if source.zone.slot(source.slot).current().is_none() {
         source
             .zone
-            .release_host_home_with(source.slot, record, commit)
+            .release_host_home_with(source.slot, record, finish)
     } else {
         source.zone.release_current_with(
             source.slot,
             record,
             &carrick_sched_core::ShortLockSpin,
-            commit,
+            finish,
         )? == carrick_sched_core::CurrentRelease::Released
     };
     if !released {

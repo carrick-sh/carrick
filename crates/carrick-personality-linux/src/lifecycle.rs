@@ -1273,16 +1273,15 @@ fn serve_exit<'a>(
                 LifecycleDecline::ExitClearTidCopyout
             });
         }
+        // Copy and wake are already complete on either release outcome.
+        // Publish that progress before a requeue can expose the record. The
+        // exact-address CAS preserves a newer set_tid_address if one won.
+        slot.mark_child_tid_cleared_in_zone(clear_child_tid);
     }
     let retirement = custody.zone_retirement(slot, &mut membership, Some(&mut admission))?;
     if !native.release_current(record.reference, retirement) {
-        // A host claim requeued the record after the clear and wake above
-        // (`CurrentRelease::Requeued`): the exit re-runs, in the zone or on
-        // the host. The joiner is already woken; suppress the second clear
-        // and wake (#685).
-        if clear_child_tid != 0 {
-            slot.mark_child_tid_cleared_in_zone(clear_child_tid);
-        }
+        // Requeue/refusal retains the progress already published above, so
+        // the next lane cannot clear and wake the joiner a second time.
         return None;
     }
     if admission.commit_with_member(slot).is_err() {

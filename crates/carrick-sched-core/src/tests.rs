@@ -3126,6 +3126,159 @@ mod ipc_wait {
         );
     }
 
+    struct ReleaseProbe<'a> {
+        zone: &'a ZoneTables,
+        record: RecordId,
+        commits: &'a AtomicU32,
+        rollbacks: &'a AtomicU32,
+    }
+    impl RecordRelease for ReleaseProbe<'_> {
+        fn commit(&mut self) -> bool {
+            assert_eq!(self.rollbacks.load(Ordering::Acquire), 0);
+            self.commits.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+        fn rollback(&mut self) {
+            assert!(matches!(
+                self.zone.record(self.record).claim(),
+                Claim::Queued { .. }
+            ));
+            assert_eq!(
+                self.zone.slot(SLOT).queued(),
+                0,
+                "rollback ran after queue publication"
+            );
+            self.rollbacks.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn requeue_rollback_is_after_cas_and_before_queue_publication() {
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, None, 0);
+        zone.enter_guest(SLOT);
+        let key = key(47, 1);
+        zone.bind_object_wait(key, &HostWait).unwrap();
+        let record = object_park(&zone, key, 71);
+        notify(&zone, key);
+        assert_eq!(zone.switch_in(SLOT), Some(record));
+        let peer = zone.alloc_record(identity(72)).unwrap();
+        zone.requeue_preempted(SlotId::new(4), peer);
+        let commits = AtomicU32::new(0);
+        let rollbacks = AtomicU32::new(0);
+        let (published, observe) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let reader_zone = &*zone;
+            let observed_rollbacks = &rollbacks;
+            let observed_commits = &commits;
+            let reader = scope.spawn(move || {
+                observe
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let guard = reader_zone.slot_lock(SLOT, &HostWait).unwrap();
+                assert_eq!(reader_zone.slot(SLOT).queued(), 1);
+                assert_eq!(observed_rollbacks.load(Ordering::Acquire), 1);
+                assert_eq!(observed_commits.load(Ordering::Acquire), 0);
+                drop(guard);
+            });
+            assert_eq!(
+                zone.release_current_with(
+                    SLOT,
+                    record,
+                    &HostWait,
+                    ReleaseProbe {
+                        zone: &zone,
+                        record,
+                        commits: &commits,
+                        rollbacks: &rollbacks
+                    }
+                ),
+                Some(CurrentRelease::Requeued)
+            );
+            published.send(()).unwrap();
+            reader.join().unwrap();
+        });
+        assert_eq!(zone.slot(SlotId::new(4)).queued(), 1);
+    }
+
+    #[test]
+    fn losing_requeue_cas_never_rolls_back_the_terminal_commit() {
+        // Pause at the actual lock acquisition, after unswitch captured its
+        // expected claim. Advance that claim adversarially while excluded;
+        // both CAS attempts must lose without invoking rollback.
+        struct Pause {
+            reached: std::sync::mpsc::SyncSender<()>,
+            resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            once: AtomicBool,
+        }
+        impl LockWait for Pause {
+            fn wait(&self, _: u32) -> bool {
+                if !self.once.swap(true, Ordering::AcqRel) {
+                    self.reached.send(()).unwrap();
+                    self.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }
+                true
+            }
+        }
+        let zone = zone();
+        host_publish(&zone, SLOT, MM, None, 0);
+        zone.enter_guest(SLOT);
+        let key = key(48, 1);
+        zone.bind_object_wait(key, &HostWait).unwrap();
+        let record = object_park(&zone, key, 81);
+        notify(&zone, key);
+        assert_eq!(zone.switch_in(SLOT), Some(record));
+        let peer = zone.alloc_record(identity(82)).unwrap();
+        zone.requeue_preempted(SlotId::new(4), peer);
+        let commits = AtomicU32::new(0);
+        let rollbacks = AtomicU32::new(0);
+        let (reached, blocked) = std::sync::mpsc::sync_channel(1);
+        let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+        let wait = Pause {
+            reached,
+            resume: std::sync::Mutex::new(resumed),
+            once: AtomicBool::new(false),
+        };
+        std::thread::scope(|scope| {
+            let guard = zone.slot_lock(SLOT, &HostWait).unwrap();
+            let writer = scope.spawn(|| {
+                zone.release_current_with(
+                    SLOT,
+                    record,
+                    &wait,
+                    ReleaseProbe {
+                        zone: &zone,
+                        record,
+                        commits: &commits,
+                        rollbacks: &rollbacks,
+                    },
+                )
+            });
+            blocked
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let from = zone.record(record).claim();
+            assert!(zone.record(record).cas(
+                from,
+                Claim::OnCpu {
+                    slot: SLOT,
+                    seq: from.seq() + 1
+                }
+            ));
+            drop(guard);
+            resume.send(()).unwrap();
+            assert_eq!(writer.join().unwrap(), Some(CurrentRelease::Released));
+        });
+        assert_eq!(commits.load(Ordering::Acquire), 1);
+        assert_eq!(rollbacks.load(Ordering::Acquire), 0);
+        assert_eq!(zone.slot(SLOT).queued(), 0);
+        assert_eq!(zone.slot(SlotId::new(4)).queued(), 1);
+    }
+
     #[test]
     fn cancelled_current_object_retains_cleanup_authority_through_host_transfer() {
         let zone = zone();

@@ -69,6 +69,42 @@ pub enum MemberExitKind {
     Stale,
 }
 
+/// Proof that host retirement publication is serialized by the registry write
+/// lock. Safe host issuance belongs to the registry guard adapter.
+///
+/// ```compile_fail
+/// use carrick_core::lifecycle::RegistryWriteHeld;
+/// let proof = RegistryWriteHeld { _guard: core::marker::PhantomData };
+/// ```
+///
+/// ```compile_fail
+/// use carrick_core::lifecycle::RegistryWriteHeld;
+/// let proof = RegistryWriteHeld::default();
+/// ```
+pub struct RegistryWriteHeld<'guard> {
+    _guard: core::marker::PhantomData<&'guard mut ()>,
+}
+impl<'guard> RegistryWriteHeld<'guard> {
+    /// # Safety
+    /// The caller must hold the authoritative registry write guard for the
+    /// token's entire lifetime. Only the host registry guard adapter may call
+    /// this in production; passing an unlocked registry is unsound authority.
+    pub unsafe fn from_write_guard<T: ?Sized>(_guard: &'guard T) -> Self {
+        Self {
+            _guard: core::marker::PhantomData,
+        }
+    }
+}
+#[cfg(any(test, feature = "host-test"))]
+impl RegistryWriteHeld<'static> {
+    /// VM-free fixtures with no host registry may exercise the neutral cells.
+    pub fn for_test() -> Self {
+        Self {
+            _guard: core::marker::PhantomData,
+        }
+    }
+}
+
 const IN_ZONE_COMMITTED: u32 = 4;
 const HOST_RETIRING: u32 = 8;
 
@@ -78,7 +114,9 @@ const ZONE_TERMINAL: u32 = 64;
 const ZONE_HOST_TERMINAL: u32 = 128;
 const ABI_EXIT_PENDING: u32 = 256;
 const MEMBERSHIP_CLAIMED: u32 = 512;
-const GRAPH_REFERENCE: u32 = 1024;
+// Reserved for layer 2. No production path arms it while Busy is disabled.
+const MEMBER_WAITER: u32 = 1024;
+const GRAPH_REFERENCE: u32 = 2048;
 
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) enum NativeExitCompletion {
@@ -138,9 +176,31 @@ fn claim_member_exit<W: crate::cancellation::CancellationWord>(
         }
     }
 }
+/// One successful RMW both publishes release and consumes the waiter bit.
+/// A separate load/clear could lose an arm or observe it twice. CAS retries
+/// only atomic interference; no lock, callback or physical wake runs here.
+fn finish_member_word<W: crate::cancellation::CancellationWord>(
+    word: &W,
+    set: u32,
+    subtract: u32,
+    order: Ordering,
+) -> bool {
+    let mut observed = word.load(Ordering::Acquire);
+    loop {
+        let next = ((observed | set) & !MEMBER_WAITER) - subtract;
+        match word.compare_exchange(observed, next, order, Ordering::Acquire) {
+            Ok(previous) => return previous & MEMBER_WAITER != 0,
+            Err(actual) => observed = actual,
+        }
+    }
+}
 impl<W: crate::cancellation::CancellationWord> Drop for MemberExitClaim<'_, W> {
     fn drop(&mut self) {
-        self.word.fetch_sub(
+        // Layer 2 will turn this observation into retained wake debt. Arming
+        // is deliberately absent from this layer, so no wake can be owed yet.
+        let _waiter = finish_member_word(
+            self.word,
+            0,
             GRAPH_REFERENCE
                 + if self.committed {
                     0
@@ -180,7 +240,7 @@ impl MemberExitCustody {
             NativeExitCompletion::Member => 0,
             NativeExitCompletion::AbiExit => ABI_EXIT_PENDING,
         };
-        self.word.fetch_or(ZONE_TERMINAL | abi, Ordering::Release);
+        let _waiter = finish_member_word(&self.word, ZONE_TERMINAL | abi, 0, Ordering::AcqRel);
     }
     pub(crate) fn abi_exit_pending(&self) -> bool {
         self.word.load(Ordering::Acquire) & ABI_EXIT_PENDING != 0
@@ -188,10 +248,12 @@ impl MemberExitCustody {
     pub(crate) fn zone_terminal(&self) -> bool {
         self.word.load(Ordering::Acquire) & ZONE_TERMINAL != 0
     }
-    pub(crate) fn commit_host_zone_terminal(&self) {
-        self.word.fetch_or(
+    pub(crate) fn commit_host_zone_terminal(&self, _registry: &RegistryWriteHeld<'_>) {
+        let _waiter = finish_member_word(
+            &self.word,
             ZONE_TERMINAL | ZONE_HOST_TERMINAL | HOST_RETIRING,
-            Ordering::Release,
+            0,
+            Ordering::AcqRel,
         );
     }
     pub(crate) fn native_zone_terminal(&self) -> bool {
@@ -236,9 +298,12 @@ impl MemberControlAuthority {
         self.custody.word.fetch_or(1, Ordering::Release);
     }
     pub fn publish_host_receipt(&self) {
-        self.custody
-            .word
-            .fetch_or(2 | GRAPH_REGISTERED, Ordering::Release);
+        let _waiter = finish_member_word(
+            &self.custody.word,
+            2 | GRAPH_REGISTERED,
+            0,
+            Ordering::AcqRel,
+        );
     }
     pub fn reserve_reset(&self) -> Result<MemberReset<'_>, TransitionError> {
         self.custody
@@ -452,6 +517,7 @@ pub fn retire_host_member(
     entry: EntryRef,
     member: &dyn MemberControl,
     membership: NonfinalExitMembership<'_>,
+    _registry: &RegistryWriteHeld<'_>,
 ) -> Result<(), TransitionError> {
     let _pin = MemberControlCustody::retain(member)?;
     if !core::ptr::addr_eq(page, membership.page) {
@@ -460,10 +526,12 @@ pub fn retire_host_member(
     if member.member_entry() != Some(entry) {
         return Err(TransitionError::StaleGeneration);
     }
-    member
-        .exit_custody()
-        .word
-        .fetch_or(HOST_RETIRING, Ordering::SeqCst);
+    let _waiter = finish_member_word(
+        &member.exit_custody().word,
+        HOST_RETIRING,
+        0,
+        Ordering::SeqCst,
+    );
     if let Err(error) = page.retire_published(entry) {
         if member.member_entry() == Some(entry) {
             member
@@ -490,10 +558,12 @@ pub fn retire_cancelled_pool_member(
     if !core::ptr::addr_eq(page, membership.page) || member.member_entry() != Some(entry) {
         return Err(TransitionError::StaleGeneration);
     }
-    member
-        .exit_custody()
-        .word
-        .fetch_or(IN_ZONE_COMMITTED, Ordering::SeqCst);
+    let _waiter = finish_member_word(
+        &member.exit_custody().word,
+        IN_ZONE_COMMITTED,
+        0,
+        Ordering::SeqCst,
+    );
     if let Err(error) = page.retire_closing_caller(entry) {
         if member.member_entry() == Some(entry) {
             member
@@ -1011,6 +1081,13 @@ impl NonfinalExitMembership<'_> {
             .as_ref()
             .is_some_and(|claim| core::ptr::eq(claim.word, &member.exit_custody().word))
     }
+    pub(crate) fn rollback(&mut self) {
+        if let Some(unit) = self.reserved.take() {
+            self.page.restore_reserved(unit);
+        }
+        // A committed reservation has no refund and keeps terminal provenance.
+        self.member.take();
+    }
     /// The exact terminal owner crossed its irreversible publication point.
     /// Dropping this token can no longer restore a terminated member's unit.
     pub(crate) fn commit_irrevocable(&mut self) {
@@ -1028,9 +1105,7 @@ impl NonfinalExitMembership<'_> {
 
 impl Drop for NonfinalExitMembership<'_> {
     fn drop(&mut self) {
-        if let Some(unit) = self.reserved.take() {
-            self.page.restore_reserved(unit);
-        }
+        self.rollback();
     }
 }
 /// Non-cloneable ownership of the bounded EL1 exit window. Dropping an
@@ -1043,6 +1118,11 @@ pub struct ExitAdmission<'a> {
 }
 
 impl ExitAdmission<'_> {
+    pub(crate) fn rollback(&mut self) {
+        self.restore_admission();
+        // The old token cannot later publish a newly admitted exit window.
+        self.committed = true;
+    }
     pub(crate) fn commit_irrevocable(&mut self) {
         self.irrevocable = true;
     }
@@ -1051,20 +1131,28 @@ impl ExitAdmission<'_> {
         entry: Option<EntryRef>,
         membership: &NonfinalExitMembership<'_>,
     ) -> bool {
-        entry == Some(self.entry) && core::ptr::addr_eq(self.page, membership.page)
+        !self.committed
+            && !self.irrevocable
+            && entry == Some(self.entry)
+            && core::ptr::addr_eq(self.page, membership.page)
     }
     /// Publish the member-owned exit kind before making the shared entry
     /// reappable. Closing may observe the marker during the admitted window,
     /// but claimed_count prevents settlement until this CAS completes.
     pub fn commit_with_member(self, member: &dyn MemberControl) -> Result<(), TransitionError> {
+        if self.committed {
+            return Err(TransitionError::StaleGeneration);
+        }
         let _pin = MemberControlCustody::retain(member)?;
         if member.member_entry() != Some(self.entry) {
             return Err(TransitionError::StaleGeneration);
         }
-        member
-            .exit_custody()
-            .word
-            .fetch_or(IN_ZONE_COMMITTED, Ordering::SeqCst);
+        let _waiter = finish_member_word(
+            &member.exit_custody().word,
+            IN_ZONE_COMMITTED,
+            0,
+            Ordering::SeqCst,
+        );
         let entry = self.entry;
         let result = self.commit();
         if result.is_err() && member.member_entry() == Some(entry) {
@@ -1077,6 +1165,9 @@ impl ExitAdmission<'_> {
     }
 
     pub fn commit(mut self) -> Result<(), TransitionError> {
+        if self.committed {
+            return Err(TransitionError::StaleGeneration);
+        }
         let activity = self.page.activity();
         if let Some(activity) = activity {
             activity.announce();
@@ -1097,8 +1188,8 @@ impl ExitAdmission<'_> {
     }
 }
 
-impl Drop for ExitAdmission<'_> {
-    fn drop(&mut self) {
+impl ExitAdmission<'_> {
+    fn restore_admission(&mut self) {
         if self.committed || self.irrevocable {
             return;
         }
@@ -1124,6 +1215,12 @@ impl Drop for ExitAdmission<'_> {
                 return;
             }
         }
+    }
+}
+
+impl Drop for ExitAdmission<'_> {
+    fn drop(&mut self) {
+        self.restore_admission();
     }
 }
 
@@ -1192,6 +1289,152 @@ mod membership_tests {
     }
 
     #[test]
+    fn terminal_rmw_consumes_reserved_waiter_bit_before_claim_drop() {
+        // Layer 1 allocates this bit but has no production arming operation.
+        // Inject only in the fixture, while a genuine claim pins reset.
+        let member = MemberControlAuthority::new();
+        let mut claim = claim_member_exit(&member.custody.word).unwrap();
+        member.custody.word.fetch_or(1024, Ordering::AcqRel);
+        member
+            .custody
+            .commit_zone_terminal(NativeExitCompletion::Member);
+        assert_eq!(
+            member.custody.word.load(Ordering::Acquire) & 1024,
+            0,
+            "terminal RMW left the waiter bit armed"
+        );
+        claim.committed = true;
+        drop(claim);
+        assert!(!member.custody.referenced());
+        assert!(member.reserve_reset().is_ok());
+    }
+
+    #[test]
+    fn waiter_release_rmw_observes_one_winner_across_terminal_and_drop() {
+        use crate::cancellation::CancellationWord;
+        struct Counted {
+            word: AtomicU32,
+            observations: AtomicU32,
+        }
+        impl CancellationWord for Counted {
+            fn load(&self, order: Ordering) -> u32 {
+                self.word.load(order)
+            }
+            fn compare_exchange(
+                &self,
+                old: u32,
+                new: u32,
+                success: Ordering,
+                failure: Ordering,
+            ) -> Result<u32, u32> {
+                let result = self.word.compare_exchange(old, new, success, failure);
+                if result.is_ok() && old & MEMBER_WAITER != 0 && new & MEMBER_WAITER == 0 {
+                    self.observations.fetch_add(1, Ordering::AcqRel);
+                }
+                result
+            }
+            fn fetch_sub(&self, n: u32, order: Ordering) -> u32 {
+                self.word.fetch_sub(n, order)
+            }
+            fn fetch_or(&self, n: u32, order: Ordering) -> u32 {
+                self.word.fetch_or(n, order)
+            }
+        }
+        for terminal in [
+            IN_ZONE_COMMITTED,
+            2 | GRAPH_REGISTERED,
+            HOST_RETIRING,
+            ZONE_TERMINAL,
+            ZONE_TERMINAL | ABI_EXIT_PENDING,
+            ZONE_TERMINAL | ZONE_HOST_TERMINAL | HOST_RETIRING,
+        ] {
+            let word = Counted {
+                word: AtomicU32::new(0),
+                observations: AtomicU32::new(0),
+            };
+            let mut claim = claim_member_exit(&word).unwrap();
+            claim.committed = true;
+            word.word.fetch_or(MEMBER_WAITER, Ordering::AcqRel);
+            std::thread::scope(|scope| {
+                let terminal_owner =
+                    scope.spawn(|| finish_member_word(&word, terminal, 0, Ordering::AcqRel));
+                drop(claim);
+                let _ = terminal_owner.join().unwrap();
+            });
+            assert_eq!(word.observations.load(Ordering::Acquire), 1);
+            assert_eq!(
+                word.word.load(Ordering::Acquire) & (REFERENCES | MEMBER_WAITER),
+                0
+            );
+            assert!(
+                !finish_member_word(&word, terminal, 0, Ordering::AcqRel),
+                "a later commit observed the same waiter twice"
+            );
+        }
+        let word = AtomicU32::new(0);
+        let claim = claim_member_exit(&word).unwrap();
+        word.fetch_or(MEMBER_WAITER, Ordering::AcqRel);
+        drop(claim);
+        assert_eq!(
+            word.load(Ordering::Acquire),
+            0,
+            "rollback must clear claim, reference and waiter together"
+        );
+    }
+
+    #[test]
+    fn waiter_flag_does_not_alias_reference_exhaustion_or_reset() {
+        assert_eq!(REFERENCES & MEMBER_WAITER, 0);
+        assert_eq!(GRAPH_REFERENCE, MEMBER_WAITER << 1);
+        let authority = MemberControlAuthority::new();
+        authority
+            .custody
+            .word
+            .store(REFERENCES | MEMBER_WAITER, Ordering::Release);
+        assert!(matches!(
+            claim_member_exit(&authority.custody.word),
+            Err(MemberMembershipError::InvalidMember)
+        ));
+        struct View<'a>(&'a MemberExitCustody);
+        impl MemberControl for View<'_> {
+            fn member_entry(&self) -> Option<EntryRef> {
+                None
+            }
+            fn exit_custody(&self) -> &MemberExitCustody {
+                self.0
+            }
+            fn host_retirement(&self) -> Option<crate::terminal::HostThreadRetirementReceipt> {
+                None
+            }
+        }
+        assert!(MemberControlCustody::retain(&View(&authority.custody)).is_err());
+        assert!(authority.reserve_reset().is_err());
+        authority
+            .custody
+            .word
+            .store(REFERENCES - GRAPH_REFERENCE, Ordering::Release);
+        let claim = claim_member_exit(&authority.custody.word).unwrap();
+        assert_eq!(
+            authority.custody.word.load(Ordering::Acquire) & REFERENCES,
+            REFERENCES
+        );
+        assert!(authority.reserve_reset().is_err());
+        drop(claim);
+        assert_eq!(
+            authority.custody.word.load(Ordering::Acquire),
+            REFERENCES - GRAPH_REFERENCE
+        );
+        authority.custody.word.store(0, Ordering::Release);
+        let reset = authority.reserve_reset().unwrap();
+        assert!(matches!(
+            claim_member_exit(&authority.custody.word),
+            Err(MemberMembershipError::InvalidMember)
+        ));
+        drop(reset);
+        assert!(claim_member_exit(&authority.custody.word).is_ok());
+    }
+
+    #[test]
     fn unpublished_nonfinal_exit_restores_live_in_release() {
         let page = Page {
             terminal: crate::terminal::ProcessExitCustody::new(),
@@ -1235,12 +1478,20 @@ mod membership_tests {
             entry: EntryRef::new(0, 1),
         };
         let mut membership = page.reserve_nonfinal_exit().unwrap();
-        member.custody.commit_host_zone_terminal();
+        member
+            .custody
+            .commit_host_zone_terminal(&RegistryWriteHeld::for_test());
         membership.commit_irrevocable();
         // The real page transition refuses its absent entry and rolls back
         // HOST_RETIRING. Its permanent provenance must still remain host-owned.
         assert_eq!(
-            retire_host_member(&page, member.entry, &member, membership),
+            retire_host_member(
+                &page,
+                member.entry,
+                &member,
+                membership,
+                &RegistryWriteHeld::for_test()
+            ),
             Err(TransitionError::NoSuchEntry)
         );
         assert!(member.custody.zone_terminal());

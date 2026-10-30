@@ -119,6 +119,8 @@ struct Turn<'a> {
     wakes: u64,
     adopted: bool,
     fail_release: bool,
+    replace_clear_on_wake: bool,
+    replaced_clear: bool,
     clears: u64,
 }
 use carrick_guest_arch::UserVa;
@@ -144,6 +146,8 @@ impl<'a> Turn<'a> {
             wakes: 0,
             adopted: false,
             fail_release: false,
+            replace_clear_on_wake: false,
+            replaced_clear: false,
             clears: 0,
         }
     }
@@ -289,6 +293,10 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
         assert_eq!(address.raw(), 0x1004);
         assert_eq!(self.words[1], 0, "clear before wake");
         self.wakes += 1;
+        if std::mem::take(&mut self.replace_clear_on_wake) {
+            self.thread().unwrap().slot.set_clear_child_tid(0x2000);
+            self.replaced_clear = true;
+        }
         true
     }
     fn release_current(
@@ -299,7 +307,88 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
         assert_eq!(self.current, Some(record));
         assert_eq!(self.words[1], 0, "clear before retirement");
         if std::mem::take(&mut self.fail_release) {
-            // A host claim requeued the record (`CurrentRelease::Requeued`).
+            // Inject a pending operation after exit_record's earlier snapshot,
+            // then use the real scheduler requeue seam with actual exit tokens.
+            use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+            use carrick_sched_core::{BoundedSpin, Claim, WakeEffects};
+            let zone = &self.process.zone;
+            let wait = BoundedSpin(1024);
+            let key = ObjectWaitKey::new(45, 1).unwrap();
+            zone.bind_object_wait(key, &wait).unwrap();
+            {
+                let guard = zone.object_wait(key, &wait).unwrap();
+                guard
+                    .park(
+                        guard.snapshot(),
+                        record.id,
+                        OperationToken::new(45, 1).unwrap(),
+                    )
+                    .unwrap();
+            }
+            zone.clear_current(SLOT);
+            {
+                let guard = zone.object_wait(key, &wait).unwrap();
+                assert_eq!(
+                    guard
+                        .notify_object(SLOT, &mut WakeEffects::default())
+                        .unwrap()
+                        .queued,
+                    1
+                );
+            }
+            assert_eq!(zone.switch_in(SLOT), Some(record.id));
+            assert!(
+                retirement
+                    .retire_current(
+                        self.binding,
+                        BornInZoneSource { zone, slot: SLOT },
+                        record.id
+                    )
+                    .is_none()
+            );
+            let process = self.process;
+            let replaced = self.replaced_clear;
+            let counts = (self.words[1], self.wakes);
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        let _guard = process.zone.slot_lock(SLOT, &BoundedSpin(1024)).unwrap();
+                        assert!(matches!(
+                            process.zone.record(record.id).claim(),
+                            Claim::Queued { .. }
+                        ));
+                        assert_eq!(
+                            counts,
+                            (0, 1),
+                            "clear and wake must finish exactly once before requeue visibility"
+                        );
+                        assert_eq!(
+                            process.page.live(),
+                            2,
+                            "peer and exiting member remain live after rollback"
+                        );
+                        if replaced {
+                            assert_eq!(
+                                process.slots[1].clear_child_tid(),
+                                0x2000,
+                                "old clear marker overwrote newer set_tid_address"
+                            );
+                            assert!(!process.slots[1].child_tid_cleared_in_zone_at(0x1004));
+                        } else {
+                            assert!(
+                                process.slots[1].child_tid_cleared_in_zone_at(0x1004),
+                                "requeued record became visible before its clear/wake marker"
+                            );
+                        }
+                    })
+                    .join()
+                    .unwrap();
+            });
+            // Resume and consume the completed fixture operation through its
+            // exclusive OnCpu owner before the next exit attempt.
+            assert_eq!(zone.switch_in(SLOT), Some(record.id));
+            // SAFETY: this fixture now owns the switched-in record exclusively.
+            assert!(unsafe { zone.record(record.id).take_object_operation() }.is_some());
             return false;
         }
         self.handoff = retirement.retire_current(
@@ -480,7 +569,7 @@ pub fn x5_linux_clone_exit() {
 /// re-run exit (in the zone or on the host lane) must not clear and wake a
 /// second time: the control slot records the clear.
 pub fn x5_exit_requeued_after_wake_wakes_once() {
-    for x86 in [false, true] {
+    for (x86, replace_clear) in [(false, false), (true, false), (false, true), (true, true)] {
         let a = Process::new(7);
         let mut turn = Turn::new(&a, x86);
         let entry = a
@@ -504,9 +593,40 @@ pub fn x5_exit_requeued_after_wake_wakes_once() {
         assert_eq!(turn.words, [7, 7]);
         turn.enter_child();
         assert_eq!(a.slots[1].clear_child_tid(), 0x1004);
+        let parent = a
+            .zone
+            .alloc_record(ThreadIdentity {
+                tid: 40,
+                serial: 1000,
+                mm: a.mm,
+                generation: 1,
+                ..a.zone.record(turn.current.unwrap().id).identity()
+            })
+            .unwrap();
+        a.zone.requeue_preempted(SlotId::new(1), parent);
+        let before_clear = turn.clears;
+        turn.replace_clear_on_wake = replace_clear;
         turn.fail_release = true;
-        assert_eq!(turn.syscall(93, [0; 6]), dispatch::CompletionRoute::Forward);
+        // Drive the real Linux exit policy directly: the injected object
+        // park creates a new scheduler generation, so an entry token captured
+        // before that deliberately injected park must not authorize its return.
+        // The subsequent retry below uses a fresh authenticated dispatch turn.
+        turn.args = [0; 6];
+        assert!(
+            carrick_personality_linux::lifecycle::invoke(
+                carrick_personality_linux::lifecycle::LifecycleCall::Exit,
+                &mut turn,
+            )
+            .is_none()
+        );
         assert_eq!((turn.words[1], turn.wakes), (0, 1));
+        assert_eq!(turn.clears - before_clear, 1);
+        assert!(a.zone.live(a.zone.record_ref(parent)).is_some());
+        if replace_clear {
+            assert_eq!(a.slots[1].clear_child_tid(), 0x2000);
+            assert!(!a.slots[1].child_tid_cleared_in_zone_at(0x1004));
+            continue;
+        }
         assert_eq!(a.slots[1].clear_child_tid(), 0, "no clear left pending");
         assert!(
             a.slots[1].child_tid_cleared_in_zone_at(0x1004),

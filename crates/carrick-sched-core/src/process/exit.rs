@@ -788,6 +788,15 @@ impl<Member> core::fmt::Debug for ExitMemberRetirementFailure<Member> {
     }
 }
 
+pub trait ExitMemberIdentity {
+    fn member_task(&self) -> TaskKey;
+}
+impl<T: ExitMember> ExitMemberIdentity for T {
+    fn member_task(&self) -> TaskKey {
+        ExitMember::exit_task(self)
+    }
+}
+
 pub trait ExitMember {
     fn exit_task(&self) -> TaskKey;
     /// Apply terminal intent when this member owns a host saved continuation.
@@ -801,7 +810,7 @@ pub trait ExitMember {
     }
 }
 pub trait ExitEffectSource<C>: ExitLive<C> {
-    type Member: ExitMember;
+    type Member: ExitMemberIdentity;
     type Resources;
     fn exit_members(&self) -> (Vec<Self::Member>, Self::Resources);
     fn exit_begin(&self) -> bool;
@@ -888,6 +897,25 @@ impl<Member, Resources, Transaction: Eq> PendingExitEffects<Member, Resources, T
         })
     }
 }
+impl<Member> ReadyExitEffects<Member> {
+    /// Attach the execution lane's retained publication venue before terminal
+    /// cancellation. A host member without that venue cannot cancel members.
+    ///
+    /// ```compile_fail
+    /// use carrick_sched_core::process::exit::{ExitMemberIdentity, ReadyExitEffects};
+    /// fn bypass<M: ExitMemberIdentity>(effects: ReadyExitEffects<M>) {
+    ///     effects.cancel_members(|_| {});
+    /// }
+    /// ```
+    pub fn map_members<M>(self, map: impl FnMut(Member) -> M) -> ReadyExitEffects<M> {
+        ReadyExitEffects {
+            task: self.task,
+            members: self.members.into_iter().map(map).collect(),
+            parent: self.parent,
+            signal: self.signal,
+        }
+    }
+}
 impl<Member: ExitMember> ReadyExitEffects<Member> {
     /// Parent notification authority is published only after member cancellation.
     pub fn cancel_members(
@@ -970,7 +998,10 @@ impl<
         }
         let identity = record.wait_identity();
         let (members, resources) = record.exit_members();
-        if members.iter().any(|member| member.exit_task() != task) {
+        if members
+            .iter()
+            .any(|member| ExitMemberIdentity::member_task(member) != task)
+        {
             return Err(ExitError::Topology(task.id));
         }
         Ok(PreparedExitEffects {

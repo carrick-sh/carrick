@@ -1887,6 +1887,24 @@ pub struct HostPlacement {
     pub resched: bool,
 }
 
+/// Terminal release owns both alternatives until the scheduler decides.
+/// `rollback` runs only after the OnCpu-to-Queued CAS succeeds, under the
+/// slot lock and before queue publication. It must use lock-free atomics only:
+/// no allocation, lock acquisition, callbacks, wake delivery or blocking Drop.
+/// `commit` runs only when no requeue was published; false retains the record.
+pub trait RecordRelease {
+    fn commit(&mut self) -> bool;
+    fn rollback(&mut self);
+}
+
+// Stateless releases need no membership/admission rollback.
+impl<F: FnMut() -> bool> RecordRelease for F {
+    fn commit(&mut self) -> bool {
+        self()
+    }
+    fn rollback(&mut self) {}
+}
+
 /// The outcome of [`ZoneTables::release_current`]: either way the slot
 /// holds nothing switched in afterwards.
 #[derive(
@@ -3432,13 +3450,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Returns whether this call published the queued record. A subsequent
     /// claimant may already own it when the caller observes this result.
     pub fn unswitch(&self, slot: SlotId, record: RecordId) -> bool {
-        self.unswitch_with(slot, record, &SpinForever)
+        self.unswitch_with(slot, record, &SpinForever, || {})
     }
 
     /// [`Self::unswitch`], waiting for the slot lock as `wait` says. False:
     /// `record` was not switched in on `slot` (or the lock was not taken),
     /// and nothing changed.
-    fn unswitch_with(&self, slot: SlotId, record: RecordId, wait: &impl LockWait<C>) -> bool {
+    fn unswitch_with(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        wait: &impl LockWait<C>,
+        rollback: impl FnOnce(),
+    ) -> bool {
         let rec = self.record(record);
         let from = rec.claim();
         let (Claim::OnCpu { slot: owner, seq } | Claim::OnCpuRequested { slot: owner, seq }) = from
@@ -3459,6 +3483,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         {
             return false;
         }
+        // The CAS, not the earlier requeue decision, owns rollback. A lock
+        // refusal or losing CAS still falls through to terminal commit.
+        rollback();
         let s = self.slot(slot);
         if s.current.load(Ordering::Acquire) == record.raw() {
             s.current.store(NIL, Ordering::Release);
@@ -3636,7 +3663,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         &self,
         slot: SlotId,
         record: RecordId,
-        commit: impl FnOnce() -> bool,
+        mut finish: impl RecordRelease,
     ) -> bool {
         let lane = self.slot(slot);
         let owned = self.record(record);
@@ -3648,7 +3675,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         {
             return false;
         }
-        if !commit() {
+        if !finish.commit() {
             return false;
         }
         self.discard_unpublished(slot, record);
@@ -4141,7 +4168,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         slot: SlotId,
         record: RecordId,
         wait: &impl LockWait<C>,
-        commit: impl FnOnce() -> bool,
+        mut finish: impl RecordRelease,
     ) -> Option<CurrentRelease> {
         let s = self.slot(slot);
         let rec = self.record(record);
@@ -4149,10 +4176,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if owned {
             rec.retire_cancelled_metadata_operation();
         }
-        if owned && rec.has_object_operation() && self.unswitch_with(slot, record, wait) {
+        if owned
+            && rec.has_object_operation()
+            && self.unswitch_with(slot, record, wait, || finish.rollback())
+        {
             return Some(CurrentRelease::Requeued);
         }
-        if owned && !commit() {
+        if owned && !finish.commit() {
             return None;
         }
         s.current.store(NIL, Ordering::Release);

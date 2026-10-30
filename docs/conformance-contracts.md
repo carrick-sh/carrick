@@ -2534,3 +2534,59 @@ Signed HVF execution, Docker differential, paired runtime ratios and exact
 artifact promotion remain director-owned and unavailable on ctb-w4. Existing
 fixture/oracle inputs are unchanged; these VM-free checks do not discharge
 those higher-layer obligations.
+
+### Requeued terminal admission and host publication (#1057 A1)
+
+`core.lifecycle.publication` and `core.entry.completion` require the terminal
+release owner to retain both admission and member custody until the scheduler
+chooses commit or requeue. Only a successful OnCpu-to-Queued CAS authorizes
+rollback. Rollback restores admission and the reserved live unit and releases
+the member claim before linking the runnable record, using only retained atomic
+cells under the slot lock. Lock refusal or a losing CAS must keep ownership for
+commit. Host-home release uses that same finish owner and commits only after
+its refusal checks. An old rolled-back admission cannot publish a later window.
+
+The VM-free two-record bindings keep a peer live while asserting one chosen
+finish, zero visible queue entries before rollback, and unchanged admission and
+membership on the commit alternative. The CAS-loss binding advances the claim
+adversarially at the actual contended slot lock; it is a scheduler seam witness,
+not a claim that this transition is naturally produced by a host claimant.
+Lifecycle bindings inject the reserved waiter bit only in tests and require one
+RMW observation across terminal publication and claim destruction, with no flag
+aliasing at reference exhaustion and no reset while a claim retains a reference.
+No production waiter is armed and InFlight remains fail-closed in layer 1.
+
+Host terminal publication requires a registry-write capability borrowed from the
+actual write guard. Process cancellation attaches that venue after topology
+release, acquires it for publication, and drops it before cancellation callbacks
+can reenter the registry. A two-live-Kernel-thread binding observes the published
+terminal state while an independent reader is excluded, then verifies registry
+read admission during each cancellation callback. It uses real prepared exit
+effects and reservation release; it does not boot a guest or prove full runtime
+retirement. There are no new scans, waits, wake transports or fatal cohorts.
+The existing structural budgets remain unchanged. Complete notification, Busy,
+ARM/x86 forced crossings and signed acceptance remain layer 2/director work;
+HVF and Docker are unavailable on ctb-w4.
+
+The existing personality `x5_exit_requeued_after_wake_wakes_once` binding now
+uses the production scheduler release instead of a simulated false return.
+With two live member records, a second lane locks the real runnable queue and
+requires the completed clear/wake marker before the native adapter returns.
+It was red with `requeued record became visible before its clear/wake marker`.
+The clear and wake each run exactly once; publishing the existing marker right
+after both succeed is correct on commit and requeue because the work is already
+done. A newer `set_tid_address` injected between wake and marker must remain
+pending at the newer address. No new marker, callback or progress flag is added.
+
+This requeue interleaving invokes the public Linux lifecycle policy boundary:
+the injected object park advances the scheduler generation, so the fixture
+cannot reuse an entry token from before that injected park. Its later exit
+retry takes a fresh authenticated dispatch turn. It does not assert that the
+old entry token can return Forward after an intervening scheduler generation.
+
+The core CAS-loss binding additionally retains genuine member and ABI admission
+tokens while a second lane advances the record through a production object
+park/wake and a fresh OnCpu generation. The stale requeue CAS must lose, then
+terminal commit must keep live=1 and ExitingPublished until actual ABI commit.
+This supplements the scheduler callback-count guard without manufacturing a
+natural Kernel/Kernel claim overlap.
