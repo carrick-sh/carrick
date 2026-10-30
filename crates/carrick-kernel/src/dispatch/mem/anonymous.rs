@@ -2796,6 +2796,32 @@ mod tests {
             DispatchOutcome::OwnerMemoryWait { committed: 0, .. }
         ));
         assert_eq!(memory.zero_backing_calls.get(), 1);
+        // The refused issuer probe released its peer holder. A sibling which
+        // wakes on that early release must park again for adoption, even though
+        // the root lock is now free. No unrelated release may satisfy the
+        // notification assertion below.
+        let Ok(DispatchOutcome::OwnerMemoryWait {
+            wait: sibling_wait, ..
+        }) = dispatcher
+            .dispatch_normalized_mutation_for_test(
+                &sibling,
+                sibling_syscall,
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("sibling must preserve its syscall until adoption");
+        };
+        let pending_release = dispatcher
+            .mem()
+            .lock()
+            .delegated_root()
+            .unwrap()
+            .observe_release()
+            .unwrap();
+        assert_eq!(pending_release, sibling_wait);
         let resumed = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
