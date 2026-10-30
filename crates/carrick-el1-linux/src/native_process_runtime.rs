@@ -12879,20 +12879,7 @@ mod tests {
                     .collect::<Vec<_>>()
             });
             if signal_exit_continuation {
-                child_page
-                    .stock(
-                        1,
-                        EntryIdentity {
-                            tid: 43,
-                            visible_tid: 43,
-                            thread_serial: 103,
-                            birth: carrick_core_abi::entry::BirthSerial::of_task(
-                                carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
-                            ),
-                            uid_credit: 0,
-                        },
-                    )
-                    .unwrap();
+                // Hold an identity issued by the native fork owner.
                 let claim = child_page.claim_any().unwrap();
                 assert!(matches!(
                     child_entry
@@ -14102,6 +14089,7 @@ mod tests {
                 serial: TaskSerial::from_raw_u64(11).unwrap(),
             };
             let mut actors = vec![parent];
+            let mut actor_pids = vec![41_i64];
             for depth in 0..depth_count {
                 let current = *actors.last().unwrap();
                 let row_address = runtime
@@ -14134,6 +14122,7 @@ mod tests {
                     LifecycleOutcome::Transferred { .. }
                 ));
                 assert!(entry.take_handoff_receipt().is_some());
+                actor_pids.push(result.raw());
                 actors.push(next);
                 activate(&runtime, source, &task, next);
                 if depth + 1 < depth_count {
@@ -14232,7 +14221,7 @@ mod tests {
             };
             if depth_count == 2 {
                 // The original child has the lower PID and remains eligible.
-                assert_eq!(result.raw(), 42);
+                assert_eq!(result.raw(), actor_pids[1]);
                 let LifecycleOutcome::Returned { result, .. } = entry.wait4(
                     ProcessWaitPid::from_syscall_argument(u64::MAX),
                     UserVa::new(0x8000),
@@ -14241,9 +14230,9 @@ mod tests {
                 ) else {
                     panic!("inherited zombie return")
                 };
-                assert_eq!(result.raw(), 43);
+                assert_eq!(result.raw(), actor_pids[2]);
             } else {
-                assert_eq!(result.raw(), 44);
+                assert_eq!(result.raw(), actor_pids[3]);
             }
             assert_eq!(
                 service.copies.last(),
@@ -15219,7 +15208,7 @@ mod tests {
         );
         let peer_entry = child_page
             .stock(
-                1,
+                carrick_el1_abi::THREAD_POOL_ENTRIES - 1,
                 carrick_el1_abi::EntryIdentity {
                     tid: 987,
                     visible_tid: 987,
@@ -15232,12 +15221,15 @@ mod tests {
             )
             .unwrap();
         child_page
-            .bind_control_address(peer_entry, &child_controls[2] as *const _ as u64)
+            .bind_control_address(
+                peer_entry,
+                &child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES] as *const _ as u64,
+            )
             .unwrap();
-        child_controls[2]
+        child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES]
             .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, peer_entry)
             .unwrap();
-        assert!(child_controls[2].publish_visible_tid(987));
+        assert!(child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES].publish_visible_tid(987));
         use carrick_el1_abi::Lifecycle;
         child_page.thread_born().unwrap();
         let born = child_page
@@ -15253,12 +15245,12 @@ mod tests {
             )
             .unwrap();
         child_page.publish(born).unwrap();
-        child_controls[2].set_robust_list(0xcafe, 24);
+        child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES].set_robust_list(0xcafe, 24);
         assert_eq!(
             entry.read_robust_list(987, &mut |page, reference| {
                 assert!(core::ptr::eq(page, &*child_page));
                 assert_eq!(reference, peer_entry);
-                Some(child_controls[2].robust_list())
+                Some(child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES].robust_list())
             }),
             Ok((0xcafe, 24))
         );
@@ -16295,7 +16287,11 @@ mod tests {
         let LifecycleOutcome::Returned { result: pid1, .. } = outcome2 else {
             panic!("expected fork success after metadata validation recovery");
         };
-        assert_eq!(pid1.raw(), 43);
+        assert!(
+            runtime
+                .namespace_child_key(entry.key, pid1.raw() as u32)
+                .is_some()
+        );
         assert_eq!(entry.service.abort_count, 1);
         assert!(!entry.service.loan_in_flight);
 
@@ -16315,7 +16311,15 @@ mod tests {
         let LifecycleOutcome::Returned { result: pid2, .. } = outcome4 else {
             panic!("expected fork success after fd_table recovery");
         };
-        assert_eq!(pid2.raw(), 45);
+        assert!(
+            runtime
+                .namespace_child_key(entry.key, pid2.raw() as u32)
+                .is_some()
+        );
+        assert!(
+            pid2.raw() > pid1.raw(),
+            "issued child identities stay distinct"
+        );
         assert_eq!(entry.service.abort_count, 2);
         assert!(!entry.service.loan_in_flight);
 
@@ -16335,7 +16339,15 @@ mod tests {
         let LifecycleOutcome::Returned { result: pid3, .. } = outcome6 else {
             panic!("expected fork success after commit recovery");
         };
-        assert_eq!(pid3.raw(), 47);
+        assert!(
+            runtime
+                .namespace_child_key(entry.key, pid3.raw() as u32)
+                .is_some()
+        );
+        assert!(
+            pid3.raw() > pid2.raw(),
+            "issued child identities stay distinct"
+        );
         assert_eq!(entry.service.abort_count, 3);
         assert!(!entry.service.loan_in_flight);
 
@@ -16372,7 +16384,15 @@ mod tests {
         let LifecycleOutcome::Returned { result: pid4, .. } = outcome8 else {
             panic!("expected fork success after alloc_record exhaustion recovery");
         };
-        assert_eq!(pid4.raw(), 49);
+        assert!(
+            runtime
+                .namespace_child_key(entry.key, pid4.raw() as u32)
+                .is_some()
+        );
+        assert!(
+            pid4.raw() > pid3.raw(),
+            "issued child identities stay distinct"
+        );
         assert_eq!(entry.service.abort_count, 4);
         assert!(!entry.service.loan_in_flight);
 
