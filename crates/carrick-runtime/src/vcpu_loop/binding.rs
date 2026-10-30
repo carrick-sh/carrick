@@ -3546,7 +3546,10 @@ where
             let wake = registration_wake_callback(scheduler, context.thread().key(), false);
             let mut observed = context.task().wake_generation();
             let native_wait =
-                carrick_kernel::kernel::continuation::NativeOwnerWaitRegistration::enroll(context);
+                carrick_kernel::kernel::continuation::NativeOwnerWaitRegistration::enroll(
+                    context,
+                    carrick_kernel::kernel::continuation::NativeWaitSource::Cancellation,
+                );
             let signal_wake = Arc::clone(&wake);
             let signal_context = context.retain_exact();
             let signal_callback: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |_| {

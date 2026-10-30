@@ -1636,6 +1636,15 @@ fn next_runnable<F: PersistentExecutor>(
     let zone = backend
         .zone_slot()
         .and_then(|slot| Some((carrick_kernel::el1_zone::zone()?, slot)));
+    // Consume the stopped slot's producer notification before a task load can
+    // reset its retained terminal identity. A released record may have an
+    // enrolled host waiter even though it no longer has a service-queue row.
+    if let Some((_, slot)) = zone {
+        let _ = carrick_kernel::el1_delegation::settle_el1_boundary(
+            usize::from(slot.raw()),
+            scheduler.kernel(),
+        );
+    }
     let Some((zone, slot)) = zone.filter(|_| carrick_kernel::el1_zone::schedules_in_guest()) else {
         // The hatch (or no guest scheduler): a thread taken off the vCPU at
         // the last exit goes back to its host continuation.
@@ -1690,10 +1699,6 @@ fn next_runnable<F: PersistentExecutor>(
     // reaches this wait or published its work before the scan. A worker's
     // creation-time hardware handle may name an already relinquished mailbox.
     let idle_wait = kick.enter_guest_idle(GuestIdleTarget::Zone(slot));
-    let _ = carrick_kernel::el1_delegation::settle_el1_boundary(
-        usize::from(slot.raw()),
-        scheduler.kernel(),
-    );
     if let ZoneProbe::Consumed(taken) = probe_zone_runnable(scheduler, zone, slot, registration)? {
         return Ok(taken);
     }

@@ -466,6 +466,65 @@ pub struct CarrierWaitServiceInner {
 }
 
 impl CarrierWaitServiceInner {
+    fn recheck_token(
+        &self,
+        token: ContinuationWakeToken,
+        host_fds: HostFdSample,
+    ) -> Result<Option<ContinuationEvent>, WaitServiceError> {
+        let (probe, signal_readiness, gate) = {
+            let state = self.state.lock();
+            let entry = state
+                .entries
+                .get(&token.continuation)
+                .filter(|entry| entry.token == token)
+                .ok_or(WaitServiceError::StaleRegistration)?;
+            if !matches!(
+                entry.state,
+                RegistrationState::Enrolled | RegistrationState::Prepared
+            ) {
+                return Ok(entry.event.clone());
+            }
+            (
+                entry.probe.clone(),
+                entry.signal_readiness.clone(),
+                Arc::clone(&entry.operation_gate),
+            )
+        };
+
+        #[cfg(test)]
+        if let Some(hook) = self.test_hooks.before_recheck_probe.lock().as_ref() {
+            hook();
+        }
+
+        let Some(claim) = gate.try_claim(token) else {
+            let state = self.state.lock();
+            if let Some(entry) = state
+                .entries
+                .get(&token.continuation)
+                .filter(|entry| entry.token == token)
+            {
+                return Ok(entry.event.clone());
+            }
+            return Err(WaitServiceError::StaleRegistration);
+        };
+
+        #[cfg(test)]
+        if let Some(hook) = self.test_hooks.after_recheck_claim.lock().as_ref() {
+            hook();
+        }
+
+        let mut probe = probe;
+        let event = signal_readiness.event().or_else(|| probe.poll(host_fds));
+        drop(claim);
+        if let Some(event) = event {
+            let receipt = self.publish_event(token, event.clone());
+            if receipt.accepted() {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
     pub(crate) fn add_metric(
         &self,
         metric: carrick_observability::work_meter::WorkMetric,
@@ -1309,13 +1368,28 @@ impl CarrierWaitService {
                 }
             }
         }
-        if signal.family == super::ContinuationFamily::KillableOwnerZone
+        if let ReadinessProbe::Zone { record, .. } = &probe
             && let Some(kernel) = signal.kernel.upgrade()
             && let Ok(context) = kernel.context(signal.task.id, signal.thread.tid)
-            && let Some(enrollment) = super::NativeOwnerWaitRegistration::enroll(&context)
+            && context.task().key() == signal.task
+            && context.thread().key() == signal.thread
         {
-            self.inner
-                .attach_subscription(token, ProducerSubscription::NativeOwner(enrollment));
+            let callback_weak = weak.clone();
+            let enrollment = super::NativeOwnerWaitRegistration::enroll(
+                &context,
+                super::NativeWaitSource::RecordRetirement {
+                    record: *record,
+                    recheck: Arc::new(move || {
+                        if let Some(inner) = callback_weak.upgrade() {
+                            let _ = inner.recheck_token(token, HostFdSample::ReactorPolls);
+                        }
+                    }),
+                },
+            );
+            if let Some(enrollment) = enrollment {
+                self.inner
+                    .attach_subscription(token, ProducerSubscription::NativeOwner(enrollment));
+            }
         }
         if let Some(task) = signal.task_ref.upgrade() {
             let callback_weak = weak.clone();
@@ -1666,58 +1740,7 @@ impl CarrierWaitService {
         registration: &ContinuationRegistration,
         host_fds: HostFdSample,
     ) -> Result<Option<ContinuationEvent>, WaitServiceError> {
-        let (probe, signal_readiness, gate) = {
-            let state = self.inner.state.lock();
-            let entry = state
-                .entries
-                .get(&registration.token.continuation)
-                .filter(|entry| entry.token == registration.token)
-                .ok_or(WaitServiceError::StaleRegistration)?;
-            if !matches!(
-                entry.state,
-                RegistrationState::Enrolled | RegistrationState::Prepared
-            ) {
-                return Ok(entry.event.clone());
-            }
-            (
-                entry.probe.clone(),
-                entry.signal_readiness.clone(),
-                Arc::clone(&entry.operation_gate),
-            )
-        };
-
-        #[cfg(test)]
-        if let Some(hook) = self.inner.test_hooks.before_recheck_probe.lock().as_ref() {
-            hook();
-        }
-
-        let Some(claim) = gate.try_claim(registration.token) else {
-            let state = self.inner.state.lock();
-            if let Some(entry) = state
-                .entries
-                .get(&registration.token.continuation)
-                .filter(|entry| entry.token == registration.token)
-            {
-                return Ok(entry.event.clone());
-            }
-            return Err(WaitServiceError::StaleRegistration);
-        };
-
-        #[cfg(test)]
-        if let Some(hook) = self.inner.test_hooks.after_recheck_claim.lock().as_ref() {
-            hook();
-        }
-
-        let mut probe = probe;
-        let event = signal_readiness.event().or_else(|| probe.poll(host_fds));
-        drop(claim);
-        if let Some(event) = event {
-            let receipt = self.inner.publish_event(registration.token, event.clone());
-            if receipt.accepted() {
-                return Ok(Some(event));
-            }
-        }
-        Ok(None)
+        self.inner.recheck_token(registration.token, host_fds)
     }
 
     pub fn publish_ready(&self, token: ContinuationWakeToken) -> WakePublishReceipt {

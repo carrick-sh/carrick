@@ -899,6 +899,28 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                     fixture.page.live(),
                     if owner == Owner::Final { 1 } else { 2 }
                 );
+                if owner == Owner::HostPreparing && !matches!(trigger, Trigger::CancelledRecord) {
+                    let work = fixture.task.linux.take_host_work_doorbell().unwrap();
+                    assert_eq!(work.native_terminal_slot(), None, "Busy did not release");
+                    work.settled();
+                    fixture.zone.requeue_on(fixture.slot, record).unwrap();
+                    assert_eq!(fixture.zone.switch_in(fixture.slot), Some(record));
+                    assert_eq!(
+                        crate::aarch64_process::resume_production_with_service(
+                            fixture.zone,
+                            &fixture.task,
+                            fixture.slot,
+                            record,
+                            &mut service,
+                        ),
+                        crate::sched::ResumeAction::Left
+                    );
+                    assert!(fixture.zone.live(reference).is_none());
+                    assert_eq!(fixture.page.live(), 1, "Busy once, then success");
+                    let work = fixture.task.linux.take_host_work_doorbell().unwrap();
+                    assert_eq!(work.native_terminal_slot(), Some(fixture.slot));
+                    work.settled();
+                }
                 continue;
             }
             assert!(fixture.zone.live(reference).is_none());

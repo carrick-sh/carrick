@@ -74,6 +74,15 @@ fn clone_thread(root: &KernelContext, tid: i32) -> &'static KernelContext {
 
 #[test]
 fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
+    deferred_control_handback(true);
+}
+
+#[test]
+fn serial_host_arm_exit_group_unregistered_sibling_wakes_parked_host() {
+    deferred_control_handback(false);
+}
+
+fn deferred_control_handback(registered: bool) {
     use carrick_el1_abi::Lifecycle;
     let (kernel, root) = bootstrap(41);
     let root = Box::leak(Box::new(root));
@@ -140,31 +149,51 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
             NonZeroU64::MIN,
             TestStockCrossing::new(&[]),
         );
-        let (reference, address) = fixture
-            .enter(
-                control,
-                fixture_ttbr0(fixture),
-                &mut sibling_service,
-                |_| {
-                    let record = fixture.zone.slot(slot).host_record().unwrap();
-                    let reference = fixture.zone.record_ref(record);
-                    let address = 0x8000 + member.thread().key().tid.raw() as u64 * 4;
-                    let guard = fixture.zone.short_lock(
-                        ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(1, address),
-                        &ShortLockSpin,
-                    );
-                    let seq = fixture.zone.next_seq(record);
-                    fixture
-                        .zone
-                        .enqueue(&guard, record, seq, 1, address, u32::MAX, 0)
-                        .unwrap();
-                    fixture.zone.publish_park(record, seq);
-                    drop(guard);
-                    fixture.zone.unhome(slot, record, 3);
-                    (reference, address)
-                },
-            )
-            .unwrap();
+        let park = || {
+            let record = fixture.zone.slot(slot).host_record().unwrap();
+            let reference = fixture.zone.record_ref(record);
+            let address = 0x8000 + member.thread().key().tid.raw() as u64 * 4;
+            let guard = fixture.zone.short_lock(
+                ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(1, address),
+                &ShortLockSpin,
+            );
+            let seq = fixture.zone.next_seq(record);
+            fixture
+                .zone
+                .enqueue(&guard, record, seq, 1, address, u32::MAX, 0)
+                .unwrap();
+            fixture.zone.publish_park(record, seq);
+            drop(guard);
+            fixture.zone.unhome(slot, record, 3);
+            (reference, address)
+        };
+        let (reference, address) = if registered {
+            fixture
+                .enter(
+                    control,
+                    fixture_ttbr0(fixture),
+                    &mut sibling_service,
+                    |_| park(),
+                )
+                .unwrap()
+        } else {
+            let record = fixture
+                .zone
+                .current_or_new(
+                    slot,
+                    ThreadIdentity {
+                        tid: member.thread().key().tid.raw() as u64,
+                        serial: member.thread().key().serial.raw(),
+                        generation: 1,
+                        lifecycle_page: page as *const _ as u64,
+                        control_slot: control as *const _ as u64,
+                        ..fixture.leader
+                    },
+                )
+                .unwrap();
+            control.bind_zone_record(fixture.zone.record_ref(record));
+            park()
+        };
         records.push((reference, address));
     }
     run_as_leader(fixture);
@@ -195,6 +224,12 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
         let mut registration = waits.prepare_registration(&continuation);
         scheduler.begin_switch_out(&running).unwrap();
         waits.enroll(&mut registration).unwrap();
+        assert!(
+            !waits
+                .registration_timing(registration.wake_token())
+                .unwrap()
+                .has_periodic_probe()
+        );
         scheduler
             .settle_blocked_continuation(running, continuation, registration)
             .unwrap();
@@ -235,11 +270,13 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
     );
     assert_eq!(page.live(), 2);
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
-    assert!(
-        members
-            .iter()
-            .all(|member| member.thread().control_slot().host_exit_requested())
-    );
+    assert!(members.iter().all(|member| {
+        let control = member.thread().control_slot();
+        control.host_exit_requested()
+            || control
+                .host_birth_identity()
+                .is_some_and(|birth| page.host_birth_requested(birth))
+    }));
 
     struct ClearAperture;
     impl Drop for ClearAperture {
@@ -258,31 +295,75 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
             scheduler.wake_control(member.thread().key()).unwrap();
         }
     });
-    let (tx, rx) = mpsc::channel();
-    // The stopped executor's normal reconciliation. Old Cancelled intent
-    // retires this plain futex record and emits no handback at all.
-    if fixture.zone.handback_current(slot, record.id) == CurrentHandback::HandedBack {
-        scheduler.publish_zone_handback(record);
-        tx.send(()).unwrap();
+    if !registered {
+        let member = members[0];
+        run_as(
+            fixture,
+            member.thread().key().tid.raw(),
+            1,
+            member.thread().key().serial.raw(),
+            member.thread().control_slot(),
+        );
+        let mut sibling_service = Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&[]),
+        );
+        assert_eq!(
+            crate::aarch64_process::resume_production_with_service(
+                fixture.zone,
+                &fixture.task,
+                slot,
+                record.id,
+                &mut sibling_service,
+            ),
+            crate::sched::ResumeAction::Left
+        );
+        // The host-work boundary is the next producer opportunity. The wait
+        // was enrolled before cancellation, so its initial probe cannot see
+        // this retirement. No later guest event is required to finish exit.
+        let doorbell = fixture.task.linux.take_host_work_doorbell();
+        carrick_kernel::el1_delegation::settle_host_work_boundary(&kernel, false, doorbell);
+        assert!(
+            matches!(
+                members[0].thread().execution_state(),
+                carrick_kernel::kernel::objects::ThreadExecutionState::Runnable { .. }
+            ),
+            "retired native record must wake its enrolled host continuation; record={:?}",
+            fixture.zone.live(record).map(|r| r.claim())
+        );
     }
-    let handback = rx.recv_timeout(Duration::from_millis(100));
-    assert!(
-        handback.is_ok(),
-        "exit_group lost the deferred control handback: live={} sibling={:?} record={:?}",
-        page.live(),
-        members[0].thread().execution_state(),
-        fixture.zone.live(record).map(|r| r.claim())
-    );
+    if registered {
+        let (tx, rx) = mpsc::channel();
+        // The stopped executor's normal reconciliation. Old Cancelled intent
+        // retires this plain futex record and emits no handback at all.
+        if fixture.zone.handback_current(slot, record.id) == CurrentHandback::HandedBack {
+            scheduler.publish_zone_handback(record);
+            tx.send(()).unwrap();
+        }
+        let handback = rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            handback.is_ok(),
+            "exit_group lost the deferred control handback: live={} sibling={:?} record={:?}",
+            page.live(),
+            members[0].thread().execution_state(),
+            fixture.zone.live(record).map(|r| r.claim())
+        );
+        assert_eq!(fixture.zone.record(record.id).entry_count(), 0);
+        assert!(!fixture.zone.record(record.id).is_cancelled());
+        assert_ne!(
+            fixture.zone.record(record.id).handback(),
+            Some(Handback::Cancelled)
+        );
+    }
     assert!(members.iter().all(|member| matches!(
         member.thread().execution_state(),
         carrick_kernel::kernel::objects::ThreadExecutionState::Runnable { .. }
     )));
-    assert_eq!(fixture.zone.record(record.id).entry_count(), 0);
-    assert!(!fixture.zone.record(record.id).is_cancelled());
-    assert_ne!(
-        fixture.zone.record(record.id).handback(),
-        Some(Handback::Cancelled)
-    );
+    run_as_leader(fixture);
     // Consume each real host job and withdraw its actual Kernel thread before
     // publishing the exact retirement receipt, as the runtime exit path does.
     let mut service_records = Vec::new();
@@ -296,6 +377,12 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
         .iter()
         .map(|member| (member.thread().key(), *member))
         .collect();
+    if !registered {
+        // The closing owner's executor is now idle in the guest, so its
+        // native continuation has a live home when host receipts arrive.
+        fixture.zone.enter_guest(fixture.slot);
+    }
+    let mut exit_wakes = 0;
     for _ in members {
         let running = if let Some(ready) = service_records.pop() {
             let member = remaining
@@ -332,15 +419,36 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
             carrick_kernel::kernel::host_birth_identity(member.task().key(), member.thread().key())
                 .unwrap();
         page.publish_exact_host_retirement(member.thread().control_slot(), birth.retirement());
+        if !registered {
+            let (mm, address) = page.exit_wait().unwrap();
+            carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+                exit_wakes += carrick_kernel::el1_zone::wake_exit_wait_channel(
+                    mm,
+                    NonZeroU64::new(address).unwrap(),
+                )
+                .unwrap();
+            });
+        }
         scheduler.settle_exited(running).unwrap();
     }
     assert!(remaining.is_empty());
     assert!(service_records.is_empty());
     assert_eq!(page.live(), 0);
     assert!(members.iter().all(|member| !member.exact_thread_is_live()));
-    fixture.zone.enter_guest(fixture.slot);
+    if registered {
+        fixture.zone.enter_guest(fixture.slot);
+    } else {
+        assert_eq!(
+            exit_wakes, 1,
+            "host retirement wakes the closing owner once"
+        );
+    }
     assert!(matches!(
-        wake_closing_root(fixture, &mut service),
+        if registered {
+            wake_closing_root(fixture, &mut service)
+        } else {
+            resume_closing_root(fixture, &mut service)
+        },
         crate::sched::ResumeAction::Left
     ));
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);

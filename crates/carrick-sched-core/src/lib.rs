@@ -3621,6 +3621,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         words[0].store(identity.tid, Ordering::Release);
     }
 
+    /// Identity retained after record release. The host holds this slot
+    /// stopped and consumes its owed work before reset or another entry can
+    /// replace the publication. This is notification only; retained member
+    /// and record custody still authenticate terminal settlement.
+    pub fn terminal_identity(&self, slot: SlotId) -> Option<ThreadIdentity> {
+        let words = &self.slot(slot).terminal;
+        let tid = words[0].load(Ordering::Acquire) & !(1 << 63);
+        (tid != 0).then(|| ThreadIdentity {
+            tid,
+            generation: words[1].load(Ordering::Relaxed),
+            mm: words[2].load(Ordering::Relaxed),
+            serial: words[3].load(Ordering::Relaxed),
+            ..ThreadIdentity::default()
+        })
+    }
+
     /// Authenticate a released execution, including after record reuse. A
     /// retired marker licenses only completion of that child's owed wake.
     pub fn terminal_matches(
