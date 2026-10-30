@@ -1019,3 +1019,73 @@ fn terminal_attempt(mode: TerminalAttempt) {
     assert_eq!(page.live(), 2);
     assert!(zone.live(zone.record_ref(peer)).is_some());
 }
+
+mod member_release {
+    use carrick_core::lifecycle::{
+        MemberControl, MemberControlAuthority, MemberControlCustody, MemberControlRelease,
+        MemberExitCustody, MemberReleaseWaiter, arm_member_release,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Member {
+        authority: MemberControlAuthority,
+        waiter: MemberReleaseWaiter,
+    }
+    impl MemberControl for Member {
+        fn member_entry(&self) -> Option<carrick_core::lifecycle::EntryRef> {
+            None
+        }
+        fn exit_custody(&self) -> &MemberExitCustody {
+            self.authority.custody()
+        }
+        fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+            None
+        }
+        fn release_waiter(&self) -> Option<&MemberReleaseWaiter> {
+            Some(&self.waiter)
+        }
+    }
+    struct Release<'a> {
+        count: AtomicUsize,
+        member: &'a Member,
+    }
+    impl MemberControlRelease for Release<'_> {
+        fn released(&self) {
+            assert!(
+                !self.member.exit_custody().referenced(),
+                "publish after returning custody"
+            );
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn retained_snapshot_publishes_only_after_the_last_pin_is_returned() {
+        let member = Member {
+            authority: MemberControlAuthority::new(),
+            waiter: MemberReleaseWaiter::new(),
+        };
+        let release = Arc::new(Release {
+            count: AtomicUsize::new(0),
+            member: &member,
+        });
+        // SAFETY: the member and release target outlive every pin in this test.
+        assert!(!unsafe { arm_member_release(&member, release.clone()) });
+        let entry = MemberControlCustody::retain(&member).unwrap();
+        let transient = MemberControlCustody::retain(&member).unwrap();
+        // SAFETY: all retained pins are returned below, before either borrow ends.
+        assert!(unsafe { arm_member_release(&member, release.clone()) });
+        // SAFETY: all retained pins are returned below, before either borrow ends.
+        assert!(unsafe { arm_member_release(&member, release.clone()) });
+        drop(entry);
+        assert!(member.exit_custody().referenced());
+        assert_eq!(release.count.load(Ordering::SeqCst), 0);
+        drop(transient);
+        assert!(!member.exit_custody().referenced());
+        assert_eq!(release.count.load(Ordering::SeqCst), 1);
+        assert!(member.authority.reserve_reset().is_ok());
+    }
+}

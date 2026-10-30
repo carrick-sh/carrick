@@ -157,6 +157,99 @@ enum CommitFault {
     MissingReply,
 }
 
+type ControlsArray = [ThreadControlSlot; carrick_el1_abi::THREAD_POOL_ENTRIES + 1];
+
+fn metadata_lifecycle_allocation() -> (core::ptr::NonNull<u8>, usize, usize) {
+    static NEXT_OFFSET: AtomicU64 = AtomicU64::new(0x100_0000);
+    let page_bytes = core::mem::size_of::<ThreadLifecyclePage>().next_multiple_of(16384);
+    let chunk_bytes = (page_bytes + core::mem::size_of::<ControlsArray>()).next_multiple_of(16384);
+    // Hosts may ignore a hint this low (macOS 27), and an
+    // unrelated host allocation can already occupy part of
+    // the window. Take the next chunk an exact,
+    // non-replacing allocation admits.
+    /// Map `len` zeroed read-write bytes at exactly `addr`, or `None` when any
+    /// part of the range is already mapped. Never replaces an existing mapping.
+    fn map_exact_unreplaced(addr: u64, len: usize) -> Option<*mut libc::c_void> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut at = addr as libc::vm_address_t;
+            // SAFETY: a fixed allocation in this task fails rather than
+            // replacing anything already mapped.
+            #[allow(deprecated)]
+            let status = unsafe {
+                libc::vm_allocate(libc::mach_task_self(), &mut at, len, libc::VM_FLAGS_FIXED)
+            };
+            (status == libc::KERN_SUCCESS).then_some(at as *mut libc::c_void)
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // SAFETY: MAP_FIXED_NOREPLACE fails rather than replacing a mapping.
+            let mapped = unsafe {
+                libc::mmap(
+                    addr as *mut libc::c_void,
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            (mapped != libc::MAP_FAILED && mapped as u64 == addr).then_some(mapped)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+        {
+            // A plain hint never replaces a mapping; keep it
+            // only where the kernel placed it exactly.
+            // SAFETY: a fresh anonymous mapping, unmapped
+            // again when it landed elsewhere.
+            let mapped = unsafe {
+                libc::mmap(
+                    addr as *mut libc::c_void,
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return None;
+            }
+            if mapped as u64 != addr {
+                // SAFETY: unmaps only the mapping made above.
+                unsafe { libc::munmap(mapped, len) };
+                return None;
+            }
+            Some(mapped)
+        }
+    }
+    let mapped = loop {
+        let offset = NEXT_OFFSET.fetch_add(chunk_bytes as u64, Ordering::Relaxed);
+        assert!(
+            offset + chunk_bytes as u64 <= carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
+            "no free metadata window chunk left"
+        );
+        let hint = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + offset;
+        if let Some(mapped) = map_exact_unreplaced(hint, chunk_bytes) {
+            break mapped;
+        }
+    };
+    let base = mapped as u64;
+    assert!(
+        base.is_multiple_of(16384)
+            && base >= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+            && base + chunk_bytes as u64
+                <= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
+        "metadata mmap landed outside EL1_DYNAMIC_METADATA_BASE window: {base:#x}"
+    );
+    (
+        core::ptr::NonNull::new(mapped.cast::<u8>()).unwrap(),
+        page_bytes,
+        chunk_bytes,
+    )
+}
+
 struct TestStockCrossing {
     #[cfg(test)]
     ipc: Option<(
@@ -450,108 +543,8 @@ impl ForkStockCrossing for TestStockCrossing {
                 type ControlsArray = [ThreadControlSlot; carrick_el1_abi::THREAD_POOL_ENTRIES + 1];
                 let (page_ptr, controls): (*mut ThreadLifecyclePage, &'static mut ControlsArray) =
                     if self.metadata_in_el1_window {
-                        static NEXT_OFFSET: AtomicU64 = AtomicU64::new(0x100_0000);
-                        let page_bytes =
-                            core::mem::size_of::<ThreadLifecyclePage>().next_multiple_of(16384);
-                        let chunk_bytes = (page_bytes + core::mem::size_of::<ControlsArray>())
-                            .next_multiple_of(16384);
-                        // Hosts may ignore a hint this low (macOS 27), and an
-                        // unrelated host allocation can already occupy part of
-                        // the window. Take the next chunk an exact,
-                        // non-replacing allocation admits.
-                        /// Map `len` zeroed read-write bytes at exactly `addr`, or `None` when any
-                        /// part of the range is already mapped. Never replaces an existing mapping.
-                        fn map_exact_unreplaced(
-                            addr: u64,
-                            len: usize,
-                        ) -> Option<*mut libc::c_void> {
-                            #[cfg(target_os = "macos")]
-                            {
-                                let mut at = addr as libc::vm_address_t;
-                                // SAFETY: a fixed allocation in this task fails rather than
-                                // replacing anything already mapped.
-                                #[allow(deprecated)]
-                                let status = unsafe {
-                                    libc::vm_allocate(
-                                        libc::mach_task_self(),
-                                        &mut at,
-                                        len,
-                                        libc::VM_FLAGS_FIXED,
-                                    )
-                                };
-                                (status == libc::KERN_SUCCESS).then_some(at as *mut libc::c_void)
-                            }
-                            #[cfg(any(target_os = "linux", target_os = "android"))]
-                            {
-                                // SAFETY: MAP_FIXED_NOREPLACE fails rather than replacing a mapping.
-                                let mapped = unsafe {
-                                    libc::mmap(
-                                        addr as *mut libc::c_void,
-                                        len,
-                                        libc::PROT_READ | libc::PROT_WRITE,
-                                        libc::MAP_PRIVATE
-                                            | libc::MAP_ANONYMOUS
-                                            | libc::MAP_FIXED_NOREPLACE,
-                                        -1,
-                                        0,
-                                    )
-                                };
-                                (mapped != libc::MAP_FAILED && mapped as u64 == addr)
-                                    .then_some(mapped)
-                            }
-                            #[cfg(not(any(
-                                target_os = "macos",
-                                target_os = "linux",
-                                target_os = "android"
-                            )))]
-                            {
-                                // A plain hint never replaces a mapping; keep it
-                                // only where the kernel placed it exactly.
-                                // SAFETY: a fresh anonymous mapping, unmapped
-                                // again when it landed elsewhere.
-                                let mapped = unsafe {
-                                    libc::mmap(
-                                        addr as *mut libc::c_void,
-                                        len,
-                                        libc::PROT_READ | libc::PROT_WRITE,
-                                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                                        -1,
-                                        0,
-                                    )
-                                };
-                                if mapped == libc::MAP_FAILED {
-                                    return None;
-                                }
-                                if mapped as u64 != addr {
-                                    // SAFETY: unmaps only the mapping made above.
-                                    unsafe { libc::munmap(mapped, len) };
-                                    return None;
-                                }
-                                Some(mapped)
-                            }
-                        }
-                        let mapped = loop {
-                            let offset =
-                                NEXT_OFFSET.fetch_add(chunk_bytes as u64, Ordering::Relaxed);
-                            assert!(
-                                offset + chunk_bytes as u64
-                                    <= carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
-                                "no free metadata window chunk left"
-                            );
-                            let hint = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + offset;
-                            if let Some(mapped) = map_exact_unreplaced(hint, chunk_bytes) {
-                                break mapped;
-                            }
-                        };
-                        let base = mapped as u64;
-                        assert!(
-                            base.is_multiple_of(16384)
-                                && base >= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
-                                && base + chunk_bytes as u64
-                                    <= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
-                                        + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
-                            "metadata mmap landed outside EL1_DYNAMIC_METADATA_BASE window: {base:#x}"
-                        );
+                        let (mapped, page_bytes, _) = metadata_lifecycle_allocation();
+                        let mapped = mapped.as_ptr();
                         unsafe {
                             let page_ptr = mapped.cast::<ThreadLifecyclePage>();
                             page_ptr.write(ThreadLifecyclePage::new());

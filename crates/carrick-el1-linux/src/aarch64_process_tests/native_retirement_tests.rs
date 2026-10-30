@@ -84,6 +84,7 @@ pub(super) struct PhysicalStock {
     early_drop: Arc<core::sync::atomic::AtomicBool>,
     pub settled: usize,
     window: Option<LifecycleWindow>,
+    pub metadata_in_el1_window: bool,
     execution: Option<GrantExecution>,
     tables: (core::ptr::NonNull<AtomicU64>, u64, usize),
     releases: usize,
@@ -138,6 +139,7 @@ impl PhysicalStock {
             early_drop: Arc::default(),
             settled: 0,
             window: None,
+            metadata_in_el1_window: false,
             execution: None,
             tables: (
                 core::ptr::NonNull::new(tables.words.as_ptr().cast_mut()).unwrap(),
@@ -156,13 +158,19 @@ impl PhysicalStock {
         parent: Vec<RootGpa>,
     ) -> ForkStockLoan {
         // One retained allocation permits the real lifecycle clear operation.
-        let controls_offset = core::mem::size_of::<ThreadLifecyclePage>()
-            .next_multiple_of(core::mem::align_of::<ThreadControlSlot>());
-        let len = controls_offset
-            + core::mem::size_of::<ThreadControlSlot>()
-                * (carrick_el1_abi::THREAD_POOL_ENTRIES + 1);
-        let layout = std::alloc::Layout::from_size_align(len, 16384).unwrap();
-        let base = core::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap();
+        let (base, controls_offset, len) = if self.metadata_in_el1_window {
+            super::metadata_lifecycle_allocation()
+        } else {
+            let controls_offset = core::mem::size_of::<ThreadLifecyclePage>()
+                .next_multiple_of(core::mem::align_of::<ThreadControlSlot>());
+            let len = controls_offset
+                + core::mem::size_of::<ThreadControlSlot>()
+                    * (carrick_el1_abi::THREAD_POOL_ENTRIES + 1);
+            let layout = std::alloc::Layout::from_size_align(len, 16384).unwrap();
+            let base =
+                core::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap();
+            (base, controls_offset, len)
+        };
         // SAFETY: leaked test allocation has sufficient extent/alignment for both records.
         let window = unsafe { LifecycleWindow::new(base, base.as_ptr() as u64, len as u64) };
         let lifecycle = carrick_el1_abi::ForkLifecycleLoan::new(

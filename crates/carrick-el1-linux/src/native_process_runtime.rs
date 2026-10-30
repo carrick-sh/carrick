@@ -3,6 +3,7 @@
 //! incarnation; it does not import a host TaskSerial or launcher credentials.
 extern crate alloc;
 mod service;
+pub(crate) mod thread_stock;
 use super::{
     native_fork_refusal::{NativeForkStage, at_busy_site, busy},
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
@@ -771,6 +772,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     control: &'a ThreadControlSlot,
     page: &'a ThreadLifecyclePage,
     members: Vec<NativeMember<'a, C>>,
+    thread_stock: Option<thread_stock::NativeThreadStock<'a, C>>,
     mm: M,
     address: AddressContext<RootGpa>,
     interrupted_child_waits: BTreeMap<RecordRef, InterruptedChildWait<C>>,
@@ -3124,6 +3126,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             control,
             page,
             members,
+            thread_stock: None,
             mm,
             address,
             interrupted_child_waits: BTreeMap::new(),
@@ -5215,7 +5218,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(reason);
         }
         match outcome {
-            None => Ok(NativeResume::NoPending),
+            None => self
+                .resume_thread_stock_wait()
+                .map_err(NativeProcessError::run_failure_reason)
+                .map(|resumed| resumed.unwrap_or(NativeResume::NoPending)),
             Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),
             Some(LifecycleOutcome::HostCustody) => {
                 // An adopted host member has no pool entry to retire in the
@@ -5585,7 +5591,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     };
                     if page.host_birth_receipt_returned(index) {
                         continue;
-                    }
+                    };
                     if self.control.host_birth_identity() == Some(identity) {
                         continue;
                     }
@@ -6608,6 +6614,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         // SAFETY: this exact newly allocated record remains Free and unpublished.
         unsafe { *self.source.zone.record(record).ctx_mut() = *child_words };
+        let thread_stock = match thread_stock::NativeThreadStock::new(
+            lifecycle.controls,
+            self.source.zone,
+            self.source.zone.record_ref(record),
+        ) {
+            Ok(stock) => stock,
+            Err(error) => {
+                self.source.zone.free_record(record);
+                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                drop(pending);
+                drop(member_custody);
+                drop(leader_custody);
+                self.service.retire_fd_table(child_file_table);
+                if let Err((_, p)) = self.service.abort_mm(prepared) {
+                    self.service.quarantine_prepared(p);
+                }
+                return Err(error);
+            }
+        };
         let member_registration = member_custody.clone();
         let resources = NativeResources {
             _control_custody: leader_custody,
@@ -6626,6 +6651,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 control: member_custody,
                 expected_host,
             }],
+            thread_stock: Some(thread_stock),
             mm: self.service.prepared_mm(&prepared),
             address,
             interrupted_child_waits: BTreeMap::new(),
@@ -6742,23 +6768,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .mm
             .clone();
         let handle = self.service.service_mm_handle(&child_mm)?;
-        let service_wait = carrick_sched_core::object_wait::ObjectWaitKey::native_service(
+        service::bind_member_service(
+            self.source.zone,
+            child_key,
             self.source.zone.record_ref(record),
-        )
-        .ok_or(NativeProcessError::Stale)?;
-        self.source
-            .zone
-            .bind_object_wait(service_wait, &carrick_sched_core::ShortLockSpin)
-            .map_err(|_| NativeProcessError::Quarantined)?;
-        control
-            .service
-            .bind(carrick_core_abi::service::ServiceBirth {
-                process: child_key,
-                thread: carrick_core_abi::EntryThreadGeneration::from_raw(thread_serial.get()),
-                record: self.source.zone.record_ref(record),
-                mm: handle,
-            })
-            .map_err(|_| NativeProcessError::Quarantined)?;
+            carrick_core_abi::EntryThreadGeneration::from_raw(thread_serial.get()),
+            control,
+            handle,
+        )?;
         // A vfork child may exec or exit as soon as it is registered and
         // runnable: its release row exists before either, and a refused
         // publication removes it again.
@@ -6950,6 +6967,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         publish: &mut dyn FnMut() -> Result<(), i64>,
     ) -> Result<(), i64> {
         let mut graph = self.runtime.graph.lock();
+        if graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?
+            .native()
+            .resources()
+            .thread_stock
+            .is_some()
+            && thread_stock::at_limit(&graph, self.key, caller_tid).map_err(|e| e.errno())?
+        {
+            return Err(-11);
+        }
         let task = graph
             .owner
             .task_mut(self.key)
@@ -6965,7 +6994,59 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             task.remove_thread(child_tid);
             return Err(error);
         }
+        if let Err(error) = thread_stock::replenish(self.runtime, &mut graph, self.key, caller_tid)
+        {
+            // Born is already committed: report an invariant failure without
+            // inviting the clone caller to roll back a published record.
+            self.run_failure = Some(error.run_failure_reason());
+        }
         Ok(())
+    }
+    fn bind_thread_birth(
+        &mut self,
+        record: RecordRef,
+        control: &ThreadControlSlot,
+    ) -> Result<(), i64> {
+        let identity = self.source.zone.record(record.id).identity();
+        if self.source.zone.record(record.id).incarnation() != record.incarnation
+            || identity.control_slot != control as *const _ as u64
+        {
+            return Err(NativeProcessError::Stale.errno());
+        }
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale.errno())?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        let handle = self
+            .service
+            .service_mm_handle(&mm)
+            .map_err(|error| error.errno())?;
+        service::bind_member_service(
+            self.source.zone,
+            self.key,
+            record,
+            carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
+            control,
+            handle,
+        )
+        .map_err(|error| error.errno())
+    }
+    fn prepare_thread_birth(
+        &mut self,
+    ) -> carrick_personality_linux::lifecycle::ThreadBirthAdmission {
+        match self.prepare_native_thread_birth() {
+            Ok(admission) => admission,
+            Err(error) => carrick_personality_linux::lifecycle::ThreadBirthAdmission::Owned(
+                self.run_failed(error.run_failure_reason()),
+            ),
+        }
     }
     fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         self.retire_thread_verdict(verdict);
@@ -7025,6 +7106,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
             return Err(error.errno());
         }
+        thread_stock::admission_settled(self.runtime, self.key);
         Ok(())
     }
     fn set_calling_tid(&mut self, tid: u32) {
@@ -7287,6 +7369,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             for record in retired {
                 registry.unregister_member(self.runtime, self.key, record);
             }
+        }
+        self.clear_thread_stock_wait();
+        drop(self._control_custody.take());
+        let mut graph = self.runtime.graph.lock();
+        let leader = graph
+            .owner
+            .task(self.key)
+            .ok()
+            .map(|task| task.metadata().namespace_pid);
+        if let Some(leader) = leader
+            && let Err(error) = thread_stock::replenish(self.runtime, &mut graph, self.key, leader)
+        {
+            self.run_failure = Some(error.run_failure_reason());
         }
     }
 
@@ -12184,20 +12279,12 @@ mod tests {
                     .collect::<Vec<_>>()
             });
             if signal_exit_continuation {
-                child_page
-                    .stock(
-                        1,
-                        EntryIdentity {
-                            tid: 43,
-                            visible_tid: 43,
-                            thread_serial: 103,
-                            birth: carrick_core_abi::entry::BirthSerial::of_task(
-                                carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
-                            ),
-                            uid_credit: 0,
-                        },
-                    )
-                    .unwrap();
+                // Prime through the real first-clone admission, then hold an
+                // identity issued by this native process owner.
+                assert!(matches!(
+                    child_entry.prepare_thread_birth(),
+                    carrick_personality_linux::lifecycle::ThreadBirthAdmission::Ready
+                ));
                 let claim = child_page.claim_any().unwrap();
                 assert!(matches!(
                     child_entry
@@ -13411,6 +13498,7 @@ mod tests {
                     LifecycleOutcome::Transferred { .. }
                 ));
                 assert!(entry.take_handoff_receipt().is_some());
+                assert_eq!(result.raw(), 42 + depth as i64);
                 actors.push(next);
                 activate(&runtime, source, &task, next);
                 if depth + 1 < depth_count {
@@ -14472,7 +14560,7 @@ mod tests {
         );
         let peer_entry = child_page
             .stock(
-                1,
+                carrick_el1_abi::THREAD_POOL_ENTRIES - 1,
                 carrick_el1_abi::EntryIdentity {
                     tid: 987,
                     visible_tid: 987,
@@ -14485,12 +14573,15 @@ mod tests {
             )
             .unwrap();
         child_page
-            .bind_control_address(peer_entry, &child_controls[2] as *const _ as u64)
+            .bind_control_address(
+                peer_entry,
+                &child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES] as *const _ as u64,
+            )
             .unwrap();
-        child_controls[2]
+        child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES]
             .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, peer_entry)
             .unwrap();
-        assert!(child_controls[2].publish_visible_tid(987));
+        assert!(child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES].publish_visible_tid(987));
         use carrick_el1_abi::Lifecycle;
         child_page.thread_born().unwrap();
         let born = child_page
@@ -14506,12 +14597,12 @@ mod tests {
             )
             .unwrap();
         child_page.publish(born).unwrap();
-        child_controls[2].set_robust_list(0xcafe, 24);
+        child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES].set_robust_list(0xcafe, 24);
         assert_eq!(
             entry.read_robust_list(987, &mut |page, reference| {
                 assert!(core::ptr::eq(page, &*child_page));
                 assert_eq!(reference, peer_entry);
-                Some(child_controls[2].robust_list())
+                Some(child_controls[carrick_el1_abi::THREAD_POOL_ENTRIES].robust_list())
             }),
             Ok((0xcafe, 24))
         );
@@ -15540,6 +15631,11 @@ mod tests {
         let LifecycleOutcome::Returned { result: pid1, .. } = outcome2 else {
             panic!("expected fork success after metadata validation recovery");
         };
+        assert!(
+            runtime
+                .namespace_child_key(entry.key, pid1.raw() as u32)
+                .is_some()
+        );
         assert_eq!(pid1.raw(), 43);
         assert_eq!(entry.service.abort_count, 1);
         assert!(!entry.service.loan_in_flight);
@@ -15560,7 +15656,16 @@ mod tests {
         let LifecycleOutcome::Returned { result: pid2, .. } = outcome4 else {
             panic!("expected fork success after fd_table recovery");
         };
+        assert!(
+            runtime
+                .namespace_child_key(entry.key, pid2.raw() as u32)
+                .is_some()
+        );
         assert_eq!(pid2.raw(), 45);
+        assert!(
+            pid2.raw() > pid1.raw(),
+            "issued child identities stay distinct"
+        );
         assert_eq!(entry.service.abort_count, 2);
         assert!(!entry.service.loan_in_flight);
 
@@ -15580,7 +15685,16 @@ mod tests {
         let LifecycleOutcome::Returned { result: pid3, .. } = outcome6 else {
             panic!("expected fork success after commit recovery");
         };
+        assert!(
+            runtime
+                .namespace_child_key(entry.key, pid3.raw() as u32)
+                .is_some()
+        );
         assert_eq!(pid3.raw(), 47);
+        assert!(
+            pid3.raw() > pid2.raw(),
+            "issued child identities stay distinct"
+        );
         assert_eq!(entry.service.abort_count, 3);
         assert!(!entry.service.loan_in_flight);
 
@@ -15617,7 +15731,16 @@ mod tests {
         let LifecycleOutcome::Returned { result: pid4, .. } = outcome8 else {
             panic!("expected fork success after alloc_record exhaustion recovery");
         };
+        assert!(
+            runtime
+                .namespace_child_key(entry.key, pid4.raw() as u32)
+                .is_some()
+        );
         assert_eq!(pid4.raw(), 49);
+        assert!(
+            pid4.raw() > pid3.raw(),
+            "issued child identities stay distinct"
+        );
         assert_eq!(entry.service.abort_count, 4);
         assert!(!entry.service.loan_in_flight);
 
