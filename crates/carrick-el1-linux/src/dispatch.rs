@@ -879,7 +879,7 @@ impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::Host
 /// namespace by `descriptor`.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[inline(never)]
-fn native_host_file_stage<V: file::MemoryValidator>(
+pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
     frame: &TrapFrame,
     task: &CurrentTask,
     validator: &V,
@@ -1188,7 +1188,7 @@ fn arm_native_service_exit(
     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    let result = super::aarch64_process::with_process_entry(
+    let (result, phase) = super::aarch64_process::with_process_entry(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
         &saved.native,
@@ -1207,53 +1207,47 @@ fn arm_native_service_exit(
             };
             let result = if let Some(payload) = exec_payload {
                 if service_wait.is_some() {
-                    return Err(super::native_process_runtime::NativeProcessError::Quarantined);
+                    Err(super::native_process_runtime::NativeProcessError::Quarantined)
+                } else {
+                    process.begin_exec_service(payload)
                 }
-                process.begin_exec_service(payload)
             } else if let Some(staged) = host_file {
                 if service_wait.is_some() {
-                    return Err(super::native_process_runtime::NativeProcessError::Quarantined);
+                    Err(super::native_process_runtime::NativeProcessError::Quarantined)
+                } else {
+                    let StagedHostFile {
+                        record,
+                        output,
+                        resolves_path,
+                        map,
+                    } = *staged;
+                    process.begin_host_file_service(record, output, resolves_path, map)
                 }
-                let StagedHostFile {
-                    record,
-                    output,
-                    resolves_path,
-                    map,
-                } = *staged;
-                process.begin_host_file_service(record, output, resolves_path, map)
             } else if retry_exec_stage {
-                process.begin_exec_stage_fault_service(
-                    match operation {
-                        Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) => fault,
-                        _ => {
-                            return Err(
-                                super::native_process_runtime::NativeProcessError::Quarantined,
-                            );
-                        }
-                    },
-                    fault_sequence,
-                    service_wait,
-                )
-            } else if let Some(wait) = service_wait {
-                process.begin_owner_service_wait(
-                    operation
-                        .ok_or(super::native_process_runtime::NativeProcessError::Quarantined)?,
-                    wait,
-                )
+                match operation {
+                    Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) => {
+                        process.begin_exec_stage_fault_service(fault, fault_sequence, service_wait)
+                    }
+                    _ => Err(super::native_process_runtime::NativeProcessError::Quarantined),
+                }
+            } else if let Some(operation) = operation {
+                if let Some(wait) = service_wait {
+                    process.begin_owner_service_wait(operation, wait)
+                } else {
+                    process.begin_service(operation, fault_sequence)
+                }
             } else {
-                process.begin_service(
-                    operation
-                        .ok_or(super::native_process_runtime::NativeProcessError::Quarantined)?,
-                    fault_sequence,
-                )
+                Err(super::native_process_runtime::NativeProcessError::Quarantined)
             };
-            process.settle_service_exit(result, exit)
+            let result = process.settle_service_exit(result, exit);
+            (result, process.native_service_phase())
         },
     )
     // Keep entry admission separate from dispatch/settlement: these source
     // locations and the exact error survive the existing fatal transport.
-    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)))
     .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
+    let result = result
+        .unwrap_or_else(|error| invalid_completion(native_service_invariant_at(error, phase)));
     Some(match result {
         NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
         NativeResume::NoPending => arm_signal_user_return(frame),
@@ -1975,6 +1969,34 @@ fn native_service_invariant(
     NativeInvariant::NativeService(native_service_fatal_reason(error))
 }
 
+/// A stale dispatch identifies the last actual owner entered, rather than
+/// implying that every stale refusal came from the service birth cell.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_service_invariant_at(
+    error: super::native_process_runtime::NativeProcessError,
+    phase: super::native_process_runtime::NativeServicePhase,
+) -> NativeInvariant {
+    use super::native_process_runtime::{NativeProcessError, NativeServicePhase as Phase};
+    use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+    if !matches!(&error, NativeProcessError::Stale) {
+        return native_service_invariant(error);
+    }
+    NativeInvariant::NativeService(match phase {
+        Phase::Unspecified => Fatal::NativeServiceStale,
+        Phase::Capability => Fatal::NativeServiceCapStale,
+        Phase::Payload => Fatal::NativeServicePayloadStale,
+        Phase::Member => Fatal::NativeServiceMemberStale,
+        Phase::Birth => Fatal::NativeServiceBirthStale,
+        Phase::Mm => Fatal::NativeServiceMmStale,
+        Phase::Bind => Fatal::NativeServiceBindStale,
+        Phase::Publication => Fatal::NativeServicePublishStale,
+        Phase::Notice => Fatal::NativeServiceNoticeStale,
+        Phase::Park => Fatal::NativeServiceParkStale,
+        Phase::Completion => Fatal::NativeServiceCompleteStale,
+        Phase::Settlement => Fatal::NativeServiceSettleStale,
+    })
+}
+
 /// Preserve the refused operation's error without changing refusal policy.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn native_service_fatal_reason(
@@ -1988,7 +2010,7 @@ fn native_service_fatal_reason(
         Error::Exhausted => Fatal::NativeServiceExhausted,
         Error::Fault => Fatal::NativeServiceFault,
         Error::Unsupported => Fatal::NativeServiceUnsupported,
-        Error::GroupExitCustody => Fatal::NativeServiceGroupExitCustody,
+        Error::GroupExitCustody => Fatal::NativeServiceGroupExit,
         Error::Busy => Fatal::NativeServiceBusy,
         Error::Quarantined => Fatal::NativeServiceQuarantined,
         Error::NoChild => Fatal::NativeServiceNoChild,
@@ -3892,10 +3914,7 @@ mod tests {
             (Error::Exhausted, Fatal::NativeServiceExhausted),
             (Error::Fault, Fatal::NativeServiceFault),
             (Error::Unsupported, Fatal::NativeServiceUnsupported),
-            (
-                Error::GroupExitCustody,
-                Fatal::NativeServiceGroupExitCustody,
-            ),
+            (Error::GroupExitCustody, Fatal::NativeServiceGroupExit),
             (Error::Busy, Fatal::NativeServiceBusy),
             (Error::Quarantined, Fatal::NativeServiceQuarantined),
             (Error::NoChild, Fatal::NativeServiceNoChild),
@@ -3907,6 +3926,37 @@ mod tests {
             assert_eq!(
                 std::format!("{invariant:?}"),
                 std::format!("NativeService({expected:?})")
+            );
+        }
+    }
+
+    #[test]
+    fn stale_service_diagnostic_distinguishes_owners_without_reclassifying_busy() {
+        use super::super::native_process_runtime::{
+            NativeProcessError as Error, NativeServicePhase as Phase,
+        };
+        use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+        for (phase, expected) in [
+            (Phase::Unspecified, Fatal::NativeServiceStale),
+            (Phase::Capability, Fatal::NativeServiceCapStale),
+            (Phase::Payload, Fatal::NativeServicePayloadStale),
+            (Phase::Member, Fatal::NativeServiceMemberStale),
+            (Phase::Birth, Fatal::NativeServiceBirthStale),
+            (Phase::Mm, Fatal::NativeServiceMmStale),
+            (Phase::Bind, Fatal::NativeServiceBindStale),
+            (Phase::Publication, Fatal::NativeServicePublishStale),
+            (Phase::Notice, Fatal::NativeServiceNoticeStale),
+            (Phase::Park, Fatal::NativeServiceParkStale),
+            (Phase::Completion, Fatal::NativeServiceCompleteStale),
+            (Phase::Settlement, Fatal::NativeServiceSettleStale),
+        ] {
+            let reason = native_service_invariant_at(Error::Stale, phase).fatal_reason();
+            assert_eq!(reason, expected);
+            assert_eq!(Fatal::from_raw(reason as u64), Some(expected));
+            assert_eq!(
+                native_service_invariant_at(Error::Busy, phase).fatal_reason(),
+                Fatal::NativeServiceBusy,
+                "diagnostic provenance cannot turn contention into stale identity"
             );
         }
     }

@@ -75,6 +75,24 @@ pub(crate) enum NativeServiceExit {
     Bridge,
     CarrierWork,
 }
+/// Last native-service owner entered by this admitted dispatch. Diagnostic
+/// provenance only: it grants no binding, retry or completion authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeServicePhase {
+    #[default]
+    Unspecified,
+    Capability,
+    Payload,
+    Member,
+    Birth,
+    Mm,
+    Bind,
+    Publication,
+    Notice,
+    Park,
+    Completion,
+    Settlement,
+}
 // Empty-checkpoint hint only; masks and contexts remain in their exact owners.
 static NATIVE_SIGNAL_CONTINUATIONS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -3586,6 +3604,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             owner_continuation,
             copyout_ready: None,
             adapter_ready: None,
+            service_phase: NativeServicePhase::Unspecified,
         })
     }
     /// Enter through the exact process registry. A non-leader thread retains
@@ -3630,6 +3649,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             owner_continuation,
             copyout_ready: None,
             adapter_ready: None,
+            service_phase: NativeServicePhase::Unspecified,
         }))
     }
 
@@ -3876,11 +3896,17 @@ pub struct NativeProcessEntry<
     owner_continuation: bool,
     copyout_ready: Option<Box<service::OwnedCopyout>>,
     adapter_ready: Option<Box<service::AdapterPreparation>>,
+    service_phase: NativeServicePhase,
 }
 
 impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'r, 'a, M, C, S>
 {
+    /// Refusal provenance for the existing terminal diagnostic transport.
+    pub fn native_service_phase(&self) -> NativeServicePhase {
+        self.service_phase
+    }
+
     /// Move standard signals admitted by an in-zone host completion into the
     /// shared native pending owner for this exact thread. The atomic take is
     /// the only carrier-to-native transfer; `enqueue_thread` provides Linux
