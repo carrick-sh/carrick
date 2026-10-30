@@ -213,13 +213,21 @@ impl HvpatchTaskEngineBindingState {
             HvpatchTaskEngineBindingPayload::Resident(state) => {
                 carrick_vmm_hvf::hvf_aarch64_engine::resident_thread_birth_template(state, cpu).map(
                     |template| {
-                        Some(crate::vcpu_loop::thread_adoption::BackendBirthTemplate::Hvf(template))
+                        Some(
+                            crate::vcpu_loop::thread_adoption::BackendBirthTemplate::Hvf(Box::new(
+                                template,
+                            )),
+                        )
                     },
                 )
             }
             HvpatchTaskEngineBindingPayload::TaskOnly(state) => {
                 state.thread_birth_template().map(|template| {
-                    Some(crate::vcpu_loop::thread_adoption::BackendBirthTemplate::Hvf(template))
+                    Some(
+                        crate::vcpu_loop::thread_adoption::BackendBirthTemplate::Hvf(Box::new(
+                            template,
+                        )),
+                    )
                 })
             }
             #[cfg(test)]
