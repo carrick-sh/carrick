@@ -981,7 +981,7 @@ impl NativeService {
             executable,
             MAX_TABLE_GRANTS,
             unpublished,
-            self,
+            Box::new(self),
             |backing| backing.release_unused(),
             |mut service, offer| {
                 // Acquire the host mutex before the guest queue, never beneath it.
@@ -1039,15 +1039,15 @@ impl NativeService {
                 ) {
                     return Err(stale());
                 }
-                service.refuse()
+                (*service).refuse()
             }
             NativeBackingSupplyOutcome::DescriptorTableCapacity(service) => {
                 // Descriptor-table stock is a bounded shared resource. Complete
                 // with an unoffered reply slot (`slot.window().is_none()`) so
                 // the guest retries the fault/syscall instead of receiving SIGSEGV.
-                service.complete(true)
+                (*service).complete(true)
             }
-            NativeBackingSupplyOutcome::Refused(service) => service.refuse(),
+            NativeBackingSupplyOutcome::Refused(service) => (*service).refuse(),
         }
     }
     fn complete_wait(

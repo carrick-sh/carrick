@@ -1120,7 +1120,7 @@ fn composed_native_supply(
                     false,
                     1,
                     unpublished_busy,
-                    ticket,
+                    Box::new(ticket),
                     super::native_retirement_tests::SupplyBacking::release_unused,
                     |_ticket, _offer| -> Result<(), (_, ())> {
                         panic!("publish must not run when descriptor table stock is exhausted");
@@ -1130,7 +1130,7 @@ fn composed_native_supply(
             let NativeBackingSupplyOutcome::DescriptorTableCapacity(ticket) = outcome else {
                 panic!("expected DescriptorTableCapacity outcome");
             };
-            (ticket, held)
+            (*ticket, held)
         };
         assert!(busy_reply_slot.window().is_none());
         {
