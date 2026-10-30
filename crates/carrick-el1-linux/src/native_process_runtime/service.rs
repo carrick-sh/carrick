@@ -147,6 +147,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             let Some(census) = member.object_wait_census() else {
                 return Ok(());
             };
+            // substrate::ipc::wait_key admits only the disjoint readiness
+            // domain below this boundary. Metadata and MM edit waits retain
+            // their own cancellation policy despite using adapter tokens too.
+            if census.queue as usize >= carrick_sched_core::object_wait::ADDRESS_SPACE_WAIT_BASE {
+                return Ok(());
+            }
             let Some(key) = ObjectWaitKey::new(census.queue, census.generation) else {
                 return Ok(());
             };
