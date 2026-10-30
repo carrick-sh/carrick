@@ -3,6 +3,9 @@ use super::*;
 use crate::linux_abi::{LINUX_PAGE_SIZE, LINUX_PROT_READ};
 use crate::memory::LINUX_MMAP_BASE;
 
+// The snapshot may be consumed only inside its guard's executor scope.
+static_assertions::assert_not_impl_any!(FrameGrantPublicationSnapshot<'static>: Send, Sync, Clone, Copy);
+
 #[test]
 fn growdown_cannot_claim_raw_clock_transport() {
     let dispatcher = SyscallDispatcher::new();
