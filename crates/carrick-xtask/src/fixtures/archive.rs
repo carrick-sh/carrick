@@ -137,9 +137,14 @@ fn unpack(bundle: &Path) -> Result<Unpacked> {
     })
 }
 
-pub fn restore(root: &Path, bundle: &Path, sha: Option<&str>) -> Result<RestoreWork> {
+pub fn restore(
+    root: &Path,
+    bundle: &Path,
+    sha: Option<&str>,
+    gate: &crate::host_lease::HostLease,
+) -> Result<RestoreWork> {
     let unpacked = unpack(bundle)?;
-    super::restore(root, &unpacked.manifest, sha)
+    super::restore(root, &unpacked.manifest, sha, gate)
 }
 
 /// Verify complete transport and scoped input identity against the receiver.

@@ -854,8 +854,18 @@ fn publish_file(path: &Path, bytes: &[u8], kind: PublicationKind) -> Result<usiz
     Ok(0)
 }
 
-pub fn restore(root: &Path, path: &Path, sha: Option<&str>) -> Result<RestoreWork> {
-    let _gate = crate::host_lease::HostLease::acquire(crate::host_lease::HostLeaseMode::Gate)?;
+/// Restore a bundle while the caller holds an exclusive gate lease. The CLI
+/// passes the machine lease; tests pass one on a private lock, so no unit test
+/// waits behind a real gate on a shared host (#1180).
+pub fn restore(
+    root: &Path,
+    path: &Path,
+    sha: Option<&str>,
+    gate: &crate::host_lease::HostLease,
+) -> Result<RestoreWork> {
+    if gate.mode() != crate::host_lease::HostLeaseMode::Gate {
+        return Err(fail("fixture restore requires an exclusive gate lease"));
+    }
     let manifest = verify_bundle(root, path, sha)?;
     let parent = path
         .parent()
@@ -1114,9 +1124,11 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
             bundle,
             sha,
         } => {
+            let gate =
+                crate::host_lease::HostLease::acquire(crate::host_lease::HostLeaseMode::Gate)?;
             let work = match (manifest, bundle) {
-                (Some(manifest), None) => restore(root, &manifest, sha.as_deref())?,
-                (None, Some(bundle)) => archive::restore(root, &bundle, sha.as_deref())?,
+                (Some(manifest), None) => restore(root, &manifest, sha.as_deref(), &gate)?,
+                (None, Some(bundle)) => archive::restore(root, &bundle, sha.as_deref(), &gate)?,
                 _ => return Err(fail("supply exactly one of --manifest or --bundle")),
             };
             writeln!(
@@ -1137,7 +1149,9 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                 "fixtures: verified captured bundle {}; identity={} archive_sha256={}",
                 provenance.captured_path, provenance.identity, provenance.archive_sha256
             )?;
-            archive::restore(root, Path::new(&provenance.captured_path), None)?;
+            let gate =
+                crate::host_lease::HostLease::acquire(crate::host_lease::HostLeaseMode::Gate)?;
+            archive::restore(root, Path::new(&provenance.captured_path), None, &gate)?;
         }
         FixturesAction::Fetch => {
             let count = fetch_dependencies(root)?;
