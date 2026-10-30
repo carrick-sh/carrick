@@ -66,6 +66,7 @@ vm_free = [
   "carrick-sched-core::tests::host_only_affinity_is_not_an_el1_residency",
   "carrick-sched-core::tests::switched_affinity_change_prompts_only_the_exact_excluded_owner",
   "carrick-el1-linux::native_process_runtime::host_test_support::ipc_busy_yield_retains_operation_and_pin_through_carrier_work (owned-yield reply typing and exact token/pin custody only)",
+  "{,ipc_preparation_busy_once_requeues_then_completes_exact_operation,native_service_exit_busy_requeues_and_resumes_the_record,native_service_exit_busy_retains_ipc_operation_and_pin,native_service_exit_deferred_preparation_is_not_quarantined,native_service_exit_refusal_policy_preserves_retry_and_authentication,native_service_exit_missing_unowned_receipt_remains_an_invariant,native_service_exit_exec_bridge_keeps_its_existing_refusal}carrick-el1-linux::native_process_runtime::host_test_support::ipc_busy_yield_retains_operation_and_pin_through_carrier_work (owned-yield reply typing and exact token/pin custody only)",
 ]
 embed = [
   "carrick-conformance-next::sched_affinity_threads (kernel cpumask return-size rule; raw diagnostic retained)",

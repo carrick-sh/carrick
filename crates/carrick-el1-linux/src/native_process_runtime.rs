@@ -68,6 +68,13 @@ pub enum NativeResume {
     Left(Option<LinuxWaitStatus>),
     Invalid,
 }
+/// Classify the bridge without carrying its staged payload across refusal folding.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[derive(Clone, Copy)]
+pub(crate) enum NativeServiceExit {
+    Bridge,
+    CarrierWork,
+}
 // Empty-checkpoint hint only; masks and contexts remain in their exact owners.
 static NATIVE_SIGNAL_CONTINUATIONS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -5501,6 +5508,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(reason);
         }
         match outcome {
+            // A refused adapter admission published no service wait. The
+            // scheduler still owns the exact IPC token and pin: retry its
+            // preparation through that owner before returning to userspace.
+            None if self
+                .source
+                .zone
+                .record(self.record.id)
+                .has_adapter_operation() =>
+            {
+                Ok(NativeResume::RetrySyscall)
+            }
             None => Ok(NativeResume::NoPending),
             Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),
             Some(LifecycleOutcome::HostCustody) => {
@@ -7257,6 +7275,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             preparation.identity,
         ) {
             Ok(NativeResume::Left(None)) => {}
+            Err(NativeProcessError::Busy | NativeProcessError::Exhausted) => {
+                // Admission has not consumed the installed operation. Keep
+                // preparation owed and release this executor; the selected
+                // record retries through its existing adapter checkpoint.
+                self.adapter_ready = Some(preparation);
+                self.yield_service_checkpoint().unwrap_or_else(|_| {
+                    crate::dispatch::invalid_completion(
+                        crate::dispatch::NativeInvariant::EntryBinding,
+                    )
+                });
+            }
             Ok(NativeResume::NoPending) => {
                 if self.resume_pending_lifecycle().is_none() {
                     self.cancel_owner_wait().unwrap_or_else(|_| {
