@@ -424,9 +424,14 @@ def _execution_context(root: Path, *, state_root: Path | None = None):
         task_root = Path(directory)
         cargo_home = task_root / "cargo-home"
         cargo_home.mkdir()
-        canonical_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(
-            strict=True
-        )
+        passwd_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        try:
+            canonical_home = passwd_home.resolve(strict=True)
+        except FileNotFoundError:
+            # System accounts (the dispatch agent, #1126) have no home on
+            # disk: there are no Cargo caches to link, and an unset
+            # RUSTUP_HOME then names a missing toolchain that fails loudly.
+            canonical_home = passwd_home
         # Rustup storage is provisioned separately from Cargo configuration on
         # CI hosts (and may be root-owned/read-only). Keep that toolchain and
         # its declared targets instead of selecting the job user's ~/.rustup.
