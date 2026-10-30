@@ -1291,8 +1291,9 @@ impl HvpatchThreadBirthTemplate {
     }
 }
 
-pub fn resident_thread_birth_template(
-    state: &mut HvpatchTaskEngineState,
+fn build_thread_birth_template(
+    vm: &HvfAarch64Vmm,
+    projection: carrick_aarch64::Aarch64TaskRuntimeProjection,
     cpu: &carrick_hal::threaded::GuestCpuState,
 ) -> Result<HvpatchThreadBirthTemplate, TrapError> {
     let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = cpu else {
@@ -1300,8 +1301,7 @@ pub fn resident_thread_birth_template(
             "thread birth template requires AArch64".into(),
         ));
     };
-    let projection = state.runtime_projection();
-    let mut spec = state.backend_mut().state.build_thread_spec()?;
+    let mut spec = vm.state.build_thread_spec()?;
     spec.cow_authority = None;
     spec.cow_identity = None;
     let snapshot = Aarch64VcpuSnapshot {
@@ -1334,6 +1334,21 @@ pub fn resident_thread_birth_template(
         projection,
         snapshot,
     })
+}
+
+pub fn resident_thread_birth_template(
+    state: &mut HvpatchTaskEngineState,
+    cpu: &carrick_hal::threaded::GuestCpuState,
+) -> Result<HvpatchThreadBirthTemplate, TrapError> {
+    let projection = state.runtime_projection();
+    build_thread_birth_template(state.backend_mut(), projection, cpu)
+}
+
+pub fn loaded_engine_thread_birth_template(
+    engine: &HvfAarch64Engine,
+    cpu: &carrick_hal::threaded::GuestCpuState,
+) -> Result<HvpatchThreadBirthTemplate, TrapError> {
+    build_thread_birth_template(engine.vm(), engine.runtime_projection(), cpu)
 }
 
 impl HvpatchTaskOnlyEngineState {

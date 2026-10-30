@@ -155,17 +155,24 @@ pub(super) enum ThreadAdoptionOrigin {
     AbiBorn,
 }
 
+pub(crate) enum BackendBirthTemplate {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Hvf(carrick_vmm_hvf::hvf_aarch64_engine::HvpatchThreadBirthTemplate),
+    #[cfg(any(test, not(all(target_os = "macos", target_arch = "aarch64"))))]
+    Test,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) type BackendTaskOnlyState =
+    carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub(super) type BackendTaskOnlyState = ();
+
 /// Shared process resources, not a running job, backend or executor lease.
 pub(super) struct ProcessThreadAdoptionFactory<E: ThreadedEngine> {
     owner: TaskKey,
     cpu_template: Option<ProcessThreadCpuTemplate>,
-    backend_template: Option<
-        Arc<
-            OwnedProcessBirthTemplate<
-                carrick_vmm_hvf::hvf_aarch64_engine::HvpatchThreadBirthTemplate,
-            >,
-        >,
-    >,
+    backend_template: Option<Arc<OwnedProcessBirthTemplate<BackendBirthTemplate>>>,
     kernel: Weak<KernelState>,
     task: Weak<carrick_kernel::kernel::objects::Task>,
     registry: Arc<ThreadRegistry>,
@@ -192,7 +199,7 @@ struct ReservedThreadRuntime<E: ThreadedEngine> {
     injected_lease: Arc<InjectedExecutionLeaseSlot>,
     origin: ThreadAdoptionOrigin,
     cpu: Option<ProcessThreadCpuReservation>,
-    backend: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState>,
+    backend: Option<BackendTaskOnlyState>,
     cow: Option<(Arc<memory::KernelFrameCowAuthority>, std::num::NonZeroU64)>,
     submission: carrick_kernel::kernel::scheduler::ProcessBirthSubmission,
 }
@@ -200,7 +207,7 @@ struct ReservedThreadRuntime<E: ThreadedEngine> {
 pub(super) struct AdoptedThreadRuntime<E: ThreadedEngine> {
     pub(super) kernel: Kernel,
     pub(super) cpu: Option<carrick_kernel::kernel::objects::MigratableTaskState>,
-    pub(super) backend: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchTaskOnlyEngineState>,
+    pub(super) backend: Option<BackendTaskOnlyState>,
     pub(super) cow: Option<(Arc<memory::KernelFrameCowAuthority>, std::num::NonZeroU64)>,
     pub(super) state: ThreadRuntimeState<E>,
     pub(super) injected_lease: Arc<InjectedExecutionLeaseSlot>,
@@ -268,7 +275,7 @@ where
     pub(super) fn with_backend_template(
         mut self,
         context: &KernelContext,
-        template: Option<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchThreadBirthTemplate>,
+        template: Option<BackendBirthTemplate>,
     ) -> Self {
         self.backend_template =
             template.map(|template| Arc::new(OwnedProcessBirthTemplate::new(context, template)));
@@ -292,6 +299,62 @@ where
             engine: std::marker::PhantomData,
         })
     }
+}
+
+pub(super) fn engine_thread_birth_template<E: ThreadedEngine + 'static>(
+    engine: &E,
+    cpu: &GuestCpuState,
+) -> Result<Option<BackendBirthTemplate>, TrapError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(engine) = (engine as &dyn std::any::Any)
+        .downcast_ref::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine>()
+    {
+        return carrick_vmm_hvf::hvf_aarch64_engine::loaded_engine_thread_birth_template(
+            engine, cpu,
+        )
+        .map(|template| Some(BackendBirthTemplate::Hvf(template)));
+    }
+    let _ = (engine, cpu);
+    #[cfg(test)]
+    if std::any::TypeId::of::<E>() == std::any::TypeId::of::<super::tests::CrashCaptureTestEngine>()
+    {
+        return Ok(Some(BackendBirthTemplate::Test));
+    }
+    Ok(None)
+}
+
+pub(super) fn bind_executable_thread_births<E: ThreadedEngine + 'static>(
+    kernel: &Kernel,
+    state: &ThreadRuntimeState<E>,
+    context: &KernelContext,
+    cpu: carrick_kernel::kernel::objects::MigratableTaskState,
+    backend_template: Option<BackendBirthTemplate>,
+) -> Result<(), TrapError>
+where
+    E::SiblingSpec: 'static,
+{
+    if !context
+        .thread()
+        .control_lease()
+        .lifecycle()
+        .serves_threads()
+    {
+        return Ok(());
+    }
+    let factory = ProcessThreadAdoptionFactory::capture(kernel, state)
+        .ok_or_else(|| {
+            TrapError::Hypervisor("thread adoption factory has no owner process".into())
+        })?
+        .with_cpu_template(context, cpu)?
+        .with_backend_template(context, backend_template);
+    context
+        .task()
+        .install_thread_adoption_factory(Arc::new(factory))
+        .map_err(|_| {
+            TrapError::Hypervisor("thread adoption factory rejected foreign task owner".into())
+        })?;
+    context.kernel().prepare_executable_thread_births(context);
+    Ok(())
 }
 
 impl<E: ThreadedEngine + 'static> ThreadBirthAdoptionFactory for ProcessThreadAdoptionFactory<E>
@@ -349,37 +412,46 @@ where
             .published_birth_scheduler(process.kernel_graph())?;
         let submission = scheduler.reserve_process_birth(&task, thread).ok()?;
         let backend = match &self.backend_template {
-            Some(template) => Some(template.with_authority(
+            Some(template) => template.with_authority(
                 task.key(),
                 task.shared().mm().id(),
                 process.kernel_graph(),
-                |template| {
-                    let GuestCpuState::Aarch64V1(cpu) = &self.cpu_template.as_ref()?.cpu.cpu else {
-                        return None;
-                    };
-                    let identity =
-                        carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity {
-                            task_serial: self.owner.serial.raw(),
-                            thread_serial: thread.serial.raw(),
-                            execution_generation:
-                                carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL.raw(),
-                            linux_pid: process.pid(),
-                            linux_tid: thread.tid.raw(),
-                            asid: (cpu.ttbr0 >> 48) as u16,
+                |template| match template {
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    BackendBirthTemplate::Hvf(template) => {
+                        let GuestCpuState::Aarch64V1(cpu) = &self.cpu_template.as_ref()?.cpu.cpu
+                        else {
+                            return None;
                         };
-                    template
-                        .reserve(
-                            identity,
-                            kernel
-                                .hvpatch_runtime
-                                .as_ref()?
-                                .carrier_tasks(process.kernel_graph()),
-                        )
-                        .ok()
+                        let identity =
+                            carrick_vmm_hvf::hvf_aarch64_engine::HvpatchCarrierTaskIdentity {
+                                task_serial: self.owner.serial.raw(),
+                                thread_serial: thread.serial.raw(),
+                                execution_generation:
+                                    carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL
+                                        .raw(),
+                                linux_pid: process.pid(),
+                                linux_tid: thread.tid.raw(),
+                                asid: (cpu.ttbr0 >> 48) as u16,
+                            };
+                        template
+                            .reserve(
+                                identity,
+                                kernel
+                                    .hvpatch_runtime
+                                    .as_ref()?
+                                    .carrier_tasks(process.kernel_graph()),
+                            )
+                            .ok()
+                            .map(Some)
+                    }
+                    #[cfg(any(test, not(all(target_os = "macos", target_arch = "aarch64"))))]
+                    BackendBirthTemplate::Test => Some(None),
                 },
-            )??),
+            )??,
             None => None,
         };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let cow = match &backend {
             Some(backend) => {
                 let GuestCpuState::Aarch64V1(cpu) = &self.cpu_template.as_ref()?.cpu.cpu else {
@@ -407,6 +479,8 @@ where
             }
             None => None,
         };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let cow = None;
         let mut state = Vec::new();
         state.try_reserve_exact(1).ok()?;
         let (execution_lease, injected_lease) = ExecutionLeaseCell::injected();
@@ -562,86 +636,96 @@ fn activate_born_thread<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
-    let mut adopted = match adopt_thread_runtime::<E>(reservation, context, Some(frame)) {
-        Ok(adopted) => adopted,
-        // The caller frees this exact stopped zone record. The kernel's
-        // terminal owner retires its row; no runtime registry/job may appear
-        // after that owner's member census has closed.
-        Err(ThreadRuntimeAdoptionError::TerminalOwner) => return Ok(()),
-        Err(ThreadRuntimeAdoptionError::Trap(error)) => return Err(error),
-    };
-    let birth_admission = adopted.birth_admission.take();
-    let cpu = adopted
-        .cpu
-        .take()
-        .ok_or_else(|| TrapError::Hypervisor("born adoption lost CPU custody".into()))?;
-    let mut backend = adopted
-        .backend
-        .take()
-        .ok_or_else(|| TrapError::Hypervisor("born adoption lost backend custody".into()))?;
-    let (cow, authority_id) = adopted
-        .cow
-        .take()
-        .ok_or_else(|| TrapError::Hypervisor("born adoption lost COW custody".into()))?;
-    let runtime = adopted
-        .kernel
-        .hvpatch_runtime
-        .as_ref()
-        .ok_or_else(|| TrapError::Hypervisor("born adoption lost directory".into()))?
-        .clone();
-    let scheduler = runtime.continuation_services(context.kernel()).0;
-    let generation = scheduler
-        .publish_initial_task_state_gated(context.thread(), cpu.clone())
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (context, reservation, frame);
+        Err(TrapError::Hypervisor(
+            "born adoption requires HVPatch hardware backend".into(),
+        ))
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let mut adopted = match adopt_thread_runtime::<E>(reservation, context, Some(frame)) {
+            Ok(adopted) => adopted,
+            // The caller frees this exact stopped zone record. The kernel's
+            // terminal owner retires its row; no runtime registry/job may appear
+            // after that owner's member census has closed.
+            Err(ThreadRuntimeAdoptionError::TerminalOwner) => return Ok(()),
+            Err(ThreadRuntimeAdoptionError::Trap(error)) => return Err(error),
+        };
+        let birth_admission = adopted.birth_admission.take();
+        let cpu = adopted
+            .cpu
+            .take()
+            .ok_or_else(|| TrapError::Hypervisor("born adoption lost CPU custody".into()))?;
+        let mut backend = adopted
+            .backend
+            .take()
+            .ok_or_else(|| TrapError::Hypervisor("born adoption lost backend custody".into()))?;
+        let (cow, authority_id) = adopted
+            .cow
+            .take()
+            .ok_or_else(|| TrapError::Hypervisor("born adoption lost COW custody".into()))?;
+        let runtime = adopted
+            .kernel
+            .hvpatch_runtime
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("born adoption lost directory".into()))?
+            .clone();
+        let scheduler = runtime.continuation_services(context.kernel()).0;
+        let generation = scheduler
+            .publish_initial_task_state_gated(context.thread(), cpu.clone())
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        let token = cow
+            .issue_reserved_hvpatch_child_token(context, authority_id)
+            .map_err(TrapError::Hypervisor)?;
+        lifecycle::bind_activate_child::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine, _>(
+            &mut lifecycle::ProductionHvpatchCloneBackendOps,
+            &mut backend,
+            token,
+            || Ok(()),
+        )
         .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
-    let token = cow
-        .issue_reserved_hvpatch_child_token(context, authority_id)
-        .map_err(TrapError::Hypervisor)?;
-    lifecycle::bind_activate_child::<carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine, _>(
-        &mut lifecycle::ProductionHvpatchCloneBackendOps,
-        &mut backend,
-        token,
-        || Ok(()),
-    )
-    .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
-    let tid = ThreadId::from_kernel_thread_identity(context.thread().key().tid.raw());
-    adopted
-        .state
-        .registry
-        .register_child_with_tid(tid, context.thread().control_slot().clear_child_tid());
-    let threads = adopted.state.threads.clone();
-    let mut logical = binding::prepare_hvpatch_logical_job(binding::HvpatchLogicalJobInput {
-        kernel: adopted.kernel,
-        state: adopted.state,
-        task_backend: executor::HvpatchTaskEngineBindingState::task_only(backend),
-        context: context.retain_exact(),
-        cpu,
-        generation,
-        injected_lease: adopted.injected_lease,
-        bootstrap_process_child: None,
-        bootstrap_thread_child: false,
-    })?;
-    let dormant = runtime.persistent_bindings().prepare_submission(
-        &scheduler,
-        executor::TaskSubmissionShape::ProcessBirth(adopted.submission),
-        None,
-        context.thread().clone(),
-        generation,
-        logical.binding.clone(),
-    )?;
-    threads::enroll_persistent_process_member(&threads, &logical.terminal_settlement);
-    let gate = context
-        .thread()
-        .take_opened_start_gate(generation)
-        .ok_or_else(|| TrapError::Hypervisor("born adoption lost start proof".into()))?;
-    logical.install_start_gate(gate)?;
-    let result = dormant.activate(
-        &scheduler,
-        context.thread().clone(),
-        logical.activation_proof()?,
-    );
-    // Registration, member enrollment and submission are all inside admission.
-    drop(birth_admission);
-    result
+        let tid = ThreadId::from_kernel_thread_identity(context.thread().key().tid.raw());
+        adopted
+            .state
+            .registry
+            .register_child_with_tid(tid, context.thread().control_slot().clear_child_tid());
+        let threads = adopted.state.threads.clone();
+        let mut logical = binding::prepare_hvpatch_logical_job(binding::HvpatchLogicalJobInput {
+            kernel: adopted.kernel,
+            state: adopted.state,
+            task_backend: executor::HvpatchTaskEngineBindingState::task_only(backend),
+            context: context.retain_exact(),
+            cpu,
+            generation,
+            injected_lease: adopted.injected_lease,
+            bootstrap_process_child: None,
+            bootstrap_thread_child: false,
+        })?;
+        let dormant = runtime.persistent_bindings().prepare_submission(
+            &scheduler,
+            executor::TaskSubmissionShape::ProcessBirth(adopted.submission),
+            None,
+            context.thread().clone(),
+            generation,
+            logical.binding.clone(),
+        )?;
+        threads::enroll_persistent_process_member(&threads, &logical.terminal_settlement);
+        let gate = context
+            .thread()
+            .take_opened_start_gate(generation)
+            .ok_or_else(|| TrapError::Hypervisor("born adoption lost start proof".into()))?;
+        logical.install_start_gate(gate)?;
+        let result = dormant.activate(
+            &scheduler,
+            context.thread().clone(),
+            logical.activation_proof()?,
+        );
+        // Registration, member enrollment and submission are all inside admission.
+        drop(birth_admission);
+        result
+    }
 }
 
 #[cfg(test)]
@@ -937,7 +1021,7 @@ mod tests {
                 .try_claim_process_exit(owner_state.this_tid)
                 .unwrap()
                 .claim,
-            super::super::ProcessExitClaim::Pending,
+            super::super::terminal::ProcessExitClaim::Pending,
             "terminal stop must wait for the first entry to publish or cancel its member"
         );
         drop(adopted);
@@ -947,7 +1031,7 @@ mod tests {
                 .try_claim_process_exit(owner_state.this_tid)
                 .unwrap()
                 .claim,
-            super::super::ProcessExitClaim::Owner
+            super::super::terminal::ProcessExitClaim::Owner
         );
         scheduler.close();
     }

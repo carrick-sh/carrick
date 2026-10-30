@@ -806,6 +806,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
     }
 
+    pub fn runtime_projection(&self) -> Aarch64TaskRuntimeProjection {
+        Aarch64TaskRuntimeProjection {
+            page_tables: self.page_tables.clone(),
+            protections: self.protections.clone(),
+            process_asid: self.process_asid,
+        }
+    }
+
     pub fn into_injected_task_only_backend(mut self) -> (V, V::Vcpu, Aarch64TaskRuntimeProjection) {
         self.settle_owed_resume_invalidation_or_log();
         let Self {

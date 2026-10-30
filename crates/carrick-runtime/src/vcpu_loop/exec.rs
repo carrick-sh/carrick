@@ -2419,7 +2419,7 @@ where
         if let Err(error) = publish_execution_authority_after_exec(
             committed_context.thread(),
             worker_executor,
-            replacement_state,
+            replacement_state.clone(),
             &self.execution_lease,
         ) {
             return Self::exec_failed_past_no_return(
@@ -2428,6 +2428,29 @@ where
                 &format!("publish replacement execution lease after exec: {error}"),
             )
             .map(Some);
+        }
+        if kernel.hvpatch_process.is_some() {
+            let bind_births = super::thread_adoption::engine_thread_birth_template(
+                engine,
+                &replacement_state.cpu,
+            )
+            .and_then(|backend_template| {
+                super::thread_adoption::bind_executable_thread_births(
+                    kernel,
+                    self,
+                    &committed_context,
+                    replacement_state,
+                    backend_template,
+                )
+            });
+            if let Err(error) = bind_births {
+                return Self::exec_failed_past_no_return(
+                    kernel,
+                    engine,
+                    &format!("bind executable thread births after exec: {error}"),
+                )
+                .map(Some);
+            }
         }
         if let Some(committed) = committed_transition {
             let (transition, replacement_mm, retired_mm) = committed.into_parts();
@@ -2566,6 +2589,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
     use crate::vcpu_loop::executor::TaskBindingResolver;
+    use carrick_el1_abi::Lifecycle;
     use parking_lot::Mutex;
     use std::sync::Arc;
     use std::time::Instant;
@@ -4564,9 +4588,14 @@ pub(crate) mod tests {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
 
+        let machine = if cfg!(all(not(target_os = "macos"), target_arch = "x86_64")) {
+            62
+        } else {
+            183
+        };
         let mut executable = tempfile::NamedTempFile::new().expect("synthetic executable");
         executable
-            .write_all(&synthetic_elf(183))
+            .write_all(&synthetic_elf(machine))
             .expect("write synthetic ELF");
         let mut permissions = executable
             .as_file()
@@ -4876,7 +4905,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn enable_exec_support_for_test(
         engine: &mut CrashCaptureTestEngine,
         context: &carrick_kernel::kernel::KernelContext,
@@ -7469,5 +7497,192 @@ pub(crate) mod tests {
 
         carrick_el1_abi::record_el1_region_host_ptr(0);
         unsafe { std::alloc::dealloc(region, layout) };
+    }
+
+    #[test]
+    fn exec_rebinds_executable_thread_births_and_reopens_gate_for_new_image() {
+        for (case_index, origin) in [
+            ExecCompletionOrigin::GuestSyscall,
+            ExecCompletionOrigin::InternalControl,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pid = 74_800 + (case_index as i32) * 10;
+            let (runtime, scheduler, kernel, context, process, _root_generation) =
+                test_carrier_graph_with_dispatcher!(pid, SyscallDispatcher::new());
+            let wait_service = runtime.continuation_services(context.kernel()).1;
+            runtime
+                .start_services_transaction(
+                    &super::super::wait_wake::PreparedPersistentServices {
+                        scheduler: Arc::clone(&scheduler),
+                        wait_service,
+                    },
+                    || Ok(()),
+                )
+                .expect("publish persistent services");
+            let executor = scheduler
+                .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                .expect("post-exec birth witness executor");
+            let mut running = scheduler
+                .take(&executor)
+                .expect("post-exec birth witness runnable root");
+            let this_tid = ThreadId::synthetic_for_tests(pid);
+            let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+            let platform: Arc<dyn PlatformFutex> = Arc::new(NoopPlatformFutex);
+            let platform_factory: PlatformFutexFactory = Arc::new(|_| Arc::new(NoopPlatformFutex));
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                Arc::new(ThreadRegistry::new(this_tid)),
+                Arc::new(FutexTable::new()),
+                platform,
+                platform_factory,
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(context.thread())),
+                Some(process.pid()),
+                context.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                this_tid,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::clone(&kicker),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.execution_lease.lock().set_lease(running.take_lease());
+            state.service_kernel_context = Some(context.retain_exact());
+            state.guest_execution = Some(
+                kernel
+                    .dispatcher
+                    .enter_mm_executor_for_thread(
+                        Some(Arc::clone(context.thread())),
+                        kicker,
+                        this_tid,
+                        crate::vcpu_loop::test_execution_slot(),
+                    )
+                    .expect("post-exec birth witness MM participation"),
+            );
+            let mut initial_state = executor::tests::task_state(&context, 900);
+            initial_state.asid_generation = process.asid_generation();
+            let carrick_hal::threaded::GuestCpuState::Aarch64V1(initial_cpu) =
+                &mut initial_state.cpu
+            else {
+                unreachable!()
+            };
+            Arc::make_mut(initial_cpu).asid_generation = process.asid_generation();
+            super::super::thread_adoption::bind_executable_thread_births(
+                &kernel,
+                &state,
+                &context,
+                initial_state,
+                Some(super::super::thread_adoption::BackendBirthTemplate::Test),
+            )
+            .expect("bind initial root executable thread births");
+            assert_eq!(
+                context.lifecycle_page().gate(),
+                carrick_el1_abi::GateState::Open
+            );
+
+            match origin {
+                ExecCompletionOrigin::GuestSyscall => {
+                    install_typed_guest_completion(&kernel, &context, &mut state);
+                }
+                ExecCompletionOrigin::InternalControl => {
+                    state.begin_internal_control_exec().unwrap();
+                }
+            }
+            let mut engine = CrashCaptureTestEngine::default();
+            enable_exec_support_for_test(&mut engine, &context, pid as u64);
+            let origin_token = state
+                .authenticate_exec_completion_origin(origin)
+                .expect("authenticate exec completion origin");
+            let clone_admission = kernel
+                .close_clone_admission_for_exec(state.this_tid)
+                .expect("close clone admission for exec");
+            let hvpatch_mm_reservation = Some(
+                process
+                    .reserve_exec_mm_eventual()
+                    .expect("reserve exec mm eventual"),
+            );
+            let image =
+                AddressSpace::load_elf_bytes_with_reader_for(&synthetic_elf(183), &|_| None, 183)
+                    .expect("production-shaped ELF image");
+            let executable = tempfile::NamedTempFile::new().expect("synthetic executable");
+            let executable_source =
+                carrick_kernel::dispatch::executable_authority::ExecSource::host(
+                    executable.reopen().expect("reopen synthetic executable"),
+                    "/fixture".to_owned(),
+                )
+                .expect("synthetic exec source");
+            let runtime_region_count = image.regions().len() as u64;
+            let runtime_mapped_bytes = image.regions().iter().map(|region| region.len()).sum();
+            let prepared = PreparedExecve {
+                origin: Some(origin_token),
+                image,
+                path: "/fixture".to_owned(),
+                proc_argv: vec!["/fixture".to_owned()],
+                proc_env: Vec::new(),
+                executable_source,
+                binfmt_argv: None,
+                command_line: "/fixture".to_owned(),
+                inventory_failure_injection: None,
+                hvpatch_mm_reservation,
+                terminal_context: Some(context.retain_exact()),
+                clone_admission: Some(clone_admission),
+                runtime_region_count,
+                runtime_mapped_bytes,
+                sibling_drain_started: std::time::Instant::now(),
+            };
+            let finished = state
+                .finish_prepared_execve(&kernel, &mut engine, prepared)
+                .expect("finish prepared execve");
+            assert!(finished.outcome.is_none());
+
+            let successor = state
+                .service_kernel_context
+                .as_ref()
+                .expect("committed exec successor context")
+                .retain_exact();
+            assert_ne!(successor.shared().mm().id(), context.shared().mm().id());
+            assert_eq!(
+                successor.lifecycle_page().gate(),
+                carrick_el1_abi::GateState::Open,
+                "post-exec image must reopen thread birth gate through the shared birth-binding owner"
+            );
+
+            let thread_plan = carrick_kernel::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES
+                    | carrick_abi::LinuxCloneFlags::FS,
+            )
+            .expect("thread clone plan");
+            let first_child = successor
+                .kernel()
+                .reserve_thread_clone(&successor, thread_plan, None)
+                .expect("reserve post-exec thread clone")
+                .prepare(ThreadId::synthetic_for_tests(pid + 1))
+                .expect("prepare post-exec thread clone")
+                .commit_for_el1()
+                .expect("first post-exec thread spawn must succeed and prime EL1 birth pool")
+                .into_context()
+                .expect("post-exec thread child context");
+            assert_eq!(first_child.task().key(), successor.task().key());
+            assert_eq!(first_child.shared().mm().id(), successor.shared().mm().id());
+            assert_eq!(
+                successor
+                    .kernel()
+                    .standing_thread_identities(successor.task().key().id)
+                    .len(),
+                4,
+                "first post-exec host thread clone must replenish standing EL1 birth pool for the replacement image"
+            );
+            let claim = successor
+                .lifecycle_page()
+                .claim_any()
+                .expect("post-exec EL1 birth pool must be claimable");
+            successor.lifecycle_page().unclaim(claim).unwrap();
+            scheduler.close();
+        }
     }
 }
