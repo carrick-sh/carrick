@@ -9145,7 +9145,7 @@ fn claimed_sibling_zone_reload(retired: bool) {
 
 #[test]
 fn serial_host_retirement_cancels_zone_wait_before_queued_claim() {
-    terminal_zone_wait_before_queued_claim(false, false);
+    terminal_zone_wait_before_queued_claim(false, false, false);
 }
 
 /// #1071 reduction: production scheduler/continuation and zone materializer,
@@ -9599,15 +9599,24 @@ fn zone_park_wake_loads_on_second_executor(wake_before_save: bool) {
 
 #[test]
 fn serial_host_process_exit_cancels_zone_wait_before_queued_claim() {
-    terminal_zone_wait_before_queued_claim(true, false);
+    terminal_zone_wait_before_queued_claim(true, false, false);
 }
 
 #[test]
 fn serial_host_shutdown_request_preserves_zone_wait_until_terminal_admission() {
-    terminal_zone_wait_before_queued_claim(false, true);
+    terminal_zone_wait_before_queued_claim(false, true, false);
 }
 
-fn terminal_zone_wait_before_queued_claim(process_exit: bool, shutdown_request: bool) {
+#[test]
+fn serial_host_process_exit_retires_abi_born_sibling_before_direct_load() {
+    terminal_zone_wait_before_queued_claim(true, false, true);
+}
+
+fn terminal_zone_wait_before_queued_claim(
+    process_exit: bool,
+    shutdown_request: bool,
+    abi_born: bool,
+) {
     use carrick_kernel::kernel::continuation::{
         BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
     };
@@ -9624,7 +9633,11 @@ fn terminal_zone_wait_before_queued_claim(process_exit: bool, shutdown_request: 
     let zone = carrick_el1_abi::zone_tables().unwrap();
     let (kernel, root) = bootstrap(19_760);
     root.thread().set_affinity(CpuAffinity::all(1));
-    let sibling = sibling(&kernel, &root, 19_761);
+    let sibling = if abi_born {
+        abi_born_sibling(&kernel, &root)
+    } else {
+        sibling(&kernel, &root, 19_761)
+    };
     assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
     let scheduler = Arc::new(single_cpu_scheduler(kernel.clone()));
     let service = CarrierWaitService::new(scheduler.clone());
@@ -9954,4 +9967,213 @@ fn serial_host_missing_terminal_continuation_finishes_exit_owner() {
     assert!(completion.is_finished());
     assert!(matches!(result.wait(), Ok(VcpuLoopOutcome::ThreadDone)));
     assert!(root.exact_thread_is_live());
+}
+
+/// Publish a real EL1 birth and let the ledger adopt its original control.
+/// Unlike a host clone, reset_for_birth leaves the host-only birth words empty.
+fn abi_born_sibling(kernel: &Arc<Kernel>, parent: &KernelContext) -> KernelContext {
+    use carrick_el1_abi::Lifecycle;
+    use carrick_kernel::kernel::thread_adoption::{
+        ThreadBirthAdoptionFactory, ThreadBirthAdoptionReservation,
+    };
+    #[derive(Debug)]
+    struct BirthCapacity(carrick_kernel::kernel::TaskKey);
+    impl ThreadBirthAdoptionFactory for BirthCapacity {
+        fn executable_births(&self) -> bool {
+            true
+        }
+        fn owner(&self) -> carrick_kernel::kernel::TaskKey {
+            self.0
+        }
+        fn reserve(&self, thread: ThreadKey) -> Option<ThreadBirthAdoptionReservation> {
+            Some(ThreadBirthAdoptionReservation::new(self.0, thread, ()))
+        }
+    }
+    parent
+        .task()
+        .install_thread_adoption_factory(Arc::new(BirthCapacity(parent.task().key())))
+        .unwrap();
+    // The first host clone replenishes executable ABI birth capacity. Hardware
+    // adoption is scripted by FakeFactory; birth and graph publication are real.
+    let bootstrap_sibling = sibling(kernel, parent, parent.thread().key().tid.raw() + 100);
+    let controls = parent.thread().control_lease().birth_controls();
+    let page = parent.lifecycle_page();
+    let claim = page.claim_any().expect("reserved ABI birth");
+    let entry = claim.entry();
+    let identity = page.identity(entry).unwrap();
+    let control = &controls.iter().find(|(key, _)| *key == entry).unwrap().1;
+    control
+        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+        .unwrap();
+    page.thread_born().unwrap();
+    page.record_born(
+        claim,
+        carrick_el1_abi::BornRecord {
+            caller_task: carrick_el1_abi::El1TaskId::from_linux_tid(
+                parent.thread().key().tid.raw(),
+            )
+            .raw(),
+            caller_serial: parent.thread().key().serial.raw(),
+            clone_flags: (LinuxCloneFlags::THREAD
+                | LinuxCloneFlags::SIGHAND
+                | LinuxCloneFlags::VM
+                | LinuxCloneFlags::FS
+                | LinuxCloneFlags::FILES)
+                .bits(),
+            clear_child_tid: 0,
+            blocked: carrick_el1_abi::BlockedMask(0),
+        },
+    )
+    .unwrap();
+    let tid = carrick_kernel::kernel::LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
+    let sibling = kernel.context(parent.task().key().id, tid).unwrap();
+    assert_eq!(
+        sibling.thread().control_lease().slot_address(),
+        control.slot_address()
+    );
+    assert_eq!(sibling.thread().control_slot().host_birth_identity(), None);
+    assert_eq!(sibling.thread().key().serial.raw(), identity.thread_serial);
+    kernel.exit_thread(&bootstrap_sibling, None).unwrap();
+    assert_eq!(parent.task().threads().len(), 2);
+    sibling
+}
+
+/// Hold an ABI-born sibling's host load while its native terminal owner
+/// releases the exact saved record. The leader stays live throughout.
+#[test]
+fn serial_host_group_close_retires_abi_born_sibling_during_direct_load() {
+    claimed_abi_born_sibling_zone_reload(true);
+}
+
+#[test]
+fn serial_host_missing_abi_born_sibling_without_terminal_intent_fails_closed() {
+    claimed_abi_born_sibling_zone_reload(false);
+}
+
+fn claimed_abi_born_sibling_zone_reload(terminal: bool) {
+    use carrick_core::terminal::{Live, Process, TerminalCustody, Thread, ThreadTerminalIdentity};
+    let (kernel, root) = bootstrap(19_820);
+    root.thread().set_affinity(CpuAffinity::all(1));
+    let sibling = abi_born_sibling(&kernel, &root);
+    assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
+    let scheduler = Arc::new(single_cpu_scheduler(kernel.clone()));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(17, [Step::Exit]);
+    let region = carrick_test_support::TestEl1Region::zeroed();
+    // SAFETY: the retained ABI-aligned region owns this zeroed zone.
+    let zone = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<carrick_el1_abi::ZoneTables>()
+    };
+    let key = sibling.thread().key();
+    let generation = publish(&sibling, 17);
+    let mm = sibling.shared().mm().id().raw();
+    let slot = carrick_sched_core::SlotId::new(0);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, mm, None, 0);
+    zone.enter_guest(slot);
+    let space = zone.spaces.publish_closed(mm, 0x1000, 0x1000).unwrap();
+    zone.spaces.open(space);
+    zone.install_space(slot, mm).unwrap();
+    let id = zone
+        .alloc_record(carrick_el1_abi::ThreadIdentity {
+            tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+            serial: key.serial.raw(),
+            mm,
+            file_table: sibling.resources().files().id().raw(),
+            generation: generation.raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    zone.requeue_preempted(slot, id);
+    assert_eq!(zone.switch_in(slot), Some(id));
+    let record = zone.record_ref(id);
+    let control = sibling.thread().control_slot();
+    control.bind_zone_record(record);
+    binding.set_cpu_residency(super::residency::TaskCpuResidency::Zone {
+        base: test_guest_cpu_state(17),
+        record,
+        origin: super::residency::ZoneResumeOrigin::GuestRecord,
+    });
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *binding.zone_load.lock() = Some(ZoneLoad {
+        zone,
+        entered: entered_tx,
+        resume: resume_rx,
+    });
+    factory.install(&sibling, binding.clone());
+    let pool = start_pool(scheduler.clone(), factory, 1);
+    let authority = enqueue_root(&scheduler, &sibling, generation);
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!binding.address_space_is_retiring());
+    let page = root.lifecycle_page();
+    let _close = TerminalCustody::<Process, Live>::close_admission(&*page);
+    let entry_binding = carrick_core_abi::ExecutionBinding {
+        task: carrick_core_abi::EntryTaskKey::from_raw(key.tid.raw() as u64),
+        generation: carrick_core_abi::SnapshotGeneration::from_raw(generation.raw()),
+        mm: carrick_core_abi::EntryMmKey::from_raw(mm),
+        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(key.serial.raw()),
+    };
+    if terminal {
+        let entry = control.entry().unwrap();
+        let identity = ThreadTerminalIdentity::from_exit(
+            entry_binding,
+            Some(entry),
+            carrick_sched_core::process::TerminationStatus::SUCCESS,
+        )
+        .unwrap();
+        let (custody, mut membership) = TerminalCustody::<Thread, Live>::admitted(identity)
+            .begin()
+            .reserve_member(&*page, control)
+            .unwrap_or_else(|_| panic!("native member"));
+        custody
+            .retire_zone_current(
+                control,
+                &mut membership,
+                entry_binding,
+                carrick_core_abi::BornInZoneSource { zone, slot },
+                id,
+            )
+            .unwrap();
+        carrick_core::lifecycle::retire_cancelled_pool_member(&*page, entry, control, membership)
+            .unwrap();
+    } else {
+        // Failure cleanup can release the same record but has no terminal
+        // provenance. Process close and absence alone must still fail closed.
+        assert_eq!(
+            zone.release_current(slot, id, &carrick_sched_core::ShortLockSpin),
+            carrick_sched_core::CurrentRelease::Released,
+        );
+    }
+    assert!(zone.live(record).is_none());
+    assert!(
+        control.host_retirement().is_none(),
+        "native intent precedes host receipt"
+    );
+    assert!(root.exact_thread_is_live());
+    resume_tx.send(()).unwrap();
+    drop(authority);
+    let shutdown = pool.shutdown();
+    if !terminal {
+        assert_eq!(
+            shutdown
+                .expect_err("absence is not terminal authority")
+                .retired_workers(),
+            1
+        );
+        assert_eq!(binding.progress.load(Ordering::SeqCst), 0);
+        assert_eq!(binding.reaped_settlements.load(Ordering::SeqCst), 0);
+        return;
+    }
+    let report = shutdown.expect("native terminal decline must preserve the worker");
+    assert_eq!(report.created(), report.joined());
+    assert_eq!(report.created(), report.destroyed());
+    assert_eq!(binding.progress.load(Ordering::SeqCst), 0);
+    assert_eq!(binding.reaped_settlements.load(Ordering::SeqCst), 1);
 }
