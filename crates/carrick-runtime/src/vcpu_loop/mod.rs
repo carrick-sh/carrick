@@ -4420,6 +4420,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn serial_host_fault_owner_wait_retired_receipt_cancels_without_signal() {
+        exercise_owner_wait_completion_at_fault(
+            carrick_abi::syscall::nr::FSTAT,
+            None,
+            false,
+            false,
+            false,
+            false,
+            (None, Some(true)),
+        );
+    }
+
+    #[test]
     fn serial_host_native_ipc_owner_wait_cancellation_from_el0() {
         exercise_owner_wait_schedule_at(
             carrick_abi::syscall::nr::READ,
@@ -5748,8 +5761,10 @@ pub(crate) mod tests {
                     );
 
                     if retire_receipt {
-                        release_tx.send(()).unwrap();
-                        peer.take().unwrap().join().unwrap();
+                        if let Some(peer) = peer.take() {
+                            release_tx.send(()).unwrap();
+                            peer.join().unwrap();
+                        }
                         let entry = zone
                             .space_entry(NonZeroU64::new(mm.raw()).unwrap())
                             .unwrap();
@@ -5971,6 +5986,16 @@ pub(crate) mod tests {
                         if !retire_receipt {
                             release_tx.send(()).unwrap();
                         }
+                    } else if retire_receipt {
+                        assert!(matches!(completed, executor::ExecutorExit::Exited));
+                        assert!(matches!(job.phase, HvpatchProductionPhase::Complete));
+                        assert!(matches!(
+                            job.terminal_result,
+                            Some(Ok(VcpuLoopOutcome::ThreadDone))
+                        ));
+                        assert!(engine.completed_syscalls.is_empty());
+                        assert_eq!(engine.native_owner_cancellations, 0);
+                        assert_eq!(engine.prepared_commits, 0);
                     } else if killing {
                         assert!(
                             matches!(
@@ -6069,8 +6094,12 @@ pub(crate) mod tests {
                     }
                     let lease = resumed_submission.take_execution_lease().unwrap();
                     resumed.restore_lease(lease).unwrap();
-                    scheduler.settle_runnable_successor(resumed).unwrap();
-                    if !killing {
+                    if retire_receipt && !native {
+                        scheduler.settle_exited(resumed).unwrap();
+                    } else {
+                        scheduler.settle_runnable_successor(resumed).unwrap();
+                    }
+                    if !killing && !retire_receipt {
                         assert_eq!(
                             engine.prepared_commits,
                             usize::from(recvfrom)
