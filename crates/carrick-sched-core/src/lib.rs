@@ -2171,6 +2171,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return Err(Exhausted);
         }
         record.set_identity(identity);
+        // SAFETY: alloc_bit and advance_incarnation give this allocator
+        // exclusive custody of the unpublished record before Claim::Free.
+        unsafe {
+            *record.ctx.get() = C::new_zeroed();
+        }
         record.result.store(0, Ordering::Relaxed);
         record.handback.store(0, Ordering::Relaxed);
         record.first_entry.store(NIL, Ordering::Relaxed);

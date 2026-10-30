@@ -3714,3 +3714,77 @@ fn reservation_supply_requests(count: usize) -> usize {
     }
     requests
 }
+
+#[test]
+fn unmanaged_thread_birth_reusing_freed_record_does_not_observe_stale_mm() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    assert!(fixture.control.publish_visible_tid(41));
+
+    let stale_record = fixture
+        .zone
+        .alloc_record(carrick_sched_core::ThreadIdentity {
+            tid: 90,
+            serial: 190,
+            mm: 99,
+            file_table: 9,
+            generation: 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    unsafe {
+        *fixture.zone.record(stale_record).ctx_mut() =
+            Aarch64ParkedContext::from_register(ThreadCtx::ZERO, 0x90000, 99, 7);
+    }
+    fixture.zone.free_record(stale_record);
+
+    let child_control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
+    let stocked_entry = fixture
+        .page
+        .stock(
+            0,
+            carrick_el1_abi::EntryIdentity {
+                tid: 42,
+                visible_tid: 42,
+                thread_serial: 102,
+                birth: carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                ),
+                uid_credit: 1,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(stocked_entry, child_control as *const _ as u64)
+        .unwrap();
+
+    let mut service = fixture.process_service();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 220;
+    frame.x[..6].copy_from_slice(&[0x50f00, VA + 0x1000, 0, 0, 0, 0]);
+    assert!(matches!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+            | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+    ));
+    assert_eq!(frame.x[0], 42);
+
+    assert_eq!(
+        fixture.zone.record(stale_record).identity().tid,
+        42,
+        "unmanaged birth must reuse the freed record slot"
+    );
+    let child_address = unsafe {
+        (*fixture.zone.record(stale_record).ctx_mut())
+            .address_context()
+            .expect("prepare_child must seed caller address context on unmanaged birth")
+    };
+    assert_eq!(
+        child_address.mm.raw().get(),
+        1,
+        "reused record must carry caller MM, never a freed predecessor's MM"
+    );
+}
