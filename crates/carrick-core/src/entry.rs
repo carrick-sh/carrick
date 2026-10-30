@@ -265,12 +265,39 @@ pub fn prepare_handoff<C: EntryContext>(
         record: record_binding(binding, source, record)?,
     })
 }
+pub type RecordReleaseHook = fn(usize, carrick_sched_core::SlotId, carrick_sched_core::RecordRef);
+
+static RECORD_RELEASE_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the notification hook invoked after an `OnCpu` or home record is
+/// released from its slot (parked, yielded, or retired).
+pub fn set_record_release_hook(hook: RecordReleaseHook) {
+    RECORD_RELEASE_HOOK.store(
+        hook as *const () as usize,
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
 impl<C: EntryContext> HandoffStart<'_, C> {
     fn published_yield(self, published: bool) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         published.then(|| self.published())
     }
 
     pub(crate) fn published(self) -> carrick_core_abi::EntryHandoffReceipt<C> {
+        let raw = RECORD_RELEASE_HOOK.load(core::sync::atomic::Ordering::Acquire);
+        if raw != 0 {
+            // SAFETY: `set_record_release_hook` only stores valid `RecordReleaseHook` function pointers.
+            let hook = unsafe { core::mem::transmute::<usize, RecordReleaseHook>(raw) };
+            hook(
+                core::ptr::from_ref(self.source.zone).addr(),
+                self.source.slot,
+                carrick_sched_core::RecordRef {
+                    id: self.record.record,
+                    incarnation: self.record.incarnation.0,
+                },
+            );
+        }
         // SAFETY: callers invoke this only after their existing exact-record
         // publication succeeds, using the captured prepublication custody.
         unsafe {

@@ -614,17 +614,25 @@ fn exec_publication_retires_late_ledger_entry() {
     for seed in 0..32 {
         let (_, contexts) = pair();
         let kernel = contexts[0].kernel().clone();
-        let born = kernel
+        let prepared = kernel
             .reserve_thread_clone(&contexts[1], thread_plan(), None)
             .unwrap()
             .prepare(ThreadId::from_guest_supplied_tid(3))
-            .unwrap()
-            .record_birth();
+            .unwrap();
+        // record_birth settles a birth that already happened. Match that
+        // production contract before publishing the prepared kernel thread.
+        contexts[1].lifecycle_page().thread_born().unwrap();
+        let born = prepared.record_birth();
         // Force the real settled view to publish the one ledger birth.
         let root = kernel
             .context(contexts[0].task().key().id, contexts[0].thread().key().tid)
             .unwrap();
         assert_eq!(root.task().threads().len(), 3);
+        assert_eq!(
+            root.lifecycle_page().live(),
+            3,
+            "ledger fixture must account for its already-born thread"
+        );
         let peer = kernel
             .reserve_fork(
                 &root,

@@ -16,6 +16,7 @@ use super::objects::{
     ThreadRef, ThreadResources,
 };
 use super::operations::{KernelFailpoint, TaskGraphReservation};
+use super::registry::RegistryWriteGuardExt;
 
 struct ExecReservation {
     kernel: Arc<Kernel>,
@@ -484,7 +485,14 @@ impl Kernel {
         }
         let transaction = reservation.transaction;
         let leader_tid = LinuxTid::for_task_leader(prepared.task.id);
-        let (task, revision, replacement_tid) = {
+        let (
+            task,
+            revision,
+            replacement_tid,
+            caller_identity,
+            replacement_identity,
+            replacement_mm,
+        ) = {
             let state = self.registry().settled().write();
             if state
                 .reservations
@@ -538,12 +546,37 @@ impl Kernel {
             {
                 return Err(ExecError::StalePreparation);
             }
+            let caller_identity =
+                super::objects::host_birth_identity(prepared.task, prepared.caller)
+                    .ok_or(ExecError::StalePreparation)?;
+            let replacement_identity =
+                super::objects::host_birth_identity(prepared.task, prepared.replacement.key())
+                    .ok_or(ExecError::StalePreparation)?;
+            let replacement_mm =
+                carrick_el1_abi::EntryMmKey::from_raw(prepared.shared.mm().id().raw());
+            let _ = carrick_core::terminal::HostExecReceipt::from_parts(
+                caller_identity,
+                replacement_identity,
+                replacement_mm,
+            )
+            .ok_or(ExecError::StalePreparation)?;
+            self.registry()
+                .thread_ledger()
+                .reserve_native_reaps(retired_count)
+                .map_err(|_| ExecError::RetiredThreadCapacity(retired_count))?;
             state
                 .retired_threads
                 .try_reserve_exact(retired_count)
                 .map_err(|_| ExecError::RetiredThreadCapacity(retired_count))?;
             check_exec_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
-            (task, revision, replacement_tid)
+            (
+                task,
+                revision,
+                replacement_tid,
+                caller_identity,
+                replacement_identity,
+                replacement_mm,
+            )
         };
 
         // This is the only blocking part of commit and happens with no kernel
@@ -581,6 +614,7 @@ impl Kernel {
         {
             return Err(ExecError::StalePreparation);
         }
+        let lifecycle = prepared.old_caller.control_lease().lifecycle();
         // The predecessor image is quiesced and admission is still closed.
         record.thread_pool.revoke_unused();
         record.task.clear_thread_adoption_factory();
@@ -593,11 +627,21 @@ impl Kernel {
             .task
             .replace_process_credentials(prepared.resources.credentials());
         record.task.reset_dumpable_for_exec();
+        let mut non_caller_predecessors = Vec::with_capacity(old_threads.len().saturating_sub(1));
+        let mut caller_published = None;
         for (tid, (_, thread)) in &old_threads {
             // The host owner completes exec; the shared in-ring owner has no
             // replacement receipt. Revoke every predecessor stamp, including
             // the old leader, so stale shared identity dispatch fails closed.
             thread.control_slot().retire_identity();
+            if thread.key() == prepared.caller {
+                caller_published = record.thread_pool.take_published(thread.key());
+            } else {
+                non_caller_predecessors.push((
+                    Arc::clone(thread),
+                    record.thread_pool.take_published(thread.key()),
+                ));
+            }
             if *tid == leader_tid {
                 continue;
             }
@@ -623,6 +667,93 @@ impl Kernel {
             revision,
         );
         reservations.remove(&prepared.task.id);
+        let retiring = state.retiring_capability();
+        for (thread, published) in non_caller_predecessors {
+            let identity = super::objects::host_birth_identity(prepared.task, thread.key())
+                .unwrap_or_else(|| {
+                    carrick_fatal::carrick_fatal!(
+                        "kernel::exec",
+                        "exec predecessor lost host birth identity"
+                    )
+                });
+            let membership = carrick_core::terminal::reserve_host_thread_exit_membership(
+                &*lifecycle,
+                thread.control_slot(),
+            )
+            .unwrap_or_else(|error| {
+                carrick_fatal::carrick_fatal!(
+                    "kernel::exec",
+                    "exec predecessor lost host exit membership: {error:?}"
+                )
+            })
+            .commit_zone_retirement(&retiring);
+            if let Some(owned) = published {
+                let ticket = membership
+                    .retire_published(owned.entry, &*owned.control, &retiring)
+                    .unwrap_or_else(|error| {
+                        carrick_fatal::carrick_fatal!(
+                            "kernel::exec",
+                            "exec predecessor lost exact ABI custody: {error:?}"
+                        )
+                    });
+                if let Some(ticket) = ticket {
+                    self.registry()
+                        .thread_ledger()
+                        .defer_native_reap(ticket, owned.control.clone());
+                }
+            } else {
+                membership.publish();
+            }
+            lifecycle.publish_exact_host_retirement(thread.control_slot(), identity.retirement());
+        }
+        let exec_receipt = if let Some(owned) = caller_published {
+            carrick_core::terminal::HostExecCallerMembership::retire_to_replacement_leader(
+                &*lifecycle,
+                owned.entry,
+                prepared.old_caller.control_slot(),
+                caller_identity,
+                prepared.replacement.control_slot(),
+                replacement_identity,
+                replacement_mm,
+                &retiring,
+            )
+            .unwrap_or_else(|error| {
+                carrick_fatal::carrick_fatal!(
+                    "kernel::exec",
+                    "exec caller pool retirement failed: {error:?}"
+                )
+            })
+        } else {
+            carrick_core::terminal::HostExecCallerMembership::transfer_leader_to_replacement(
+                &*lifecycle,
+                prepared.old_caller.control_slot(),
+                caller_identity,
+                prepared.replacement.control_slot(),
+                replacement_identity,
+                replacement_mm,
+                &retiring,
+            )
+            .unwrap_or_else(|error| {
+                carrick_fatal::carrick_fatal!(
+                    "kernel::exec",
+                    "exec caller leader transfer failed: {error:?}"
+                )
+            })
+        };
+        lifecycle.publish_exact_host_retirement(
+            prepared.old_caller.control_slot(),
+            caller_identity.retirement(),
+        );
+        if !prepared
+            .replacement
+            .control_slot()
+            .publish_host_exec_receipt(exec_receipt)
+        {
+            carrick_fatal::carrick_fatal!(
+                "kernel::exec",
+                "exec replacement rejected host exec receipt"
+            );
+        }
         prepared.guard.commit_reservation();
         drop(state);
         drop(old_threads);
@@ -1826,5 +1957,165 @@ mod tests {
         let err = ExecPrepareError::InvalidHostPid(e);
         assert_eq!(err.to_errno(), LINUX_EINVAL);
         assert_eq!(LinuxErrno::from(err), LINUX_EINVAL);
+    }
+
+    #[test]
+    fn committed_exec_from_pool_born_sibling_settles_predecessors_and_publishes_receipt() {
+        use carrick_core::lifecycle::{
+            EntryState, Lifecycle, MemberExitKind, recorded_member_exit_kind,
+        };
+        use carrick_el1_abi::{BlockedMask, BornRecord, El1TaskId, EntryMmKey};
+
+        let (kernel, root) = bootstrap(9_280);
+        let thread_plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD
+                | LinuxCloneFlags::SIGHAND
+                | LinuxCloneFlags::VM
+                | LinuxCloneFlags::FS
+                | LinuxCloneFlags::FILES,
+        )
+        .expect("thread plan");
+        // Prime the standing thread pool.
+        let priming = kernel
+            .clone_thread(
+                &root,
+                thread_plan,
+                ThreadId::synthetic_for_tests(9_281),
+                None,
+            )
+            .expect("priming thread");
+        kernel.exit_thread(&priming, None).expect("exit priming");
+
+        let page = root.thread().control_lease().lifecycle();
+        let birth_pool_thread = |caller: &KernelContext| {
+            let claim = page.claim_any().expect("claim pool entry");
+            let entry = claim.entry();
+            let identity = page.identity(entry).expect("pool identity");
+            let control = {
+                let state = kernel.registry().settled().read();
+                let record = state.tasks.get(&root.task().key().id).expect("task record");
+                record
+                    .thread_pool
+                    .control_for_entry(entry)
+                    .expect("pooled entry")
+            };
+            control
+                .reset_for_birth(BlockedMask(0), 0, entry)
+                .expect("reset control for birth");
+            page.thread_born().expect("thread_born");
+            page.record_born(
+                claim,
+                BornRecord {
+                    caller_task: El1TaskId::from_linux_tid(caller.thread().key().tid.raw()).raw(),
+                    caller_serial: caller.thread().key().serial.raw(),
+                    clone_flags: (LinuxCloneFlags::THREAD
+                        | LinuxCloneFlags::SIGHAND
+                        | LinuxCloneFlags::VM
+                        | LinuxCloneFlags::FS
+                        | LinuxCloneFlags::FILES)
+                        .bits(),
+                    clear_child_tid: 0,
+                    blocked: BlockedMask(0),
+                },
+            )
+            .expect("record_born");
+            let tid = LinuxTid::from_abi_positive(identity.tid as i32).expect("pool tid");
+            let context = kernel
+                .context(root.task().key().id, tid)
+                .expect("settle pool birth");
+            (entry, control, context)
+        };
+
+        let leader_refresh = kernel
+            .context(root.task().key().id, root.thread().key().tid)
+            .expect("leader context");
+        let (sibling_entry, sibling_control, sibling) = birth_pool_thread(&leader_refresh);
+        let (caller_entry, caller_control, caller) = birth_pool_thread(&leader_refresh);
+        assert_eq!(page.live(), 3);
+        assert_eq!(
+            page.state(sibling_entry.index()),
+            Some((sibling_entry.generation(), EntryState::Published))
+        );
+        assert_eq!(
+            page.state(caller_entry.index()),
+            Some((caller_entry.generation(), EntryState::Published))
+        );
+
+        let leader_identity =
+            super::super::objects::host_birth_identity(root.task().key(), root.thread().key())
+                .expect("leader birth identity");
+        let sibling_identity =
+            super::super::objects::host_birth_identity(root.task().key(), sibling.thread().key())
+                .expect("sibling birth identity");
+        let caller_identity =
+            super::super::objects::host_birth_identity(root.task().key(), caller.thread().key())
+                .expect("caller birth identity");
+
+        let prepared = kernel.prepare_exec(&caller, None).expect("prepare exec");
+        let committed = kernel.commit_exec(prepared, None).expect("commit exec");
+
+        assert_eq!(
+            page.live(),
+            1,
+            "sole surviving live unit transfers to replacement"
+        );
+        assert_eq!(
+            page.state(sibling_entry.index()),
+            Some((sibling_entry.generation(), EntryState::Reaped)),
+            "non-caller pool entry must be reaped at exec commit"
+        );
+        assert_eq!(
+            page.state(caller_entry.index()),
+            Some((caller_entry.generation(), EntryState::Reaped)),
+            "exec caller pool entry must be reaped at exec commit"
+        );
+        assert_eq!(
+            recorded_member_exit_kind(&*sibling_control, Some(sibling_entry)),
+            MemberExitKind::HostRetiring
+        );
+        assert_eq!(
+            recorded_member_exit_kind(&*caller_control, Some(caller_entry)),
+            MemberExitKind::HostRetiring
+        );
+        assert!(
+            root.thread()
+                .control_slot()
+                .host_retirement()
+                .is_some_and(|receipt| receipt.acknowledges(leader_identity))
+        );
+        assert!(
+            sibling_control
+                .host_retirement()
+                .is_some_and(|receipt| receipt.acknowledges(sibling_identity))
+        );
+        assert!(
+            caller_control
+                .host_retirement()
+                .is_some_and(|receipt| receipt.acknowledges(caller_identity))
+        );
+
+        let replacement_identity = super::super::objects::host_birth_identity(
+            committed.task().key(),
+            committed.thread().key(),
+        )
+        .expect("replacement birth identity");
+        let expected_receipt = carrick_core::terminal::HostExecReceipt::from_parts(
+            caller_identity,
+            replacement_identity,
+            EntryMmKey::from_raw(committed.shared().mm().id().raw()),
+        )
+        .expect("expected host exec receipt");
+        assert_eq!(
+            committed.thread().control_slot().host_exec_receipt(),
+            Some(expected_receipt)
+        );
+        assert!(
+            committed
+                .thread()
+                .control_slot()
+                .take_host_exec_receipt(expected_receipt)
+        );
+        assert_eq!(committed.thread().control_slot().host_exec_receipt(), None);
+        kernel.validate_invariants().expect("kernel invariants");
     }
 }
