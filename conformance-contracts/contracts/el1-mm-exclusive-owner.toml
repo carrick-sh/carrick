@@ -1,3 +1,6 @@
+# #1044: owned-yield replies are typed separately from memory preparation.
+# The retained IPC/CarrierWork seam bindings below cover that API change;
+# existing fork, lifecycle, file and inotify acceptance remains unchanged.
 # #1101: fork lifecycle backing uses retained metadata custody.
 # MM editor admission and exclusion are unchanged; the lifecycle backing remains in the same kernel-only metadata aperture.
 # The component ownership/counter witnesses are registered under
@@ -18,6 +21,7 @@ rationale = "Exclusive ownership forbids host semantic protection, COW, VMA proj
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::native_process_runtime::host_test_support::ipc_busy_yield_retains_operation_and_pin_through_carrier_work (owned-yield reply typing and exact token/pin custody only)",
   "carrick-hal::fork_stock::tests::{exec_replacement_absorbs_pending_descriptor_tables_with_peer_live,exec_replacement_rejects_stale_predecessor_incarnation} (pending native descriptor grants move into exact predecessor retirement custody across exec; failed clear retains release progress, peer remains live, stale predecessor incarnation refuses; HAL component only, native exec adoption and signed execution remain unresolved)",
   "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_child_empty_supply_resumes_cow_without_changing_parent",
   "carrick-el1-linux::mm_portal::tests::bounded_backing_prefix_does_not_publish_beyond_readable_tail",

@@ -30,11 +30,24 @@ pub struct CopyoutRequest {
 #[derive(Debug)]
 pub enum CopyoutPreparation {
     Ready(carrick_sched_core::object_wait::OperationToken),
+    /// Transient admission contention without an enrollable owner dependency.
+    Busy(carrick_sched_core::object_wait::OperationToken),
     Wait {
         operation: carrick_sched_core::object_wait::OperationToken,
         wait: carrick_core_abi::PortalOwnerWait,
     },
     Fault(carrick_sched_core::object_wait::OperationToken),
+    Unrouted(carrick_sched_core::object_wait::OperationToken),
+    Complete(i64),
+    Suspended,
+}
+
+/// An owned execution yield cannot request another memory preparation.
+/// Keeping this reply distinct prevents Busy from becoming a retry loop in
+/// the yield venue itself; a native owner suspends through CarrierWork.
+#[derive(Debug)]
+pub enum OwnedOperationYield {
+    Ready(carrick_sched_core::object_wait::OperationToken),
     Unrouted(carrick_sched_core::object_wait::OperationToken),
     Complete(i64),
     Suspended,
