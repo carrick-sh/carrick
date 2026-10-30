@@ -1186,7 +1186,7 @@ impl Kernel {
             if interest.context.exact_thread_is_live()
                 && interest.context.shared().mm().id().raw() == identity.mm
                 && let NativeWaitSource::RecordRetirement { record, recheck } = &interest.source
-                && zone.live(*record).is_none()
+                && zone.host_resume_readiness(*record).is_none()
             {
                 recheck();
             }
