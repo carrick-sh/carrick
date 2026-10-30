@@ -2446,6 +2446,15 @@ wrapper; it does not execute guest instructions.
 This is constant work per member; the signed parked-thread exit-group stress
 remains director-owned on HVF.
 
+`executor_failure_after_exit_group_keeps_thread_done_and_finishes_owner`
+removes a sibling through real Kernel process exit before syscall context
+recapture. The failed capture must retain the member's previously admitted
+exact context for executor-failure settlement. That settlement withdraws the
+registry member, returns its host retirement receipt and publishes `ThreadDone`
+so the neutral exit owner can complete. Guest syscall dispatch still
+requires a fresh successful capture. Retirement remains constant work per
+member through the existing terminal-owner path.
+
 ### Interrupted-sleep remainder publication (#986 Slice 1)
 
 `kernel.memory.owner-wait` includes the frozen remainder from an interrupted
