@@ -1296,6 +1296,9 @@ where
         &mut TrapFrame,
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 {
+    if control.synchronous_fault().is_some() && !classified_fault_entry_permitted(frame.esr) {
+        return Err(super::native_process_runtime::NativeProcessError::Invalid);
+    }
     if carrick_el1::substrate::sched::NativeEntryVenue::select_with_lifecycle(
         source.zone,
         source.slot,
@@ -1304,25 +1307,43 @@ where
         control,
     ) != carrick_el1::substrate::sched::NativeEntryVenue::SignalOwner
     {
+        // A sibling's exec/exit may have closed admission after publication.
+        // Return a terminal fallback through the host's existing core/exit path;
+        // retaining an awaiting-owner payload here would re-enter forever.
+        if !carrick_el1_abi::Lifecycle::gate(page).serves_ring()
+            && control.synchronous_fault().is_some()
+        {
+            control.synchronous_fault_default();
+        }
         return Ok(Action::Forward);
     }
     // A host-classified fault returns through the durable signal checkpoint.
     // It is a fault return, never fatal-owner cancellation or syscall restart.
     if let Some((_, _, address, _)) = control.synchronous_fault() {
-        frame.esr = 0x9200_0004;
+        frame.esr = HOST_CLASSIFIED_DATA_ABORT_ESR;
         frame.far = address;
     }
-    declined_fault_admission_result(super::aarch64_process::deliver_declined_fault_signal_with(
-        source,
-        task,
-        native,
-        ttbr0,
-        page,
-        control,
-        service,
-        frame.far,
-        |process| deliver(process, frame),
-    ))
+    let action = declined_fault_admission_result(
+        super::aarch64_process::deliver_declined_fault_signal_with(
+            source,
+            task,
+            native,
+            ttbr0,
+            page,
+            control,
+            service,
+            frame.far,
+            |process| deliver(process, frame),
+        ),
+    )?;
+    // Admission can also close between venue selection and the owner retain.
+    if action == Action::Forward
+        && !carrick_el1_abi::Lifecycle::gate(page).serves_ring()
+        && control.synchronous_fault().is_some()
+    {
+        control.synchronous_fault_default();
+    }
+    Ok(action)
 }
 
 /// Admission refusals precede signal publication; the loaded host executor
@@ -1425,6 +1446,17 @@ pub(crate) fn arm_deliver_declined_fault_signal(frame: &mut TrapFrame) -> Action
     .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding))
 }
 
+/// Lower-EL data abort, translation fault at level 0, used only to carry the
+/// host-classified fault into the shared signal-frame builder.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+const HOST_CLASSIFIED_DATA_ABORT_ESR: u64 = 0x9200_0004;
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn classified_fault_entry_permitted(esr: u64) -> bool {
+    // NativeOwnerCancel is the explicit host-to-owner fault checkpoint.
+    esr == 0xfffc || matches!((esr >> 26) & 0x3f, 0x20 | 0x24)
+}
+
 /// The one native signal checkpoint at the actual EL0 return boundary. The
 /// syscall work ledger and scheduler resume result have already settled here;
 /// IRQ, fault and SVC returns all pass through the same owner.
@@ -1438,6 +1470,12 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         .and_then(|task| task.lifecycle_refs())
         .is_some_and(|(_, control)| control.synchronous_fault().is_some())
     {
+        // A retained fault on a syscall/IRQ return is a broken entry binding.
+        // Reject before the declined-fault prefix can rewrite the syndrome or
+        // consume the syscall's unbudgeted service-exit stack envelope.
+        if !classified_fault_entry_permitted(frame.esr) {
+            invalid_completion(NativeInvariant::EntryBinding);
+        }
         return arm_deliver_declined_fault_signal(frame);
     }
     let fatal_owner_cancel = frame.esr == 0xfffc;

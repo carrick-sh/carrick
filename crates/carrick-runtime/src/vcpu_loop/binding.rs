@@ -5226,6 +5226,21 @@ where
             && let Some((signal, code, address, default)) =
                 thread.control_slot().synchronous_fault()
         {
+            let default = if default {
+                true
+            } else {
+                match engine.enter_native_fault_signal() {
+                    Ok(carrick_hal::NativeFaultSignalEntry::Entered) => false,
+                    Ok(carrick_hal::NativeFaultSignalEntry::NoVenue) => {
+                        thread.control_slot().synchronous_fault_default();
+                        true
+                    }
+                    Err(error) => {
+                        thread.control_slot().clear_synchronous_fault();
+                        return Err(error.into());
+                    }
+                }
+            };
             if default {
                 let context = self
                     .kernel
@@ -5252,8 +5267,6 @@ where
                 )? {
                     return Ok(self.enter_terminal_with_outcome(engine, outcome));
                 }
-            } else {
-                engine.enter_native_fault_signal()?;
             }
         }
         self.state

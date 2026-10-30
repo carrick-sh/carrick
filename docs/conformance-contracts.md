@@ -2792,7 +2792,15 @@ no polling, extra execution pool or second signal frame builder is introduced.
 
 VM-free bindings cover both numeric payloads, native handler frames, selected
 default, ignored and blocked actions, and action replacement before delivery.
-The retained-home Busy witness exercises the same admission path. The existing
+The retained-home Busy witness exercises the same admission path, then releases
+the holder and requires successful delivery with no retained payload. Engines
+without a native fault entry (currently x86, seam #1084) return a typed absent
+venue; runtime preserves signal termination and clears the published payload.
+A two-live-thread witness publishes a fault while a sibling wins exit_group;
+closed admission returns a terminal fallback verdict rather than retrying the
+owner checkpoint. A retained payload is admitted only on an actual fault or
+the explicit host-fault checkpoint, never on a syscall or interrupt return.
+These paths use bounded slot reads and one settlement without polling. The existing
 `siglongjmpaltstack` probe now recovers from real MAPERR and file-past-EOF faults
 through `siglongjmp`, and checks default and blocked signal 11 in fork children
 with a five-second pipe wait. Its updated source requires deliberate native

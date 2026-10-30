@@ -2658,6 +2658,11 @@ impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
         self.trap.inject_signal(signal)
     }
+    fn enter_native_fault_signal(
+        &mut self,
+    ) -> Result<carrick_hal::NativeFaultSignalEntry, TrapError> {
+        self.trap.enter_native_fault_signal()
+    }
     fn last_syscall_nr(&self) -> Option<u64> {
         self.trap.last_syscall_nr()
     }
@@ -2726,6 +2731,8 @@ mod tests {
         syscalls: std::collections::VecDeque<carrick_hal::RawSyscall>,
         restored_sigframes: usize,
         execve_calls: usize,
+        native_fault_entry: Option<carrick_hal::NativeFaultSignalEntry>,
+        native_fault_entries: usize,
         memory: std::collections::BTreeMap<u64, u8>,
     }
 
@@ -2785,9 +2792,38 @@ mod tests {
             Ok(())
         }
 
+        fn enter_native_fault_signal(
+            &mut self,
+        ) -> Result<carrick_hal::NativeFaultSignalEntry, TrapError> {
+            self.native_fault_entries += 1;
+            Ok(self
+                .native_fault_entry
+                .unwrap_or(carrick_hal::NativeFaultSignalEntry::NoVenue))
+        }
+
         fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
             self.restored_sigframes += 1;
             Ok(0)
+        }
+    }
+
+    #[test]
+    fn split_view_preserves_native_fault_entry_result() {
+        for entry in [
+            carrick_hal::NativeFaultSignalEntry::Entered,
+            carrick_hal::NativeFaultSignalEntry::NoVenue,
+        ] {
+            let mut memory = RetryCompletionTrap::default();
+            let mut trap = RetryCompletionTrap {
+                native_fault_entry: Some(entry),
+                ..Default::default()
+            };
+            let mut view = SplitView {
+                mem: &mut memory,
+                trap: &mut trap,
+            };
+            assert_eq!(view.enter_native_fault_signal().unwrap(), entry);
+            assert_eq!(trap.native_fault_entries, 1);
         }
     }
 

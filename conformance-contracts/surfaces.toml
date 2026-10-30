@@ -475,7 +475,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.signal.socket-restart", "ke
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/runtime.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.el1.gic"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-conformance-next/tests/syscall_write_destinations.rs"
@@ -1545,7 +1545,7 @@ contracts = ["core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/dispatch.rs"
-contracts = ["kernel.el1.ipc-two-process", "process.native.arm-admission", "core.entry.completion", "core.personality.files", "kernel.el1.ipc-fd-authority", "process.exec.custody"]
+contracts = ["kernel.el1.ipc-two-process", "process.native.arm-admission", "core.entry.completion", "core.personality.files", "kernel.el1.ipc-fd-authority", "process.exec.custody", "kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/trap.rs"
@@ -2063,7 +2063,7 @@ contracts = ["kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/lib.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/binding.rs"
@@ -2148,3 +2148,7 @@ contracts = ["kernel.memory.owner-wait"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fd_wait/tests.rs"
 contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-x86/src/engine.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]

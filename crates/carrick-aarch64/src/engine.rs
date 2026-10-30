@@ -5009,7 +5009,9 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         Ok(())
     }
 
-    fn enter_native_fault_signal(&mut self) -> Result<(), TrapError> {
+    fn enter_native_fault_signal(
+        &mut self,
+    ) -> Result<carrick_hal::NativeFaultSignalEntry, TrapError> {
         use carrick_hal::RegAccess as _;
         self.pending_resume_pc = None;
         if self.get_reg(Reg::Pstate)? & 0xf != 0 {
@@ -5020,7 +5022,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         }
         self.vcpu
             .get_mut()
-            .cancel_native_owner_wait(carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0)
+            .cancel_native_owner_wait(carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0)?;
+        Ok(carrick_hal::NativeFaultSignalEntry::Entered)
     }
 
     fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {

@@ -42,8 +42,8 @@ pub mod stage1_mm;
 
 pub mod trap;
 pub use trap::{
-    ExecInventoryCommits, HostAliasBacking, HostAliasOwnedFd, HostAliasSharing, RawSyscall,
-    SignalInjection, SyscallTrap, TrapError,
+    ExecInventoryCommits, HostAliasBacking, HostAliasOwnedFd, HostAliasSharing,
+    NativeFaultSignalEntry, RawSyscall, SignalInjection, SyscallTrap, TrapError,
 };
 pub mod vm_backend;
 pub use vm_backend::{ForkRamStrategy, GuestVmBackend};
