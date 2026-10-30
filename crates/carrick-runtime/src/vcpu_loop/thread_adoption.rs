@@ -157,7 +157,9 @@ pub(super) enum ThreadAdoptionOrigin {
 
 pub(crate) enum BackendBirthTemplate {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    Hvf(carrick_vmm_hvf::hvf_aarch64_engine::HvpatchThreadBirthTemplate),
+    // Boxed: the HVF template is about 1.1 KiB and the test variant carries
+    // nothing, so an unboxed enum trips `clippy::large_enum_variant` on macOS.
+    Hvf(Box<carrick_vmm_hvf::hvf_aarch64_engine::HvpatchThreadBirthTemplate>),
     #[cfg(any(test, not(all(target_os = "macos", target_arch = "aarch64"))))]
     Test,
 }
@@ -312,7 +314,7 @@ pub(super) fn engine_thread_birth_template<E: ThreadedEngine + 'static>(
         return carrick_vmm_hvf::hvf_aarch64_engine::loaded_engine_thread_birth_template(
             engine, cpu,
         )
-        .map(|template| Some(BackendBirthTemplate::Hvf(template)));
+        .map(|template| Some(BackendBirthTemplate::Hvf(Box::new(template))));
     }
     let _ = (engine, cpu);
     #[cfg(test)]
