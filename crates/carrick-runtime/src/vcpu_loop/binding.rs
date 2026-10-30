@@ -8019,6 +8019,149 @@ mod tests {
     }
 
     #[test]
+    fn classified_fault_default_loses_to_sibling_exit_group_and_settles() {
+        for terminal_preempts in [false, true] {
+            let (_runtime, scheduler, kernel, root, process, _generation) =
+                test_carrier_graph_with_dispatcher!(72_435, SyscallDispatcher::new());
+            root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+            let sibling_tid = ThreadId::synthetic_for_tests(72_436);
+            let sibling = root
+                .kernel()
+                .reserve_thread_clone(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::THREAD
+                            | carrick_abi::LinuxCloneFlags::SIGHAND
+                            | carrick_abi::LinuxCloneFlags::VM,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .prepare(sibling_tid)
+                .unwrap()
+                .commit()
+                .unwrap()
+                .start_thread()
+                .unwrap()
+                .into_context();
+            assert_eq!(root.task().threads().len(), 2);
+            let control = root.thread().control_slot();
+            let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+            custody.commit_registration();
+            custody.commit_native_signal_owner();
+            control.publish_synchronous_fault(
+                carrick_personality_linux::signal::policy::Signal::SEGV,
+                1,
+                0x1234_5000,
+            );
+            // exit_group's production claim is held by the other live member.
+            let winner = kernel
+                .try_claim_persistent_process_exit(sibling_tid)
+                .unwrap();
+            assert_eq!(winner.claim, ProcessExitClaim::Owner);
+            control.synchronous_fault_default();
+            let tid = ThreadId::synthetic_for_tests(72_435);
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                Arc::new(ThreadRegistry::new(tid)),
+                Arc::new(FutexTable::new()),
+                Arc::new(NoopPlatformFutex),
+                Arc::new(|_| Arc::new(NoopPlatformFutex)),
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(root.thread())),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                tid,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.service_kernel_context = Some(root.retain_exact());
+            let mut job =
+                suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+            let mut engine = CrashCaptureTestEngine::default();
+            if terminal_preempts {
+                kernel.begin_process_exit();
+                let reject_descendant = |_, _| unreachable!();
+                let mut submission = executor::ExecutorSubmissionContext {
+                    registration: None,
+                    scheduler: &scheduler,
+                    publish_test_descendant: &reject_descendant,
+                    current: None,
+                    authority: executor::ExecutionLeaseAuthoritySlot::new(None),
+                    exec_replacement: None,
+                };
+                let need_resched = std::sync::atomic::AtomicBool::new(false);
+                let mut quantum =
+                    executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+                assert!(matches!(
+                    job.poll_with_engine(&mut engine, &mut quantum).unwrap(),
+                    executor::ExecutorExit::Exited
+                ));
+            } else {
+                // Use the same default consumer and terminal entry as poll_with_engine.
+                let outcome = super::super::signal::deliver_fault_signal(
+                    &kernel,
+                    &root,
+                    &mut engine,
+                    tid,
+                    kernel.fatal_signal.current_generation(),
+                    super::super::signal::FaultSignal {
+                        // The published verdict, not these stale host values,
+                        // owns the final signal and siginfo.
+                        signum: 7,
+                        si_code: 2,
+                        si_addr: 0xdead,
+                        interrupted_pc: None,
+                    },
+                    0,
+                )
+                .unwrap()
+                .expect("default fault must produce terminal outcome");
+                assert!(
+                    control.synchronous_fault().is_none(),
+                    "host consumes the default payload"
+                );
+                assert_eq!(engine.native_owner_cancellations, 0, "no native re-entry");
+                assert!(
+                    matches!(outcome, VcpuLoopOutcome::ProcessExit(ref result) if result.terminating_signal == Some(11))
+                );
+                let fatal = kernel
+                    .fatal_signal
+                    .recorded_for(kernel.fatal_signal.current_generation())
+                    .unwrap();
+                assert_eq!((fatal.signo, fatal.code, fatal.addr), (11, 1, 0x1234_5000));
+                assert!(matches!(
+                    job.enter_terminal_with_outcome(&mut engine, outcome),
+                    executor::ExecutorExit::Exited
+                ));
+            }
+            assert!(
+                control.synchronous_fault().is_none(),
+                "terminal preemption must consume the default payload too"
+            );
+            assert_eq!(engine.native_owner_cancellations, 0, "no native re-entry");
+            assert!(matches!(job.phase, HvpatchProductionPhase::Complete));
+            assert!(
+                matches!(job.terminal_result, Some(Ok(VcpuLoopOutcome::ThreadDone))),
+                "loser must not publish a competing process exit"
+            );
+            assert_eq!(
+                kernel
+                    .try_claim_persistent_process_exit(sibling_tid)
+                    .unwrap()
+                    .claim,
+                ProcessExitClaim::Owner
+            );
+            assert!(root.kernel().task_key_is_live(sibling.task().key()));
+            scheduler.close();
+        }
+    }
+
+    #[test]
     fn retired_host_wait_finishes_only_its_thread_without_guest_return() {
         let (_runtime, scheduler, kernel, root, process, _generation) =
             test_carrier_graph_with_dispatcher!(72_431, SyscallDispatcher::new());

@@ -1255,6 +1255,12 @@ where
     pub(super) fn withdraw_persistent_terminal_owner_runtime(&mut self, kernel: &Kernel) -> bool {
         let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 1);
+        // Terminal custody pre-empts any retained synchronous fault. This
+        // member cannot re-enter its signal owner after withdrawal, including
+        // when loop-top exit_group cancellation bypasses signal delivery.
+        if let Some(thread) = self.kernel_thread.as_ref() {
+            thread.control_slot().clear_synchronous_fault();
+        }
         let last = self.registry.exit(self.this_tid);
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 2);
         carrick_kernel::run_state::clear_guest_tid(self.this_tid.raw());
