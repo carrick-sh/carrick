@@ -49,13 +49,15 @@ impl Drop for RetirementEnrollment {
 }
 impl<I> Drop for PhysicalRetirementCompletion<I> {
     fn drop(&mut self) {
-        if self
-            .wait
-            .state
-            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            // As with PhysicalGrantCompletion, callbacks notify their owner;
+        if matches!(
+            self.wait
+                .state
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire),
+            Ok(_) | Err(2 | 3)
+        ) {
+            // Teardown may precede an already queued abandonment publication.
+            // The same enrollment guard authenticates both notifications and
+            // permits at most one wake. Callbacks only notify their owner;
             // they must not perform physical retirement inside producer Drop.
             self.wait.callbacks.publish(0);
         }
@@ -355,6 +357,28 @@ mod tests {
         let (_late, ready) = enroll(&wait, &count);
         assert!(ready);
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn abandoned_publication_survives_producer_drop_before_idle() {
+        for reason in [
+            RetirementAbandonReason::ProducerDropped,
+            RetirementAbandonReason::RecordRemoved,
+        ] {
+            let producer = PhysicalRetirementCompletion::new(identity());
+            let wait = producer.wait();
+            let count = Arc::new(AtomicUsize::new(0));
+            let (_enrollment, ready) = enroll(&wait, &count);
+            assert!(!ready);
+            let publication = producer.abandon(identity(), reason).unwrap().unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            drop(producer); // carrier teardown can precede the queued idle turn
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert_eq!(wait.state(), PhysicalRetirementState::Abandoned(reason));
+            assert_eq!(wait.receipt(), None);
+            publication.publish();
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
