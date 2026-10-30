@@ -202,6 +202,7 @@ enum ContinuationOrigin {
     Syscall(SyscallFrame),
     HostReadiness,
     RetainedMemory,
+    Fault,
 }
 
 #[derive(Debug)]
@@ -435,7 +436,9 @@ impl ContinuationAuthority {
     pub const fn syscall(&self) -> Option<SyscallFrame> {
         match self.origin {
             ContinuationOrigin::Syscall(frame) => Some(frame),
-            ContinuationOrigin::HostReadiness | ContinuationOrigin::RetainedMemory => None,
+            ContinuationOrigin::HostReadiness
+            | ContinuationOrigin::RetainedMemory
+            | ContinuationOrigin::Fault => None,
         }
     }
 
@@ -1751,6 +1754,22 @@ impl BlockedContinuation {
         Ok(Self::from_zone_park(capture, wait, None))
     }
 
+    /// A fault retains its CPU snapshot rather than a syscall completion.
+    /// Fatal cancellation must still wake it while the root holder runs.
+    pub fn from_fault_owner_zone_park(
+        context: &KernelContext,
+        lease: &crate::kernel::objects::ThreadExecutionLease,
+        wait: ZoneWait,
+    ) -> Result<Self, ContinuationBuildError> {
+        let capture = ContinuationCapture::capture_lease(
+            context,
+            lease,
+            ContinuationOrigin::Fault,
+            RestartClass::Never,
+        )?;
+        Ok(Self::from_killable_owner_zone_park(capture, wait))
+    }
+
     /// The zone record a zone wait parks on.
     pub fn zone_wait(&self) -> Option<&ZoneWait> {
         match &self.state().detail {
@@ -2373,6 +2392,10 @@ impl BlockedContinuation {
         let outcome = if self.authority().is_retained_memory_action() {
             // A notification makes the retained action eligible to prepare
             // again. Even a raced signal cannot synthesize a guest return.
+            ContinuationCompletion::ResumeRetainedMemory
+        } else if matches!(self.authority().origin, ContinuationOrigin::Fault)
+            && matches!(event, ContinuationEvent::Ready)
+        {
             ContinuationCompletion::ResumeRetainedMemory
         } else if !completed && self.interrupted_by_group_stop(context.task()) {
             ContinuationCompletion::Errno(LINUX_EINTR)
