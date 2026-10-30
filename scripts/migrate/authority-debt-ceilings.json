@@ -2874,7 +2874,7 @@
     {
       "family": "fatal_carrier_fault",
       "operation": "fatal:kernel::run_queue",
-      "owner": "carrick_kernel::kernel::scheduler::IdleAnnouncement<'a>::release",
+      "owner": "carrick_kernel::kernel::scheduler::IdleAnnouncement::release",
       "lane": "shared",
       "ceiling": 1
     },
