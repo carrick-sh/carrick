@@ -331,6 +331,8 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
         "fork must not burn visible thread IDs before the first clone"
     );
     let mut baseline_claims = crate::native_process_runtime::thread_stock::claim_counts(&owner);
+    // The first clone lazily reserves four distinct standing identities.
+    baseline_claims.reserved_numbers += 4;
     baseline_claims.thread_claims += 4;
     for _round in 0..rounds {
         let mut tids = Vec::new();
