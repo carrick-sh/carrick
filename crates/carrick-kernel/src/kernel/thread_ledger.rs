@@ -243,7 +243,7 @@ impl Kernel {
 /// the common libc/Go worker fan-out without reserving a visible gap in the
 /// tid space for a single-threaded process: a pool is primed only after the
 /// task's first thread clone.
-pub const DEFAULT_THREAD_POOL_DEPTH: usize = 4;
+pub use carrick_core::lifecycle::stock::DEFAULT_THREAD_POOL_DEPTH;
 
 /// `CARRICK_THREAD_POOL=0` (exactly) turns the standing reserve off.
 fn pool_depth_from_env() -> usize {
@@ -1016,23 +1016,55 @@ impl ThreadLedger {
         }
         let uid = publisher.resources.credentials().ruid();
         let limit = nproc_limit(publisher);
-        while record.thread_pool.len() < depth {
-            if let Some(limit) = limit {
-                let in_flight = self.in_flight.lock();
-                if nproc_count(state, &in_flight, uid, limit).is_some_and(|count| count >= limit) {
-                    return;
-                }
+        struct Stock<'a> {
+            kernel: &'a Kernel,
+            state: &'a RegistryState,
+            ledger: &'a ThreadLedger,
+            record: &'a TaskRecord,
+            uid: NsUid,
+            limit: Option<usize>,
+            page: super::objects::ThreadLifecycleLease,
+        }
+        impl carrick_core::lifecycle::stock::ThreadStock for Stock<'_> {
+            fn page(&self) -> &dyn Lifecycle {
+                &*self.page
             }
-            let Ok(identity) = ThreadIdentity::reserve(kernel, &record.task) else {
-                return;
-            };
-            if !record
-                .thread_pool
-                .push(kernel, state, &record.task, uid, identity)
-            {
-                return;
+            fn standing(&self) -> usize {
+                self.record.thread_pool.len()
+            }
+            fn reserve_and_stock(&mut self) -> bool {
+                if let Some(limit) = self.limit {
+                    let in_flight = self.ledger.in_flight.lock();
+                    if nproc_count(self.state, &in_flight, self.uid, limit)
+                        .is_some_and(|count| count >= limit)
+                    {
+                        return false;
+                    }
+                }
+                let Ok(identity) = ThreadIdentity::reserve(self.kernel, &self.record.task) else {
+                    return false;
+                };
+                self.record.thread_pool.push(
+                    self.kernel,
+                    self.state,
+                    &self.record.task,
+                    self.uid,
+                    identity,
+                )
             }
         }
+        carrick_core::lifecycle::stock::replenish(
+            &mut Stock {
+                kernel,
+                state,
+                ledger: self,
+                record,
+                uid,
+                limit,
+                page: publisher.thread().control_lease().lifecycle(),
+            },
+            depth,
+        );
     }
 
     /// `RLIMIT_NPROC` admission for one thread clone; see [`nproc_verdict`].

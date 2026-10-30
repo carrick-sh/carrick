@@ -2,6 +2,8 @@
 pub use carrick_core_abi::lifecycle::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+pub mod stock;
+
 /// Independent diagnostic observations, never a settlement or retirement proof.
 #[derive(
     ::core::clone::Clone,
