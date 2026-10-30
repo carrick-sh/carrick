@@ -2630,3 +2630,9 @@ or a physical first-touch proof. The memory assertions call the delegated
 owner directly; no guest libc or instructions execute. The original five
 signed tests remain director-owned, including the distinction between stack
 mmap failure and clone refusal. Existing semantic and work budgets remain.
+
+Native stock notification-source admission uses the supplied short-lock wait
+policy while the carrier's completion queue finishes its bounded initialization.
+`busy_initializer_finishes_through_the_supplied_wait_policy` forces Busy once,
+then publishes initialization and succeeds; an explicitly refusing wait policy
+retains Busy. Native initialization contention cannot become pool exhaustion.

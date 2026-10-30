@@ -2136,3 +2136,7 @@ contracts = ["kernel.el1.thread-lifecycle", "core.lifecycle.publication"]
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_runtime/thread_stock.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.lifecycle.publication"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/completion_queue.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
