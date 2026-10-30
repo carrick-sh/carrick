@@ -202,8 +202,9 @@ pub fn apply_as_host_if_excluded<M>(
     txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
     maintenance: &M,
     // The required invalidation of a completed transaction (run now, or owed
-    // to the syscall's return); `maintenance` runs break-before-make ones,
-    // including the one before an emptied table is unlinked and reclaimed.
+    // to the syscall's return when no table pages are reclaimed); `maintenance`
+    // runs break-before-make invalidations and the immediate ASID flush any
+    // table-reclaiming outcome needs before its receipt is settled.
     invalidate_asid: &dyn Fn(),
     check: impl FnOnce() -> Result<(), TrapError>,
 ) -> Option<Result<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt, TrapError>>
@@ -238,7 +239,11 @@ where
                 .execute_guest_descriptor_txn_as_host(txn, excluded, maintenance)
                 .map_err(failed)
                 .and_then(|receipt| {
-                    if carrick_mmu_core::aarch64::descriptor_txn::outcome_requires_invalidation(
+                    if carrick_mmu_core::aarch64::descriptor_txn::outcome_reclaimed_tables(
+                        &receipt.outcome,
+                    ) {
+                        maintenance.invalidate_range(0, 0);
+                    } else if carrick_mmu_core::aarch64::descriptor_txn::outcome_requires_invalidation(
                         &receipt.outcome,
                     ) {
                         invalidate_asid();

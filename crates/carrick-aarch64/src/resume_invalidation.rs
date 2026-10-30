@@ -23,8 +23,11 @@
 //!   `hv_vm_unmap`, which must itself invalidate the guest's cached
 //!   translations of that IPA (stage-1 and combined entries) before it
 //!   returns, or no guest stage-2 retirement would be safe. Stage-1 table
-//!   pages are not exposed: EL1 unlinks an emptied table only after its own
-//!   break-before-make invalidation, and the host editor reclaims tables only
+//!   pages are not exposed: EL1 invalidates the MM's ASID before publishing
+//!   any receipt (`ClaimedDescriptorTxn::complete`), the host-applied guest
+//!   lane flushes the ASID immediately (bypassing `required_invalidation` and
+//!   owed-resume deferral) before settling any receipt that reclaims tables
+//!   (`outcome_reclaimed_tables`), and the host editor reclaims tables only
 //!   in a single-threaded MM, whose one thread is the one returning.
 //! - **A sibling thread's syscall must not return over a stale translation.**
 //!   While an MM owes an invalidation ([`outstanding_for_mm`]), every other
@@ -32,8 +35,10 @@
 //!   through the same entry, so its own invalidation completes before it
 //!   reaches EL0 (a `munmap` on one thread and a reusing `mmap` on another).
 //!
-//! Fork and exec never owe (they are not eligible syscalls), and break-
-//! before-make invalidations inside a transaction always run at once.
+//! Fork and exec never owe (they are not eligible syscalls), and
+//! break-before-make invalidations inside a transaction, as well as the
+//! trailing flush of any transaction that reclaims stage-1 table pages,
+//! always run at once.
 //! `CARRICK_EL1_RESUME_TLBI=0` makes every required invalidation a host
 //! round trip again.
 

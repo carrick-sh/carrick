@@ -386,10 +386,14 @@ impl TerminalEdit {
     }
 
     /// Whether this edit's reclaim request is well formed: within the
-    /// receipt bound, and only after plain munmap retirement.
+    /// receipt bound, ASID-scoped (`nG = 1`), and only after plain munmap
+    /// retirement. Reclaimed tables rely on the transaction's trailing
+    /// `TLBI ASIDE1IS` to flush both leaf and intermediate walk-cache entries,
+    /// which covers only non-global (`nG = 1`) translations.
     fn reclaim_well_formed(self) -> bool {
         self.reclaim_budget == 0
-            || (usize::from(self.reclaim_budget) <= MAX_RECLAIMED_TABLES
+            || (self.asid_scoped
+                && usize::from(self.reclaim_budget) <= MAX_RECLAIMED_TABLES
                 && self.rule == super::TerminalRule::pt(super::PtOp::Retire))
     }
 
@@ -1856,14 +1860,25 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
             let descriptor = self.words.load(pa)?;
             let entry_va = table_base + index * span;
             let after = self.visit_entry(level, Loc::Live(pa), descriptor, entry_va)?;
-            reclaimable = reclaimable && super::reclaimable_entry(after, level, entry_va);
+            let non_global_leaf = is_table(descriptor, level)
+                || is_table(after, level)
+                || (descriptor & VALID == 0 || descriptor & NON_GLOBAL != 0)
+                    && (after == 0 || after & NON_GLOBAL != 0);
+            debug_assert!(
+                !reclaimable || non_global_leaf,
+                "reclaimable table entry at {entry_va:#x} must not map a global (nG=0) leaf: before={descriptor:#x} after={after:#x}"
+            );
+            reclaimable =
+                reclaimable && non_global_leaf && super::reclaimable_entry(after, level, entry_va);
         }
         if !reclaimable {
             return Ok(false);
         }
         for index in (0..first).chain(last + 1..512) {
             let descriptor = self.words.load(table_pa + index * 8)?;
-            if !super::reclaimable_entry(descriptor, level, table_base + index * span) {
+            let entry_va = table_base + index * span;
+            let non_global_leaf = descriptor == 0 || descriptor & NON_GLOBAL != 0;
+            if !non_global_leaf || !super::reclaimable_entry(descriptor, level, entry_va) {
                 return Ok(false);
             }
         }
@@ -1887,18 +1902,19 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
     }
 
     /// Replace the entry at `loc` that links (or would link) a reclaimed
-    /// table with an empty entry. Breaking a valid link is break-before-make
-    /// without a make: the invalidation of the entry's whole span completes
-    /// before the page can be reported free, so no walker on any PE can still
-    /// reach it when the host reissues it. Undoing the store relinks the
-    /// unchanged table, an invalid-to-valid transition that needs no
-    /// invalidation.
+    /// table with an empty entry. Because nothing is installed in its place,
+    /// no intermediate break-before-make invalidation is needed: clearing a
+    /// valid table descriptor marks `flush_required`, so the transaction's
+    /// single trailing ASID invalidation flushes the whole edit before the
+    /// receipt is published or settled and any reclaimed table page can be
+    /// reissued. Undoing the store relinks the unchanged table, an
+    /// invalid-to-valid transition that needs no invalidation.
     fn unlink(
         &mut self,
         loc: Loc,
         descriptor: u64,
-        base: u64,
-        level: usize,
+        _base: u64,
+        _level: usize,
         table: Option<u64>,
     ) -> Result<(), DescriptorRefusal> {
         self.note_reclaimed(table)?;
@@ -1906,10 +1922,6 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
             return Ok(());
         }
         self.store(loc, descriptor, 0, None)?;
-        if self.apply && matches!(loc, Loc::Live(_)) && descriptor & VALID != 0 {
-            self.words.publish_barrier();
-            self.words.invalidate_range(base, entry_span(level));
-        }
         Ok(())
     }
 
@@ -2782,6 +2794,20 @@ pub fn outcome_requires_invalidation(outcome: &DescriptorOutcome) -> bool {
     }
 }
 
+/// Whether a receipt's outcome unlinked (or rolled back after touching) any
+/// stage-1 table page. A host-applied venue must complete its ASID
+/// invalidation immediately before publishing or settling such a receipt so no
+/// reclaimed table page enters `free_tables` while a PE can still cache walks
+/// through it.
+#[must_use]
+pub fn outcome_reclaimed_tables(outcome: &DescriptorOutcome) -> bool {
+    match outcome {
+        DescriptorOutcome::Applied(applied) => !applied.reclaimed.is_empty(),
+        DescriptorOutcome::Refused(_) => false,
+        DescriptorOutcome::RolledBack(_) | DescriptorOutcome::Indeterminate(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3023,20 +3049,18 @@ mod tests {
                 );
             }
         }
-        // Reclaiming munmap retirement round-trips at every budget.
+        // Reclaiming munmap retirement round-trips at every budget on an
+        // ASID-scoped (`nG = 1`) image, and is rejected without `ASID_SCOPED`.
         for budget in 1..=MAX_RECLAIMED_TABLES as u8 {
-            for asid_scoped in [false, true] {
-                let mut edit =
-                    TerminalEdit::unmap_reclaiming(asid_scoped, 0x0800_0000, 0x0100_0000);
-                edit.reclaim_budget = budget;
-                let op = DescriptorOp::Terminal {
-                    span: PageSpan::new(0x5000, 3 * PT_PAGE),
-                    edit,
-                };
-                let (kind, payload) = op.encode();
-                assert_eq!(DescriptorOp::decode(kind, payload, None), Some(op));
-                assert_eq!(op.reclaim_budget(), usize::from(budget));
-            }
+            let mut edit = TerminalEdit::unmap_reclaiming(true, 0x0800_0000, 0x0100_0000);
+            edit.reclaim_budget = budget;
+            let op = DescriptorOp::Terminal {
+                span: PageSpan::new(0x5000, 3 * PT_PAGE),
+                edit,
+            };
+            let (kind, payload) = op.encode();
+            assert_eq!(DescriptorOp::decode(kind, payload, None), Some(op));
+            assert_eq!(op.reclaim_budget(), usize::from(budget));
         }
         let decode = |word| {
             DescriptorOp::decode(
@@ -3051,13 +3075,19 @@ mod tests {
         for word in [
             1 << 16,
             TerminalEdit::OP_INVALIDATE | TerminalEdit::EXEC,
-            // Reclaim only follows plain munmap retirement, within the
-            // receipt bound.
-            TerminalEdit::OP_INVALIDATE | budget(1),
-            TerminalEdit::OP_READ_WRITE | budget(1),
-            TerminalEdit::OP_RETIRE | TerminalEdit::DENY_HOST_BUFFERS | budget(1),
-            TerminalEdit::RULE_BUS_FAULT | budget(1),
-            TerminalEdit::OP_RETIRE | budget(MAX_RECLAIMED_TABLES as u64 + 1),
+            // Reclaim only follows ASID-scoped plain munmap retirement, within
+            // the receipt bound.
+            TerminalEdit::OP_RETIRE | budget(1),
+            TerminalEdit::OP_INVALIDATE | TerminalEdit::ASID_SCOPED | budget(1),
+            TerminalEdit::OP_READ_WRITE | TerminalEdit::ASID_SCOPED | budget(1),
+            TerminalEdit::OP_RETIRE
+                | TerminalEdit::ASID_SCOPED
+                | TerminalEdit::DENY_HOST_BUFFERS
+                | budget(1),
+            TerminalEdit::RULE_BUS_FAULT | TerminalEdit::ASID_SCOPED | budget(1),
+            TerminalEdit::OP_RETIRE
+                | TerminalEdit::ASID_SCOPED
+                | budget(MAX_RECLAIMED_TABLES as u64 + 1),
             TerminalEdit::OP_NONE | TerminalEdit::EXEC,
             TerminalEdit::RULE_BUS_FAULT | TerminalEdit::FORK_ARM,
             TerminalEdit::RULE_BUS_FAULT | TerminalEdit::EXEC,
@@ -4812,6 +4842,61 @@ mod tests {
         }
 
         #[test]
+        fn reclaiming_transaction_costs_one_invalidation() {
+            for blocks in [1_u64, 2, 4] {
+                let words = TestWords::new();
+                let idx = indices(VA);
+                words.set(page(0) + idx[0] as u64 * 8, table(1));
+                words.set(page(1) + idx[1] as u64 * 8, table(9));
+                for block in 0..blocks {
+                    words.set(page(9) + (idx[2] as u64 + block) * 8, table(10 + block));
+                    words.set(
+                        page(10 + block),
+                        (IPA + block * PT_PAGE) | USER_PAGE_FLAGS | NON_GLOBAL,
+                    );
+                }
+                let op = unmap_reclaiming(VA, blocks * (1 << 21), MAX_RECLAIMED_TABLES as u8);
+                let result = applied(run(&words, op, &TableGrants::NONE));
+                let invalidations = words
+                    .log
+                    .borrow()
+                    .iter()
+                    .filter(|event| matches!(event, Event::Invalidate(..)))
+                    .count()
+                    + usize::from(result.flush_required);
+                assert_eq!(
+                    invalidations, 1,
+                    "{blocks} emptied blocks must share one completed invalidation before table reuse"
+                );
+            }
+
+            // Witness: a non-ASID-scoped reclaiming edit is refused, and a
+            // table holding a global (`nG = 0`) neighbour leaf is never
+            // unlinked under an ASID-scoped invalidation.
+            let words = two_alias_blocks();
+            let non_scoped = DescriptorOp::Terminal {
+                span: PageSpan::new(VA, PT_PAGE),
+                edit: TerminalEdit::unmap_reclaiming(false, 0, 0),
+            };
+            assert_eq!(
+                run(&words, non_scoped, &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding)
+            );
+            // Put a retired global (`nG = 0`) identity leaf in slot 1 of L3
+            // table 10; unmapping slot 0 must not unlink table 10.
+            words.set(page(10) + 8, ((VA + PT_PAGE) & PA_MASK_4KIB) | SW_RETIRED);
+            let result = applied(run(
+                &words,
+                unmap_reclaiming(VA, PT_PAGE, 4),
+                &TableGrants::NONE,
+            ));
+            assert!(
+                result.reclaimed.is_empty(),
+                "a table carrying a global (nG=0) entry must never be unlinked under ASID invalidation"
+            );
+        }
+
+        #[test]
         fn reclaiming_unmap_unlinks_emptied_tables_with_break_before_make() {
             const TWO_MIB: u64 = 1 << 21;
             let words = two_alias_blocks();
@@ -4828,12 +4913,18 @@ mod tests {
                 0,
                 "L1 entry unlinked"
             );
-            // Each unlink is broken, published, then invalidated over the
-            // whole span the entry covered, before anything later.
+            // Each emptied child table is unlinked before its parent and the
+            // transaction marks `flush_required` once for the trailing ASID
+            // invalidation rather than issuing a separate invalidation per
+            // unlinked table.
+            assert!(result.flush_required);
             let log = words.log.borrow().clone();
-            let unlink = |entry: u64, before: u64, span_va: u64, span: u64| {
-                let at = log
-                    .iter()
+            assert!(
+                !log.iter().any(|e| matches!(e, Event::Invalidate(..))),
+                "unlink without a make must not issue intermediate range invalidations: {log:?}"
+            );
+            let unlink = |entry: u64, before: u64| {
+                log.iter()
                     .position(|e| {
                         *e == Event::Cas {
                             pa: entry,
@@ -4841,25 +4932,12 @@ mod tests {
                             after: 0,
                         }
                     })
-                    .expect("unlink store");
-                assert_eq!(
-                    &log[at + 1..at + 3],
-                    &[Event::Barrier, Event::Invalidate(span_va, span)]
-                );
+                    .expect("unlink store")
             };
-            unlink(page(9) + idx[2] as u64 * 8, table(10), VA, TWO_MIB);
-            unlink(
-                page(9) + (idx[2] as u64 + 1) * 8,
-                table(11),
-                VA + TWO_MIB,
-                TWO_MIB,
-            );
-            unlink(
-                page(1) + idx[1] as u64 * 8,
-                table(9),
-                VA & !((1 << 30) - 1),
-                1 << 30,
-            );
+            let u10 = unlink(page(9) + idx[2] as u64 * 8, table(10));
+            let u11 = unlink(page(9) + (idx[2] as u64 + 1) * 8, table(11));
+            let u9 = unlink(page(1) + idx[1] as u64 * 8, table(9));
+            assert!(u10 < u11 && u11 < u9);
 
             // The boot L1 is never reclaimed, and a live neighbour keeps its
             // table: only the retired leaf changes.

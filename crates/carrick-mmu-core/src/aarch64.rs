@@ -2837,14 +2837,24 @@ impl PageTableManager {
             maintenance,
         };
         let mut journal = descriptor_txn::InlineJournal::new();
-        Ok(descriptor_txn::apply_submitted_descriptor_txn(
-            slot,
-            mm_key,
-            &words,
-            SubstrateGpa(self.base()),
-            &mut journal,
-            invalidate_asid,
-        ))
+        let Some(claimed) = slot.claim_for_mm(mm_key) else {
+            return Ok(None);
+        };
+        let root = SubstrateGpa(self.base());
+        let outcome = match claimed.txn() {
+            Ok(txn) => {
+                descriptor_txn::execute_descriptor_txn(&words, root, txn, &mut journal).outcome
+            }
+            Err(refusal) => descriptor_txn::DescriptorOutcome::Refused(refusal),
+        };
+        let reclaims = descriptor_txn::outcome_reclaimed_tables(&outcome);
+        Ok(Some(claimed.complete(outcome, || {
+            if reclaims {
+                maintenance.invalidate_range(0, 0);
+            } else {
+                invalidate_asid();
+            }
+        })))
     }
 
     pub fn prepare_guest_descriptor_txn(
@@ -12854,6 +12864,7 @@ mod tests {
     struct RecordingMaintenance {
         barriers: core::cell::Cell<usize>,
         invalidations: core::cell::RefCell<Vec<(u64, u64)>>,
+        asid_invalidations: core::cell::Cell<usize>,
     }
 
     impl descriptor_txn::TableMaintenance for RecordingMaintenance {
@@ -12892,7 +12903,11 @@ mod tests {
             &words,
             SubstrateGpa(LINUX_PAGE_TABLES_BASE),
             &mut journal,
-            || {},
+            || {
+                maintenance
+                    .asid_invalidations
+                    .set(maintenance.asid_invalidations.get() + 1);
+            },
         )
     }
 
@@ -13780,12 +13795,14 @@ mod tests {
         let maintenance = RecordingMaintenance::default();
         let receipt = guest_apply(&resolver, &slot, 41, &maintenance).expect("claimed");
         assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+        assert_eq!(
+            maintenance.asid_invalidations.get(),
+            1,
+            "the unlinked table is flushed by one ASID invalidation before the receipt"
+        );
         assert!(
-            maintenance
-                .invalidations
-                .borrow()
-                .contains(&(g + TWO_MIB, TWO_MIB)),
-            "the unlinked entry's whole span is invalidated before the receipt"
+            maintenance.invalidations.borrow().is_empty(),
+            "unlinking without a make must not issue intermediate range invalidations"
         );
         let host_receipt = slot.take_receipt(id).unwrap();
         let free_before = mgr.free_tables.len();
