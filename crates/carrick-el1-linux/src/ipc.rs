@@ -413,6 +413,10 @@ pub fn serve_ipc_with_signals<C: ThreadCpu, U: UserWord, M: UserCopy>(
                             .ok()
                             .and_then(TransferredBytes::new)
                             .map_or(WaitProgress::Blocked, WaitProgress::Transferred);
+                        // Settle retained progress here. RestartClass::Never
+                        // defers SA_RESTART to arm_signal::restart_forwarded_frame
+                        // and its shared is_native_restartable_syscall predicate,
+                        // through the zero-progress marker below.
                         frame.x[0] =
                             match interrupted_wait(RestartClass::Never, progress, Some(false)) {
                                 WaitDecision::CompletePartial(bytes) => bytes.get() as u64,

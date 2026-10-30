@@ -3466,3 +3466,117 @@ fn native_exec_successor_reaps_its_fork_child() {
     ));
     assert_eq!(parent_service.copies, vec![LinuxWaitStatus::exited(0)]);
 }
+
+#[cfg(test)]
+#[test]
+fn portal_wait_cancellation_resumes_exact_native_service_waiter() {
+    use carrick_guest_arch::ProcessContext;
+    let fixture = native_exec_fixture();
+    let mut service = fixture.service();
+    let handle = service.service_mm_handle(&fixture.address).unwrap();
+    let space = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    space
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::ShortLockSpin,
+            &|effects| {
+                let _ = effects.deliver_handbacks(&mut |_| {});
+            },
+        )
+        .unwrap();
+    let source = space.notifications(handle.incarnation()).unwrap();
+    let observed = source.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor);
+    // SAFETY: the fixture retains this admitted MM and its observed editor revision.
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Editor,
+            observed.revision(),
+        )
+    };
+    let enrollment =
+        carrick_core_abi::wait::PortalWaitEnrollment::for_owner(fixture.zone, handle, wait)
+            .unwrap();
+    let birth = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let completed = words(fixture.address).with_syscall_return(0x41);
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                birth,
+                fixture.task,
+                fixture.address,
+                &completed,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry
+                .begin_owner_service_wait(
+                    carrick_core_abi::service::ServiceOperation::CarrierWork {
+                        entry: OwnerEntry::Syscall
+                    },
+                    wait
+                )
+                .unwrap(),
+            NativeResume::Left(None)
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    assert!(matches!(
+        fixture.zone.record(fixture.record.id).claim(),
+        carrick_sched_core::Claim::Parked { .. }
+    ));
+    fixture
+        .runtime
+        .cancel_service(fixture.record, fixture.slot, &mut service)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .zone
+            .object_queue_census(enrollment.key().index())
+            .unwrap()
+            .waiters,
+        0,
+        "service cancellation must detach the enrolled portal waiter"
+    );
+    assert_eq!(
+        fixture.zone.record(fixture.record.id).handback(),
+        Some(carrick_sched_core::Handback::Resumed)
+    );
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot)
+        .expect("cancelled portal waiter must be runnable");
+    assert_eq!(selected.record, fixture.record.id);
+    assert_eq!(
+        selected.result, None,
+        "the retained service owns its result"
+    );
+    // SAFETY: the selected native record is exclusively held by this fixture's driver.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            birth,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(entry.resume_checkpoint().unwrap(), NativeResume::Returned(result) if result.raw() == 0x41),
+        "cancellation resumes the service and preserves its committed result"
+    );
+}

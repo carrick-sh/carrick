@@ -1073,7 +1073,7 @@ contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle", "kernel.copyout.owner-refusal", "kernel.vcpu.shutdown-entry"]
+contracts = ["kernel.el1.ipc-two-process", "kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle", "kernel.copyout.owner-refusal", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/fork_loan.rs"

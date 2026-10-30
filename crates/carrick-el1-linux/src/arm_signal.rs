@@ -58,6 +58,9 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
 /// the interrupted SVC only for the shared restartable-call policy. The
 /// restart-eligible mailbox marker authenticates the continuation's untimed
 /// wait; a timed wait uses the distinct no-restart marker.
+/// `ipc::serve_ipc_with_signals` first settles retained progress with
+/// `RestartClass::Never`, then uses this marker for zero-progress non-epoll
+/// interruptions. The signal owner combines this predicate with SA_RESTART.
 pub(crate) fn restart_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
     if frame.esr != 0xfffe
         || frame.x[0] != carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
