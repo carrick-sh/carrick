@@ -269,6 +269,7 @@ impl ResidentFacts {
                 host_protection: self.resident_fault_ranges.prot_for_page(page),
                 bus_fault: bus_fault_contains(&self.bus_fault_ranges, page),
                 exclusion,
+                _guard: std::marker::PhantomData,
             })
         };
         if let Some(root) = self.delegated_root() {
@@ -942,7 +943,14 @@ pub struct ResidentFaultPlan<'permit> {
 }
 
 /// One pre-publication root observation, valid only while its MM guard is
-/// borrowed through `exclusion`. Publication settlement performs no root read.
+/// borrowed through `exclusion` and `_guard`. Publication settlement performs
+/// no root read. The typed guard borrow also prevents executor migration.
+///
+/// The synchronous descriptor drain cannot edit reservation facts: its
+/// DESCRIPTOR_DRAIN_ESR entry returns before Linux dispatch, and calls only
+/// serve_host_drain -> drain_mm_descriptor_txns -> HardwareDescriptorTxnApplier.
+/// That applier executes descriptor transactions through PrimaryTableWords;
+/// it has no reservation-root or deferred-return operation.
 pub struct FrameGrantPublicationSnapshot<'permit> {
     owner: FirstTouchOwner,
     retired: Vec<ReservationRange>,
@@ -952,6 +960,7 @@ pub struct FrameGrantPublicationSnapshot<'permit> {
     host_protection: Option<LinuxProtFlags>,
     bus_fault: bool,
     exclusion: super::HostAliasDispatchGuard<'permit>,
+    _guard: std::marker::PhantomData<&'permit super::mm_mutation::HostAliasPermit<'permit>>,
 }
 
 /// Why a verified publication cannot settle against this MM's current facts.
