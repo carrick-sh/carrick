@@ -505,6 +505,10 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         This is an ephemeral runner. Use local shared carrick leases for builds.\n\
         Contabo leases are per VM under owner decision #639; never acquire a hypervisor lease.\n\
         Run only gates supported by this host; report unavailable Docker, KVM or HVF honestly.\n\
+        Prove your slice as AGENTS.md \"Workers prove their slice\" says: focused suites of the\n\
+        crates you touched, just check-contract-change {} HEAD, just xtask authority-debt\n\
+        --source-only, plus just cross-check-macos for macOS-cfg code and just check-linux for\n\
+        KVM/HAL code. Leave whole-workspace just lint-domains and just test-kernel to CI.\n\
         To propose a PR body, write ../pr-body.md beside result.json (relative to the checkout root).\n\
         Keep it at most 8 KiB, write for people, and omit closing references and dispatch footers; the server adds them.\n\
         Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
@@ -512,6 +516,7 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         dispatch.branch,
         dispatch.base,
         dispatch.worker.coauthor,
+        dispatch.base,
         dispatch.body,
         dispatch.review_text
     )
@@ -3719,6 +3724,14 @@ mod tests {
         );
         let prompt = worker_prompt(&dispatch);
         assert!(prompt.contains(&dispatch.base) && prompt.contains("Resolve any conflicts"));
+        assert!(prompt.contains(&format!(
+            "just check-contract-change {} HEAD",
+            dispatch.base
+        )));
+        assert!(prompt.contains("just cross-check-macos") && prompt.contains("just check-linux"));
+        assert!(
+            prompt.contains("Leave whole-workspace just lint-domains and just test-kernel to CI")
+        );
         assert_eq!(
             git(&work, &["rev-parse", "refs/carrick/dispatch-main"])
                 .unwrap()
