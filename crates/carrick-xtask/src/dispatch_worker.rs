@@ -8,6 +8,8 @@ use std::process::{Command, Stdio};
 
 #[path = "dispatch_loop.rs"]
 mod agent_loop;
+#[path = "dispatch_reactor.rs"]
+mod reactor;
 
 const LOOP_USER: &str = "carrick-dispatch-loop";
 const AGENT_USER: &str = "carrick-dispatch-agent";
@@ -36,6 +38,11 @@ pub enum DispatchAction {
         admit: bool,
         #[arg(long, conflicts_with = "admit")]
         retire: bool,
+    },
+    /// Owner-local poll loop that answers PR conversation with `/agent` rounds (#1193).
+    Reactor {
+        #[command(subcommand)]
+        mode: reactor::Mode,
     },
 }
 
@@ -2094,6 +2101,10 @@ fn guard_admission(
 }
 
 pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
+    let args = match args.action {
+        DispatchAction::Reactor { mode } => return reactor::run(root, mode),
+        action => DispatchArgs { action },
+    };
     if let DispatchAction::Tool { name } = &args.action {
         return agent_loop::client(name);
     }
@@ -2108,7 +2119,9 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     }
     let root = root.canonicalize()?;
     let (event_path, admit) = match args.action {
-        DispatchAction::Tool { .. } => return Err(ScalerError::Guard("tool already handled")),
+        DispatchAction::Tool { .. } | DispatchAction::Reactor { .. } => {
+            return Err(ScalerError::Guard("action already handled"));
+        }
         DispatchAction::Loop {
             event,
             setup_status,
