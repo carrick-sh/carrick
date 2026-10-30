@@ -513,6 +513,9 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             let table = table.clone();
             let zone = fixture.zone;
             let (done, finished) = std::sync::mpsc::channel();
+            // Test-owned peer publication. The bounded completion wait below
+            // precedes join; production never creates this host thread.
+            #[allow(clippy::disallowed_methods)]
             let thread = std::thread::spawn(move || {
                 carrick_kernel::el1_zone::with_test_zone(zone, || table.close(fd::Fd(4)).unwrap());
                 done.send(()).unwrap();
