@@ -124,12 +124,22 @@ login, with the hidden marker `<!-- carrick-reactor -->`:
   unedited owner comment. It is posted only when the PR passes `adopted_pr`
   or is an owned dispatch PR, no `dispatch-worker.yml` run is queued or in
   progress for that PR, and fewer than four dispatch runs are in flight.
+- At most one reactor round per PR head, unless a human (non-bot) comment
+  arrived after the last reactor round. State records the round's head and
+  time.
 - A `reply` posts plain text; text starting with `/agent` is refused.
-- Comments from bots, comments carrying the marker and owner `/agent`
-  commands are not events. PRs labelled `agent:hold` are skipped.
-- A director PR without exactly one closing reference gets one reply asking
-  for `Closes #N`, once per PR. An adoptable PR with no push for 15 minutes
-  and no reactor round yet counts as one event per head.
+- Dispatch outcome comments (from `github-actions[bot]` or
+  `carrick-workers[bot]`, containing "Dispatch outcome") are events, so a
+  finished, blocked or failed round gets a decision. Other bot comments and
+  comments carrying the marker are not. Owner `/agent` commands do not ask
+  for a decision but count as a human comment. PRs labelled `agent:hold` are
+  skipped.
+- Automatic behaviour applies only to PRs created after the reactor's epoch
+  (recorded in state on the first real run; `--since <YYYY-MM-DDTHH:MM:SSZ>`
+  overrides it): a director PR without exactly one closing reference gets
+  one reply asking for `Closes #N`, once per PR, and an adoptable PR with no
+  push for 15 minutes and no reactor round yet counts as one event per head.
+  Comments and reviews on any PR are still events.
 - The reactor never merges, pushes, edits, labels or closes anything.
 
 State (cursor and per-PR memory) lives in

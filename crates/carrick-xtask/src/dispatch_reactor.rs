@@ -35,6 +35,10 @@ pub struct Opts {
     /// State file (cursor and per-PR memory).
     #[arg(long)]
     state: Option<PathBuf>,
+    /// Reactor epoch override (`YYYY-MM-DDTHH:MM:SSZ`): only PRs created since
+    /// get quiet pickup and the closing-reference ask.
+    #[arg(long)]
+    since: Option<String>,
     /// Model for the deciding agent (`claude -p --model`).
     #[arg(long, default_value = "sonnet")]
     model: String,
@@ -76,6 +80,8 @@ pub(crate) struct Decision {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct State {
+    /// First real run; automatic pickup and asks apply only to PRs created since.
+    epoch: Option<String>,
     cursor: Option<String>,
     prs: BTreeMap<u64, Memory>,
 }
@@ -84,6 +90,10 @@ pub(crate) struct Memory {
     rounds: u32,
     closes_asked: bool,
     candidate_head: Option<String>,
+    last_round_head: Option<String>,
+    last_round_at: Option<String>,
+    /// A non-bot, non-reactor comment arrived after the last reactor round.
+    human_since_round: bool,
     seen: Vec<String>,
 }
 
@@ -92,6 +102,8 @@ pub(crate) struct Gate {
     pub eligible: bool,
     pub pr_run_active: bool,
     pub active_total: usize,
+    /// The reactor already posted a round on this head and no human spoke since.
+    pub repeat_round: bool,
 }
 /// The only effects the rule layer can produce.
 #[derive(Debug, PartialEq, Eq)]
@@ -112,6 +124,9 @@ pub(crate) fn enforce(decision: &Decision, gate: &Gate) -> Effect {
         Act::Round if !gate.eligible => Effect::Refused("PR is neither adoptable nor owned"),
         Act::Round if gate.pr_run_active => Effect::Refused("dispatch run in flight for this PR"),
         Act::Round if gate.active_total >= GLOBAL_CAP => Effect::Refused("global dispatch cap"),
+        Act::Round if gate.repeat_round => {
+            Effect::Refused("already rounded this head; waiting for a human comment")
+        }
         Act::Round if text.is_empty() || text.contains(MARKER) => Effect::Refused("invalid brief"),
         Act::Round => Effect::Post(format!("/agent {text}\n\n{MARKER}")),
     }
@@ -122,10 +137,34 @@ fn bot(user: &Value) -> bool {
         || user["__typename"] == "Bot"
         || user["login"].as_str().is_none_or(|l| l.ends_with("[bot]"))
 }
-/// An event that may warrant a decision: not a bot, not the reactor, and not
-/// an owner `/agent` command (the dispatch workflow already handles those).
-pub(crate) fn relevant(user: &Value, body: &str) -> bool {
-    !bot(user) && !body.contains(MARKER) && !body.trim_start().starts_with("/agent")
+/// Bots whose dispatch outcome comments are events.
+const OUTCOME_BOTS: [&str; 2] = ["github-actions[bot]", "carrick-workers[bot]"];
+/// How a comment or review counts: `None` is not an event (reactor-marked, or
+/// a bot other than a dispatch outcome). `trigger` asks for a decision; an
+/// owner `/agent` command does not (the dispatch workflow handles it) but is
+/// still `human`, which re-enables a round on the same head.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Class {
+    trigger: bool,
+    human: bool,
+}
+pub(crate) fn classify(user: &Value, body: &str) -> Option<Class> {
+    if body.contains(MARKER) {
+        return None;
+    }
+    if bot(user) {
+        let login = user["login"].as_str().unwrap_or_default();
+        return (OUTCOME_BOTS.contains(&login) && body.contains("Dispatch outcome")).then_some(
+            Class {
+                trigger: true,
+                human: false,
+            },
+        );
+    }
+    Some(Class {
+        trigger: !body.trim_start().starts_with("/agent"),
+        human: true,
+    })
 }
 
 /// Same-repository `work/*` PR into main by the owner or publish App: the
@@ -157,6 +196,7 @@ struct Event {
     who: String,
     kind: &'static str,
     body: String,
+    class: Class,
 }
 
 /// One poll cycle. Returns the human log lines it would print.
@@ -165,6 +205,7 @@ pub(crate) fn cycle(
     agent: &mut dyn Agent,
     state: &mut State,
     now: u64,
+    epoch: &str,
     dry_run: bool,
 ) -> Result<Vec<String>, ScalerError> {
     let mut log = Vec::new();
@@ -205,14 +246,15 @@ pub(crate) fn cycle(
         } else {
             "comment"
         };
-        events.entry(pr).or_default().push(Event {
-            id: format!("{kind}:{}:{at}", c["id"]),
-            who: c["user"]["login"].as_str().unwrap_or("?").to_owned(),
-            kind,
-            body: c["body"].as_str().unwrap_or_default().to_owned(),
-        });
-        if !relevant(&c["user"], c["body"].as_str().unwrap_or_default()) {
-            events.get_mut(&pr).and_then(|v| v.pop());
+        let body = c["body"].as_str().unwrap_or_default();
+        if let Some(class) = classify(&c["user"], body) {
+            events.entry(pr).or_default().push(Event {
+                id: format!("{kind}:{}:{at}", c["id"]),
+                who: c["user"]["login"].as_str().unwrap_or("?").to_owned(),
+                kind,
+                body: body.to_owned(),
+                class,
+            });
         }
     }
     for (number, node) in &facts {
@@ -221,12 +263,16 @@ pub(crate) fn cycle(
                 r["submittedAt"].as_str().unwrap_or_default(),
                 r["body"].as_str().unwrap_or_default(),
             );
-            if at >= since.as_str() && relevant(&r["author"], body) {
+            if at < since.as_str() {
+                continue;
+            }
+            if let Some(class) = classify(&r["author"], body) {
                 events.entry(*number).or_default().push(Event {
                     id: format!("review:{}", r["databaseId"]),
                     who: r["author"]["login"].as_str().unwrap_or("?").to_owned(),
                     kind: "review",
                     body: format!("[{}] {body}", r["state"].as_str().unwrap_or("")),
+                    class,
                 });
             }
         }
@@ -257,6 +303,8 @@ pub(crate) fn cycle(
         let node = facts.get(&number).cloned().unwrap_or(Value::Null);
         let commit = &node["commits"]["nodes"][0]["commit"];
         let mut adoptable = false;
+        // Automatic behaviours only for PRs created since the reactor's epoch.
+        let recent = pr["created_at"].as_str().is_some_and(|c| c >= epoch);
         if director {
             let mut closing = None;
             let adoption = adopted_pr(pr, |read| {
@@ -271,7 +319,7 @@ pub(crate) fn cycle(
                 .as_ref()
                 .and_then(|c| super::parse_closing_references(c).ok())
                 .map(|r| r.all.len());
-            if count != Some(1) && !memory.closes_asked {
+            if recent && count != Some(1) && !memory.closes_asked {
                 memory.closes_asked = true;
                 let body = format!("{CLOSES_ASK}\n\n{MARKER}");
                 log.push(format!("#{number}: ask for a closing reference"));
@@ -281,6 +329,7 @@ pub(crate) fn cycle(
                 .as_str()
                 .is_some_and(|d| d <= iso(now.saturating_sub(QUIET_SECS)).as_str());
             if adoptable
+                && recent
                 && quiet
                 && memory.rounds == 0
                 && memory.candidate_head.as_deref() != Some(head.as_str())
@@ -292,17 +341,22 @@ pub(crate) fn cycle(
                     kind: "candidate",
                     body: "Adoptable director PR, no push for 15 minutes, no reactor round yet."
                         .into(),
+                    class: Class {
+                        trigger: true,
+                        human: false,
+                    },
                 });
             }
         }
-        if fresh.is_empty() {
-            continue;
-        }
         for e in &fresh {
             memory.seen.push(e.id.clone());
+            memory.human_since_round |= e.class.human;
         }
         let excess = memory.seen.len().saturating_sub(SEEN_LIMIT);
         memory.seen.drain(..excess);
+        if !fresh.iter().any(|e| e.class.trigger) {
+            continue;
+        }
         let title = pr["title"].as_str().unwrap_or_default();
         let branch = pr["head"]["ref"].as_str().unwrap_or_default();
         let pr_run_active = active
@@ -340,6 +394,8 @@ pub(crate) fn cycle(
             eligible: adoptable || owned,
             pr_run_active,
             active_total,
+            repeat_round: memory.last_round_head.as_deref() == Some(head.as_str())
+                && !memory.human_since_round,
         };
         match enforce(&decision, &gate) {
             Effect::None => {}
@@ -347,6 +403,9 @@ pub(crate) fn cycle(
             Effect::Post(body) => {
                 if decision.action == Act::Round {
                     memory.rounds += 1;
+                    memory.last_round_head = Some(head.clone());
+                    memory.last_round_at = Some(iso(now));
+                    memory.human_since_round = false;
                     active_total += 1;
                 }
                 emit(gh, number, &body, dry_run, &mut log)?;
@@ -545,6 +604,24 @@ fn once(root: &Path, opts: &Opts) -> Result<(), ScalerError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ScalerError::Guard("clock before epoch"))?
         .as_secs();
+    if let Some(since) = &opts.since
+        && !regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+            .map_err(|_| ScalerError::Guard("epoch pattern"))?
+            .is_match(since)
+    {
+        return Err(ScalerError::Usage(format!(
+            "--since must be YYYY-MM-DDTHH:MM:SSZ, got {since:?}"
+        )));
+    }
+    if !opts.dry_run && state.epoch.is_none() {
+        state.epoch = Some(iso(now));
+    }
+    let epoch = opts
+        .since
+        .clone()
+        .or_else(|| state.epoch.clone())
+        .unwrap_or_else(|| iso(now));
+    println!("reactor: epoch {epoch}");
     let log = cycle(
         &mut Live { root },
         &mut Claude {
@@ -552,6 +629,7 @@ fn once(root: &Path, opts: &Opts) -> Result<(), ScalerError> {
         },
         &mut state,
         now,
+        &epoch,
         opts.dry_run,
     )?;
     for line in &log {
@@ -657,8 +735,10 @@ mod tests {
     }
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
     const NOW: u64 = 1_793_404_800; // 2026-10-31T00:00:00Z
+    const EPOCH: &str = "2026-10-30T23:00:00Z";
     fn pr(number: u64, branch: &str) -> Value {
         json!({"number":number,"state":"open","title":format!("PR {number}"),
+            "created_at":"2026-10-30T23:10:00Z",
             "user":{"login":"tjfontaine","type":"User"},"labels":[],
             "head":{"ref":branch,"sha":SHA,"repo":{"full_name":REPOSITORY}},
             "base":{"ref":"main","repo":{"full_name":REPOSITORY}}})
@@ -687,6 +767,7 @@ mod tests {
             eligible,
             pr_run_active,
             active_total,
+            repeat_round: false,
         };
         assert_eq!(
             enforce(&d, &gate(false, false, 0)),
@@ -712,6 +793,7 @@ mod tests {
             eligible: true,
             pr_run_active: false,
             active_total: 0,
+            repeat_round: false,
         };
         for text in ["/agent do it", "  /agent"] {
             let d = Decision {
@@ -736,7 +818,7 @@ mod tests {
         fake.closing = vec![7, 8];
         let mut a = agent(Act::Round, "fix CI");
         let mut state = State::default();
-        let log = cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
+        let log = cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
         assert_eq!(a.calls, 1);
         assert_eq!(fake.posted.len(), 1);
         assert!(fake.posted[0].1.starts_with(CLOSES_ASK));
@@ -760,6 +842,7 @@ mod tests {
                 &mut agent(Act::Round, "go"),
                 &mut state,
                 NOW,
+                EPOCH,
                 false,
             )
             .unwrap();
@@ -786,6 +869,7 @@ mod tests {
             &mut agent(Act::Round, "go"),
             &mut State::default(),
             NOW,
+            EPOCH,
             false,
         )
         .unwrap();
@@ -810,7 +894,7 @@ mod tests {
         );
         let mut a = agent(Act::Reply, "hello");
         let mut state = State::default();
-        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
         assert_eq!(a.calls, 0);
         assert!(fake.posted.is_empty());
         assert_eq!(state.cursor.as_deref(), Some("2026-10-30T23:59:00Z"));
@@ -822,15 +906,15 @@ mod tests {
         fake.closing = vec![];
         let mut state = State::default();
         let mut a = agent(Act::Ignore, "");
-        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
-        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
         assert_eq!(fake.posted.len(), 1);
         assert!(fake.posted[0].1.ends_with(MARKER));
         assert!(state.prs[&13].closes_asked);
         // Dry run reports the ask but posts nothing.
         let mut dry = gh(vec![pr(13, "work/no-closes")], vec![]);
         dry.closing = vec![];
-        let log = cycle(&mut dry, &mut a, &mut State::default(), NOW, true).unwrap();
+        let log = cycle(&mut dry, &mut a, &mut State::default(), NOW, EPOCH, true).unwrap();
         assert!(dry.posted.is_empty());
         assert!(log.iter().any(|l| l.contains("would post")));
     }
@@ -843,10 +927,104 @@ mod tests {
         ];
         let mut a = agent(Act::Ignore, "");
         let mut state = State::default();
-        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
-        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
         assert_eq!(a.calls, 1);
         assert!(fake.posted.is_empty());
+    }
+
+    #[test]
+    fn dispatch_reactor_outcome_comment_produces_a_decision() {
+        let mut fake = gh(
+            vec![pr(15, "work/o")],
+            vec![
+                comment(
+                    15,
+                    6,
+                    "carrick-workers[bot]",
+                    "Bot",
+                    "## Dispatch outcome: blocked\nWhich base?",
+                ),
+                comment(
+                    15,
+                    7,
+                    "carrick-workers[bot]",
+                    "Bot",
+                    "unrelated bot chatter",
+                ),
+            ],
+        );
+        let mut a = agent(Act::Ignore, "");
+        cycle(&mut fake, &mut a, &mut State::default(), NOW, EPOCH, false).unwrap();
+        assert_eq!(a.calls, 1);
+    }
+
+    #[test]
+    fn dispatch_reactor_one_round_per_head_until_a_human_speaks() {
+        let mut fake = gh(
+            vec![pr(16, "work/r")],
+            vec![comment(16, 8, "tjfontaine", "User", "please fix CI")],
+        );
+        let mut a = agent(Act::Round, "fix CI");
+        let mut state = State::default();
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(fake.posted.len(), 1);
+        assert_eq!(state.prs[&16].last_round_head.as_deref(), Some(SHA));
+        assert_eq!(
+            state.prs[&16].last_round_at.as_deref(),
+            Some("2026-10-31T00:00:00Z")
+        );
+        // An outcome on the same head asks again; the second round is refused.
+        fake.comments = vec![comment(
+            16,
+            9,
+            "github-actions[bot]",
+            "Bot",
+            "Dispatch outcome: failed",
+        )];
+        let log = cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(a.calls, 2);
+        assert_eq!(fake.posted.len(), 1, "{log:?}");
+        assert!(
+            log.iter().any(|l| l.contains("already rounded this head")),
+            "{log:?}"
+        );
+        // A human comment after the round re-enables one more round.
+        fake.comments = vec![comment(
+            16,
+            10,
+            "tjfontaine",
+            "User",
+            "try the other approach",
+        )];
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(fake.posted.len(), 2);
+    }
+
+    #[test]
+    fn dispatch_reactor_old_pr_gets_no_automatic_behaviour() {
+        let mut old = pr(17, "work/old");
+        old["created_at"] = json!("2026-10-01T00:00:00Z");
+        let mut unclosed = pr(18, "work/old-unclosed");
+        unclosed["created_at"] = json!("2026-10-01T00:00:00Z");
+        let mut fake = gh(vec![old, unclosed], vec![]);
+        fake.facts = vec![
+            json!({"number":17,"commits":{"nodes":[{"commit":{"committedDate":"2026-10-01T00:00:00Z"}}]}}),
+        ];
+        let mut a = agent(Act::Round, "go");
+        let mut state = State::default();
+        // FakeGh answers closing references for every PR alike; run each case.
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        fake.closing = vec![];
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(a.calls, 0);
+        assert!(fake.posted.is_empty());
+        // An explicit owner comment on an old PR is still an event.
+        fake.closing = vec![7];
+        fake.comments = vec![comment(17, 11, "tjfontaine", "User", "please fix")];
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(a.calls, 1);
+        assert_eq!(fake.posted.len(), 1);
     }
 
     #[test]
