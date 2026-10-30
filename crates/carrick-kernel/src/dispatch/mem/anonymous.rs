@@ -2676,6 +2676,27 @@ mod tests {
             "completed backend outcome lost its root proposal on Busy"
         );
         assert_eq!(memory.zero_backing_calls.get(), 1);
+        let foreign = SyscallDispatcher::new();
+        let wrong_guard = crate::dispatch::mm_mutation::test_support::with_guard(
+            foreign.mm_mutation_coordinator(),
+            |guard| {
+                let mut cx = MutationSyscallCtx {
+                    kernel: &context,
+                    request: syscall,
+                    memory: &mut memory,
+                    reporter: &reporter,
+                    thread: None,
+                    mm_mutation: guard,
+                    execution_lease: None,
+                };
+                view.resume_completed_host_venue(&mut cx).unwrap()
+            },
+        );
+        assert!(
+            wrong_guard.is_err(),
+            "foreign mutation guard consumed a completed proposal"
+        );
+        assert!(dispatcher.mem().lock().has_owner_proposal());
         let busy_again = root.with_held_root_refusal(|| {
             dispatcher
                 .dispatch_normalized_mutation_for_test(
