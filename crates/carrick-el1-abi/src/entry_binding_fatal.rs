@@ -197,7 +197,6 @@ pub struct ArmEntryBindingFatal {
     pub frame_slot: u64,
     pub saved_lr: u64,
     pub saved_x: [u64; 4],
-    pub saved_ordinal: u64,
     pub saved_elr: u64,
     pub saved_spsr: u64,
     pub saved_esr: u64,
@@ -286,7 +285,6 @@ impl ArmEntryBindingFatal {
             frame_slot: frame.slot,
             saved_lr: frame.x[30],
             saved_x: [frame.x[0], frame.x[1], frame.x[2], frame.x[3]],
-            saved_ordinal: frame.x[8],
             saved_elr: frame.elr,
             saved_spsr: frame.spsr,
             saved_esr: frame.esr,
@@ -369,14 +367,13 @@ impl fmt::Display for ArmEntryBindingFatal {
         )?;
         write!(
             f,
-            "frame_slot={:#x} saved_lr={:#x} saved_x0={:#x} saved_x1={:#x} saved_x2={:#x} saved_x3={:#x} saved_x8={:#x} saved_elr={:#x} saved_spsr={:#x} saved_esr={:#x} saved_far={:#x} ",
+            "frame_slot={:#x} saved_lr={:#x} saved_x0={:#x} saved_x1={:#x} saved_x2={:#x} saved_x3={:#x} saved_elr={:#x} saved_spsr={:#x} saved_esr={:#x} saved_far={:#x} ",
             self.frame_slot,
             self.saved_lr,
             self.saved_x[0],
             self.saved_x[1],
             self.saved_x[2],
             self.saved_x[3],
-            self.saved_ordinal,
             self.saved_elr,
             self.saved_spsr,
             self.saved_esr,
@@ -569,7 +566,6 @@ mod tests {
         let mut frame = crate::TrapFrame::default();
         frame.x[..4].copy_from_slice(&[0x10, 0x11, 0x12, 0x13]);
         frame.x[30] = 0x1234;
-        frame.x[8] = 64;
         frame.elr = 0x266318;
         let registers = ArmEntryFatalRegisters {
             pc: Some(0xdead),
@@ -589,14 +585,12 @@ mod tests {
         assert_eq!(capture.loaded, binding());
         assert_eq!(capture.saved_lr, 0x1234);
         assert_eq!(capture.saved_x, [0x10, 0x11, 0x12, 0x13]);
-        assert_eq!(capture.saved_ordinal, 64);
         let text = format!("{capture}");
         for field in [
             "pc=0xdead",
             "lr=0xbeef",
             "sp_el0=0x5678",
             "saved_lr=0x1234",
-            "saved_x8=0x40",
             "saved_elr=0x266318",
             "task=0x2a",
             "generation=0x0",
