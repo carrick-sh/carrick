@@ -1126,23 +1126,29 @@ fn pool_cancellation_refuses_record_release_before_terminal_gate() {
 mod member_release {
     use carrick_core::lifecycle::{
         MemberControl, MemberControlAuthority, MemberControlCustody, MemberControlRelease,
-        MemberExitCustody,
+        MemberExitCustody, MemberReleaseWaiter, arm_member_release,
     };
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
 
-    struct Member(MemberControlAuthority);
+    struct Member {
+        authority: MemberControlAuthority,
+        waiter: MemberReleaseWaiter,
+    }
     impl MemberControl for Member {
         fn member_entry(&self) -> Option<carrick_core::lifecycle::EntryRef> {
             None
         }
         fn exit_custody(&self) -> &MemberExitCustody {
-            self.0.custody()
+            self.authority.custody()
         }
         fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
             None
+        }
+        fn release_waiter(&self) -> Option<&MemberReleaseWaiter> {
+            Some(&self.waiter)
         }
     }
     struct Release<'a> {
@@ -1161,21 +1167,24 @@ mod member_release {
 
     #[test]
     fn retained_snapshot_publishes_only_after_the_last_pin_is_returned() {
-        let member = Member(MemberControlAuthority::new());
+        let member = Member {
+            authority: MemberControlAuthority::new(),
+            waiter: MemberReleaseWaiter::new(),
+        };
         let release = Arc::new(Release {
             count: AtomicUsize::new(0),
             member: &member,
         });
-        let entry = MemberControlCustody::retain(&member)
-            .unwrap()
-            .with_release(release.clone());
-        let snapshot = entry.retained().unwrap();
+        assert!(!arm_member_release(&member, release.clone()));
+        let entry = MemberControlCustody::retain(&member).unwrap();
+        let transient = MemberControlCustody::retain(&member).unwrap();
+        assert!(arm_member_release(&member, release.clone()));
         drop(entry);
         assert!(member.exit_custody().referenced());
         assert_eq!(release.count.load(Ordering::SeqCst), 0);
-        drop(snapshot);
+        drop(transient);
         assert!(!member.exit_custody().referenced());
         assert_eq!(release.count.load(Ordering::SeqCst), 1);
-        assert!(member.0.reserve_reset().is_ok());
+        assert!(member.authority.reserve_reset().is_ok());
     }
 }
