@@ -1,3 +1,8 @@
+# #1101: fork lifecycle backing uses retained metadata custody.
+# Task entry receipts, identity, and admission transitions are unchanged; lifecycle storage keeps its existing address geometry and carrier lifetime.
+# The component ownership/counter witnesses are registered under
+# kernel.el1.metadata-allocation; retain every existing family binding below.
+# These VM-free component checks do not confer signed acceptance for this family.
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks

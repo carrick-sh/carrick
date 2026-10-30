@@ -219,23 +219,12 @@ impl ForkStockHostCustody {
         let generation = custody
             .live_generation()
             .ok_or_else(|| fail("native fork stock has no live carrier"))?;
-        let reply = crate::metadata_grant::service_metadata_operation(
-            custody,
-            Some(generation),
-            carrick_guest_arch::CpuId::new(0),
-            None,
-            carrick_el1_abi::METADATA_GRANT_OP_ALLOC,
-            carrick_el1_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64,
-            0,
-            0,
-        )?;
-        if reply[0] != carrick_el1_abi::METADATA_GRANT_SUCCESS {
-            return Err(fail("native fork lifecycle extent unavailable"));
-        }
+        let extent = crate::metadata_grant::install_fork_lifecycle(custody, generation)
+            .map_err(|error| fail(&format!("native fork lifecycle extent: {error:?}")))?;
         let lifecycles = carrick_hal::fork_stock::lifecycle_slots(
             carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
-            reply[1],
-            reply[2] / carrick_hal::fork_stock::LIFECYCLE_SLOT_STRIDE,
+            extent.base(),
+            extent.len() / carrick_hal::fork_stock::LIFECYCLE_SLOT_STRIDE,
         )
         .ok_or_else(|| fail("native fork lifecycle extent layout"))?;
         stock

@@ -416,6 +416,12 @@ impl MetadataBacking {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct MetadataPublication {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    identity: crate::trap::CarrierStage2RecordIdentity,
+}
+
 #[derive(::core::fmt::Debug)]
 struct GrantedSlotRecord {
     backing: Arc<MetadataBacking>,
@@ -518,14 +524,7 @@ impl CarrierMetadataAccess {
                 &self.carrier.custody,
                 self.generation,
                 backing,
-                |spec| unsafe {
-                    crate::trap::inventory_hv_vm_map(
-                        spec.host_addr as *mut std::ffi::c_void,
-                        spec.ipa,
-                        spec.len,
-                        spec.perms,
-                    )
-                },
+                map_metadata_backing,
             )?;
         Ok(RetainedMetadataMapping {
             access: self.clone(),
@@ -650,19 +649,41 @@ impl HostApertureState {
         backing: Arc<dyn RetainedMetadataBacking>,
         map: impl FnOnce(crate::trap::CarrierStage2RecordSpec) -> i32,
     ) -> Result<MetadataExtent, MetadataResolutionError> {
-        let len = backing.mapped_len();
-        let host = backing.host_base().raw();
+        if !request_has_live_vm(custody, Some(generation)) {
+            return Err(MetadataResolutionError::StaleOwner);
+        }
+        self.install_backing_using(
+            MetadataBacking::Retained(backing),
+            generation.0,
+            |host, ipa, len, token| {
+                publish_backing_using(custody, generation, host, ipa, len, token, map)
+            },
+        )
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn install_backing_using(
+        &mut self,
+        backing: MetadataBacking,
+        generation: u64,
+        publish: impl FnOnce(
+            usize,
+            u64,
+            usize,
+            u64,
+        ) -> Result<MetadataPublication, MetadataResolutionError>,
+    ) -> Result<MetadataExtent, MetadataResolutionError> {
+        let granule = 16384;
+        let len = backing.len();
+        let host = backing.as_ptr() as usize;
         if len == 0
             || len > EL1_DYNAMIC_METADATA_SIZE as usize
-            || !len.is_multiple_of(16384)
+            || !len.is_multiple_of(granule)
             || host == 0
-            || !host.is_multiple_of(16384)
+            || !host.is_multiple_of(granule)
             || host.checked_add(len).is_none()
         {
             return Err(MetadataResolutionError::InvalidExtent);
-        }
-        if !request_has_live_vm(custody, Some(generation)) {
-            return Err(MetadataResolutionError::StaleOwner);
         }
         let token = reserve_metadata_token(&NEXT_TOKEN).ok_or(MetadataResolutionError::Busy)?;
         let count = len.div_ceil(EL1_DYNAMIC_METADATA_EXTENT_SIZE);
@@ -670,35 +691,55 @@ impl HostApertureState {
             .find_and_reserve_slots(count)
             .ok_or(MetadataResolutionError::Busy)?;
         let ipa = EL1_DYNAMIC_METADATA_BASE + (slot * EL1_DYNAMIC_METADATA_EXTENT_SIZE) as u64;
-        let spec = crate::trap::CarrierStage2RecordSpec {
-            vm_generation: generation,
-            ipa,
-            len,
-            host_addr: host,
-            mapped: true,
-            backend_map_installed: true,
-            release_ipa: false,
-            perms: 3,
-            logical_owner: Some(crate::trap::CarrierLogicalOwner {
-                id: token,
-                generation: token,
-            }),
-        };
-        let identity = match publish_metadata_mapping_using(custody, spec, |_| map(spec)) {
+        let MetadataPublication {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            identity,
+        } = match publish(host, ipa, len, token) {
             Ok(identity) => identity,
             Err(_) => {
                 self.unreserve_slots(slot, count);
                 return Err(MetadataResolutionError::Busy);
             }
         };
-        self.slots[slot] = Some(GrantedSlotRecord {
-            backing: Arc::new(MetadataBacking::Retained(backing)),
-            identity,
-            num_slots: count,
-            token,
-            generation: generation.0,
-        });
+        self.commit_grant(
+            slot,
+            GrantedSlotRecord {
+                backing: Arc::new(backing),
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                identity,
+                num_slots: count,
+                token,
+                generation,
+            },
+        );
         MetadataExtent::new(ipa, len as u64, token).ok_or(MetadataResolutionError::InvalidExtent)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn install_fork_lifecycle_using(
+        &mut self,
+        generation: u64,
+        publish: impl FnOnce(
+            usize,
+            u64,
+            usize,
+            u64,
+        ) -> Result<MetadataPublication, MetadataResolutionError>,
+    ) -> Result<MetadataExtent, MetadataResolutionError> {
+        let backing = MetadataBacking::Allocated(
+            allocate_metadata_backing(EL1_DYNAMIC_METADATA_EXTENT_SIZE)
+                .map_err(|_| MetadataResolutionError::Busy)?,
+        );
+        self.install_backing_using(backing, generation, publish)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn commit_grant(&mut self, slot: usize, record: GrantedSlotRecord) {
+        if matches!(record.backing.as_ref(), MetadataBacking::Allocated(_)) {
+            GRANTS_SUCCEEDED.fetch_add(1, Ordering::Relaxed);
+            BYTES_GRANTED.fetch_add(record.backing.len() as u64, Ordering::Relaxed);
+        }
+        self.slots[slot] = Some(record);
     }
 
     fn pin_extent(
@@ -748,7 +789,12 @@ impl HostApertureState {
         {
             return METADATA_GRANT_ERR_DENIED;
         }
-        self.retire_extent_using(slot, size, token, generation, unmap)
+        let status = self.retire_extent_using(slot, size, token, generation, unmap);
+        if status == METADATA_GRANT_SUCCESS {
+            RETURNS_COMPLETED.fetch_add(1, Ordering::Relaxed);
+            BYTES_RETURNED.fetch_add(size as u64, Ordering::Relaxed);
+        }
+        status
     }
 
     fn retire_retained_using(
@@ -936,6 +982,78 @@ fn retire_metadata_record_using(
     }
 }
 
+/// Install carrier-lifetime fork storage through the aperture's existing owner.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn install_fork_lifecycle(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: crate::trap::CarrierVmGeneration,
+) -> Result<MetadataExtent, MetadataResolutionError> {
+    if !request_has_live_vm(custody, Some(generation)) {
+        return Err(MetadataResolutionError::StaleOwner);
+    }
+    metadata_aperture(custody)
+        .lock()
+        .install_fork_lifecycle_using(generation.0, |host, ipa, len, token| {
+            publish_backing_using(
+                custody,
+                generation,
+                host,
+                ipa,
+                len,
+                token,
+                map_metadata_backing,
+            )
+        })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn map_metadata_backing(spec: crate::trap::CarrierStage2RecordSpec) -> i32 {
+    // SAFETY: the aperture owner retains the validated backing and reservation
+    // through the inventory's rollback-capable stage-2 publication.
+    unsafe {
+        crate::trap::inventory_hv_vm_map(
+            spec.host_addr as *mut std::ffi::c_void,
+            spec.ipa,
+            spec.len,
+            spec.perms,
+        )
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn publish_backing_using(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: crate::trap::CarrierVmGeneration,
+    host: usize,
+    ipa: u64,
+    len: usize,
+    token: u64,
+    map: impl FnOnce(crate::trap::CarrierStage2RecordSpec) -> i32,
+) -> Result<MetadataPublication, MetadataResolutionError> {
+    let spec = crate::trap::CarrierStage2RecordSpec {
+        vm_generation: generation,
+        ipa,
+        len,
+        host_addr: host,
+        mapped: true,
+        backend_map_installed: true,
+        release_ipa: false,
+        perms: 3,
+        logical_owner: Some(crate::trap::CarrierLogicalOwner {
+            id: token,
+            generation: token,
+        }),
+    };
+    publish_metadata_mapping_using(custody, spec, |_| map(spec))
+        .map(|identity| MetadataPublication { identity })
+        .map_err(|_| MetadataResolutionError::Busy)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn note_inline_metadata_trap(_op: u64) {
+    INLINE_HVC_TRAPS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Return a snapshot of metadata grant counters.
 pub fn metadata_grant_stats() -> MetadataGrantStats {
     MetadataGrantStats {
@@ -1090,17 +1208,18 @@ pub(crate) fn service_metadata_operation(
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
         };
-        state.slots[slot_idx] = Some(GrantedSlotRecord {
-            backing: Arc::new(MetadataBacking::Allocated(backing)),
-            identity,
-            num_slots,
-            token,
-            generation,
-        });
+        state.commit_grant(
+            slot_idx,
+            GrantedSlotRecord {
+                backing: Arc::new(MetadataBacking::Allocated(backing)),
+                identity,
+                num_slots,
+                token,
+                generation,
+            },
+        );
         drop(state);
 
-        GRANTS_SUCCEEDED.fetch_add(1, Ordering::Relaxed);
-        BYTES_GRANTED.fetch_add(extent_size as u64, Ordering::Relaxed);
         Ok([METADATA_GRANT_SUCCESS, ipa, extent_size as u64, token])
     } else if op == METADATA_GRANT_OP_FREE {
         let ipa = arg1;
@@ -1137,10 +1256,6 @@ pub(crate) fn service_metadata_operation(
                         }
                     })
                 });
-        if status == METADATA_GRANT_SUCCESS {
-            RETURNS_COMPLETED.fetch_add(1, Ordering::Relaxed);
-            BYTES_RETURNED.fetch_add(size as u64, Ordering::Relaxed);
-        }
         Ok([status, 0, 0, 0])
     } else if op == GRANT_OP_ROOT_EXIT {
         let record_va = carrick_guest_arch::KernelVa::new(arg1);
@@ -2067,10 +2182,10 @@ pub(crate) fn handle_metadata_grant_trap(
     generation: Option<crate::trap::CarrierVmGeneration>,
 ) -> Result<MetadataTrapOutcome, TrapError> {
     use applevisor::vcpu::Reg;
-    INLINE_HVC_TRAPS.fetch_add(1, Ordering::Relaxed);
     let op = vcpu
         .get_reg(Reg::X0)
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X0 for metadata grant: {e}")))?;
+    note_inline_metadata_trap(op);
     let arg1 = vcpu
         .get_reg(Reg::X1)
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X1 for metadata grant: {e}")))?;
@@ -2471,6 +2586,135 @@ fn root_execution(
             generation: task.root_generation()?,
         },
     ))
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn serial_host_process_crossings_are_not_inline_allocator_waits() {
+        reset_metadata_grant_state();
+        for op in [
+            GRANT_OP_ROOT_EXIT,
+            GRANT_OP_FORK_STOCK,
+            carrick_el1_abi::GRANT_OP_RESIDENCY_KICK,
+        ] {
+            note_inline_metadata_trap(op);
+        }
+        assert_eq!(metadata_grant_stats().inline_hvc_traps, 0);
+        for op in [METADATA_GRANT_OP_ALLOC, METADATA_GRANT_OP_FREE] {
+            note_inline_metadata_trap(op);
+        }
+        assert_eq!(metadata_grant_stats().inline_hvc_traps, 2);
+    }
+
+    // No VM is needed: backend publication is the only substituted operation.
+    // Exercise the same fork-storage admission used before guest startup, then
+    // grow/free through the real allocator and aperture return authorities.
+    #[test]
+    fn serial_host_fork_lifecycle_does_not_leave_a_guest_grant_outstanding() {
+        reset_metadata_grant_state();
+        let mut state = HostApertureState::new();
+        let custody = crate::trap::CarrierVmCustody::new();
+        let generation = {
+            let generation = custody.begin_create().unwrap();
+            custody.commit_create(generation).unwrap();
+            generation
+        };
+        let publish = |host, ipa, len, token| {
+            publish_backing_using(&custody, generation, host, ipa, len, token, |_| 0)
+        };
+        let retire = |record: &GrantedSlotRecord| {
+            retire_metadata_record_using(&custody, record.identity, |_, _| Ok(()))
+        };
+        assert!(
+            state
+                .install_fork_lifecycle_using(1, |_, _, _, _| {
+                    Err(MetadataResolutionError::Busy)
+                })
+                .is_err()
+        );
+        assert!(state.occupied_bitmap.iter().all(|bits| *bits == 0));
+        assert_eq!(metadata_grant_stats().grants_succeeded, 0);
+        let lifecycle = state.install_fork_lifecycle_using(1, publish).unwrap();
+        let lifecycle_pin = state.pin_extent(lifecycle, 1).unwrap();
+        let lifecycle_host = lifecycle_pin.host_base().as_ptr();
+        unsafe { lifecycle_host.write(0x5a) };
+        drop(lifecycle_pin);
+
+        let bootstrap = allocate_metadata_backing(64 * 1024).unwrap();
+        let mut allocator = carrick_core::mm::capacity::MetadataAllocatorCore::new();
+        allocator
+            .admit_extent(
+                bootstrap.as_ptr() as u64,
+                bootstrap.len(),
+                carrick_core::mm::capacity::ExtentKind::Bootstrap,
+            )
+            .unwrap();
+        let size = 2 * EL1_DYNAMIC_METADATA_EXTENT_SIZE;
+        assert!(
+            allocator.allocate(size / 2, 64).is_none(),
+            "force dynamic growth"
+        );
+        let backing = allocate_metadata_backing(size).unwrap();
+        let host = backing.as_ptr();
+        let dynamic = state
+            .install_backing_using(MetadataBacking::Allocated(backing), 1, publish)
+            .unwrap();
+        allocator
+            .admit_extent(
+                host as u64,
+                size,
+                carrick_core::mm::capacity::ExtentKind::Dynamic {
+                    token: dynamic.token(),
+                },
+            )
+            .unwrap();
+        let payload = allocator.allocate(size / 2, 64).unwrap();
+        unsafe { payload.write_bytes(0xa5, size / 2) };
+        let receipt = allocator.deallocate(payload, 64).unwrap();
+        let slot = ((dynamic.base() - EL1_DYNAMIC_METADATA_BASE)
+            / EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64) as usize;
+        assert_eq!(
+            state.return_extent_using(slot, size, receipt.token, 1, retire),
+            METADATA_GRANT_SUCCESS
+        );
+        assert!(allocator.complete_extent_return(receipt));
+        assert_eq!(allocator.diagnostics().allocated_bytes, 0);
+        assert_eq!(
+            allocator.diagnostics().total_capacity_bytes,
+            bootstrap.len()
+        );
+        assert_eq!(
+            state.return_extent_using(slot, size, receipt.token, 1, |_| panic!("double unmap")),
+            METADATA_GRANT_ERR_NOT_FOUND,
+        );
+        let stats = metadata_grant_stats();
+        assert_eq!(stats.grants_succeeded, stats.returns_completed, "{stats:?}");
+        assert_eq!(stats.bytes_granted, stats.bytes_returned, "{stats:?}");
+        assert_eq!(
+            unsafe { lifecycle_host.read() },
+            0x5a,
+            "fork storage must stay live after guest allocator drain"
+        );
+        assert_eq!(
+            state.return_extent_using(
+                0,
+                lifecycle.len() as usize,
+                lifecycle.token(),
+                1,
+                |_| panic!("guest cannot free fork storage")
+            ),
+            METADATA_GRANT_ERR_DENIED
+        );
+        assert_eq!(
+            state.retire_retained_using(lifecycle, 1, retire),
+            METADATA_GRANT_SUCCESS
+        );
+        assert!(state.occupied_bitmap.iter().all(|bits| *bits == 0));
+        assert!(custody.stage2_record_identities().is_empty());
+    }
 }
 
 #[cfg(test)]
