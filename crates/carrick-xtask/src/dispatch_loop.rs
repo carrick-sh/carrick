@@ -1614,15 +1614,26 @@ impl Server<'_> {
         if matches!(applied.body, AppliedBody::Failed(_)) {
             observations.push("PR body publication failed");
         }
+        let unpushed = (observations.is_empty() && status == ContractStatus::Done)
+            .then(|| self.unpushed_head())
+            .flatten();
         let status = if !observations.is_empty() {
             ContractStatus::Failed
         } else if applied.adoption_blocked.is_some() && status == ContractStatus::Done {
             // An adopted PR moved or was rewritten: nothing was pushed.
             ContractStatus::Blocked
+        } else if unpushed.is_some() {
+            // Done means pushed (#1168).
+            ContractStatus::Blocked
         } else {
             status
         };
-        let applied = if observations.is_empty() {
+        let applied = if let Some(reason) = &unpushed {
+            format!(
+                "Server observed: {reason}, so done is reported as blocked.\n\n{}",
+                applied.report()
+            )
+        } else if observations.is_empty() {
             applied.report()
         } else {
             format!(
@@ -1711,6 +1722,84 @@ impl Server<'_> {
             )?;
         }
         Ok(())
+    }
+    /// Done means pushed (#1168): after every worker, whatever its status,
+    /// and before any fallback outcome, push the harvested commits as a WIP
+    /// checkpoint under the run's advancing lease. Commits only: the loop's
+    /// own `publish` keeps PR creation and the body, and its budget is
+    /// untouched. A refusal is recorded (an adopted PR that moved stays
+    /// blocked) and never ends the round by itself.
+    fn checkpoint_publish(&mut self) -> Option<String> {
+        let attempt = (|| -> Result<Option<String>, ScalerError> {
+            if Applied::load()?.adoption_blocked.is_some() {
+                return Ok(None);
+            }
+            let state = crate::agent_runner::state()?;
+            let Some(receipt) = worker_checkpoint(&state, &self.dispatch)? else {
+                return Ok(None);
+            };
+            let lease = RunLease::load(&state, admitted_tip(&self.dispatch, &receipt))?;
+            if receipt.head == lease.current() || produced_nothing(&self.dispatch, &receipt) {
+                return Ok(None);
+            }
+            cleanup_agent_user()?;
+            let report = state.join("checkpoint.md");
+            std::fs::write(&report, "")?;
+            publish_with(
+                self.root,
+                &self.dispatch,
+                &receipt,
+                &receipt.contract,
+                &report,
+                &self.token,
+                &mut self.runs,
+                PublishMode::CommitsOnly,
+            )?;
+            if RunLease::load(&state, "")?.current() != receipt.head {
+                return Ok(Some(
+                    "WIP checkpoint not pushed: the existing branch was retained".into(),
+                ));
+            }
+            Applied::record(|a| a.wip_pushed = Some(receipt.head.clone()))?;
+            Ok(Some(format!("pushed WIP at `{}`", receipt.head)))
+        })();
+        let note = attempt.unwrap_or_else(|error| {
+            Some(format!(
+                "WIP checkpoint push failed: {}",
+                masked(&error.to_string(), &self.token)
+            ))
+        });
+        if let Some(note) = &note {
+            let _ = loop_log(json!({"phase":"checkpoint","note":note}));
+        }
+        note
+    }
+    /// A `done` round must have pushed the worker's last commit: the live
+    /// branch head equals the last harvested head, or the worker made none.
+    fn unpushed_head(&self) -> Option<String> {
+        let check = || -> Result<Option<String>, ScalerError> {
+            let state = crate::agent_runner::state()?;
+            let Some(receipt) = worker_checkpoint(&state, &self.dispatch)? else {
+                return Ok(None);
+            };
+            if produced_nothing(&self.dispatch, &receipt) {
+                return Ok(None);
+            }
+            let live = live_branch_tip(&state.join("work"), &self.dispatch.branch)?;
+            let live = live.split_whitespace().next().unwrap_or("absent");
+            Ok((live != receipt.head).then(|| {
+                format!(
+                    "the PR head on GitHub (`{live}`) is not the worker's last commit `{}`",
+                    receipt.head
+                )
+            }))
+        };
+        check().unwrap_or_else(|error| {
+            Some(format!(
+                "the worker's last commit could not be confirmed pushed: {}",
+                masked(&error.to_string(), &self.token)
+            ))
+        })
     }
     fn finish_with(
         &mut self,
@@ -2278,7 +2367,13 @@ impl Server<'_> {
                         risks: vec![],
                     });
                 }
-                result
+                let checkpoint = self.checkpoint_publish();
+                result.map(|mut response| {
+                    if let Some(note) = checkpoint {
+                        response["checkpoint"] = note.into();
+                    }
+                    response
+                })
             }
             Request::Publish(_) => {
                 if self.used.workers == 0 {
@@ -2746,6 +2841,7 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
                 .unwrap_or_else(|| "Loop exited without calling finish".into())
         };
 
+        server.checkpoint_publish();
         server.outcome(ContractStatus::Failed, &reason)?;
         retirement?;
         return Err(ScalerError::Guard(
@@ -4278,6 +4374,92 @@ API
     fn followup_recovered_worker_can_finish_done() {
         outcome_floor_fixture(vec![FixtureTurn::MissingResult, FixtureTurn::Good], true);
     }
+    #[test]
+    fn timed_out_worker_work_is_pushed_without_a_publish_call() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let (native, _) = native_fixture(vec![FixtureTurn::Timeout]);
+            server.launcher = Box::new(ObservedNativeLauncher(native));
+            // The run's branch does not exist on GitHub yet.
+            std::fs::write(root.join("remote-tip"), "").unwrap();
+            let response = server.execute(worker_request()).unwrap();
+            let state = crate::agent_runner::state().unwrap();
+            let receipt = worker_checkpoint(&state, &server.dispatch)
+                .unwrap()
+                .unwrap();
+            assert!(receipt.checkpointed, "timed-out work was not checkpointed");
+            assert_eq!(
+                regular_text(&root.join("remote-tip"))
+                    .expect("timed-out worker's commits were never pushed")
+                    .trim(),
+                receipt.head
+            );
+            assert_eq!(
+                server.used.publishes, 0,
+                "checkpoint spent the loop's budget"
+            );
+            assert!(
+                response["checkpoint"]
+                    .as_str()
+                    .is_some_and(|note| note.contains(&receipt.head)),
+                "{response}"
+            );
+            assert_eq!(
+                Applied::load().unwrap().wip_pushed.as_deref(),
+                Some(receipt.head.as_str())
+            );
+        });
+    }
+    #[test]
+    fn done_with_the_last_commit_pushed_stays_done() {
+        done_means_pushed_fixture(false);
+    }
+    #[test]
+    fn done_with_an_unpushed_last_commit_is_blocked() {
+        done_means_pushed_fixture(true);
+    }
+    fn done_means_pushed_fixture(unpushed: bool) {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let (native, _) = native_fixture(vec![FixtureTurn::Good]);
+            server.launcher = Box::new(ObservedNativeLauncher(native));
+            std::fs::write(root.join("remote-tip"), "").unwrap();
+            server.execute(worker_request()).unwrap();
+            if unpushed {
+                // GitHub still shows an older head than the worker's last commit.
+                std::fs::write(root.join("remote-tip"), &server.dispatch.base).unwrap();
+            }
+            server
+                .execute(Request::Finish(Outcome {
+                    status: ContractStatus::Done,
+                    summary: "All work is complete".into(),
+                }))
+                .unwrap();
+            let outcome: Contract = serde_json::from_str(
+                &regular_text(&root.join("dispatch-output/contract.json")).unwrap(),
+            )
+            .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            if unpushed {
+                assert_eq!(outcome.status, ContractStatus::Blocked);
+                assert!(
+                    posted.starts_with("Dispatch outcome: Blocked")
+                        && posted.contains("is not the worker's last commit")
+                        && posted.contains("> loop claimed: done"),
+                    "{posted}"
+                );
+            } else {
+                assert_eq!(outcome.status, ContractStatus::Done, "{posted}");
+                assert!(posted.contains("Pushed WIP at"), "{posted}");
+            }
+        });
+    }
     fn outcome_floor_fixture(turns: Vec<FixtureTurn>, publish_tree: bool) {
         shared_fixture(|root| {
             let recovered = matches!(turns.last(), Some(FixtureTurn::Good));
@@ -4940,7 +5122,13 @@ API
         let moved = git(&work, &["rev-parse", "HEAD"]).unwrap();
         git(&work, &["commit", "--allow-empty", "-m", "candidate"]).unwrap();
         let server = server(&work);
-        let command = push_command(&work, &server.dispatch, "42", &expected).unwrap();
+        let command = push_command(
+            &work,
+            &server.dispatch,
+            "42",
+            &RunLease::admitted(&expected),
+        )
+        .unwrap();
         let args: Vec<_> = command
             .get_args()
             .map(|arg| {

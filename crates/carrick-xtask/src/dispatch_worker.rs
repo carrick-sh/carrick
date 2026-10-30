@@ -1797,6 +1797,20 @@ fn worker_checkpoint(state: &Path, dispatch: &Dispatch) -> Result<Option<Receipt
     Ok(Some(receipt))
 }
 
+/// Where this run's lease starts: the admitted PR tip on an adopted run, else
+/// the branch tip the first worker checked out (empty for a new branch).
+fn admitted_tip<'a>(dispatch: &'a Dispatch, receipt: &'a Receipt) -> &'a str {
+    match &dispatch.continuation {
+        Continuation::Adopted { tip, .. } => tip,
+        Continuation::Owned => &receipt.expected_tip,
+    }
+}
+/// Whether the harvested head adds nothing to what the run started from.
+fn produced_nothing(dispatch: &Dispatch, receipt: &Receipt) -> bool {
+    let admitted = admitted_tip(dispatch, receipt);
+    receipt.head == admitted || (admitted.is_empty() && receipt.head == receipt.base)
+}
+
 /// Re-pair the checkpoint receipt with the tree after publication moved HEAD.
 fn refresh_checkpoint_head(state: &Path, work: &Path) -> Result<(), ScalerError> {
     use std::io::Write;
@@ -2555,13 +2569,51 @@ fn produce(
     Ok(())
 }
 
+/// The push lease of one run. It starts at the tip admitted for the run and
+/// advances to each tip this run pushed, so a later push in the same run (a
+/// WIP checkpoint, then the final push) is still a lease, never a force.
+/// `published-tip` is server-owned run state; worker output never writes it.
+struct RunLease {
+    admitted: String,
+    pushed: Option<String>,
+}
+impl RunLease {
+    #[cfg(test)]
+    fn admitted(tip: &str) -> Self {
+        Self {
+            admitted: tip.to_owned(),
+            pushed: None,
+        }
+    }
+    fn load(state: &Path, admitted: &str) -> Result<Self, ScalerError> {
+        let path = state.join("published-tip");
+        let pushed = if path.exists() {
+            let tip = regular_text(&path)?.trim().to_owned();
+            if !sha(&tip) {
+                return Err(ScalerError::Guard("invalid published tip"));
+            }
+            Some(tip)
+        } else {
+            None
+        };
+        Ok(Self {
+            admitted: admitted.to_owned(),
+            pushed,
+        })
+    }
+    fn current(&self) -> &str {
+        self.pushed.as_deref().unwrap_or(&self.admitted)
+    }
+}
+
 /// The destination is derived from the admitted event, never from agent output.
 fn push_command(
     root: &Path,
     dispatch: &Dispatch,
     id: &str,
-    expected: &str,
+    lease: &RunLease,
 ) -> Result<Command, ScalerError> {
+    let expected = lease.current();
     let branch = match &dispatch.continuation {
         Continuation::Owned => {
             let branch = format!("work/dispatch-{}-{id}", dispatch.issue);
@@ -2573,9 +2625,9 @@ fn push_command(
             if !valid_branch(branch) || dispatch_branch(branch).is_some() {
                 return Err(ScalerError::Guard("invalid adopted branch"));
             }
-            if expected != tip {
+            if lease.admitted != *tip {
                 return Err(ScalerError::Guard(
-                    "adopted push lease must be the admitted PR tip",
+                    "adopted push lease must start at the admitted PR tip",
                 ));
             }
             branch.clone()
@@ -2744,6 +2796,9 @@ struct Applied {
     /// An adopted PR moved or its history was rewritten; the round ends blocked.
     #[serde(default)]
     adoption_blocked: Option<String>,
+    /// The last tip the server pushed as a WIP checkpoint after a worker.
+    #[serde(default)]
+    wip_pushed: Option<String>,
 }
 impl Applied {
     fn load() -> Result<Self, ScalerError> {
@@ -2765,10 +2820,14 @@ impl Applied {
     }
     fn report(&self) -> String {
         format!(
-            "{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}",
+            "{}{}- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}",
             self.adoption_blocked
                 .as_ref()
                 .map(|reason| format!("- Push refused: {reason}.\n"))
+                .unwrap_or_default(),
+            self.wip_pushed
+                .as_ref()
+                .map(|tip| format!("- Pushed WIP at `{tip}`.\n"))
                 .unwrap_or_default(),
             if self.commits.is_empty() {
                 "none".into()
@@ -3469,6 +3528,39 @@ fn publish(
     token: &str,
     runs: &mut agent_loop::RunCache,
 ) -> Result<Option<u64>, ScalerError> {
+    publish_with(
+        root,
+        dispatch,
+        receipt,
+        contract,
+        report_path,
+        token,
+        runs,
+        PublishMode::Full,
+    )
+}
+
+/// What one publication may change on GitHub.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublishMode {
+    /// Push commits, then create the PR or apply the body proposal.
+    Full,
+    /// The server's WIP checkpoint after a worker: push commits only, never
+    /// create a PR or touch a body, so turn-end work is never lost.
+    CommitsOnly,
+}
+
+#[expect(clippy::too_many_arguments, reason = "one publication request")]
+fn publish_with(
+    root: &Path,
+    dispatch: &Dispatch,
+    receipt: &Receipt,
+    contract: &Contract,
+    report_path: &Path,
+    token: &str,
+    runs: &mut agent_loop::RunCache,
+    mode: PublishMode,
+) -> Result<Option<u64>, ScalerError> {
     let mut preserve = None;
     let result = publish_commits(
         root,
@@ -3479,6 +3571,7 @@ fn publish(
         token,
         runs,
         &mut preserve,
+        mode,
     );
     let (Err(error), Some(base)) = (&result, preserve) else {
         return result;
@@ -3551,6 +3644,7 @@ fn publish_commits(
     token: &str,
     runs: &mut agent_loop::RunCache,
     preserve: &mut Option<String>,
+    mode: PublishMode,
 ) -> Result<Option<u64>, ScalerError> {
     let mut credential = PublishCredential::new(token);
     let mut check = ReferenceCheck::new(reference_host());
@@ -3576,7 +3670,9 @@ fn publish_commits(
         branch_run(dispatch.issue, &dispatch.branch)?
     };
     // Invalid prose cannot consume the run's only chance to publish commits.
-    let proposal = if adopted.is_some() {
+    let proposal = if mode == PublishMode::CommitsOnly {
+        None
+    } else if adopted.is_some() {
         // An adopted PR belongs to its author: push commits, never the body.
         if receipt.pr_body.is_some() {
             Applied::record(|a| {
@@ -3602,6 +3698,7 @@ fn publish_commits(
             }
         }
     };
+    let lease = RunLease::load(&state, admitted_tip(dispatch, receipt))?;
     if work.is_dir()
         && (dispatch.resume || git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base)
     {
@@ -3614,6 +3711,17 @@ fn publish_commits(
                     number,
                     &format!(
                         "the worker rewrote history: HEAD does not descend from the admitted tip `{admitted}`. Nothing was pushed"
+                    ),
+                )?);
+            }
+            // Fast-forward only, also over this run's own earlier pushes.
+            if let Some(pushed) = &lease.pushed
+                && git(&work, &["merge-base", "--is-ancestor", pushed, "HEAD"]).is_err()
+            {
+                return Err(adopted_publication_blocked(
+                    number,
+                    &format!(
+                        "the worker rewrote history: HEAD does not descend from this run's pushed tip `{pushed}`. Nothing was pushed"
                     ),
                 )?);
             }
@@ -3733,7 +3841,7 @@ fn publish_commits(
         };
         let existing = tip.split_whitespace().next();
         if let Some((number, admitted)) = adopted
-            && existing != Some(admitted)
+            && existing != Some(lease.current())
             && existing != Some(head.trim())
         {
             return Err(adopted_publication_blocked(
@@ -3744,8 +3852,8 @@ fn publish_commits(
             )?);
         }
         let retained =
-            existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim());
-        if existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim()) {
+            existing.is_some() && lease.current().is_empty() && existing != Some(head.trim());
+        if retained {
             let pr = require_owned_pr(root, dispatch)?;
             use std::io::Write;
             writeln!(
@@ -3763,18 +3871,18 @@ fn publish_commits(
             let mut new_commits = Vec::new();
             let mut rebased_onto = None;
             if existing != Some(head.trim()) {
-                let prior_base = if receipt.expected_tip.is_empty() {
+                let leased = lease.current();
+                let prior_base = if leased.is_empty() {
                     receipt.base.clone()
                 } else {
-                    git(&work, &["merge-base", &live_main, &receipt.expected_tip])?
+                    git(&work, &["merge-base", &live_main, leased])?
                         .trim()
                         .to_owned()
                 };
                 // Main must be on the primary history, and a published old tip
                 // must have been rewritten. Merging main retains that old tip.
-                let rewritten = receipt.expected_tip.is_empty()
-                    || git(&work, &["merge-base", &receipt.expected_tip, "HEAD"])?.trim()
-                        != receipt.expected_tip;
+                let rewritten = leased.is_empty()
+                    || git(&work, &["merge-base", leased, "HEAD"])?.trim() != leased;
                 if prior_base != base
                     && rewritten
                     && git(
@@ -3805,21 +3913,22 @@ fn publish_commits(
                     commits.clone()
                 };
                 credential.write(push_event, |token| {
-                    let mut push = push_command(&work, dispatch, id, &receipt.expected_tip)?;
+                    let mut push = push_command(&work, dispatch, id, &lease)?;
                     push.env("GH_TOKEN", token).env_remove("GITHUB_TOKEN");
                     output(&mut push)
                 }).or_else(|error| match adopted {
                     // Decide from the server, never from git's localized text.
-                    Some((number, admitted))
+                    Some((number, _))
                         if live_branch_tip(&work, &dispatch.branch)?
                             .split_whitespace()
                             .next()
-                            != Some(admitted) =>
+                            != Some(lease.current()) =>
                     {
                         Err(adopted_publication_blocked(
                             number,
                             &format!(
-                                "the PR moved after admission (the push lease on `{admitted}` was rejected). Nothing was overwritten; comment `/agent` again to continue from the new head"
+                                "the PR moved after admission (the push lease on `{}` was rejected). Nothing was overwritten; comment `/agent` again to continue from the new head",
+                                lease.current()
                             ),
                         )?)
                     }
@@ -3832,7 +3941,12 @@ fn publish_commits(
             }
             Applied::record(|a| {
                 a.commits = commits;
-                a.new_commits = new_commits;
+                // A WIP checkpoint may already have pushed some of them.
+                for commit in new_commits {
+                    if !a.new_commits.contains(&commit) {
+                        a.new_commits.push(commit);
+                    }
+                }
                 a.published_checkpoint = receipt.checkpointed;
                 a.rebased_onto = rebased_onto;
             })?;
@@ -3843,6 +3957,9 @@ fn publish_commits(
         if let Some((number, _)) = adopted {
             // Commits only: no PR creation, body edit or draft change.
             return Ok(Some(number));
+        }
+        if mode == PublishMode::CommitsOnly {
+            return Ok(None);
         }
         if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
             let pr = require_owned_pr(root, dispatch)?;
@@ -4564,6 +4681,18 @@ mod tests {
         publication_fixture("adopted-director-history");
     }
     #[test]
+    fn adopted_second_push_in_one_run_advances_the_lease() {
+        publication_fixture("adopted-second-push");
+    }
+    #[test]
+    fn adopted_second_push_refuses_a_foreign_push_between() {
+        publication_fixture("adopted-second-moved");
+    }
+    #[test]
+    fn adopted_second_push_refuses_rewriting_the_pushed_tip() {
+        publication_fixture("adopted-second-rewrite");
+    }
+    #[test]
     fn publish_auth_failure_on_push_falls_back_once() {
         publication_fixture("publish-token-auth-push");
     }
@@ -5039,6 +5168,67 @@ fi
             );
             let applied = Applied::load().unwrap();
             assert_eq!(applied.publication_pr, None);
+            if witness.starts_with("adopted-second") {
+                // The first push of the run fast-forwards from the admitted tip.
+                assert_eq!(result.unwrap(), Some(800));
+                let first = receipt.head.clone();
+                assert_eq!(regular_text(&state.join("published-tip")).unwrap(), first);
+                std::fs::write(outer.join("push.args"), "").unwrap();
+                match witness {
+                    "adopted-second-moved" => std::fs::write(
+                        outer.join("remote-tip"),
+                        format!("{}\trefs/heads/{branch}\n", "f".repeat(40)),
+                    )
+                    .unwrap(),
+                    "adopted-second-rewrite" => {
+                        git(&work, &["reset", "--hard", &tip]).unwrap();
+                    }
+                    _ => {}
+                }
+                git(
+                    &work,
+                    &["commit", "--allow-empty", "-m", "fix(core): second worker"],
+                )
+                .unwrap();
+                receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+                let second = publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default(),
+                );
+                let push = regular_text(&outer.join("push.args")).unwrap();
+                if witness == "adopted-second-push" {
+                    assert_eq!(second.unwrap(), Some(800));
+                    assert!(
+                        push.contains(&format!("--force-with-lease=refs/heads/{branch}:{first}\n")),
+                        "second push did not lease the run's own pushed tip: {push}"
+                    );
+                    assert_eq!(
+                        regular_text(&state.join("published-tip")).unwrap(),
+                        receipt.head
+                    );
+                    assert_eq!(Applied::load().unwrap().adoption_blocked, None);
+                } else {
+                    let error = second.unwrap_err().to_string();
+                    let expected = if witness == "adopted-second-rewrite" {
+                        "rewrote history"
+                    } else {
+                        "moved after admission"
+                    };
+                    assert!(error.contains(expected), "{error}");
+                    assert!(
+                        push.is_empty(),
+                        "pushed over a moved or rewritten tip: {push}"
+                    );
+                    assert!(Applied::load().unwrap().adoption_blocked.is_some());
+                    assert_eq!(regular_text(&state.join("published-tip")).unwrap(), first);
+                }
+                return;
+            }
             if matches!(witness, "adopted" | "adopted-director-history") {
                 assert_eq!(result.unwrap(), Some(800));
                 assert_eq!(
@@ -5591,7 +5781,9 @@ fi
                 .unwrap()
                 .is_none()
         );
+        // A later run starts with fresh run state: its own evidence and lease.
         std::fs::remove_file(state.join("applied.json")).unwrap();
+        std::fs::remove_file(state.join("published-tip")).unwrap();
         dispatch.resume = true;
         receipt.expected_tip = git(&work, &["rev-parse", "HEAD"])
             .unwrap()
@@ -6318,18 +6510,18 @@ fi
         let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
         dispatch.branch = "work/dispatch-634-42".into();
         git(temp.path(), &["checkout", "-b", &dispatch.branch]).unwrap();
-        let command = push_command(temp.path(), &dispatch, "42", "").unwrap();
+        let command = push_command(temp.path(), &dispatch, "42", &RunLease::admitted("")).unwrap();
         let args: Vec<_> = command.get_args().map(|s| s.to_str().unwrap()).collect();
         assert_eq!(args.last(), Some(&"HEAD:refs/heads/work/dispatch-634-42"));
         assert_eq!(args.iter().filter(|s| s.starts_with("HEAD:")).count(), 1);
         assert!(args.contains(&"--force-with-lease=refs/heads/work/dispatch-634-42:"));
         assert!(args.contains(&"--no-follow-tags"));
         assert!(!args.contains(&"--all") && !args.contains(&"--mirror"));
-        assert!(push_command(temp.path(), &dispatch, "43", "").is_err());
+        assert!(push_command(temp.path(), &dispatch, "43", &RunLease::admitted("")).is_err());
         git(temp.path(), &["checkout", "-b", "work/another-lane"]).unwrap();
-        assert!(push_command(temp.path(), &dispatch, "42", "").is_err());
+        assert!(push_command(temp.path(), &dispatch, "42", &RunLease::admitted("")).is_err());
         dispatch.branch = "work/another-lane".into();
-        assert!(push_command(temp.path(), &dispatch, "42", "").is_err());
+        assert!(push_command(temp.path(), &dispatch, "42", &RunLease::admitted("")).is_err());
         for branch in [
             "main",
             "work/dispatch-633-42",
@@ -6909,28 +7101,36 @@ cat "$file"
             tip: tip.clone(),
         };
         git(temp.path(), &["checkout", "-b", &dispatch.branch]).unwrap();
-        let command = push_command(temp.path(), &dispatch, "", &tip).unwrap();
+        let command = push_command(temp.path(), &dispatch, "", &RunLease::admitted(&tip)).unwrap();
         let args: Vec<_> = command.get_args().map(|s| s.to_str().unwrap()).collect();
         assert_eq!(args.last(), Some(&"HEAD:refs/heads/work/986-slice4"));
         assert_eq!(args.iter().filter(|s| s.starts_with("HEAD:")).count(), 1);
         let lease = format!("--force-with-lease=refs/heads/work/986-slice4:{tip}");
         assert!(args.contains(&lease.as_str()), "{args:?}");
         // Any lease but the admitted tip, including none, is refused.
-        assert!(push_command(temp.path(), &dispatch, "", "").is_err());
-        assert!(push_command(temp.path(), &dispatch, "", &"b".repeat(40)).is_err());
+        assert!(push_command(temp.path(), &dispatch, "", &RunLease::admitted("")).is_err());
+        assert!(
+            push_command(
+                temp.path(),
+                &dispatch,
+                "",
+                &RunLease::admitted(&"b".repeat(40))
+            )
+            .is_err()
+        );
         // The run id of an owned branch never redirects an adopted push.
-        assert!(push_command(temp.path(), &dispatch, "42", &tip).is_ok());
+        assert!(push_command(temp.path(), &dispatch, "42", &RunLease::admitted(&tip)).is_ok());
         // Any other checked-out or requested branch is refused.
         for branch in ["work/dispatch-986-42", "work/another-lane", "main"] {
             git(temp.path(), &["checkout", "-B", branch]).unwrap();
             assert!(
-                push_command(temp.path(), &dispatch, "42", &tip).is_err(),
+                push_command(temp.path(), &dispatch, "42", &RunLease::admitted(&tip)).is_err(),
                 "{branch}"
             );
             let mut other = dispatch.clone();
             other.branch = branch.into();
             assert!(
-                push_command(temp.path(), &other, "42", &tip).is_err(),
+                push_command(temp.path(), &other, "42", &RunLease::admitted(&tip)).is_err(),
                 "{branch}"
             );
         }
@@ -6942,7 +7142,7 @@ cat "$file"
             branch: forged.branch.clone(),
             tip: tip.clone(),
         };
-        assert!(push_command(temp.path(), &forged, "42", &tip).is_err());
+        assert!(push_command(temp.path(), &forged, "42", &RunLease::admitted(&tip)).is_err());
     }
     #[test]
     fn review_base_uses_admitted_main_and_never_the_merge_sha() {
