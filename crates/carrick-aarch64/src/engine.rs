@@ -607,6 +607,7 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
             vcpu: std::cell::RefCell::new(&mut *self.vcpu),
             process_asid,
             carrier_root,
+            required_invalidation,
             error: std::cell::RefCell::new(None),
         };
         crate::descriptor_drain::apply_as_host_if_excluded(
@@ -635,13 +636,15 @@ impl<V: Aarch64Vmm> crate::descriptor_drain::GuestDrainVenue for EngineStage1Ser
     }
 }
 
-/// Break-before-make invalidations a host-applied guest transaction asks
-/// for, run at once on the applying vCPU (ASID-wide, inner shareable). The
-/// first failure is kept and the transaction's result reported unsettled.
+/// Break-before-make and table-reclaim invalidations a host-applied guest
+/// transaction asks for, run at once on the applying vCPU (ASID-wide, inner
+/// shareable). The first failure is kept and the transaction's result reported
+/// unsettled.
 struct VcpuBbmMaintenance<'a, V: Aarch64Vmm> {
     vcpu: std::cell::RefCell<&'a mut V::Vcpu>,
     process_asid: Option<u16>,
     carrier_root: Option<carrick_mem::memory::CarrierMaintenanceRoot>,
+    required_invalidation: Option<&'a std::cell::Cell<bool>>,
     error: std::cell::RefCell<Option<TrapError>>,
 }
 
@@ -651,12 +654,19 @@ impl<V: Aarch64Vmm> carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance
     fn publish_barrier(&self) {}
 
     fn invalidate_range(&self, _va: u64, _len: u64) {
-        if let Err(error) = Aarch64EngineCore::<V>::run_stage1_maintenance_on(
+        match Aarch64EngineCore::<V>::run_stage1_maintenance_on(
             &mut self.vcpu.borrow_mut(),
             self.process_asid,
             self.carrier_root,
         ) {
-            self.error.borrow_mut().get_or_insert(error);
+            Ok(()) => {
+                if let Some(required) = self.required_invalidation {
+                    required.set(false);
+                }
+            }
+            Err(error) => {
+                self.error.borrow_mut().get_or_insert(error);
+            }
         }
     }
 }
@@ -9136,6 +9146,12 @@ mod transfer_service_tests {
         }
         fn run(&mut self) -> Result<Aarch64Exit, TrapError> {
             self.runs += 1;
+            let pc = self.get_reg(Reg::Pc)?;
+            if pc == carrick_mem::memory::LINUX_EL1_MAINT_BASE
+                || pc == carrick_mem::memory::LINUX_EL1_ASID_MAINT_BASE
+            {
+                return Ok(Aarch64Exit::MaintenanceDone);
+            }
             assert_eq!(self.ttbr0, 0x7000_0080_0000_0000);
             if self.runs == 1 {
                 assert_eq!(self.get_reg(Reg::Pc)?, 0x1000);
@@ -9638,5 +9654,111 @@ mod transfer_service_tests {
             assert_eq!(cpu.runs, 2);
             assert_eq!(cpu.regs, saved);
         }
+    }
+
+    #[test]
+    fn host_applied_reclaiming_txn_flushes_before_reclaimed_table_is_handed_out() {
+        use carrick_mem::memory::LINUX_MMAP_BASE;
+        use carrick_mmu_core::aarch64::SubstrateGpa;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            AliasAccess, BackingIdentity, DescriptorOp, PageSpan,
+        };
+
+        let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        let mut engine = engine_fixture();
+        let (authority, _publisher) =
+            crate::stage1_authority::tests::boot_root_fixture(0x9b_4000_0000, pool);
+        engine.page_tables = authority;
+        engine.vcpu.get_mut().ttbr0 = 0x9b_4000_0000;
+        engine.publish_initial_stage1_root(&mut |_| Ok(())).unwrap();
+        engine.mm_generation = 0x55;
+        let mm = std::num::NonZeroU64::new(engine.mm_generation).unwrap();
+        assert_eq!(
+            engine.page_tables.select_guest_descriptor_owner().unwrap(),
+            crate::stage1_authority::GuestLaneSelection::Selected
+        );
+        let slots = carrick_el1_abi::DescriptorTxnSlots::new();
+        let va = LINUX_MMAP_BASE + (2 << 20);
+        let map_op = DescriptorOp::MapAlias {
+            access: AliasAccess::User {
+                writable: true,
+                executable: false,
+            },
+            span: PageSpan::new(va, 4096),
+            target_ipa: SubstrateGpa(va),
+            backing: BackingIdentity {
+                frame_id: mm,
+                mapping_id: mm,
+                owner_generation: mm,
+                inventory_revision: mm,
+            },
+        };
+
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let excluded = spaces.unpublished(mm.get()).expect("unpublished exclusion");
+        let _guard = carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
+        let map_txn = engine
+            .page_tables
+            .prepare_guest_descriptor_txn(mm, map_op)
+            .expect("prepare initial split L3 table");
+        assert_eq!(map_txn.tables.len(), 1);
+        let split_table = map_txn.tables.as_slice()[0];
+        {
+            let mut services = engine.descriptor_services();
+            services.slot = Some(0);
+            crate::descriptor_drain::apply_guest_descriptor_txns_now(
+                &mut services,
+                &slots,
+                &[map_txn],
+            )
+            .expect("apply initial map");
+        }
+        engine.vcpu.borrow_mut().runs = 0;
+
+        let unmap_op = engine
+            .page_tables
+            .with_manager(|manager| manager.unmap_aliased_op(va, 2 << 20))
+            .expect("manager present");
+        let unmap_txn = engine
+            .page_tables
+            .prepare_guest_descriptor_txn(mm, unmap_op)
+            .expect("prepare reclaiming unmap");
+        let required = std::cell::Cell::new(false);
+        let receipts = {
+            let mut services = engine.descriptor_services();
+            services.slot = Some(0);
+            services.required_invalidation = Some(&required);
+            crate::descriptor_drain::apply_guest_descriptor_txns_now(
+                &mut services,
+                &slots,
+                &[unmap_txn],
+            )
+            .expect("apply reclaiming unmap on required_invalidation=Some venue")
+        };
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].reclaimed_tables(), &[split_table]);
+
+        let reused_txn = engine
+            .page_tables
+            .prepare_guest_descriptor_txn(mm, map_op)
+            .expect("prepare subsequent map");
+        assert_eq!(
+            reused_txn.tables.as_slice(),
+            &[split_table],
+            "settled receipt returned the reclaimed table to free_tables"
+        );
+        assert_eq!(
+            engine.vcpu.borrow().runs,
+            1,
+            "the ASID flush must complete before a reclaimed table page is settled into free_tables and handed out again"
+        );
+        assert!(
+            !required.get(),
+            "synchronous flush for a reclaiming transaction must satisfy required_invalidation"
+        );
+        engine
+            .page_tables
+            .abandon_guest_descriptor_txn(&reused_txn)
+            .unwrap();
     }
 }
