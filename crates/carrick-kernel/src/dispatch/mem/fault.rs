@@ -230,55 +230,6 @@ pub struct ResidentFacts {
 }
 
 impl ResidentFacts {
-    fn try_publication_snapshot<'permit>(
-        &self,
-        exclusion: super::HostAliasDispatchGuard<'permit>,
-        span: ReservationRange,
-        page: u64,
-    ) -> Result<FrameGrantPublicationSnapshot<'permit>, RootAccessRefusal> {
-        let capture = |mut model: Option<&mut Reservations<'_>>| {
-            let owner = if self.delegated_root().is_none()
-                || self.venue_owns(page, page.saturating_add(1))
-            {
-                FirstTouchOwner::Host
-            } else {
-                let node = model.as_mut().ok_or(Refusal::Stale)?.node(page);
-                self.first_touch_owner_from_node(page, node)?
-            };
-            let mut retired = Vec::new();
-            let mut stock = false;
-            if let Some(model) = model.as_mut() {
-                model.observe_deferred_returns(&mut |entry| {
-                    if let Some(range) = ReservationRange::new(
-                        span.start().max(entry.range.start()),
-                        span.end().min(entry.range.end()),
-                    ) {
-                        retired.push(range);
-                    }
-                });
-                if matches!(owner, FirstTouchOwner::Root(..)) {
-                    stock = !root_holes(model, span)?.is_empty();
-                }
-            }
-            Ok(FrameGrantPublicationSnapshot {
-                owner,
-                retired,
-                stock,
-                span,
-                page,
-                host_protection: self.resident_fault_ranges.prot_for_page(page),
-                bus_fault: bus_fault_contains(&self.bus_fault_ranges, page),
-                exclusion,
-                _guard: std::marker::PhantomData,
-            })
-        };
-        if let Some(root) = self.delegated_root() {
-            root.with_root(|model| capture(Some(model)))
-        } else {
-            capture(None).map_err(RootAccessRefusal::Refused)
-        }
-    }
-
     /// Record `range` resident under `owner`, replacing any fact it covers.
     pub(crate) fn insert(&mut self, range: carrick_vfs::GuestMemoryRange, owner: ResidencyOwner) {
         self.remove(range);
@@ -459,6 +410,55 @@ impl RootPiece {
 }
 
 impl MemState {
+    fn try_publication_snapshot<'permit>(
+        &self,
+        exclusion: super::HostAliasDispatchGuard<'permit>,
+        span: ReservationRange,
+        page: u64,
+    ) -> Result<FrameGrantPublicationSnapshot<'permit>, RootAccessRefusal> {
+        let capture = |mut model: Option<&mut Reservations<'_>>| {
+            let owner = if self.delegated_root().is_none()
+                || self.venue_owns(page, page.saturating_add(1))
+            {
+                FirstTouchOwner::Host
+            } else {
+                let node = model.as_mut().ok_or(Refusal::Stale)?.node(page);
+                self.first_touch_owner_from_node(page, node)?
+            };
+            let mut retired = Vec::new();
+            let mut stock = false;
+            if let Some(model) = model.as_mut() {
+                model.observe_deferred_returns(&mut |entry| {
+                    if let Some(range) = ReservationRange::new(
+                        span.start().max(entry.range.start()),
+                        span.end().min(entry.range.end()),
+                    ) {
+                        retired.push(range);
+                    }
+                });
+                if matches!(owner, FirstTouchOwner::Root(..)) {
+                    stock = !root_holes(model, span)?.is_empty();
+                }
+            }
+            Ok(FrameGrantPublicationSnapshot {
+                owner,
+                retired,
+                stock,
+                span,
+                page,
+                host_protection: self.resident_fault_ranges.prot_for_page(page),
+                bus_fault: bus_fault_contains(&self.bus_fault_ranges, page),
+                exclusion,
+                _guard: std::marker::PhantomData,
+            })
+        };
+        if let Some(root) = self.delegated_root() {
+            root.with_root(|model| capture(Some(model)))
+        } else {
+            capture(None).map_err(RootAccessRefusal::Refused)
+        }
+    }
+
     /// A pre-exclusion reader must preserve contention as an admission result.
     pub(in crate::dispatch::mem) fn try_first_touch_owner(
         &self,
