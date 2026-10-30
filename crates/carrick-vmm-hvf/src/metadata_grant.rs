@@ -1629,7 +1629,7 @@ fn retain_fork_custody_rows(
 /// an authenticated terminal maintenance-root venue. This supplies mechanics;
 /// release-once, hygiene, tag retirement and pin disposal stay with ForkStock.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn reclaim_fork_stock(
+pub(super) fn reclaim_fork_stock(
     custody: &crate::trap::CarrierVmCustody,
     stock: &mut crate::fork_stock::ForkStockHostCustody,
     ledger: &mut impl carrick_hal::fork_stock::ForkTableLedger,
