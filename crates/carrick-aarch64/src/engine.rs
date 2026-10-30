@@ -6137,16 +6137,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     ) -> Result<Option<carrick_hal::Aarch64CoreRegisters>, TrapError> {
         require_core_fpsimd_authority(self.vm.fpsimd_enabled())?;
         let snapshot = self.vcpu.borrow().snapshot()?;
+        // Capture the raw resume PC without reading guest memory: normal
+        // blocking syscall parks (`stash_parked_registers`) call this on every
+        // `WaitOnFds` park, and an eager island decode (`hvpatch_island_svc_addr`
+        // -> `read_into`) costs an 8-byte owner `CopyIn` (3 service exits per
+        // park). Core-dump assembly already translates HvPatch island return
+        // addresses lazily via `guest_visible_resume_pc`.
         let (resume_pc, resume_pstate) = core_resume_pair(self.pending_resume_pc, &snapshot);
-        // The Linux-visible resume pc of a thread blocked in this syscall is
-        // the instruction AFTER its svc, so +4 past the island's decoded
-        // origin (which is the svc's own address) -- see
-        // `hvpatch_island_svc_addr`'s doc comment for why this differs from
-        // `diagnostic_wait_registers`'s bare-origin use above.
-        let resume_pc = self
-            .hvpatch_island_svc_addr(resume_pc)
-            .and_then(|origin| origin.checked_add(4))
-            .unwrap_or(resume_pc);
         Ok(Some(carrick_hal::Aarch64CoreRegisters {
             gprs: snapshot.gprs,
             sp_el0: snapshot.sp_el0,
@@ -7145,7 +7142,7 @@ mod tests {
         }
     }
 
-    fn sample() -> Aarch64VcpuSnapshot {
+    pub(super) fn sample() -> Aarch64VcpuSnapshot {
         let boot = carrick_hal::Aarch64GuestArch::bootstrap_sysregs();
         Aarch64VcpuSnapshot {
             gprs: std::array::from_fn(|index| 0x1000 + index as u64),
@@ -9144,7 +9141,7 @@ mod transfer_service_tests {
             Ok(0)
         }
         fn snapshot(&self) -> Result<Aarch64VcpuSnapshot, TrapError> {
-            Err(TrapError::Hypervisor("unused snapshot".into()))
+            Ok(super::tests::sample())
         }
         fn restore(&mut self, _: &Aarch64VcpuSnapshot) -> Result<(), TrapError> {
             Ok(())
@@ -9768,5 +9765,30 @@ mod transfer_service_tests {
             .page_tables
             .abandon_guest_descriptor_txn(&reused_txn)
             .unwrap();
+    }
+
+    #[test]
+    fn parked_core_registers_capture_costs_no_guest_memory_round_trip() {
+        let mut engine = engine_fixture();
+        engine.process_asid = Some(1);
+        engine.pending_resume_pc = Some(0x2004);
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                core::num::NonZeroU64::new(17).unwrap(),
+                carrick_el1_abi::ReservationMm::new(88).unwrap(),
+                core::num::NonZeroU64::new(3).unwrap(),
+            )
+        };
+        engine.protections = UserMemoryAuthority::from_owner(handle);
+        let regs = engine
+            .aarch64_core_registers()
+            .expect("snapshot must succeed")
+            .expect("core registers must be present");
+        assert_eq!(regs.resume_pc, 0x2004);
+        assert_eq!(
+            engine.vcpu.borrow().runs,
+            0,
+            "stashing parked registers on a normal blocking syscall park must not run an owner CopyIn service call"
+        );
     }
 }
