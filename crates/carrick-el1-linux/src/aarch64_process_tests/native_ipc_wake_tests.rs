@@ -809,3 +809,170 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
     }
     assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 2);
 }
+
+#[test]
+fn serial_host_deliverable_signal_does_not_cancel_mm_edit_conflict() {
+    use crate::mm_portal::{TransferIntent, prepare_transfer, test_support};
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
+    };
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            parked,
+        )
+        .unwrap(),
+    );
+    let owner_registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+    owner_registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let binding = runtime
+        .task_binding(TaskKey {
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        })
+        .unwrap();
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, binding.record.id);
+    activate_target(source, &fixture.task, &binding);
+    // SAFETY: this fixture exclusively selected the exact registered root.
+    unsafe {
+        *fixture.zone.record(binding.record.id).ctx_mut() = parked;
+    }
+    assert!(fixture.zone.record(binding.record.id).is_native_owned());
+    let mut service = fixture.process_service();
+    let mut entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+    entry
+        .rt_sigaction(
+            Signal::from_number(10).unwrap(),
+            Some(Action {
+                disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                ..Action::default()
+            }),
+        )
+        .unwrap();
+    let view = test_support::nodes(fixture.region);
+    let portal = crate::mm_portal::MmPortal::new(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        &fixture.zone.spaces,
+        &view,
+    )
+    .with_zone(fixture.zone)
+    .unwrap();
+    let mm = ReservationMm::new(1).unwrap();
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            crate::mm_portal::GuestVa::new(test_support::VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let request = test_support::selected(test_support::select(&portal, &transfer, &fixture.tables))
+        .request(
+            TransferIntent::UserWrite,
+            carrick_el1_abi::PortalRetainedData {
+                record: NonZeroU64::MIN,
+                vm_generation: NonZeroU64::MIN,
+                owner: None,
+            },
+        )
+        .unwrap();
+    let permit = prepare_transfer(
+        &portal,
+        request,
+        &fixture.tables.live(&fixture.maintenance),
+        0,
+    )
+    .unwrap()
+    .unwrap();
+    let key = portal.prepared_wait_key(transfer.handle).unwrap();
+    let record = fixture.zone.slot(fixture.slot).current().unwrap();
+    let mut cpu = crate::sched::FakeCpu::default();
+    let counters = carrick_el1_abi::Counters::new();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        elr: 0x4004,
+        ..Default::default()
+    };
+    frame.x[8] = 215;
+    frame.x[0] = test_support::VA;
+    frame.x[1] = 4096;
+    fixture.task.linux.mark_pending_host_work();
+    let mut sched = crate::sched::Sched {
+        handoff: None,
+        zone: fixture.zone,
+        slot: fixture.slot,
+        task: &fixture.task,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+        counters: &counters,
+    };
+    assert!(matches!(
+        crate::mm_portal::park_prepared_edit(&mut sched, &mut frame, fixture.region.table()),
+        Some(crate::sched::Served::Idle)
+    ));
+    assert!(matches!(
+        fixture.zone.record(record).claim(),
+        Claim::Parked { .. }
+    ));
+    let retained = fixture.zone.record(record).object_wait_census().unwrap();
+    entry
+        .kill(
+            SignalProcessSelector::from_abi(41),
+            SignalRequest::from_abi(10).unwrap(),
+            SignalInfo::Generated(None),
+        )
+        .unwrap();
+    assert!(
+        entry.interrupt_pending_wait(),
+        "the caught signal is deliverable"
+    );
+    assert!(
+        matches!(fixture.zone.record(record).claim(), Claim::Parked { .. }),
+        "a signal must not cancel the MM edit-conflict park"
+    );
+    assert_eq!(
+        fixture
+            .zone
+            .object_queue_census(key.index())
+            .unwrap()
+            .waiters,
+        1
+    );
+    assert!(entry.take_run_failure().is_none());
+    let after_signal = fixture.zone.record(record).object_wait_census().unwrap();
+    assert_eq!(
+        (after_signal.operation, after_signal.operation_generation),
+        (retained.operation, retained.operation_generation),
+        "the MM owner retains the same edit operation"
+    );
+    portal.cancel_prepared(permit, request, 0).unwrap();
+    assert_eq!(
+        fixture
+            .zone
+            .object_queue_census(key.index())
+            .unwrap()
+            .waiters,
+        0,
+        "the prepared-transfer owner releases its edit waiter"
+    );
+}
