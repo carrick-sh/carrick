@@ -3170,6 +3170,65 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         rec.handback.store(kind as u32, Ordering::Release);
     }
 
+    /// Interrupt an exact single-entry futex park (`UserReturn`) with `result`
+    /// (`-EINTR`) and queue the record on an eligible guest slot.
+    pub fn interrupt_parked_futex(
+        &self,
+        record: RecordRef,
+        waker: SlotId,
+        result: u64,
+        wait: &impl ShortLockWait,
+        effects: &mut WakeEffects,
+    ) -> bool {
+        loop {
+            let Some(rec) = self.live(record) else {
+                return false;
+            };
+            if rec.resume_disposition() != object_wait::ResumeDisposition::UserReturn
+                || rec.entry_count() != 1
+            {
+                return false;
+            }
+            let Claim::Parked { seq } = rec.claim() else {
+                return false;
+            };
+            let entry_id = rec.first_entry.load(Ordering::Acquire);
+            if entry_id == NIL {
+                return false;
+            }
+            let bucket = self.entry(entry_id).bucket.load(Ordering::Relaxed) as usize;
+            let guard = self.short_lock(bucket, wait);
+            if self.live(record).is_none()
+                || rec.resume_disposition() != object_wait::ResumeDisposition::UserReturn
+                || rec.entry_count() != 1
+                || rec.first_entry.load(Ordering::Acquire) != entry_id
+            {
+                return false;
+            }
+            let entry = self.entry(entry_id);
+            if entry.bucket.load(Ordering::Relaxed) as usize != guard.bucket {
+                continue;
+            }
+            if entry.record.load(Ordering::Relaxed) != record.id.raw()
+                || entry.seq.load(Ordering::Relaxed) != seq
+            {
+                return false;
+            }
+            let claimed = self.claim_for_el1(record.id, seq, result, waker, effects, || {
+                self.unlink(&guard, entry_id);
+                self.drop_entry(rec, entry_id);
+            });
+            drop(guard);
+            if claimed {
+                self.timers.cancel_record(record.id);
+                if let Some(counter) = self.counters.host_claims.get(Handback::Signal as usize) {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return claimed;
+        }
+    }
+
     /// The record `entry` wakes for `(mm, uaddr, bitset)`, if it is a live
     /// park.
     fn eligible(&self, entry: &ZoneEntry, mm: u64, uaddr: u64, bitset: u32) -> Option<RecordId> {

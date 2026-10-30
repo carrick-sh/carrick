@@ -3730,3 +3730,41 @@ fn cancelled_metadata_wait(deferred: bool) {
     }
     assert!(zone.live(live).is_none());
 }
+
+#[test]
+fn interrupt_parked_futex_wakes_single_entry_user_return_with_eintr() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, None, 0);
+    let record = park(&zone, 41, 0x7000);
+    let reference = zone.record_ref(record);
+    let stale = RecordRef {
+        id: record,
+        incarnation: reference.incarnation + 1,
+    };
+    let mut effects = WakeEffects::default();
+    assert!(!zone.interrupt_parked_futex(
+        stale,
+        SLOT,
+        (-4i64) as u64,
+        &ShortLockSpin,
+        &mut effects,
+    ));
+    assert!(zone.interrupt_parked_futex(
+        reference,
+        SLOT,
+        (-4i64) as u64,
+        &ShortLockSpin,
+        &mut effects,
+    ));
+    assert_eq!(zone.record(record).entry_count(), 0);
+    assert_eq!(
+        zone.counters.host_claims[Handback::Signal as usize].load(Ordering::Relaxed),
+        1,
+        "signal futex interruption must record a Signal claim"
+    );
+    let selected = zone
+        .switch_in_full(SLOT)
+        .expect("interrupted futex waiter must become runnable");
+    assert_eq!(selected.record, record);
+    assert_eq!(selected.result.map(|value| value as i64), Some(-4));
+}

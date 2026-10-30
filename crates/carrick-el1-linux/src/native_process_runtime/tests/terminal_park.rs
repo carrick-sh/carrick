@@ -506,3 +506,42 @@ fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
     assert!(fixture.zone.live(sibling.record).is_none());
     assert_eq!(page.live(), 0);
 }
+
+#[cfg(test)]
+#[test]
+fn retiring_host_issued_sibling_refuses_tgkill_with_esrch() {
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalRequest, SignalThreadSelector,
+    };
+    let fixture = native_exec_fixture();
+    let sibling = super::add_signal_sibling(&fixture, None, true);
+    assert_eq!(fixture.page.live(), 2);
+    let _reserved =
+        carrick_core::terminal::reserve_host_thread_exit_membership(fixture.page, sibling.control)
+            .unwrap();
+    let saved = words(fixture.address);
+    let mut service = fixture.service();
+    let mut sender = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert_eq!(
+        sender.tgkill(
+            SignalThreadSelector::from_abi(41),
+            SignalThreadSelector::from_abi(42),
+            SignalRequest::Probe,
+            SignalInfo::Generated(None),
+        ),
+        Err(carrick_syscall_abi::LINUX_ESRCH),
+    );
+}

@@ -260,6 +260,13 @@ impl MemberExitCustody {
         let word = self.word.load(Ordering::Acquire);
         word & (ZONE_TERMINAL | ZONE_HOST_TERMINAL) == ZONE_TERMINAL
     }
+    /// Whether this exact member incarnation has claimed or completed exit or
+    /// reset custody.
+    pub fn exit_claimed_or_terminal(&self) -> bool {
+        self.word.load(Ordering::Acquire)
+            & (ZONE_TERMINAL | IN_ZONE_COMMITTED | MEMBERSHIP_CLAIMED | HOST_RETIRING | RESETTING)
+            != 0
+    }
     pub fn referenced(&self) -> bool {
         self.word.load(Ordering::Acquire) & REFERENCES != 0
     }
