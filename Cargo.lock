@@ -557,6 +557,7 @@ dependencies = [
  "carrick-syscall-abi",
  "carrick-test-support",
  "libc",
+ "wait-timeout",
  "zerocopy",
 ]
 

@@ -31,6 +31,7 @@ pub struct Physical<'a, C: ProcessContext = ParkedContextWords> {
     pub tid_wakes: usize,
     pub tid_writes: Vec<(u64, u64, u32)>,
     pub child_copy_error: Option<NativeProcessError>,
+    pub prepare_copy_error: Option<NativeProcessError>,
     pub child_copy_error_at: Option<u64>,
     pub on_copy_complete: Option<Box<dyn FnMut(UserVa) + 'a>>,
     pub native_ipc: Option<carrick_el1_abi::ipc::IpcRegion<'a>>,
@@ -311,7 +312,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         _: &Self::Mm,
         request: carrick_core::mm::transaction::CopyoutRequest,
     ) -> Result<(), NativeProcessError> {
-        if let Some(error) = self.child_copy_error
+        if let Some(error) = self.prepare_copy_error.or(self.child_copy_error)
             && self
                 .child_copy_error_at
                 .is_none_or(|at| request.address.raw() == at)
@@ -563,6 +564,7 @@ impl NativeSignalFixture {
             tid_wakes: 0,
             tid_writes: Vec::new(),
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -1102,6 +1104,7 @@ impl NativeOwnerSignalFixture {
             tid_wakes: 0,
             tid_writes: Vec::new(),
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -3521,6 +3524,120 @@ fn native_exec_successor_reaps_its_fork_child() {
 }
 
 #[cfg(test)]
+fn completed_output_busy_yields(in_preparation: bool) {
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    service.child_copy_error = Some(if in_preparation {
+        NativeProcessError::Unsupported
+    } else {
+        NativeProcessError::Busy
+    });
+    service.prepare_copy_error = in_preparation.then_some(NativeProcessError::Busy);
+    let bytes = vec![0x17; 8192];
+    take_signal_copies();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let result = entry.finish_copyout(service::OwnedCopyout {
+            address: UserVa::new(0x10000),
+            bytes: bytes.clone(),
+            offset: 0,
+            result: SyscallResult::new(37),
+        });
+        assert!(
+            matches!(result, Ok(NativeResume::Left(None))),
+            "Busy must retain completed output through CarrierWork: {:?}",
+            result.as_ref().err()
+        );
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    assert!(take_signal_copies().is_empty());
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(fixture.record).unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    // SAFETY: the fixture owns the exact member and its service queue.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(
+            &fixture.control.service,
+            notice,
+            NonZeroU64::MIN,
+            fixture.zone.record(fixture.record.id).identity(),
+        )
+    }
+    .unwrap();
+    assert!(matches!(
+        ticket.request().operation,
+        ServiceOperation::CarrierWork { .. }
+    ));
+    assert!(ticket.complete(true).is_ok());
+    queue
+        .notify_object(fixture.slot, &mut WakeEffects::default())
+        .unwrap();
+    drop(queue);
+    service.child_copy_error = None;
+    service.prepare_copy_error = None;
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        matches!(entry.resume_checkpoint().unwrap(), NativeResume::Returned(result) if result.raw() == 37)
+    );
+    assert_eq!(
+        take_signal_copies(),
+        [
+            (UserVa::new(0x10000), bytes[..4096].to_vec()),
+            (UserVa::new(0x11000), bytes[4096..].to_vec()),
+        ]
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn completed_poll_output_copy_busy_yields_then_delivers_the_answer() {
+    completed_output_busy_yields(false);
+}
+#[cfg(test)]
+#[test]
+fn completed_poll_output_preparation_busy_yields_then_delivers_the_answer() {
+    completed_output_busy_yields(true);
+}
+
+#[cfg(test)]
 fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, production_frame: bool) {
     #[repr(C, align(4096))]
     struct PollPages([crate::file_table::PollFd; 1024]);
@@ -3850,6 +3967,34 @@ fn owner_copyout_never_prepares_under_an_ipc_object_lock() {
     ));
 }
 
+/// Inject only the physical preparation error, retaining the production
+/// native owner's refusal classification for IPC adapter witnesses.
+#[cfg(test)]
+pub(crate) fn prepare_copyout_with_error(
+    request: carrick_core::mm::transaction::CopyoutRequest,
+    operation: carrick_sched_core::object_wait::OperationToken,
+    error: NativeProcessError,
+) -> carrick_core::mm::transaction::CopyoutPreparation {
+    let fixture = native_exec_fixture();
+    let mut service = fixture.service();
+    service.child_copy_error = Some(error);
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    entry.prepare_owned_copyout(request, operation)
+}
+
 #[cfg(test)]
 #[test]
 fn owner_copyout_unavailable_is_not_a_user_memory_fault() {
@@ -3891,23 +4036,30 @@ fn owner_copyout_unavailable_is_not_a_user_memory_fault() {
             NativeProcessError::Busy | NativeProcessError::Stale | NativeProcessError::Quarantined
         ) {
             let operation = carrick_sched_core::object_wait::OperationToken::new(7, 1).unwrap();
-            assert!(matches!(
-                entry.prepare_owned_copyout(
-                    carrick_core::mm::transaction::CopyoutRequest {
-                        address: UserVa::new(0x10000),
-                        len: carrick_guest_arch::GuestLen::new(8),
-                    },
-                    operation
-                ),
-                carrick_core::mm::transaction::CopyoutPreparation::Unrouted(_)
-            ));
+            let preparation = entry.prepare_owned_copyout(
+                carrick_core::mm::transaction::CopyoutRequest {
+                    address: UserVa::new(0x10000),
+                    len: carrick_guest_arch::GuestLen::new(8),
+                },
+                operation,
+            );
+            if error == NativeProcessError::Busy {
+                assert!(matches!(
+                    preparation,
+                    carrick_core::mm::transaction::CopyoutPreparation::Busy(_)
+                ));
+            } else {
+                assert!(matches!(
+                    preparation,
+                    carrick_core::mm::transaction::CopyoutPreparation::Unrouted(_)
+                ));
+            }
         }
     }
 }
 
 #[cfg(test)]
-fn retained_ipc_supply(supplied: bool, already_ready: bool) {
-    use carrick_core::mm::transaction::CopyoutPreparation;
+fn retained_ipc_supply(supplied: bool, already_ready: bool, yielding: bool) {
     use carrick_core_abi::service::{ServiceCell, ServiceOperation};
     use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
     use carrick_el1_abi::ipc::{
@@ -3971,18 +4123,23 @@ fn retained_ipc_supply(supplied: bool, already_ready: bool) {
                 &mut service,
             )
             .unwrap();
-        assert!(matches!(
+        if yielding {
+            assert!(matches!(
+                entry.yield_owned_operation(token),
+                carrick_core::mm::transaction::OwnedOperationYield::Suspended
+            ));
+        } else {
             entry.suspend_adapter_operation(
                 token,
                 ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
                     address: UserVa::new(0x10000),
                     access: carrick_guest_arch::Access::Write,
-                    present: true
+                    present: true,
                 }),
-                None
-            ),
-            CopyoutPreparation::Suspended
-        ));
+                None,
+            );
+        }
+
         assert!(
             fixture.task.service_notice.take().unwrap().is_none(),
             "IPC frames must unwind before physical enrollment"
@@ -4010,6 +4167,12 @@ fn retained_ipc_supply(supplied: bool, already_ready: bool) {
     }
     .unwrap();
     let request = ticket.request();
+    if yielding {
+        assert!(matches!(
+            request.operation,
+            ServiceOperation::CarrierWork { .. }
+        ));
+    }
     assert!(ticket.complete(supplied).is_ok());
     queue
         .notify_object(fixture.slot, &mut WakeEffects::default())
@@ -4114,20 +4277,26 @@ fn retained_ipc_supply(supplied: bool, already_ready: bool) {
 #[cfg(test)]
 #[test]
 fn ipc_backing_supply_retains_the_exact_operation_and_pin() {
-    retained_ipc_supply(true, false);
+    retained_ipc_supply(true, false, false);
 }
 #[cfg(test)]
 #[test]
 fn ipc_backing_refusal_retires_the_operation_and_pin() {
-    retained_ipc_supply(false, false);
+    retained_ipc_supply(false, false, false);
 }
 #[cfg(test)]
 #[test]
 fn ipc_already_ready_supply_defers_completion_to_the_checkpoint() {
-    retained_ipc_supply(true, true);
+    retained_ipc_supply(true, true, false);
 }
 #[cfg(test)]
 #[test]
 fn ipc_already_ready_refusal_retires_at_the_checkpoint() {
-    retained_ipc_supply(false, true);
+    retained_ipc_supply(false, true, false);
+}
+
+#[cfg(test)]
+#[test]
+fn ipc_busy_yield_retains_operation_and_pin_through_carrier_work() {
+    retained_ipc_supply(true, false, true);
 }

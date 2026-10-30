@@ -290,6 +290,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, NativeProcessError> {
         let mut prepared_offset = None;
         while output.offset < output.bytes.len() {
+            let previous_prepared_offset = prepared_offset.take();
             let address = output
                 .address
                 .raw()
@@ -312,8 +313,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         false,
                     );
                 }
+                Err(NativeProcessError::Busy) => {
+                    return self.begin_service_inner(
+                        ServiceOperation::CarrierWork {
+                            entry: OwnerEntry::Syscall,
+                        },
+                        None,
+                        None,
+                        ServicePayload::Copyout(output),
+                        false,
+                    );
+                }
                 Err(NativeProcessError::Unsupported) => {
-                    if prepared_offset == Some(output.offset) {
+                    if previous_prepared_offset == Some(output.offset) {
                         return Err(NativeProcessError::Unsupported);
                     }
                     let preparation =
@@ -333,6 +345,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 },
                                 None,
                                 Some(wait),
+                                ServicePayload::Copyout(output),
+                                false,
+                            );
+                        }
+                        Err(NativeProcessError::Busy) => {
+                            return self.begin_service_inner(
+                                ServiceOperation::CarrierWork {
+                                    entry: OwnerEntry::Syscall,
+                                },
+                                None,
+                                None,
                                 ServicePayload::Copyout(output),
                                 false,
                             );

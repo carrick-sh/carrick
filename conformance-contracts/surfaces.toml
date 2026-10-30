@@ -933,7 +933,7 @@ contracts = ["core.entry.completion", "kernel.el1.futex-handoff"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/lifecycle.rs"
-contracts = ["kernel.scheduler.runnable-progress", "core.entry.completion", "kernel.el1.thread-lifecycle"]
+contracts = ["kernel.scheduler.runnable-progress", "core.entry.completion", "kernel.el1.thread-lifecycle", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/pending_file.rs"
@@ -1516,11 +1516,11 @@ contracts = ["kernel.el1.open-lifetime", "kernel.el1.files", "core.personality.f
 
 [[surfaces]]
 path = "crates/carrick-el1/src/file.rs"
-contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify"]
+contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/file.rs"
-contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify"]
+contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/substrate/mod.rs"
@@ -1580,7 +1580,7 @@ contracts = ["kernel.x86.file-region", "kernel.vcpu.shutdown-entry"]
 
 [[surfaces]]
 path = "crates/carrick-core/src/mm/transaction/user_write.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-softmmu/src/lib.rs"
@@ -2107,3 +2107,7 @@ contracts = ["kernel.el1.anonymous-reservations"]
 [[surfaces]]
 path = "crates/carrick-sched-core/src/object_wait.rs"
 contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/mm/transaction.rs"
+contracts = ["kernel.memory.owner-wait"]

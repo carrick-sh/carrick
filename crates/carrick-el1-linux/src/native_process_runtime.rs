@@ -4387,8 +4387,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: carrick_sched_core::object_wait::OperationToken,
         service: carrick_core_abi::service::ServiceOperation,
         sequence: Option<NonZeroU64>,
-    ) -> carrick_core::mm::transaction::CopyoutPreparation {
-        use carrick_core::mm::transaction::CopyoutPreparation;
+    ) {
         let identity = operation.identity();
         carrick_core::wait::restore_object_operation(
             self.source.zone,
@@ -4407,7 +4406,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             sequence,
             identity,
         }));
-        CopyoutPreparation::Suspended
     }
     fn prepare_owner_output(
         &mut self,
@@ -6937,10 +6935,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                 return CopyoutPreparation::Wait { operation, wait };
             }
             Err(NativeProcessError::Fault) => return CopyoutPreparation::Fault(operation),
+            Err(NativeProcessError::Busy) => return CopyoutPreparation::Busy(operation),
             Err(NativeProcessError::Unsupported) => {}
             Err(_) => {
-                // A stale execution or a suspended transfer is not EFAULT.
-                // Such a refusal must not manufacture a successful prefix.
+                // Invalid execution has no user-memory errno authority.
+                // Busy is distinct: the caller keeps custody and yields.
                 return CopyoutPreparation::Unrouted(operation);
             }
         }
@@ -6951,12 +6950,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             operation,
             carrick_core_abi::service::ServiceOperation::Fault(fault),
             Some(sequence),
-        )
+        );
+        CopyoutPreparation::Suspended
     }
     fn yield_owned_operation(
         &mut self,
         operation: carrick_sched_core::object_wait::OperationToken,
-    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+    ) -> carrick_core::mm::transaction::OwnedOperationYield {
         self.current.linux.mark_pending_host_work();
         self.suspend_adapter_operation(
             operation,
@@ -6964,7 +6964,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                 entry: OwnerEntry::Syscall,
             },
             None,
-        )
+        );
+        carrick_core::mm::transaction::OwnedOperationYield::Suspended
     }
     fn complete_copyout(
         &mut self,
@@ -9236,6 +9237,7 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error,
+                prepare_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
@@ -9496,6 +9498,7 @@ mod tests {
                     tid_writes: Vec::new(),
                     refuse_copy: false,
                     child_copy_error: None,
+                    prepare_copy_error: None,
                     child_copy_error_at: None,
                     on_copy_complete: None,
                     native_ipc: None,
@@ -9617,6 +9620,7 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                prepare_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
@@ -9632,6 +9636,7 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                prepare_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
@@ -10014,6 +10019,7 @@ mod tests {
                         tid_writes: Vec::new(),
                         refuse_copy: false,
                         child_copy_error: None,
+                        prepare_copy_error: None,
                         child_copy_error_at: None,
                         on_copy_complete: None,
                         native_ipc: None,
@@ -10077,6 +10083,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -10227,6 +10234,7 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                prepare_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
@@ -10461,6 +10469,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -10780,6 +10789,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -11010,6 +11020,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -11359,6 +11370,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -11478,6 +11490,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -11627,6 +11640,7 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                prepare_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
@@ -11907,6 +11921,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -12140,6 +12155,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -12782,6 +12798,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -12887,6 +12904,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -12981,6 +12999,7 @@ mod tests {
                         tid_writes: Vec::new(),
                         refuse_copy: false,
                         child_copy_error: None,
+                        prepare_copy_error: None,
                         child_copy_error_at: None,
                         on_copy_complete: None,
                         native_ipc: None,
@@ -13031,6 +13050,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -13209,6 +13229,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -13409,6 +13430,7 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                prepare_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
@@ -13644,6 +13666,7 @@ mod tests {
                 tid_writes: Vec::new(),
                 refuse_copy: false,
                 child_copy_error: None,
+                prepare_copy_error: None,
                 child_copy_error_at: None,
                 on_copy_complete: None,
                 native_ipc: None,
@@ -13920,6 +13943,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -14165,6 +14189,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -14275,6 +14300,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -14415,6 +14441,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -14521,6 +14548,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -14681,6 +14709,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -15130,6 +15159,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,
@@ -15329,6 +15359,7 @@ mod tests {
             tid_writes: Vec::new(),
             refuse_copy: false,
             child_copy_error: None,
+            prepare_copy_error: None,
             child_copy_error_at: None,
             on_copy_complete: None,
             native_ipc: None,

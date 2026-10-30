@@ -269,8 +269,8 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn yield_owned_operation(
         &mut self,
         operation: carrick_sched_core::object_wait::OperationToken,
-    ) -> carrick_core::mm::transaction::CopyoutPreparation {
-        carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation)
+    ) -> carrick_core::mm::transaction::OwnedOperationYield {
+        carrick_core::mm::transaction::OwnedOperationYield::Unrouted(operation)
     }
     fn prepare_owned_copyout(
         &mut self,
