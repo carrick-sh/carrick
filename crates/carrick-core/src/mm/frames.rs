@@ -294,6 +294,25 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             {
                 return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
             }
+            // Another publisher may have made this instruction usable while
+            // the owner retained its reply, including at a different output
+            // after COW. Do not turn that valid publication into WrongBacking
+            // and a fatal native completion. An invalid leaf still needs the
+            // exact retained output authenticated by Publish below.
+            if let Ok(root) = B::root(grant.ttbr0)
+                && matches!(
+                    B::translate(
+                        words,
+                        root,
+                        carrick_guest_arch::UserVa::new(window.fault_page),
+                        access,
+                        true
+                    ),
+                    Ok(Some(_))
+                )
+            {
+                return DescriptorOutcome::Refused(DescriptorRefusal::Occupied);
+            }
             return B::execute_grant(words, grant.ttbr0, txn);
         }
         let DescriptorOp::Prepare {

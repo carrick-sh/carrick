@@ -271,6 +271,7 @@ enum PreparedScenario {
     UntouchedGrant,
     ProtNoneAcrossFork,
     ResidentTranslationRetry,
+    CompetingValidPreparedReply,
 }
 
 fn composed_native_supply(
@@ -321,6 +322,17 @@ fn native_child_translation_retry_requires_an_already_valid_leaf() {
     );
 }
 
+#[test]
+fn native_prepared_reply_retries_after_competing_valid_publication() {
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::CompetingValidPreparedReply,
+    );
+}
+
 fn composed_native_supply_with_prepared(
     competing_publication: bool,
     absent_page: Option<usize>,
@@ -336,7 +348,7 @@ fn composed_native_supply_with_prepared(
     fixture.tables.words = table_words.into_boxed_slice();
     match prepared {
         PreparedScenario::None | PreparedScenario::ResidentTranslationRetry => {}
-        PreparedScenario::UntouchedGrant => {
+        PreparedScenario::UntouchedGrant | PreparedScenario::CompetingValidPreparedReply => {
             // Untouched private anonymous stock has an output but is invalid.
             // Keep the non-identity IPA and Linux RW intent from the parent leaf.
             let descriptor = fixture.tables.words[1536].load(Ordering::Relaxed);
@@ -350,7 +362,7 @@ fn composed_native_supply_with_prepared(
         }
         PreparedScenario::ProtNoneAcrossFork => {
             crate::mm_portal::test_support::change_policy(
-                &fixture.region,
+                fixture.region,
                 crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
                 ReservationMm::new(1).unwrap(),
                 &fixture.tables,
@@ -520,7 +532,9 @@ fn composed_native_supply_with_prepared(
     };
     match prepared {
         PreparedScenario::None => {}
-        PreparedScenario::UntouchedGrant | PreparedScenario::ResidentTranslationRetry => {
+        PreparedScenario::UntouchedGrant
+        | PreparedScenario::ResidentTranslationRetry
+        | PreparedScenario::CompetingValidPreparedReply => {
             frame.esr = 0x92000006;
             frame.far = VA;
             let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
@@ -601,12 +615,62 @@ fn composed_native_supply_with_prepared(
                 .unwrap();
             let before = leaf(words, root, VA);
             let reply = publish_inherited(selected, root);
+            let mut competing = None;
+            if prepared == PreparedScenario::CompetingValidPreparedReply {
+                use carrick_mmu_core::aarch64::descriptor_txn::{
+                    AliasAccess, BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal,
+                    PageSpan, TableGrants, execute_descriptor_op,
+                };
+                // A second publisher installs an already-retained neighboring
+                // frame through the shipping descriptor executor while this
+                // reply still retains the original expected output.
+                let _editor = access
+                    .try_begin_edit(
+                        access.find(identity.mm).unwrap(),
+                        identity.mm,
+                        NonZeroU64::new(2).unwrap(),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    execute_descriptor_op(
+                        words,
+                        carrick_mmu_core::aarch64::SubstrateGpa(root & AARCH64_ROOT_ADDRESS_MASK),
+                        DescriptorOp::MapAlias {
+                            access: AliasAccess::User {
+                                writable: false,
+                                executable: false
+                            },
+                            span: PageSpan::new(VA, 4096),
+                            target_ipa: carrick_mmu_core::aarch64::SubstrateGpa(IPA + 4096),
+                            backing: BackingIdentity {
+                                frame_id: NonZeroU64::MIN,
+                                mapping_id: NonZeroU64::MIN,
+                                owner_generation: NonZeroU64::MIN,
+                                inventory_revision: NonZeroU64::MIN,
+                            },
+                        },
+                        &TableGrants::NONE,
+                        &mut InlineJournal::new(),
+                    ),
+                    DescriptorOutcome::Applied(_)
+                ));
+                competing = Some(leaf(words, root, VA));
+            }
             NativeProcessService::apply_fault_reply(
                 &mut service,
                 &reply,
                 crate::native_process_runtime::FaultReplyDisposition::Apply,
             )
             .unwrap();
+            if let Some(competing) = competing {
+                assert_eq!(
+                    leaf(words, root, VA),
+                    competing,
+                    "late reply must preserve the competing translation"
+                );
+                assert_eq!(memory.pages.borrow()[&IPA], vec![17; 4096]);
+                return;
+            }
             assert_eq!(
                 leaf(words, root, VA),
                 before | 1,

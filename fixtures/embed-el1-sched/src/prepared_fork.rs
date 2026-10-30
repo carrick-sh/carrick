@@ -83,7 +83,6 @@ pub(crate) fn run() -> i32 {
         let ok = unsafe {
             libc::mprotect(hidden.cast(), page, libc::PROT_READ) == 0
                 && hidden.read_volatile() == 0x22
-                && data.add(page).read_volatile() == 0
                 && libc::mprotect(hidden.cast(), page, libc::PROT_READ | libc::PROT_WRITE) == 0
         };
         if !ok {
@@ -92,8 +91,17 @@ pub(crate) fn run() -> i32 {
             }
         }
         unsafe {
-            data.add(page).write_volatile(0x33);
             hidden.write_volatile(0x44);
+        }
+        // Fault the still-prepared neighbor after breaking COW, including
+        // hosts whose physical COW compound covers several guest pages.
+        if unsafe { data.add(page).read_volatile() } != 0 {
+            unsafe {
+                libc::_exit(1);
+            }
+        }
+        unsafe {
+            data.add(page).write_volatile(0x33);
         }
         // The parent checks its bytes before permitting this child to exit.
         let ok = write_count(c2p_write.as_raw_fd(), 1)

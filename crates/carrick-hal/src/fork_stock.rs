@@ -1052,6 +1052,17 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         {
             return Err(ForkStockServiceError::StaleExecution);
         }
+        if count == 0 {
+            // Publishing an inherited leaf needs no table storage. Do not
+            // visit or reorder unrelated spare pages for each first touch.
+            return Ok(NativeDescriptorTableReservation {
+                key,
+                mm,
+                root,
+                pages: Vec::new(),
+                descriptor_tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants::NONE,
+            });
+        }
         if self.tables.len() < count {
             self.counters.descriptor_capacity_refusals =
                 self.counters.descriptor_capacity_refusals.saturating_add(1);
