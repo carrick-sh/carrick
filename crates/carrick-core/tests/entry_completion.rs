@@ -1122,3 +1122,60 @@ fn pool_cancellation_refuses_record_release_before_terminal_gate() {
     );
     assert_eq!(page.live(), 1);
 }
+
+mod member_release {
+    use carrick_core::lifecycle::{
+        MemberControl, MemberControlAuthority, MemberControlCustody, MemberControlRelease,
+        MemberExitCustody,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Member(MemberControlAuthority);
+    impl MemberControl for Member {
+        fn member_entry(&self) -> Option<carrick_core::lifecycle::EntryRef> {
+            None
+        }
+        fn exit_custody(&self) -> &MemberExitCustody {
+            self.0.custody()
+        }
+        fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+            None
+        }
+    }
+    struct Release<'a> {
+        count: AtomicUsize,
+        member: &'a Member,
+    }
+    impl MemberControlRelease for Release<'_> {
+        fn released(&self) {
+            assert!(
+                !self.member.exit_custody().referenced(),
+                "publish after returning custody"
+            );
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn retained_snapshot_publishes_only_after_the_last_pin_is_returned() {
+        let member = Member(MemberControlAuthority::new());
+        let release = Arc::new(Release {
+            count: AtomicUsize::new(0),
+            member: &member,
+        });
+        let entry = MemberControlCustody::retain(&member)
+            .unwrap()
+            .with_release(release.clone());
+        let snapshot = entry.retained().unwrap();
+        drop(entry);
+        assert!(member.exit_custody().referenced());
+        assert_eq!(release.count.load(Ordering::SeqCst), 0);
+        drop(snapshot);
+        assert!(!member.exit_custody().referenced());
+        assert_eq!(release.count.load(Ordering::SeqCst), 1);
+        assert!(member.0.reserve_reset().is_ok());
+    }
+}
