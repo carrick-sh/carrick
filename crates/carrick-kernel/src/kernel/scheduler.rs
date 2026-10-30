@@ -9219,6 +9219,7 @@ mod tests {
     #[test]
     fn guest_idle_zone_entry_releases_the_announcement_even_without_a_row() {
         let (kernel, root) = bootstrap(12_418);
+        root.thread().set_affinity(CpuAffinity::all(1));
         publish(&root, 59);
         let scheduler = scheduler_with_cpus(kernel, 1);
         let executor = scheduler
@@ -9263,6 +9264,7 @@ mod tests {
     #[test]
     fn enqueuing_onto_a_busy_cpu_wakes_one_guest_idle_stealer_and_propagates() {
         let (kernel, root) = bootstrap(12_409);
+        root.thread().set_affinity(CpuAffinity::all(3));
         let peer1 = sibling(&kernel, &root, 9_509);
         let peer2 = sibling(&kernel, &root, 9_510);
         publish(&root, 52);
@@ -9353,6 +9355,7 @@ mod tests {
     #[test]
     fn releasing_a_zone_row_onto_a_busy_cpu_wakes_a_guest_idle_stealer() {
         let (kernel, root) = bootstrap(12_414);
+        root.thread().set_affinity(CpuAffinity::all(2));
         let peer = sibling(&kernel, &root, 9_511);
         publish(&root, 55);
         publish(&peer, 56);
@@ -9415,6 +9418,7 @@ mod tests {
     #[test]
     fn releasing_a_handoff_with_a_row_already_host_queued_wakes_a_guest_idle_stealer() {
         let (kernel, root) = bootstrap(12_415);
+        root.thread().set_affinity(CpuAffinity::all(2));
         let peer = sibling(&kernel, &root, 9_512);
         publish(&root, 57);
         publish(&peer, 58);
