@@ -552,12 +552,116 @@ impl HostLease {
         })
     }
 
+    /// The lease this process inherited from an outer runner, if any. Never
+    /// takes a fresh lock: without a handoff there is nothing to pass on.
+    pub(crate) fn inherited(mode: HostLeaseMode) -> Result<Option<Self>, HostLeaseError> {
+        if std::env::var_os(INHERITED_SOCKET).is_none() {
+            return Ok(None);
+        }
+        Self::acquire(mode).map(Some)
+    }
+
+    /// Hand this lease to a command that runs as another account (sudo).
+    /// The account group may validate the lease and join its scope; it never
+    /// receives the locked description, so its death cannot release or change
+    /// the holder's lock, and nested acquires still refuse upgrades.
+    pub(crate) fn account_handoff(&self, group: libc::gid_t) -> io::Result<AccountHandoff> {
+        use std::os::unix::fs::PermissionsExt;
+        if !self.socket.is_absolute() || !self.path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "account lease handoff needs absolute socket and lock paths",
+            ));
+        }
+        let directory = self.socket.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "lease socket has no directory")
+        })?;
+        // Group traverse and connect only; the directory stays unlistable and
+        // closed to every other account.
+        for (path, mode) in [(directory, 0o710), (self.socket.as_path(), 0o660)] {
+            std::os::unix::fs::chown(path, None, Some(group))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+        Ok(AccountHandoff {
+            socket: self.socket.clone(),
+            path: self.path.clone(),
+            scope: self._scope.as_ref().map(OwnedFd::try_clone).transpose()?,
+        })
+    }
+
     pub fn mode(&self) -> HostLeaseMode {
         self.mode
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// Descriptor the scope writer occupies inside the other account. sudo
+/// closes every descriptor above stderr and the runner's sudoers grants no
+/// `closefrom_override`, so the writer crosses as stdin and the account-side
+/// shell moves it here, restoring stdin to /dev/null before exec.
+const ACCOUNT_SCOPE_FD: libc::c_int = 3;
+
+/// Exactly the lease variables and scope writer, nothing else from this env.
+pub(crate) struct AccountHandoff {
+    socket: PathBuf,
+    path: PathBuf,
+    scope: Option<OwnedFd>,
+}
+
+impl AccountHandoff {
+    /// Arguments between `sudo --` and the account's command.
+    pub(crate) fn launcher(&self) -> Vec<OsString> {
+        if self.scope.is_none() {
+            return Vec::new();
+        }
+        let script = format!("exec {ACCOUNT_SCOPE_FD}>&0 0</dev/null; exec \"$@\"");
+        ["/bin/sh", "-c", &script, "carrick-host-lease"]
+            .map(OsString::from)
+            .to_vec()
+    }
+
+    /// `KEY=VALUE` assignments for the account's `env -i`.
+    pub(crate) fn assignments(&self) -> Vec<OsString> {
+        let mut values = vec![
+            (INHERITED_SOCKET, self.socket.clone().into_os_string()),
+            (
+                "CARRICK_HOST_LEASE_PATH",
+                self.path.clone().into_os_string(),
+            ),
+        ];
+        if self.scope.is_some() {
+            values.push((SCOPE_FD, ACCOUNT_SCOPE_FD.to_string().into()));
+        }
+        values
+            .into_iter()
+            .map(|(key, value)| {
+                let mut assignment = OsString::from(key);
+                assignment.push("=");
+                assignment.push(value);
+                assignment
+            })
+            .collect()
+    }
+
+    pub(crate) fn stdin(self) -> std::process::Stdio {
+        self.scope
+            .map_or_else(std::process::Stdio::null, std::process::Stdio::from)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(scope: bool) -> io::Result<Self> {
+        Ok(Self {
+            socket: "/tmp/carrick-lease-fixture/lease.sock".into(),
+            path: DEFAULT_LOCK_PATH.into(),
+            scope: if scope {
+                Some(std::io::pipe()?.1.into())
+            } else {
+                None
+            },
+        })
     }
 }
 
@@ -842,6 +946,104 @@ mod tests {
             HostLease::inherit(temp.path(), HostLeaseMode::Carrick, &nested.socket).is_err(),
             "stale capability must fail closed"
         );
+    }
+
+    #[test]
+    fn account_handoff_lets_a_stripped_process_reuse_the_holders_lease() {
+        // The dispatch loop inherits a supervised lease; its agent runs as
+        // another account through sudo, which resets env and closes fds >= 3.
+        let lock = NamedTempFile::new().unwrap();
+        let (_lifetime, writer) = std::io::pipe().unwrap();
+        let writer: OwnedFd = writer.into();
+        let identity = ScopeIdentity::writer(&writer).unwrap();
+        let holder = HostLease::acquire_path_with_wait(
+            lock.path(),
+            HostLeaseMode::Carrick,
+            Duration::ZERO,
+            Some(identity),
+            |_| Ok(false),
+        )
+        .unwrap();
+        let inherited = HostLease {
+            _holder: None,
+            _scope: Some(writer),
+            socket: holder.socket.clone(),
+            path: lock.path().to_path_buf(),
+            mode: HostLeaseMode::Carrick,
+        };
+        // SAFETY: getgid has no preconditions.
+        let handoff = inherited
+            .account_handoff(unsafe { libc::getgid() })
+            .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(holder.socket.parent().unwrap()), 0o710);
+            assert_eq!(mode(&holder.socket), 0o660);
+        }
+        let launcher = handoff.launcher();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut account = Command::new(&launcher[0]);
+        account
+            .args(&launcher[1..])
+            .arg("/usr/bin/env")
+            .arg("-i")
+            .args(handoff.assignments())
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host_lease::tests::account_handoff_child_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .current_dir(elsewhere.path())
+            .stdin(handoff.stdin());
+        // SAFETY: async-signal-safe close only; models sudo's closefrom(3).
+        unsafe {
+            account.pre_exec(|| {
+                for fd in 3..1024 {
+                    libc::close(fd);
+                }
+                Ok(())
+            });
+        }
+        let output = account.output().unwrap();
+        assert!(
+            output.status.success(),
+            "account-side nested acquire failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // The child's exit never released or changed the holder's lock.
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(lock.path(), HostLeaseMode::Gate, Duration::ZERO),
+            Err(HostLeaseError::Timeout { .. })
+        ));
+        drop(inherited);
+        drop(holder);
+    }
+
+    #[test]
+    #[ignore = "account-side fixture invoked by its parent handoff regression"]
+    fn account_handoff_child_fixture() {
+        assert!(
+            std::env::var_os(INHERITED_SOCKET).is_some(),
+            "no lease handoff reached the account"
+        );
+        let lease = HostLease::acquire(HostLeaseMode::Carrick).unwrap();
+        assert!(lease._holder.is_none(), "took a lock instead of inheriting");
+        assert!(lease._scope.is_some(), "scope writer did not cross");
+        assert_eq!(lease.mode(), HostLeaseMode::Carrick);
+        assert!(
+            HostLease::inherit(lease.path(), HostLeaseMode::Gate, &lease.socket).is_err(),
+            "nested acquire must not upgrade"
+        );
+        // stdin is back to /dev/null, not the scope pipe.
+        // SAFETY: fstat on stdin into owned storage.
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        assert_eq!(unsafe { libc::fstat(0, &mut stat) }, 0);
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFCHR);
     }
 
     #[test]

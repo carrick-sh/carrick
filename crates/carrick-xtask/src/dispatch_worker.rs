@@ -472,12 +472,20 @@ fn foreground_command(state: &Path, root: &Path, launch: Foreground<'_>) -> Comm
     command
 }
 /// Enter an account only after clearing both the wrapper and model environments.
-fn account_command(command: &Command, user: &str, root: &Path) -> Command {
+/// A host-lease handoff adds only its own variables and scope writer.
+fn account_command(
+    command: &Command,
+    user: &str,
+    root: &Path,
+    lease: Option<crate::host_lease::AccountHandoff>,
+) -> Command {
     let mut isolated = Command::new("/usr/bin/sudo");
     private_environment(&mut isolated);
-    isolated
-        .args(["-n", "-u", user, "--", "/usr/bin/env", "-i", "-C"])
-        .arg(root);
+    isolated.args(["-n", "-u", user, "--"]);
+    if let Some(lease) = &lease {
+        isolated.args(lease.launcher());
+    }
+    isolated.args(["/usr/bin/env", "-i", "-C"]).arg(root);
     for (key, value) in command.get_envs() {
         if let Some(value) = value {
             let mut assignment = key.to_os_string();
@@ -486,12 +494,39 @@ fn account_command(command: &Command, user: &str, root: &Path) -> Command {
             isolated.arg(assignment);
         }
     }
+    if let Some(lease) = &lease {
+        isolated.args(lease.assignments());
+    }
     isolated
         .arg(command.get_program())
         .args(command.get_args())
         .current_dir("/")
-        .stdin(Stdio::null());
+        .stdin(lease.map_or_else(Stdio::null, crate::host_lease::AccountHandoff::stdin));
     isolated
+}
+
+/// The loop's inherited lease, shared with the agent account's group. Nested
+/// `just lease carrick` in the agent then reuses this lease on the one lock path.
+fn agent_lease() -> Result<
+    Option<(
+        crate::host_lease::HostLease,
+        crate::host_lease::AccountHandoff,
+    )>,
+    ScalerError,
+> {
+    let Some(lease) =
+        crate::host_lease::HostLease::inherited(crate::host_lease::HostLeaseMode::Carrick)
+            .map_err(std::io::Error::other)?
+    else {
+        return Ok(None);
+    };
+    let group = output(Command::new("/usr/bin/id").args(["-g", AGENT_USER]))?;
+    let group = String::from_utf8_lossy(&group)
+        .trim()
+        .parse::<libc::gid_t>()
+        .map_err(|_| ScalerError::Guard("invalid pre-created agent gid"))?;
+    let handoff = lease.account_handoff(group)?;
+    Ok(Some((lease, handoff)))
 }
 
 fn worker_prompt(dispatch: &Dispatch) -> String {
@@ -581,7 +616,9 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
         .env("AGY_DIRECTOR_ROUTES", "default")
         .current_dir(root);
-    let mut isolated = account_command(&command, AGENT_USER, root);
+    // Held until the agent retires; the agent only validates and joins it.
+    let (_lease, handoff) = agent_lease()?.unzip();
+    let mut isolated = account_command(&command, AGENT_USER, root, handoff);
     hand_over(&state)?;
     let logs = crate::agent_runner::state()?;
     isolated
@@ -3640,6 +3677,49 @@ fn publish_commits(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn agent_account_command_adds_only_the_host_lease_handoff() {
+        let mut command = Command::new("python3");
+        private_environment(&mut command);
+        command.arg("agy_worker.py").env("HOME", "/private/home");
+        let args = |lease| {
+            account_command(&command, AGENT_USER, Path::new("/private/root"), lease)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let plain = args(None);
+        let handed = args(Some(
+            crate::host_lease::AccountHandoff::fixture(true).unwrap(),
+        ));
+        let at = plain.iter().position(|a| a == "--").unwrap() + 1;
+        let program = plain.iter().position(|a| a == "python3").unwrap();
+        let launcher = &handed[at..at + 4];
+        assert_eq!(launcher[0], "/bin/sh");
+        assert_eq!(launcher[2], "exec 3>&0 0</dev/null; exec \"$@\"");
+        let lease = &handed[program + 4..program + 7];
+        assert_eq!(
+            lease,
+            [
+                "CARRICK_HOST_LEASE_SOCKET=/tmp/carrick-lease-fixture/lease.sock",
+                "CARRICK_HOST_LEASE_PATH=/tmp/carrick-host-lease.lock",
+                "CARRICK_HOST_LEASE_SCOPE_FD=3",
+            ]
+        );
+        // Removing exactly the launcher and lease assignments gives the
+        // unchanged credential-free command; nothing else was added.
+        let mut stripped = handed.clone();
+        stripped.drain(program + 4..program + 7);
+        stripped.drain(at..at + 4);
+        assert_eq!(stripped, plain);
+        assert!(!plain.iter().any(|a| a.starts_with("CARRICK_HOST_LEASE")));
+        // An unscoped holder needs no descriptor and therefore no shell.
+        let unscoped = args(Some(
+            crate::host_lease::AccountHandoff::fixture(false).unwrap(),
+        ));
+        assert_eq!(unscoped.len(), plain.len() + 2);
+        assert_eq!(unscoped[at], "/usr/bin/env");
+    }
     #[test]
     fn proposed_body_is_bounded_and_cannot_add_linkage_or_provenance() {
         let body = proposed_pr_body(
