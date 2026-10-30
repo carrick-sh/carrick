@@ -4056,6 +4056,19 @@ fn el1_fork_cow_resolves_in_guest() {
     }
 }
 
+/// Actual guest reads and writes with two live processes. VM-free descriptor
+/// checks cannot prove the backend's armed physical COW authority fires.
+#[test]
+fn el1_inherited_prepared_fork_preserves_bytes_and_isolates_live_processes() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    let run = run_fixture(&carrier, &["prepared-fork"], Duration::from_secs(30));
+    assert_eq!(
+        run.result.stdout_utf8().trim(),
+        "prepared-fork inherited_zero=true prot_none_bytes=true two_live_isolation=true ok=true"
+    );
+}
+
 /// The carrier pool's guest COW counters: (resolved, declined by reason).
 fn el1_cow_pool_counters() -> (u64, [u64; carrick_el1_abi::COW_DECLINE_REASONS]) {
     carrick_el1_abi::cow_grant_pool_host()

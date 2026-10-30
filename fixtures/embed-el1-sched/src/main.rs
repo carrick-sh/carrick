@@ -118,6 +118,10 @@
 use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+mod pipe_count;
+mod prepared_fork;
+use pipe_count::{poll_read_count, write_count};
+
 mod delegated_root;
 mod host_read_gate;
 mod ipc;
@@ -2079,36 +2083,6 @@ fn fork_cow_process(
     Some(verified_pages)
 }
 
-/// Send one observed count to the peer as 8 little-endian bytes.
-fn write_count(fd: libc::c_int, count: u64) -> bool {
-    let bytes = count.to_le_bytes();
-    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-    n == bytes.len() as isize
-}
-
-/// Receive a count written by `write_count`, bounded by `timeout_ms`.
-fn poll_read_count(fd: libc::c_int, timeout_ms: libc::c_int) -> Option<u64> {
-    let mut bytes = [0u8; 8];
-    let mut have = 0;
-    while have < bytes.len() {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if rc <= 0 || (pfd.revents & libc::POLLIN) == 0 {
-            return None;
-        }
-        let n = unsafe { libc::read(fd, bytes[have..].as_mut_ptr().cast(), bytes.len() - have) };
-        if n <= 0 {
-            return None;
-        }
-        have += n as usize;
-    }
-    Some(u64::from_le_bytes(bytes))
-}
-
 fn fork_cow(forks: usize, pages: usize) -> i32 {
     let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size_raw <= 0 {
@@ -3814,6 +3788,7 @@ fn main() {
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(16),
         ),
+        "prepared-fork" => prepared_fork::run(),
         "mapping-retirement" => mapping_retirement(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),

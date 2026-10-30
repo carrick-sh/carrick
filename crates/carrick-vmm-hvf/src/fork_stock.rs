@@ -27,8 +27,36 @@ impl carrick_hal::physical_grants::NativeSupplyCustody for NativeChildPhysical {
         self.supplied.as_mut()
     }
 }
+impl carrick_hal::physical_grants::NativePreparedSupplyCustody for NativeChildPhysical {
+    fn retained_prepared_frame(
+        &self,
+        address: carrick_guest_arch::UserVa,
+    ) -> Option<carrick_el1_abi::PortalForkCustody> {
+        self.inherited_frame(address)
+    }
+    fn prepared_supply(
+        &mut self,
+        owner: carrick_hal::GuestFrameOwner,
+    ) -> (
+        &mut carrick_hal::physical_grants::NativePhysicalGrants<Self::Backing>,
+        std::sync::Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
+    ) {
+        let rollback = std::sync::Arc::clone(&self.rollback);
+        let grants = self
+            .supplied
+            .get_or_insert_with(|| carrick_hal::physical_grants::NativePhysicalGrants::new(owner));
+        (grants, rollback)
+    }
+}
 impl NativeChildPhysical {
-    pub fn new(inherited: Vec<crate::trap::ForkPhysicalRetention>) -> Self {
+    pub fn new(mut inherited: Vec<crate::trap::ForkPhysicalRetention>) -> Self {
+        // Keep the physical retentions themselves ordered, rather than a
+        // second VA-to-output authority. First touch finds one covering frame
+        // in logarithmic work even after a large fork.
+        inherited.sort_by_key(|row| match row.selected() {
+            carrick_el1_abi::PortalForkCustody::Frame { va, .. } => va,
+            _ => u64::MAX,
+        });
         let mut sources = carrick_hal::fork_stock::ForkHostBackingCustody::default();
         for row in &inherited {
             if let Some(source) = row.retained_host_backing() {
@@ -40,6 +68,35 @@ impl NativeChildPhysical {
             sources,
             ..Default::default()
         }
+    }
+
+    pub fn inherited_frame(
+        &self,
+        address: carrick_guest_arch::UserVa,
+    ) -> Option<carrick_el1_abi::PortalForkCustody> {
+        let index = self
+            .inherited
+            .partition_point(|row| match row.selected() {
+                carrick_el1_abi::PortalForkCustody::Frame { va, .. } => va <= address.raw(),
+                _ => false,
+            })
+            .checked_sub(1)?;
+        let selected = self.inherited[index].selected();
+        let carrick_el1_abi::PortalForkCustody::Frame {
+            va,
+            len,
+            shared: false,
+            ..
+        } = selected
+        else {
+            return None;
+        };
+        address
+            .raw()
+            .checked_sub(va)?
+            .checked_add(4096)
+            .filter(|end| *end <= len)
+            .map(|_| selected)
     }
 }
 impl core::fmt::Debug for NativeChildPhysical {
