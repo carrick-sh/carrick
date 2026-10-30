@@ -2731,6 +2731,187 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
         let address = self.page.control_address(entry)?;
         owned_control(self.page, self.control, address)
     }
+    fn is_live_member_control(&self, member: &NativeMember<'a, C>) -> bool {
+        let control = member.control.control();
+        if carrick_core::lifecycle::MemberControl::exit_custody(control).exit_claimed_or_terminal()
+            || control.host_retirement().is_some()
+        {
+            return false;
+        }
+        match control.entry() {
+            Some(entry) => self
+                .page
+                .state(entry.index())
+                .is_some_and(|(generation, state)| {
+                    generation == entry.generation()
+                        && matches!(
+                            state,
+                            carrick_el1_abi::EntryState::Born
+                                | carrick_el1_abi::EntryState::Published
+                        )
+                }),
+            // Registration consumes the page's host-birth receipt. Retained
+            // control custody owns liveness after adoption, until exit above.
+            None => control.host_birth_identity() == Some(member.expected_host),
+        }
+    }
+    fn owned_control(&self, address: u64) -> Option<&'a ThreadControlSlot> {
+        if self.control as *const _ as u64 == address {
+            return Some(self.control);
+        }
+        if let Some(member) = self.members.iter().find(|member| {
+            member.control.control() as *const _ as u64 == address
+                && self.is_live_member_control(member)
+        }) {
+            return Some(member.control.control());
+        }
+        owned_control(self.page, self.control, address)
+    }
+    fn authenticated_signal_member(
+        &self,
+        process_key: TaskKey,
+        zone: &'a ZoneTables<C>,
+        member: &NativeMember<'a, C>,
+    ) -> Option<(RecordRef, &'a ThreadControlSlot)> {
+        let control = member.control.control();
+        if member.process != process_key || !self.is_live_member_control(member) {
+            return None;
+        }
+        let record = control.zone_record().unwrap_or(member.record);
+        if !signal_record_exists(zone, record) {
+            return None;
+        }
+        let thread = zone.record(record.id).identity();
+        (thread.tid == member.thread.id().raw() as u64
+            && thread.serial == member.expected_host.thread().raw()
+            && thread.mm == self.address.mm.raw().get()
+            && thread.lifecycle_page == self.page as *const _ as u64
+            && thread.control_slot == control as *const _ as u64
+            && (record != member.record
+                || member
+                    .thread
+                    .issued()
+                    .is_none_or(|issued| thread.generation == issued.generation.raw())))
+        .then_some((record, control))
+    }
+    fn live_signal_member(
+        &self,
+        process_key: TaskKey,
+        leader_tid: u32,
+        zone: &'a ZoneTables<C>,
+        visible_tid: u32,
+    ) -> Option<(RecordRef, &'a ThreadControlSlot)> {
+        if visible_tid == leader_tid {
+            // The process leader is not necessarily the caller: a
+            // sibling's tgkill(tgid, leader_tid, ...) names the leader's
+            // exact retained control, never the caller's current record.
+            let record = self.control.zone_record().unwrap_or(self.record);
+            if signal_record_exists(zone, record) {
+                return Some((record, self.control));
+            }
+        }
+        for member in &self.members {
+            if member.control.visible_tid() == Some(visible_tid)
+                && let Some(resolved) = self.authenticated_signal_member(process_key, zone, member)
+            {
+                return Some(resolved);
+            }
+        }
+        for index in 0..self.page.entry_count() {
+            let Some((generation, state)) = self.page.state(index) else {
+                continue;
+            };
+            if !matches!(
+                state,
+                carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+            ) {
+                continue;
+            }
+            let entry = EntryRef::new(index as u32, generation);
+            let Some(identity) = self.page.identity(entry) else {
+                continue;
+            };
+            if identity.visible_tid != visible_tid {
+                continue;
+            }
+            let Some(address) = self.page.control_address(entry) else {
+                continue;
+            };
+            let Some(control) = owned_control(self.page, self.control, address) else {
+                continue;
+            };
+            let Some(record) = control.zone_record() else {
+                continue;
+            };
+            let Some(live) = zone.live(record) else {
+                continue;
+            };
+            let thread = live.identity();
+            if thread.tid != u64::from(identity.tid)
+                || thread.serial != identity.thread_serial
+                || thread.mm != self.address.mm.raw().get()
+                || thread.lifecycle_page != self.page as *const _ as u64
+                || thread.control_slot != address
+            {
+                continue;
+            }
+            return Some((record, control));
+        }
+        None
+    }
+    fn for_each_live_signal_member(
+        &self,
+        process_key: TaskKey,
+        zone: &'a ZoneTables<C>,
+        mut visit: impl FnMut(RecordRef, &'a ThreadControlSlot),
+    ) {
+        let leader = self.control.zone_record().unwrap_or(self.record);
+        if signal_record_exists(zone, leader) {
+            visit(leader, self.control);
+        }
+        for member in &self.members {
+            if core::ptr::eq(member.control.control(), self.control) {
+                continue;
+            }
+            if let Some((record, control)) =
+                self.authenticated_signal_member(process_key, zone, member)
+                && record != leader
+            {
+                visit(record, control);
+            }
+        }
+        for index in 0..self.page.entry_count() {
+            let Some((generation, state)) = self.page.state(index) else {
+                continue;
+            };
+            if !matches!(
+                state,
+                carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+            ) {
+                continue;
+            }
+            let entry = EntryRef::new(index as u32, generation);
+            let Some(address) = self.page.control_address(entry) else {
+                continue;
+            };
+            let Some(control) = owned_control(self.page, self.control, address) else {
+                continue;
+            };
+            if self
+                .members
+                .iter()
+                .any(|member| core::ptr::eq(member.control.control(), control))
+            {
+                continue;
+            }
+            if let Some(record) = control.zone_record()
+                && record != leader
+                && signal_record_exists(zone, record)
+            {
+                visit(record, control);
+            }
+        }
+    }
     pub fn file_table(&self) -> u64 {
         self.file_table
     }
@@ -2845,7 +3026,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 && resources.page as *const _ as u64 == page
         })?;
         let resources = row.native().resources();
-        let control = owned_control(resources.page, resources.control, control_address)?;
+        let control = resources.owned_control(control_address)?;
         let record = control
             .zone_record()
             .or_else(|| core::ptr::eq(resources.control, control).then_some(resources.record))?;
@@ -3751,75 +3932,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 continue;
             }
             let resources = row.native().resources();
-            if visible.get() == row.metadata().namespace_pid {
-                // The process leader is not necessarily the caller: a
-                // sibling's tgkill(tgid, leader_tid, ...) names the leader's
-                // exact retained control, never the caller's current record.
-                let record = resources.control.zone_record().unwrap_or(resources.record);
-                if signal_record_exists(self.source.zone, record) {
-                    selected = Some((
-                        row.key(),
-                        record,
-                        resources.signals().clone(),
-                        resources.channel.clone(),
-                    ));
-                    break;
-                }
-            }
-            for index in 0..resources.page.entry_count() {
-                let Some((generation, state)) = resources.page.state(index) else {
-                    continue;
-                };
-                if !matches!(
-                    state,
-                    carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
-                ) {
-                    continue;
-                }
-                let entry = EntryRef::new(index as u32, generation);
-                let Some(identity) = resources.page.identity(entry) else {
-                    continue;
-                };
-                if identity.visible_tid != visible.get() {
-                    continue;
-                }
-                let Some(address) = resources.page.control_address(entry) else {
-                    continue;
-                };
-                // SAFETY: the lifecycle owner retains and authenticates this control
-                // address for this exact nonretired entry incarnation.
-                let control = unsafe { &*(address as *const ThreadControlSlot) };
-                if control.entry() != Some(entry) {
-                    continue;
-                }
-                let Some(record) = control.zone_record() else {
-                    continue;
-                };
-                let Some(live) = self.source.zone.live(record) else {
-                    continue;
-                };
-                let thread = live.identity();
-                if thread.tid != u64::from(identity.tid)
-                    || thread.serial != identity.thread_serial
-                    || thread.mm != resources.address.mm.raw().get()
-                    || thread.lifecycle_page != resources.page as *const _ as u64
-                    || thread.control_slot != address
-                {
-                    continue;
-                }
+            if let Some((record, control)) = resources.live_signal_member(
+                row.key(),
+                row.metadata().namespace_pid,
+                self.source.zone,
+                visible.get(),
+            ) {
                 selected = Some((
                     row.key(),
                     record,
+                    control,
                     resources.signals().clone(),
                     resources.channel.clone(),
                 ));
                 break;
             }
-            if selected.is_some() {
-                break;
-            }
         }
-        let (target_key, record, signals, channel) = selected.ok_or(LINUX_ESRCH)?;
+        let (target_key, record, control, signals, channel) = selected.ok_or(LINUX_ESRCH)?;
         use carrick_personality_linux::signal::SignalTargetScope;
         info.check_target(if target_key == self.key {
             SignalTargetScope::CallingProcess
@@ -3850,24 +3979,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if signal == carrick_signal_core::policy::Signal::KILL {
             self.current.linux.mark_native_signal_work();
         }
-        let target = self.source.zone.record(record.id).identity();
-        let blocked = graph
-            .owner
-            .tasks()
-            .iter()
-            .find_map(|(_, row)| {
-                let resources = row.native().resources();
-                (resources.address.mm.raw().get() == target.mm
-                    && resources.page as *const _ as u64 == target.lifecycle_page)
-                    .then(|| owned_control(resources.page, resources.control, target.control_slot))
-                    .flatten()
-            })
-            .map(|control| {
-                carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                    carrick_signal_core::SignalSet::from_bits(control.blocked().0),
-                )
-            });
-        let interrupt = blocked.is_some_and(|blocked| signals.has_deliverable(record, blocked));
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(control.blocked().0),
+        );
+        let interrupt = signals.has_deliverable(record, blocked);
         let ipc_channel = if interrupt {
             match graph.pending.get(&target_key) {
                 Some(PendingContinuation::Ipc(pending)) => Some(pending.channel.clone()),
@@ -3891,15 +4006,32 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(())
     }
 
-    // Dependency: owned interrupt cancellation. Parked futex/object operations
-    // retain their pending signals until their owner resumes; an IPI does not
-    // cancel their operation or release its queue/timer custody.
+    // Dependency: owned interrupt cancellation. Parked object operations retain
+    // their pending signals until their owner resumes; a single-entry futex
+    // wait (`UserReturn`) wakes with `-EINTR` on deliverable signal arrival.
     fn interrupt_signal_record(&mut self, record: RecordRef) {
         if let Err(error) = self
             .runtime
             .cancel_service(record, self.source.slot, self.service)
         {
             self.run_failure = Some(error.run_failure_reason());
+        }
+        if !self.runtime.graph.lock().has_member_wait(&record) {
+            let mut effects = WakeEffects::default();
+            if self.source.zone.interrupt_parked_futex(
+                record,
+                self.source.slot,
+                carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+                &NativeBucketWait {
+                    lifetime: core::marker::PhantomData,
+                    #[cfg(test)]
+                    probe: self.publication_wait_probe,
+                },
+                &mut effects,
+            ) {
+                self.service.wake_effects(effects);
+                return;
+            }
         }
         request_signal_reschedule(self.source.zone, self.service, record);
     }
@@ -8641,39 +8773,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let before = interrupts.len();
             let _ = target_signals.enqueue(target_key, signal, Some(info));
             if let Ok(row) = graph.owner.task(target_key) {
-                let resources = row.native().resources();
-                let leader = resources.control.zone_record().unwrap_or(resources.record);
-                let leader_mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                    carrick_signal_core::SignalSet::from_bits(resources.control.blocked().0),
-                );
-                if target_signals.has_deliverable(leader, leader_mask) {
-                    interrupts.push(leader);
-                }
-                for index in 0..resources.page.entry_count() {
-                    let Some((generation, state)) = resources.page.state(index) else {
-                        continue;
-                    };
-                    if !matches!(
-                        state,
-                        carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
-                    ) {
-                        continue;
-                    }
-                    let entry = EntryRef::new(index as u32, generation);
-                    if let Some(address) = resources.page.control_address(entry)
-                        && let Some(control) =
-                            owned_control(resources.page, resources.control, address)
-                        && let Some(record) = control.zone_record()
-                        && record != leader
-                    {
+                row.native().resources().for_each_live_signal_member(
+                    target_key,
+                    self.source.zone,
+                    |record, control| {
                         let mask = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                             carrick_signal_core::SignalSet::from_bits(control.blocked().0),
                         );
                         if target_signals.has_deliverable(record, mask) {
                             interrupts.push(record);
                         }
-                    }
-                }
+                    },
+                );
             }
             if interrupts.len() != before
                 && let Some(PendingContinuation::Ipc(pending)) = graph.pending.get(&target_key)
