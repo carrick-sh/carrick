@@ -10041,6 +10041,8 @@ fn tgkill_during_futex_enrollment_returns_eintr() {
     let sender_address = fixture.address;
     let sender_zone = fixture.zone;
     let sender_table = fixture.region.table();
+    // Test-only bounded actor; production thread creation remains catalogued.
+    #[allow(clippy::disallowed_methods)]
     let sender = std::thread::spawn(move || {
         go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, sender_address);
