@@ -316,7 +316,7 @@ pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
         // Only the fault service may complete/cancel its retained operation.
         // A host readiness claim must not interrupt that service with a
         // fabricated completion. Quiescence owners retain the core custody API.
-        route_native_exception_in_zone(zone, record);
+        route_native_handback_in_zone(zone, record);
         return HostClaim::Deferred;
     }
     let outcome = zone.claim_for_host(record, seq, kind, &HostLockWait);
@@ -324,7 +324,7 @@ pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
         kick_slot(slot);
     }
     if zone.requires_native_entry(record) {
-        route_native_exception_in_zone(zone, record);
+        route_native_handback_in_zone(zone, record);
         return HostClaim::Deferred;
     }
     outcome
@@ -1031,7 +1031,7 @@ fn publish_handback_in_zone(
     zone.counters
         .host_handbacks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if route_native_exception_in_zone(zone, record) {
+    if route_native_handback_in_zone(zone, record) {
         return;
     }
     if route_first_entry_in_zone(zone, record) {
@@ -1041,21 +1041,22 @@ fn publish_handback_in_zone(
 }
 
 /// Route at readiness publication, before any scheduler row or reactor event
-/// can be produced. Host custody of a fault is not a host-resumable context.
-pub(crate) fn route_native_exception_handback(record: RecordRef) -> bool {
+/// can be produced. Physical host custody does not create a native thread's
+/// host continuation: exception and scalar IPC readiness retain the ring owner.
+pub(crate) fn route_native_handback(record: RecordRef) -> bool {
     zone()
         .or_else(zone_tables)
-        .is_some_and(|zone| route_native_exception_in_zone(zone, record))
+        .is_some_and(|zone| route_native_handback_in_zone(zone, record))
 }
 
-fn route_native_exception_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
+fn route_native_handback_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
     let Some(rec) = zone.live(record) else {
         return false;
     };
-    if !rec.requires_native_entry() {
+    if !rec.needs_native_handback() {
         return false;
     }
-    if let Some(placement) = zone.place_native_exception(record) {
+    if let Some(placement) = zone.place_native_handback(record) {
         deliver_placement(Some(placement));
         if !zone.slot(placement.slot).is_live() {
             deliver_handback_event(HandbackEvent::NativeQueued);

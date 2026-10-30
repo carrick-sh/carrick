@@ -907,6 +907,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         ) && !self.requires_native_entry()
     }
 
+    /// A native exception or ordinary readiness completion has no host
+    /// syscall continuation. Its existing ring owner must retain publication,
+    /// even when every execution driver is outside the guest. Signal/control
+    /// handbacks keep their own cancellation and settlement protocols.
+    pub fn needs_native_handback(&self) -> bool {
+        self.requires_native_entry()
+            || (self.is_native_owned()
+                && matches!(self.handback(), Some(Handback::Resumed | Handback::Woken)))
+    }
+
     /// Adopted exception owners may predate the native-owned allocation hint.
     pub fn has_native_execution_owner(&self) -> bool {
         self.is_native_owned() || self.requires_native_entry()
@@ -4416,13 +4426,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.place_from_claim(record, from)
     }
 
-    /// Retain an exception completion on a native run queue when every driver
+    /// Retain a native readiness/exception completion when every driver
     /// is outside the guest. Queue custody survives a driver stepping away;
     /// an eligible returning or idle driver can take/steal it. This does not
     /// grant execution on the queue's CPU or bypass MM/affinity admission.
-    pub fn place_native_exception(&self, record: RecordRef) -> Option<HostPlacement> {
+    pub fn place_native_handback(&self, record: RecordRef) -> Option<HostPlacement> {
         let rec = self.live(record)?;
-        if !rec.requires_native_entry() {
+        if !rec.needs_native_handback() {
             return None;
         }
         let from = rec.claim();

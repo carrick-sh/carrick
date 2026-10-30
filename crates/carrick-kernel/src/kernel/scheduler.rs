@@ -3983,7 +3983,7 @@ impl Scheduler {
     /// wait becomes ready and the thread runnable (or, if it is still
     /// running and about to settle, kicked so it settles promptly).
     pub fn publish_zone_handback(&self, record: carrick_el1_abi::RecordRef) {
-        if crate::el1_zone::route_native_exception_handback(record) {
+        if crate::el1_zone::route_native_handback(record) {
             return;
         }
         if crate::el1_zone::route_first_entry_handback(record) {
@@ -4662,7 +4662,7 @@ impl Scheduler {
         executor: &ExecutorRegistration,
         record: carrick_el1_abi::RecordRef,
     ) -> Result<Option<RunnableThread>, RunQueueError> {
-        if crate::el1_zone::route_native_exception_handback(record) {
+        if crate::el1_zone::route_native_handback(record) {
             return Ok(None);
         }
         let Some(key) = crate::el1_zone::thread_key_of(record) else {

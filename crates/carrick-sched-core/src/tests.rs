@@ -1191,6 +1191,56 @@ fn el1_honours_affinity_for_floating_threads() {
     );
 }
 
+/// Readiness goes back to the native owner; a host continuation and native
+/// signal/control settlement keep their existing publication routes.
+#[test]
+fn native_readiness_handback_preserves_the_execution_owner() {
+    for native in [false, true] {
+        for kind in [
+            Handback::Resumed,
+            Handback::Woken,
+            Handback::Signal,
+            Handback::Service,
+        ] {
+            let zone = zone();
+            host_publish(&zone, SLOT, MM, Some(0), 1);
+            let record = zone.alloc_record(identity(3)).unwrap();
+            if native {
+                assert!(zone.mark_native_owned(record));
+            }
+            let exact = zone.record_ref(record);
+            zone.publish_park(record, zone.next_seq(record));
+            assert_eq!(
+                zone.claim_for_host(exact, None, kind, &HostWait),
+                HostClaim::Claimed
+            );
+            let native_ready = native && matches!(kind, Handback::Resumed | Handback::Woken);
+            assert_eq!(zone.record(record).needs_native_handback(), native_ready);
+            let stale = RecordRef {
+                incarnation: exact.incarnation + 1,
+                ..exact
+            };
+            assert!(zone.place_native_handback(stale).is_none());
+            assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
+            let placed = zone.place_native_handback(exact);
+            assert_eq!(placed.is_some(), native_ready);
+            if native_ready {
+                assert_eq!(placed.unwrap().slot, SLOT);
+                assert_eq!(zone.slot(SLOT).queued(), 1);
+                assert!(
+                    zone.place_native_handback(exact).is_none(),
+                    "one queue entry"
+                );
+                assert_eq!(zone.slot(SLOT).queued(), 1);
+            } else {
+                assert_eq!(zone.slot(SLOT).queued(), 0);
+                assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
+            }
+            assert_eq!(zone.record(record).handback(), Some(kind));
+        }
+    }
+}
+
 #[test]
 fn host_places_a_native_owned_wake_on_a_stopped_live_slot() {
     let zone = zone();
