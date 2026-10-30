@@ -2167,13 +2167,15 @@ where
             SyscallMmPhase::Ordinary(mm_executor)
         };
         if let SyscallMmPhase::Mutation(ref guard) = mm_phase {
-            if let Err(busy) =
-                signal::reconcile_guest_frame_commits(&kernel.dispatcher, engine, guard)
-            {
-                return Ok(DispatchOutcome::OwnerMemoryWait {
-                    wait: busy.wait,
-                    committed: 0,
-                });
+            match signal::reconcile_guest_frame_commits(&kernel.dispatcher, engine, guard) {
+                Ok(()) => {}
+                Err(DispatchError::ReservationBusy(busy)) => {
+                    return Ok(DispatchOutcome::OwnerMemoryWait {
+                        wait: busy.wait,
+                        committed: 0,
+                    });
+                }
+                Err(error) => return Err(error.into()),
             }
         }
         // The parked-slice, sleep/poll deadline and child-wait trace state that

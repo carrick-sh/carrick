@@ -844,7 +844,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     fault_kind: Option<carrick_mmu_core::aarch64::Stage1FaultKind>,
     tid: carrick_kernel::kernel::LinuxTid,
     mutation: &mut carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
-) -> Result<Result<bool, carrick_kernel::dispatch::mem::ReservationBusy>, TrapError> {
+) -> Result<Result<bool, carrick_kernel::dispatch::mem::ReservationBusy>, RuntimeError> {
     use carrick_observability::probes::HvpatchFirstTouchDeliverReason as DeliverReason;
     let notify_first_touch_deliver = |reason: DeliverReason| {
         crate::probes::hvpatch_first_touch_deliver(address, reason, tid.raw());
@@ -862,9 +862,13 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     };
     let ring_tid = tid.raw();
     let mm_key = mutation.host_alias_permit().mm().raw();
-    if let Err(busy) = reconcile_guest_frame_commits(dispatcher, engine, mutation) {
-        cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
-        return Ok(Err(busy));
+    match reconcile_guest_frame_commits(dispatcher, engine, mutation) {
+        Ok(()) => {}
+        Err(DispatchError::ReservationBusy(busy)) => {
+            cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
+            return Ok(Err(busy));
+        }
+        Err(error) => return Err(error.into()),
     }
     if guest_descriptor_edit_in_flight(
         carrick_el1_abi::descriptor_txn_slots_host(),
@@ -882,7 +886,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         if context.shared().mm().id() != permit.mm() {
             return Err(TrapError::Hypervisor(
                 "fault backing settlement context names another MM".to_owned(),
-            ));
+            )
+            .into());
         }
         dispatcher
             .with_kernel_resources(&context, || {
@@ -933,7 +938,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         if !mailbox.abandon_unstarted_request(request) {
                             return Err(TrapError::UnexpectedExit {
                                 reason: "busy root lost its unstarted frame request".into(),
-                            });
+                            }
+                            .into());
                         }
                         return Ok(Err(busy));
                     }
@@ -1290,12 +1296,34 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
     dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
     engine: &E,
     mutation: &carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
-) -> Result<(), carrick_kernel::dispatch::mem::ReservationBusy> {
+) -> Result<(), DispatchError> {
     let Some(table) = carrick_el1_abi::frame_grant_residency_host() else {
         return Ok(());
     };
+    reconcile_dirty_frame_commits(table, mutation.mm_id().raw(), |pages| {
+        let mut refused = None;
+        // One live-root read and one resolution per table arena for the
+        // whole grant (`ThreadedEngine::live_el1_grant_pages`).
+        engine.live_el1_grant_pages(pages, &mut |page, _protection| {
+            if refused.is_none() {
+                refused = dispatcher.reconcile_el1_resident_page(mutation, page).err();
+            }
+        });
+        refused.map_or(Ok(()), Err)
+    })
+}
+
+/// A refused adoption must leave the row dirty, whether it needs a retry or
+/// terminates the run. The caller supplies the live-leaf authenticated root step.
+fn reconcile_dirty_frame_commits(
+    table: &carrick_el1_abi::FrameGrantResidencyTable,
+    mm_key: u64,
+    mut adopt_live: impl FnMut(
+        &[(u64, u64)],
+    ) -> Result<(), carrick_kernel::dispatch::mem::RootAccessRefusal>,
+) -> Result<(), DispatchError> {
     let mut pages = Vec::new();
-    let walked = table.for_each_dirty_mm(mutation.mm_id().raw(), |slot, identity, bits| {
+    let walked = table.for_each_dirty_mm(mm_key, |slot, identity, bits| {
         pages.clear();
         for (word_index, mut word) in bits.into_iter().enumerate() {
             while word != 0 {
@@ -1308,31 +1336,22 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
                 pages.push((page, identity.physical_ipa + page - identity.semantic_base));
             }
         }
-        // One live-root read and one resolution per table arena for the
-        // whole grant (`ThreadedEngine::live_el1_grant_pages`).
-        let mut refused = None;
-        engine.live_el1_grant_pages(&pages, &mut |page, _protection| {
-            if refused.is_none() {
-                match dispatcher.reconcile_el1_resident_page(mutation, page) {
-                    Ok(_) => {}
-                    Err(carrick_kernel::dispatch::mem::RootAccessRefusal::Busy(busy)) => {
-                        refused = Some(busy)
-                    }
-                    Err(error) => {
-                        carrick_fatal!("vcpu_loop::residency", "invalid resident root: {error:?}")
-                    }
+        if let Err(refusal) = adopt_live(&pages) {
+            return std::ops::ControlFlow::Break(match refusal {
+                carrick_kernel::dispatch::mem::RootAccessRefusal::Busy(busy) => {
+                    DispatchError::ReservationBusy(busy)
                 }
-            }
-        });
-        if let Some(busy) = refused {
-            return std::ops::ControlFlow::Break(busy);
+                carrick_kernel::dispatch::mem::RootAccessRefusal::Refused(error) => {
+                    DispatchError::ReservationAuthority(error)
+                }
+            });
         }
         let _ = table.ack_dirty(slot, identity);
         std::ops::ControlFlow::Continue(())
     });
     match walked {
         std::ops::ControlFlow::Continue(()) => Ok(()),
-        std::ops::ControlFlow::Break(busy) => Err(busy),
+        std::ops::ControlFlow::Break(error) => Err(error),
     }
 }
 
@@ -2329,6 +2348,57 @@ mod tests {
 mod first_touch_access_tests {
     use super::*;
     use carrick_mmu_core::aarch64::LeafAccess;
+
+    #[test]
+    fn invalid_resident_root_returns_typed_error_without_acknowledging_dirty_rows() {
+        use carrick_el1::memory::reservations::Refusal;
+        use carrick_kernel::dispatch::mem::RootAccessRefusal;
+
+        let table = Box::new(carrick_el1_abi::FrameGrantResidencyTable::new());
+        let mm_key = 71;
+        for base in [0x4000_0000, 0x4020_0000] {
+            let identity = carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key,
+                semantic_base: base,
+                physical_ipa: base,
+                len: 4096,
+                mapping_id: 1,
+                frame_id: 1,
+                owner_generation: 1,
+                inventory_revision: 1,
+            };
+            table.publish(identity).unwrap();
+            assert!(table.record_commit(table.lookup(mm_key, base).unwrap()));
+        }
+        let mut attempts = 0;
+        let result = reconcile_dirty_frame_commits(&table, mm_key, |pages| {
+            attempts += 1;
+            assert_eq!(pages.len(), 1);
+            // Inject the root authority's broken-invariant refusal at the
+            // same boundary used after live-leaf authentication in production.
+            Err(RootAccessRefusal::Refused(Refusal::Invalid))
+        })
+        .map_err(RuntimeError::from);
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Dispatch(DispatchError::ReservationAuthority(
+                Refusal::Invalid
+            )))
+        ));
+        assert_eq!(attempts, 1, "stop before adopting another dirty row");
+
+        let mut retained = 0;
+        reconcile_dirty_frame_commits(&table, mm_key, |_| {
+            retained += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(retained, 2, "neither dirty row was acknowledged on refusal");
+        reconcile_dirty_frame_commits(&table, mm_key, |_| {
+            panic!("successful adoption must acknowledge both rows")
+        })
+        .unwrap();
+    }
 
     #[test]
     fn abort_hatch_converts_only_memory_fault_signals() {

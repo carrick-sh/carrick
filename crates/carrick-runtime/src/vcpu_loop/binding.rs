@@ -5556,20 +5556,19 @@ where
                 let requires_mm_mutation =
                     self.kernel.dispatcher.fault_requires_mm_mutation(si_addr);
                 if owner_file_fault.is_none() && requires_mm_mutation {
-                    let resolved = self
-                        .state
-                        .with_mm_mutation_authority(&self.kernel, |mutation| {
-                            signal::resolve_mutating_fault(
-                                &self.kernel.dispatcher,
-                                engine,
-                                si_addr,
-                                fault_access,
-                                signal::el0_fault_kind(syndrome),
-                                faulting_tid,
-                                mutation,
-                            )
-                        })?
-                        .map_err(RuntimeError::Trap)?;
+                    let resolved =
+                        self.state
+                            .with_mm_mutation_authority(&self.kernel, |mutation| {
+                                signal::resolve_mutating_fault(
+                                    &self.kernel.dispatcher,
+                                    engine,
+                                    si_addr,
+                                    fault_access,
+                                    signal::el0_fault_kind(syndrome),
+                                    faulting_tid,
+                                    mutation,
+                                )
+                            })??;
                     match resolved {
                         Ok(true) => return Ok(executor::ExecutorExit::Syscall),
                         Ok(false) => {}
@@ -5666,20 +5665,19 @@ where
                     .dispatcher
                     .fault_requires_mm_mutation(fault_addr);
                 if requires_mm_mutation {
-                    let resolved = self
-                        .state
-                        .with_mm_mutation_authority(&self.kernel, |mutation| {
-                            signal::resolve_mutating_fault(
-                                &self.kernel.dispatcher,
-                                engine,
-                                fault_addr,
-                                None,
-                                None,
-                                faulting_tid,
-                                mutation,
-                            )
-                        })?
-                        .map_err(RuntimeError::Trap)?;
+                    let resolved =
+                        self.state
+                            .with_mm_mutation_authority(&self.kernel, |mutation| {
+                                signal::resolve_mutating_fault(
+                                    &self.kernel.dispatcher,
+                                    engine,
+                                    fault_addr,
+                                    None,
+                                    None,
+                                    faulting_tid,
+                                    mutation,
+                                )
+                            })??;
                     match resolved {
                         Ok(true) => return Ok(executor::ExecutorExit::Syscall),
                         Ok(false) => {}
