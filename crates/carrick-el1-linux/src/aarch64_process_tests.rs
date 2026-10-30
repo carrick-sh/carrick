@@ -825,7 +825,9 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                     .unwrap()
                 });
             let host = if owner == Owner::HostCommitted {
-                host.unwrap().commit_zone_retirement().publish();
+                host.unwrap()
+                    .commit_zone_retirement(&carrick_core::lifecycle::RegistryWriteHeld::for_test())
+                    .publish();
                 None
             } else {
                 host
@@ -1007,7 +1009,9 @@ fn arm_unregistered_cancel_requeues_adapter_operation_without_retirement() {
             .unwrap()
         });
         let host = if owner == Owner::HostCommitted {
-            host.unwrap().commit_zone_retirement().publish();
+            host.unwrap()
+                .commit_zone_retirement(&carrick_core::lifecycle::RegistryWriteHeld::for_test())
+                .publish();
             None
         } else {
             host
@@ -1177,7 +1181,7 @@ fn arm_unregistered_pool_cancel_reaps_entry_before_host_cleanup() {
         assert_eq!(fixture.page.live(), 1);
         carrick_core::terminal::reserve_host_thread_exit_membership(fixture.page, control)
             .unwrap()
-            .commit_zone_retirement()
+            .commit_zone_retirement(&carrick_core::lifecycle::RegistryWriteHeld::for_test())
             .publish();
         assert_eq!(
             fixture.page.live(),

@@ -2509,7 +2509,7 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                 waiter_control,
             )
             .unwrap()
-            .commit_zone_retirement()
+            .commit_zone_retirement(&carrick_core::lifecycle::RegistryWriteHeld::for_test())
             .publish();
             assert_eq!(
                 fixture.page.live(),

@@ -344,7 +344,7 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
                         BornInZoneSource { zone, slot: SLOT },
                         record.id
                     )
-                    .is_none()
+                    .is_err()
             );
             let process = self.process;
             let replaced = self.replaced_clear;
