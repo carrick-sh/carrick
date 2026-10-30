@@ -151,6 +151,20 @@ impl<
         });
         super::native_run_failure::complete_native_run_failure(binding, reason)
     }
+    fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
+        let admission = self
+            .process_venue()
+            .map_or(ThreadBirthAdmission::Unmanaged, |venue| {
+                venue.prepare_thread_birth()
+            });
+        match admission {
+            ThreadBirthAdmission::Owned(mut outcome) => {
+                self.run_ready_after_native_transfer(&mut outcome);
+                ThreadBirthAdmission::Owned(outcome)
+            }
+            admission => admission,
+        }
+    }
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         if let Some(venue) = self.process_venue() {
             venue.lifecycle_admission_settled()?;
@@ -401,6 +415,18 @@ impl<
         zone.alloc_record(identity)
             .map(|id| zone.record_ref(id))
             .map_err(|_| carrick_sched_core::Exhausted)
+    }
+    fn retain_native_birth(&mut self, record: RecordRef, control: &ThreadControlSlot) -> bool {
+        if self
+            .process_venue()
+            .is_none_or(|venue| venue.bind_thread_birth(record, control).is_err())
+        {
+            return false;
+        }
+        self.zone.as_ref().is_some_and(|zone| {
+            zone.tables.record(record.id).incarnation() == record.incarnation
+                && zone.tables.mark_native_owned(record.id)
+        })
     }
     fn free_record(&mut self, record: RecordRef) {
         if let Some(zone) = &self.zone

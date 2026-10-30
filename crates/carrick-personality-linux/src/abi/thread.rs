@@ -2024,11 +2024,23 @@ impl ThreadLifecyclePage {
         index: usize,
         identity: EntryIdentity,
     ) -> Result<EntryRef, TransitionError> {
+        self.stock_with_control(index, identity, None)
+    }
+    /// Publish identity and its retained control address as one stock entry.
+    pub fn stock_with_control(
+        &self,
+        index: usize,
+        identity: EntryIdentity,
+        control: Option<carrick_guest_arch::KernelVa>,
+    ) -> Result<EntryRef, TransitionError> {
         let e = self.entry(index)?;
         let reference = self.reserve_stock(index)?;
         let next = reference.generation();
         e.tid.store(identity.tid, Ordering::Relaxed);
-        self.controls[index].store(0, Ordering::Relaxed);
+        self.controls[index].store(
+            control.map_or(0, |address| address.raw()),
+            Ordering::Relaxed,
+        );
         e.visible_tid.store(identity.visible_tid, Ordering::Relaxed);
         e.thread_serial
             .store(identity.thread_serial, Ordering::Relaxed);

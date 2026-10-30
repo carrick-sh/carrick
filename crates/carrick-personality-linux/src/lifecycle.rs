@@ -243,6 +243,13 @@ pub enum OwnedCopyError {
 
 /// Native process custody supplied by the execution lane. Registry decisions
 /// remain in the shared scheduler owner; this adapter retains machine context.
+/// The process owner either supplies stock or retains the whole admission.
+pub enum ThreadBirthAdmission {
+    Unmanaged,
+    Ready,
+    Owned(LifecycleOutcome),
+}
+
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
     /// Resume this exact thread's retained operation before a new syscall is
     /// dispatched. Readiness alone cannot authorize a user return.
@@ -346,6 +353,16 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     }
     /// Notify an owned exit only after a claim's rollback or Born enqueue has
     /// finished. The venue releases graph ownership before publishing a wake.
+    fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
+        ThreadBirthAdmission::Unmanaged
+    }
+    fn bind_thread_birth(
+        &mut self,
+        _record: RecordRef,
+        _control: &ThreadControlSlot,
+    ) -> Result<(), i64> {
+        Ok(())
+    }
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         Ok(())
     }
@@ -437,6 +454,9 @@ pub struct ExitRecord {
 pub trait LifecycleNative<'a>: UserCopy {
     /// Terminal custody loss must never become a guest errno or leave exit parked.
     fn fail_lifecycle(&mut self, reason: NativeRunFailureReason) -> !;
+    fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
+        ThreadBirthAdmission::Unmanaged
+    }
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         Ok(())
     }
@@ -477,6 +497,9 @@ pub trait LifecycleNative<'a>: UserCopy {
         identity: ThreadIdentity,
     ) -> Result<RecordRef, carrick_sched_core::Exhausted>;
     fn free_record(&mut self, record: RecordRef);
+    fn retain_native_birth(&mut self, _record: RecordRef, _control: &ThreadControlSlot) -> bool {
+        false
+    }
     /// ISA-only context availability, checked before any output or pool claim.
     fn can_prepare_child(&self, stack: UserVa, tls: Option<UserVa>) -> bool;
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext);
@@ -674,12 +697,15 @@ pub const fn is_lifecycle_syscall(nr: usize) -> bool {
 
 /// Execute Linux policy, leaving ordinary result installation and completion
 /// publication to the authenticated entry owner.
+fn returned(result: SyscallResult, work: bool) -> LifecycleOutcome {
+    LifecycleOutcome::Returned { result, work }
+}
+
 pub fn invoke<'a>(
     call: LifecycleCall,
     native: &mut dyn LifecycleNative<'a>,
 ) -> Option<LifecycleOutcome> {
     let args = native.arguments();
-    let returned = |result, work| LifecycleOutcome::Returned { result, work };
     if call == LifecycleCall::SetRobustList {
         return Some(returned(
             native.register_robust_list(args[0], args[1])?,
@@ -788,10 +814,7 @@ pub fn invoke<'a>(
                 Err(errno) => returned(SyscallResult::new(errno.guest_retval()), false),
             })
         }
-        LifecycleCall::Clone => {
-            let visible = serve_clone(args, thread, native)?;
-            Some(returned(SyscallResult::new(visible), false))
-        }
+        LifecycleCall::Clone => serve_clone(args, thread, native),
         LifecycleCall::Exit => {
             if !native.has_scheduler() {
                 native.record_decline(LifecycleDecline::ExitScheduler);
@@ -1015,7 +1038,7 @@ fn serve_clone<'a>(
     args: [u64; 6],
     thread: LifecycleThread<'a>,
     native: &mut dyn LifecycleNative<'a>,
-) -> Option<i64> {
+) -> Option<LifecycleOutcome> {
     if !native.has_scheduler() {
         return None;
     }
@@ -1049,21 +1072,37 @@ fn serve_clone<'a>(
 
     let state = native.task_state()?;
     let affinity = native.affinity()?;
-    let claimed = match page.claim_any() {
-        Ok(claimed) => claimed,
-        Err(TransitionError::GateClosed(_)) => {
-            // A speculative claim may have been observed by an exit before
-            // the gate check backed it out. That rollback also owes a wake.
-            if native.lifecycle_admission_settled().is_err() {
-                native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+    let managed = match native.prepare_thread_birth() {
+        ThreadBirthAdmission::Unmanaged => false,
+        ThreadBirthAdmission::Ready => true,
+        ThreadBirthAdmission::Owned(outcome) => return Some(outcome),
+    };
+    let claimed = loop {
+        match page.claim_any() {
+            Ok(claimed) => break claimed,
+            Err(TransitionError::GateClosed(_)) => {
+                // A speculative claim may have been observed by an exit before
+                // the gate check backed it out. That rollback also owes a wake.
+                if native.lifecycle_admission_settled().is_err() {
+                    native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+                }
+                return Some(returned(SyscallResult::new(-11), false));
             }
-            return Some(-11);
-        }
-        Err(error) => {
-            if error == TransitionError::PoolEmpty {
-                native.record_decline(LifecycleDecline::ClonePoolEmpty);
+            Err(error) => {
+                if error == TransitionError::PoolEmpty {
+                    if managed {
+                        match native.prepare_thread_birth() {
+                            ThreadBirthAdmission::Ready => continue,
+                            ThreadBirthAdmission::Owned(outcome) => return Some(outcome),
+                            ThreadBirthAdmission::Unmanaged => {
+                                native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+                            }
+                        }
+                    }
+                    native.record_decline(LifecycleDecline::ClonePoolEmpty);
+                }
+                return None;
             }
-            return None;
         }
     };
     // This exact owned claim is the sole authority for Claimed -> Reserved.
@@ -1120,7 +1159,7 @@ fn serve_clone<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        return None;
+        return managed.then(|| returned(SyscallResult::new(-11), false));
     };
     if child_slot
         .reset_for_birth(blocked, clear_child_tid, entry)
@@ -1137,6 +1176,9 @@ fn serve_clone<'a>(
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return None;
+    }
+    if managed && !native.retain_native_birth(record, child_slot) {
+        native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
     }
     if !outputs.publish(identity.visible_tid, native) {
         native.free_record(record);
@@ -1198,12 +1240,12 @@ fn serve_clone<'a>(
         if native.lifecycle_admission_settled().is_err() {
             native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
-        return Some(error);
+        return Some(returned(SyscallResult::new(error), false));
     }
     if native.lifecycle_admission_settled().is_err() {
         native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
     }
-    Some(visible as i64)
+    Some(returned(SyscallResult::new(visible as i64), false))
 }
 
 /// `exit(status)` of a non-leader thread that EL1 switched in, when it is
