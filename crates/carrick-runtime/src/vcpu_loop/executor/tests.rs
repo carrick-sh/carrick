@@ -9971,6 +9971,7 @@ fn serial_host_missing_terminal_continuation_finishes_exit_owner() {
 
 /// Publish a real EL1 birth and let the ledger adopt its original control.
 /// Unlike a host clone, reset_for_birth leaves the host-only birth words empty.
+#[cfg(test)]
 fn abi_born_sibling(kernel: &Arc<Kernel>, parent: &KernelContext) -> KernelContext {
     use carrick_el1_abi::Lifecycle;
     use carrick_kernel::kernel::thread_adoption::{
@@ -10034,7 +10035,11 @@ fn abi_born_sibling(kernel: &Arc<Kernel>, parent: &KernelContext) -> KernelConte
     assert_eq!(sibling.thread().control_slot().host_birth_identity(), None);
     assert_eq!(sibling.thread().key().serial.raw(), identity.thread_serial);
     kernel.exit_thread(&bootstrap_sibling, None).unwrap();
-    assert_eq!(parent.task().threads().len(), 2);
+    assert!(
+        !bootstrap_sibling.exact_thread_is_live()
+            && parent.exact_thread_is_live()
+            && sibling.exact_thread_is_live()
+    );
     sibling
 }
 
@@ -10050,6 +10055,7 @@ fn serial_host_missing_abi_born_sibling_without_terminal_intent_fails_closed() {
     claimed_abi_born_sibling_zone_reload(false);
 }
 
+#[cfg(test)]
 fn claimed_abi_born_sibling_zone_reload(terminal: bool) {
     use carrick_core::terminal::{Live, Process, TerminalCustody, Thread, ThreadTerminalIdentity};
     let (kernel, root) = bootstrap(19_820);
