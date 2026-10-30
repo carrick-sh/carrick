@@ -2832,16 +2832,24 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         // Only the running owner can leave OnCpuRequested. The host waits
         // for this slot's exit; it cannot consume this unpublished entry.
+        self.withdraw_guest_park(guard, record);
+        rec.last_seq.store(previous_seq, Ordering::Relaxed);
+        rec.handback.store(previous_handback, Ordering::Relaxed);
+        false
+    }
+
+    /// Undo a single-entry guest enrollment while its running owner still
+    /// holds the entry's bucket. No park or runnable record is published.
+    /// The same owner withdraws on a pending interruption or a refused claim.
+    pub fn withdraw_guest_park(&self, guard: &BucketGuard<'_, C>, record: RecordId) {
+        let rec = self.record(record);
         let entry = rec.first_entry.load(Ordering::Relaxed);
         if entry != NIL {
             self.unlink(guard, entry);
             self.drop_entry(rec, entry);
         }
-        rec.last_seq.store(previous_seq, Ordering::Relaxed);
-        rec.handback.store(previous_handback, Ordering::Relaxed);
         rec.deadline.store(0, Ordering::Relaxed);
         self.timers.cancel_record(record);
-        false
     }
 
     /// Set the CNTVCT deadline of `record`'s next park (0: untimed). The
@@ -3189,9 +3197,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             {
                 return false;
             }
-            let Claim::Parked { seq } = rec.claim() else {
-                return false;
-            };
             let entry_id = rec.first_entry.load(Ordering::Acquire);
             if entry_id == NIL {
                 return false;
@@ -3209,6 +3214,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             if entry.bucket.load(Ordering::Relaxed) as usize != guard.bucket {
                 continue;
             }
+            // Enrollment owns this bucket through park publication. A sender
+            // seeing OnCpu before that publication must wait for its verdict.
+            let Claim::Parked { seq } = rec.claim() else {
+                return false;
+            };
             if entry.record.load(Ordering::Relaxed) != record.id.raw()
                 || entry.seq.load(Ordering::Relaxed) != seq
             {

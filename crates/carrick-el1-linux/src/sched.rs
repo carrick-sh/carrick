@@ -128,6 +128,7 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
             .wake_word(self.frame, mm.raw(), address.raw(), bitset, limit)
     }
     fn wait(&mut self, wait: FutexWait) -> Option<Served> {
+        let zone = self.sched.zone;
         self.sched.wait_word(
             self.frame,
             wait.mm.raw(),
@@ -137,6 +138,13 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
             wait.deadline.map(CounterTick::raw),
             wait.mismatch_result.raw() as u64,
             wait.timeout_result.raw() as u64,
+            |record| {
+                crate::aarch64_process::registry()
+                    .futex_signal_pending(zone, record)
+                    .then_some(carrick_guest_arch::NativeReturnWord(
+                        carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+                    ))
+            },
         )
     }
 }

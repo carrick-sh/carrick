@@ -1921,6 +1921,32 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         state.members.get(key).map(|member| member.runtime.clone())
     }
 
+    /// Exact wait-interruption predicate, sampled once after futex enrollment.
+    /// The caller holds the wait bucket. Signal senders release graph custody
+    /// before acquiring that bucket; selection retains the canonical signal
+    /// queue lock, so a sender cannot miss enrollment and this pending probe.
+    pub(crate) fn futex_signal_pending(&self, zone: &ZoneTables<C>, record: RecordRef) -> bool {
+        let state = self.state.lock();
+        let Some(member) = state
+            .records
+            .get(&Self::record_key(zone, record))
+            .and_then(|key| state.members.get(key))
+        else {
+            return false;
+        };
+        let graph = member.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(member.process) else {
+            return false;
+        };
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
+        );
+        row.native()
+            .resources()
+            .signals()
+            .has_deliverable(record, blocked)
+    }
+
     /// Cheap read-only signal checkpoint predicate before an ARM hardware
     /// context is saved. The record index and process graph remain the same
     /// authority used by the delivery owner; a stale record is never treated

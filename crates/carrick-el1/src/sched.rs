@@ -260,6 +260,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         deadline: Option<u64>,
         mismatch_result: u64,
         timeout_result: u64,
+        interrupt: impl FnOnce(
+            carrick_sched_core::RecordRef,
+        ) -> Option<carrick_guest_arch::NativeReturnWord>,
     ) -> Option<Served> {
         let (zone, slot) = (self.zone, self.slot);
         let guard = zone.short_lock(
@@ -315,6 +318,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         #[cfg(any(test, feature = "host-test"))]
         self.cpu.after_wait_enqueue();
+        // Probe once after enrollment under the same bucket that serializes
+        // signal interruption with park publication. Never consume the signal.
+        if let Some(result) = interrupt(zone.record_ref(record)) {
+            zone.withdraw_guest_park(&guard, record);
+            drop(guard);
+            frame.x[0] = result.0;
+            return Some(Served::Returned { switched: false });
+        }
         zone.set_deadline(record, deadline.unwrap_or(0));
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
