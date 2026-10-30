@@ -1495,6 +1495,8 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     delegated_file_waits: [object_wait::ObjectQueue; object_wait::DELEGATED_FILE_WAIT_QUEUES],
     /// Native external service operations retain their own exact-member queue.
     native_service_waits: [object_wait::ObjectQueue; ZONE_RECORDS],
+    /// Final retained-control release has an independent progress source.
+    member_release_waits: [object_wait::ObjectQueue; ZONE_RECORDS],
     /// Saved host enrollment attempts handed back by the actual queue release.
     object_admission_handbacks:
         [completion_queue::CompletionQueue; object_wait::OBJECT_WAIT_QUEUES],

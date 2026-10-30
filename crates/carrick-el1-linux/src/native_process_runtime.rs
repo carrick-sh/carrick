@@ -3,6 +3,7 @@
 //! incarnation; it does not import a host TaskSerial or launcher credentials.
 extern crate alloc;
 mod service;
+pub(crate) mod thread_stock;
 use super::{
     native_fork_refusal::{NativeForkStage, at_busy_site, busy},
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
@@ -771,6 +772,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     control: &'a ThreadControlSlot,
     page: &'a ThreadLifecyclePage,
     members: Vec<NativeMember<'a, C>>,
+    thread_stock: Option<thread_stock::NativeThreadStock<'a, C>>,
     mm: M,
     address: AddressContext<RootGpa>,
     interrupted_child_waits: BTreeMap<RecordRef, InterruptedChildWait<C>>,
@@ -784,6 +786,27 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     channel: Option<Arc<WaitChannel>>,
     usage: TaskRusage,
     file_table: u64,
+}
+impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
+    fn retain_control(
+        &self,
+        control: &'a ThreadControlSlot,
+    ) -> Result<
+        Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
+        NativeProcessError,
+    > {
+        if let Some(member) = self
+            .members
+            .iter()
+            .find(|member| core::ptr::eq(member.control.control(), control))
+        {
+            return Ok(member.control.clone());
+        }
+        match self.thread_stock.as_ref() {
+            Some(stock) => stock.retain(control).map(Arc::new),
+            None => retain_member_control(control),
+        }
+    }
 }
 pub type NativeForkPreparation<'a, M, P, C> = PreparedFork<
     VisibleNamespace,
@@ -2482,7 +2505,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     resources.map_stash.remove(&old_record);
                 }
             } else {
-                let retained = retain_member_control(control)?;
+                let retained = row.native().resources().retain_control(control)?;
                 let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
                     .map_err(|_| NativeProcessError::Busy)?;
                 retained.commit_registration();
@@ -2511,7 +2534,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process,
                 address,
                 record: source.zone.record_ref(record),
-                control: retain_member_control(control)?,
+                control: runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .task(process)
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .native()
+                    .resources()
+                    .retain_control(control)?,
             },
         );
         state
@@ -3124,6 +3155,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             control,
             page,
             members,
+            thread_stock: None,
             mm,
             address,
             interrupted_child_waits: BTreeMap::new(),
@@ -3304,8 +3336,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             record: source.zone.record_ref(record),
             control,
             _control_custody: Some(
-                carrick_core::lifecycle::MemberControlCustody::retain(control)
-                    .map_err(|_| NativeProcessError::Stale)?,
+                self.graph
+                    .lock()
+                    .owner
+                    .task(key)
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .native()
+                    .resources()
+                    .retain_control(control)?,
             ),
             key,
             caller_address,
@@ -3346,8 +3384,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             record,
             control: member_control,
             _control_custody: Some(
-                carrick_core::lifecycle::MemberControlCustody::retain(member_control)
-                    .map_err(|_| NativeProcessError::Stale)?,
+                self.graph
+                    .lock()
+                    .owner
+                    .task(process)
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .native()
+                    .resources()
+                    .retain_control(member_control)?,
             ),
             key: process,
             caller_address: address,
@@ -3590,7 +3634,8 @@ pub struct NativeProcessEntry<
     binding: ExecutionBinding,
     record: RecordRef,
     control: &'a ThreadControlSlot,
-    _control_custody: Option<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
+    _control_custody:
+        Option<Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>>,
     key: TaskKey,
     caller_address: AddressContext<RootGpa>,
     words: Box<C>,
@@ -5215,7 +5260,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(reason);
         }
         match outcome {
-            None => Ok(NativeResume::NoPending),
+            None => self
+                .resume_thread_stock_wait()
+                .map_err(NativeProcessError::run_failure_reason)
+                .map(|resumed| resumed.unwrap_or(NativeResume::NoPending)),
             Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),
             Some(LifecycleOutcome::HostCustody) => {
                 // An adopted host member has no pool entry to retire in the
@@ -5486,7 +5534,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     pool.push(entry);
                     outstanding.push(OutstandingExitReceipt::Pool {
                         entry,
-                        control: retain_member_control(control)?,
+                        control: graph
+                            .owner
+                            .task(self.key)
+                            .map_err(|_| NativeProcessError::Stale)?
+                            .native()
+                            .resources()
+                            .retain_control(control)?,
                         expected_host,
                     });
                 }
@@ -5533,7 +5587,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         {
                             continue;
                         }
-                        let retained = match retain_member_control(control) {
+                        let retained = match graph
+                            .owner
+                            .task(self.key)
+                            .map_err(|_| NativeProcessError::Stale)?
+                            .native()
+                            .resources()
+                            .retain_control(control)
+                        {
                             Ok(retained) => retained,
                             Err(error) => {
                                 // Retirement can win after the state/address
@@ -5576,7 +5637,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 for (birth, control, _) in &adopted {
                     outstanding.push(OutstandingExitReceipt::Adopted {
                         birth: *birth,
-                        control: retain_member_control(control)?,
+                        control: graph
+                            .owner
+                            .task(self.key)
+                            .map_err(|_| NativeProcessError::Stale)?
+                            .native()
+                            .resources()
+                            .retain_control(control)?,
                     });
                 }
                 for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
@@ -5611,7 +5678,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // Every fallible retain precedes consumption. A refusal
                 // drops preparation with admission still closed and no begun
                 // claim or caller live unit consumed.
-                let caller = retain_member_control(self.control)?;
+                let caller = graph
+                    .owner
+                    .task(self.key)
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .native()
+                    .resources()
+                    .retain_control(self.control)?;
                 let custody = match (&operation, admission) {
                     (
                         PendingCloseOperation::Exit { status, .. },
@@ -6608,6 +6681,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         // SAFETY: this exact newly allocated record remains Free and unpublished.
         unsafe { *self.source.zone.record(record).ctx_mut() = *child_words };
+        let thread_stock = match thread_stock::NativeThreadStock::new(
+            lifecycle.controls,
+            self.source.zone,
+            self.source.zone.record_ref(record),
+        ) {
+            Ok(stock) => stock,
+            Err(error) => {
+                self.source.zone.free_record(record);
+                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                drop(pending);
+                drop(member_custody);
+                drop(leader_custody);
+                self.service.retire_fd_table(child_file_table);
+                if let Err((_, p)) = self.service.abort_mm(prepared) {
+                    self.service.quarantine_prepared(p);
+                }
+                return Err(error);
+            }
+        };
         let member_registration = member_custody.clone();
         let resources = NativeResources {
             _control_custody: leader_custody,
@@ -6626,6 +6718,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 control: member_custody,
                 expected_host,
             }],
+            thread_stock: Some(thread_stock),
             mm: self.service.prepared_mm(&prepared),
             address,
             interrupted_child_waits: BTreeMap::new(),
@@ -6730,6 +6823,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.service.quarantine_born(born);
             return Err(NativeProcessError::Quarantined);
         }
+        if let Err(error) = thread_stock::replenish(
+            self.runtime,
+            &mut self.runtime.graph.lock(),
+            child_key,
+            visible.get(),
+        ) {
+            self.run_failure = Some(error.run_failure_reason());
+            return Err(NativeProcessError::Quarantined);
+        }
         let child_mm = self
             .runtime
             .graph
@@ -6742,23 +6844,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .mm
             .clone();
         let handle = self.service.service_mm_handle(&child_mm)?;
-        let service_wait = carrick_sched_core::object_wait::ObjectWaitKey::native_service(
+        service::bind_member_service(
+            self.source.zone,
+            child_key,
             self.source.zone.record_ref(record),
-        )
-        .ok_or(NativeProcessError::Stale)?;
-        self.source
-            .zone
-            .bind_object_wait(service_wait, &carrick_sched_core::ShortLockSpin)
-            .map_err(|_| NativeProcessError::Quarantined)?;
-        control
-            .service
-            .bind(carrick_core_abi::service::ServiceBirth {
-                process: child_key,
-                thread: carrick_core_abi::EntryThreadGeneration::from_raw(thread_serial.get()),
-                record: self.source.zone.record_ref(record),
-                mm: handle,
-            })
-            .map_err(|_| NativeProcessError::Quarantined)?;
+            carrick_core_abi::EntryThreadGeneration::from_raw(thread_serial.get()),
+            control,
+            handle,
+        )?;
         // A vfork child may exec or exit as soon as it is registered and
         // runnable: its release row exists before either, and a refused
         // publication removes it again.
@@ -6950,6 +7043,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         publish: &mut dyn FnMut() -> Result<(), i64>,
     ) -> Result<(), i64> {
         let mut graph = self.runtime.graph.lock();
+        if graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_personality_linux::identity::ESRCH)?
+            .native()
+            .resources()
+            .thread_stock
+            .is_some()
+            && thread_stock::at_limit(&graph, self.key, caller_tid).map_err(|e| e.errno())?
+        {
+            return Err(-11);
+        }
         let task = graph
             .owner
             .task_mut(self.key)
@@ -6965,7 +7070,65 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             task.remove_thread(child_tid);
             return Err(error);
         }
+        if let Err(error) = thread_stock::replenish(self.runtime, &mut graph, self.key, caller_tid)
+        {
+            // Born is already committed: report an invariant failure without
+            // inviting the clone caller to roll back a published record.
+            self.run_failure = Some(error.run_failure_reason());
+        }
         Ok(())
+    }
+    fn bind_thread_birth(
+        &mut self,
+        record: RecordRef,
+        control: &ThreadControlSlot,
+    ) -> Result<(), i64> {
+        let identity = self.source.zone.record(record.id).identity();
+        if self.source.zone.record(record.id).incarnation() != record.incarnation
+            || identity.control_slot != control as *const _ as u64
+        {
+            return Err(NativeProcessError::Stale.errno());
+        }
+        // This unpublished record may retain a predecessor's saved MM. Copy
+        // the caller's complete neutral context before ISA register setup.
+        // SAFETY: clone exclusively owns this exact unpublished incarnation.
+        unsafe {
+            *self.source.zone.record(record.id).ctx_mut() = *self.words;
+        }
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale.errno())?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        let handle = self
+            .service
+            .service_mm_handle(&mm)
+            .map_err(|error| error.errno())?;
+        service::bind_member_service(
+            self.source.zone,
+            self.key,
+            record,
+            carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
+            control,
+            handle,
+        )
+        .map_err(|error| error.errno())
+    }
+    fn prepare_thread_birth(
+        &mut self,
+    ) -> carrick_personality_linux::lifecycle::ThreadBirthAdmission {
+        match self.prepare_native_thread_birth() {
+            Ok(admission) => admission,
+            Err(error) => carrick_personality_linux::lifecycle::ThreadBirthAdmission::Owned(
+                self.run_failed(error.run_failure_reason()),
+            ),
+        }
     }
     fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         self.retire_thread_verdict(verdict);
@@ -7287,6 +7450,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             for record in retired {
                 registry.unregister_member(self.runtime, self.key, record);
             }
+        }
+        self.clear_thread_stock_wait();
+        drop(self._control_custody.take());
+        let mut graph = self.runtime.graph.lock();
+        let leader = graph
+            .owner
+            .task(self.key)
+            .ok()
+            .map(|task| task.metadata().namespace_pid);
+        if let Some(leader) = leader
+            && let Err(error) = thread_stock::replenish(self.runtime, &mut graph, self.key, leader)
+        {
+            self.run_failure = Some(error.run_failure_reason());
         }
     }
 

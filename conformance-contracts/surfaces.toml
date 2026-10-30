@@ -2128,3 +2128,11 @@ contracts = ["core.lifecycle.publication"]
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_ipc_wake_tests.rs"
 contracts = ["kernel.el1.ipc-two-process"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/lifecycle/stock.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.lifecycle.publication"]
+
+[[surfaces]]
+path = "crates/carrick-el1-linux/src/native_process_runtime/thread_stock.rs"
+contracts = ["kernel.el1.thread-lifecycle", "core.lifecycle.publication"]

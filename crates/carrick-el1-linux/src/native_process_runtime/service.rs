@@ -7,6 +7,31 @@ use carrick_core_abi::service::{
 };
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 
+/// Publish one exact member's retained service capability before execution,
+/// or at the first service entry of an already authenticated host member.
+pub(super) fn bind_member_service<C: ProcessContext>(
+    zone: &ZoneTables<C>,
+    process: TaskKey,
+    record: RecordRef,
+    thread: carrick_core_abi::EntryThreadGeneration,
+    control: &ThreadControlSlot,
+    mm: carrick_el1_abi::El1MmHandle,
+) -> Result<(), NativeProcessError> {
+    let wait = ObjectWaitKey::native_service(record).ok_or(NativeProcessError::Stale)?;
+    zone.bind_object_wait(wait, &carrick_sched_core::ShortLockSpin)
+        .map_err(|_| NativeProcessError::Quarantined)?;
+    control.bind_zone_record(record);
+    control
+        .service
+        .bind(carrick_core_abi::service::ServiceBirth {
+            process,
+            thread,
+            record,
+            mm,
+        })
+        .map_err(service_error)
+}
+
 fn native_exception_signal(
     kind: carrick_core_abi::service::NativeExceptionKind,
 ) -> (carrick_signal_core::policy::Signal, i32) {
@@ -440,24 +465,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(birth) => birth,
                 Err(ServiceError::Busy) => {
                     // Fork binds a child's service cell at publication. The root
-                    // has no earlier physical-service venue, so its first exact
+                    // and an authenticated unbound member use this same owner. Its first exact
                     // registered operation binds the same retained capability.
                     let handle = self.service.service_mm_handle(&mm)?;
-                    let wait = ObjectWaitKey::native_service(self.record)
-                        .ok_or(NativeProcessError::Stale)?;
-                    self.source
-                        .zone
-                        .bind_object_wait(wait, &carrick_sched_core::ShortLockSpin)
-                        .map_err(|_| NativeProcessError::Quarantined)?;
-                    control
-                        .service
-                        .bind(carrick_core_abi::service::ServiceBirth {
-                            process: self.key,
-                            thread: self.binding.thread_generation,
-                            record: self.record,
-                            mm: handle,
-                        })
-                        .map_err(service_error)?;
+                    bind_member_service(
+                        self.source.zone,
+                        self.key,
+                        self.record,
+                        self.binding.thread_generation,
+                        control.control(),
+                        handle,
+                    )?;
                     control
                         .service
                         .bound_birth(self.key, self.binding.thread_generation, self.record)
