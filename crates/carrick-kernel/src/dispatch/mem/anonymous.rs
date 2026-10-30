@@ -104,8 +104,9 @@ impl DelegatedAnonymous {
     }
 }
 
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 enum HostVenue {
+    Completed(Arc<parking_lot::Mutex<CompletedHostVenue>>),
     /// A pending root proposal: its range is root-owned, so the host path
     /// records no row for it and the outcome completes or refuses it.
     Proposal(ReservationRequest),
@@ -115,6 +116,55 @@ enum HostVenue {
     /// A fixed host-served replacement keeps the predecessor until successful
     /// publication. The MM mutation gate excludes other editors meanwhile.
     Replacing(ReservationRange),
+}
+
+/// Shared by metadata projections, consumed once by the exact MM's settlement.
+/// Contains no borrowed guard, root lock, mailbox slot, or executor authority.
+#[derive(Debug)]
+struct CompletedHostVenue {
+    request: ReservationRequest,
+    binding: HostVenueBinding,
+    syscall: crate::dispatch::SyscallRequest,
+    root: carrick_el1_abi::El1MmHandle,
+    succeeded: bool,
+    outcome: Option<Result<DispatchOutcome, DispatchError>>,
+}
+
+#[derive(Debug)]
+struct HostVenueBinding {
+    kernel: std::sync::Weak<crate::kernel::Kernel>,
+    task: crate::kernel::objects::TaskKey,
+    thread: crate::kernel::objects::ThreadKey,
+    mm: crate::kernel::MmId,
+}
+
+impl HostVenueBinding {
+    fn capture(context: &crate::kernel::KernelContext) -> Self {
+        Self {
+            kernel: Arc::downgrade(context.kernel()),
+            task: context.task().key(),
+            thread: context.thread().key(),
+            mm: context.shared().mm().id(),
+        }
+    }
+    fn authenticates(&self, context: &crate::kernel::KernelContext) -> bool {
+        self.kernel
+            .upgrade()
+            .is_some_and(|kernel| Arc::ptr_eq(&kernel, context.kernel()))
+            && self.task == context.task().key()
+            && self.thread == context.thread().key()
+            && self.mm == context.shared().mm().id()
+    }
+}
+
+impl HostVenue {
+    fn request(&self) -> Option<ReservationRequest> {
+        match self {
+            Self::Proposal(request) => Some(*request),
+            Self::Completed(completed) => Some(completed.lock().request),
+            _ => None,
+        }
+    }
 }
 
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
@@ -1104,8 +1154,8 @@ impl MemState {
         };
         let within = |range: ReservationRange| range.start() <= start && end <= range.end();
         matches!(
-            delegated.venue,
-            Some(HostVenue::Proposal(request))
+            delegated.venue.as_ref().and_then(HostVenue::request),
+            Some(request)
                 if within(request.range) || request.source.is_some_and(within)
         )
     }
@@ -1150,7 +1200,7 @@ impl MemState {
         {
             return;
         }
-        if let Some(HostVenue::Proposal(request)) = delegated.venue {
+        if let Some(request) = delegated.venue.as_ref().and_then(HostVenue::request) {
             if self.venue_owns(start, end) {
                 return;
             }
@@ -1411,7 +1461,7 @@ impl MemState {
         matches!(
             &self.anonymous,
             AnonymousAuthority::Delegated(DelegatedAnonymous {
-                venue: Some(HostVenue::Proposal(_)),
+                venue: Some(HostVenue::Proposal(_) | HostVenue::Completed(_)),
                 ..
             })
         )
@@ -1933,67 +1983,158 @@ impl MemView<'_> {
             .is_ok())
     }
 
+    /// A redispatch of completed work may perform only the root adoption step.
+    pub(in crate::dispatch) fn resume_completed_host_venue<M: CurrentMmMemory>(
+        &self,
+        cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        let authority = self.mem();
+        let mut mem = authority.lock();
+        let AnonymousAuthority::Delegated(delegated) = &mem.anonymous else {
+            return None;
+        };
+        let Some(HostVenue::Completed(completed)) = &delegated.venue else {
+            return None;
+        };
+        let completed = Arc::clone(completed);
+        let root = delegated.root.clone();
+        let mut completed = completed.lock();
+        if !completed.binding.authenticates(cx.kernel) || completed.syscall != cx.request {
+            return Some(Err(root_refusal(Refusal::Stale)));
+        }
+        if root.handle().ok() != Some(completed.root) {
+            mem.take_venue();
+            completed.outcome.take();
+            return Some(Ok(DispatchOutcome::OwnerCancelled(
+                crate::kernel::continuation::OwnerWaitCancellation::GroupExit,
+            )));
+        }
+        let request = completed.request;
+        let layout = mem.layout;
+        let adopted = root.with_root(|model| {
+            if !completed.succeeded {
+                model.refuse(request)?;
+                return Ok((Vec::new(), Vec::new()));
+            }
+            // SAFETY: these are the exact completed backend effects retained
+            // above; only this one root step can consume their request.
+            let receipt = unsafe {
+                ReservationCompletion::after_descriptor_and_backing_commit(
+                    request,
+                    ReservationBackingReceipt {
+                        receipt: request.sequence.raw(),
+                        granted_bytes: 0,
+                        returned_bytes: 0,
+                    },
+                )
+            }
+            .ok_or(Refusal::Invalid)?;
+            model.complete(receipt)?;
+            let pieces = if matches!(
+                request.operation,
+                ReservationOperation::Prepare | ReservationOperation::Move
+            ) {
+                MemState::root_first_touch_pieces(
+                    model,
+                    layout,
+                    request.range.start(),
+                    request.range.end(),
+                )?
+            } else {
+                Vec::new()
+            };
+            let mut retired = Vec::new();
+            if request.operation == ReservationOperation::Retire {
+                while let Some(identity) = model.take_retired_host_backing()? {
+                    retired.push(identity);
+                }
+            }
+            Ok((pieces, retired))
+        });
+        let (pieces, retired) = match adopted {
+            Ok(snapshot) => snapshot,
+            Err(RootAccessRefusal::Busy(busy)) => {
+                return Some(Ok(DispatchOutcome::OwnerMemoryWait {
+                    wait: busy.wait,
+                    committed: 0,
+                }));
+            }
+            Err(refusal) => return Some(Err(root_refusal(refusal))),
+        };
+        for identity in retired {
+            mem.host_backing_leases.remove(&identity);
+        }
+        mem.adopt_completed_residency(pieces);
+        mem.take_venue();
+        let outcome = completed
+            .outcome
+            .take()
+            .unwrap_or_else(|| Err(root_refusal(Refusal::Stale)));
+        let success = completed.succeeded;
+        drop(completed);
+        drop(mem);
+        if success {
+            if let Some(source) = request.source {
+                cx.memory
+                    .return_to_root(source.start(), source.len() as usize);
+            }
+            if request.operation == ReservationOperation::Retire {
+                cx.memory
+                    .return_to_root(request.range.start(), request.range.len() as usize);
+            } else {
+                cx.memory
+                    .release_root_facts(request.range.start(), request.range.len() as usize);
+            }
+        }
+        Some(outcome)
+    }
+
     /// Settle this syscall's host venue with its outcome: complete a proposal
     /// the syscall succeeded for, refuse any other, and mirror a host-placed
     /// range's host rows whatever happened.
-    fn settle_host_venue<M: CurrentMmMemory + ?Sized>(
+    fn settle_host_venue<M: CurrentMmMemory>(
         &self,
-        memory: &mut M,
-        outcome: &Result<DispatchOutcome, DispatchError>,
+        cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
+        outcome: Result<DispatchOutcome, DispatchError>,
         succeeded: impl FnOnce(&DispatchOutcome, &ReservationRequest) -> bool,
-    ) -> Result<(), DispatchError> {
+    ) -> Result<DispatchOutcome, DispatchError> {
         let authority = self.mem();
         let mut mem = authority.lock();
         let Some((root, venue)) = mem.take_venue() else {
-            return Ok(());
+            return outcome;
         };
         match venue {
             HostVenue::Proposal(request) => {
-                if matches!(outcome, Ok(outcome) if succeeded(outcome, &request)) {
-                    complete_delegated(&root, request)?;
-                    if request.operation == ReservationOperation::Retire {
-                        mem.reconcile_host_backing_leases();
-                    }
-                    if matches!(
-                        request.operation,
-                        ReservationOperation::Prepare | ReservationOperation::Move
-                    ) {
-                        // What this syscall made resident belongs to the
-                        // incarnations it just created.
-                        mem.adopt_completed_residency(request.range.start(), request.range.end());
-                    }
-                    drop(mem);
-                    // The committed range is the root's now: the guest venue
-                    // may edit it without the host, so no host protection
-                    // fact may outlive this commit where the root decides.
-                    // A retired range (and a move's source) is a root hole.
-                    if let Some(source) = request.source {
-                        memory.return_to_root(source.start(), source.len() as usize);
-                    }
-                    let (start, len) = (request.range.start(), request.range.len() as usize);
-                    if request.operation == ReservationOperation::Retire {
-                        memory.return_to_root(start, len);
-                    } else {
-                        memory.release_root_facts(start, len);
-                    }
-                    return Ok(());
-                }
-                if request.operation == ReservationOperation::Prepare
-                    && let Ok(DispatchOutcome::MapHostAlias { transaction, .. }) = outcome
+                let success = matches!(&outcome, Ok(outcome) if succeeded(outcome, &request));
+                if !success
+                    && request.operation == ReservationOperation::Prepare
+                    && let Ok(DispatchOutcome::MapHostAlias { transaction, .. }) = &outcome
                 {
-                    // The runtime installs this mapping after the syscall,
-                    // under the same MM mutation guard. The proposal stays
-                    // pending until then: the install commits it, a failed
-                    // install refuses it, and the root never holds anything
-                    // the install did not produce.
                     drop(mem);
                     if transaction.attach_root_proposal(RootAliasProposal::new(root, request)) {
-                        return Ok(());
+                        return outcome;
                     }
                     return Err(root_refusal(Refusal::Stale));
                 }
-                root.with_root(|model| model.refuse(request))
-                    .map_err(root_refusal)?;
+                let completed = CompletedHostVenue {
+                    request,
+                    binding: HostVenueBinding::capture(cx.kernel),
+                    syscall: cx.request,
+                    root: root.handle().map_err(root_refusal)?,
+                    succeeded: success,
+                    outcome: Some(outcome),
+                };
+                mem.open_venue(HostVenue::Completed(Arc::new(parking_lot::Mutex::new(
+                    completed,
+                ))));
+                drop(mem);
+                return self
+                    .resume_completed_host_venue(cx)
+                    .unwrap_or_else(|| Err(root_refusal(Refusal::Stale)));
+            }
+            HostVenue::Completed(completed) => {
+                mem.open_venue(HostVenue::Completed(completed));
+                return Err(root_refusal(Refusal::Stale));
             }
             HostVenue::Replacing(_) if !matches!(outcome, Ok(DispatchOutcome::Returned { .. })) => {
                 // Refusal keeps the old source and permissions. An alias outcome
@@ -2013,11 +2154,12 @@ impl MemView<'_> {
                     .collect();
                 drop(mem);
                 for range in owned {
-                    memory.release_root_facts(range.start(), range.len() as usize);
+                    cx.memory
+                        .release_root_facts(range.start(), range.len() as usize);
                 }
             }
         }
-        Ok(())
+        outcome
     }
 
     /// Before a host `munmap`/`mprotect` of a delegated MM: open the root
@@ -2063,11 +2205,10 @@ impl MemView<'_> {
         cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let outcome = self.mmap_served(cx);
-        self.settle_host_venue(cx.memory, &outcome, |outcome, request| {
+        self.settle_host_venue(cx, outcome, |outcome, request| {
             matches!(outcome, DispatchOutcome::Returned { value }
                 if *value as u64 == request.range.start())
-        })?;
-        outcome
+        })
     }
 
     pub(in crate::dispatch) fn munmap<M: CurrentMmMemory>(
@@ -2082,10 +2223,9 @@ impl MemView<'_> {
             return Ok(DispatchOutcome::errno(errno));
         }
         let outcome = self.munmap_served(cx);
-        self.settle_host_venue(cx.memory, &outcome, |outcome, _| {
+        self.settle_host_venue(cx, outcome, |outcome, _| {
             matches!(outcome, DispatchOutcome::Returned { value: 0 })
-        })?;
-        outcome
+        })
     }
 
     pub(in crate::dispatch) fn mprotect<M: CurrentMmMemory>(
@@ -2120,10 +2260,9 @@ impl MemView<'_> {
                 || None,
             );
         }
-        self.settle_host_venue(cx.memory, &outcome, |outcome, _| {
+        self.settle_host_venue(cx, outcome, |outcome, _| {
             matches!(outcome, DispatchOutcome::Returned { value: 0 })
-        })?;
-        outcome
+        })
     }
 
     pub(in crate::dispatch) fn mremap<M: CurrentMmMemory>(
@@ -2161,8 +2300,7 @@ impl MemView<'_> {
             self.demote_for_host_edit(new_address.0, new_size);
         }
         let outcome = self.mremap_served(cx);
-        self.settle_host_venue(cx.memory, &outcome, |_, _| false)?;
-        outcome
+        self.settle_host_venue(cx, outcome, |_, _| false)
     }
 
     /// `mremap` of root-owned anonymous memory as ONE root `mremap`
@@ -2301,27 +2439,27 @@ impl MemView<'_> {
                 let outcome = with_args(cx, [tail.start(), tail.len(), 0, 0, 0, 0], |cx| {
                     self.munmap_served(cx)
                 });
-                self.settle_host_venue(cx.memory, &outcome, |outcome, _| {
-                    matches!(outcome, DispatchOutcome::Returned { value: 0 })
-                })?;
-                return Ok(Some(match outcome? {
+                let outcome = outcome.map(|outcome| match outcome {
                     DispatchOutcome::Returned { value: 0 } => {
                         DispatchOutcome::returned_u64_or_errno(old_address)
                     }
                     other => other,
-                }));
+                });
+                return self.settle_host_venue(cx, outcome, |outcome, _| {
+                    matches!(outcome, DispatchOutcome::Returned { value } if *value as u64 == old_address)
+                }).map(Some);
             }
             ReservationOperation::Prepare if !dontunmap => {
                 self.mremap_root_extend(cx, proposed, old_address, locked)
             }
             _ => self.mremap_root_move(cx, proposed, source, dontunmap, locked),
         };
-        self.settle_host_venue(cx.memory, &outcome, |outcome, request| {
+        self.settle_host_venue(cx, outcome, |outcome, request| {
             matches!(outcome, DispatchOutcome::Returned { value }
                 if *value as u64 == request.range.start()
                     || request.operation == ReservationOperation::Prepare && !dontunmap)
-        })?;
-        outcome.map(Some)
+        })
+        .map(Some)
     }
 
     /// Publish `[start, start+len)` as fresh private anonymous memory with
@@ -2506,14 +2644,87 @@ mod tests {
         memory.zero_backing(base, 4096).unwrap();
         view.mark_range_resident(base, 4096);
         let outcome = Ok(DispatchOutcome::Returned { value: base as i64 });
-        let refused = root
-            .with_held_root_refusal(|| view.settle_host_venue(&mut memory, &outcome, |_, _| true));
-        assert!(refused.is_err());
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let syscall = crate::dispatch::SyscallRequest::new(
+            222,
+            crate::compat::SyscallArgs([base, 4096, 3, 0x32, u64::MAX, 0]),
+        );
+        let reporter = crate::compat::CompatReporter::default();
+        let refused = crate::dispatch::mm_mutation::test_support::with_guard(
+            dispatcher.mm_mutation_coordinator(),
+            |guard| {
+                let mut cx = MutationSyscallCtx {
+                    kernel: &context,
+                    request: syscall,
+                    memory: &mut memory,
+                    reporter: &reporter,
+                    thread: None,
+                    mm_mutation: guard,
+                    execution_lease: None,
+                };
+                root.with_held_root_refusal(|| {
+                    view.settle_host_venue(&mut cx, outcome, |_, _| true)
+                })
+            },
+        );
+        assert!(matches!(
+            refused,
+            Ok(DispatchOutcome::OwnerMemoryWait { committed: 0, .. })
+        ));
         assert!(
             dispatcher.mem().lock().has_owner_proposal(),
             "completed backend outcome lost its root proposal on Busy"
         );
         assert_eq!(memory.zero_backing_calls.get(), 1);
+        let busy_again = root.with_held_root_refusal(|| {
+            dispatcher
+                .dispatch_normalized_mutation_for_test(
+                    &context,
+                    syscall,
+                    &mut memory,
+                    &reporter,
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+        });
+        assert!(matches!(
+            busy_again,
+            DispatchOutcome::OwnerMemoryWait { committed: 0, .. }
+        ));
+        assert_eq!(memory.zero_backing_calls.get(), 1);
+        let resumed = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    dispatcher
+                        .dispatch_normalized_mutation_for_test(
+                            &context,
+                            syscall,
+                            &mut memory,
+                            &reporter,
+                            None,
+                        )
+                        .unwrap()
+                        .unwrap()
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(resumed, DispatchOutcome::Returned { value: base as i64 });
+        assert_eq!(
+            memory.zero_backing_calls.get(),
+            1,
+            "root adoption cannot replay backend effects"
+        );
+        assert!(!dispatcher.mem().lock().has_owner_proposal());
+        let (_, incarnation) = root.lock().node(base).unwrap();
+        assert!(
+            dispatcher
+                .mem()
+                .lock()
+                .resident
+                .contains(base, super::super::fault::ResidencyOwner::Root(incarnation))
+        );
     }
 
     #[test]
