@@ -1076,49 +1076,123 @@ pub fn owner_wait_cancellation(context: &KernelContext) -> Option<OwnerWaitCance
     })
 }
 
-/// Exact native owner waits which a native-signal host-work edge may notify.
+/// Exact record and physical owner waits notified by native host work.
+/// Signals fan out once; retirement indexes only the released member.
 /// Ordinary syscall boundaries never walk this registry.
 #[derive(Debug, Default)]
 pub struct NativeOwnerWaitRegistry {
-    waits: Mutex<std::collections::BTreeMap<ThreadKey, Vec<Weak<KernelContext>>>>,
+    waits: Mutex<std::collections::BTreeMap<ThreadKey, Vec<Weak<NativeOwnerWaitInterest>>>>,
     #[cfg(test)]
     pub(super) bridge_claims: std::sync::atomic::AtomicUsize,
+}
+
+/// Why a retained native owner asks the existing host-work venue for a wake.
+pub enum NativeWaitSource {
+    Cancellation,
+    RecordRetirement {
+        record: carrick_el1_abi::RecordRef,
+        recheck: Arc<dyn Fn() + Send + Sync>,
+    },
+}
+impl std::fmt::Debug for NativeWaitSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancellation => formatter.write_str("Cancellation"),
+            Self::RecordRetirement { record, .. } => formatter
+                .debug_tuple("RecordRetirement")
+                .field(record)
+                .finish(),
+        }
+    }
+}
+
+struct NativeOwnerWaitInterest {
+    context: KernelContext,
+    source: NativeWaitSource,
+}
+impl std::fmt::Debug for NativeOwnerWaitInterest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeOwnerWaitInterest")
+            .field("thread", &self.context.thread().key())
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
 pub struct NativeOwnerWaitRegistration {
     registry: Arc<NativeOwnerWaitRegistry>,
-    context: Arc<KernelContext>,
+    interest: Arc<NativeOwnerWaitInterest>,
 }
 impl NativeOwnerWaitRegistration {
-    pub fn enroll(context: &KernelContext) -> Option<Self> {
-        if !context.thread().control_slot().native_signal_owner() {
+    pub fn enroll(context: &KernelContext, source: NativeWaitSource) -> Option<Self> {
+        if matches!(&source, NativeWaitSource::Cancellation)
+            && !context.thread().control_slot().native_signal_owner()
+        {
             return None;
         }
         let registry = Arc::clone(&context.kernel().native_owner_waits);
-        let context = Arc::new(context.retain_exact());
+        let interest = Arc::new(NativeOwnerWaitInterest {
+            context: context.retain_exact(),
+            source,
+        });
         registry
             .waits
             .lock()
             .entry(context.thread().key())
             .or_default()
-            .push(Arc::downgrade(&context));
-        Some(Self { registry, context })
+            .push(Arc::downgrade(&interest));
+        Some(Self { registry, interest })
     }
 }
 impl Drop for NativeOwnerWaitRegistration {
     fn drop(&mut self) {
         let mut waits = self.registry.waits.lock();
-        let key = self.context.thread().key();
+        let key = self.interest.context.thread().key();
         if let Some(entries) = waits.get_mut(&key) {
-            entries.retain(|entry| entry.as_ptr() != Arc::as_ptr(&self.context));
+            entries.retain(|entry| entry.as_ptr() != Arc::as_ptr(&self.interest));
             if entries.is_empty() {
                 waits.remove(&key);
             }
         }
     }
 }
+
 impl Kernel {
+    /// Deliver only the released member's record interests. Record reuse and a
+    /// later park cannot receive this notification; enrollment's own probe
+    /// handles a release which preceded registration.
+    pub(crate) fn notify_native_terminal_wait(
+        &self,
+        zone: &carrick_el1_abi::ZoneTables,
+        identity: carrick_el1_abi::ThreadIdentity,
+    ) {
+        let Some(key) = i32::try_from(identity.tid)
+            .ok()
+            .zip(std::num::NonZeroU64::new(identity.serial))
+            .and_then(|(tid, serial)| ThreadKey::from_zone_identity(tid, serial))
+        else {
+            return;
+        };
+        let interests = self
+            .native_owner_waits
+            .waits
+            .lock()
+            .get(&key)
+            .map(|entries| entries.iter().filter_map(Weak::upgrade).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for interest in interests {
+            if interest.context.exact_thread_is_live()
+                && interest.context.shared().mm().id().raw() == identity.mm
+                && let NativeWaitSource::RecordRetirement { record, recheck } = &interest.source
+                && zone.live(*record).is_none()
+            {
+                recheck();
+            }
+        }
+    }
+
     pub(crate) fn notify_native_owner_waits(&self) {
         let contexts = self
             .native_owner_waits
@@ -1129,9 +1203,11 @@ impl Kernel {
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
         let mut notified = std::collections::BTreeSet::new();
-        for context in contexts {
+        for interest in contexts {
+            let context = &interest.context;
             if context.exact_thread_is_live()
-                && owner_wait_cancellation(&context).is_some()
+                && context.thread().control_slot().native_signal_owner()
+                && owner_wait_cancellation(context).is_some()
                 && notified.insert(context.task().key())
             {
                 context.task().wake();

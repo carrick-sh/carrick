@@ -340,6 +340,7 @@ fn resume_production_with(
                             } else {
                                 membership.publish();
                             }
+                            task.linux.mark_native_terminal_work(slot);
                         }
                         Err(_) => hand_back(),
                     }
@@ -355,7 +356,10 @@ fn resume_production_with(
                             match carrick_core::terminal::settle_losing_zone_current(
                                 control, binding, source, record,
                             ) {
-                                Some(LosingMemberSettlement::Released(_)) | None => {}
+                                Some(LosingMemberSettlement::Released(_)) => {
+                                    task.linux.mark_native_terminal_work(slot);
+                                }
+                                None => {}
                                 Some(LosingMemberSettlement::HostCustody) => {
                                     // Defensive against terminal evidence
                                     // disappearing between admission and

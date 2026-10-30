@@ -2434,6 +2434,32 @@ VM-free schedules cover constant work per retired member and one retained raw
 reap ticket per pending member. Signed 30-run acceptance remains director-owned;
 these bindings do not establish a signed pass rate.
 
+Native record retirement also owes any already-enrolled host ZoneWait a
+producer notification. `serial_host_arm_exit_group_unregistered_sibling_wakes_parked_host`
+drives the production ARM exit_group adapter with three actual live Kernel
+threads, two parked host continuations, and a sibling switched in on another
+slot. The one control wake defers to that slot; native cancellation releases
+its record after host enrollment. The existing host-work doorbell carries the
+terminal publisher's slot, whose retained identity indexes that member's wait
+interests. The callback reuses the wait service's exact-token readiness probe;
+record absence only wakes a recheck and grants no terminal authority. Enrollment
+installs the interest before its existing one-shot probe. An earlier release
+therefore needs no later producer edge. Slot work is consumed before another
+host task load can reset its terminal identity.
+
+The witness requires both host jobs runnable without a timer or another guest
+event, exact host graph retirement, one exit-channel wake for the retained
+Closing owner, and the original exit status. Every wait remains nonperiodic.
+Enrollment costs one member-index insertion and one probe; retirement visits
+only the released member's interests, rather than all parked siblings. The
+existing unregistered-cancellation binding additionally holds a real host
+membership reservation for one refusal, drops it, and re-enters the production
+checkpoint: Busy emits no terminal notification, then successful release emits
+one exact source. Its terminal frame stays within the existing image budget.
+These VM-free bindings do not supply signed guest-instruction evidence; the
+director's repeated `el1_sched_exit_group_with_parked_threads` run remains the
+hardware acceptance binding.
+
 The host executor binding
 `serial_host_missing_terminal_continuation_finishes_exit_owner` holds a sibling's
 DirectLoad claim across the `cancelled_on_slot` neutral retirement seam. The

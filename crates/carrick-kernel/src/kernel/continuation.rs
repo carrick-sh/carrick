@@ -64,7 +64,7 @@ pub mod wait_service;
 pub(crate) use self::readiness::ReadinessProbe;
 pub use self::readiness::{ContinuationWakeToken, ReservedSignal, ResumeContext, StaleThreadCause};
 pub use self::readiness::{
-    NativeOwnerWaitRegistration, OwnerWaitCancellation, SignalReadinessProbe,
+    NativeOwnerWaitRegistration, NativeWaitSource, OwnerWaitCancellation, SignalReadinessProbe,
     owner_wait_cancellation, reserve_killable_wait_signal,
 };
 pub use self::wait_service::{

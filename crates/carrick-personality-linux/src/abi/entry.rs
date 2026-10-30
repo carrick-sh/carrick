@@ -5,6 +5,13 @@ pub const SERVED_WAKES_OWED: u32 = 1;
 pub const SERVED_COMMIT_OWED: u32 = 2;
 pub const SERVED_FORWARD_WORK: u32 = 3;
 
+/// The doorbell retains the terminal publisher's slot until host settlement.
+/// One LinuxTaskState belongs to one slot, so concurrent publications OR the
+/// same source, while ordinary work preserves it. No per-task ABI field moves.
+pub const HOST_WORK_PROTOCOL: u64 = 2;
+const TERMINAL_WORK_SLOT_SHIFT: u32 = 8;
+const TERMINAL_WORK_SLOT_MASK: u32 = 0x1ff << TERMINAL_WORK_SLOT_SHIFT;
+
 #[repr(C, align(8))]
 #[derive(Debug)]
 pub struct LinuxTaskState {
@@ -31,6 +38,12 @@ pub struct LinuxTaskState {
 pub struct HostWorkDoorbell(u32);
 
 impl HostWorkDoorbell {
+    pub fn native_terminal_slot(&self) -> Option<carrick_sched_core::SlotId> {
+        let source = (self.0 & TERMINAL_WORK_SLOT_MASK) >> TERMINAL_WORK_SLOT_SHIFT;
+        source
+            .checked_sub(1)
+            .and_then(|slot| carrick_sched_core::SlotId::from_index(slot as usize))
+    }
     pub fn native_signal_wake(&self) -> bool {
         self.0 & 2 != 0
     }
@@ -95,6 +108,13 @@ impl LinuxTaskState {
     /// Preserve this cause when ordinary host work is published concurrently.
     pub fn mark_native_signal_work(&self) {
         self.pending_host_work.fetch_or(2, Ordering::Release);
+    }
+    /// A native terminal release owes the enrolled host record owner a recheck.
+    /// Its stopped slot retains the exact terminal identity through Free;
+    /// the host consumes this cause before admitting another task on the slot.
+    pub fn mark_native_terminal_work(&self, slot: carrick_sched_core::SlotId) {
+        let source = (u32::from(slot.raw()) + 1) << TERMINAL_WORK_SLOT_SHIFT;
+        self.pending_host_work.fetch_or(source, Ordering::Release);
     }
     pub fn take_served_boundary(&self) -> Option<ServedBoundary> {
         match self.served_with_work.swap(0, Ordering::AcqRel) {
@@ -214,6 +234,29 @@ impl SyscallResult {
 #[cfg(test)]
 mod host_work_tests {
     use super::*;
+    #[test]
+    fn terminal_source_survives_signal_and_ordinary_work_until_consumed() {
+        for slot in [
+            carrick_sched_core::SlotId::new(0),
+            carrick_sched_core::SlotId::new(255),
+        ] {
+            let state = LinuxTaskState::new();
+            state.mark_native_terminal_work(slot);
+            state.mark_native_signal_work();
+            state.mark_pending_host_work();
+            state.mark_native_terminal_work(slot);
+            let work = state.take_host_work_doorbell().unwrap();
+            assert_eq!(work.native_terminal_slot(), Some(slot));
+            assert!(work.native_signal_wake());
+            work.settled();
+            assert!(!state.has_pending_host_work());
+            state.mark_pending_host_work();
+            let work = state.take_host_work_doorbell().unwrap();
+            assert_eq!(work.native_terminal_slot(), None);
+            work.settled();
+        }
+    }
+
     #[test]
     fn native_signal_wake_cause_survives_ordinary_publication() {
         let state = LinuxTaskState::new();

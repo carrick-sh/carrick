@@ -5139,6 +5139,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         )
         .map_err(|_| NativeProcessError::Quarantined)?;
         self.retire_thread_verdict(custody.into_verdict(page));
+        self.current
+            .linux
+            .mark_native_terminal_work(self.source.slot);
         self.lifecycle_admission_settled()
             .map_err(|_| NativeProcessError::Quarantined)?;
         self.handoff = Some(receipt);
@@ -5245,6 +5248,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
+    // Keep record-park scratch out of the process-exit publication frame.
+    #[inline(never)]
     fn park_pending_exit(
         &mut self,
         page: &ThreadLifecyclePage,
@@ -5292,6 +5297,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Ok(Some(LifecycleOutcome::HostCustody));
                 }
                 carrick_core::terminal::LosingMemberSettlement::Released(receipt) => {
+                    self.current
+                        .linux
+                        .mark_native_terminal_work(self.source.slot);
                     self.retire_thread_identity(self.calling_tid);
                     self.handoff = Some(receipt);
                     return Ok(Some(LifecycleOutcome::Transferred {

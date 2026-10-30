@@ -80,6 +80,14 @@ fn deliver_boundary_wakes(
     doorbell: Option<carrick_el1_abi::HostWorkDoorbell>,
 ) {
     let pending = doorbell.is_some();
+    if let Some(slot) = doorbell
+        .as_ref()
+        .and_then(|work| work.native_terminal_slot())
+        && let Some(zone) = zone_tables()
+        && let Some(identity) = zone.terminal_identity(slot)
+    {
+        kernel.notify_native_terminal_wait(zone, identity);
+    }
     if doorbell
         .as_ref()
         .is_some_and(carrick_el1_abi::HostWorkDoorbell::native_signal_wake)

@@ -4449,7 +4449,7 @@ pub(crate) mod tests {
     #[test]
     fn serial_host_native_owner_wait_fatal_callback_budget() {
         use carrick_el1_linux::mm_portal::test_support::{ROOT, Region, admit_notified};
-        use carrick_kernel::kernel::continuation::NativeOwnerWaitRegistration;
+        use carrick_kernel::kernel::continuation::{NativeOwnerWaitRegistration, NativeWaitSource};
         use carrick_kernel::kernel::objects::TaskWakeEnrollment;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4500,7 +4500,10 @@ pub(crate) mod tests {
                 // These are the production physical-wait registry and persistent
                 // task subscriptions. Count callback work, including redundant
                 // invocations that a one-shot runnable latch would hide.
-                waits.push(NativeOwnerWaitRegistration::enroll(&sibling).unwrap());
+                waits.push(
+                    NativeOwnerWaitRegistration::enroll(&sibling, NativeWaitSource::Cancellation)
+                        .unwrap(),
+                );
                 let count = callbacks.clone();
                 let enrollment = sibling.task().subscribe_wake(
                     sibling.task().wake_generation(),
