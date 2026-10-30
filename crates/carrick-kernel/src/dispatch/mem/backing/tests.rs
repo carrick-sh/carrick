@@ -1327,7 +1327,7 @@ fn range_owned_metadata_removal_clears_every_mmap_classification() {
         mem.remap_snapshots.insert(start, vec![0; len as usize]);
         mem.bus_fault_ranges.push((start, len));
         locked_ranges_insert(&mut mem.locked_ranges, range);
-        mem.record_resident(range);
+        mem.record_resident(range).unwrap();
         locked_ranges_insert(&mut mem.resident_tracked_ranges, range);
         mem.resident_fault_ranges.arm(range, LinuxProtFlags::READ);
         locked_ranges_insert(&mut mem.write_sealed_shared_maps, range);
@@ -1374,7 +1374,7 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         mem.remap_snapshots.insert(start, snapshot);
         mem.bus_fault_ranges.push((start, len));
         locked_ranges_insert(&mut mem.locked_ranges, whole);
-        mem.record_resident(whole);
+        mem.record_resident(whole).unwrap();
         locked_ranges_insert(&mut mem.resident_tracked_ranges, whole);
         mem.resident_fault_ranges.arm(whole, LinuxProtFlags::READ);
         locked_ranges_insert(&mut mem.write_sealed_shared_maps, whole);
@@ -1639,7 +1639,7 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
         let mem_authority_124 = dispatcher.mem();
         let mut mem = mem_authority_124.lock();
         locked_ranges_insert(&mut mem.locked_ranges, replacement);
-        mem.record_resident(replacement);
+        mem.record_resident(replacement).unwrap();
         locked_ranges_insert(&mut mem.write_sealed_shared_maps, replacement);
         mem.writable_memfd_maps
             .push((replacement, std::sync::Arc::clone(&writable_memfd)));

@@ -862,7 +862,10 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
     };
     let ring_tid = tid.raw();
     let mm_key = mutation.host_alias_permit().mm().raw();
-    reconcile_guest_frame_commits(dispatcher, engine, mutation);
+    if let Err(busy) = reconcile_guest_frame_commits(dispatcher, engine, mutation) {
+        cancel_frame_grant_request(engine.mailbox_slot(), mm_key, address, access);
+        return Ok(Err(busy));
+    }
     if guest_descriptor_edit_in_flight(
         carrick_el1_abi::descriptor_txn_slots_host(),
         mm_key,
@@ -1287,12 +1290,12 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
     dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
     engine: &E,
     mutation: &carrick_kernel::dispatch::mm_mutation::MmMutationGuard<'_>,
-) {
+) -> Result<(), carrick_kernel::dispatch::mem::ReservationBusy> {
     let Some(table) = carrick_el1_abi::frame_grant_residency_host() else {
-        return;
+        return Ok(());
     };
     let mut pages = Vec::new();
-    table.for_each_dirty_mm(mutation.mm_id().raw(), |slot, identity, bits| {
+    let walked = table.for_each_dirty_mm(mutation.mm_id().raw(), |slot, identity, bits| {
         pages.clear();
         for (word_index, mut word) in bits.into_iter().enumerate() {
             while word != 0 {
@@ -1307,11 +1310,30 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
         }
         // One live-root read and one resolution per table arena for the
         // whole grant (`ThreadedEngine::live_el1_grant_pages`).
+        let mut refused = None;
         engine.live_el1_grant_pages(&pages, &mut |page, _protection| {
-            let _ = dispatcher.reconcile_el1_resident_page(mutation, page);
+            if refused.is_none() {
+                match dispatcher.reconcile_el1_resident_page(mutation, page) {
+                    Ok(_) => {}
+                    Err(carrick_kernel::dispatch::mem::RootAccessRefusal::Busy(busy)) => {
+                        refused = Some(busy)
+                    }
+                    Err(error) => {
+                        carrick_fatal!("vcpu_loop::residency", "invalid resident root: {error:?}")
+                    }
+                }
+            }
         });
+        if let Some(busy) = refused {
+            return std::ops::ControlFlow::Break(busy);
+        }
         let _ = table.ack_dirty(slot, identity);
+        std::ops::ControlFlow::Continue(())
     });
+    match walked {
+        std::ops::ControlFlow::Continue(()) => Ok(()),
+        std::ops::ControlFlow::Break(busy) => Err(busy),
+    }
 }
 
 /// `CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL=1`: turn the first synchronous

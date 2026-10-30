@@ -983,10 +983,14 @@ impl<'a> MemView<'a> {
             mem.bus_fault_ranges.push((start, len));
         }
         if commit.resident {
-            mem.record_resident(replacement);
+            mem.record_resident(replacement).unwrap_or_else(|refusal| {
+                super::anonymous::broken_root("host residency commit", refusal)
+            });
         }
         if let Some(locked) = commit.locked {
-            mem.record_resident(locked);
+            mem.record_resident(locked).unwrap_or_else(|refusal| {
+                super::anonymous::broken_root("host residency commit", refusal)
+            });
             locked_ranges_insert(&mut mem.locked_ranges, locked);
         }
         if commit.write_sealed_shared {
