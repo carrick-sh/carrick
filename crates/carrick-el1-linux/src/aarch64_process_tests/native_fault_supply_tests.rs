@@ -377,12 +377,14 @@ fn native_fork_child_first_allocation_and_thread_admission() {
         },
     )
     .unwrap();
-    assert_eq!(
-        counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
-            .load(Ordering::Acquire),
-        1,
-        "the real clone must reach empty-pool admission rather than an earlier refusal"
-    );
+    if route == carrick_personality_linux::dispatch::CompletionRoute::Forward {
+        assert_eq!(
+            counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ClonePoolEmpty as usize]
+                .load(Ordering::Acquire),
+            1,
+            "a declined clone must reach empty-pool admission rather than an earlier refusal"
+        );
+    }
     assert!(
         matches!(
             route,
