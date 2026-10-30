@@ -81,12 +81,24 @@ all of these, checked against the live PR when the comment is admitted:
   the run's issue: the loop reads it, the board updates it, and commits may
   close only it.
 
-The PR head the hosted guard sees becomes the admitted tip. Clone admission
-and the controller refuse a different head, as for owned PRs. The run can push
-only to the adopted branch, with `--force-with-lease` set to that tip, and it
-cannot call `select_branch`. If someone pushes to the PR meanwhile, the run
-pushes nothing, reports why and ends blocked; comment `/agent` again to
-continue from the new head.
+The PR head the hosted guard observes becomes the admitted tip. That is the
+head when the guard runs, not when the comment was written: runs for one PR
+wait in a concurrency queue, so a push made while the run is queued is adopted
+under the owner's comment. Clone admission and the controller refuse a
+different head, as for owned PRs. The run can push only to the adopted
+branch, with `--force-with-lease` set to that tip, and it cannot call
+`select_branch`. If someone pushes to the PR after the guard, the run pushes
+nothing, reports why and ends blocked; comment `/agent` again to continue
+from the new head. The controller also checks that the issue the guard named
+in its `Dispatch issue` step is the one it resolves itself.
+
+The director owns the adopted branch's history. Workers add commits on top of
+the admitted tip and never rebase or rewrite it; keeping the branch current
+with `main` stays the director's job, so publication never rebases an adopted
+branch. If the published HEAD does not descend from the admitted tip, the run
+pushes nothing and ends blocked. Workflow-file and closing-reference checks
+count only the run's own commits (admitted tip to HEAD), never the
+director's.
 
 On an adopted PR dispatch pushes commits and nothing else. It never creates a
 PR, edits the body or changes draft status; a worker's proposed PR body is

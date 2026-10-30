@@ -533,7 +533,17 @@ impl Github {
                         false,
                     ),
                 })?;
-                return Ok(adoption.is_some());
+                // The guard names the issue it resolved; both must agree.
+                let guard_issue: Vec<_> = steps
+                    .iter()
+                    .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch issue "))
+                    .collect();
+                return Ok(adoption.is_some_and(|adoption| {
+                    guard_issue.len() == 1
+                        && adoption
+                            .issue_number()
+                            .is_some_and(|issue| guard_issue[0] == issue.to_string())
+                }));
             };
             let original_id = crate::dispatch_worker::branch_run(issue_number, branch)?;
             let original = request(
@@ -923,6 +933,8 @@ mod tests {
             ("edited", false),
             ("outsider", false),
             ("closed_pr", false),
+            ("guard_issue_mismatch", false),
+            ("no_guard_issue", false),
         ] {
             let mut comment = json!({"id":123,"issue_url":format!("https://api.github.com/repos/{REPOSITORY}/issues/1150"),"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-30T00:00:00Z","updated_at":"2026-10-30T00:00:00Z","body":"/agent continue"});
             let digest = crate::dispatch_worker::comment_digest(&comment);
@@ -958,10 +970,28 @@ mod tests {
                 .map(|n| json!({"number":n,"repository":{"nameWithOwner":REPOSITORY}}))
                 .collect();
             let connection = json!({"nodes":nodes,"pageInfo":{"hasNextPage":false}});
+            let mut steps = vec![
+                json!({"name":format!("Dispatch comment 1150 123 {digest}"),"conclusion":"success"}),
+                json!({"name":format!("Dispatch head {tip}"),"conclusion":"success"}),
+            ];
+            match case {
+                "guard_issue_mismatch" => {
+                    steps.push(json!({"name":"Dispatch issue 987","conclusion":"success"}))
+                }
+                "no_guard_issue" => {}
+                _ => steps.push(json!({"name":"Dispatch issue 986","conclusion":"success"})),
+            }
+            // A dispatch-named ref takes the owned path: a real original run
+            // whose App PR has no publication binding, never the predicate.
+            let mut original = review_run(42);
+            original["event"] = "issues".into();
+            original["head_branch"] = "main".into();
+            let mut graphql = 0;
             let admitted = Github::admits_run(&Admission::Agent, &run, &mut |method, endpoint, body, _| {
                 Ok(if endpoint.contains("/jobs?") {
-                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success","steps":[{"name":format!("Dispatch comment 1150 123 {digest}"),"conclusion":"success"},{"name":format!("Dispatch head {tip}"),"conclusion":"success"}]}]}])
+                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success","steps":steps}]}])
                 } else if endpoint == "graphql" {
+                    graphql += 1;
                     assert_eq!(method, "POST");
                     assert_eq!(body.unwrap()["variables"]["number"], 1150);
                     json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":connection,"bodyReferences":connection}}}})
@@ -969,9 +999,15 @@ mod tests {
                 else if endpoint.ends_with("/issues/1150") { json!({"pull_request":{}}) }
                 else if endpoint.ends_with("/pulls/1150") { pr.clone() }
                 else if endpoint.ends_with("/issues/986") { issue.clone() }
-                else if endpoint.ends_with("/actions/runs/42") { Err(ScalerError::Guard("owned path"))? }
+                else if endpoint.ends_with("/actions/runs/42") { original.clone() }
                 else { panic!("unexpected endpoint {endpoint}") })
             }, &mut |_, _, _, _| None).unwrap();
+            if case == "dispatch_ref" {
+                assert_eq!(
+                    graphql, 0,
+                    "a dispatch-named ref reached the adoption predicate"
+                );
+            }
             if admitted != allowed {
                 unsafe_cases.push(case);
             }

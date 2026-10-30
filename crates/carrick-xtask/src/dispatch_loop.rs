@@ -1616,8 +1616,8 @@ impl Server<'_> {
         }
         let status = if !observations.is_empty() {
             ContractStatus::Failed
-        } else if applied.lease_refused.is_some() && status == ContractStatus::Done {
-            // An adopted PR moved under this run: nothing was overwritten.
+        } else if applied.adoption_blocked.is_some() && status == ContractStatus::Done {
+            // An adopted PR moved or was rewritten: nothing was pushed.
             ContractStatus::Blocked
         } else {
             status
@@ -2820,7 +2820,7 @@ mod tests {
             assert!(error.contains("adopted"), "{error}");
             std::fs::create_dir_all(crate::agent_runner::state().unwrap()).unwrap();
             Applied::record(|a| {
-                a.lease_refused = Some("Adopted PR #800 moved after admission".into())
+                a.adoption_blocked = Some("Adopted PR #800 moved after admission".into())
             })
             .unwrap();
             s.outcome(ContractStatus::Done, "pushed").unwrap();
