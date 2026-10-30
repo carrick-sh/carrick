@@ -4875,6 +4875,53 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     );
     fixture.task.publish_ptrace_traced(false);
 
+    // A previous home is still retained by another executor. Rehoming the
+    // signal owner must refuse transiently, before publishing a forced signal.
+    let other = SlotId::new(1);
+    fixture
+        .zone
+        .publish_slot(other, fixture.address.mm.raw().get(), Some(1), 1);
+    fixture
+        .zone
+        .install_space(other, fixture.address.mm.raw().get())
+        .unwrap();
+    let retained_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: other,
+    };
+    let retained = process_record_for_call(
+        retained_source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.control,
+    )
+    .unwrap();
+    registry()
+        .rehome_entry(
+            retained_source,
+            &fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .unwrap()
+        .unwrap();
+    let refused = super::dispatch::arm_deliver_declined_fault_signal_with(
+        source,
+        &fixture.task,
+        &ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        &mut service,
+        &mut frame,
+        |_, _| panic!("Busy admission must not publish or deliver a signal"),
+    );
+    assert_eq!(refused, Ok(carrick_el1_abi::Action::Forward));
+    assert_eq!(frame.elr, 0x40_0200);
+    assert!(fixture.zone.release_host_home(other, retained));
+
     // Untraced SignalOwner delivers SIGSEGV/SEGV_ACCERR in-ring and builds the
     // user signal frame.
     let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
@@ -10721,6 +10768,28 @@ fn native_process_venue_survives_host_only_and_closed_admission() {
         } else {
             fixture.page.decline_to_host();
         }
+        // A retained host home is a service-exit concern, not a running
+        // native thread for IRQ or fault supply.
+        assert_eq!(
+            NativeEntryVenue::select(fixture.zone, fixture.slot, &fixture.task),
+            NativeEntryVenue::Host
+        );
+        assert_eq!(
+            NativeEntryVenue::select_service_with_lifecycle(
+                fixture.zone,
+                fixture.slot,
+                &fixture.task,
+                fixture.page,
+                fixture.control,
+            ),
+            NativeEntryVenue::NativeProcess(record)
+        );
+        fixture.zone.requeue_preempted(fixture.slot, record);
+        assert_eq!(
+            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            record
+        );
+        assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(record));
         assert_eq!(
             NativeEntryVenue::select_with_lifecycle(
                 fixture.zone,
