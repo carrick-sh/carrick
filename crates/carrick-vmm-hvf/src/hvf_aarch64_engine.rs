@@ -2192,6 +2192,10 @@ impl HvpatchPersistentExecutorFactoryAuthority {
         self.spec.fd_ceiling_publisher()
     }
 
+    pub fn guest_capture(&self) -> Arc<crate::guest_capture::GuestCapture> {
+        self.spec.guest_capture()
+    }
+
     pub fn create_executor_parts(&self) -> Result<(HvfAarch64Vmm, HvfAarch64Vcpu), TrapError> {
         let (state, vcpu, mailbox) = HvfVmState::from_persistent_executor_spec(&self.spec)?;
         let custody = state.carrier_vm_custody();

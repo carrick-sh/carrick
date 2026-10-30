@@ -227,12 +227,37 @@ pub(crate) struct CarrierKernelRuntime {
     directory: Arc<crate::vcpu_loop::HvpatchRuntimeDirectory>,
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct HvfPhysicalDebug {
+    directory: Arc<crate::vcpu_loop::HvpatchRuntimeDirectory>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_kernel::kernel::debug::PhysicalCaptureProvider for HvfPhysicalDebug {
+    fn capture(&self) -> carrick_kernel::kernel::debug::PhysicalCapture {
+        let capture = self.directory.capture_running_guests();
+        carrick_kernel::kernel::debug::PhysicalCapture {
+            zone_census: String::new(),
+            vcpus: capture.vcpus,
+            host_threads: Vec::new(),
+            unavailable: capture.unavailable,
+        }
+    }
+}
+
 impl CarrierKernelRuntime {
     pub(crate) fn install_debug_server(&self, scope: &CarrierScopeId) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let physical = Some(Arc::new(HvfPhysicalDebug {
+            directory: Arc::clone(&self.directory),
+        })
+            as Arc<dyn carrick_kernel::kernel::debug::PhysicalCaptureProvider>);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let physical = None;
         *self.debug_server.lock() = carrick_kernel::kernel::KernelDebugServer::install(
             Arc::clone(&self.kernel),
             scope.as_str(),
-            None,
+            physical,
         );
     }
 

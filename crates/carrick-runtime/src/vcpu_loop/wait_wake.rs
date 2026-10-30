@@ -215,6 +215,8 @@ pub(crate) struct HvpatchRuntimeDirectory {
             >,
         >,
     >,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    guest_capture: Mutex<Option<Arc<carrick_vmm_hvf::guest_capture::GuestCapture>>>,
     /// Carrier-owned logical process jobs. No process child owns a host thread;
     /// the root waits these exact completions before shutting the shared pool.
     pub(crate) process_jobs: Mutex<ProcessJobDirectoryState>,
@@ -661,6 +663,8 @@ impl Default for HvpatchRuntimeDirectory {
             carrier_tasks: Mutex::new(None),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             persistent_pool: Mutex::new(None),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            guest_capture: Mutex::new(None),
             process_jobs: Mutex::new(ProcessJobDirectoryState::default()),
             process_jobs_changed: Condvar::new(),
             shutdown: Mutex::new(RuntimeDirectoryShutdown::Open),
@@ -803,6 +807,7 @@ impl HvpatchRuntimeDirectory {
         // One `M` per `P` (guest CPU): see `ExecutorPoolConfig`.
         let bound_workers = executor::configured_bound_executors(services.scheduler.cpu_count());
         let spare_executors = executor::configured_spare_executors(services.scheduler.cpu_count());
+        let guest_capture = authority.guest_capture();
         let factory = Arc::new(executor::HvpatchPersistentExecutorFactory::new(authority));
         let started = self.start_services_transaction(services, || {
             executor::ExecutorPool::start(
@@ -820,9 +825,25 @@ impl HvpatchRuntimeDirectory {
             .map_err(|error| RuntimeError::Configuration(error.to_string()))
         })?;
         *pool = Some(started);
+        *self.guest_capture.lock() = Some(guest_capture);
         *self.census_scope.lock() = Some(scope.clone());
         crate::el1_census::init_from_env();
         Ok(true)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn capture_running_guests(
+        &self,
+    ) -> carrick_vmm_hvf::guest_capture::RunningGuestCapture {
+        let Some(capture) = self.guest_capture.lock().clone() else {
+            return carrick_vmm_hvf::guest_capture::RunningGuestCapture {
+                vcpus: Vec::new(),
+                unavailable: vec![
+                    "guest register capture unavailable: no persistent pool".to_owned(),
+                ],
+            };
+        };
+        capture.capture_running()
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -830,6 +851,7 @@ impl HvpatchRuntimeDirectory {
         let Some(pool) = self.persistent_pool.lock().take() else {
             return Ok(());
         };
+        *self.guest_capture.lock() = None;
         tracing::info!("HVPatch persistent pool shutdown begins (run queue will close)");
         let result = pool
             .shutdown()
