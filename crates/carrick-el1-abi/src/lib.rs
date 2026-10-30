@@ -5174,22 +5174,33 @@ mod tests {
         for identity in [grant, second] {
             assert!(table.record_commit(table.lookup(41, identity.semantic_base).unwrap()));
         }
-        let mut visited = Vec::new();
+        let mut visits = 0;
         let stopped = table.for_each_dirty_mm(41, |slot, _, _| {
-            visited.push(slot);
+            assert!(slot == first_slot || slot == second_slot);
+            visits += 1;
             ControlFlow::Break("busy")
         });
         assert_eq!(stopped, ControlFlow::Break("busy"));
-        assert_eq!(visited, [first_slot]);
-        visited.clear();
+        assert_eq!(visits, 1);
+        visits = 0;
+        let mut seen = 0;
         let completed: ControlFlow<()> = table.for_each_dirty_mm(41, |slot, identity, bits| {
             assert_eq!(bits[0], 1);
-            visited.push(slot);
+            let bit = if slot == first_slot {
+                1
+            } else {
+                assert_eq!(slot, second_slot);
+                2
+            };
+            assert_eq!(seen & bit, 0, "each dirty row is visited once");
+            seen |= bit;
+            visits += 1;
             assert!(table.ack_dirty(slot, identity));
             ControlFlow::Continue(())
         });
         assert_eq!(completed, ControlFlow::Continue(()));
-        assert_eq!(visited, [first_slot, second_slot]);
+        assert_eq!(visits, 2);
+        assert_eq!(seen, 3);
         let _: ControlFlow<()> =
             table.for_each_dirty_mm(41, |_, _, _| panic!("all rows acknowledged"));
     }
