@@ -451,8 +451,11 @@ impl Frames {
                 "native backing reply",
                 service
                     + self.required("::apply_fault_reply::")?
+                    // Application and physical settlement are sequential:
+                    // the aligned crossing buffer is not live in descent.
                     + (self.sum(&["::grant_target::", "::root_for::"]) + root)
-                        .max(self.maximum("::apply_grant::") + descriptors),
+                        .max(self.maximum("::apply_grant::") + descriptors)
+                        .max(self.required("::settle_native_descriptor_reply::")?),
             ),
             // Completed output is re-driven only after the service stack has
             // unwound. Charging `service + write` here would describe exactly
@@ -733,6 +736,7 @@ mod tests {
             "x::settle_service_exit::h0",
             "x::park_owner_wait::h0",
             "x::apply_fault_reply::h0",
+            "x::settle_native_descriptor_reply::h0",
             "x::setup_arm_signal_frame::h0",
             "x::restore_live_arm_signal_frame::h0",
             "x::serve_delegated_anonymous::h0",
@@ -742,6 +746,16 @@ mod tests {
             values.insert(name.to_owned(), 128);
         }
         Frames(values)
+    }
+
+    #[test]
+    fn native_descriptor_settlement_is_charged_to_the_backing_reply() {
+        let mut frames = small_frames();
+        frames
+            .0
+            .insert("x::settle_native_descriptor_reply::h0".to_owned(), 11000);
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("native backing reply"));
     }
 
     #[test]

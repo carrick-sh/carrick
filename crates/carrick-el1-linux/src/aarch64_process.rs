@@ -96,6 +96,37 @@ impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for CurrentMmMa
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 static CURRENT_MM_MAINTENANCE: CurrentMmMaintenance = CurrentMmMaintenance;
 
+/// The wire buffer exists only after descriptor application has unwound. Do
+/// not retain its aligned storage beneath the descriptor traversal frames.
+#[inline(never)]
+fn settle_native_descriptor_reply<X: ForkStockCrossing>(
+    crossing: &X,
+    slot: SlotId,
+    owner_handle: carrick_el1_abi::El1MmHandle,
+    generation: NonZeroU64,
+    reply: &carrick_el1_abi::PortalGrantSlot,
+) -> Result<(), carrick_core::mm::transaction::MmError> {
+    use carrick_core::mm::transaction::MmError;
+    let reply_address = carrick_guest_arch::KernelVa::new(core::ptr::from_ref(reply).addr() as u64);
+    // Keep one aligned wire record in this settlement phase, without
+    // aggregate returns or moves through error adapters.
+    let mut settlement = carrick_el1_abi::NativeDescriptorSettlement::EMPTY;
+    settlement
+        .initialize(owner_handle, generation, reply_address)
+        .ok_or(MmError::Stale)?;
+    let crossed =
+        crossing.cross_fork_stock(&raw mut settlement as *mut _ as u64, u64::from(slot.raw()));
+    match settlement.take(owner_handle, generation, reply_address) {
+        Some(Ok(())) => crossed.map_err(|_| MmError::Stale)?,
+        Some(Err(())) => return Err(MmError::Stale),
+        None => {
+            crossed.map_err(|_| MmError::Stale)?;
+            return Err(MmError::Stale);
+        }
+    }
+    Ok(())
+}
+
 pub enum PreparedWords<'a> {
     Borrowed(&'a dyn LiveDescriptorWords),
     Owned(Box<dyn LiveDescriptorWords + 'a>),
@@ -1991,27 +2022,13 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 window.operation.incarnation,
             )
         };
-        let reply_address =
-            carrick_guest_arch::KernelVa::new(core::ptr::from_ref(slot).addr() as u64);
-        // Keep the aligned wire record in one caller-owned slot. Returning it
-        // through Option and moving it through error adapters retains several
-        // aggregate buffers beneath the backing-reply descriptor path.
-        let mut settlement = carrick_el1_abi::NativeDescriptorSettlement::EMPTY;
-        settlement
-            .initialize(owner_handle, window.operation.sequence, reply_address)
-            .ok_or(MmError::Stale)?;
-        let crossed = self.crossing.cross_fork_stock(
-            &raw mut settlement as *mut _ as u64,
-            u64::from(self.worker()),
-        );
-        match settlement.take(owner_handle, window.operation.sequence, reply_address) {
-            Some(Ok(())) => crossed.map_err(|_| MmError::Stale)?,
-            Some(Err(())) => return Err(MmError::Stale),
-            None => {
-                crossed.map_err(|_| MmError::Stale)?;
-                return Err(MmError::Stale);
-            }
-        }
+        settle_native_descriptor_reply(
+            &self.crossing,
+            self.slot,
+            owner_handle,
+            window.operation.sequence,
+            slot,
+        )?;
         // The carrier authenticated the full receipt. Retain only the retry
         // verdict across the crossing, not a by-value descriptor journal.
         if applied? != Some(false) {
