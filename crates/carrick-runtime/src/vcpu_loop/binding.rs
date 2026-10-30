@@ -3132,13 +3132,26 @@ where
     /// `publish_member`, and publishing it here keeps the job's own settlement
     /// the sole owner of its publication instead of a member list this job may
     /// already have left.
-    fn publish_lost_claim_terminal_result(&mut self) {
+    fn publish_lost_claim_terminal_result(&mut self) -> Result<(), RuntimeError> {
         if self.phase.is_terminal_transition() {
             carrick_fatal!(
                 "kernel::terminal_settlement",
                 "terminal owner cannot publish a losing member completion"
             );
         }
+        // Retain the exact retirement authority before withdrawing membership.
+        // A malformed job reports its configuration error to its settlement
+        // caller without partially tearing down the member or aborting here.
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "losing member lost exact host retirement context".to_owned(),
+                )
+            })?
+            .retain_exact();
         self.state
             .capture_child_tid_clear()
             .unwrap_or_else(|error| {
@@ -3156,21 +3169,12 @@ where
                 .withdraw_persistent_terminal_owner_runtime(&self.kernel);
             self.state.thread_exit_withdrawn = true;
         }
-        let context = self
-            .state
-            .service_kernel_context
-            .as_ref()
-            .unwrap_or_else(|| {
-                carrick_fatal!(
-                    "kernel::terminal_settlement",
-                    "losing member lost exact host retirement context"
-                );
-            });
-        self.publish_host_thread_retirement(context);
+        self.publish_host_thread_retirement(&context);
         if self.terminal_result.is_none() {
             self.terminal_result = Some(Ok(VcpuLoopOutcome::ThreadDone));
         }
         self.publish_terminal_result();
+        Ok(())
     }
 
     pub(super) fn suspend(
@@ -5810,7 +5814,10 @@ where
         // published is published from the settlement that owns it. Without
         // this the job's `HvpatchLoopResult` was never filled and its
         // container process job waited on it forever (`go_types`).
-        self.publish_lost_claim_terminal_result();
+        if let Err(error) = self.publish_lost_claim_terminal_result() {
+            self.terminal_result = Some(Err(error));
+            self.publish_terminal_result();
+        }
     }
 
     fn after_executor_failure_settlement(
@@ -5869,7 +5876,7 @@ where
                 // the process exit, so Linux has terminated this one, which is
                 // exactly the `ThreadDone` the owner's member drain would have
                 // published. Publish it from the settlement that owns it.
-                self.publish_lost_claim_terminal_result();
+                self.after_reaped_settlement();
                 return continuation::ExecutorFailureSettlement::PublishCurrent;
             }
             ProcessExitClaim::Owner | ProcessExitClaim::Pending => {}
@@ -7648,6 +7655,58 @@ mod tests {
             .unwrap();
         scheduler.unregister_executor(&executor).unwrap();
         scheduler.close();
+    }
+
+    #[test]
+    fn lost_claim_without_context_publishes_configuration_error() {
+        for executor_failed in [false, true] {
+            let (_runtime, scheduler, kernel, root, process, _generation) =
+                test_carrier_graph_with_dispatcher!(72_433, SyscallDispatcher::new());
+            let tid = ThreadId::synthetic_for_tests(72_433);
+            let state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                Arc::new(ThreadRegistry::new(tid)),
+                Arc::new(FutexTable::new()),
+                Arc::new(NoopPlatformFutex),
+                Arc::new(|_| Arc::new(NoopPlatformFutex)),
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(root.thread())),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                tid,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            let mut job =
+                suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+            let result = job.terminal_settlement.result.clone();
+            if executor_failed {
+                assert_eq!(
+                    kernel
+                        .try_claim_persistent_process_exit(ThreadId::synthetic_for_tests(72_434))
+                        .unwrap()
+                        .claim,
+                    ProcessExitClaim::Owner
+                );
+                assert_eq!(
+                    job.after_executor_failure_settlement("injected executor failure".into()),
+                    continuation::ExecutorFailureSettlement::PublishCurrent
+                );
+            } else {
+                job.after_reaped_settlement();
+            }
+            assert!(matches!(
+                result.take_published(),
+                Some(Err(RuntimeError::Configuration(message)))
+                    if message == "losing member lost exact host retirement context"
+            ));
+            assert!(!job.state.thread_exit_withdrawn);
+            assert!(root.thread().control_slot().host_retirement().is_none());
+            scheduler.close();
+        }
     }
 
     #[test]
