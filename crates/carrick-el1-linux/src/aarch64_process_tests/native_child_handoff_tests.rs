@@ -3,6 +3,15 @@ use super::*;
 
 #[test]
 fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
+    fork_child_service_ack(false);
+}
+
+#[test]
+fn arm_native_fork_child_stdout_service_keeps_exact_entry() {
+    fork_child_service_ack(true);
+}
+
+fn fork_child_service_ack(stdout: bool) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
@@ -88,7 +97,15 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
     let child_control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
     // Suspend this very child through the production service continuation.
     // Re-selecting a different MM would hide stale installed-space occupancy.
-    let saved = unsafe { *fixture.zone.record(child).ctx_mut() };
+    let mut saved = unsafe { *fixture.zone.record(child).ctx_mut() };
+    if stdout {
+        // Same SVC words as the signed sender's 57-byte stdout write.
+        saved.native.x[0] = 1;
+        saved.native.x[1] = 0x6000006030;
+        saved.native.x[2] = 0x39;
+        saved.native.x[8] = 64;
+        saved.native.pc = 0x2a6f20;
+    }
     let child_ttbr = cpu.ttbr;
     assert_eq!(fixture.zone.installed_space(fixture.slot), identity.mm);
     let result = with_process_entry(
@@ -103,16 +120,42 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
         child_control,
         &mut service,
         |entry| {
-            let result = entry
-                .begin_service(
+            let result = if stdout {
+                use carrick_core_abi::host_file::{HostFileHeader, HostFileOp};
+                let bytes = b"mask-storm role=child sends=2000 send_failures=0 ok=true\n";
+                assert_eq!(bytes.len(), 0x39);
+                let mut record =
+                    vec![0; carrick_core_abi::host_file::record_len(bytes.len(), 0).unwrap()];
+                carrick_core_abi::host_file::encode(
+                    &mut record,
+                    HostFileHeader {
+                        op: HostFileOp::Write,
+                        table: [5, 1, 0],
+                        fd: 1,
+                        flags: 0,
+                        args: [0; 4],
+                    },
+                    bytes,
+                    0,
+                )
+                .unwrap();
+                let result =
+                    entry.begin_host_file_service(record.into_boxed_slice(), None, false, None);
+                entry.settle_service_exit(
+                    result,
+                    super::super::native_process_runtime::NativeServiceExit::Bridge,
+                )
+            } else {
+                let result = entry.begin_service(
                     carrick_core_abi::service::ServiceOperation::CarrierWork {
                         entry: carrick_sched_core::object_wait::OwnerEntry::Exception,
                     },
                     None,
-                )
-                .unwrap();
-            assert!(entry.take_handoff_receipt().is_some());
-            result
+                );
+                assert!(entry.take_handoff_receipt().is_some());
+                result
+            };
+            result.unwrap()
         },
     )
     .unwrap();
@@ -137,6 +180,23 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
         )
     }
     .unwrap();
+    if stdout {
+        let carrick_core_abi::service::ServiceOperation::HostFile { payload, .. } =
+            ticket.request().operation
+        else {
+            panic!("stdout must enter the host-file bridge");
+        };
+        // SAFETY: the exact pending owner retains this record until this ticket's ACK.
+        let record = unsafe {
+            core::slice::from_raw_parts_mut(
+                payload.address().raw() as *mut u8,
+                payload.length().raw() as usize,
+            )
+        };
+        let view = carrick_core_abi::host_file::HostFileRequestView::parse(record).unwrap();
+        assert_eq!(view.input().len(), 57);
+        view.reply(57, &[]).unwrap();
+    }
     assert!(ticket.complete(true).is_ok());
     fixture
         .zone
@@ -196,7 +256,7 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
     assert!(matches!(
         resumed,
         super::super::native_process_runtime::NativeResume::Returned(result)
-            if result.raw() as u64 == saved.native.x[0]
+            if result.raw() as u64 == if stdout { 57 } else { saved.native.x[0] }
     ));
     assert_eq!(child_page.claimed_count(), 0);
     frame.x[8] = 172; // getpid, the child's first EL0 syscall.
