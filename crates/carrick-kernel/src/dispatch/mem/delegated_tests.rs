@@ -312,7 +312,7 @@ fn commit(root: &mut Reservations<'_>, decision: Decision) -> u64 {
 impl Root {
     /// Refuse a host probe while a peer owns the real root, releasing before
     /// that refusal reaches the caller. No timeout drives the root release.
-    fn with_held_root_refusal<T>(&self, work: impl FnOnce() -> T) -> T {
+    pub(in crate::dispatch) fn with_held_root_refusal<T>(&self, work: impl FnOnce() -> T) -> T {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(1);
         let (released_tx, released_rx) = std::sync::mpsc::sync_channel(1);

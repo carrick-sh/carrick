@@ -2475,6 +2475,48 @@ mod tests {
     use super::union_of;
 
     #[test]
+    fn completed_host_proposal_keeps_custody_on_busy() {
+        use super::*;
+        use crate::dispatch::mem::delegated_tests::Root;
+        use carrick_el1::memory::reservations::Placement;
+        let dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let view = dispatcher.mem_view();
+        let base = crate::memory::LINUX_MMAP_BASE;
+        let request = {
+            let mut model = root.lock();
+            match model
+                .mmap(
+                    Placement::Fixed(base),
+                    4096,
+                    ReservationProtection::READ_WRITE,
+                )
+                .unwrap()
+            {
+                Decision::Work(request) => request,
+                _ => panic!("mapping needs backend work"),
+            }
+        };
+        dispatcher
+            .mem()
+            .lock()
+            .open_venue(HostVenue::Proposal(request));
+        let mut memory = super::super::tests::CountingMmapMemory::new(base, 8192);
+        use carrick_guest_mem::GuestMemory;
+        memory.zero_backing(base, 4096).unwrap();
+        view.mark_range_resident(base, 4096);
+        let outcome = Ok(DispatchOutcome::Returned { value: base as i64 });
+        let refused = root
+            .with_held_root_refusal(|| view.settle_host_venue(&mut memory, &outcome, |_, _| true));
+        assert!(refused.is_err());
+        assert!(
+            dispatcher.mem().lock().has_owner_proposal(),
+            "completed backend outcome lost its root proposal on Busy"
+        );
+        assert_eq!(memory.zero_backing_calls.get(), 1);
+    }
+
+    #[test]
     fn union_of_merges_overlapping_and_abutting_rows() {
         assert_eq!(union_of(vec![(0, 10)]), [(0, 10)]);
         assert_eq!(union_of(vec![(0, 10), (5, 15)]), [(0, 15)]);
