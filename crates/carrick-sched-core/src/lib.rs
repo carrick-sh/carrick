@@ -3217,13 +3217,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             let claimed = self.claim_for_el1(record.id, seq, result, waker, effects, || {
                 self.unlink(&guard, entry_id);
                 self.drop_entry(rec, entry_id);
+                // A published consumer may immediately re-park with a new timer.
+                self.timers.cancel_record(record.id);
             });
             drop(guard);
-            if claimed {
-                self.timers.cancel_record(record.id);
-                if let Some(counter) = self.counters.host_claims.get(Handback::Signal as usize) {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
+            if claimed
+                && let Some(counter) = self.counters.host_claims.get(Handback::Signal as usize)
+            {
+                counter.fetch_add(1, Ordering::Relaxed);
             }
             return claimed;
         }

@@ -3768,3 +3768,44 @@ fn interrupt_parked_futex_wakes_single_entry_user_return_with_eintr() {
     assert_eq!(selected.record, record);
     assert_eq!(selected.result.map(|value| value as i64), Some(-4));
 }
+
+#[test]
+fn interrupt_parked_futex_preserves_a_resumed_waiters_new_timer() {
+    let zone: Arc<ZoneTables> = Arc::from(zone());
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let record = el1_park(&zone, SLOT, 41, 0x7000, 500);
+    let reparked = Arc::new(AtomicBool::new(false));
+    let consumer = zone.clone();
+    let consumed = reparked.clone();
+    timer_index::BEFORE_CANCEL.with(|probe| {
+        *probe.borrow_mut() = Some(Box::new(move || {
+            // A queue consumer may run as soon as publication exposes it.
+            // Exercise an actual switch and timed re-park at that boundary.
+            if let Some(selected) = consumer.switch_in_full(SLOT) {
+                assert_eq!(selected.record, record);
+                assert_eq!(selected.result, Some((-4i64) as u64));
+                assert_eq!(el1_park(&consumer, SLOT, 41, 0x8000, 900), record);
+                consumed.store(true, Ordering::Release);
+            }
+        }));
+    });
+    assert!(zone.interrupt_parked_futex(
+        zone.record_ref(record),
+        OTHER,
+        (-4i64) as u64,
+        &ShortLockSpin,
+        &mut WakeEffects::default(),
+    ));
+    if !reparked.load(Ordering::Acquire) {
+        let selected = zone.switch_in_full(SLOT).unwrap();
+        assert_eq!(selected.record, record);
+        assert_eq!(selected.result, Some((-4i64) as u64));
+        assert_eq!(el1_park(&zone, SLOT, 41, 0x8000, 900), record);
+    }
+    assert_eq!(zone.timer_deadline(SLOT), Some(900));
+    assert_eq!(zone.expire_timer(SLOT, 900, 0xbeef), Ok(true));
+    let selected = zone.switch_in_full(SLOT).unwrap();
+    assert_eq!(selected.record, record);
+    assert_eq!(selected.result, Some(0xbeef));
+}

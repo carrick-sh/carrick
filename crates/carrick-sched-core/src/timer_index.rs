@@ -4,6 +4,12 @@ use super::{RecordId, RecordRef, SlotId, ThreadCtx, ZONE_RECORDS, ZONE_SLOTS, Zo
 #[cfg(test)]
 std::thread_local! { static NODE_READS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) }; }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static BEFORE_CANCEL: std::cell::RefCell<Option<std::boxed::Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 use super::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +198,10 @@ impl Index {
         key
     }
     pub(super) fn cancel_record(&self, record: RecordId) {
+        #[cfg(test)]
+        if let Some(probe) = BEFORE_CANCEL.with(|probe| probe.borrow_mut().take()) {
+            probe();
+        }
         let lease = &self.leases[record.raw() as usize];
         loop {
             let slot_raw = lease.slot.load(Ordering::Acquire);
