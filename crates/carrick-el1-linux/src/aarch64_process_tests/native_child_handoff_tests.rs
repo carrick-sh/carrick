@@ -98,10 +98,11 @@ fn fork_child_service_ack(stdout: bool) {
     // Suspend this very child through the production service continuation.
     // Re-selecting a different MM would hide stale installed-space occupancy.
     let mut saved = unsafe { *fixture.zone.record(child).ctx_mut() };
+    let stdout_bytes = b"mask-storm role=child sends=2000 send_failures=0 ok=true\n";
     if stdout {
         // Same SVC words as the signed sender's 57-byte stdout write.
         saved.native.x[0] = 1;
-        saved.native.x[1] = 0x6000006030;
+        saved.native.x[1] = stdout_bytes.as_ptr() as u64;
         saved.native.x[2] = 0x39;
         saved.native.x[8] = 64;
         saved.native.pc = 0x2a6f20;
@@ -121,26 +122,40 @@ fn fork_child_service_ack(stdout: bool) {
         &mut service,
         |entry| {
             let result = if stdout {
-                use carrick_core_abi::host_file::{HostFileHeader, HostFileOp};
-                let bytes = b"mask-storm role=child sends=2000 send_failures=0 ok=true\n";
-                assert_eq!(bytes.len(), 0x39);
-                let mut record =
-                    vec![0; carrick_core_abi::host_file::record_len(bytes.len(), 0).unwrap()];
-                carrick_core_abi::host_file::encode(
-                    &mut record,
-                    HostFileHeader {
-                        op: HostFileOp::Write,
-                        table: [5, 1, 0],
-                        fd: 1,
-                        flags: 0,
-                        args: [0; 4],
+                use carrick_personality_linux::native_host_file::{
+                    DescriptionAccess, HostFileStage, NativeDescriptor,
+                };
+                let stage_frame = carrick_el1_abi::TrapFrame {
+                    x: saved.native.x,
+                    elr: saved.native.pc,
+                    esr: 0x56000000,
+                    slot: u64::from(fixture.slot.raw()),
+                    ..Default::default()
+                };
+                // Run the shipping staging entry point. A pre-encoded request
+                // bypasses its descriptor, input-copy and operation selection.
+                let Some(HostFileStage::Request {
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                }) = super::super::dispatch::native_host_file_stage(
+                    &stage_frame,
+                    &fixture.task,
+                    &crate::file::HardwareValidator,
+                    [5, 1, 0],
+                    |fd| {
+                        assert_eq!(fd, 1);
+                        Some(NativeDescriptor::HostBacked {
+                            access: DescriptionAccess::WriteOnly,
+                        })
                     },
-                    bytes,
-                    0,
+                    &mut |_| panic!("stdout releases no mapping sources"),
                 )
-                .unwrap();
-                let result =
-                    entry.begin_host_file_service(record.into_boxed_slice(), None, false, None);
+                else {
+                    panic!("the fork child's stdout must stage a host request");
+                };
+                let result = entry.begin_host_file_service(record, output, resolves_path, map);
                 entry.settle_service_exit(
                     result,
                     super::super::native_process_runtime::NativeServiceExit::Bridge,
@@ -194,7 +209,7 @@ fn fork_child_service_ack(stdout: bool) {
             )
         };
         let view = carrick_core_abi::host_file::HostFileRequestView::parse(record).unwrap();
-        assert_eq!(view.input().len(), 57);
+        assert_eq!(view.input(), stdout_bytes);
         view.reply(57, &[]).unwrap();
     }
     assert!(ticket.complete(true).is_ok());

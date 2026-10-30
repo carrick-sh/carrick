@@ -472,6 +472,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         result: Result<NativeResume, NativeProcessError>,
         exit: NativeServiceExit,
     ) -> Result<NativeResume, NativeProcessError> {
+        // Preserve the owner of a refused operation. A later refusal while
+        // folding a non-stale result belongs to settlement itself.
+        if !matches!(&result, Err(NativeProcessError::Stale)) {
+            self.service_phase = NativeServicePhase::Settlement;
+        }
         if !self.retains_ipc_operation(exit) {
             let result = result?;
             if matches!(result, NativeResume::Left(_)) && self.take_handoff_receipt().is_none() {
@@ -587,6 +592,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
             )));
         }
+        self.service_phase = NativeServicePhase::Capability;
         let capability = self
             .runtime
             .exec_capability()
@@ -651,6 +657,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
             )));
         }
+        self.service_phase = NativeServicePhase::Capability;
         let capability = self
             .runtime
             .exec_capability()
@@ -706,6 +713,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         payload: ServicePayload,
         retry_syscall_after_supply: bool,
     ) -> Result<NativeResume, NativeProcessError> {
+        self.service_phase = NativeServicePhase::Payload;
         let (payload, copyout, adapter) = match payload {
             ServicePayload::Copyout(output) => {
                 (ServicePayload::None, Some(Box::new(output)), false)
@@ -727,6 +735,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Stale);
             }
         };
+        self.service_phase = NativeServicePhase::Member;
         let (page, control, mm) = {
             let graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
@@ -748,6 +757,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .ok_or(NativeProcessError::Stale)?;
             (resources.page, member.control.clone(), resources.mm.clone())
         };
+        self.service_phase = NativeServicePhase::Birth;
         let birth =
             match control
                 .service
@@ -758,6 +768,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     // Fork binds a child's service cell at publication. The root
                     // has no earlier physical-service venue, so its first exact
                     // registered operation binds the same retained capability.
+                    self.service_phase = NativeServicePhase::Mm;
                     let handle = self.service.service_mm_handle(&mm)?;
                     let wait = ObjectWaitKey::native_service(self.record)
                         .ok_or(NativeProcessError::Stale)?;
@@ -765,6 +776,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .zone
                         .bind_object_wait(wait, &carrick_sched_core::ShortLockSpin)
                         .map_err(|_| NativeProcessError::Quarantined)?;
+                    self.service_phase = NativeServicePhase::Bind;
                     control
                         .service
                         .bind(carrick_core_abi::service::ServiceBirth {
@@ -774,6 +786,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             mm: handle,
                         })
                         .map_err(service_error)?;
+                    self.service_phase = NativeServicePhase::Birth;
                     control
                         .service
                         .bound_birth(self.key, self.binding.thread_generation, self.record)
@@ -781,6 +794,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 Err(error) => return Err(service_error(error)),
             };
+        self.service_phase = NativeServicePhase::Unspecified;
         let exec_successor = matches!(operation, ServiceOperation::Exec { .. })
             .then(|| {
                 self.runtime
@@ -813,6 +827,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )),
             _ => None,
         };
+        self.service_phase = NativeServicePhase::Park;
         let owner_queue = owner_wait
             .map(|_| {
                 let key =
@@ -825,6 +840,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .transpose()?;
         let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
             .map_err(|_| NativeProcessError::Busy)?;
+        self.service_phase = NativeServicePhase::Publication;
         let published = {
             let graph = self.runtime.graph.lock();
             if !claim.admitted() || graph.has_member_wait(&self.record) {
@@ -889,6 +905,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some(wait) = owner_wait {
             return self.park_owner_wait(&request, wait);
         }
+        self.service_phase = NativeServicePhase::Notice;
         if let Err(error) = self
             .current
             .service_notice
@@ -979,6 +996,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         request: &ServiceRequest,
         defer_adapter: bool,
     ) -> Result<NativeResume, NativeProcessError> {
+        self.service_phase = NativeServicePhase::Park;
         use carrick_sched_core::object_wait::ObjectWaitError;
         let zone = self.source.zone;
         let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
@@ -1186,6 +1204,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         request: &ServiceRequest,
         wait: carrick_core_abi::PortalOwnerWait,
     ) -> Result<NativeResume, NativeProcessError> {
+        self.service_phase = NativeServicePhase::Park;
         use carrick_sched_core::object_wait::ObjectWaitError;
         let zone = self.source.zone;
         let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
@@ -1903,6 +1922,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         mut result: ServiceResult,
         mut pending: Box<PendingService<'a>>,
     ) -> Result<NativeResume, NativeProcessError> {
+        self.service_phase = NativeServicePhase::Completion;
         if pending.request != *request {
             return Err(NativeProcessError::Quarantined);
         }
