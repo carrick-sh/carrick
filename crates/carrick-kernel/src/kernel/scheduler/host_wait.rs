@@ -573,6 +573,9 @@ impl RunQueueInner {
         self.changed.notify_all();
         drop(state);
         self.cpus[cpu.as_usize()].nudge();
+        if self.host_queued.load(Ordering::Acquire) > 0 {
+            self.wake_guest_idle(None);
+        }
         true
     }
 }
