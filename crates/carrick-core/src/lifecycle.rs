@@ -332,10 +332,18 @@ impl Drop for MemberReset<'_> {
     }
 }
 
+/// A retained source of progress for a control storage owner.
+pub trait MemberControlRelease: Send + Sync {
+    /// Publish progress after the final retained reference is returned. The
+    /// observer owns its exact notification source; this is not a reuse proof.
+    fn released(&self);
+}
+
 /// An owned control reference that prevents allocation reuse. A committed
 /// registration publishes its unregister receipt when every reference drops.
 pub struct MemberControlCustody<'a, T: MemberControl + ?Sized> {
     control: &'a T,
+    release: Option<alloc::sync::Arc<dyn MemberControlRelease + 'a>>,
 }
 impl<'a, T: MemberControl + ?Sized> MemberControlCustody<'a, T> {
     pub fn retain(control: &'a T) -> Result<Self, TransitionError> {
@@ -350,7 +358,25 @@ impl<'a, T: MemberControl + ?Sized> MemberControlCustody<'a, T> {
                 }
             })
             .map_err(|_| TransitionError::StaleGeneration)?;
-        Ok(Self { control })
+        Ok(Self {
+            control,
+            release: None,
+        })
+    }
+    /// Attach the storage owner's admitted progress source. All independently
+    /// retained references which can outlive this lease must inherit it.
+    pub fn with_release(
+        mut self,
+        release: alloc::sync::Arc<dyn MemberControlRelease + 'a>,
+    ) -> Self {
+        self.release = Some(release);
+        self
+    }
+    /// Retain the same incarnation and its notification authority together.
+    pub fn retained(&self) -> Result<Self, TransitionError> {
+        let mut retained = Self::retain(self.control)?;
+        retained.release = self.release.clone();
+        Ok(retained)
     }
     /// Commit a retained reference into the graph or terminal receipt set.
     /// Speculative retains must drop without manufacturing an unregister receipt.
@@ -379,10 +405,16 @@ impl<T: MemberControl + ?Sized> core::ops::Deref for MemberControlCustody<'_, T>
 }
 impl<T: MemberControl + ?Sized> Drop for MemberControlCustody<'_, T> {
     fn drop(&mut self) {
-        self.control
+        let previous = self
+            .control
             .exit_custody()
             .word
             .fetch_sub(GRAPH_REFERENCE, Ordering::AcqRel);
+        if previous & REFERENCES == GRAPH_REFERENCE
+            && let Some(release) = self.release.as_ref()
+        {
+            release.released();
+        }
     }
 }
 
