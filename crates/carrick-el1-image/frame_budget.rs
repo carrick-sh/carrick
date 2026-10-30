@@ -426,6 +426,27 @@ impl Frames {
                 "native service continuation",
                 service + self.maximum("::release_service_claim::") + allocation,
             ),
+            // Refusal folding runs after service preparation has returned.
+            // It can yield or retire an adapter, but never nests a backing
+            // reply under its own frame. Charge the new cold handoff path.
+            (
+                "native service refusal",
+                entry
+                    + self.required("::dispatch::arm_native_service_exit::")?
+                    + self.required("::aarch64_process::with_process_entry::")?
+                    + self.maximum("::arm_native_service_exit::_$u7b$$u7b$closure")
+                    + self.required("::settle_service_exit::")?
+                    + self.maximum("::yield_service_checkpoint::").max(
+                        self.sum(&[
+                            "::retire_adapter_result::",
+                            "::retire_adapter_operation::",
+                            "::retire_native_operation::",
+                            "::unpin_filtered::",
+                        ]) + fd_storage.max(fd_references)
+                            + fd_release.max(fd_notify).max(fd_deliver),
+                    )
+                    + allocation,
+            ),
             (
                 "native backing reply",
                 service
@@ -709,6 +730,7 @@ mod tests {
             "x::dispatch::arm_native_service_exit::h0",
             "x::park_service::h0",
             "x::begin_service_inner::h0",
+            "x::settle_service_exit::h0",
             "x::park_owner_wait::h0",
             "x::apply_fault_reply::h0",
             "x::setup_arm_signal_frame::h0",
@@ -732,6 +754,28 @@ mod tests {
         let error = frames.check(16384, 288).unwrap_err();
         assert!(error.contains("ring completed copyout"));
         assert!(error.contains("ring pipe copyout"));
+    }
+
+    #[test]
+    fn native_service_refusal_charges_handoff_and_adapter_retirement() {
+        reject_fd_chain(
+            "native service refusal",
+            &[
+                "x::settle_service_exit",
+                "x::yield_service_checkpoint",
+                "x::dispatch::arm_native_service_exit",
+                "x::aarch64_process::with_process_entry",
+            ],
+        );
+        reject_fd_chain(
+            "native service refusal",
+            &[
+                "x::settle_service_exit",
+                "x::retire_adapter_result",
+                "x::retire_native_operation",
+                "x::unpin_filtered",
+            ],
+        );
     }
 
     #[test]

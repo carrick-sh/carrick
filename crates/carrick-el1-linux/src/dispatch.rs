@@ -1010,7 +1010,6 @@ fn arm_native_service_exit(
     counters: &Counters,
 ) -> Option<Action> {
     use super::native_process_runtime::NativeResume;
-    use carrick_personality_linux::lifecycle::ProcessNative;
     let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
     let slot = SlotId::from_index(frame.slot as usize)?;
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
@@ -1198,11 +1197,19 @@ fn arm_native_service_exit(
         control,
         &mut service,
         |process| {
+            let exit = if matches!(
+                operation,
+                Some(carrick_core_abi::service::ServiceOperation::CarrierWork { .. })
+            ) {
+                super::native_process_runtime::NativeServiceExit::CarrierWork
+            } else {
+                super::native_process_runtime::NativeServiceExit::Bridge
+            };
             let result = if let Some(payload) = exec_payload {
                 if service_wait.is_some() {
                     return Err(super::native_process_runtime::NativeProcessError::Quarantined);
                 }
-                process.begin_exec_service(payload)?
+                process.begin_exec_service(payload)
             } else if let Some(staged) = host_file {
                 if service_wait.is_some() {
                     return Err(super::native_process_runtime::NativeProcessError::Quarantined);
@@ -1213,7 +1220,7 @@ fn arm_native_service_exit(
                     resolves_path,
                     map,
                 } = *staged;
-                process.begin_host_file_service(record, output, resolves_path, map)?
+                process.begin_host_file_service(record, output, resolves_path, map)
             } else if retry_exec_stage {
                 process.begin_exec_stage_fault_service(
                     match operation {
@@ -1226,24 +1233,21 @@ fn arm_native_service_exit(
                     },
                     fault_sequence,
                     service_wait,
-                )?
+                )
             } else if let Some(wait) = service_wait {
                 process.begin_owner_service_wait(
                     operation
                         .ok_or(super::native_process_runtime::NativeProcessError::Quarantined)?,
                     wait,
-                )?
+                )
             } else {
                 process.begin_service(
                     operation
                         .ok_or(super::native_process_runtime::NativeProcessError::Quarantined)?,
                     fault_sequence,
-                )?
+                )
             };
-            if matches!(result, NativeResume::Left(_)) && process.take_handoff_receipt().is_none() {
-                return Err(super::native_process_runtime::NativeProcessError::Quarantined);
-            }
-            Ok(result)
+            process.settle_service_exit(result, exit)
         },
     )
     .and_then(core::convert::identity)
