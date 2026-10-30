@@ -3646,7 +3646,7 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
         .zone
         .enqueue(&guard, sibling.record.id, seq, 1, address, u32::MAX, 0)
         .unwrap();
-    let receipt = carrick_core::entry::publish_handoff_park(
+    let _receipt = carrick_core::entry::publish_handoff_park(
         start,
         &guard,
         carrick_core_abi::EntryRecordGeneration(seq),
@@ -3727,5 +3727,4 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
             .take_deliverable(sibling.record, SigBlockMask::NONE)
             .is_some()
     );
-    drop(receipt);
 }
