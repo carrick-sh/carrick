@@ -9721,32 +9721,35 @@ mod transfer_service_tests {
             .prepare_guest_descriptor_txn(mm, unmap_op)
             .expect("prepare reclaiming unmap");
         let required = std::cell::Cell::new(false);
-        let receipts = {
+        let receipt = {
+            use crate::descriptor_drain::GuestDrainVenue;
+
             let mut services = engine.descriptor_services();
             services.slot = Some(0);
             services.required_invalidation = Some(&required);
-            crate::descriptor_drain::apply_guest_descriptor_txns_now(
-                &mut services,
-                &slots,
-                &[unmap_txn],
-            )
-            .expect("apply reclaiming unmap on required_invalidation=Some venue")
+            let applied = services
+                .apply_as_host(&unmap_txn, &slots)
+                .expect("held editor exclusion must take the host lane, never EL1 drain")
+                .expect("apply reclaiming unmap on required_invalidation=Some venue");
+            services
+                .settle(&unmap_txn, &applied)
+                .expect("settle host-applied reclaiming unmap")
         };
-        assert_eq!(receipts.len(), 1);
-        assert_eq!(receipts[0].reclaimed_tables(), &[split_table]);
+        assert_eq!(receipt.reclaimed_tables(), &[split_table]);
 
         let reused_txn = engine
             .page_tables
             .prepare_guest_descriptor_txn(mm, map_op)
             .expect("prepare subsequent map");
+        // Snapshot at handout, before any later operation could pay deferred debt.
+        let maintenance_runs_at_reissue = engine.vcpu.borrow().runs;
         assert_eq!(
             reused_txn.tables.as_slice(),
             &[split_table],
             "settled receipt returned the reclaimed table to free_tables"
         );
         assert_eq!(
-            engine.vcpu.borrow().runs,
-            1,
+            maintenance_runs_at_reissue, 1,
             "the ASID flush must complete before a reclaimed table page is settled into free_tables and handed out again"
         );
         assert!(
