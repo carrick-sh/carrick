@@ -415,6 +415,7 @@ impl<'a, C: ProcessContext> HostExecRebindWaiters<'a, C> {
                 }
                 Ok((record, fresh))
             },
+            Some(self),
         );
         if parked.is_err() {
             registered
@@ -451,7 +452,7 @@ impl<'a, C: ProcessContext> HostExecRebindWaiters<'a, C> {
                     *source.zone.record(record).ctx_mut() = *saved;
                 }
                 source.zone.requeue_preempted(source.slot, record);
-                carrick_core::entry::publish_handoff_yield(handoff)
+                carrick_core::entry::publish_handoff_yield(handoff, Some(self))
                     .ok_or(NativeProcessError::Stale)?;
                 Ok(())
             }
@@ -1769,7 +1770,28 @@ pub(super) enum NativeThreadGroupOwner {
 /// graph; children retain their parent's graph through exact member indices.
 pub struct NativeProcessRegistry<'a, M: Clone, C: ProcessContext> {
     state: SpinLock<NativeRegistryState<'a, M, C>>,
-    rebind_waits: HostExecRebindWaiters<'a, C>,
+    rebind_waits: SpinLock<Option<Arc<HostExecRebindWaiters<'a, C>>>>,
+}
+
+impl<M: Clone, C: ProcessContext> carrick_core::entry::RecordRelease<C>
+    for NativeProcessRegistry<'_, M, C>
+{
+    fn record_released(&self, source: BornInZoneSource<'_, C>, record: RecordRef) {
+        self.host_exec_waiters()
+            .record_released(core::ptr::from_ref(source.zone).addr(), record);
+    }
+}
+impl<C: ProcessContext> carrick_core::entry::RecordRelease<C> for HostExecRebindWaiters<'_, C> {
+    fn record_released(&self, source: BornInZoneSource<'_, C>, record: RecordRef) {
+        self.record_released(core::ptr::from_ref(source.zone).addr(), record);
+    }
+}
+impl<C: ProcessContext> carrick_personality_linux::abi::thread::NativePendingRelease
+    for HostExecRebindWaiters<'_, C>
+{
+    fn pending_released(&self, control: &ThreadControlSlot) {
+        self.pending_released(control);
+    }
 }
 
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
@@ -1903,7 +1925,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
 
     pub const fn new() -> Self {
         Self {
-            rebind_waits: HostExecRebindWaiters::new(),
+            rebind_waits: SpinLock::new(None),
             state: SpinLock::new(NativeRegistryState {
                 members: BTreeMap::new(),
                 groups: BTreeMap::new(),
@@ -1913,8 +1935,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
     }
 
-    pub fn host_exec_waiters(&self) -> &HostExecRebindWaiters<'a, C> {
-        &self.rebind_waits
+    pub fn host_exec_waiters(&self) -> Arc<HostExecRebindWaiters<'a, C>> {
+        self.rebind_waits
+            .lock()
+            .get_or_insert_with(|| Arc::new(HostExecRebindWaiters::new()))
+            .clone()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2248,7 +2273,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             )
         };
         let prepared = NativeProcessRuntime::<M, C>::prepare_root_group::<B>(
-            source, current, page, control, address, &words, true, &runtime.pending_release,
+            source,
+            current,
+            page,
+            control,
+            address,
+            &words,
+            true,
+            &runtime.pending_release,
         )?;
         if prepared.leader.key != process
             || prepared.leader.visible.get() != visible_pid
@@ -3550,6 +3582,13 @@ struct PreparedRootGroup<'a, C: ProcessContext> {
 }
 
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
+    // Resolve the venue before publication; no registration guard is retained
+    // across the service's physical backing-reply completion.
+    #[inline(never)]
+    fn record_release(&self) -> Option<&'a dyn carrick_core::entry::RecordRelease<C>> {
+        (*self.registry.lock())
+            .map(|registry| registry as &dyn carrick_core::entry::RecordRelease<C>)
+    }
     #[cfg(test)]
     pub(super) fn install_closing_race_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.closing_race_hook.lock() = Some(hook);
@@ -3812,7 +3851,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         address: AddressContext<RootGpa>,
         words: &C,
         park_on_pending_busy: bool,
-        pending_release: &Arc<dyn carrick_personality_linux::abi::thread::NativePendingRelease + 'a>,
+        pending_release: &Arc<
+            dyn carrick_personality_linux::abi::thread::NativePendingRelease + 'a,
+        >,
     ) -> Result<PreparedRootGroup<'a, C>, NativeProcessError> {
         let leader =
             Self::validate_root_leader::<B>(source, current, page, control, address, words)?;
@@ -3836,17 +3877,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         members.extend(imported.iter().map(|(member, _, _)| member.clone()));
         let signals = NativeProcessSignals::fresh_root(leader.key, page);
         for member in &mut members {
-            let pending = carrick_el1_abi::NativePendingCustody::try_admit(member.control.clone(), pending_release.clone())
-                .map_err(|_| {
-                    if park_on_pending_busy {
-                        NativeProcessError::RebindWait(HostExecRebindWait::PendingCustody {
-                            record: member.record,
-                            control: core::ptr::from_ref(member.control.control()).addr(),
-                        })
-                    } else {
-                        NativeProcessError::Busy
-                    }
-                })?;
+            let pending = carrick_el1_abi::NativePendingCustody::try_admit(
+                member.control.clone(),
+                pending_release.clone(),
+            )
+            .map_err(|_| {
+                if park_on_pending_busy {
+                    NativeProcessError::RebindWait(HostExecRebindWait::PendingCustody {
+                        record: member.record,
+                        control: core::ptr::from_ref(member.control.control()).addr(),
+                    })
+                } else {
+                    NativeProcessError::Busy
+                }
+            })?;
             member.signal_projection = Some(signals.project_member(member.record, pending));
         }
         let control_custody = carrick_core::lifecycle::MemberControlCustody::retain(control)
@@ -3871,8 +3915,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: C,
         pending_release: Arc<dyn carrick_personality_linux::abi::thread::NativePendingRelease + 'a>,
     ) -> Result<Self, NativeProcessError> {
-        let prepared =
-            Self::prepare_root_group::<B>(source, current, page, control, address, &words, false, &pending_release)?;
+        let prepared = Self::prepare_root_group::<B>(
+            source,
+            current,
+            page,
+            control,
+            address,
+            &words,
+            false,
+            &pending_release,
+        )?;
         let ValidatedRootLeader {
             record,
             visible,
@@ -4542,8 +4594,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current()
             .or_else(|| self.source.zone.slot(self.source.slot).host_record())
         {
-            self.handoff =
-                carrick_core::entry::retire_current(self.binding, self.source, record, None);
+            self.handoff = carrick_core::entry::retire_current(
+                self.binding,
+                self.source,
+                record,
+                self.runtime.record_release(),
+            );
         }
         // No graph exit or MM retirement is claimed. Even if lane retirement
         // refuses, the authenticated carrier report stops this incomplete run.
@@ -5221,7 +5277,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             start,
             &guard,
             carrick_el1_abi::EntryRecordGeneration(sequence),
-            None,
+            self.runtime.record_release(),
         );
         if receipt.is_none() {
             self.runtime.graph.lock().remove_signal_wait(&self.record);
@@ -5427,7 +5483,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             start,
             &guard,
             carrick_el1_abi::EntryRecordGeneration(sequence),
-            None,
+            self.runtime.record_release(),
         );
         if receipt.is_none() {
             self.runtime.graph.lock().pending.remove(&self.key);
@@ -5623,7 +5679,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             start,
             &guard,
             carrick_el1_abi::EntryRecordGeneration(sequence),
-            None,
+            self.runtime.record_release(),
         );
         if receipt.is_none() {
             self.runtime.graph.lock().pending.remove(&self.key);
@@ -5952,7 +6008,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.binding,
                 self.source,
                 self.record.id,
-                None,
+                self.runtime.record_release(),
             )
             .ok_or(NativeProcessError::Quarantined)?;
         carrick_core::lifecycle::retire_cancelled_pool_member(
@@ -6049,7 +6105,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     self.binding,
                     self.source,
                     self.record.id,
-                    None,
+                    self.runtime.record_release(),
                 );
                 if self.take_handoff_receipt().is_none() {
                     return Err(NativeProcessError::Quarantined.run_failure_reason());
@@ -6110,7 +6166,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.binding,
                 self.source,
                 record,
-                None,
+                self.runtime.record_release(),
             )
             .ok_or(NativeProcessError::Quarantined)?
             {
@@ -6139,8 +6195,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             zone.record(record).publish_owner_continuation(entry);
         }
         let sequence = carrick_el1_abi::EntryRecordGeneration(sequence);
-        let receipt = carrick_core::terminal::park_process_exit(start, &guard, sequence, None)
-            .ok_or(NativeProcessError::Quarantined)?;
+        let receipt = carrick_core::terminal::park_process_exit(
+            start,
+            &guard,
+            sequence,
+            self.runtime.record_release(),
+        )
+        .ok_or(NativeProcessError::Quarantined)?;
         drop(guard);
         zone.clear_current(self.source.slot);
         self.handoff = Some(receipt);
@@ -6823,7 +6884,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.binding,
             self.source,
             record,
-            None,
+            self.runtime.record_release(),
         );
         if self.handoff.is_none() {
             return Err(NativeProcessError::Quarantined);

@@ -131,7 +131,7 @@ pub(super) fn admit_root(
         address,
         address,
         words,
-        Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+        REGISTRY.host_exec_waiters(),
     )?;
     REGISTRY.register_root(Arc::new(owner), source, task, address)?;
     let binding =

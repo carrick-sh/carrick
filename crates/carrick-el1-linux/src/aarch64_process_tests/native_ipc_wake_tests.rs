@@ -51,7 +51,7 @@ fn two_native_children_pipe_eof_wake(away: bool) {
         fixture.address,
         fixture.address,
         parked,
-        alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+        crate::aarch64_process::registry().host_exec_waiters(),
     )
     .unwrap();
     let owner = Arc::new(

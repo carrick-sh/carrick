@@ -1262,7 +1262,7 @@ fn arm_host_exec_rebind_parks_on_predecessor_on_cpu_once_then_succeeds() {
         Claim::Parked { .. }
     ));
 
-    // 2. Release `pred_record` from `slot_b` via `retire_current`: this triggers `on_record_released`
+    // 2. Release `pred_record` from `slot_b` via `retire_current`: this notifies its retained registry venue
     // and wakes `waiter_record` onto `fixture.slot`!
     assert!(
         carrick_core::entry::retire_current(
@@ -1272,6 +1272,7 @@ fn arm_host_exec_rebind_parks_on_predecessor_on_cpu_once_then_succeeds() {
                 slot: slot_b,
             },
             pred_record.id,
+            Some(registry()),
         )
         .is_some()
     );
@@ -1465,8 +1466,11 @@ fn arm_host_exec_rebind_parks_on_pending_custody_once_then_succeeds() {
         carrick_core::lifecycle::MemberControlCustody::retain(post_sib_control)
             .map(Arc::new)
             .unwrap();
-    let pending_custody =
-        carrick_el1_abi::NativePendingCustody::try_admit(retained_sib_control).unwrap();
+    let pending_custody = carrick_el1_abi::NativePendingCustody::try_admit(
+        retained_sib_control,
+        registry().host_exec_waiters(),
+    )
+    .unwrap();
     assert!(post_sib_control.native_pending_busy());
 
     let replacement_control = committed.thread().control_slot();
@@ -1559,7 +1563,7 @@ fn arm_host_exec_rebind_parks_on_pending_custody_once_then_succeeds() {
         Claim::Parked { .. }
     ));
 
-    // 2. Drop `pending_custody`: this triggers `on_native_pending_released` and wakes `waiter_record`!
+    // 2. Drop `pending_custody`: this notifies its retained pending-release venue and wakes `waiter_record`!
     drop(pending_custody);
     assert!(!post_sib_control.native_pending_busy());
     assert!(

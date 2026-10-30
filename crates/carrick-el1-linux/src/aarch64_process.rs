@@ -471,20 +471,12 @@ fn admit_entry_runtime(
         address,
         address,
         words,
-        alloc::sync::Arc::new(|_: &carrick_el1_abi::ThreadControlSlot| {}),
+        REGISTRY.host_exec_waiters(),
     )?);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
     Ok((runtime, address))
 }
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn on_record_released(zone: usize, _slot: SlotId, record: carrick_sched_core::RecordRef) {
-    REGISTRY.host_exec_waiters().record_released(zone, record);
-}
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn on_native_pending_released(control: &ThreadControlSlot) {
-    REGISTRY.host_exec_waiters().pending_released(control);
-}
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[inline(never)]
 pub(super) fn park_host_exec_rebind_wait(
@@ -493,8 +485,6 @@ pub(super) fn park_host_exec_rebind_wait(
     record: RecordId,
     wait: super::native_process_runtime::HostExecRebindWait,
 ) -> Result<(), NativeProcessError> {
-    carrick_core::entry::set_record_release_hook(on_record_released);
-    carrick_el1_abi::set_native_pending_release_hook(on_native_pending_released);
     let resume = carrick_core::wait::OperationResumePc::new(native.pc.wrapping_sub(4))
         .ok_or(NativeProcessError::Stale)?;
     // SAFETY: this entry owns the exact running/home record until handoff.

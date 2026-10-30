@@ -687,7 +687,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 Ok((self.record.id, false))
             },
-            None,
+            self.runtime.record_release(),
         );
         if let Some(error) = failure {
             return Err(error);
@@ -792,7 +792,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 Ok((self.record.id, false))
             },
-            None,
+            self.runtime.record_release(),
         );
         match parked {
             Ok(mut parked) => {
@@ -1335,7 +1335,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             start,
             &guard,
             carrick_el1_abi::EntryRecordGeneration(sequence),
-            None,
+            self.runtime.record_release(),
         )
         .ok_or(NativeProcessError::Quarantined)?;
         drop(guard);
