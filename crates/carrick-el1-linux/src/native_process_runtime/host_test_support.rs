@@ -1750,6 +1750,14 @@ fn add_service_sibling(
     fixture: &NativeSignalFixture,
     operation: Option<carrick_core_abi::service::ServiceOperation>,
 ) -> ExecSibling {
+    add_signal_sibling(fixture, operation, false)
+}
+
+fn add_signal_sibling(
+    fixture: &NativeSignalFixture,
+    operation: Option<carrick_core_abi::service::ServiceOperation>,
+    host_issued: bool,
+) -> ExecSibling {
     let binding = ExecutionBinding {
         task: carrick_core_abi::EntryTaskKey::from_raw(42),
         generation: carrick_core_abi::SnapshotGeneration::from_raw(12),
@@ -1757,53 +1765,75 @@ fn add_service_sibling(
         thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(102),
     };
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
-    let entry = fixture
-        .page
-        .stock(
-            0,
-            carrick_el1_abi::EntryIdentity {
-                tid: 42,
-                visible_tid: 42,
-                thread_serial: 102,
-                birth: carrick_core_abi::entry::BirthSerial::of_task(
-                    TaskSerial::from_raw_u64(12).unwrap(),
-                ),
-                uid_credit: 0,
-            },
-        )
-        .unwrap();
-    fixture
-        .page
-        .bind_control_address(entry, control as *const _ as u64)
-        .unwrap();
-    control
-        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
-        .unwrap();
-    assert!(control.publish_visible_tid(42));
-    control.publish_host_birth_identity(
-        carrick_core::terminal::ThreadBirthIdentity::from_parts(
-            binding.task,
-            carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
-            binding.thread_generation,
-        )
-        .unwrap(),
-    );
-    let claim = fixture.page.claim(entry).unwrap();
-    fixture
-        .page
-        .record_born(
-            claim,
-            carrick_el1_abi::BornRecord {
-                caller_task: 41,
-                caller_serial: 101,
-                clone_flags: 0x0001_0000,
-                clear_child_tid: 0,
-                blocked: carrick_el1_abi::BlockedMask(0),
-            },
-        )
-        .unwrap();
-    carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
-    fixture.page.publish(entry).unwrap();
+    if host_issued {
+        control
+            .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+            .unwrap();
+        assert!(control.publish_visible_tid(42));
+        control.publish_host_birth_identity(
+            carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                binding.task,
+                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+                binding.thread_generation,
+            )
+            .unwrap(),
+        );
+        let birth = fixture.page.reserve_host_birth().unwrap();
+        carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
+        assert!(
+            fixture
+                .page
+                .publish_host_birth(birth, control.host_birth_identity().unwrap())
+        );
+    } else {
+        let entry = fixture
+            .page
+            .stock(
+                0,
+                carrick_el1_abi::EntryIdentity {
+                    tid: 42,
+                    visible_tid: 42,
+                    thread_serial: 102,
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        TaskSerial::from_raw_u64(12).unwrap(),
+                    ),
+                    uid_credit: 0,
+                },
+            )
+            .unwrap();
+        fixture
+            .page
+            .bind_control_address(entry, control as *const _ as u64)
+            .unwrap();
+        control
+            .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+            .unwrap();
+        assert!(control.publish_visible_tid(42));
+        control.publish_host_birth_identity(
+            carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                binding.task,
+                carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+                binding.thread_generation,
+            )
+            .unwrap(),
+        );
+        let claim = fixture.page.claim(entry).unwrap();
+        fixture
+            .page
+            .record_born(
+                claim,
+                carrick_el1_abi::BornRecord {
+                    caller_task: 41,
+                    caller_serial: 101,
+                    clone_flags: 0x0001_0000,
+                    clear_child_tid: 0,
+                    blocked: carrick_el1_abi::BlockedMask(0),
+                },
+            )
+            .unwrap();
+        carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
+        fixture.page.publish(entry).unwrap();
+    }
 
     let task = Box::leak(Box::new(CurrentTask::new()));
     task.set(
@@ -3579,4 +3609,123 @@ fn portal_wait_cancellation_resumes_exact_native_service_waiter() {
         matches!(entry.resume_checkpoint().unwrap(), NativeResume::Returned(result) if result.raw() == 0x41),
         "cancellation resumes the service and preserves its committed result"
     );
+}
+
+#[test]
+fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalRequest, SignalThreadSelector,
+    };
+    use carrick_signal_core::policy::{SigBlockMask, Signal};
+    let fixture = native_exec_fixture();
+    fixture.install_handler(10, false);
+    let sibling = add_signal_sibling(&fixture, None, true);
+    assert_eq!(fixture.page.live(), 2);
+    assert!(sibling.control.entry().is_none());
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: sibling.slot,
+    };
+    let binding = super::super::common_entry::execution_binding(sibling.task);
+    let start = carrick_core::entry::prepare_handoff(binding, source, sibling.record.id).unwrap();
+    let word = core::sync::atomic::AtomicU32::new(0);
+    let address = word.as_ptr() as u64;
+    let guard = fixture
+        .zone
+        .lock(
+            ZoneTables::<ParkedContextWords>::bucket_of_with_context(1, address),
+            &carrick_sched_core::BoundedSpin(1000),
+        )
+        .unwrap();
+    let seq = fixture.zone.next_seq(sibling.record.id);
+    // Same enrollment/publication boundary used by the futex syscall; no host wait or sleep.
+    unsafe {
+        *fixture.zone.record(sibling.record.id).ctx_mut() = words(fixture.address);
+    }
+    fixture
+        .zone
+        .enqueue(&guard, sibling.record.id, seq, 1, address, u32::MAX, 0)
+        .unwrap();
+    let receipt = carrick_core::entry::publish_handoff_park(
+        start,
+        &guard,
+        carrick_core_abi::EntryRecordGeneration(seq),
+    )
+    .unwrap();
+    drop(guard);
+    assert_eq!(fixture.zone.record(sibling.record.id).entry_count(), 1);
+    assert_eq!(
+        fixture.zone.record(sibling.record.id).claim(),
+        carrick_sched_core::Claim::Parked { seq }
+    );
+    let mut service = fixture.service();
+    let saved = words(fixture.address);
+    let mut sender = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert_eq!(
+        sender.tgkill(
+            SignalThreadSelector::from_abi(99),
+            SignalThreadSelector::from_abi(42),
+            SignalRequest::Probe,
+            SignalInfo::Generated(None),
+        ),
+        Err(carrick_syscall_abi::LINUX_ESRCH),
+    );
+    assert_eq!(
+        sender.tgkill(
+            SignalThreadSelector::from_abi(41),
+            SignalThreadSelector::from_abi(99),
+            SignalRequest::Probe,
+            SignalInfo::Generated(None),
+        ),
+        Err(carrick_syscall_abi::LINUX_ESRCH),
+    );
+    assert_eq!(
+        sender.tgkill(
+            SignalThreadSelector::from_abi(41),
+            SignalThreadSelector::from_abi(42),
+            SignalRequest::Deliver(Signal::from_number(10).unwrap()),
+            SignalInfo::Generated(None),
+        ),
+        Ok(()),
+    );
+    assert!(sender.take_run_failure().is_none());
+    drop(sender);
+    assert!(
+        fixture
+            .runtime
+            .current_signals(fixture.task)
+            .unwrap()
+            .take_deliverable(fixture.record, SigBlockMask::NONE)
+            .is_none(),
+        "sender cannot steal a sibling's signal"
+    );
+    let selected = fixture
+        .zone
+        .switch_in_full(sibling.slot)
+        .expect("signal must make the exact futex waiter runnable");
+    assert_eq!(selected.record, sibling.record.id);
+    assert_eq!(selected.result.map(|value| value as i64), Some(-4));
+    assert_eq!(fixture.zone.record(sibling.record.id).entry_count(), 0);
+    assert!(
+        fixture
+            .runtime
+            .current_signals(sibling.task)
+            .unwrap()
+            .take_deliverable(sibling.record, SigBlockMask::NONE)
+            .is_some()
+    );
+    drop(receipt);
 }
