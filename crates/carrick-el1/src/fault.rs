@@ -253,6 +253,9 @@ impl PreparedPageResolver for HardwarePreparedResolver {
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
         Ok(outcome)
     }
+    fn inherited_prepared_supply(&self) -> bool {
+        true
+    }
 }
 
 /// Invalidate this CPL0 CPU's TLB entry for the page holding `va` in the
@@ -1561,13 +1564,15 @@ fn dispatch_classified_fault<
                 }
                 Err(_) => return None,
             };
-            let window = match prepared
-                .as_mut()?
+            let path = prepared.as_mut()?;
+            let window = match path
                 .resolver
                 .select_backing_window(editor.grant().ttbr0, window)
             {
                 Ok(window) => window,
-                Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied) => {
+                Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied)
+                    if path.resolver.inherited_prepared_supply() =>
+                {
                     // The output exists but is still invalid. The child's
                     // inherited physical custody, not fresh zero backing, must
                     // authorize this page's first publication.
@@ -1587,7 +1592,13 @@ fn dispatch_classified_fault<
                         .publish_prepared_fault_selection(window.operation.sequence.get(), page)
                         .then_some(());
                 }
-                Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::AlreadyValid) => {
+                // A valid publication raced the observed fault, or this lane
+                // has no inherited-prepared supply for an occupied leaf.
+                // Re-enter without physical supply.
+                Err(
+                    carrick_mmu_core::descriptor_refusal::DescriptorRefusal::AlreadyValid
+                    | carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied,
+                ) => {
                     retry = true;
                     return None;
                 }

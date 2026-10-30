@@ -269,8 +269,9 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
         }
         if let DescriptorOp::Publish { span, access, .. } = txn.op {
             // This reply owns existing fork custody, not a fresh grant. The
-            // descriptor executor checks the exact output and only raises
-            // VALID; inherited permissions and physical COW remain intact.
+            // descriptor executor checks the exact output and consumes the
+            // leaf's deferred fork COW: the output is published COW-armed,
+            // so the first write from either process copies it.
             let permitted = match access {
                 carrick_mmu_core::aarch64::LeafAccess::Read => {
                     window
