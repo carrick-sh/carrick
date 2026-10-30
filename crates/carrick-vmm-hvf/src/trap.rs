@@ -2756,6 +2756,10 @@ impl PersistentExecutorSpec {
     ) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
         self.carrier_mappings.fd_ceiling_publisher()
     }
+
+    pub(crate) fn guest_capture(&self) -> std::sync::Arc<crate::guest_capture::GuestCapture> {
+        std::sync::Arc::clone(&self.carrier_mappings.custody.guest_capture)
+    }
 }
 
 // SAFETY: PersistentCarrierMappings owns immutable VM-global MAP_SHARED
@@ -8255,6 +8259,26 @@ impl HvfInner {
             crate::probes::vcpu_run_enter(vcpu.id());
             vcpu.run().map_err(hvf_error)?;
             drop(entry);
+            if let Some(slot) = mailbox.leased_slot() {
+                custody.guest_capture.observe(usize::from(slot.raw()), || {
+                    crate::guest_capture::GuestRegisters {
+                        pc: vcpu.get_reg(Reg::PC).ok(),
+                        cpsr: vcpu.get_reg(Reg::CPSR).ok(),
+                        elr: vcpu.get_sys_reg(SysReg::ELR_EL1).ok(),
+                        esr: vcpu.get_sys_reg(SysReg::ESR_EL1).ok(),
+                        far: vcpu.get_sys_reg(SysReg::FAR_EL1).ok(),
+                        spsr: vcpu.get_sys_reg(SysReg::SPSR_EL1).ok(),
+                        x8: vcpu.get_reg(Reg::X8).ok(),
+                        record: carrick_el1_abi::zone_tables().and_then(|zone| {
+                            let slot =
+                                carrick_el1_abi::SlotId::from_index(usize::from(slot.raw()))?;
+                            zone.slot(slot)
+                                .current()
+                                .map(|record| zone.record_ref(record))
+                        }),
+                    }
+                });
+            }
             VCPU_RUN_EXITS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let exit = vcpu.get_exit_info();
             let class = carrick_el1_abi::HostExitClass::from_hvf(

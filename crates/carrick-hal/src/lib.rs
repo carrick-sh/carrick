@@ -146,3 +146,5 @@ pub use pre_admission::{PreAdmissionOwner, PreAdmissionPermit, PreAdmissionRecei
 
 // Exact owner MM domain used by physical inventory bindings.
 pub use carrick_guest_arch::MmGeneration;
+
+pub mod diagnostic_capture;
