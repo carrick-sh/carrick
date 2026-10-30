@@ -32,8 +32,8 @@ pub use owner::*;
 
 mod user_write;
 pub use user_write::{
-    CopyoutPreparation, CopyoutRequest, UserWriteError, UserWriteRequest, UserWriteTarget,
-    UserWriteVenue,
+    CopyoutPreparation, CopyoutRequest, OwnedOperationYield, UserWriteError, UserWriteRequest,
+    UserWriteTarget, UserWriteVenue,
 };
 
 pub use crate::mm::frames::{GrantTarget, grant_target};

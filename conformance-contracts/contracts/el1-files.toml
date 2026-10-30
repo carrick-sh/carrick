@@ -1,3 +1,6 @@
+# #1044: owned-yield replies are typed separately from memory preparation.
+# The retained IPC/CarrierWork seam bindings below cover that API change;
+# existing fork, lifecycle, file and inotify acceptance remains unchanged.
 schema_version = 1
 id = "kernel.el1.files"
 title = "Delegated EL1 regular file operations"

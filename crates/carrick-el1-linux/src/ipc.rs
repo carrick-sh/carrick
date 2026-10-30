@@ -674,6 +674,9 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
     let mut copy = PrefixCopy::new(user);
     let mut prepared_offset = None;
     loop {
+        // Only the immediate Ready retry keeps its preparation guard. A
+        // different dependency/yield must get a fresh preparation attempt.
+        let previous_prepared_offset = prepared_offset.take();
         let nonblock = {
             let pin = OfdPin::from_raw(op.pin);
             let flags = region.fd(EL1_WAIT).pinned(&pin).map(|d| d.flags.nonblock);
@@ -798,7 +801,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             });
             // One successful preparation may retry the hardware copy once
             // at this cursor. A persistent refusal has no progress authority.
-            let preparation = if prepared_offset == Some(op.progress.written) {
+            let preparation = if previous_prepared_offset == Some(op.progress.written) {
                 CopyoutPreparation::Unrouted(operation)
             } else {
                 copy.user.prepare_copyout(request, operation)
@@ -818,6 +821,40 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     operation
                 }
                 CopyoutPreparation::Fault(operation) => operation,
+                CopyoutPreparation::Busy(operation) => {
+                    let restored = from_sched_token(operation).unwrap_or_else(|| {
+                        crate::dispatch::invalid_completion(
+                            crate::dispatch::NativeInvariant::EntryBinding,
+                        )
+                    });
+                    // Report an already-delivered prefix; before any bytes,
+                    // yield the same operation through its CarrierWork owner.
+                    let why = if op.progress.written > 0 {
+                        IpcLeave::FaultFirst
+                    } else {
+                        IpcLeave::ObjectBusyHost
+                    };
+                    return (
+                        match bail(
+                            sched,
+                            frame,
+                            restored,
+                            op,
+                            resumed,
+                            venue,
+                            why,
+                            copy.user,
+                            native_sigpipe,
+                        ) {
+                            Ok(served) => served,
+                            Err(retry) => {
+                                token = retry;
+                                continue;
+                            }
+                        },
+                        false,
+                    );
+                }
                 CopyoutPreparation::Unrouted(operation) => {
                     let restored = from_sched_token(operation).unwrap_or_else(|| {
                         crate::dispatch::invalid_completion(
@@ -826,9 +863,9 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     });
                     if native_sigpipe {
                         if op.progress.written == 0 {
-                            // Busy/stale preparation supplies no dependency
-                            // to enroll on. Keep terminal custody and fail
-                            // closed, rather than invent ENOSYS or spin.
+                            // A structural refusal supplies no valid execution
+                            // authority. Busy takes the owned yield arm above;
+                            // stale/quarantined execution keeps terminal custody.
                             retain_native_operation(sched, restored);
                             crate::dispatch::invalid_completion(
                                 crate::dispatch::NativeInvariant::EntryBinding,
@@ -1298,20 +1335,20 @@ fn bail<C: ThreadCpu, U: UserWord, M: UserCopy>(
             let operation = to_sched_token(token).unwrap_or_else(|_| {
                 crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::EntryBinding)
             });
-            use carrick_core::mm::transaction::CopyoutPreparation;
+            use carrick_core::mm::transaction::OwnedOperationYield;
             return match user.yield_owned_operation(operation) {
-                CopyoutPreparation::Ready(operation) => Err(from_sched_token(operation)
+                OwnedOperationYield::Ready(operation) => Err(from_sched_token(operation)
                     .unwrap_or_else(|| {
                         crate::dispatch::invalid_completion(
                             crate::dispatch::NativeInvariant::EntryBinding,
                         )
                     })),
-                CopyoutPreparation::Suspended => Ok(IpcServed::Idle),
-                CopyoutPreparation::Complete(result) => {
+                OwnedOperationYield::Suspended => Ok(IpcServed::Idle),
+                OwnedOperationYield::Complete(result) => {
                     frame.x[0] = result as u64;
                     Ok(IpcServed::Returned { switched: false })
                 }
-                _ => crate::dispatch::invalid_completion(
+                OwnedOperationYield::Unrouted(_) => crate::dispatch::invalid_completion(
                     crate::dispatch::NativeInvariant::EntryBinding,
                 ),
             };
@@ -2849,9 +2886,12 @@ mod tests {
         );
     }
 
-    /// Inject the preparation boundary's Busy -> Unrouted reply, or a Ready
-    /// reply whose hardware copy still refuses. Drive the real adapter loop.
-    fn refused_preparation_read(prefix: usize, ready: bool) {
+    /// Inject physical refusal through the production native classifier, or
+    /// a Ready reply whose hardware copy still refuses. Drive the real loop.
+    fn refused_preparation_read(
+        prefix: usize,
+        error: Option<crate::native_process_runtime::NativeProcessError>,
+    ) {
         use carrick_core::mm::transaction::{CopyoutPreparation, CopyoutRequest};
         use carrick_sched_core::object_wait::OperationToken;
         let mut w = world();
@@ -2866,7 +2906,7 @@ mod tests {
             inner: User<'a>,
             boundary: u64,
             request: Option<CopyoutRequest>,
-            ready: bool,
+            error: Option<crate::native_process_runtime::NativeProcessError>,
             preparations: usize,
         }
         impl UserCopy for Refused<'_> {
@@ -2888,7 +2928,7 @@ mod tests {
             }
             fn prepare_copyout(
                 &mut self,
-                _: CopyoutRequest,
+                request: CopyoutRequest,
                 operation: OperationToken,
             ) -> CopyoutPreparation {
                 self.preparations += 1;
@@ -2896,10 +2936,13 @@ mod tests {
                     self.preparations, 1,
                     "preparation repeated without progress"
                 );
-                if self.ready {
-                    CopyoutPreparation::Ready(operation)
-                } else {
-                    CopyoutPreparation::Unrouted(operation)
+                match self.error {
+                    None => CopyoutPreparation::Ready(operation),
+                    Some(error) => {
+                        crate::native_process_runtime::host_test_support::prepare_copyout_with_error(
+                            request, operation, error,
+                        )
+                    }
                 }
             }
         }
@@ -2922,7 +2965,7 @@ mod tests {
                 },
                 boundary: 0x20000 + prefix as u64,
                 request: None,
-                ready,
+                error,
                 preparations: 0,
             };
             let mut sched = Sched {
@@ -2971,56 +3014,280 @@ mod tests {
 
     #[test]
     fn native_pipe_second_granule_busy_returns_prefix_and_preserves_suffix() {
-        refused_preparation_read(4096, false);
+        refused_preparation_read(
+            4096,
+            Some(crate::native_process_runtime::NativeProcessError::Busy),
+        );
     }
 
     #[test]
     fn native_pipe_ready_without_hardware_progress_returns_prefix() {
-        refused_preparation_read(4096, true);
+        refused_preparation_read(4096, None);
+    }
+
+    /// One refused output, an owned yield, then the same operation completes.
+    /// A Ready followed by host contention also requires a fresh preparation.
+    fn zero_progress_read_recovers(event: bool, ready_then_host_busy: bool) {
+        use carrick_core::mm::transaction::{CopyoutPreparation, CopyoutRequest};
+        use carrick_sched_core::object_wait::OperationToken;
+        let mut w = world();
+        let table = w.table(w.a_tid);
+        let (read, write, object, bytes) = if event {
+            let fd = w.eventfd(table, 7, EventMode::Counter, BLOCK);
+            let backing = w.host().get(table, Fd(fd)).unwrap().backing;
+            let Some(IpcBacking::EventFd { object }) = IpcBacking::decode(backing) else {
+                unreachable!()
+            };
+            (fd, None, object, 7u64.to_ne_bytes().to_vec())
+        } else {
+            let (read, write, object) = w.pipe(table, BLOCK);
+            let bytes: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+            w.mem.write(MM, 0x10000, &bytes);
+            let mut frame = syscall(SYS_WRITE, write, 0x10000, 8192, A_SVC);
+            assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, 8192));
+            (read, Some(write), object, bytes)
+        };
+        w.mem.map(MM, 0x20000, bytes.len() as u64);
+        let mut frame = syscall(SYS_READ, read, 0x20000, bytes.len() as u64, A_SVC);
+        w.queue(w.a_tid, MM, &frame, A_SVC);
+        assert!(w.zone.switch_in_full(SLOT).is_some());
+        w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
+        w.map.publish(w.a_tid, table.to_raw()).unwrap();
+        struct Contended<'a> {
+            inner: User<'a>,
+            region: IpcRegion<'a>,
+            object: IpcObjectHandle,
+            request: Option<CopyoutRequest>,
+            held: Option<carrick_el1_abi::ipc::IpcObjectGuard<'a>>,
+            ready_then_host_busy: bool,
+            allowed: bool,
+            preparations: usize,
+            yields: usize,
+        }
+        impl UserCopy for Contended<'_> {
+            fn copy_in(&mut self, dst: &mut [u8], at: u64) -> bool {
+                self.inner.copy_in(dst, at)
+            }
+            fn copy_out(&mut self, at: u64, bytes: &[u8]) -> bool {
+                if self.allowed {
+                    return self.inner.copy_out(at, bytes);
+                }
+                self.request = Some(CopyoutRequest {
+                    address: carrick_guest_arch::UserVa::new(at),
+                    len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+                });
+                false
+            }
+            fn take_copyout_refusal(&mut self) -> Option<CopyoutRequest> {
+                self.request.take()
+            }
+            fn prepare_copyout(
+                &mut self,
+                request: CopyoutRequest,
+                operation: OperationToken,
+            ) -> CopyoutPreparation {
+                assert!(self.region.lock_holder(self.object).is_none());
+                self.preparations += 1;
+                if self.ready_then_host_busy {
+                    match self.preparations {
+                        1 => self.held = Some(self.region.lock(self.object, &HostWait).unwrap()),
+                        2 => self.allowed = true,
+                        _ => panic!("preparation repeated without a new dependency"),
+                    }
+                    CopyoutPreparation::Ready(operation)
+                } else {
+                    assert_eq!(self.preparations, 1);
+                    crate::native_process_runtime::host_test_support::prepare_copyout_with_error(
+                        request,
+                        operation,
+                        crate::native_process_runtime::NativeProcessError::Busy,
+                    )
+                }
+            }
+            fn yield_owned_operation(
+                &mut self,
+                operation: OperationToken,
+            ) -> carrick_core::mm::transaction::OwnedOperationYield {
+                self.yields += 1;
+                assert_eq!(self.yields, 1, "contention must cross the owned yield once");
+                drop(self.held.take());
+                assert!(self.region.lock_holder(self.object).is_none());
+                let token = from_sched_token(operation).unwrap();
+                let op = self.region.operation(&token).unwrap();
+                assert_eq!(op.progress.written, 0);
+                let mut guard = self.region.lock(self.object, &HostWait).unwrap();
+                if op.kind == IpcOpKind::EventFdRead {
+                    assert_eq!(guard.eventfd().unwrap().value(), 7);
+                } else {
+                    assert_eq!(guard.pipe().unwrap().unread_bytes(), 8192);
+                }
+                drop(guard);
+                self.allowed = !self.ready_then_host_busy;
+                carrick_core::mm::transaction::OwnedOperationYield::Ready(
+                    to_sched_token(token).unwrap(),
+                )
+            }
+        }
+        {
+            let mut user = Contended {
+                inner: User {
+                    task: &w.task,
+                    mem: &w.mem,
+                },
+                region: *w.region,
+                object,
+                request: None,
+                held: None,
+                ready_then_host_busy,
+                allowed: false,
+                preparations: 0,
+                yields: 0,
+            };
+            let mut sched = Sched {
+                handoff: None,
+                zone: &w.zone,
+                slot: SLOT,
+                task: &w.task,
+                cpu: &mut w.cpu,
+                user: &HardwareUserWord,
+                counters: w.counters,
+            };
+            let venue = IpcVenue {
+                region: *w.region,
+                tables: &w.tables,
+            };
+            assert_eq!(
+                serve_ipc_with_sigpipe(&mut sched, &mut frame, &venue, &mut user, true).0,
+                RETURNED
+            );
+            assert_eq!(user.yields, 1);
+            assert_eq!(user.preparations, if ready_then_host_busy { 2 } else { 1 });
+        }
+        assert_eq!(frame.x[0], bytes.len() as u64);
+        assert_eq!(w.mem.read(MM, 0x20000, bytes.len()), bytes);
+        let mut guard = w.region.lock(object, &HostWait).unwrap();
+        if event {
+            assert_eq!(guard.eventfd().unwrap().value(), 0);
+        } else {
+            assert_eq!(guard.pipe().unwrap().unread_bytes(), 0);
+        }
+        drop(guard);
+        let current = w.zone.slot(SLOT).current().unwrap();
+        assert!(!w.zone.record(current).has_object_operation());
+        w.host_close(table, read);
+        if let Some(write) = write {
+            w.host_close(table, write);
+        }
+        assert!(
+            w.region.lock(object, &HostWait).is_err(),
+            "operation pin leaked"
+        );
     }
 
     mod serial_host {
         use super::*;
 
-        // Run fatal controls in separate test processes: a fatal hook exits before
-        // abort, leaving the parent's process-wide fatal sink untouched.
-        fn zero_progress_preparation_fails_closed(test: &str, ready: bool) {
+        // Isolate the fatal sink and bound every child, including recovery
+        // controls: a regression must fail instead of hanging the test runner.
+        fn preparation_child(test: &str, fatal: bool, run: fn()) {
+            use wait_timeout::ChildExt;
             const CHILD: &str = "CARRICK_IPC_PREPARATION_FATAL_CHILD";
             if std::env::var(CHILD).ok().as_deref() == Some(test) {
                 carrick_fatal::set_hook(|domain, _| {
                     assert_eq!(domain, "el1::entry_completion");
                     std::process::exit(86);
                 });
-                refused_preparation_read(0, ready);
-                panic!("zero-progress refusal returned to the guest");
+                run();
+                return;
             }
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", test, "--nocapture"])
                 .env(CHILD, test)
-                .output()
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
                 .unwrap();
+            let timed_out = child
+                .wait_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .is_none();
+            if timed_out {
+                child.kill().unwrap();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !timed_out,
+                "copyout preparation child exceeded 10 seconds and was killed"
+            );
             assert_eq!(
                 output.status.code(),
-                Some(86),
+                Some(if fatal { 86 } else { 0 }),
                 "{}",
                 std::string::String::from_utf8_lossy(&output.stderr)
             );
-            assert!(std::string::String::from_utf8_lossy(&output.stderr).contains("EntryBinding"));
+            if fatal {
+                assert!(
+                    std::string::String::from_utf8_lossy(&output.stderr).contains("EntryBinding")
+                );
+            }
         }
 
         #[test]
-        fn native_pipe_zero_progress_busy_fails_closed_without_enosys() {
-            zero_progress_preparation_fails_closed(
-                "ipc::tests::serial_host::native_pipe_zero_progress_busy_fails_closed_without_enosys",
+        fn native_pipe_zero_progress_busy_yields_then_delivers_all_bytes() {
+            preparation_child(
+                "ipc::tests::serial_host::native_pipe_zero_progress_busy_yields_then_delivers_all_bytes",
                 false,
+                || zero_progress_read_recovers(false, false),
             );
         }
-
+        #[test]
+        fn native_eventfd_zero_progress_busy_yields_then_delivers_counter() {
+            preparation_child(
+                "ipc::tests::serial_host::native_eventfd_zero_progress_busy_yields_then_delivers_counter",
+                false,
+                || zero_progress_read_recovers(true, false),
+            );
+        }
+        #[test]
+        fn native_copyout_host_yield_clears_the_ready_progress_guard() {
+            preparation_child(
+                "ipc::tests::serial_host::native_copyout_host_yield_clears_the_ready_progress_guard",
+                false,
+                || zero_progress_read_recovers(false, true),
+            );
+        }
         #[test]
         fn native_pipe_zero_progress_ready_refusal_is_bounded() {
-            zero_progress_preparation_fails_closed(
+            preparation_child(
                 "ipc::tests::serial_host::native_pipe_zero_progress_ready_refusal_is_bounded",
                 true,
+                || refused_preparation_read(0, None),
+            );
+        }
+        #[test]
+        fn native_pipe_zero_progress_stale_fails_closed() {
+            preparation_child(
+                "ipc::tests::serial_host::native_pipe_zero_progress_stale_fails_closed",
+                true,
+                || {
+                    refused_preparation_read(
+                        0,
+                        Some(crate::native_process_runtime::NativeProcessError::Stale),
+                    )
+                },
+            );
+        }
+        #[test]
+        fn native_pipe_zero_progress_quarantined_fails_closed() {
+            preparation_child(
+                "ipc::tests::serial_host::native_pipe_zero_progress_quarantined_fails_closed",
+                true,
+                || {
+                    refused_preparation_read(
+                        0,
+                        Some(crate::native_process_runtime::NativeProcessError::Quarantined),
+                    )
+                },
             );
         }
     }

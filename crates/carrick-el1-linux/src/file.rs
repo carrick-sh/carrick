@@ -203,10 +203,10 @@ impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, 
     fn yield_owned_operation(
         &mut self,
         operation: carrick_sched_core::object_wait::OperationToken,
-    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+    ) -> carrick_core::mm::transaction::OwnedOperationYield {
         match self.owner.as_deref_mut() {
             Some(owner) => owner.yield_owned_operation(operation),
-            None => carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation),
+            None => carrick_core::mm::transaction::OwnedOperationYield::Unrouted(operation),
         }
     }
     fn prepare_copyout(

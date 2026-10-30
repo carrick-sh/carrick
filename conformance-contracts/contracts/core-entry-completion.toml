@@ -1,3 +1,6 @@
+# #1044: owned-yield replies are typed separately from memory preparation.
+# The retained IPC/CarrierWork seam bindings below cover that API change;
+# existing fork, lifecycle, file and inotify acceptance remains unchanged.
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
@@ -49,6 +52,7 @@ ISA adapter. The existing return-work and x86 context witnesses still apply.
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::native_process_runtime::host_test_support::ipc_busy_yield_retains_operation_and_pin_through_carrier_work (owned-yield reply typing and exact token/pin custody only)",
   "carrick-core::entry_completion::{requeued_terminal_attempt_restores_membership_and_admission_before_return,losing_requeue_cas_keeps_membership_and_admission_for_commit,refused_requeue_lock_keeps_membership_and_admission_for_commit,host_home_terminal_release_commits_the_same_exit_ownership}",
   "carrick-el1-linux::dispatch::tests::physical_custody_reasons_preserve_fatal_codes_and_debug_text (diagnostic reason selection and host Debug compatibility)",
   "carrick-kernel-example::root_exit_full_width::root_exit_record_codec_preserves_full_width_termination",

@@ -35,6 +35,7 @@ path = "src/entry.rs"
 path = "src/lib.rs"
 
 [dev-dependencies]
+wait-timeout = "0.2.1"
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
 carrick-mem = { path = "../carrick-mem" }

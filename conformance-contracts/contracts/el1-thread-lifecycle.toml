@@ -1,3 +1,6 @@
+# #1044: owned-yield replies are typed separately from memory preparation.
+# The retained IPC/CarrierWork seam bindings below cover that API change;
+# existing fork, lifecycle, file and inotify acceptance remains unchanged.
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
@@ -67,6 +70,7 @@ embed = [
 # zone admission record has already been released. One control-wake batch is
 # applied per retained lifecycle page; this does not complete guest waits.
 vm_free = [
+  "carrick-el1-linux::native_process_runtime::host_test_support::ipc_busy_yield_retains_operation_and_pin_through_carrier_work (owned-yield reply typing and exact token/pin custody only)",
   "carrick-runtime::vcpu_loop::executor::tests::{serial_host_process_exit_retires_abi_born_sibling_before_direct_load,serial_host_group_close_retires_abi_born_sibling_during_direct_load,serial_host_missing_abi_born_sibling_without_terminal_intent_fails_closed} (actual ABI birth and retained control, queued process-exit cancellation and native terminal release during a held load; zero retired-member guest entries, one terminal settlement, all workers joined; absence without terminal intent remains fatal)",
   "carrick-el1-linux::aarch64_process_tests::exit_group_hang_tests::serial_host_arm_exit_group_unregistered_sibling_wakes_parked_host (production exit_group, enrolled exact record retirement, nonperiodic waits, real host receipts and one Closing wake)",
   "carrick-el1-linux::aarch64_process_tests::arm_unregistered_host_cancel_commits_terminal_intent_before_record_release (Busy once then successful native release)",
