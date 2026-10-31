@@ -167,6 +167,11 @@ pub enum Continuation {
         pr: u64,
         branch: String,
         tip: String,
+        /// The owner's trigger said `Rebase: allowed` (#1215): publication
+        /// may replace the admitted history with one rebased onto admitted
+        /// main, still only under the lease that starts at `tip`.
+        #[serde(default)]
+        rebase: bool,
     },
 }
 
@@ -182,11 +187,12 @@ impl Adoption {
     pub(crate) fn issue_number(&self) -> Option<u64> {
         self.issue["number"].as_u64()
     }
-    fn continuation(&self) -> Continuation {
+    fn continuation(&self, rebase: bool) -> Continuation {
         Continuation::Adopted {
             pr: self.number,
             branch: self.branch.clone(),
             tip: self.tip.clone(),
+            rebase,
         }
     }
 }
@@ -431,6 +437,18 @@ pub(crate) fn agent_comment(comment: &Value, trusted: &mut dyn FnMut(&str) -> bo
                 .is_some_and(|s| s.starts_with(char::is_whitespace)))
 }
 
+/// Director consent to rebase an adopted PR (owner decision, #1215): the
+/// admitted `/agent` comment is the owner account's, which director
+/// sessions post as, and has a line that is exactly `Rebase: allowed`.
+/// Write collaborators can trigger a round but not consent to a rewrite.
+fn rebase_consent(comment: &Value) -> bool {
+    comment["user"]["login"] == "tjfontaine"
+        && comment["user"]["type"] == "User"
+        && comment["body"]
+            .as_str()
+            .is_some_and(|body| body.lines().any(|line| line.trim() == "Rebase: allowed"))
+}
+
 pub(crate) fn comment_digest(comment: &Value) -> String {
     use sha2::{Digest, Sha256};
     let data = json!({"id":comment["id"],"body":comment["body"],"created_at":comment["created_at"],"updated_at":comment["updated_at"]});
@@ -513,7 +531,10 @@ fn validate_event_with_publication(
                     "adoption proof does not match the triggering PR",
                 ));
             }
-            (branch.to_owned(), adoption.continuation())
+            (
+                branch.to_owned(),
+                adoption.continuation(rebase_consent(&event["comment"])),
+            )
         } else if owned_pr(
             pr,
             &event["dispatch_run"],
@@ -854,6 +875,19 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         Continuation::Owned => format!(
             "Rebase onto admitted main {} (refs/carrick/dispatch-main) before working.\n\
             Resolve any conflicts in this isolated checkout; preserve earlier workers' commits.\n",
+            dispatch.base
+        ),
+        Continuation::Adopted {
+            pr,
+            tip,
+            rebase: true,
+            ..
+        } => format!(
+            "This continues PR #{pr}, which the director owns. The director consented to a rebase:\n\
+            rebase the admitted PR head {tip} onto admitted main {} (refs/carrick/dispatch-main),\n\
+            resolve conflicts in this isolated checkout, and keep every commit and its author.\n\
+            Publication refuses a HEAD that descends from neither {tip} nor admitted main.\n\
+            The PR body is not yours to change.\n",
             dispatch.base
         ),
         Continuation::Adopted { pr, tip, .. } => format!(
@@ -3086,6 +3120,9 @@ struct Applied {
     published_checkpoint: bool,
     #[serde(default)]
     rebased_onto: Option<String>,
+    /// Director commits whose patch changed in a consented rebase (#1215).
+    #[serde(default)]
+    rebase_changed: Vec<String>,
     body: AppliedBody,
     board_changes: Vec<String>,
     #[serde(default)]
@@ -3152,7 +3189,17 @@ impl Applied {
             },
             self.rebased_onto
                 .as_ref()
-                .map(|base| format!("\n- Rebased onto main at {base}."))
+                .map(|base| {
+                    let changed = if self.rebase_changed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " Director commits whose patch changed while rebasing (review these): {}.",
+                            self.rebase_changed.join(", ")
+                        )
+                    };
+                    format!("\n- Rebased onto main at {base}.{changed}")
+                })
                 .unwrap_or_default(),
             match &self.body {
                 AppliedBody::NotUpdated => "not updated".into(),
@@ -3793,6 +3840,61 @@ fn live_publication_main(work: &Path, token: &str) -> Result<String, ScalerError
 
 /// An adopted PR moved after admission, or the worker rewrote its history.
 /// Nothing is overwritten and the round ends blocked with the reason.
+/// A consented rebase must keep the director's history (#1215): every
+/// non-merge commit from the merge-base with main to the admitted tip must
+/// reappear above main, matched by author email and subject. Resolving a
+/// conflict changes a commit's patch, so a changed patch is allowed and
+/// listed for the reviewer (`git cherry`), but a dropped or replaced commit
+/// is refused. `Err` names the first missing commit; `Ok` lists the changed
+/// ones.
+fn rebase_kept_commits(
+    work: &Path,
+    admitted: &str,
+    base: &str,
+) -> Result<Result<Vec<String>, String>, ScalerError> {
+    let fork = git(work, &["merge-base", admitted, base])?;
+    let fork = fork.trim();
+    let commits = |range: &str| -> Result<Vec<(String, String)>, ScalerError> {
+        Ok(git(
+            work,
+            &["log", "--no-merges", "--format=%H%x00%ae%x00%s", range],
+        )?
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\0');
+            let sha = parts.next()?.to_owned();
+            let key = format!("{}\0{}", parts.next()?, parts.next()?);
+            Some((sha, key))
+        })
+        .collect())
+    };
+    let original = commits(&format!("{fork}..{admitted}"))?;
+    let mut rebased: Vec<String> = commits(&format!("{base}..HEAD"))?
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect();
+    for (sha, key) in &original {
+        match rebased.iter().position(|k| k == key) {
+            Some(index) => {
+                rebased.remove(index);
+            }
+            None => {
+                let subject = key.split('\0').nth(1).unwrap_or_default();
+                return Ok(Err(format!(
+                    "`{}` (\"{subject}\")",
+                    &sha[..12.min(sha.len())]
+                )));
+            }
+        }
+    }
+    // `+` marks an admitted commit with no patch-equivalent above main.
+    let cherry = git(work, &["cherry", "HEAD", admitted, fork])?;
+    Ok(Ok(cherry
+        .lines()
+        .filter_map(|line| line.strip_prefix("+ "))
+        .map(|sha| sha.chars().take(12).collect())
+        .collect()))
+}
 fn adopted_publication_blocked(number: u64, why: &str) -> Result<ScalerError, ScalerError> {
     let reason = format!("Adopted PR #{number}: {why}");
     Applied::record(|a| a.adoption_blocked = Some(reason.clone()))?;
@@ -3960,6 +4062,10 @@ fn publish_commits(
         Continuation::Adopted { pr, tip, .. } => Some((*pr, tip.as_str())),
         Continuation::Owned => None,
     };
+    let rebase_allowed = matches!(
+        dispatch.continuation,
+        Continuation::Adopted { rebase: true, .. }
+    );
     if adopted.is_some() {
         require_target_pr(root, dispatch)?;
     } else if dispatch.resume {
@@ -4012,12 +4118,44 @@ fn publish_commits(
             // commits on top of the admitted tip, never rebase or rewrite it.
             *preserve = Some(admitted.to_owned());
             if git(&work, &["merge-base", "--is-ancestor", admitted, "HEAD"]).is_err() {
-                return Err(adopted_publication_blocked(
-                    number,
-                    &format!(
-                        "the worker rewrote history: HEAD does not descend from the admitted tip `{admitted}`. Nothing was pushed"
-                    ),
-                )?);
+                // With the director's consent the one allowed rewrite is a
+                // rebase onto admitted main, pushed under the same lease.
+                let onto_main = git(
+                    &work,
+                    &["merge-base", "--is-ancestor", &dispatch.base, "HEAD"],
+                )
+                .is_ok();
+                if !rebase_allowed {
+                    return Err(adopted_publication_blocked(
+                        number,
+                        &format!(
+                            "the worker rewrote history: HEAD does not descend from the admitted tip `{admitted}`, and the trigger did not consent to a rebase (`Rebase: allowed`). Nothing was pushed"
+                        ),
+                    )?);
+                }
+                if !onto_main {
+                    return Err(adopted_publication_blocked(
+                        number,
+                        &format!(
+                            "the rebased HEAD does not descend from admitted main `{}`. Nothing was pushed",
+                            dispatch.base
+                        ),
+                    )?);
+                }
+                match rebase_kept_commits(&work, admitted, &dispatch.base)? {
+                    Err(missing) => {
+                        return Err(adopted_publication_blocked(
+                            number,
+                            &format!(
+                                "the rebase dropped the director's commit {missing}. Nothing was pushed"
+                            ),
+                        )?);
+                    }
+                    Ok(changed) => Applied::record(|a| {
+                        a.rebased_onto = Some(dispatch.base.clone());
+                        a.rebase_changed = changed;
+                    })?,
+                }
             }
             // Fast-forward only, also over this run's own earlier pushes.
             if let Some(pushed) = &lease.pushed
@@ -4253,7 +4391,8 @@ fn publish_commits(
                     }
                 }
                 a.published_checkpoint = receipt.checkpointed;
-                a.rebased_onto = rebased_onto;
+                // An adopted round's consented rebase was recorded above.
+                a.rebased_onto = rebased_onto.or(a.rebased_onto.take());
             })?;
         }
         if !retained {
@@ -4986,6 +5125,18 @@ mod tests {
         publication_fixture("adopted-rewrite");
     }
     #[test]
+    fn adopted_publication_pushes_a_consented_rebase_under_the_lease() {
+        publication_fixture("adopted-rebase");
+    }
+    #[test]
+    fn adopted_publication_refuses_a_consented_rebase_that_drops_director_commits() {
+        publication_fixture("adopted-rebase-drop");
+    }
+    #[test]
+    fn adopted_publication_refuses_a_consented_rewrite_off_main() {
+        publication_fixture("adopted-rebase-off-main");
+    }
+    #[test]
     fn adopted_publication_is_not_charged_for_director_history() {
         publication_fixture("adopted-director-history");
     }
@@ -5418,8 +5569,32 @@ fi
                 ],
             )
             .unwrap();
-            if witness == "adopted-rewrite" {
-                // The worker rewrote the director's tip instead of adding to it.
+            if witness == "adopted-rebase" {
+                // A real rebase: the director's commit is re-created above
+                // admitted main (same author and subject, new SHA), then the
+                // worker's own commit.
+                git(&work, &["reset", "--hard", &receipt.base]).unwrap();
+                for subject in [
+                    "refactor(core): director slice",
+                    "fix(core): continue the slice",
+                ] {
+                    // A new date makes a new SHA, as a real rebase would.
+                    git(
+                        &work,
+                        &[
+                            "commit",
+                            "--allow-empty",
+                            "--date=2026-01-01T00:00:00Z",
+                            "-m",
+                            subject,
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+            if matches!(witness, "adopted-rewrite" | "adopted-rebase-drop") {
+                // The worker replaced the director's tip instead of adding
+                // to it: the director's commit is gone.
                 git(&work, &["reset", "--hard", &receipt.base]).unwrap();
                 git(
                     &work,
@@ -5431,6 +5606,16 @@ fi
                     ],
                 )
                 .unwrap();
+            }
+            if witness == "adopted-rebase-off-main" {
+                // A consented rewrite that is not a rebase onto main.
+                let tree = git(&work, &["hash-object", "-t", "tree", "/dev/null"]).unwrap();
+                let orphan = git(
+                    &work,
+                    &["commit-tree", tree.trim(), "-m", "chore: unrelated history"],
+                )
+                .unwrap();
+                git(&work, &["reset", "--hard", orphan.trim()]).unwrap();
             }
             if witness == "adopted-race" {
                 // Someone pushes while ours is in flight: the lease rejects it.
@@ -5444,6 +5629,8 @@ fi
             dispatch.branch = branch.into();
             dispatch.resume = true;
             dispatch.continuation = Continuation::Adopted {
+                rebase: witness.starts_with("adopted-rebase"),
+
                 pr: 800,
                 branch: branch.into(),
                 tip: tip.clone(),
@@ -5541,6 +5728,27 @@ fi
                 }
                 return;
             }
+            if witness == "adopted-rebase" {
+                // Consent (#1215): the rebased history is pushed, still only
+                // under the lease that starts at the admitted tip.
+                assert_eq!(result.unwrap(), Some(800), "{}", applied.report());
+                let push = regular_text(&outer.join("push.args")).unwrap();
+                assert!(
+                    push.contains(&format!("--force-with-lease=refs/heads/{branch}:{tip}\n")),
+                    "{push}"
+                );
+                assert_eq!(
+                    applied.rebased_onto.as_deref(),
+                    Some(dispatch.base.as_str())
+                );
+                assert!(
+                    applied.report().contains("Rebased onto main"),
+                    "{}",
+                    applied.report()
+                );
+                assert_eq!(applied.adoption_blocked, None);
+                return;
+            }
             if matches!(witness, "adopted" | "adopted-director-history") {
                 assert_eq!(result.unwrap(), Some(800));
                 assert_eq!(
@@ -5565,10 +5773,11 @@ fi
                 assert_eq!(applied.adoption_blocked, None);
             } else {
                 let error = result.unwrap_err().to_string();
-                let expected = if witness == "adopted-rewrite" {
-                    "rewrote history"
-                } else {
-                    "moved after admission"
+                let expected = match witness {
+                    "adopted-rewrite" => "did not consent to a rebase",
+                    "adopted-rebase-off-main" => "does not descend from admitted main",
+                    "adopted-rebase-drop" => "dropped the director's commit",
+                    _ => "moved after admission",
                 };
                 assert!(error.contains(expected), "{error}");
                 assert!(
@@ -5579,7 +5788,13 @@ fi
                 assert!(applied.adoption_blocked.is_some());
                 assert!(applied.commits.is_empty());
                 assert!(!state.join("published-tip").exists());
-                if matches!(witness, "adopted-moved" | "adopted-rewrite") {
+                if matches!(
+                    witness,
+                    "adopted-moved"
+                        | "adopted-rewrite"
+                        | "adopted-rebase-off-main"
+                        | "adopted-rebase-drop"
+                ) {
                     assert!(
                         !outer.join("push-attempts").exists(),
                         "pushed over a moved head"
@@ -7577,6 +7792,7 @@ cat "$file"
             .unwrap();
             assert!(retired);
             let expected = Continuation::Adopted {
+                rebase: false,
                 pr: 1150,
                 branch: "work/986-slice4".into(),
                 tip: tip.clone(),
@@ -7610,6 +7826,7 @@ cat "$file"
         assert_eq!(
             dispatch.continuation,
             Continuation::Adopted {
+                rebase: false,
                 pr: 1150,
                 branch: "work/986-slice4".into(),
                 tip: tip.clone()
@@ -7628,6 +7845,35 @@ cat "$file"
             any_issue["user"] = author;
             assert!(admit(&event, &any_pr, &any_issue, &comment, &[986]).is_ok());
         }
+        // #1215: only the owner account's exact `Rebase: allowed` line is
+        // consent to rewrite an adopted PR's history.
+        let rebase_of = |body: &str| {
+            let mut consent = comment.clone();
+            consent["body"] = json!(body);
+            let mut with = event.clone();
+            with["comment"] = consent.clone();
+            match admit(&with, &pr, &issue, &consent, &[986])
+                .unwrap()
+                .continuation
+            {
+                Continuation::Adopted { rebase, .. } => rebase,
+                Continuation::Owned => panic!("adoption lost"),
+            }
+        };
+        assert!(rebase_of("/agent rebase onto main\nRebase: allowed"));
+        assert!(rebase_of("/agent rebase onto main\n  Rebase: allowed  \n"));
+        assert!(!rebase_of("/agent rebase onto main"));
+        assert!(!rebase_of(
+            "/agent rebase onto main\nRebase: allowed, please"
+        ));
+        assert!(!rebase_of("/agent rebase onto main\nrebase: allowed"));
+        assert!(!rebase_of("/agent Rebase: allowed"));
+        let mut collaborator = comment.clone();
+        collaborator["user"] = json!({"login":"collab","type":"User"});
+        collaborator["body"] = json!("/agent rebase\nRebase: allowed");
+        assert!(!rebase_consent(&collaborator));
+        collaborator["user"] = json!({"login":"tjfontaine","type":"Bot"});
+        assert!(!rebase_consent(&collaborator));
 
         let mut admitted = Vec::new();
         let mut refuse = |case: &str, result: Result<Dispatch, ScalerError>| {
@@ -8114,6 +8360,7 @@ cat "$file"
         dispatch.branch = "work/986-slice4".into();
         dispatch.resume = true;
         dispatch.continuation = Continuation::Adopted {
+            rebase: false,
             pr: 1150,
             branch: dispatch.branch.clone(),
             tip: tip.clone(),
@@ -8156,6 +8403,7 @@ cat "$file"
         let mut forged = dispatch.clone();
         forged.branch = "work/dispatch-986-42".into();
         forged.continuation = Continuation::Adopted {
+            rebase: false,
             pr: 1150,
             branch: forged.branch.clone(),
             tip: tip.clone(),
