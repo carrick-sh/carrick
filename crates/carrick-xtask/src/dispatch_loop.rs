@@ -3024,9 +3024,13 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))?;
         let mut command = isolated_loop(&actor, &socket, &server.policy, limit)?;
         hand_over_to(&actor, LOOP_USER)?;
+        super::live_log::set_token(&server.token);
         command
-            .stdout(std::fs::File::create(state.join("loop.out"))?)
-            .stderr(std::fs::File::create(state.join("loop.err"))?);
+            .stdout(super::live_log::create("loop", &state.join("loop.out"))?)
+            .stderr(super::live_log::create(
+                "loop stderr",
+                &state.join("loop.err"),
+            )?);
         let remaining = server.deadline.saturating_duration_since(Instant::now());
         let code = wait_account_serving(&mut command, remaining, LOOP_USER, || {
             match listener.accept() {
@@ -3043,6 +3047,8 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
             }
             Ok(server.should_stop())
         });
+        super::live_log::unfollow("loop");
+        super::live_log::unfollow("loop stderr");
         drop(commands);
         let _final_commands = CommandWindow::until(final_deadline);
         post_loop_capture(
