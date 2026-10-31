@@ -12,6 +12,7 @@ structural_budgets = []
 # at shutdown, preserving retirement ownership and any displaced owner clear.
 [bindings]
 vm_free = [
+  "carrick-el1-linux::aarch64_process_tests::exit_group_hang_tests::serial_host_arm_exit_group_unregistered_sibling_wakes_parked_host (production exit_group, enrolled exact record retirement, nonperiodic waits, real host receipts and one Closing wake)",
   "carrick-core::entry::tests::host_claim_after_yield_does_not_revoke_publication_receipt",
   "carrick-core::entry_completion::committed_host_zone_retirement_never_refunds_or_borrows_native_membership",
   "carrick-core::entry_completion::terminal_member_proof_precedes_lifecycle_receipt_after_record_release",
@@ -20,7 +21,6 @@ vm_free = [
   "carrick-core::lifecycle::membership_tests::refused_host_page_transition_preserves_host_zone_provenance",
   "carrick-el1-linux::aarch64_process_tests::arm_unregistered_host_cancel_commits_terminal_intent_before_record_release (Busy once then successful native release)",
   "carrick-el1-linux::aarch64_process_tests::exit_group_hang_tests::serial_host_adopted_fault_checkpoint_transfers_terminal_custody",
-  "carrick-el1-linux::aarch64_process_tests::exit_group_hang_tests::serial_host_arm_exit_group_unregistered_sibling_wakes_parked_host (production exit_group, enrolled exact record retirement, nonperiodic waits, real host receipts and one Closing wake)",
   "carrick-el1-linux::native_process_runtime::host_test_support::exit_group_cancels_exception_service_before_publishing_host_wakes",
   "carrick-el1-linux::native_process_runtime::host_test_support::terminal_park_tests::exit_group_host_request_before_terminal_park_retains_owner",
   "carrick-el1-linux::native_process_runtime::host_test_support::terminal_park_tests::losing_entryless_exit_group_publishes_terminal_before_record_release",
@@ -57,9 +57,9 @@ vm_free = [
   "carrick-sched-core::loom_models::concurrent_group_exit_keeps_direct_load_terminal_intent_before_release",
 ]
 embed = [
+  "carrick-vmm-hvf::trap_engine_hvf::shutdown_kick::trap_engine_hvf_shutdown_kick_before_entry",
   "carrick-embed::el1_files_exit_group_stress",
   "carrick-embed::el1_sched_exit_group_with_parked_threads",
-  "carrick-vmm-hvf::trap_engine_hvf::shutdown_kick::trap_engine_hvf_shutdown_kick_before_entry",
   "carrick-vmm-hvf::trap_engine_hvf::shutdown_kick::trap_engine_hvf_shutdown_kick_in_run",
 ]
 

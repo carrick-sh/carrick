@@ -46,6 +46,7 @@ authenticated frame becomes a code page (cross-vCPU publication is #684).
 
 [bindings]
 vm_free = [
+  "carrick-softmmu::softmmu_contract::linear_placement_enforces_alignment_bounds_and_mmio_holes",
   "carrick-softmmu::softmmu_contract::concurrent_pte_writer_snapshot_consistency_and_structural_budgets",
   "carrick-softmmu::softmmu_contract::cr_gating_smep_smap_wp_and_id_error_code_bit",
   "carrick-softmmu::softmmu_contract::fault_classes_non_canonical_gp_ss_mmio_non_fault_and_descriptor_load",
@@ -53,7 +54,6 @@ vm_free = [
   "carrick-softmmu::softmmu_contract::hardware_accessed_and_dirty_bits_updated_via_cas",
   "carrick-softmmu::softmmu_contract::huge_page_authentication_2m_and_1g_at_zero_page_and_tail_offsets",
   "carrick-softmmu::softmmu_contract::invlpg_on_large_page_evicts_all_sibling_slots",
-  "carrick-softmmu::softmmu_contract::linear_placement_enforces_alignment_bounds_and_mmio_holes",
   "carrick-softmmu::softmmu_contract::page_crossing_access_misses_tlb_and_validates_both_pages",
   "carrick-softmmu::softmmu_contract::permission_classes_not_present_write_cow_nx_and_upper_half_va",
   "carrick-softmmu::softmmu_contract::red_first_non_present_precedence_ignored_nonleaf_bits_and_reserved_bits",

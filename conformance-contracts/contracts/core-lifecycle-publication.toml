@@ -9,11 +9,11 @@ rationale = "The production Lifecycle owner uses exact generation CAS transition
 
 [bindings]
 vm_free = [
+  "carrick-personality-linux::x86_wave2::x5_exit_requeued_after_wake_wakes_once",
   "carrick-core::entry_completion::{requeued_terminal_attempt_restores_membership_and_admission_before_return,losing_requeue_cas_keeps_membership_and_admission_for_commit,refused_requeue_lock_keeps_membership_and_admission_for_commit,host_home_terminal_release_commits_the_same_exit_ownership}",
   "carrick-core::lifecycle::membership_tests::{terminal_rmw_consumes_reserved_waiter_bit_before_claim_drop,waiter_release_rmw_observes_one_winner_across_terminal_and_drop,waiter_flag_does_not_alias_reference_exhaustion_or_reset}",
   "carrick-core::x86_wave2::x5_lifecycle_publication",
   "carrick-kernel::kernel::operations::exit::tests::process_member_terminal_publication_excludes_registry_readers",
-  "carrick-personality-linux::x86_wave2::x5_exit_requeued_after_wake_wakes_once",
   "carrick-sched-core::tests::ipc_wait::{requeue_rollback_is_after_cas_and_before_queue_publication,losing_requeue_cas_never_rolls_back_the_terminal_commit}",
 ]
 

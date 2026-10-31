@@ -22,6 +22,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}",
   "carrick-el1-abi::ipc_tables::tests::directory_custody_cannot_replace_or_retire_a_borrowed_binding",
   "carrick-el1-linux::aarch64_process_tests::{serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof,serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe}",
   "carrick-el1-linux::aarch64_process_tests::{serial_host_native_fork_two_children_inherit_the_complete_ipc_namespace,serial_host_native_fork_restored_view_mapping_outlives_children,serial_host_native_fork_children_outlive_restored_view_mapping}",
@@ -39,7 +40,6 @@ vm_free = [
   "carrick-kernel::dispatch::overlay_dispatch_tests::{fork_child_stdio_reuse_keeps_allocation_cursor_above_stdio,exec_child_single_allocation_reuses_cloexec_stdio_with_parent_alive,exec_child_pair_allocation_reuses_cloexec_stdio_with_parent_alive}",
   "carrick-kernel::el1_ipc::table::tests::serial_host_el1_ipc_reservations_cancel_commit_and_retire_once",
   "carrick-kernel::kernel::exec::tests::{prepared_cloexec_two_live_tasks_preserve_peer_and_rollback,prepared_cloexec_retains_physical_releases_until_consumed_once}",
-  "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}",
   "carrick-kernel::kernel::objects::tests::reserved_pair_refusal_publishes_neither_slot_or_functional_reference",
   "carrick-xtask::el1_image_sysroot::image_build::frame_budget::tests::{fd_inheritance_charges_retained_core_and_storage_frames,fd_retirement_charges_release_callbacks_after_revocation}",
 ]

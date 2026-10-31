@@ -24,7 +24,7 @@ embed = [
   "carrick-cli::trace::host-namespace-work(carrick_embed::contracts::host_namespace_fixture)",
 ]
 vm_free = [
-  "carrick-vfs::serial_host::test_namespace_mutation_work",
+  "carrick-vfs::vfs::rootfs::tests::serial_host::test_namespace_mutation_work",
 ]
 
 [bindings.unresolved]

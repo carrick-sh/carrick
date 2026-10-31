@@ -1,5 +1,6 @@
 //! Typed, fail-closed conformance-contract registry for Carrick development gates.
 
+mod binding_resolution;
 mod evaluate;
 mod inventory;
 mod model;
@@ -7,6 +8,7 @@ mod observation;
 pub mod personality_boundary;
 mod registry;
 
+pub use binding_resolution::{BindingResolutionError, BindingResolver};
 pub use evaluate::{ContractFailure, ContractPass, evaluate};
 pub type EvaluationError = ContractFailure;
 pub use inventory::{InventorySummary, SyscallInventory, SyscallInventoryEntry};

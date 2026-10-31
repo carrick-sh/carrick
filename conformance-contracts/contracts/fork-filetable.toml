@@ -13,8 +13,8 @@ rationale = "Fork file-table copy cost must scale affinely with populated descri
 
 [bindings]
 vm_free = [
-  "carrick-fd-core::tests::red_until_step3_m1_sparse_fork_visits_only_populated_descriptors",
   "carrick-kernel-example::fork_filetable_contract",
+  "carrick-fd-core::tests::red_until_step3_m1_sparse_fork_visits_only_populated_descriptors",
 ]
 embed = [
   "carrick-embed::fork_filetable_contract",

@@ -363,10 +363,15 @@ def load_surfaces(root: Path):
     mapping: dict[str, list[str]] = {}
     for entry in data.get("surfaces", []):
         path = entry["path"]
-        contract = entry["contract"]
         contracts_for_path = mapping.setdefault(path, [])
-        if contract not in contracts_for_path:
-            contracts_for_path.append(contract)
+        if "contract" in entry:
+            contract = entry["contract"]
+            if contract not in contracts_for_path:
+                contracts_for_path.append(contract)
+        else:
+            for contract in entry.get("contracts", []):
+                if contract not in contracts_for_path:
+                    contracts_for_path.append(contract)
     return mapping
 
 
@@ -395,24 +400,28 @@ def is_evidence_path(path: str, contract_id: str, contracts: dict, surfaces: dic
     if "/tests/" in path or "conformance-probes/" in path or path.endswith(("/tests.rs", "_test.rs", "_tests.rs")):
         return True
 
-    # Check contract declared bindings
+    # Check contract declared bindings (preserving main's primary-binding semantics:
+    # inspect only the first entry of vm_free/embed/docker, excluding ecosystem/unresolved).
     contract_data = contracts.get(contract_id, {})
     bindings = contract_data.get("bindings", {})
     for layer, target in bindings.items():
-        if layer == "unresolved" or not isinstance(target, list):
+        if layer in ("unresolved", "ecosystem"):
             continue
-        for entry in target:
-            if not isinstance(entry, str):
-                continue
-            if entry.startswith("probe:"):
-                probe_name = entry.split("probe:", 1)[1]
-                if probe_name in path:
-                    return True
-            elif "::" in entry:
-                cleaned = entry.removeprefix("doctest:")
-                crate_name = cleaned.split("::", 1)[0]
-                if f"crates/{crate_name}/" in path and ("/tests/" in path or "/contracts.rs" in path or "contracts/" in path):
-                    return True
+        entry = None
+        if isinstance(target, str):
+            entry = target
+        elif isinstance(target, list) and target and isinstance(target[0], str):
+            entry = target[0]
+        if entry is None:
+            continue
+        if entry.startswith("probe:"):
+            probe_name = entry.split("probe:", 1)[1]
+            if probe_name in path:
+                return True
+        elif "::" in entry:
+            crate_name = entry.split("::", 1)[0]
+            if f"crates/{crate_name}/" in path and ("/tests/" in path or "/contracts.rs" in path or "contracts/" in path):
+                return True
     return False
 
 

@@ -17,6 +17,7 @@ rationale = "Owner waits are killable-only: handled signals and stops never comp
 
 [bindings]
 vm_free = [
+  "carrick-kernel::dispatch::mem::tests::private_file_mmap_self_held_gate_is_an_invariant_only_with_custody (real HAL exclusion registration does not make a non-custody eager refusal fatal; eager self-reacquisition is #1141 and foreign custody is #1124)",
   "carrick-core::cancellation::loom_models",
   "carrick-kernel::dispatch::copyout::tests::s1_array_keeps_first_valid_permit_across_mapping_changes",
   "carrick-kernel::dispatch::copyout::tests::s1_arrays_secure_only_whole_records_and_bound_preparation_work",
@@ -25,7 +26,6 @@ vm_free = [
   "carrick-kernel::dispatch::copyout_tests::{select_large_output_retained_on_initial_owner_refusal,select_large_output_retains_selection_across_later_window_refusal,retained_poll_output_refusal_keeps_terminal_selection_and_edited_inputs,retained_select_timeout_suspends_between_large_set_windows,select_output_fault_keeps_the_committed_prefix,select_output_rejects_stale_resume_and_cancellation_before_access,select_owner_output_requires_exact_execution_authority,retained_poll_sparse_output_keeps_prefix_across_owner_supply_and_physical}",
   "carrick-kernel::dispatch::fs::legacy_aio::s1_tests::s1_aio_copyout_refusal_preserves_completion",
   "carrick-kernel::dispatch::fs::legacy_aio::s1_tests::s1_aio_large_output_preserves_minimum_and_refused_window",
-  "carrick-kernel::dispatch::mem::tests::private_file_mmap_self_held_gate_is_an_invariant_only_with_custody (real HAL exclusion registration does not make a non-custody eager refusal fatal; eager self-reacquisition is #1141 and foreign custody is #1124)",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::s1_empty_epoll_skips_owner_preparation",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::s1_epoll_copyout_refusal_preserves_oneshot_and_edge_readiness",
   "carrick-kernel::dispatch::net::epoll_ops::nested_epoll_readiness_tests::s1_epoll_refusal_keeps_pipe_bytes_and_pending_report",

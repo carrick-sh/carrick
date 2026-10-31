@@ -9,8 +9,8 @@ rationale = "Host fd-map entries are non-owning views. Ring dup/fork acquire exp
 structural_budgets = []
 [bindings]
 vm_free = [
-  "carrick-el1-abi::open_lifetime::tests",
   "carrick-kernel::el1_delegation::tests::serial_host::{file_seam_ring_duplicate_survives_last_host_reference,file_seam_final_ring_release_has_one_terminal_handoff_at_each_population,file_seam_native_child_exit_preserves_parent_and_terminal_custody}",
+  "carrick-el1-abi::open_lifetime::tests",
 ]
 [bindings.unresolved]
 embed_structural = "Director-owned full signed regression gate; the production non-Linux binding follows in F1b/F4."

@@ -14,8 +14,8 @@ rationale = "Exactly one process owner admits the fork; the child receives a pri
 
 [bindings]
 vm_free = [
-  "carrick-el1-linux::native_process_runtime::tests::process_clone_child_tid_lives_in_child_mm_and_clears_on_exit",
   "carrick-personality-linux::common_entry::common_linux_entry_calls_native_process_custody",
+  "carrick-el1-linux::native_process_runtime::tests::process_clone_child_tid_lives_in_child_mm_and_clears_on_exit",
 ]
 embed = [
   "carrick-embed::el1_files_inode_exclusivity_two_processes",

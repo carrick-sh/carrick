@@ -13,9 +13,9 @@ rationale = "A host write must invalidate every translation dependency on its ph
 
 [bindings]
 vm_free = [
-  "carrick-core::trap::foreign_mm::tests::native_code_content_foreign_write_revokes_backing_dependencies",
-  "carrick-core::trap::foreign_mm::tests::native_code_content_raw_data_pointer_revokes_and_blocks_observation",
   "carrick-vmm-hvf::trap::code_content::tests::native_code_content_invalidation_contract",
+  "carrick-vmm-hvf::trap::foreign_mm::tests::native_code_content_foreign_write_revokes_backing_dependencies",
+  "carrick-vmm-hvf::trap::foreign_mm::tests::native_code_content_raw_data_pointer_revokes_and_blocks_observation",
 ]
 
 [bindings.unresolved]

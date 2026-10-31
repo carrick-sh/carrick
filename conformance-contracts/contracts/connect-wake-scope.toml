@@ -10,8 +10,8 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
-  "carrick-kernel-example::socket_close::tcp_peer_shut_wr_live_peer_handshake",
   "carrick-kernel::dispatch::net::lifecycle::connect_tests::connect_publication_does_not_wake_a_newly_accepted_rdhup_wait",
+  "carrick-kernel-example::socket_close::tcp_peer_shut_wr_live_peer_handshake",
   "carrick-kernel::dispatch::net::lifecycle::connect_tests::loom_models",
 ]
 

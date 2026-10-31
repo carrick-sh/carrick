@@ -215,8 +215,8 @@ fn surfaces_group_multiple_contracts_and_reject_exact_duplicates() {
     );
     let surfaces = r#"schema_version = 1
 surfaces = [
-  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.requeue" },
   { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.requeue" },
 ]
 "#;
     let root = fixture_root(COMPLETE_CONTRACT, surfaces);
@@ -229,6 +229,7 @@ surfaces = [
 
     let registry = ContractRegistry::load(root.path()).expect("grouped surfaces load");
     assert_eq!(registry.surfaces().len(), 1);
+    assert_eq!(registry.surface_entry_count(), 2);
     assert_eq!(
         registry.surfaces()[0].contracts,
         vec![
@@ -253,6 +254,101 @@ surfaces = [
         Err(RegistryError::DuplicateSurfaceEntry { surface, contract })
             if surface == "crates/carrick-kernel/src/dispatch/futex.rs"
                 && contract.as_str() == "kernel.futex.contention"
+    ));
+}
+
+#[test]
+fn empty_contract_surface_markers_are_preserved_and_cannot_conflict() {
+    let surfaces = r#"schema_version = 1
+surfaces = [
+  # Classified substrate file with no Linux syscall contract.
+  { path = "crates/carrick-core/src/personality.rs", contracts = [] },
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.contention" },
+]
+"#;
+    let root = fixture_root(COMPLETE_CONTRACT, surfaces);
+    let registry = ContractRegistry::load(root.path()).expect("empty surface marker loads");
+    assert_eq!(registry.surfaces().len(), 2);
+    assert_eq!(registry.surface_entry_count(), 2);
+    assert!(registry.surfaces()[0].contracts.is_empty());
+
+    let mixed = r#"schema_version = 1
+surfaces = [
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contracts = [] },
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.contention" },
+]
+"#;
+    fs::write(
+        root.path().join("conformance-contracts/surfaces.toml"),
+        mixed,
+    )
+    .expect("mixed surface fixture");
+    assert!(matches!(
+        ContractRegistry::load(root.path()),
+        Err(RegistryError::ConflictingEmptySurfaceEntry { surface })
+            if surface == "crates/carrick-kernel/src/dispatch/futex.rs"
+    ));
+
+    let non_empty_contracts_array = r#"schema_version = 1
+surfaces = [
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contracts = ["kernel.futex.contention"] },
+]
+"#;
+    fs::write(
+        root.path().join("conformance-contracts/surfaces.toml"),
+        non_empty_contracts_array,
+    )
+    .expect("non-empty contracts array fixture");
+    assert!(matches!(
+        ContractRegistry::load(root.path()),
+        Err(RegistryError::Toml { .. })
+    ));
+}
+
+#[test]
+fn unsorted_surfaces_and_bindings_are_rejected() {
+    let unsorted_surfaces = r#"schema_version = 1
+surfaces = [
+  { path = "crates/z.rs", contract = "kernel.futex.contention" },
+  { path = "crates/a.rs", contract = "kernel.futex.contention" },
+]
+"#;
+    let root = fixture_root(COMPLETE_CONTRACT, unsorted_surfaces);
+    assert!(matches!(
+        ContractRegistry::load(root.path()),
+        Err(RegistryError::UnsortedSurfaceEntries { previous_path, current_path })
+            if previous_path == "crates/z.rs" && current_path == "crates/a.rs"
+    ));
+
+    // Primary binding at [0] may precede alphabetically earlier follow-up bindings,
+    // provided follow-up bindings [1..] are sorted.
+    let valid_primary_plus_sorted_tail = COMPLETE_CONTRACT.replace(
+        "  \"carrick-kernel-example::futex_contention_contract\",",
+        "  \"carrick-z-primary::futex_contention_contract\",\n  \"carrick-a::follow_up\",\n  \"carrick-b::follow_up\",",
+    );
+    let root = fixture_root(&valid_primary_plus_sorted_tail, EMPTY_SURFACES);
+    ContractRegistry::load(root.path()).expect("primary + sorted tail loads");
+
+    let unsorted_tail = COMPLETE_CONTRACT.replace(
+        "  \"carrick-kernel-example::futex_contention_contract\",",
+        "  \"carrick-z-primary::futex_contention_contract\",\n  \"carrick-b::follow_up\",\n  \"carrick-a::follow_up\",",
+    );
+    let root = fixture_root(&unsorted_tail, EMPTY_SURFACES);
+    assert!(matches!(
+        ContractRegistry::load(root.path()),
+        Err(RegistryError::UnsortedBindingEntries { id, .. })
+            if id.as_str() == "kernel.futex.contention"
+    ));
+
+    let unsorted_ecosystem = COMPLETE_CONTRACT.replace(
+        "  \"cpython:concurrent_futures\",\n  \"go:sync\",",
+        "  \"go:sync\",\n  \"cpython:concurrent_futures\",",
+    );
+    let root = fixture_root(&unsorted_ecosystem, EMPTY_SURFACES);
+    assert!(matches!(
+        ContractRegistry::load(root.path()),
+        Err(RegistryError::UnsortedBindingEntries { id, .. })
+            if id.as_str() == "kernel.futex.contention"
     ));
 }
 

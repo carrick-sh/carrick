@@ -56,12 +56,12 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-sched-core::occupancy::tests (one_vcpu_runs_one_address_space, a_switched_slot_is_counted_for_the_address_space_it_runs, host_slots_are_distinct_from_zone_slots_and_reusable, a_pause_never_misses_a_vcpu_about_to_run_its_address_space)",
   "carrick-core::x86_acceleration::x1_shared_mm_owner (order-1 component only: the same moved MM owner over real x86 descriptors, two live same-VA MMs, byte-copy PREPARE/COMMIT and exact prefix settlement; 16/64/256 touched pages, 16/512 unrelated mappings, eight descriptor loads per touched page; no physical pin, hardware invalidation or occupancy-drain acceptance)",
   "carrick-kernel::kernel::mm_occupancy::tests (a_pause_of_z_drains_a_vcpu_switched_from_y_to_z, every_vcpu_running_an_mm_is_counted_whatever_process_it_loaded, rejected_install_still_drains_original_before_granting_mutation, failed_crash_participation_vacates_the_slot, an_unloaded_admission_vacates_its_slot_and_reoccupies_where_it_is_loaded, vacating_one_occupant_preserves_the_other_and_unwind_vacates, a_vcpu_without_a_mailbox_keeps_one_host_slot_per_thread)",
   "carrick-runtime::hvpatch::asid::tests (retirement_needs_one_broadcast_invalidation_of_its_exact_generation, retirement_closes_new_loads_and_waits_for_an_in_flight_load)",
   "carrick-runtime::hvpatch::stage1_mm::tests (one_service_on_any_vcpu_covers_a_publication_for_every_vcpu, a_publication_during_a_service_stays_owed, pre_entry_service_records_coverage_only_after_hardware_success)",
   "carrick-runtime::vcpu_loop::quiesce::pt_pause_tests (foreign_cow_pauses_the_active_target_and_defers_invalidation_to_the_next_entry)",
-  "carrick-sched-core::occupancy::tests (one_vcpu_runs_one_address_space, a_switched_slot_is_counted_for_the_address_space_it_runs, host_slots_are_distinct_from_zone_slots_and_reusable, a_pause_never_misses_a_vcpu_about_to_run_its_address_space)",
   "carrick-thread::fork_quiesce::tests (a_starving_entrant_leaves_before_the_next_fence_is_raised, red without the bounded entrant wait)",
 ]
 embed = [

@@ -29,6 +29,7 @@ rationale = "EL1 increment 1b. Before it, every FUTEX_WAIT/FUTEX_WAKE handoff be
 
 [bindings]
 vm_free = [
+  "carrick-sched-core::tests::interrupt_parked_futex_rechecks_claim_after_futex_enrollment (sender waits on the held bucket and observes subsequent park publication; exact errno 4 and zero leftover entries)",
   "carrick-el1-linux::aarch64_process_tests::tgkill_during_futex_enrollment_returns_eintr (two live registered threads, production tgkill after production futex enqueue and before publication; EINTR, zero park/entry/timer; VM-free only)",
   "carrick-el1-linux::sched::tests",
   "carrick-el1-linux::sched::tests::{cancelled_on_cpu_thread_is_not_stranded_by_repark,signal_requested_on_cpu_is_not_lost_by_repark}",
@@ -40,7 +41,6 @@ vm_free = [
   "carrick-runtime::vcpu_loop::executor::tests::serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle_slot (real self-affinity, shared-futex wake, service capture and host publication; current-mailbox durable wake before guest entry, one capture and one claim on the allowed CPU)",
   "carrick-sched-core::tests",
   "carrick-sched-core::tests::guest_wake_publication_has_no_remaining_futex_entry (zero attached futex entries at guest queue consumption; populations 1/8/32)",
-  "carrick-sched-core::tests::interrupt_parked_futex_rechecks_claim_after_futex_enrollment (sender waits on the held bucket and observes subsequent park publication; exact errno 4 and zero leftover entries)",
   "carrick-sched-core::tests::{cancelled_on_cpu_claim_is_retired_by_the_next_handback,an_admitted_cancel_request_does_not_cancel_a_reused_record,exhausted_record_incarnation_is_never_reallocated,late_host_requests_neither_target_nor_mask_a_new_incarnation} (incarnation-bound deferred requests and cancellation-before-handback)",
   "carrick-sched-core::tests::{drain_handback_identity_survives_reuse_before_the_consumer_runs,host_wake_batch_keeps_identity_after_return_and_reuse,service_take_keeps_identity_after_return_and_reuse} (host publication and returned-batch identity)",
   "carrick-sched-core::tests::{host_claim_is_not_published_before_queue_cleanup,host_claim_cleanup_does_not_unlink_a_replacement_waiter,host_wake_transfer_owns_waitv_cleanup_until_completion,a_host_request_during_transfer_prevents_guest_relocation} (owned transfer, cancellation, waitv cleanup and deferred host requests)",

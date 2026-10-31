@@ -243,11 +243,64 @@ pub struct ConformanceContract {
     pub rationale: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurfaceEntry {
     pub path: String,
-    pub contract: ContractId,
+    pub contract: Option<ContractId>,
+}
+
+#[derive(::serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SurfaceEntryWire {
+    path: String,
+    #[serde(default)]
+    contract: Option<ContractId>,
+    #[serde(default)]
+    contracts: Option<Vec<ContractId>>,
+}
+
+impl<'de> Deserialize<'de> for SurfaceEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = SurfaceEntryWire::deserialize(deserializer)?;
+        match (wire.contract, wire.contracts) {
+            (Some(contract), None) => Ok(Self {
+                path: wire.path,
+                contract: Some(contract),
+            }),
+            (None, Some(contracts)) if contracts.is_empty() => Ok(Self {
+                path: wire.path,
+                contract: None,
+            }),
+            (None, Some(_)) => Err(serde::de::Error::custom(
+                "surface `contracts` field may only be `[]`; list bound contracts one entry per line with `contract = \"...\"`",
+            )),
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "surface entry cannot specify both `contract` and `contracts`",
+            )),
+            (None, None) => Err(serde::de::Error::custom(
+                "surface entry requires `contract = \"...\"` or `contracts = []`",
+            )),
+        }
+    }
+}
+
+impl ::serde::Serialize for SurfaceEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: ::serde::Serializer,
+    {
+        use ::serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("SurfaceEntry", 2)?;
+        state.serialize_field("path", &self.path)?;
+        match &self.contract {
+            Some(contract) => state.serialize_field("contract", contract)?,
+            None => state.serialize_field("contracts", &([] as [ContractId; 0]))?,
+        }
+        state.end()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
