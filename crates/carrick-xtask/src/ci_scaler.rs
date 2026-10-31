@@ -64,6 +64,15 @@ pub enum ScalerError {
     Guard(&'static str),
     #[error("{0}")]
     Usage(String),
+    /// The run's own commits change workflow files, which dispatch's
+    /// publishing credentials can't push (#1241); the second field is any
+    /// note publication adds (where the commits were kept).
+    #[error(
+        "Refused workflow changes: the run's own commits change {}; dispatch publishing credentials cannot publish .github/workflows/*, so the owner must publish or drop them{}",
+        .0.join(", "),
+        .1
+    )]
+    WorkflowRefused(Vec<String>, String),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON: {0}")]

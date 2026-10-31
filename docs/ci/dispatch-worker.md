@@ -562,6 +562,41 @@ server commits `.github/workflows/` back to its admitted-main state on top,
 pushes that under the same lease, and the outcome lists the workflow files
 left out for the owner to publish from `harvest.patch`.
 
+### One round at a time, and the round's mailbox (#1241)
+
+Workers serialize per dispatch issue (`concurrency` on the `worker` job,
+keyed by the guard's resolved issue), so a second trigger queues behind a
+running round instead of racing it. A trigger is never dropped on a guess:
+when the queued round starts, it reads the earlier round's outcome, and if
+that outcome lists the trigger as seen by the coordinator, the trigger
+collapsed into that round (owner decision, #231) and this one ends at once
+with a step-summary note. Otherwise it runs. A duplicate round is
+acceptable; a lost trigger isn't. `/agent stop` is refused by the guard: it
+acts only on a running round, through its mailbox. Only the server writes
+outcomes: the coordinator's `comment` tool refuses bodies that start with
+`Dispatch outcome:` or carry the mailbox header, and the consumption check
+reads only the server's section, before the `<details>` block that embeds
+the worker contract.
+
+While a round runs, the runner reads the issue's and PR's comments about
+once a minute (not review bodies, whose edits the API doesn't show; a
+changes-requested review starts its own round), from the serve loop that waits on the
+coordinator and on every worker, keeping the owner's new, unedited text
+since the trigger (or since the run's creation, for a label round)
+(`round_inbox`):
+- the coordinator receives it in its next tool reply as `inbox`, whatever
+  tool it called, outside its `read_state` budget;
+- a running worker finds it appended to the inbox file its brief names, in
+  a runner-owned `0711` directory with a random name under `/var/tmp` (made
+  before any brief, so the path can't be claimed in advance; created with
+  `O_NOFOLLOW` and deleted after the worker); if it can't be made, the brief
+  names no inbox;
+- an owner comment that is exactly `/agent stop` stops the coordinator or
+  worker at once; the checkpoint is pushed and the round finishes Blocked;
+- the mailbox reads once more just before the outcome, which lists each
+  comment and whether the coordinator saw it; an unseen trigger then gets
+  its own round.
+
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
 proposals and the comment tool refuse the marker.
