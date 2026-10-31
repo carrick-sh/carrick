@@ -6,11 +6,11 @@
       "mcp__carrick-reactor__*",
       "Read",
       "Agent",
-      "SendMessage",
-      "Monitor",
-      "Bash(tail -n0 -F /Volumes/CaseSensitive/carrick-director/reactor/state/mailbox.jsonl)"
+      "SendMessage"
     ],
     "deny": [
+      "Bash",
+      "Monitor",
       "Edit",
       "Write",
       "NotebookEdit",
