@@ -227,7 +227,13 @@ pub fn admit_assigned(
     let deadline = Instant::now() + limit;
     loop {
         if state.join("approved-policy").exists() {
-            return read_policy(&state.join("approved-policy"), Some(owner))?.authorize(context);
+            let policy = read_policy(&state.join("approved-policy"), Some(owner))?;
+            if !matches!(policy, JobPolicy::Bound(_) | JobPolicy::Agent(_)) {
+                return Err(ScalerError::Guard(
+                    "controller rendezvous requires a run-bound policy",
+                ));
+            }
+            return policy.authorize(context);
         }
         if state.join("draining").exists() || Instant::now() >= deadline {
             return Err(ScalerError::Guard("assigned run approval unavailable"));
@@ -264,6 +270,11 @@ pub fn pending_assignment(state: &Path) -> Result<Option<JobContext>, ScalerErro
 }
 
 pub fn publish_assignment(state: &Path, policy: &JobPolicy) -> Result<(), ScalerError> {
+    if !matches!(policy, JobPolicy::Bound(_) | JobPolicy::Agent(_)) {
+        return Err(ScalerError::Guard(
+            "controller rendezvous requires a run-bound policy",
+        ));
+    }
     let _lock = admission_lock(state)?;
     if state.join("draining").exists() {
         return Err(ScalerError::Guard("runner is draining"));

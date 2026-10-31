@@ -738,14 +738,16 @@ pub struct RunBinding {
     pub sha: String,
 }
 
-/// What a runner's job-start hook admits, written by the controller into a
-/// root-owned policy file before the runner starts.
+/// What a runner's job-start hook admits, written into a root-owned policy
+/// file before the runner starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobPolicy {
     /// The historical pilot: [`Admission::Pilot`] for one approved SHA.
     Pilot {
         sha: String,
     },
+    /// [`Admission::Standing`] for a persistent self-hosted runner.
+    Standing,
     /// [`Admission::Standing`] restricted to the one run the controller
     /// vetted (repository, workflow, event, ref and dispatch actors).
     Bound(RunBinding),
@@ -760,6 +762,7 @@ impl JobPolicy {
                 Admission::Pilot { sha } => Ok(Self::Pilot { sha }),
                 _ => Err(ScalerError::Guard("pilot policy")),
             },
+            ["standing"] => Ok(Self::Standing),
             [kind @ ("standing" | "agent"), run, attempt, sha] => {
                 let run = field(run, "run=")
                     .and_then(|v| v.parse::<u64>().ok())
@@ -789,6 +792,7 @@ impl JobPolicy {
     pub fn render(&self) -> String {
         match self {
             Self::Pilot { sha } => format!("pilot {sha}"),
+            Self::Standing => "standing".to_owned(),
             Self::Agent(b) => format!("agent run={} attempt={} sha={}", b.run.0, b.attempt, b.sha),
             Self::Bound(b) => format!(
                 "standing run={} attempt={} sha={}",
@@ -800,6 +804,7 @@ impl JobPolicy {
     pub fn authorize(&self, context: &JobContext) -> Result<(), ScalerError> {
         match self {
             Self::Pilot { sha } => Admission::Pilot { sha: sha.clone() }.authorize(context),
+            Self::Standing => Admission::Standing.authorize(context),
             Self::Bound(binding) | Self::Agent(binding) => {
                 if matches!(self, Self::Agent(_)) {
                     Admission::Agent
@@ -1027,6 +1032,37 @@ pub fn read_policy(path: &Path, owner: Option<u32>) -> Result<JobPolicy, ScalerE
     }
     JobPolicy::parse(&std::fs::read_to_string(path)?)
 }
+/// Authorize a job-start hook invocation against `policy_file` (owned by
+/// `owner`, `0` in production) or controller rendezvous (`controller`).
+pub fn admit_job_context(
+    context: &JobContext,
+    policy_file: &Path,
+    state_dir: &Path,
+    controller: bool,
+    owner: u32,
+) -> Result<(), ScalerError> {
+    if context.run_id == 0 || context.run_attempt == 0 {
+        return Err(ScalerError::Guard("malformed GitHub run context"));
+    }
+    if controller {
+        admit_assigned(state_dir, context, owner, assignment::APPROVAL_LIMIT)?;
+        mark_job_started(state_dir)?;
+    } else {
+        match read_policy(policy_file, Some(owner))? {
+            JobPolicy::Pilot { sha } => {
+                JobPolicy::Pilot { sha }.authorize(context)?;
+                mark_job_started(state_dir)?;
+            }
+            JobPolicy::Standing => Admission::Standing.authorize(context)?,
+            JobPolicy::Bound(_) | JobPolicy::Agent(_) => {
+                return Err(ScalerError::Guard(
+                    "standing assignments require controller rendezvous",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
     match args.action {
         ScalerAction::Site { lane } => {
@@ -1048,12 +1084,17 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             controller,
         } => {
             let get = |name| {
-                std::env::var(name).map_err(|_| ScalerError::Guard("missing GitHub job context"))
+                std::env::var(name)
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .ok_or(ScalerError::Guard("missing GitHub job context"))
             };
             let number = |name| {
                 get(name)?
                     .parse::<u64>()
-                    .map_err(|_| ScalerError::Guard("malformed GitHub run context"))
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .ok_or(ScalerError::Guard("malformed GitHub run context"))
             };
             let event = get("GITHUB_EVENT_NAME")?;
             let webhook = if event == "pull_request_review" {
@@ -1078,19 +1119,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 run_attempt: u32::try_from(number("GITHUB_RUN_ATTEMPT")?)
                     .map_err(|_| ScalerError::Guard("malformed GitHub run context"))?,
             };
-            if controller {
-                admit_assigned(&state_dir, &context, 0, assignment::APPROVAL_LIMIT)?;
-            } else {
-                match read_policy(&policy_file, Some(0))? {
-                    JobPolicy::Pilot { sha } => JobPolicy::Pilot { sha }.authorize(&context)?,
-                    JobPolicy::Bound(_) | JobPolicy::Agent(_) => {
-                        return Err(ScalerError::Guard(
-                            "standing assignments require controller rendezvous",
-                        ));
-                    }
-                }
-            }
-            mark_job_started(&state_dir)?;
+            admit_job_context(&context, &policy_file, &state_dir, controller, 0)?;
             println!("admitted workflow, event and ref");
             Ok(())
         }

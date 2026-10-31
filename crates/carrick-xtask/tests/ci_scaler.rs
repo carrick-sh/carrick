@@ -536,16 +536,22 @@ fn standing_demand_serves_only_trusted_kernel_runtime_runs() {
 fn job_policy_file_round_trips_and_rejects_unknown_text() {
     for policy in [
         bound(),
+        JobPolicy::Standing,
         JobPolicy::Pilot {
             sha: "e".repeat(40),
         },
     ] {
         assert_eq!(JobPolicy::parse(&policy.render()).unwrap(), policy);
     }
+    assert_eq!(
+        JobPolicy::parse("  standing\n").unwrap(),
+        JobPolicy::Standing
+    );
     let sha = "e".repeat(40);
     for text in [
         "".to_owned(),
-        "standing".to_owned(),
+        "standing extra".to_owned(),
+        "agent".to_owned(),
         "pilot".to_owned(),
         "pilot short".to_owned(),
         format!("standing run=x attempt=1 sha={sha}"),
@@ -555,6 +561,82 @@ fn job_policy_file_round_trips_and_rejects_unknown_text() {
     ] {
         assert!(JobPolicy::parse(&text).is_err(), "{text:?}");
     }
+}
+
+#[test]
+fn serial_host_standing_policy_admits_trusted_runs_without_one_shot_state() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let policy_path = dir.path().join("policy");
+    let absent_state = dir.path().join("missing-state-dir");
+    std::fs::write(&policy_path, "standing\n").unwrap();
+    std::fs::set_permissions(&policy_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let uid = unsafe { libc::geteuid() };
+
+    // Persistent standing runner admits multiple main pushes and owner dispatches
+    // without touching a one-shot state_dir/admission.lock.
+    let mut second_push = standing_context("push", "refs/heads/main");
+    second_push.run_id = 78;
+    second_push.sha = "f".repeat(40);
+    for allowed in [
+        standing_context("push", "refs/heads/main"),
+        second_push,
+        standing_context("workflow_dispatch", "refs/heads/main"),
+    ] {
+        admit_job_context(&allowed, &policy_path, &absent_state, false, uid).unwrap();
+    }
+    assert!(!absent_state.exists());
+
+    // Untrusted events, refs, workflows, actors, and malformed run IDs fail closed.
+    let mut non_owner_dispatch = standing_context("workflow_dispatch", "refs/heads/main");
+    non_owner_dispatch.triggering_actor = "contributor".into();
+    let mut wrong_workflow = standing_context("push", "refs/heads/main");
+    wrong_workflow.workflow_ref = format!("{REPOSITORY}/.github/workflows/ci.yml@refs/heads/main");
+    let mut zero_run = standing_context("push", "refs/heads/main");
+    zero_run.run_id = 0;
+    for denied in [
+        standing_context("pull_request", "refs/heads/main"),
+        standing_context("push", "refs/heads/work/feature"),
+        non_owner_dispatch,
+        wrong_workflow,
+        zero_run,
+    ] {
+        assert!(
+            admit_job_context(&denied, &policy_path, &absent_state, false, uid).is_err(),
+            "{denied:?}"
+        );
+    }
+
+    // Wrong owner or Bound policy without --controller fails closed.
+    let trusted = standing_context("push", "refs/heads/main");
+    assert!(
+        admit_job_context(
+            &trusted,
+            &policy_path,
+            &absent_state,
+            false,
+            uid.wrapping_add(1)
+        )
+        .is_err()
+    );
+    let bound_path = dir.path().join("bound-policy");
+    std::fs::write(&bound_path, format!("{}\n", bound().render())).unwrap();
+    std::fs::set_permissions(&bound_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(admit_job_context(&trusted, &bound_path, &absent_state, false, uid).is_err());
+
+    // Unbound Standing policy must never satisfy JIT controller rendezvous.
+    let rendezvous = dir.path().join("rendezvous");
+    std::fs::create_dir_all(&rendezvous).unwrap();
+    std::fs::write(rendezvous.join("admission.lock"), b"").unwrap();
+    std::fs::write(rendezvous.join("assignment.json"), b"").unwrap();
+    assert!(publish_assignment(&rendezvous, &JobPolicy::Standing).is_err());
+    std::fs::write(rendezvous.join("approved-policy"), "standing\n").unwrap();
+    std::fs::set_permissions(
+        rendezvous.join("approved-policy"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(admit_assigned(&rendezvous, &trusted, uid, std::time::Duration::ZERO).is_err());
 }
 
 #[test]
