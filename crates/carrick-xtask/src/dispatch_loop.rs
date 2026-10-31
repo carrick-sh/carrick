@@ -1707,12 +1707,34 @@ impl Server<'_> {
         self.pr = applied.publication_pr.or(self.pr);
         let manual_repair = applied.manual_repair.clone();
         let mut observations = Vec::new();
-        if self.used.workers > 0
+        let last_failed = self.used.workers > 0
             && self
                 .history
                 .last()
-                .is_none_or(|worker| worker.status == ContractStatus::Failed)
-        {
+                .is_none_or(|worker| worker.status == ContractStatus::Failed);
+        // #1253: the last worker's own commits are on the branch (pushed by
+        // the server, and still the live tip), and only then did its
+        // launcher exit badly. That is published work with a failed
+        // launcher, not a round that produced nothing.
+        let published_exit = (last_failed
+            && !applied.published_checkpoint
+            && applied.wip_pushed.is_some()
+            && self.unpushed_head().is_none())
+        .then(|| {
+            let cause = applied
+                .wip_exit
+                .filter(|exit| *exit != LauncherExit::Clean)
+                .map_or_else(
+                    || "the worker's result was incomplete".to_owned(),
+                    |exit| exit.to_string(),
+                );
+            format!(
+                "Published: the worker's commits are on the branch at `{}`; then: {}. Review the pushed head; the worker's own result is incomplete.",
+                applied.wip_pushed.as_deref().unwrap_or_default(),
+                cause
+            )
+        });
+        if last_failed && published_exit.is_none() {
             observations
                 .push("the last worker failed, timed out, or did not produce complete output");
         }
@@ -1740,13 +1762,17 @@ impl Server<'_> {
             // Done means pushed (#1168), and a Done that changed nothing
             // must not leave the PR behind or conflicting (#1215).
             ContractStatus::Blocked
+        } else if published_exit.is_some() && status == ContractStatus::Done {
+            // Published work, but its launcher didn't finish: for review.
+            ContractStatus::Blocked
         } else {
             status
         };
-        let mut checked = facts
-            .as_ref()
-            .map(|f| format!("{}\n\n", f.report()))
-            .unwrap_or_default();
+        let mut checked: String = published_exit
+            .iter()
+            .map(|p| format!("{p}\n\n"))
+            .chain(facts.as_ref().map(|f| format!("{}\n\n", f.report())))
+            .collect();
         super::round_inbox::pump_now();
         let mailbox = super::round_inbox::log();
         // Server-written, for the next round's consumption check: this
@@ -1934,7 +1960,10 @@ impl Server<'_> {
                     "WIP checkpoint not pushed: the existing branch was retained".into(),
                 ));
             }
-            Applied::record(|a| a.wip_pushed = Some(receipt.head.clone()))?;
+            Applied::record(|a| {
+                a.wip_pushed = Some(receipt.head.clone());
+                a.wip_exit = Some(LauncherExit::from_code(receipt.exit_code));
+            })?;
             Ok(Some(format!("pushed WIP at `{}`", receipt.head)))
         })();
         let note = attempt.unwrap_or_else(|error| {
@@ -4534,6 +4563,8 @@ fi
         MissingResult,
         LauncherFailure,
         ReportedTimeout,
+        /// Commits complete work, then its launcher exits 1 (#1253).
+        PublishThenExit,
         /// Work plus a workflow file, which dispatch can't publish (#1241).
         Workflow,
     }
@@ -4596,6 +4627,9 @@ fi
                     "rm ../result.json; printf partial > incomplete-output"
                 }
                 FixtureTurn::LauncherFailure | FixtureTurn::ReportedTimeout => "true",
+                FixtureTurn::PublishThenExit => {
+                    "printf good > first-good; git add first-good; git -c user.name=w -c user.email=w@example.com commit -qm 'fix(core): complete the slice'"
+                }
                 FixtureTurn::Workflow => {
                     "printf good > first-good; mkdir -p .github/workflows; printf 'on: push\\n' > .github/workflows/new.yml"
                 }
@@ -4638,7 +4672,9 @@ fi
                     git(root, &["commit", "-m", "fix(ci): first good worker"])?;
                 }
                 Ok(match self.active {
-                    FixtureTurn::MissingResult | FixtureTurn::LauncherFailure => 1,
+                    FixtureTurn::MissingResult
+                    | FixtureTurn::LauncherFailure
+                    | FixtureTurn::PublishThenExit => 1,
                     FixtureTurn::ReportedTimeout => 124,
                     _ => 0,
                 })
@@ -4905,6 +4941,55 @@ fi
     #[test]
     fn followup_missing_worker_output_floors_finish_done() {
         outcome_floor_fixture(vec![FixtureTurn::MissingResult], false);
+    }
+    /// #1253: a worker commits complete work, the server pushes it, then
+    /// the launcher exits 1. The outcome says the work is published and
+    /// names the exit, instead of reading like a round with no work.
+    #[test]
+    fn published_work_with_a_failed_launcher_reads_as_published() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let (native, _) = native_fixture(vec![FixtureTurn::PublishThenExit]);
+            server.launcher = Box::new(ObservedNativeLauncher(native));
+            std::fs::write(root.join("remote-tip"), "").unwrap();
+            server.execute(worker_request()).unwrap();
+            let pushed = regular_text(&root.join("remote-tip")).unwrap();
+            server
+                .execute(Request::Finish(Outcome {
+                    status: ContractStatus::Done,
+                    summary: "All work is complete".into(),
+                }))
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(posted.starts_with("Dispatch outcome: Blocked"), "{posted}");
+            assert!(
+                posted.contains(&format!(
+                    "Published: the worker's commits are on the branch at `{}`",
+                    pushed.trim()
+                )),
+                "{posted}"
+            );
+            assert!(posted.contains("exited with code 1"), "{posted}");
+            assert!(
+                !posted.contains("the last worker failed, timed out"),
+                "{posted}"
+            );
+            // It sits in the server section beside the mailbox record.
+            let server = server_part(&posted);
+            assert!(
+                server.contains("Published: the worker's commits"),
+                "{posted}"
+            );
+            assert!(
+                server.contains("; then: the worker's launcher exited with code 1."),
+                "{posted}"
+            );
+            assert!(server.contains(MAILBOX_HEADER), "{posted}");
+            assert_eq!(outcome_status(&posted), Some("Blocked"));
+        });
     }
     #[test]
     fn followup_launcher_failure_floors_finish_done() {

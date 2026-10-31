@@ -604,6 +604,13 @@ on every worker, keeping new, unedited items (`round_inbox`):
   each comment; only a Done round marks one as seen, so a failed, stopped
   or fallback round leaves everything for a later round;
 
+When the last worker's launcher exits badly after its own commits were
+pushed (the server's WIP push, still the live branch tip, not a
+server-created checkpoint), the outcome leads with "Published: the worker's
+commits are on the branch at `<head>`; then: <the exit>" and reads Blocked
+for review, instead of the "last worker failed" Failed of a round that
+produced nothing (#1253).
+
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
 proposals and the comment tool refuse the marker.

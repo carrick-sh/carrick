@@ -2099,6 +2099,34 @@ fn regular_text(path: &Path) -> Result<String, ScalerError> {
     Ok(crate::safe_copy::text(path, 20 * 1024 * 1024)?)
 }
 
+/// How a worker's launcher ended, from its exit code (#1253): 124 is the
+/// server's timeout, 0 a clean exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LauncherExit {
+    Clean,
+    TimedOut,
+    Code(i32),
+}
+impl LauncherExit {
+    pub(crate) fn from_code(code: i32) -> Self {
+        match code {
+            0 => Self::Clean,
+            124 => Self::TimedOut,
+            code => Self::Code(code),
+        }
+    }
+}
+impl std::fmt::Display for LauncherExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Clean => write!(f, "the worker's launcher exited cleanly"),
+            Self::TimedOut => write!(f, "the worker timed out"),
+            Self::Code(code) => write!(f, "the worker's launcher exited with code {code}"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Receipt {
     head: String,
@@ -3239,6 +3267,9 @@ struct Applied {
     /// The last tip the server pushed as a WIP checkpoint after a worker.
     #[serde(default)]
     wip_pushed: Option<String>,
+    /// How that worker's launcher ended, from the server's receipt (#1253).
+    #[serde(default)]
+    wip_exit: Option<LauncherExit>,
     /// Workflow files a WIP checkpoint left out, because dispatch can't
     /// publish `.github/workflows/*` (#1241); the owner publishes them.
     #[serde(default)]
