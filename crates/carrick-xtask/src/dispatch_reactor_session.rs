@@ -537,7 +537,12 @@ impl Server<'_> {
                 if trusted_pr(&pr) {
                     out["body"] = json!(clip(pr["body"].as_str().unwrap_or_default()));
                 } else {
+                    // Title, branch name and check names are author-chosen
+                    // text too, so a stranger's PR shows none of them.
                     out["body_untrusted"] = json!(true);
+                    out["title"] = Value::Null;
+                    out["head"]["ref"] = Value::Null;
+                    out["ci"] = Value::Null;
                 }
                 Ok(out.to_string())
             }
@@ -646,6 +651,7 @@ impl Server<'_> {
                     );
                 } else {
                     out["body_untrusted"] = json!(true);
+                    out["title"] = Value::Null;
                 }
                 let limit = args["comments"].as_u64().unwrap_or(0).min(30) as usize;
                 if limit > 0 {
@@ -1549,6 +1555,15 @@ mod tests {
         let out: Value = serde_json::from_str(&text).unwrap();
         assert!(
             !err && out.get("body").is_none() && out["body_untrusted"] == true,
+            "{text}"
+        );
+        assert!(
+            out["title"].is_null() && out["head"]["ref"].is_null() && out["ci"].is_null(),
+            "{text}"
+        );
+        let (_, text) = call(&mut fake, &state, "read_issue", json!({"n":41}));
+        assert!(
+            serde_json::from_str::<Value>(&text).unwrap()["title"].is_null(),
             "{text}"
         );
         let (err, text) = call(&mut fake, &state, "read_diff", json!({"pr":41}));
