@@ -78,11 +78,8 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             Some("${{ fromJSON(needs.changes.outputs.macos_runner) }}")
         );
         let steps = jobs[job.as_str()]["steps"].as_vec().unwrap();
-        assert!(
-            steps
-                .iter()
-                .any(|s| s["run"].as_str() == Some(&format!("just ci-macos-test {shard}")))
-        );
+        assert!(steps.iter().any(|s| s["run"].as_str()
+            == Some(&format!("just lease carrick just ci-macos-test {shard}"))));
         assert!(
             steps
                 .iter()
@@ -121,7 +118,9 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             .as_vec()
             .unwrap()
             .iter()
-            .any(|s| s["run"].as_str() == Some("just check-test-shards"))
+            .any(|s| s["run"]
+                .as_str()
+                .is_some_and(|r| r.contains("check-test-shards")))
     );
     assert!(
         !jobs["lint-domains"]["steps"]
@@ -166,19 +165,23 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
     };
     assert!(runs("linux-doc", "just check-fuzz"));
     assert!(!runs("macos-build", "just check-fuzz"));
+    assert!(!runs("macos-build", "just lease carrick just check-fuzz"));
     assert!(
-        runs("macos-build", "just doc"),
+        runs("macos-build", "just lease carrick just doc"),
         "macOS cfg documentation must retain native coverage"
     );
     assert!(
-        runs("macos-clippy", "just xtask authority-debt"),
+        runs(
+            "macos-clippy",
+            "just lease carrick just xtask authority-debt"
+        ),
         "PR and nightly macOS census must remain in macos-clippy"
     );
     let census = jobs["macos-clippy"]["steps"]
         .as_vec()
         .unwrap()
         .iter()
-        .find(|s| s["run"].as_str() == Some("just xtask authority-debt"))
+        .find(|s| s["run"].as_str() == Some("just lease carrick just xtask authority-debt"))
         .unwrap();
     assert_eq!(
         census["if"].as_str(),
