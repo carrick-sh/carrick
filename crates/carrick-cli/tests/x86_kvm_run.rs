@@ -740,17 +740,106 @@ fn mounted_static_x86_ppoll_waits_and_rejects_bad_nsec() {
     assert_eq!(run_poll_timeout_markers(command, &[b"B\n", b"T\n"]), native);
 }
 
+const POLL_TIMEOUT_FLOOR: Duration = Duration::from_millis(100);
+
+#[must_use]
+struct PollStartEpoch<Stamp> {
+    after_marker: usize,
+    stamp: Stamp,
+}
+
+trait PollEpochClock {
+    type Stamp;
+
+    fn start_epoch(&mut self, after_marker: usize) -> PollStartEpoch<Self::Stamp>;
+    fn elapsed_since(&mut self, epoch: PollStartEpoch<Self::Stamp>) -> Duration;
+}
+
+struct MonotonicPollClock;
+
+impl PollEpochClock for MonotonicPollClock {
+    type Stamp = Instant;
+
+    fn start_epoch(&mut self, after_marker: usize) -> PollStartEpoch<Instant> {
+        PollStartEpoch {
+            after_marker,
+            stamp: Instant::now(),
+        }
+    }
+
+    fn elapsed_since(&mut self, epoch: PollStartEpoch<Instant>) -> Duration {
+        epoch.stamp.elapsed()
+    }
+}
+
+#[derive(Debug)]
+enum PollObserverError {
+    MissingMarker {
+        index: usize,
+    },
+    ReadFailed {
+        index: usize,
+        error: std::io::Error,
+        output: Vec<u8>,
+    },
+    UnexpectedMarker {
+        index: usize,
+        expected: [u8; 2],
+        actual: [u8; 2],
+    },
+    ReleaseWriteFailed {
+        after_marker: usize,
+        error: std::io::Error,
+    },
+    PrematureCompletion {
+        after_marker: usize,
+        elapsed: Duration,
+        minimum: Duration,
+    },
+}
+
+impl std::fmt::Display for PollObserverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingMarker { index } => write!(f, "poll marker {index} missing"),
+            Self::ReadFailed {
+                index,
+                error,
+                output,
+            } => write!(
+                f,
+                "poll marker {index} read failed: {error}; output={output:?}"
+            ),
+            Self::UnexpectedMarker {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "poll marker {index} mismatch: expected {expected:?}, got {actual:?}"
+            ),
+            Self::ReleaseWriteFailed {
+                after_marker,
+                error,
+            } => write!(
+                f,
+                "poll release write after marker {after_marker} failed: {error}"
+            ),
+            Self::PrematureCompletion {
+                after_marker,
+                elapsed,
+                minimum,
+            } => write!(
+                f,
+                "poll returned after {elapsed:?}, before its {minimum:?} deadline after marker {after_marker}"
+            ),
+        }
+    }
+}
+
 fn run_poll_timeout_markers(
     mut command: std::process::Command,
     markers: &[&[u8; 2]],
-) -> (Vec<u8>, Option<i32>) {
-    run_poll_timeout_markers_with(&mut command, markers, |_, _| ())
-}
-
-fn run_poll_timeout_markers_with(
-    command: &mut std::process::Command,
-    markers: &[&[u8; 2]],
-    mut after_start: impl FnMut(i32, usize),
 ) -> (Vec<u8>, Option<i32>) {
     let mut child = ReapChild(
         command
@@ -760,60 +849,285 @@ fn run_poll_timeout_markers_with(
             .spawn()
             .expect("spawn empty-set poll witness"),
     );
+    let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
-    let mut output = Vec::new();
-    let mut start_epoch: Option<Instant> = None;
-    for (index, expected) in markers.iter().enumerate() {
+    let mut clock = MonotonicPollClock;
+    let observed = observe_poll_timeout_markers(
+        &mut stdin,
+        &mut stdout,
+        markers,
+        5_000,
+        &mut clock,
+        |_, _, _| (),
+    );
+    drop(stdin);
+    if let Err(ref error) = observed {
+        let status = match child.wait_timeout(Duration::from_secs(1)).unwrap() {
+            Some(status) => status,
+            None => {
+                let _ = child.kill();
+                child.wait().unwrap()
+            }
+        };
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
         assert!(
-            poll_readable(stdout.as_raw_fd(), 5_000),
-            "poll marker {index} missing"
+            observed.is_ok(),
+            "{error}; status={status}; stderr={stderr}"
         );
-        let mut marker = [0u8; 2];
-        let read_result = stdout.read_exact(&mut marker);
-        if read_result.is_err() {
-            let status = child.wait().unwrap();
-            let mut stderr = String::new();
-            child
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
-            assert!(
-                read_result.is_ok(),
-                "poll marker {index} read failed: {read_result:?}; status={status}; output={output:?}; stderr={stderr}"
-            );
-        }
-        assert_eq!(&marker, *expected);
-        output.extend_from_slice(&marker);
-        if let Some(start) = start_epoch.take() {
-            assert!(
-                start.elapsed() >= Duration::from_millis(100),
-                "poll returned before its 100ms deadline after marker {}",
-                index - 1
-            );
-        }
-        if index + 1 < markers.len() {
-            start_epoch = Some(Instant::now());
-            child.stdin.as_mut().unwrap().write_all(b"X").unwrap();
-            after_start(stdout.as_raw_fd(), index);
-        }
     }
+    let output = observed.unwrap();
     let status = child.wait().unwrap();
     (output, status.code())
 }
 
+fn observe_poll_timeout_markers<R, W, C>(
+    stdin: &mut W,
+    stdout: &mut R,
+    markers: &[&[u8; 2]],
+    wait_timeout_ms: i32,
+    clock: &mut C,
+    mut after_release: impl FnMut(&mut C, i32, usize),
+) -> Result<Vec<u8>, PollObserverError>
+where
+    R: Read + AsRawFd,
+    W: Write,
+    C: PollEpochClock,
+{
+    assert!(
+        !markers.is_empty(),
+        "poll marker sequence must not be empty"
+    );
+    let mut output = Vec::with_capacity(markers.len() * 2);
+    let mut start_epoch: Option<PollStartEpoch<C::Stamp>> = None;
+    for (index, expected) in markers.iter().enumerate() {
+        if !poll_readable(stdout.as_raw_fd(), wait_timeout_ms) {
+            return Err(PollObserverError::MissingMarker { index });
+        }
+        let mut marker = [0u8; 2];
+        if let Err(error) = stdout.read_exact(&mut marker) {
+            return Err(PollObserverError::ReadFailed {
+                index,
+                error,
+                output,
+            });
+        }
+        if &marker != *expected {
+            return Err(PollObserverError::UnexpectedMarker {
+                index,
+                expected: **expected,
+                actual: marker,
+            });
+        }
+        output.extend_from_slice(&marker);
+        if let Some(epoch) = start_epoch.take() {
+            let after_marker = epoch.after_marker;
+            let elapsed = clock.elapsed_since(epoch);
+            if elapsed < POLL_TIMEOUT_FLOOR {
+                return Err(PollObserverError::PrematureCompletion {
+                    after_marker,
+                    elapsed,
+                    minimum: POLL_TIMEOUT_FLOOR,
+                });
+            }
+        }
+        if index + 1 < markers.len() {
+            assert!(
+                start_epoch.is_none(),
+                "previous poll start epoch must be consumed before minting the next"
+            );
+            start_epoch = Some(clock.start_epoch(index));
+            stdin
+                .write_all(b"X")
+                .and_then(|()| stdin.flush())
+                .map_err(|error| PollObserverError::ReleaseWriteFailed {
+                    after_marker: index,
+                    error,
+                })?;
+            after_release(clock, stdout.as_raw_fd(), index);
+        }
+    }
+    assert!(
+        start_epoch.is_none(),
+        "final poll marker must consume the last start epoch"
+    );
+    Ok(output)
+}
+
 #[test]
 fn host_poll_observer_late_marker_uses_original_start_epoch() {
-    let dir = tempfile::tempdir().unwrap();
-    let elf = dir.path().join("poll-empty-sets");
-    compile_assembly("x86_poll_empty_sets.S", &elf);
-    let mut native = std::process::Command::new(&elf);
+    struct ScriptedPollClock {
+        now: Duration,
+        minted: Vec<(usize, Duration)>,
+        consumed: Vec<(usize, Duration, Duration)>,
+    }
+
+    impl ScriptedPollClock {
+        fn new() -> Self {
+            Self {
+                now: Duration::ZERO,
+                minted: Vec::new(),
+                consumed: Vec::new(),
+            }
+        }
+
+        fn advance(&mut self, delta: Duration) {
+            self.now += delta;
+        }
+    }
+
+    impl PollEpochClock for ScriptedPollClock {
+        type Stamp = Duration;
+
+        fn start_epoch(&mut self, after_marker: usize) -> PollStartEpoch<Duration> {
+            let stamp = self.now;
+            self.minted.push((after_marker, stamp));
+            PollStartEpoch {
+                after_marker,
+                stamp,
+            }
+        }
+
+        fn elapsed_since(&mut self, epoch: PollStartEpoch<Duration>) -> Duration {
+            let elapsed = self
+                .now
+                .checked_sub(epoch.stamp)
+                .expect("scripted poll clock is monotonic");
+            self.consumed
+                .push((epoch.after_marker, epoch.stamp, self.now));
+            elapsed
+        }
+    }
+
+    // Late observer / already-buffered marker: each completion marker arrives
+    // at +100ms, then the observer reaches poll_readable strictly later (+150ms
+    // and +5ms) with zero clock progress between poll_readable and read_exact.
+    // Measuring from poll_readable entry instead of the owned start epoch would
+    // observe 0ms (< 100ms) and fail.
+    let (mut peer_stdin, mut observer_stdin) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (mut observer_stdout, mut peer_stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer_stdout.write_all(b"B\n").unwrap();
+    let mut clock = ScriptedPollClock::new();
+    let observed = observe_poll_timeout_markers(
+        &mut observer_stdin,
+        &mut observer_stdout,
+        &[b"B\n", b"N\n", b"T\n"],
+        0,
+        &mut clock,
+        |clock, stdout_fd, index| {
+            assert!(
+                !poll_readable(stdout_fd, 0),
+                "completion marker must not precede release {index}"
+            );
+            assert_eq!(
+                clock.minted.len(),
+                index + 1,
+                "start epoch must be minted before writing release byte"
+            );
+            assert!(
+                poll_readable(peer_stdin.as_raw_fd(), 0),
+                "release byte {index} must be readable by peer"
+            );
+            let mut release = [0u8; 1];
+            peer_stdin.read_exact(&mut release).unwrap();
+            assert_eq!(&release, b"X");
+            assert!(
+                !poll_readable(peer_stdin.as_raw_fd(), 0),
+                "each epoch must emit exactly one release byte"
+            );
+            let (marker, observer_delay_ms): (&[u8; 2], u64) = match index {
+                0 => (b"N\n", 150),
+                1 => (b"T\n", 5),
+                _ => (&[0, 0], 0),
+            };
+            assert_ne!(marker, &[0, 0], "unexpected release index {index}");
+            clock.advance(POLL_TIMEOUT_FLOOR);
+            peer_stdout.write_all(marker).unwrap();
+            clock.advance(Duration::from_millis(observer_delay_ms));
+            assert!(
+                poll_readable(stdout_fd, 0),
+                "completion marker after {index} must be buffered before observer polls"
+            );
+        },
+    )
+    .expect("late markers must measure elapsed time from their owned start epochs");
+    assert_eq!(observed, b"B\nN\nT\n");
     assert_eq!(
-        run_poll_timeout_markers_with(&mut native, &[b"B\n", b"N\n", b"T\n"], |fd, _| {
-            assert!(poll_readable(fd, 5_000), "native poll completion missing");
-        }),
-        (b"B\nN\nT\n".to_vec(), Some(7))
+        clock.minted,
+        vec![(0, Duration::ZERO), (1, Duration::from_millis(250))]
+    );
+    assert_eq!(
+        clock.consumed,
+        vec![
+            (0, Duration::ZERO, Duration::from_millis(250)),
+            (1, Duration::from_millis(250), Duration::from_millis(355)),
+        ]
+    );
+
+    // Owned epoch consumption: after a valid 250ms first wait, a 99ms second
+    // wait must fail against the newly minted second epoch (250ms -> 349ms),
+    // even though 349ms has elapsed since the first epoch.
+    let (mut peer_stdin, mut observer_stdin) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (mut observer_stdout, mut peer_stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer_stdout.write_all(b"B\n").unwrap();
+    let mut clock = ScriptedPollClock::new();
+    let premature = observe_poll_timeout_markers(
+        &mut observer_stdin,
+        &mut observer_stdout,
+        &[b"B\n", b"N\n", b"T\n"],
+        0,
+        &mut clock,
+        |clock, stdout_fd, index| {
+            let mut release = [0u8; 1];
+            peer_stdin.read_exact(&mut release).unwrap();
+            assert_eq!(&release, b"X");
+            if index == 0 {
+                clock.advance(Duration::from_millis(250));
+                peer_stdout.write_all(b"N\n").unwrap();
+            } else {
+                clock.advance(Duration::from_millis(99));
+                peer_stdout.write_all(b"T\n").unwrap();
+            }
+            assert!(poll_readable(stdout_fd, 0));
+        },
+    );
+    assert!(
+        matches!(
+            premature,
+            Err(PollObserverError::PrematureCompletion {
+                after_marker: 1,
+                elapsed,
+                minimum,
+            }) if elapsed == Duration::from_millis(99) && minimum == POLL_TIMEOUT_FLOOR
+        ),
+        "expected premature completion on second epoch, got {premature:?}"
+    );
+
+    // Bounded wait without marker arrival returns MissingMarker without retry.
+    let (mut peer_stdin, mut observer_stdin) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (mut observer_stdout, mut peer_stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer_stdout.write_all(b"B\n").unwrap();
+    let mut clock = ScriptedPollClock::new();
+    let missing = observe_poll_timeout_markers(
+        &mut observer_stdin,
+        &mut observer_stdout,
+        &[b"B\n", b"N\n"],
+        0,
+        &mut clock,
+        |_, _, _| {
+            let mut release = [0u8; 1];
+            peer_stdin.read_exact(&mut release).unwrap();
+            assert_eq!(&release, b"X");
+        },
+    );
+    assert!(
+        matches!(missing, Err(PollObserverError::MissingMarker { index: 1 })),
+        "expected missing marker 1, got {missing:?}"
     );
 }
 
