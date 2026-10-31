@@ -832,11 +832,14 @@ pub unsafe fn publish_existing_invalid_private_pages(
 /// carrying EL1's private-anonymous authority, prepared or resident (a
 /// prepared leaf stays invalid; its AP/UXN govern its later commit and host
 /// buffer access). The complete range, terminal coverage, and permission
-/// ceiling are checked before the first store; COW-armed leaves report
-/// `PermissionWidening`. This entry point carries no table grants, so a
-/// partially covered block is refused; a host submission carrying grants
-/// splits it (see [`descriptor_txn`]). A rolled-back edit restores every
-/// word; the caller still invalidates the ASID only after success.
+/// ceiling are checked before the first store; COW-armed resident leaves edit
+/// in place under `edit.cow_ceiling` (keeping `SW_EL1_COW` armed, never
+/// granting `AP_RW`, and recording write intent in `SW_EL1_MAY_WRITE`) and
+/// report `PermissionWidening` when `cow_ceiling` is `None` or exceeded. This
+/// entry point carries no table grants, so a partially covered block is
+/// refused; a host submission carrying grants splits it (see [`descriptor_txn`]).
+/// A rolled-back edit restores every word; the caller still invalidates the
+/// ASID only after success.
 ///
 /// # Safety
 ///
@@ -12193,6 +12196,81 @@ mod tests {
             Err(GuestPermissionEditError::PermissionWidening)
         );
         assert_eq!(words[l3].load(Ordering::Acquire), armed);
+        let ro_ceiling = Some(GuestPermissionCeiling {
+            readable: true,
+            writable: false,
+            executable: false,
+        });
+        assert_eq!(
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    byte_len,
+                    None,
+                    GuestPermissionEdit {
+                        va,
+                        len: PT_PAGE,
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        cow_ceiling: ro_ceiling,
+                    },
+                )
+            },
+            Err(GuestPermissionEditError::PermissionWidening)
+        );
+        assert_eq!(words[l3].load(Ordering::Acquire), armed);
+        assert_eq!(
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    byte_len,
+                    None,
+                    GuestPermissionEdit {
+                        va,
+                        len: PT_PAGE,
+                        readable: false,
+                        writable: false,
+                        executable: false,
+                        cow_ceiling: ro_ceiling,
+                    },
+                )
+            },
+            Ok(1)
+        );
+        let narrowed = words[l3].load(Ordering::Acquire);
+        assert!(el1_cow(narrowed));
+        assert_eq!(narrowed & AP_MASK, AP_PRIV_RO);
+        assert_eq!(narrowed & SW_EL1_MAY_WRITE, 0);
+        assert_eq!(
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words.as_mut_ptr(),
+                    root,
+                    byte_len,
+                    None,
+                    GuestPermissionEdit {
+                        va,
+                        len: PT_PAGE,
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        cow_ceiling: Some(GuestPermissionCeiling {
+                            readable: true,
+                            writable: true,
+                            executable: false,
+                        }),
+                    },
+                )
+            },
+            Ok(1)
+        );
+        let widened = words[l3].load(Ordering::Acquire);
+        assert!(el1_cow(widened));
+        assert_eq!(widened & AP_MASK, AP_RO);
+        assert_ne!(widened & SW_EL1_MAY_WRITE, 0);
 
         // A narrowed page must not gain write intent or EL0 access at fork.
         for ap in [AP_RO, AP_PRIV_RO] {

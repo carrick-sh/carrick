@@ -3060,7 +3060,7 @@ fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_
             &mut frame,
             &counters,
             &task,
-            SpaceAccess::source_free_with_context(&spaces),
+            SpaceAccess::source_free(&spaces),
             region.table(),
             &mut editor,
             None,

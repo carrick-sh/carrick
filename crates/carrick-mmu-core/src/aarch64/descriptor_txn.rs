@@ -208,9 +208,12 @@ pub enum DescriptorOp {
         expected_ipa: SubstrateGpa,
         access: LeafAccess,
     },
-    /// Change permissions on prepared and/or resident private leaves. The
-    /// software write/execute ceiling bounds the result; COW-armed leaves are
-    /// refused. Prepared leaves stay invalid.
+    /// Change permissions on prepared and/or resident private leaves. On
+    /// non-COW leaves the software write/execute bits bound the result; on
+    /// COW-armed resident leaves `edit.cow_ceiling` bounds the result in place
+    /// (keeping `SW_EL1_COW` armed, never granting `AP_RW`, and recording new
+    /// write intent in `SW_EL1_MAY_WRITE`), or `CowArmed` is refused when no
+    /// ceiling is supplied. Prepared leaves stay invalid.
     Protect(GuestPermissionEdit),
     /// Retire prepared and resident private leaves, retaining outputs for the
     /// host's lease reconciliation.
@@ -2271,15 +2274,35 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 ) {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
+                let any_el0 = edit.readable || edit.writable || edit.executable;
                 if el1_cow(descriptor) {
-                    return Err(DescriptorRefusal::CowArmed);
+                    let Some(ceiling) = edit.cow_ceiling else {
+                        return Err(DescriptorRefusal::CowArmed);
+                    };
+                    if (any_el0 && !ceiling.readable)
+                        || (edit.writable && !ceiling.writable)
+                        || (edit.executable
+                            && (!ceiling.executable || descriptor & SW_EL1_MAY_EXEC == 0))
+                    {
+                        return Err(DescriptorRefusal::PermissionWidening);
+                    }
+                    let (ap, uxn) = if !any_el0 {
+                        (AP_PRIV_RO, UXN)
+                    } else {
+                        (AP_RO, if edit.executable { 0 } else { UXN })
+                    };
+                    let may_write = if edit.writable { SW_EL1_MAY_WRITE } else { 0 };
+                    return Ok((descriptor & !AP_MASK & !UXN & !SW_EL1_MAY_WRITE)
+                        | ap
+                        | uxn
+                        | may_write);
                 }
                 if (edit.writable && descriptor & SW_EL1_MAY_WRITE == 0)
                     || (edit.executable && descriptor & SW_EL1_MAY_EXEC == 0)
                 {
                     return Err(DescriptorRefusal::PermissionWidening);
                 }
-                let (ap, uxn) = if !(edit.readable || edit.writable || edit.executable) {
+                let (ap, uxn) = if !any_el0 {
                     (AP_PRIV_RO, UXN)
                 } else if edit.writable {
                     (AP_RW, if edit.executable { 0 } else { UXN })
