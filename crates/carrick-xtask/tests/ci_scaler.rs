@@ -1037,10 +1037,21 @@ fn dispatch_demand_and_hook_are_bound_to_owner_main_workflow_run() {
     run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
     assert!(Admission::Agent.identifies_run(&run));
     assert!(!Admission::Standing.identifies_run(&run));
+    // #1214: run identity is shape only (human actors with valid logins);
+    // whether those actors are write collaborators is the live check in
+    // controller admission and the token mint, covered by the lib tests.
     for field in ["actor", "triggering_actor"] {
-        let mut bad = run.clone();
-        bad[field]["login"] = "outsider".into();
-        assert!(!Admission::Agent.identifies_run(&bad));
+        let mut collaborator = run.clone();
+        collaborator[field]["login"] = "collaborator".into();
+        assert!(Admission::Agent.identifies_run(&collaborator));
+        for (key, value) in [("type", "Bot"), ("login", "../outsider"), ("login", "")] {
+            let mut bad = run.clone();
+            bad[field][key] = value.into();
+            assert!(
+                !Admission::Agent.identifies_run(&bad),
+                "{field}.{key}={value}"
+            );
+        }
     }
     let mut context = standing_context("issues", "refs/heads/main");
     context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main");

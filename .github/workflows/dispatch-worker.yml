@@ -18,7 +18,10 @@ concurrency:
 
 jobs:
   guard:
-    if: github.actor == 'tjfontaine' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/agent')) || (github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))
+    # Cheap pre-filter only (#1214). Comments and reviews need an OWNER, MEMBER or
+    # COLLABORATOR association; applying a label already needs triage access. The
+    # guard's live collaborator-permission check (write or higher) is authoritative.
+    if: github.event.sender.type == 'User' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && startsWith(github.event.comment.body, '/agent')) || (github.event_name == 'pull_request_review' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association) && github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:

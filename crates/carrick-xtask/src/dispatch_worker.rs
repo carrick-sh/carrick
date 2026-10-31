@@ -1,4 +1,4 @@
-//! Owner-authorized dispatch driver. Workflow input never becomes shell source.
+//! Collaborator-authorized dispatch driver (#1214). Workflow input never becomes shell source.
 use crate::ci_scaler::{REPOSITORY, ScalerError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -61,8 +61,73 @@ struct LoopConfig {
     loop_policy: agent_loop::Policy,
 }
 
-pub fn trusted_actor(actor: &str) -> bool {
-    actor == "tjfontaine"
+/// Who may trigger dispatch (#1214, owner decision on #231): a repository
+/// collaborator with `write`, `maintain` or `admin` permission, read live
+/// from `GET repos/{REPOSITORY}/collaborators/{login}/permission`. Callers
+/// supply the transport so the validators stay pure. `read`, `triage` and
+/// `none`, a malformed login, a 404 and any other API error are refused.
+pub(crate) fn write_collaborator(
+    login: &str,
+    read: impl FnOnce(&str) -> Result<Value, ScalerError>,
+) -> bool {
+    let Some(endpoint) = permission_endpoint(login) else {
+        return false;
+    };
+    read(&endpoint).is_ok_and(|v| {
+        matches!(
+            v["permission"].as_str(),
+            Some("admin" | "maintain" | "write")
+        )
+    })
+}
+/// The permission endpoint for a syntactically valid GitHub login only, so
+/// event text can never reshape the request path.
+pub(crate) fn permission_endpoint(login: &str) -> Option<String> {
+    let valid = !login.is_empty()
+        && login.len() <= 39
+        && !login.starts_with('-')
+        && login
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    valid.then(|| format!("repos/{REPOSITORY}/collaborators/{login}/permission"))
+}
+/// A per-event trusted-login predicate over one transport, caching each
+/// login's answer (refusals included) for the life of the predicate.
+pub(crate) fn collaborators<'a>(
+    mut read: impl FnMut(&str) -> Result<Value, ScalerError> + 'a,
+) -> impl FnMut(&str) -> bool + 'a {
+    let mut cache = std::collections::BTreeMap::<String, bool>::new();
+    move |login: &str| {
+        if let Some(trusted) = cache.get(login) {
+            return *trusted;
+        }
+        let trusted = write_collaborator(login, &mut read);
+        cache.insert(login.to_owned(), trusted);
+        trusted
+    }
+}
+/// A human account that [`write_collaborator`] trusts.
+pub(crate) fn trusted_user(user: &Value, trusted: &mut dyn FnMut(&str) -> bool) -> bool {
+    user["type"] == "User" && user["login"].as_str().is_some_and(trusted)
+}
+/// Test transport for [`collaborators`]: each listed login answers its
+/// permission; any other login gets the API's 404.
+#[cfg(test)]
+pub(crate) fn fake_collaborators(
+    table: &'static [(&'static str, &'static str)],
+) -> impl FnMut(&str) -> bool {
+    collaborators(move |endpoint| {
+        table
+            .iter()
+            .find(|(login, _)| permission_endpoint(login).as_deref() == Some(endpoint))
+            .map(|(_, permission)| json!({"permission":permission}))
+            .ok_or(ScalerError::Guard("gh: Not Found (HTTP 404)"))
+    })
+}
+/// The fixtures' usual actor, `tjfontaine`, as an admin collaborator.
+#[cfg(test)]
+pub(crate) fn owner_collaborator() -> impl FnMut(&str) -> bool {
+    fake_collaborators(&[("tjfontaine", "admin")])
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,15 +200,15 @@ pub(crate) enum AdoptionRead {
 
 /// The one adoption predicate, shared by the hosted guard, clone admission,
 /// the controller and the loop. A same-repository `work/*` PR into main that
-/// no dispatch run named, authored by the owner or the publish App, closing
-/// exactly one open owner-authored issue. Head freshness is the caller's
-/// expected-tip check, exactly as for owned PRs.
+/// no dispatch run named, closing exactly one open issue in this repository.
+/// Authorship is not checked (#1214): a same-repository head already needs
+/// write access to push, and the trusted `/agent` comment is the approval.
+/// Head freshness is the caller's expected-tip check, exactly as for owned PRs.
 pub(crate) fn adopted_pr(
     pr: &Value,
     mut read: impl FnMut(AdoptionRead) -> Result<Value, ScalerError>,
 ) -> Result<Option<Adoption>, ScalerError> {
     let branch = pr["head"]["ref"].as_str().unwrap_or_default();
-    let author = &pr["user"];
     let (Some(number), Some(tip)) = (
         pr["number"].as_u64().filter(|n| *n > 0),
         pr["head"]["sha"].as_str().filter(|s| sha(s)),
@@ -156,8 +221,6 @@ pub(crate) fn adopted_pr(
         || pr["base"]["ref"] != "main"
         || !valid_branch(branch)
         || dispatch_branch(branch).is_some()
-        || !((author["login"] == "tjfontaine" && author["type"] == "User")
-            || publish_app_author(author))
     {
         return Ok(None);
     }
@@ -171,8 +234,6 @@ pub(crate) fn adopted_pr(
     let issue = read(AdoptionRead::Issue(reference.number))?;
     if issue["number"].as_u64() != Some(reference.number)
         || issue["state"] != "open"
-        || issue["user"]["login"] != "tjfontaine"
-        || issue["user"]["type"] != "User"
         || issue.get("pull_request").is_some()
     {
         return Ok(None);
@@ -243,10 +304,10 @@ pub(crate) fn dispatch_label(label: &str) -> bool {
 }
 
 /// Used by the guard and controller; text is context, never executable policy.
-pub(crate) fn agent_comment(comment: &Value) -> bool {
+/// The author must be a trusted collaborator ([`write_collaborator`]).
+pub(crate) fn agent_comment(comment: &Value, trusted: &mut dyn FnMut(&str) -> bool) -> bool {
     let body = comment["body"].as_str().unwrap_or_default();
-    comment["user"]["login"] == "tjfontaine"
-        && comment["user"]["type"] == "User"
+    trusted_user(&comment["user"], trusted)
         && comment["created_at"]
             .as_str()
             .is_some_and(|s| !s.is_empty())
@@ -263,26 +324,33 @@ pub(crate) fn comment_digest(comment: &Value) -> String {
     format!("{:x}", Sha256::digest(data.to_string().as_bytes()))
 }
 
-pub fn validate_event(event: &Value, triggering_actor: &str) -> Result<Dispatch, ScalerError> {
-    validate_event_with_publication(event, triggering_actor, None, None)
+#[cfg(test)]
+pub(crate) fn validate_event(
+    event: &Value,
+    triggering_actor: &str,
+    trusted: &mut dyn FnMut(&str) -> bool,
+) -> Result<Dispatch, ScalerError> {
+    validate_event_with_publication(event, triggering_actor, trusted, None, None)
 }
 fn validate_event_with_publication(
     event: &Value,
     triggering_actor: &str,
+    trusted: &mut dyn FnMut(&str) -> bool,
     publication: Option<&PublishedPr>,
     adoption: Option<&Adoption>,
 ) -> Result<Dispatch, ScalerError> {
     let review = event.get("review").is_some();
     let comment = event.get("comment").is_some();
+    // Any issue author is fine (#1214): the trusted label, comment or review
+    // is the approval. The issue must still be an issue, not a PR.
     if event["repository"]["full_name"] != REPOSITORY
-        || !trusted_actor(event["sender"]["login"].as_str().unwrap_or_default())
-        || !trusted_actor(triggering_actor)
-        || event["sender"]["type"] != "User"
-        || event["issue"]["user"]["login"] != "tjfontaine"
+        || !trusted_user(&event["sender"], trusted)
+        || triggering_actor.is_empty()
+        || !trusted(triggering_actor)
         || event["issue"].get("pull_request").is_some()
     {
         return Err(ScalerError::Guard(
-            "dispatch requires owner actors and an owner-authored issue",
+            "dispatch requires collaborator actors with write access",
         ));
     }
     let issue = event["issue"]["number"]
@@ -292,20 +360,19 @@ fn validate_event_with_publication(
     if review {
         if event["action"] != "submitted"
             || event["review"]["state"] != "changes_requested"
-            || event["review"]["user"]["login"] != "tjfontaine"
-            || event["review"]["user"]["type"] != "User"
+            || !trusted_user(&event["review"]["user"], trusted)
         {
             return Err(ScalerError::Guard(
-                "review requires owner changes_requested",
+                "review requires collaborator changes_requested",
             ));
         }
     } else if comment {
         if event["action"] != "created"
             || event["issue"]["state"] != "open"
-            || !agent_comment(&event["comment"])
+            || !agent_comment(&event["comment"], trusted)
         {
             return Err(ScalerError::Guard(
-                "comment requires an unedited owner /agent creation",
+                "comment requires an unedited collaborator /agent creation",
             ));
         }
     } else if event["action"] != "labeled"
@@ -334,7 +401,14 @@ fn validate_event_with_publication(
                 ));
             }
             (branch.to_owned(), adoption.continuation())
-        } else if owned_pr(pr, &event["dispatch_run"], issue, branch, publication) {
+        } else if owned_pr(
+            pr,
+            &event["dispatch_run"],
+            issue,
+            branch,
+            publication,
+            trusted,
+        ) {
             (branch.to_owned(), Continuation::Owned)
         } else {
             return Err(ScalerError::Guard(
@@ -1630,9 +1704,12 @@ fn branch_prs(root: &Path, branch: &str, state: &str) -> Result<Value, ScalerErr
     Ok(prs)
 }
 
-/// Run identity for controller admission and #799 PR ownership. Artifact and
-/// publication provenance additionally authenticate main workflow and jobs.
-/// The issue constraint is checked against every available issue/branch mapping.
+/// Run shape for controller admission and #799 PR ownership: repository,
+/// workflow, event and ref, and human actors. It does not decide trust:
+/// authority callers use [`dispatch_run_admitted`], which adds the live
+/// collaborator check (#1214). Artifact and publication provenance
+/// additionally authenticate main workflow and jobs. The issue constraint is
+/// checked against every available issue/branch mapping.
 pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
     let branch = run["head_branch"].as_str().unwrap_or_default();
     let review_issue = dispatch_branch(branch);
@@ -1644,7 +1721,12 @@ pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
             .is_some_and(crate::ci_scaler::full_sha)
         || ![&run["actor"], &run["triggering_actor"]]
             .iter()
-            .all(|actor| actor["login"] == "tjfontaine" && actor["type"] == "User")
+            .all(|actor| {
+                actor["type"] == "User"
+                    && actor["login"]
+                        .as_str()
+                        .is_some_and(|l| permission_endpoint(l).is_some())
+            })
         || !((matches!(run["event"].as_str(), Some("issues" | "issue_comment"))
             && branch == "main")
             || (run["event"] == "pull_request_review" && review_issue.is_some()))
@@ -1677,6 +1759,18 @@ pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
                 .and_then(dispatch_branch)
                 .is_none_or(|mapped| mapped == issue)
         })
+}
+
+/// [`dispatch_run_identity`] plus a live trust check on both the run's
+/// actor and its triggering actor.
+pub(crate) fn dispatch_run_admitted(
+    run: &Value,
+    issue: Option<u64>,
+    trusted: &mut dyn FnMut(&str) -> bool,
+) -> bool {
+    dispatch_run_identity(run, issue)
+        && trusted_user(&run["actor"], trusted)
+        && trusted_user(&run["triggering_actor"], trusted)
 }
 
 fn dispatch_comment_author(user: &Value) -> bool {
@@ -1723,6 +1817,7 @@ pub(crate) fn owned_pr(
     issue: u64,
     branch: &str,
     publication: Option<&PublishedPr>,
+    trusted: &mut dyn FnMut(&str) -> bool,
 ) -> bool {
     let Ok(id) = branch_run(issue, branch) else {
         return false;
@@ -1735,7 +1830,7 @@ pub(crate) fn owned_pr(
         && pr["base"]["ref"] == "main"
         && pr["draft"] == true
         && run["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
-        && dispatch_run_identity(run, Some(issue))
+        && dispatch_run_admitted(run, Some(issue), trusted)
         && pr["body"].as_str().is_some_and(|body| {
             body.lines().any(|line| line == format!("Closes #{issue}"))
                 && body.lines().any(|line| {
@@ -1786,6 +1881,7 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
             dispatch.issue,
             &dispatch.branch,
             publication.as_ref(),
+            &mut collaborators(|endpoint| authenticated_api(root, endpoint)),
         ) {
             return Ok(pr.clone());
         }
@@ -2010,9 +2106,10 @@ fn admitted_head(event: &Value) -> Option<String> {
 pub(crate) fn load_event(
     root: &Path,
     path: &Path,
+    trusted: &mut dyn FnMut(&str) -> bool,
 ) -> Result<(Value, Option<Adoption>), ScalerError> {
     let mut event: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    if !trusted_actor(event["sender"]["login"].as_str().unwrap_or_default()) {
+    if !trusted_user(&event["sender"], trusted) {
         return Err(ScalerError::Guard("untrusted event actor"));
     }
     if event.get("comment").is_some() {
@@ -2020,7 +2117,7 @@ pub(crate) fn load_event(
             .as_u64()
             .ok_or(ScalerError::Guard("missing comment id"))?;
         let live = api(root, &format!("repos/{REPOSITORY}/issues/comments/{id}"))?;
-        if !agent_comment(&live)
+        if !agent_comment(&live, trusted)
             || ["id", "body", "created_at", "updated_at"]
                 .iter()
                 .any(|k| live[k] != event["comment"][k])
@@ -2043,7 +2140,7 @@ pub(crate) fn load_event(
             .as_u64()
             .ok_or(ScalerError::Guard("missing PR number"))?;
         let Some(issue) = dispatch_branch(&branch) else {
-            // Only an owner /agent comment adopts; reviews need a dispatch ref.
+            // Only a collaborator /agent comment adopts; reviews need a dispatch ref.
             if event.get("comment").is_none() {
                 return Err(ScalerError::Guard("not a dispatch head ref"));
             }
@@ -2077,6 +2174,7 @@ fn select_owned_pr(
     issue: u64,
     prs: &[Value],
     mut run: impl FnMut(&Value, &str) -> Result<(Value, Option<PublishedPr>), ScalerError>,
+    trusted: &mut dyn FnMut(&str) -> bool,
 ) -> Result<Option<Value>, ScalerError> {
     let mut selected = None;
     for pr in prs.iter().filter(|pr| pr["state"] == "open") {
@@ -2085,7 +2183,7 @@ fn select_owned_pr(
             continue;
         }
         let (original, publication) = run(pr, branch_run(issue, branch)?)?;
-        if owned_pr(pr, &original, issue, branch, publication.as_ref()) {
+        if owned_pr(pr, &original, issue, branch, publication.as_ref(), trusted) {
             if selected.is_some() {
                 return Err(ScalerError::Guard("multiple open owned dispatch PRs"));
             }
@@ -2134,7 +2232,10 @@ fn guard_admission(
     admit: bool,
     retire_previous_agent: impl FnOnce() -> Result<(), ScalerError>,
 ) -> Result<(Value, Dispatch), ScalerError> {
-    let (event, adoption) = load_event(root, event_path)?;
+    // Both guard phases hold the job token (the endpoint answers 401
+    // without one); the live permission read fails closed.
+    let mut trusted = collaborators(|endpoint| authenticated_api(root, endpoint));
+    let (event, adoption) = load_event(root, event_path, &mut trusted)?;
     let publication = if adoption.is_none() && publish_app_author(&event["pull_request"]["user"]) {
         let branch = event["pull_request"]["head"]["ref"]
             .as_str()
@@ -2153,6 +2254,7 @@ fn guard_admission(
     let mut dispatch = validate_event_with_publication(
         &event,
         &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
+        &mut trusted,
         publication.as_ref(),
         adoption.as_ref(),
     )?;
@@ -4291,7 +4393,8 @@ mod tests {
         git(&root, &["checkout", "main"]).unwrap();
         std::fs::write(root.join("conflict"), "main change\n").unwrap();
         git(&root, &["commit", "-am", "main change"]).unwrap();
-        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
         dispatch.base = git(&root, &["rev-parse", "HEAD"])
             .unwrap()
             .trim()
@@ -4536,7 +4639,8 @@ mod tests {
         std::fs::write(candidate.join("new-tree"), "new").unwrap();
         git(&candidate, &["add", "new-tree"]).unwrap();
         git(&candidate, &["commit", "-m", "fix(ci): new candidate"]).unwrap();
-        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
         dispatch.base = git(&state.join("work"), &["rev-parse", "HEAD"])
             .unwrap()
             .trim()
@@ -4639,7 +4743,8 @@ mod tests {
         let work = root.path().join("work");
         std::fs::create_dir(&work).unwrap();
         fixture_repository(&work);
-        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
         dispatch.base = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
         dispatch.branch = "work/dispatch-634-42".into();
         git(&work, &["checkout", "-b", &dispatch.branch]).unwrap();
@@ -4725,7 +4830,8 @@ mod tests {
                 &event["dispatch_run"],
                 634,
                 "work/dispatch-634-42",
-                None
+                None,
+                &mut owner_collaborator(),
             ),
             "shared App PR without authenticated publication_pr is owned"
         );
@@ -4842,7 +4948,8 @@ mod tests {
             &event["dispatch_run"],
             634,
             "work/dispatch-634-42",
-            Some(&publication)
+            Some(&publication),
+            &mut owner_collaborator(),
         ));
         pr["user"]["login"] = "another-app[bot]".into();
         assert!(!owned_pr(
@@ -4850,7 +4957,8 @@ mod tests {
             &event["dispatch_run"],
             634,
             "work/dispatch-634-42",
-            Some(&publication)
+            Some(&publication),
+            &mut owner_collaborator(),
         ));
     }
     #[test]
@@ -4970,6 +5078,7 @@ def conn(ns):return {"nodes":[{"number":n,"repository":{"nameWithOwner":"carrick
 print(json.dumps({"data":{"repository":{"pullRequest":{"closingIssuesReferences":conn(all_refs),"bodyReferences":conn(body_refs)}}}}))
 REFS
  ;;
+ */collaborators/tjfontaine/permission) echo '{"permission":"admin","role_name":"admin"}' ;;
  */pulls/800) cat "$RUNNER_TEMP/adopted-pr.json" ;;
  */issues/634) cat "$RUNNER_TEMP/adopted-issue.json" ;;
  */actions/runs/42) cat "$RUNNER_TEMP/original.json" ;;
@@ -5085,7 +5194,7 @@ fi
             .to_owned();
         let mut event = event();
         event["label"]["name"] = "dispatch".into();
-        let mut dispatch = validate_event(&event, "tjfontaine").unwrap();
+        let mut dispatch = validate_event(&event, "tjfontaine", &mut owner_collaborator()).unwrap();
         dispatch.base = base.clone();
         assigned_branch(&mut dispatch).unwrap();
         if matches!(witness, "footer" | "publish-token-recovery-create") {
@@ -5842,18 +5951,26 @@ fi
             "--draft\n--base\nmain\n--head\n{}\n--title\n{subject}",
             dispatch.branch
         )));
-        let selected = select_owned_pr(dispatch.issue, std::slice::from_ref(&pr), |_, _| {
-            Ok((run.clone(), None))
-        })
+        let selected = select_owned_pr(
+            dispatch.issue,
+            std::slice::from_ref(&pr),
+            |_, _| Ok((run.clone(), None)),
+            &mut owner_collaborator(),
+        )
         .unwrap()
         .unwrap();
         assert_eq!(selected["head"]["ref"], dispatch.branch);
         let mut unowned = pr;
         unowned["user"]["login"] = "outsider".into();
         assert!(
-            select_owned_pr(dispatch.issue, &[unowned], |_, _| Ok((run.clone(), None)))
-                .unwrap()
-                .is_none()
+            select_owned_pr(
+                dispatch.issue,
+                &[unowned],
+                |_, _| Ok((run.clone(), None)),
+                &mut owner_collaborator()
+            )
+            .unwrap()
+            .is_none()
         );
         // A later run starts with fresh run state: its own evidence and lease.
         std::fs::remove_file(state.join("applied.json")).unwrap();
@@ -6228,9 +6345,14 @@ fi
             let mut edited = selected.clone();
             edited["body"] = body.into();
             assert!(
-                select_owned_pr(dispatch.issue, &[edited], |_, _| Ok((run.clone(), None)))
-                    .unwrap()
-                    .is_some(),
+                select_owned_pr(
+                    dispatch.issue,
+                    &[edited],
+                    |_, _| Ok((run.clone(), None)),
+                    &mut owner_collaborator()
+                )
+                .unwrap()
+                .is_some(),
                 "edited PR lost dispatch ownership"
             );
         }
@@ -6581,7 +6703,8 @@ fi
     fn push_is_only_the_admitted_run_ref_and_refuses_another_lane() {
         let temp = tempfile::tempdir().unwrap();
         fixture_repository(temp.path());
-        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
         dispatch.branch = "work/dispatch-634-42".into();
         git(temp.path(), &["checkout", "-b", &dispatch.branch]).unwrap();
         let command = push_command(temp.path(), &dispatch, "42", &RunLease::admitted("")).unwrap();
@@ -6616,9 +6739,30 @@ fi
         let run = json!({"id":42,"path":".github/workflows/dispatch-worker.yml",
             "event":"issues","head_branch":"main","repository":{"full_name":REPOSITORY},
             "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"},"head_repository":{"full_name":REPOSITORY},"head_sha":"a".repeat(40)});
-        assert!(owned_pr(&pr, &run, 634, branch, None));
-        assert!(!owned_pr(&pr, &run, 635, branch, None));
-        assert!(!owned_pr(&pr, &run, 634, "work/dispatch-634-43", None));
+        assert!(owned_pr(
+            &pr,
+            &run,
+            634,
+            branch,
+            None,
+            &mut owner_collaborator()
+        ));
+        assert!(!owned_pr(
+            &pr,
+            &run,
+            635,
+            branch,
+            None,
+            &mut owner_collaborator()
+        ));
+        assert!(!owned_pr(
+            &pr,
+            &run,
+            634,
+            "work/dispatch-634-43",
+            None,
+            &mut owner_collaborator()
+        ));
         for pointer in [
             "/user/login",
             "/user/type",
@@ -6629,11 +6773,21 @@ fi
         ] {
             let mut bad = pr.clone();
             *bad.pointer_mut(pointer).unwrap() = "foreign".into();
-            assert!(!owned_pr(&bad, &run, 634, branch, None), "{pointer}");
+            assert!(
+                !owned_pr(&bad, &run, 634, branch, None, &mut owner_collaborator()),
+                "{pointer}"
+            );
         }
         let mut ready = pr.clone();
         ready["draft"] = false.into();
-        assert!(!owned_pr(&ready, &run, 634, branch, None));
+        assert!(!owned_pr(
+            &ready,
+            &run,
+            634,
+            branch,
+            None,
+            &mut owner_collaborator()
+        ));
         for pointer in [
             "/path",
             "/event",
@@ -6643,7 +6797,10 @@ fi
         ] {
             let mut bad = run.clone();
             *bad.pointer_mut(pointer).unwrap() = "foreign".into();
-            assert!(!owned_pr(&pr, &bad, 634, branch, None), "{pointer}");
+            assert!(
+                !owned_pr(&pr, &bad, 634, branch, None, &mut owner_collaborator()),
+                "{pointer}"
+            );
         }
     }
 
@@ -6795,7 +6952,7 @@ fi
             "From the #548 independent review: `crates/carrick-xtask/src/ci_scaler/security_tests.rs` (around :47 and the new test near :428) still sets `set_read_timeout(2s)` on the fixture stream.\n\nFailure: if curl is descheduled for more than 2 s between connect and sending its request, `stream.read().unwrap()` panics and the test fails on speed rather than correctness. That is a load-dependent verdict.\n\nAcceptance: use the same 60 s hang bound as `execute`/`http_fixture`, or an event-driven bound; no wall-clock speed assertion."
         );
         assert!(
-            validate_event(&value, "tjfontaine").is_ok(),
+            validate_event(&value, "tjfontaine", &mut owner_collaborator()).is_ok(),
             "#587 free-form body refused"
         );
     }
@@ -6805,7 +6962,7 @@ fi
         for label in ["dispatch", "dispatch:any owner context"] {
             value["label"]["name"] = label.into();
             assert!(
-                validate_event(&value, "tjfontaine").is_ok(),
+                validate_event(&value, "tjfontaine", &mut owner_collaborator()).is_ok(),
                 "label {label} refused"
             );
         }
@@ -6818,7 +6975,7 @@ fi
         value["issue"]["state"] = "open".into();
         value["comment"] = json!({"user":{"login":"tjfontaine","type":"User"},"body":"/agent please continue","created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z"});
         assert!(
-            validate_event(&value, "tjfontaine").is_ok(),
+            validate_event(&value, "tjfontaine", &mut owner_collaborator()).is_ok(),
             "owner /agent refused"
         );
         let mut admitted = Vec::new();
@@ -6831,7 +6988,7 @@ fi
         ] {
             let mut other = value.clone();
             *other.pointer_mut(pointer).unwrap() = bad.into();
-            if validate_event(&other, "tjfontaine").is_ok() {
+            if validate_event(&other, "tjfontaine", &mut owner_collaborator()).is_ok() {
                 admitted.push(pointer);
             }
         }
@@ -6839,6 +6996,170 @@ fi
             admitted.is_empty(),
             "unsafe comments admitted: {admitted:?}"
         );
+    }
+    /// Logins with each GitHub permission level; anyone else gets a 404.
+    const PERMISSIONS: &[(&str, &str)] = &[
+        ("tjfontaine", "admin"),
+        ("maintainer", "maintain"),
+        ("writer", "write"),
+        ("triager", "triage"),
+        ("reader", "read"),
+        ("nobody", "none"),
+    ];
+    fn as_actor(mut value: Value, login: &str) -> Value {
+        value["sender"]["login"] = login.into();
+        if value.get("comment").is_some() {
+            value["comment"]["user"]["login"] = login.into();
+        }
+        value
+    }
+    #[test]
+    fn collaborators_with_write_access_trigger_and_others_are_refused() {
+        // #1214: trust is a live write-or-higher collaborator check, not a
+        // fixed login; the issue author no longer matters.
+        let mut app_issue = event();
+        app_issue["issue"]["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        let mut comment = app_issue.clone();
+        comment["action"] = "created".into();
+        comment["issue"]["state"] = "open".into();
+        comment["comment"] = json!({"user":{"login":"tjfontaine","type":"User"},"body":"/agent go","created_at":"2026-10-30T00:00:00Z","updated_at":"2026-10-30T00:00:00Z"});
+        for trigger in [&app_issue, &comment] {
+            for login in ["tjfontaine", "maintainer", "writer"] {
+                let mut trusted = fake_collaborators(PERMISSIONS);
+                validate_event(&as_actor(trigger.clone(), login), login, &mut trusted)
+                    .unwrap_or_else(|e| panic!("{login} refused: {e}"));
+            }
+            for login in ["triager", "reader", "nobody", "stranger"] {
+                let mut trusted = fake_collaborators(PERMISSIONS);
+                assert!(
+                    validate_event(&as_actor(trigger.clone(), login), login, &mut trusted).is_err(),
+                    "{login} admitted"
+                );
+                // A trusted sender cannot carry an untrusted rerun actor.
+                assert!(
+                    validate_event(&as_actor(trigger.clone(), "writer"), login, &mut trusted)
+                        .is_err(),
+                    "{login} rerun admitted"
+                );
+            }
+            // Any permission API failure refuses (fail closed).
+            let mut failing = collaborators(|_| Err(ScalerError::Guard("API unavailable")));
+            assert!(validate_event(trigger, "tjfontaine", &mut failing).is_err());
+        }
+        // The comment author is checked on its own, beyond the sender.
+        let mut foreign = as_actor(comment.clone(), "writer");
+        foreign["comment"]["user"]["login"] = "reader".into();
+        assert!(validate_event(&foreign, "writer", &mut fake_collaborators(PERMISSIONS)).is_err());
+        // A collaborator Bot account is not a human trigger.
+        let mut bot = as_actor(app_issue, "writer");
+        bot["sender"]["type"] = "Bot".into();
+        assert!(validate_event(&bot, "writer", &mut fake_collaborators(PERMISSIONS)).is_err());
+    }
+    #[test]
+    fn collaborator_permission_reads_only_a_well_formed_endpoint() {
+        let mut reads = Vec::new();
+        for login in [
+            "../../orgs/x",
+            "a/b",
+            "",
+            "-lead",
+            &"x".repeat(40),
+            "ok?x=1",
+        ] {
+            assert!(!write_collaborator(login, |endpoint| {
+                reads.push(endpoint.to_owned());
+                Ok(json!({"permission":"admin"}))
+            }));
+        }
+        assert!(reads.is_empty(), "{reads:?}");
+        assert!(write_collaborator("Mixed-Case-1", |endpoint| {
+            assert_eq!(
+                endpoint,
+                "repos/carrick-sh/carrick/collaborators/Mixed-Case-1/permission"
+            );
+            Ok(json!({"permission":"write","role_name":"write"}))
+        }));
+        for answer in [
+            json!({}),
+            json!({"permission":null}),
+            json!({"role_name":"admin"}),
+        ] {
+            assert!(!write_collaborator("writer", |_| Ok(answer.clone())));
+        }
+        // Each login is read once per predicate, refusals included.
+        let mut count = 0;
+        let mut trusted = collaborators(|_| {
+            count += 1;
+            Ok(json!({"permission":"read"}))
+        });
+        assert!(!trusted("reader") && !trusted("reader"));
+        drop(trusted);
+        assert_eq!(count, 1);
+    }
+    #[test]
+    fn dispatch_runs_need_collaborator_actors_live() {
+        let run = json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main",
+            "repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},"head_sha":"a".repeat(40),
+            "actor":{"login":"writer","type":"User"},"triggering_actor":{"login":"writer","type":"User"}});
+        assert!(dispatch_run_admitted(
+            &run,
+            Some(634),
+            &mut fake_collaborators(PERMISSIONS)
+        ));
+        for (pointer, login) in [
+            ("/actor/login", "reader"),
+            ("/triggering_actor/login", "stranger"),
+            ("/triggering_actor/login", "triager"),
+        ] {
+            let mut bad = run.clone();
+            *bad.pointer_mut(pointer).unwrap() = login.into();
+            assert!(dispatch_run_identity(&bad, Some(634)), "{pointer}");
+            assert!(
+                !dispatch_run_admitted(&bad, Some(634), &mut fake_collaborators(PERMISSIONS)),
+                "{pointer}={login}"
+            );
+        }
+        let mut bot = run.clone();
+        bot["actor"]["type"] = "Bot".into();
+        assert!(!dispatch_run_identity(&bot, Some(634)));
+        assert!(!dispatch_run_admitted(
+            &run,
+            Some(634),
+            &mut collaborators(|_| Err(ScalerError::Guard("API unavailable")))
+        ));
+    }
+    #[test]
+    fn app_authored_pr_with_one_closing_issue_is_adoptable() {
+        let pr = json!({"number":1150,"state":"open","user":{"login":"carrick-workers[bot]","type":"Bot"},
+            "head":{"ref":"work/986-slice4","sha":"a".repeat(40),"repo":{"full_name":REPOSITORY}},
+            "base":{"ref":"main","repo":{"full_name":REPOSITORY}}});
+        let issue = json!({"number":986,"state":"open","user":{"login":"carrick-workers[bot]","type":"Bot"}});
+        let read = |refs: &'static [u64]| {
+            let issue = issue.clone();
+            move |read: AdoptionRead| match read {
+                AdoptionRead::ClosingReferences(1150) => {
+                    let nodes: Vec<_> = refs
+                        .iter()
+                        .map(|n| json!({"number":n,"repository":{"nameWithOwner":REPOSITORY}}))
+                        .collect();
+                    let connection = json!({"nodes":nodes,"pageInfo":{"hasNextPage":false}});
+                    Ok(
+                        json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":connection,"bodyReferences":connection}}}}),
+                    )
+                }
+                AdoptionRead::Issue(986) => Ok(issue.clone()),
+                _ => Err(ScalerError::Guard("unexpected read")),
+            }
+        };
+        let adoption = adopted_pr(&pr, read(&[986]))
+            .unwrap()
+            .expect("App PR refused");
+        assert_eq!(adoption.issue_number(), Some(986));
+        assert!(adopted_pr(&pr, read(&[])).unwrap().is_none());
+        assert!(adopted_pr(&pr, read(&[986, 987])).unwrap().is_none());
+        let mut fork = pr.clone();
+        fork["head"]["repo"]["full_name"] = "outsider/carrick".into();
+        assert!(adopted_pr(&fork, read(&[986])).unwrap().is_none());
     }
     fn fixture_repository(root: &Path) {
         git(root, &["init", "-b", "work/dispatch-634-pending"]).unwrap();
@@ -6858,28 +7179,35 @@ fi
         ] {
             let mut bad = base.clone();
             *bad.pointer_mut(pointer).unwrap() = "untrusted".into();
-            assert!(validate_event(&bad, "tjfontaine").is_err(), "{pointer}");
+            assert!(
+                validate_event(&bad, "tjfontaine", &mut owner_collaborator()).is_err(),
+                "{pointer}"
+            );
         }
         assert!(
-            validate_event(&base, "someone-else").is_err(),
+            validate_event(&base, "someone-else", &mut owner_collaborator()).is_err(),
             "rerun actor"
         );
         let mut pr = base.clone();
         pr["issue"]["pull_request"] = json!({});
-        assert!(validate_event(&pr, "tjfontaine").is_err());
+        assert!(validate_event(&pr, "tjfontaine", &mut owner_collaborator()).is_err());
         let mut bot = base;
         bot["sender"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
-        assert!(validate_event(&bot, "carrick-workers[bot]").is_err());
+        assert!(validate_event(&bot, "carrick-workers[bot]", &mut owner_collaborator()).is_err());
         bot["sender"]["type"] = "User".into();
-        assert!(validate_event(&bot, "carrick-workers[bot]").is_err());
+        assert!(validate_event(&bot, "carrick-workers[bot]", &mut owner_collaborator()).is_err());
     }
     #[test]
-    fn owner_label_does_not_admit_an_issue_owned_by_another_author() {
+    fn collaborator_label_admits_an_issue_by_any_author() {
+        // #1214 reversed the old owner-authored-issue rule: the trusted
+        // label is the approval, whoever filed the issue.
         let mut value = event();
         value["issue"]["user"]["login"] = "someone-else".into();
-        assert!(validate_event(&value, "tjfontaine").is_err());
+        assert!(validate_event(&value, "tjfontaine", &mut owner_collaborator()).is_ok());
+        value["issue"]["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        assert!(validate_event(&value, "tjfontaine", &mut owner_collaborator()).is_ok());
         value["issue"].as_object_mut().unwrap().remove("user");
-        assert!(validate_event(&value, "tjfontaine").is_err());
+        assert!(validate_event(&value, "tjfontaine", &mut owner_collaborator()).is_ok());
     }
     #[test]
     fn wip_checkpoint_preserves_trailer_and_excludes_target_symlink() {
@@ -6890,7 +7218,7 @@ fi
         std::fs::write(root.join("new file"), "work in progress").unwrap();
         std::fs::create_dir(root.join("conformance-probes")).unwrap();
         std::os::unix::fs::symlink("/tmp", root.join("conformance-probes/target")).unwrap();
-        let mut d = validate_event(&event(), "tjfontaine").unwrap();
+        let mut d = validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
         d.worker.coauthor = "GPT-6.1 Sol <noreply@openai.com>".into();
         assert!(checkpoint(root, &d).unwrap());
         let message = git(root, &["log", "-1", "--format=%B"]).unwrap();
@@ -6914,17 +7242,19 @@ fi
         event
     }
     #[test]
-    fn review_admission_requires_owner_owned_pr() {
+    fn review_admission_requires_trusted_reviewer_and_owned_pr() {
         let event = review_event();
-        let dispatch =
-            validate_event(&event, "tjfontaine").expect("owner review must continue its PR");
+        let dispatch = validate_event(&event, "tjfontaine", &mut owner_collaborator())
+            .expect("owner review must continue its PR");
         assert_eq!(dispatch.branch, "work/dispatch-634-42");
         assert!(dispatch.resume);
         let mut legacy = event.clone();
         legacy["issue"]["body"] =
             "## Brief\nBranch: work/dispatch-634-99\nBranch: work/elsewhere\nDo the review".into();
         assert_eq!(
-            validate_event(&legacy, "tjfontaine").unwrap().branch,
+            validate_event(&legacy, "tjfontaine", &mut owner_collaborator())
+                .unwrap()
+                .branch,
             dispatch.branch
         );
         let mut admitted = Vec::new();
@@ -6940,19 +7270,38 @@ fi
             ("/pull_request/head/ref", json!("work/arbitrary")),
             ("/pull_request/draft", json!(false)),
             ("/dispatch_run/path", json!("other.yml")),
+            ("/dispatch_run/actor/login", json!("outsider")),
+            ("/dispatch_run/triggering_actor/login", json!("outsider")),
             ("/issue/state", json!("closed")),
-            ("/issue/user/login", json!("outsider")),
         ] {
             let mut bad = event.clone();
             *bad.pointer_mut(pointer).unwrap() = value;
-            if validate_event(&bad, "tjfontaine").is_ok() {
+            if validate_event(&bad, "tjfontaine", &mut owner_collaborator()).is_ok() {
                 admitted.push(pointer);
             }
         }
-        if validate_event(&event, "outsider").is_ok() {
+        if validate_event(&event, "outsider", &mut owner_collaborator()).is_ok() {
             admitted.push("triggering_actor");
         }
         assert!(admitted.is_empty(), "unsafe reviews admitted: {admitted:?}");
+        // #1214: any write collaborator's review continues the PR; a
+        // read-only reviewer does not, and the issue author is not checked.
+        let mut collaborator = event.clone();
+        collaborator["sender"]["login"] = "writer".into();
+        collaborator["review"]["user"]["login"] = "writer".into();
+        collaborator["issue"]["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        assert!(
+            validate_event(
+                &collaborator,
+                "writer",
+                &mut fake_collaborators(PERMISSIONS)
+            )
+            .is_ok()
+        );
+        let mut reader = collaborator.clone();
+        reader["sender"]["login"] = "reader".into();
+        reader["review"]["user"]["login"] = "reader".into();
+        assert!(validate_event(&reader, "reader", &mut fake_collaborators(PERMISSIONS)).is_err());
     }
 
     #[test]
@@ -6961,10 +7310,10 @@ fi
         event.as_object_mut().unwrap().remove("review");
         event["action"] = "created".into();
         event["comment"] = json!({"user":{"login":"tjfontaine","type":"User"},"body":"/agent fix the conflict","created_at":"2026-10-24","updated_at":"2026-10-24"});
-        assert!(validate_event(&event, "tjfontaine").is_ok());
+        assert!(validate_event(&event, "tjfontaine", &mut owner_collaborator()).is_ok());
         event["pull_request"]["user"]["login"] = "outsider".into();
         assert!(
-            validate_event(&event, "tjfontaine").is_err(),
+            validate_event(&event, "tjfontaine", &mut owner_collaborator()).is_err(),
             "unowned PR admitted"
         );
     }
@@ -7060,13 +7409,25 @@ cat "$file"
                 write("issues/986", issue);
                 std::fs::write(fixture.join("graphql.json"), references(refs).to_string()).unwrap();
                 std::fs::write(&event_path, event.to_string()).unwrap();
-                let (loaded, adoption) = load_event(&fixture, &event_path)?;
-                validate_event_with_publication(&loaded, "tjfontaine", None, adoption.as_ref())
+                let (loaded, adoption) =
+                    load_event(&fixture, &event_path, &mut owner_collaborator())?;
+                validate_event_with_publication(
+                    &loaded,
+                    "tjfontaine",
+                    &mut owner_collaborator(),
+                    None,
+                    adoption.as_ref(),
+                )
             };
         if std::env::var_os("ADOPTION_ADMIT").is_some() {
             // The production guard, then clone admission: require_target_pr
             // re-checks the PR and the private admission round-trips the type.
             admit(&event, &pr, &issue, &comment, &[986]).unwrap();
+            // The guard's live permission read goes through the same gh.
+            write(
+                "collaborators/tjfontaine/permission",
+                &json!({"permission":"admin"}),
+            );
             let (_, hosted) = guard_admission(&fixture, &event_path, false, || {
                 panic!("the hosted guard never retires an agent")
             })
@@ -7117,9 +7478,19 @@ cat "$file"
                 tip: tip.clone()
             }
         );
-        let mut owner_pr = pr.clone();
-        owner_pr["user"] = json!({"login":"tjfontaine","type":"User"});
-        assert!(admit(&event, &owner_pr, &issue, &comment, &[986]).is_ok());
+        // #1214: neither the PR nor the issue author matters any more; a
+        // collaborator's unedited /agent comment is the approval.
+        for author in [
+            json!({"login":"tjfontaine","type":"User"}),
+            json!({"login":"outsider","type":"User"}),
+            json!({"login":"carrick-workers[bot]","type":"Bot"}),
+        ] {
+            let mut any_pr = pr.clone();
+            any_pr["user"] = author.clone();
+            let mut any_issue = issue.clone();
+            any_issue["user"] = author;
+            assert!(admit(&event, &any_pr, &any_issue, &comment, &[986]).is_ok());
+        }
 
         let mut admitted = Vec::new();
         let mut refuse = |case: &str, result: Result<Dispatch, ScalerError>| {
@@ -7134,8 +7505,6 @@ cat "$file"
             ("/head/ref", json!("feature/slice4")),
             ("/head/ref", json!("work/../main")),
             ("/base/ref", json!("release")),
-            ("/user/login", json!("outsider")),
-            ("/user/type", json!("User")),
             ("/state", json!("closed")),
         ] {
             let mut bad = pr.clone();
@@ -7151,11 +7520,7 @@ cat "$file"
                 admit(&event, &pr, &issue, &comment, refs),
             );
         }
-        for (pointer, value) in [
-            ("/state", json!("closed")),
-            ("/user/login", json!("outsider")),
-            ("/number", json!(987)),
-        ] {
+        for (pointer, value) in [("/state", json!("closed")), ("/number", json!(987))] {
             let mut bad = issue.clone();
             *bad.pointer_mut(pointer).unwrap() = value.clone();
             refuse(
@@ -7198,20 +7563,33 @@ cat "$file"
         let (loaded, adoption) = {
             write("pulls/1150", &pr);
             std::fs::write(&event_path, event.to_string()).unwrap();
-            load_event(&fixture, &event_path).unwrap()
+            load_event(&fixture, &event_path, &mut owner_collaborator()).unwrap()
         };
         let mut moved = loaded.clone();
         moved["pull_request"]["head"]["sha"] = "c".repeat(40).into();
         assert!(
-            validate_event_with_publication(&moved, "tjfontaine", None, adoption.as_ref()).is_err()
+            validate_event_with_publication(
+                &moved,
+                "tjfontaine",
+                &mut owner_collaborator(),
+                None,
+                adoption.as_ref()
+            )
+            .is_err()
         );
         let mut review = loaded;
         review["review"] =
             json!({"state":"changes_requested","user":{"login":"tjfontaine","type":"User"}});
         review["action"] = "submitted".into();
         assert!(
-            validate_event_with_publication(&review, "tjfontaine", None, adoption.as_ref())
-                .is_err()
+            validate_event_with_publication(
+                &review,
+                "tjfontaine",
+                &mut owner_collaborator(),
+                None,
+                adoption.as_ref()
+            )
+            .is_err()
         );
     }
     #[test]
@@ -7230,7 +7608,8 @@ cat "$file"
         let temp = tempfile::tempdir().unwrap();
         fixture_repository(temp.path());
         let tip = "a".repeat(40);
-        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
+        let mut dispatch =
+            validate_event(&event(), "tjfontaine", &mut owner_collaborator()).unwrap();
         dispatch.issue = 986;
         dispatch.branch = "work/986-slice4".into();
         dispatch.resume = true;

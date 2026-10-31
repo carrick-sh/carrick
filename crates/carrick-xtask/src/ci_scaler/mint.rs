@@ -222,6 +222,8 @@ pub struct MintEntry {
 pub(super) trait MintApi {
     fn job(&self, job: JobId) -> Result<Value, ScalerError>;
     fn run(&self, run: RunId, attempt: u32) -> Result<Value, ScalerError>;
+    /// `GET` of a [`crate::dispatch_worker::permission_endpoint`] (#1214).
+    fn permission(&self, endpoint: &str) -> Result<Value, ScalerError>;
     fn configured(&self) -> bool;
     fn mint(&self, scope: MintScope) -> Result<AppToken, ScalerError>;
     /// Best-effort, bounded revocation of a token this controller minted.
@@ -483,6 +485,9 @@ fn decide(
         || run["run_attempt"].as_u64() != Some(u64::from(key.attempt))
         || run["head_sha"].as_str() != Some(sha.as_str())
         || !Admission::Agent.identifies_run(&run)
+        || !crate::dispatch_worker::dispatch_run_admitted(&run, None, &mut |login: &str| {
+            crate::dispatch_worker::write_collaborator(login, |endpoint| api.permission(endpoint))
+        })
     {
         return Ok(Err(MintRefusal::IdentityMismatch));
     }
@@ -569,6 +574,9 @@ impl MintApi for AppMinter<'_> {
             None,
             false,
         )
+    }
+    fn permission(&self, endpoint: &str) -> Result<Value, ScalerError> {
+        self.gh.request("GET", endpoint, None, false)
     }
     fn configured(&self) -> bool {
         self.key.is_some()
@@ -731,6 +739,8 @@ mod tests {
 
     struct Api {
         job_status: &'static str,
+        /// The run actor's live repository permission; `error` fails the read.
+        permission: &'static str,
         configured: bool,
         mints: RefCell<Vec<MintScope>>,
         reads: RefCell<u32>,
@@ -741,6 +751,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 job_status: "in_progress",
+                permission: "admin",
                 configured: true,
                 mints: RefCell::new(vec![]),
                 reads: RefCell::new(0),
@@ -767,6 +778,17 @@ mod tests {
                 "actor":{"login":DISPATCH_OWNER,"type":"User"},
                 "triggering_actor":{"login":DISPATCH_OWNER,"type":"User"}}),
             )
+        }
+        fn permission(&self, endpoint: &str) -> Result<Value, ScalerError> {
+            assert_free(&self.admission, "a GitHub permission read");
+            assert_eq!(
+                Some(endpoint),
+                crate::dispatch_worker::permission_endpoint(DISPATCH_OWNER).as_deref()
+            );
+            match self.permission {
+                "error" => Err(ScalerError::GithubGone),
+                permission => Ok(json!({ "permission": permission })),
+            }
         }
         fn configured(&self) -> bool {
             self.configured
@@ -949,6 +971,33 @@ mod tests {
         let (served, _, _) = serve(&api, other, request("board", 41));
         assert_eq!(served, MintServed::Refused(MintRefusal::IdentityMismatch));
         assert!(api.mints.borrow().is_empty());
+    }
+
+    #[test]
+    fn run_actor_without_live_write_permission_is_refused() {
+        // #1214: the mint re-checks the run's actors as write collaborators.
+        for permission in ["write", "maintain"] {
+            let mut api = Api::new();
+            api.permission = permission;
+            let (served, _, _) = serve(&api, row(), request("publish", 41));
+            assert_eq!(
+                served,
+                MintServed::Minted(MintScope::Publish),
+                "{permission}"
+            );
+        }
+        for permission in ["read", "triage", "none", "error"] {
+            let mut api = Api::new();
+            api.permission = permission;
+            let (served, exchange, _) = serve(&api, row(), request("publish", 41));
+            assert_eq!(
+                served,
+                MintServed::Refused(MintRefusal::IdentityMismatch),
+                "{permission}"
+            );
+            assert!(api.mints.borrow().is_empty());
+            assert!(!exchange.responses[0].contains(SECRET));
+        }
     }
 
     #[test]
