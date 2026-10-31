@@ -221,12 +221,27 @@ Claude Code session that keeps one subagent per PR. It has two parts:
   `read_outcomes` and `read_issue`. Its only act tools are `reply` and
   `request_round`, and both go through the same `enforce` gates as `run`.
   The server records round heads and times in its own state file and
-  re-checks for later human comments live before allowing another round on
+  re-checks for a later owner comment live before allowing another round on
   the same head.
+- The server is also a Claude Code channel. It declares
+  `experimental["claude/channel"]`, follows the mailbox (`--mailbox`), and
+  sends each new line as a `notifications/claude/channel` message with
+  `pr`, `kind`, `event_id`, `author` and `head` meta. The last delivered id
+  is kept in `--channel-state`, so a restart doesn't redeliver. The session
+  must be started with
+  `claude --dangerously-load-development-channels server:carrick-reactor`.
+
+The repository is public, so only the owner (`tjfontaine`, type User, which
+director sessions post as) can produce events, count as a human comment for
+the loop guard, or have comment, review, PR and issue bodies shown to the
+session. Dispatch outcome comments from the workflow bots are the only other
+events. Anyone else's comment shows as `{author, created_at, untrusted:
+true}`, and diffs and CI logs of other authors' PRs are withheld.
 
 `scripts/reactor/` is the session workspace: `CLAUDE.md` (the routing role),
 a `pr-watcher` subagent, `.mcp.json`, permission settings and `start.sh`,
-which starts the feed and the session in the tmux session `carrick-reactor`.
+which starts the session in the tmux session `carrick-reactor`; the feed runs
+as its own launchd job.
 
 ## Accounts and credentials
 

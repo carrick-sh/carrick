@@ -7,7 +7,11 @@
         "reactor",
         "mcp",
         "--state",
-        "/Volumes/CaseSensitive/carrick-director/reactor/state/tools-state.json"
+        "/Volumes/CaseSensitive/carrick-director/reactor/state/tools-state.json",
+        "--mailbox",
+        "/Volumes/CaseSensitive/carrick-director/reactor/state/mailbox.jsonl",
+        "--channel-state",
+        "/Volumes/CaseSensitive/carrick-director/reactor/state/channel-state.json"
       ]
     }
   }

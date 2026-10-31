@@ -155,20 +155,29 @@ pub(crate) struct Class {
     pub trigger: bool,
     pub human: bool,
 }
+/// The owner's account, which director sessions also post as. The repository
+/// is public: text from anyone else could steer an `/agent` brief posted with
+/// owner authority, so only this author is an event, counts as human or has
+/// its body shown to the session.
+pub(crate) fn trusted_owner(user: &Value) -> bool {
+    user["login"] == "tjfontaine" && (user["type"] == "User" || user["__typename"] == "User")
+}
+/// An allowlisted workflow bot, whose dispatch outcome comments are events.
+pub(crate) fn outcome_bot(user: &Value) -> bool {
+    bot(user) && OUTCOME_BOTS.contains(&user["login"].as_str().unwrap_or_default())
+}
 pub(crate) fn classify(user: &Value, body: &str) -> Option<Class> {
     if body.contains(MARKER) {
         return None;
     }
-    if bot(user) {
-        let login = user["login"].as_str().unwrap_or_default();
-        return (OUTCOME_BOTS.contains(&login) && body.contains("Dispatch outcome")).then_some(
-            Class {
-                trigger: true,
-                human: false,
-            },
-        );
+    if outcome_bot(user) && body.contains("Dispatch outcome") {
+        return Some(Class {
+            trigger: true,
+            human: false,
+        });
     }
-    Some(Class {
+    // Everyone else, bot or stranger, is dropped and advances no guard.
+    trusted_owner(user).then(|| Class {
         trigger: !body.trim_start().starts_with("/agent"),
         human: true,
     })
@@ -421,7 +430,12 @@ pub(crate) fn cycle(
                 .unwrap_or("none"),
             memory.rounds
         );
-        for c in node["comments"]["nodes"].as_array().into_iter().flatten() {
+        for c in node["comments"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| classify(&c["author"], c["body"].as_str().unwrap_or_default()).is_some())
+        {
             context.push_str(&format!(
                 "\n### {}\n{}\n",
                 c["author"]["login"].as_str().unwrap_or("?"),
