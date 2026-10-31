@@ -858,28 +858,36 @@ fn worker_session_name(name: &str) -> bool {
 
 /// Copy a worker's stream-json session into the upload as the next
 /// `worker-<n>.jsonl`, keeping whole lines and redacting like every other
-/// diagnostic. An over-long session ends with one `truncated` event.
+/// diagnostic. The bound applies to the redacted text, because lossy UTF-8
+/// decoding and redaction can grow it; an over-long session ends with one
+/// `truncated` event. The session is worker-written evidence, so a missing or
+/// unreadable log is skipped rather than failing the whole upload.
 fn record_worker_session(log: &Path, package: &Path) -> Result<(), ScalerError> {
     use std::io::Read;
-    let Ok(file) = crate::safe_copy::open_text(log) else {
-        return Ok(());
-    };
     let mut bytes = Vec::new();
-    file.take(WORKER_SESSION_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    let truncated = bytes.len() > WORKER_SESSION_BYTES;
-    if truncated {
-        let end = bytes[..WORKER_SESSION_BYTES]
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(0, |n| n + 1);
-        bytes.truncate(end);
+    let read = crate::safe_copy::open_text(log).and_then(|file| {
+        file.take(WORKER_SESSION_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(Into::into)
+    });
+    if read.is_err() {
+        return Ok(());
     }
+    let mut truncated = bytes.len() > WORKER_SESSION_BYTES;
     let mut text = crate::dispatch_redaction::redact(&bytes);
     if let Ok(token) = std::env::var("GH_TOKEN")
         && !token.is_empty()
     {
         text = text.replace(&token, "[REDACTED]");
+    }
+    if truncated || text.len() > WORKER_SESSION_BYTES {
+        truncated = true;
+        let mut end = WORKER_SESSION_BYTES.min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let end = text[..end].rfind('\n').map_or(0, |n| n + 1);
+        text.truncate(end);
     }
     if truncated {
         text.push_str(&format!(
@@ -6719,6 +6727,20 @@ fi
             );
         }
         assert!(!package.join("worker-3.jsonl").exists());
+        // Invalid bytes under the read bound triple in size when decoded; the
+        // bound still holds on the redacted text and the upload still masks.
+        let junk = logs.join("junk.log");
+        let mut bytes = Vec::new();
+        while bytes.len() + 1001 < WORKER_SESSION_BYTES {
+            bytes.extend_from_slice(&[0xff; 1000]);
+            bytes.push(b'\n');
+        }
+        std::fs::write(&junk, &bytes).unwrap();
+        record_worker_session(&junk, &package).unwrap();
+        let clipped = regular_text(&package.join("worker-3.jsonl")).unwrap();
+        assert!(clipped.len() <= WORKER_SESSION_BYTES + 128);
+        assert!(clipped.ends_with("\"event\":\"truncated\",\"limit_bytes\":16777216}\n"));
+        mask_artifacts(&package, token).unwrap();
         for name in ["worker-.jsonl", "worker-x.jsonl", "worker-1.json"] {
             std::fs::write(package.join(name), "{}\n").unwrap();
             assert!(mask_artifacts(&package, token).is_err(), "{name}");
