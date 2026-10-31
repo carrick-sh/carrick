@@ -421,17 +421,21 @@ fn run_id(url: &str) -> Option<String> {
 }
 /// The ids of this repository's own Actions runs on `head`. A fork PR can
 /// share the head SHA and name its own jobs (#1219 review P1-1), so only
-/// these runs' checks are named; a lookup failure trusts nothing.
-fn own_runs(remote: &mut dyn Remote, head: &str) -> Vec<String> {
-    remote
-        .list(&format!(
-            "repos/{REPOSITORY}/actions/runs?head_sha={head}&per_page=100"
-        ))
-        .unwrap_or_default()
+/// these runs' checks are named. The endpoint answers an object
+/// (`{total_count, workflow_runs}`), not a list; one page of 100 covers a
+/// head's runs.
+fn own_runs(remote: &mut dyn Remote, head: &str) -> Result<Vec<String>, ScalerError> {
+    let page = remote.get(&format!(
+        "repos/{REPOSITORY}/actions/runs?head_sha={head}&per_page=100"
+    ))?;
+    let runs = page["workflow_runs"].as_array().ok_or(ScalerError::Guard(
+        "actions runs response lacks workflow_runs",
+    ))?;
+    Ok(runs
         .iter()
         .filter(|r| r["head_repository"]["full_name"] == REPOSITORY && r["head_sha"] == head)
         .filter_map(|r| r["id"].as_u64().map(|id| id.to_string()))
-        .collect()
+        .collect())
 }
 fn ci_rollup(remote: &mut dyn Remote, pr: u64, head: &str) -> Result<Value, ScalerError> {
     let raw: Value = serde_json::from_str(&remote.text(&[
@@ -443,7 +447,7 @@ fn ci_rollup(remote: &mut dyn Remote, pr: u64, head: &str) -> Result<Value, Scal
         "--json",
         "statusCheckRollup",
     ])?)?;
-    let own = own_runs(remote, head);
+    let own = own_runs(remote, head)?;
     let (mut failing, mut pending, mut passed, mut unverified) = (Vec::new(), 0, 0, 0);
     for c in raw["statusCheckRollup"].as_array().into_iter().flatten() {
         let url = c["detailsUrl"]
@@ -1301,6 +1305,10 @@ mod tests {
     }
     impl Remote for FakeRemote {
         fn get(&mut self, endpoint: &str) -> Result<Value, ScalerError> {
+            if endpoint.contains("/actions/runs?") {
+                let runs: Vec<Value> = self.workflow_runs.values().cloned().collect();
+                return Ok(json!({"total_count":runs.len(),"workflow_runs":runs}));
+            }
             let n: u64 = endpoint
                 .rsplit('/')
                 .next()
@@ -1309,9 +1317,6 @@ mod tests {
             self.prs.get(&n).cloned().ok_or(ScalerError::GithubGone)
         }
         fn list(&mut self, endpoint: &str) -> Result<Vec<Value>, ScalerError> {
-            if endpoint.contains("/actions/runs?") {
-                return Ok(self.workflow_runs.values().cloned().collect());
-            }
             Ok(if endpoint.contains("/issues/") {
                 self.comments.clone()
             } else {
