@@ -127,6 +127,8 @@ login, with the hidden marker `<!-- carrick-reactor -->`:
 - At most one reactor round per PR head, unless a human (non-bot) comment
   arrived after the last reactor round. State records the round's head and
   time.
+- At most three reactor rounds on a PR in a row without a human comment in
+  between, so a round whose push fails CI again cannot loop across heads.
 - A `reply` posts plain text; text starting with `/agent` is refused.
 - Dispatch outcome comments (from `github-actions[bot]` or
   `carrick-workers[bot]`, containing "Dispatch outcome") are events, so a
@@ -134,6 +136,15 @@ login, with the hidden marker `<!-- carrick-reactor -->`:
   comments carrying the marker are not. Owner `/agent` commands do not ask
   for a decision but count as a human comment. PRs labelled `agent:hold` are
   skipped.
+- Failed GitHub Actions runs are events. A completed run concluding
+  `failure`, `timed_out`, `startup_failure` or `action_required` on a PR's
+  current head SHA asks for a decision on that PR. This applies to every open
+  director PR and owned dispatch PR, however old: the point is to finish PRs
+  that already exist. Successful, skipped and cancelled runs, runs on an older
+  head, and `dispatch-worker.yml`'s own runs (reported through outcome
+  comments) are not events. Runs are read from
+  `actions/runs?status=completed`, created up to three hours before a
+  separate run cursor.
 - Automatic behaviour applies only to PRs created after the reactor's epoch
   (recorded in state on the first real run; `--since <YYYY-MM-DDTHH:MM:SSZ>`
   overrides it): a director PR without exactly one closing reference gets

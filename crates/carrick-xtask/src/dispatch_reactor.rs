@@ -18,6 +18,15 @@ const GLOBAL_CAP: usize = 4;
 const QUIET_SECS: u64 = 15 * 60;
 const SEEN_LIMIT: usize = 200;
 const BODY_LIMIT: usize = 1500;
+/// Reactor rounds allowed on one PR before a human must comment again.
+const UNATTENDED_ROUNDS: u32 = 3;
+/// Completed runs are listed by creation time; a run that finishes after the
+/// cursor may have started this long before it.
+const RUN_LOOKBACK_SECS: u64 = 3 * 3600;
+/// Conclusions that ask for a decision; success, skipped, neutral and
+/// cancelled (usually superseded by a newer push) do not.
+const FAILED_CONCLUSIONS: [&str; 4] =
+    ["failure", "timed_out", "startup_failure", "action_required"];
 const CLOSES_ASK: &str = "This PR needs exactly one closing reference (`Closes #N`, an open owner-authored issue) before dispatch can adopt it for a round.";
 
 #[derive(clap::Subcommand, Debug)]
@@ -52,6 +61,8 @@ pub(crate) trait Github {
     fn pr_facts(&mut self) -> Result<Vec<Value>, ScalerError>;
     /// REST issue comments and PR review comments updated at or after `since`.
     fn comments(&mut self, since: &str) -> Result<Vec<Value>, ScalerError>;
+    /// REST completed workflow runs created at or after `created`.
+    fn workflow_runs(&mut self, created: &str) -> Result<Vec<Value>, ScalerError>;
     fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError>;
     /// `gh run list --workflow dispatch-worker.yml` rows.
     fn runs(&mut self) -> Result<Vec<Value>, ScalerError>;
@@ -83,6 +94,8 @@ pub(crate) struct State {
     /// First real run; automatic pickup and asks apply only to PRs created since.
     epoch: Option<String>,
     cursor: Option<String>,
+    /// Latest `updated_at` of a completed workflow run already read.
+    run_cursor: Option<String>,
     prs: BTreeMap<u64, Memory>,
 }
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -94,6 +107,9 @@ pub(crate) struct Memory {
     last_round_at: Option<String>,
     /// A non-bot, non-reactor comment arrived after the last reactor round.
     human_since_round: bool,
+    /// Reactor rounds since the last human comment.
+    #[serde(default)]
+    unattended_rounds: u32,
     seen: Vec<String>,
 }
 
@@ -104,6 +120,8 @@ pub(crate) struct Gate {
     pub active_total: usize,
     /// The reactor already posted a round on this head and no human spoke since.
     pub repeat_round: bool,
+    /// [`UNATTENDED_ROUNDS`] reactor rounds since the last human comment.
+    pub unattended: bool,
 }
 /// The only effects the rule layer can produce.
 #[derive(Debug, PartialEq, Eq)]
@@ -126,6 +144,9 @@ pub(crate) fn enforce(decision: &Decision, gate: &Gate) -> Effect {
         Act::Round if gate.active_total >= GLOBAL_CAP => Effect::Refused("global dispatch cap"),
         Act::Round if gate.repeat_round => {
             Effect::Refused("already rounded this head; waiting for a human comment")
+        }
+        Act::Round if gate.unattended => {
+            Effect::Refused("unattended round limit; waiting for a human comment")
         }
         Act::Round if text.is_empty() || text.contains(MARKER) => Effect::Refused("invalid brief"),
         Act::Round => Effect::Post(format!("/agent {text}\n\n{MARKER}")),
@@ -167,6 +188,34 @@ pub(crate) fn classify(user: &Value, body: &str) -> Option<Class> {
     })
 }
 
+/// A completed workflow run is an event when it failed; dispatch's own runs
+/// report through their outcome comments instead.
+pub(crate) fn run_event(run: &Value) -> Option<Event> {
+    let conclusion = run["conclusion"].as_str()?;
+    if !FAILED_CONCLUSIONS.contains(&conclusion)
+        || run["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("dispatch-worker.yml"))
+    {
+        return None;
+    }
+    let name = run["name"].as_str().unwrap_or("?");
+    Some(Event {
+        id: format!("run:{}:{}", run["id"], run["run_attempt"]),
+        who: name.to_owned(),
+        kind: "workflow run",
+        body: format!(
+            "{name} ({}) concluded {conclusion}: {}",
+            run["event"].as_str().unwrap_or("?"),
+            run["html_url"].as_str().unwrap_or_default()
+        ),
+        class: Class {
+            trigger: true,
+            human: false,
+        },
+    })
+}
+
 /// Same-repository `work/*` PR into main by the owner or publish App: the
 /// population that adoption admits once it closes exactly one issue.
 fn director_pr(pr: &Value) -> bool {
@@ -191,7 +240,7 @@ fn clip(text: &str) -> String {
     text[..end].to_owned()
 }
 
-struct Event {
+pub(crate) struct Event {
     id: String,
     who: String,
     kind: &'static str,
@@ -220,6 +269,24 @@ pub(crate) fn cycle(
         .filter_map(|n| Some((n["number"].as_u64()?, n)))
         .collect();
     let comments = gh.comments(&since)?;
+    let run_since = state.run_cursor.clone().unwrap_or_else(|| since.clone());
+    let mut run_cursor = run_since.clone();
+    // Failed runs keyed by head SHA; they count only on the PR at that head.
+    let mut run_events: BTreeMap<String, Vec<Event>> = BTreeMap::new();
+    for run in gh.workflow_runs(&lookback(&run_since))? {
+        let (Some(at), Some(sha)) = (run["updated_at"].as_str(), run["head_sha"].as_str()) else {
+            continue;
+        };
+        if at < run_since.as_str() {
+            continue;
+        }
+        if at > run_cursor.as_str() {
+            run_cursor = at.to_owned();
+        }
+        if let Some(event) = run_event(&run) {
+            run_events.entry(sha.to_owned()).or_default().push(event);
+        }
+    }
     let active: Vec<Value> = gh
         .runs()?
         .into_iter()
@@ -305,6 +372,17 @@ pub(crate) fn cycle(
         let mut adoptable = false;
         // Automatic behaviours only for PRs created since the reactor's epoch.
         let recent = pr["created_at"].as_str().is_some_and(|c| c >= epoch);
+        // A failed run finishes existing work, so it counts on any open PR a
+        // round could target, however old.
+        if director || owned {
+            fresh.extend(
+                run_events
+                    .remove(&head)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| !memory.seen.contains(&e.id)),
+            );
+        }
         if director {
             let mut closing = None;
             let adoption = adopted_pr(pr, |read| {
@@ -350,7 +428,10 @@ pub(crate) fn cycle(
         }
         for e in &fresh {
             memory.seen.push(e.id.clone());
-            memory.human_since_round |= e.class.human;
+            if e.class.human {
+                memory.human_since_round = true;
+                memory.unattended_rounds = 0;
+            }
         }
         let excess = memory.seen.len().saturating_sub(SEEN_LIMIT);
         memory.seen.drain(..excess);
@@ -396,6 +477,7 @@ pub(crate) fn cycle(
             active_total,
             repeat_round: memory.last_round_head.as_deref() == Some(head.as_str())
                 && !memory.human_since_round,
+            unattended: memory.unattended_rounds >= UNATTENDED_ROUNDS,
         };
         match enforce(&decision, &gate) {
             Effect::None => {}
@@ -406,6 +488,7 @@ pub(crate) fn cycle(
                     memory.last_round_head = Some(head.clone());
                     memory.last_round_at = Some(iso(now));
                     memory.human_since_round = false;
+                    memory.unattended_rounds += 1;
                     active_total += 1;
                 }
                 emit(gh, number, &body, dry_run, &mut log)?;
@@ -413,6 +496,7 @@ pub(crate) fn cycle(
         }
     }
     state.cursor = Some(cursor);
+    state.run_cursor = Some(run_cursor);
     Ok(log)
 }
 fn emit(
@@ -429,6 +513,26 @@ fn emit(
         log.push(format!("#{number}: posted"));
         gh.post(number, body)
     }
+}
+
+/// `at` minus [`RUN_LOOKBACK_SECS`], for the runs list `created` filter.
+fn lookback(at: &str) -> String {
+    parse_iso(at).map_or_else(
+        || at.to_owned(),
+        |s| iso(s.saturating_sub(RUN_LOOKBACK_SECS)),
+    )
+}
+/// Inverse of [`iso`] for the same shape.
+fn parse_iso(at: &str) -> Option<u64> {
+    let n = |r: std::ops::Range<usize>| at.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86400 + n(11..13)? * 3600 + n(14..16)? * 60 + n(17..19)?).ok()
 }
 
 /// UTC `YYYY-MM-DDTHH:MM:SSZ`, the shape GitHub returns (sorts lexically).
@@ -491,6 +595,26 @@ impl Github for Live<'_> {
         }
         Ok(all)
     }
+    fn workflow_runs(&mut self, created: &str) -> Result<Vec<Value>, ScalerError> {
+        let pages: Value = serde_json::from_str(&super::gh(
+            self.root,
+            &[
+                "api",
+                "--paginate",
+                "--slurp",
+                &format!(
+                    "repos/{REPOSITORY}/actions/runs?status=completed&created=%3E%3D{created}&per_page=100"
+                ),
+            ],
+        )?)?;
+        Ok(pages
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|p| p["workflow_runs"].as_array().into_iter().flatten())
+            .cloned()
+            .collect())
+    }
     fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError> {
         super::adoption_read(self.root, read)
     }
@@ -528,7 +652,7 @@ impl Github for Live<'_> {
 const PROMPT: &str = "You are the Carrick dispatch reactor. Read the PR context and choose ONE action.\n\
 - ignore: nothing needs doing (default; most events need nothing).\n\
 - reply: a short factual answer to a direct question; plain text, never a command.\n\
-- round: start one worker round on this PR; `text` is the brief for the worker (what to fix and how to prove it). Only when the owner or a reviewer asked for changes, CI failed on the PR's own code, or this is a quiet new director PR that clearly needs work.\n\
+- round: start one worker round on this PR; `text` is the brief for the worker (what to fix and how to prove it). Only when the owner or a reviewer asked for changes, CI failed on the PR's own code (a failed workflow run event; check it is not an infrastructure or runner failure), or this is a quiet new director PR that clearly needs work.\n\
 Code enforces eligibility and caps; never merge, push, label or close.\n\n";
 struct Claude {
     model: String,
@@ -675,6 +799,7 @@ mod tests {
         prs: Vec<Value>,
         facts: Vec<Value>,
         comments: Vec<Value>,
+        workflow_runs: Vec<Value>,
         runs: Vec<Value>,
         closing: Vec<u64>,
         posted: Vec<(u64, String)>,
@@ -688,6 +813,9 @@ mod tests {
         }
         fn comments(&mut self, _: &str) -> Result<Vec<Value>, ScalerError> {
             Ok(self.comments.clone())
+        }
+        fn workflow_runs(&mut self, _: &str) -> Result<Vec<Value>, ScalerError> {
+            Ok(self.workflow_runs.clone())
         }
         fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError> {
             Ok(match read {
@@ -768,6 +896,7 @@ mod tests {
             pr_run_active,
             active_total,
             repeat_round: false,
+            unattended: false,
         };
         assert_eq!(
             enforce(&d, &gate(false, false, 0)),
@@ -794,6 +923,7 @@ mod tests {
             pr_run_active: false,
             active_total: 0,
             repeat_round: false,
+            unattended: false,
         };
         for text in ["/agent do it", "  /agent"] {
             let d = Decision {
@@ -1027,10 +1157,101 @@ mod tests {
         assert_eq!(fake.posted.len(), 1);
     }
 
+    fn workflow_run(id: u64, sha: &str, conclusion: &str, path: &str) -> Value {
+        json!({"id":id,"run_attempt":1,"name":"ci","path":path,"event":"pull_request",
+            "head_sha":sha,"conclusion":conclusion,"updated_at":"2026-10-30T23:58:00Z",
+            "html_url":format!("https://github.com/{REPOSITORY}/actions/runs/{id}")})
+    }
+
+    #[test]
+    fn dispatch_reactor_failed_run_on_head_produces_a_decision_once() {
+        let mut fake = gh(vec![pr(19, "work/ci")], vec![]);
+        fake.workflow_runs = vec![
+            workflow_run(100, SHA, "failure", ".github/workflows/ci.yml"),
+            workflow_run(101, SHA, "success", ".github/workflows/ci.yml"),
+            workflow_run(102, SHA, "cancelled", ".github/workflows/ci.yml"),
+            workflow_run(103, SHA, "failure", ".github/workflows/dispatch-worker.yml"),
+            workflow_run(104, "feedface", "failure", ".github/workflows/ci.yml"),
+        ];
+        let mut a = agent(Act::Ignore, "");
+        let mut state = State::default();
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(a.calls, 1);
+        assert!(state.prs[&19].seen.iter().any(|s| s == "run:100:1"));
+        assert!(
+            !state.prs[&19]
+                .seen
+                .iter()
+                .any(|s| s.starts_with("run:10") && s != "run:100:1")
+        );
+        assert_eq!(state.run_cursor.as_deref(), Some("2026-10-30T23:58:00Z"));
+        // The same run read again is not a new event.
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(a.calls, 1);
+        // Control: only successful runs ask for nothing.
+        fake.workflow_runs = vec![workflow_run(
+            105,
+            SHA,
+            "success",
+            ".github/workflows/ci.yml",
+        )];
+        cycle(&mut fake, &mut a, &mut State::default(), NOW, EPOCH, false).unwrap();
+        assert_eq!(a.calls, 1);
+    }
+
+    #[test]
+    fn dispatch_reactor_failed_run_on_old_pr_is_still_an_event() {
+        let mut old = pr(20, "work/old-ci");
+        old["created_at"] = json!("2026-10-01T00:00:00Z");
+        let mut other = pr(22, "feature/not-director");
+        other["head"]["sha"] = json!("feedface");
+        let mut fake = gh(vec![old, other], vec![]);
+        fake.workflow_runs = vec![
+            workflow_run(110, SHA, "failure", ".github/workflows/ci.yml"),
+            workflow_run(111, "feedface", "failure", ".github/workflows/ci.yml"),
+        ];
+        let mut a = agent(Act::Round, "fix");
+        cycle(&mut fake, &mut a, &mut State::default(), NOW, EPOCH, false).unwrap();
+        // The old director PR gets its round; the non-director PR asks nothing.
+        assert_eq!(a.calls, 1);
+        assert_eq!(fake.posted, vec![(20, format!("/agent fix\n\n{MARKER}"))]);
+    }
+
+    #[test]
+    fn dispatch_reactor_unattended_rounds_stop_until_a_human_speaks() {
+        // Each round lands a new head whose CI fails again: the per-head guard
+        // never fires, the unattended limit does.
+        let mut fake = gh(vec![pr(21, "work/loop")], vec![]);
+        let mut a = agent(Act::Round, "fix CI");
+        let mut state = State::default();
+        for i in 0..=UNATTENDED_ROUNDS {
+            let head = format!("{i:040x}");
+            fake.prs[0]["head"]["sha"] = json!(head);
+            fake.workflow_runs = vec![workflow_run(
+                200 + u64::from(i),
+                &head,
+                "failure",
+                ".github/workflows/ci.yml",
+            )];
+            cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        }
+        assert_eq!(fake.posted.len(), UNATTENDED_ROUNDS as usize);
+        // A human comment re-enables one round on the same head.
+        fake.workflow_runs = vec![];
+        fake.comments = vec![comment(21, 12, "tjfontaine", "User", "one more try")];
+        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(fake.posted.len(), UNATTENDED_ROUNDS as usize + 1);
+    }
+
     #[test]
     fn dispatch_reactor_iso_matches_github_shape() {
         assert_eq!(iso(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso(NOW), "2026-10-31T00:00:00Z");
         assert_eq!(iso(951_782_400), "2000-02-29T00:00:00Z");
+        for secs in [0, 951_782_400, NOW, NOW + 86_399] {
+            assert_eq!(parse_iso(&iso(secs)), Some(secs));
+        }
+        assert_eq!(lookback("2026-10-31T00:00:00Z"), "2026-10-30T21:00:00Z");
+        assert_eq!(parse_iso("garbage"), None);
     }
 }
