@@ -245,45 +245,88 @@ pub(crate) fn adopted_pr(
         issue,
     }))
 }
-/// The issue body with its last writer, read in one GraphQL response so the
-/// check and the brief cannot diverge (#1218 review).
-pub(crate) const ISSUE_BRIEF_QUERY: &str = r#"query($number:Int!){repository(owner:"carrick-sh",name:"carrick"){issue(number:$number){number author{login} lastEditedAt editor{login} body}}}"#;
-/// The issue body a worker may take as its brief. Any issue author may be
+/// The issue title and body with their last writers, read in one GraphQL
+/// response so the checks and the admitted [`Dispatch`] fields cannot diverge
+/// (#1218, #1220). `lastEditedAt` tracks body edits only, so title changes are
+/// checked through the latest `RENAMED_TITLE_EVENT` timeline item.
+pub(crate) const ISSUE_BRIEF_QUERY: &str = r#"query($number:Int!){repository(owner:"carrick-sh",name:"carrick"){issue(number:$number){number author{login} title lastEditedAt editor{__typename login} body renames:timelineItems(last:1,itemTypes:[RENAMED_TITLE_EVENT]){pageInfo{hasPreviousPage} nodes{__typename ... on RenamedTitleEvent{actor{__typename login} currentTitle}}}}}}"#;
+/// Verified issue title and body from one [`ISSUE_BRIEF_QUERY`] snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrustedBrief {
+    pub title: String,
+    pub body: String,
+}
+/// A GraphQL `Actor` for a human account (`__typename == "User"`) that
+/// [`write_collaborator`] trusts.
+fn trusted_graphql_actor(actor: &Value, trusted: &mut dyn FnMut(&str) -> bool) -> bool {
+    actor["__typename"] == "User" && actor["login"].as_str().is_some_and(trusted)
+}
+/// The issue title and body a worker round may admit. Any issue author may be
 /// approved by a collaborator's label, comment or review (#1214), but the
-/// approval covers only text a collaborator saw or wrote: the body must be
-/// unedited since filing (`lastEditedAt` null), or last edited by a login
-/// that passes `trusted` ([`write_collaborator`]). Errors, a different issue
-/// and any missing field are refused.
+/// approval covers only text a collaborator saw or wrote:
+/// - the body must be unedited since filing (`lastEditedAt` null), or last
+///   edited by a human account that passes `trusted` ([`write_collaborator`]);
+/// - the title must be unrenamed since filing (no `RENAMED_TITLE_EVENT`), or
+///   last renamed to the current `title` by a human account that passes
+///   `trusted`.
+///
+/// Errors, a different issue, a title mismatch and any missing field are
+/// refused.
 pub(crate) fn trusted_brief(
     response: &Value,
     number: u64,
     trusted: &mut dyn FnMut(&str) -> bool,
-) -> Result<String, ScalerError> {
+) -> Result<TrustedBrief, ScalerError> {
     if response.get("errors").is_some() {
         return Err(ScalerError::Guard("issue brief query returned errors"));
     }
     let issue = &response["data"]["repository"]["issue"];
-    let body = issue["body"]
-        .as_str()
-        .filter(|_| issue["number"].as_u64() == Some(number))
-        .ok_or(ScalerError::Guard("issue brief unavailable"))?;
+    if issue["number"].as_u64() != Some(number) {
+        return Err(ScalerError::Guard("issue brief unavailable"));
+    }
+    let (Some(title), Some(body)) = (issue["title"].as_str(), issue["body"].as_str()) else {
+        return Err(ScalerError::Guard("issue brief unavailable"));
+    };
     match issue.get("lastEditedAt") {
-        Some(Value::Null) => Ok(body.to_owned()),
+        Some(Value::Null) => {}
         Some(Value::String(at)) if !at.is_empty() => {
-            if issue["editor"]["login"].as_str().is_some_and(trusted) {
-                Ok(body.to_owned())
-            } else {
-                Err(ScalerError::Guard(
+            if !trusted_graphql_actor(&issue["editor"], trusted) {
+                return Err(ScalerError::Guard(
                     "issue body was last edited by a non-collaborator; a collaborator must edit or re-file it",
-                ))
+                ));
             }
         }
-        _ => Err(ScalerError::Guard("issue brief edit history unavailable")),
+        _ => return Err(ScalerError::Guard("issue brief edit history unavailable")),
     }
+    let renames = &issue["renames"];
+    let (Some(has_previous), Some(nodes)) = (
+        renames["pageInfo"]["hasPreviousPage"].as_bool(),
+        renames["nodes"].as_array(),
+    ) else {
+        return Err(ScalerError::Guard("issue title rename history unavailable"));
+    };
+    match nodes.as_slice() {
+        [] if !has_previous => {}
+        [rename]
+            if rename["__typename"] == "RenamedTitleEvent"
+                && rename["currentTitle"].as_str() == Some(title) =>
+        {
+            if !trusted_graphql_actor(&rename["actor"], trusted) {
+                return Err(ScalerError::Guard(
+                    "issue title was last edited by a non-collaborator; a collaborator must retitle or re-file it",
+                ));
+            }
+        }
+        _ => return Err(ScalerError::Guard("issue title rename history unavailable")),
+    }
+    Ok(TrustedBrief {
+        title: title.to_owned(),
+        body: body.to_owned(),
+    })
 }
-/// Replace the event's issue body with the [`trusted_brief`] for that issue.
-/// Every path that admits a round (label, comment, review, adoption) ends
-/// here, so no issue body reaches a worker without this check.
+/// Replace the event's issue title and body with the [`trusted_brief`] for
+/// that issue. Every path that admits a round (label, comment, review,
+/// adoption) ends here, so neither field enters [`Dispatch`] unchecked.
 fn apply_trusted_brief(
     event: &mut Value,
     read: impl FnOnce(u64) -> Result<Value, ScalerError>,
@@ -293,8 +336,9 @@ fn apply_trusted_brief(
         .as_u64()
         .filter(|n| *n > 0)
         .ok_or(ScalerError::Guard("missing issue number"))?;
-    let body = trusted_brief(&read(number)?, number, trusted)?;
-    event["issue"]["body"] = body.into();
+    let brief = trusted_brief(&read(number)?, number, trusted)?;
+    event["issue"]["title"] = brief.title.into();
+    event["issue"]["body"] = brief.body.into();
     Ok(())
 }
 fn issue_brief_response(root: &Path, number: u64) -> Result<Value, ScalerError> {
@@ -2179,8 +2223,8 @@ pub(crate) fn load_event(
 ) -> Result<(Value, Option<Adoption>), ScalerError> {
     let (mut event, adoption) = resolve_event(root, path, trusted)?;
     // Whatever path resolved the issue (the label payload, a live re-read for
-    // an owned PR, or the adopted PR's closing issue), its body becomes the
-    // brief only through the last-writer check.
+    // an owned PR, or the adopted PR's closing issue), its title and body
+    // enter Dispatch only through the last-writer checks.
     apply_trusted_brief(
         &mut event,
         |number| issue_brief_response(root, number),
@@ -7686,45 +7730,123 @@ cat "$file"
         );
     }
     /// The [`ISSUE_BRIEF_QUERY`] response for `issue`, unedited when
-    /// `editor` is `None`.
+    /// `editor` is `None` and unrenamed unless [`issue_brief_renamed`] adds a
+    /// `RENAMED_TITLE_EVENT`.
     fn issue_brief(issue: &Value, editor: Option<&str>) -> Value {
         json!({"data":{"repository":{"issue":{
             "number":issue["number"],
             "author":{"login":issue["user"]["login"]},
+            "title":issue["title"].as_str().unwrap_or("Fixture issue"),
             "lastEditedAt":editor.map(|_| "2026-10-30T01:00:00Z"),
-            "editor":editor.map(|login| json!({"login":login})),
-            "body":issue["body"]}}}})
+            "editor":editor.map(|login| json!({"__typename":"User","login":login})),
+            "body":issue["body"],
+            "renames":{"pageInfo":{"hasPreviousPage":false},"nodes":[]}}}}})
+    }
+    fn issue_brief_renamed(
+        issue: &Value,
+        editor: Option<&str>,
+        renamer: &str,
+        has_previous: bool,
+    ) -> Value {
+        let mut response = issue_brief(issue, editor);
+        let title = response["data"]["repository"]["issue"]["title"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        response["data"]["repository"]["issue"]["renames"] = json!({
+            "pageInfo":{"hasPreviousPage":has_previous},
+            "nodes":[{
+                "__typename":"RenamedTitleEvent",
+                "actor":{"__typename":"User","login":renamer},
+                "currentTitle":title,
+            }],
+        });
+        response
     }
     const BRIEF_PERMISSIONS: &[(&str, &str)] = &[("tjfontaine", "admin"), ("writer", "write")];
     #[test]
     fn issue_brief_must_be_unedited_or_last_written_by_a_collaborator() {
-        let issue = json!({"number":634,"body":"## Brief\nDo it","user":{"login":"outsider"}});
+        let issue = json!({"number":634,"title":"Initial title","body":"## Brief\nDo it","user":{"login":"outsider"}});
         let check = |response: &Value| {
             trusted_brief(response, 634, &mut fake_collaborators(BRIEF_PERMISSIONS))
         };
-        // Unedited: the body is exactly what the approving collaborator saw.
+        // Unedited and unrenamed: title and body are what the collaborator saw.
         assert_eq!(
             check(&issue_brief(&issue, None)).unwrap(),
-            "## Brief\nDo it"
+            TrustedBrief {
+                title: "Initial title".into(),
+                body: "## Brief\nDo it".into(),
+            }
         );
-        // Edited by a collaborator: the collaborator wrote the last word.
+        // Body edited or title renamed by a collaborator (including recovery
+        // after an earlier rename where `hasPreviousPage` is true).
         for editor in ["writer", "tjfontaine"] {
             assert!(
                 check(&issue_brief(&issue, Some(editor))).is_ok(),
                 "{editor}"
             );
+            for has_previous in [false, true] {
+                assert_eq!(
+                    check(&issue_brief_renamed(&issue, None, editor, has_previous)).unwrap(),
+                    TrustedBrief {
+                        title: "Initial title".into(),
+                        body: "## Brief\nDo it".into(),
+                    },
+                    "{editor} has_previous={has_previous}"
+                );
+            }
         }
-        // Edited by the outsider (or anyone without write) after approval.
+        // Body edited by the outsider (or anyone without write, or a Bot).
         for editor in ["outsider", "reader", "github-actions[bot]", ""] {
             let error = check(&issue_brief(&issue, Some(editor))).unwrap_err();
             assert!(
                 error
                     .to_string()
-                    .contains("last edited by a non-collaborator"),
+                    .contains("issue body was last edited by a non-collaborator"),
                 "{editor}: {error}"
             );
         }
-        // Fail closed: errors, another issue, and every missing field.
+        let mut bot_editor = issue_brief(&issue, Some("writer"));
+        bot_editor["data"]["repository"]["issue"]["editor"]["__typename"] = "Bot".into();
+        assert!(
+            check(&bot_editor)
+                .unwrap_err()
+                .to_string()
+                .contains("issue body was last edited by a non-collaborator")
+        );
+        // Title renamed by the outsider, a reader, a Bot, or a deleted user,
+        // even when the body is untouched or was edited by a collaborator.
+        for renamer in ["outsider", "reader", "github-actions[bot]", ""] {
+            for body_editor in [None, Some("writer")] {
+                let error =
+                    check(&issue_brief_renamed(&issue, body_editor, renamer, false)).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("issue title was last edited by a non-collaborator"),
+                    "{renamer} ({body_editor:?}): {error}"
+                );
+            }
+        }
+        let mut bot_renamer = issue_brief_renamed(&issue, None, "writer", false);
+        bot_renamer["data"]["repository"]["issue"]["renames"]["nodes"][0]["actor"]["__typename"] =
+            "Bot".into();
+        assert!(
+            check(&bot_renamer)
+                .unwrap_err()
+                .to_string()
+                .contains("issue title was last edited by a non-collaborator")
+        );
+        let mut deleted_renamer = issue_brief_renamed(&issue, None, "writer", false);
+        deleted_renamer["data"]["repository"]["issue"]["renames"]["nodes"][0]["actor"] =
+            Value::Null;
+        assert!(
+            check(&deleted_renamer)
+                .unwrap_err()
+                .to_string()
+                .contains("issue title was last edited by a non-collaborator")
+        );
+        // Fail closed: errors, another issue, title/timeline skew, and missing fields.
         let mut refused = vec![
             json!({"errors":[{"message":"rate limited"}],"data":null}),
             json!({"data":{"repository":{"issue":null}}}),
@@ -7733,7 +7855,7 @@ cat "$file"
         let mut other = issue_brief(&issue, None);
         other["data"]["repository"]["issue"]["number"] = 635.into();
         refused.push(other);
-        for field in ["number", "body", "lastEditedAt"] {
+        for field in ["number", "title", "body", "lastEditedAt", "renames"] {
             let mut missing = issue_brief(&issue, None);
             missing["data"]["repository"]["issue"]
                 .as_object_mut()
@@ -7747,22 +7869,43 @@ cat "$file"
         let mut empty_time = issue_brief(&issue, None);
         empty_time["data"]["repository"]["issue"]["lastEditedAt"] = "".into();
         refused.push(empty_time);
+        let mut truncated_renames = issue_brief(&issue, None);
+        truncated_renames["data"]["repository"]["issue"]["renames"]["pageInfo"]["hasPreviousPage"] =
+            true.into();
+        refused.push(truncated_renames);
+        let mut null_rename_node = issue_brief(&issue, None);
+        null_rename_node["data"]["repository"]["issue"]["renames"]["nodes"] = json!([null]);
+        refused.push(null_rename_node);
+        let mut wrong_typename = issue_brief_renamed(&issue, None, "writer", false);
+        wrong_typename["data"]["repository"]["issue"]["renames"]["nodes"][0]["__typename"] =
+            "LabeledEvent".into();
+        refused.push(wrong_typename);
+        let mut stale_rename = issue_brief_renamed(&issue, None, "writer", false);
+        stale_rename["data"]["repository"]["issue"]["renames"]["nodes"][0]["currentTitle"] =
+            "Earlier title".into();
+        refused.push(stale_rename);
+        let mut two_renames = issue_brief_renamed(&issue, None, "writer", false);
+        let node = two_renames["data"]["repository"]["issue"]["renames"]["nodes"][0].clone();
+        two_renames["data"]["repository"]["issue"]["renames"]["nodes"] = json!([node, node]);
+        refused.push(two_renames);
         for response in refused {
             assert!(check(&response).is_err(), "admitted {response}");
         }
-        // The brief comes from the checked response, never the event's copy.
-        let mut event = json!({"issue":{"number":634,"body":"stale event body"}});
+        // Both title and body come from the checked response, never the event's copy.
+        let mut event =
+            json!({"issue":{"number":634,"title":"stale event title","body":"stale event body"}});
         apply_trusted_brief(
             &mut event,
             |n| {
                 Ok(issue_brief(
-                    &json!({"number":n,"body":"live","user":{"login":"x"}}),
+                    &json!({"number":n,"title":"live title","body":"live","user":{"login":"x"}}),
                     None,
                 ))
             },
             &mut fake_collaborators(BRIEF_PERMISSIONS),
         )
         .unwrap();
+        assert_eq!(event["issue"]["title"], "live title");
         assert_eq!(event["issue"]["body"], "live");
         assert!(
             apply_trusted_brief(
@@ -7773,8 +7916,8 @@ cat "$file"
             .is_err()
         );
     }
-    /// The production `load_event` on every path that turns an issue body
-    /// into a brief: a label, an `/agent` comment on the issue, an `/agent`
+    /// The production `load_event` on every path that turns an issue into a
+    /// [`Dispatch`]: a label, an `/agent` comment on the issue, an `/agent`
     /// follow-up on an owned dispatch PR, and adoption of a director PR.
     #[test]
     fn every_brief_path_refuses_an_issue_body_an_outsider_edited() {
@@ -7808,7 +7951,7 @@ cat "$file"
                 .env("BRIEF_FIXTURE", temp.path())
                 .env("GH_TOKEN", "fixture-token")
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-                .env_remove("CARRICK_DISPATCH_HEAD")
+                .env("CARRICK_DISPATCH_HEAD", "a".repeat(40))
                 .output()
                 .unwrap();
             assert!(
@@ -7830,12 +7973,12 @@ cat "$file"
         let tip = "a".repeat(40);
         let comment = json!({"id":123,"user":{"login":"tjfontaine","type":"User"},"body":"/agent go","created_at":"2026-10-30T00:00:00Z","updated_at":"2026-10-30T00:00:00Z"});
         write("issues/comments/123", &comment);
-        // An outsider filed #634; the label/comment snapshot is what a
-        // collaborator approved, and the live body is what the outsider
-        // wrote afterwards.
-        let issue = json!({"number":634,"state":"open","title":"Outsider issue","body":"edited by outsider","user":{"login":"outsider","type":"User"}});
-        write("issues/634", &issue);
-        let event_issue = json!({"number":634,"state":"open","title":"Outsider issue","body":"approved text","user":{"login":"outsider","type":"User"}});
+        // An outsider filed #634; REST and webhook copies have distinct titles
+        // and bodies so only the verified GraphQL snapshot can match both.
+        let rest_issue = json!({"number":634,"state":"open","title":"untrusted REST title","body":"untrusted REST body","user":{"login":"outsider","type":"User"}});
+        write("issues/634", &rest_issue);
+        let graphql_issue = json!({"number":634,"state":"open","title":"verified GraphQL title","body":"edited by outsider","user":{"login":"outsider","type":"User"}});
+        let event_issue = json!({"number":634,"state":"open","title":"stale event title","body":"approved text","user":{"login":"outsider","type":"User"}});
         let base = json!({"repository":{"full_name":REPOSITORY},"sender":{"login":"tjfontaine","type":"User"}});
         let mut label = base.clone();
         label["action"] = "labeled".into();
@@ -7851,7 +7994,10 @@ cat "$file"
             "base":{"ref":"main","repo":{"full_name":REPOSITORY}},"draft":true,
             "body":format!("Closes #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
         write("pulls/800", &owned_pr);
-        write("actions/runs/42", &json!({"id":42}));
+        write(
+            "actions/runs/42",
+            &json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","head_sha":tip,"repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},"actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}}),
+        );
         let mut owned = on_issue.clone();
         owned["issue"] = json!({"number":800,"state":"open","pull_request":{"url":"pr"}});
         // Adoption: `/agent` on a director PR closing issue 634.
@@ -7876,35 +8022,67 @@ cat "$file"
         ] {
             std::fs::write(&event_path, event.to_string()).unwrap();
             let load = || {
-                load_event(
+                let (loaded, adoption) = load_event(
                     &fixture,
                     &event_path,
                     &mut fake_collaborators(BRIEF_PERMISSIONS),
+                )?;
+                validate_event_with_publication(
+                    &loaded,
+                    "tjfontaine",
+                    &mut fake_collaborators(BRIEF_PERMISSIONS),
+                    None,
+                    adoption.as_ref(),
                 )
             };
-            // Unedited since filing: accepted, and the brief is the live body.
+            // Unedited and unrenamed since filing: accepted, and both
+            // Dispatch.title and Dispatch.body come from the GraphQL snapshot.
             std::fs::write(
                 fixture.join("issue-graphql.json"),
-                issue_brief(&issue, None).to_string(),
+                issue_brief(&graphql_issue, None).to_string(),
             )
             .unwrap();
-            let (loaded, _) = load().unwrap_or_else(|e| panic!("{path}: unedited refused: {e}"));
-            assert_eq!(loaded["issue"]["body"], "edited by outsider", "{path}");
-            // Edited by a collaborator: accepted.
+            let dispatch = load().unwrap_or_else(|e| panic!("{path}: unedited refused: {e}"));
+            assert_eq!(dispatch.title, "verified GraphQL title", "{path}");
+            assert_eq!(dispatch.body, "edited by outsider", "{path}");
+            // Body edited by a collaborator: accepted.
             std::fs::write(
                 fixture.join("issue-graphql.json"),
-                issue_brief(&issue, Some("writer")).to_string(),
+                issue_brief(&graphql_issue, Some("writer")).to_string(),
             )
             .unwrap();
             assert!(load().is_ok(), "{path}: collaborator edit refused");
-            // Edited by the outsider after approval: refused.
+            // Retitled by a collaborator (even after an earlier rename): accepted.
             std::fs::write(
                 fixture.join("issue-graphql.json"),
-                issue_brief(&issue, Some("outsider")).to_string(),
+                issue_brief_renamed(&graphql_issue, None, "writer", true).to_string(),
+            )
+            .unwrap();
+            let dispatch =
+                load().unwrap_or_else(|e| panic!("{path}: collaborator retitle refused: {e}"));
+            assert_eq!(dispatch.title, "verified GraphQL title", "{path}");
+            // Retitled by the outsider without touching the body: refused.
+            std::fs::write(
+                fixture.join("issue-graphql.json"),
+                issue_brief_renamed(&graphql_issue, None, "outsider", false).to_string(),
             )
             .unwrap();
             let error = load().map(|_| ()).unwrap_err().to_string();
-            assert!(error.contains("non-collaborator"), "{path}: {error}");
+            assert!(
+                error.contains("issue title was last edited by a non-collaborator"),
+                "{path}: {error}"
+            );
+            // Body edited by the outsider after approval: refused.
+            std::fs::write(
+                fixture.join("issue-graphql.json"),
+                issue_brief(&graphql_issue, Some("outsider")).to_string(),
+            )
+            .unwrap();
+            let error = load().map(|_| ()).unwrap_err().to_string();
+            assert!(
+                error.contains("issue body was last edited by a non-collaborator"),
+                "{path}: {error}"
+            );
             // GraphQL failure: refused.
             std::fs::write(
                 fixture.join("issue-graphql.json"),
