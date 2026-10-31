@@ -40,7 +40,7 @@ fn creation_host_routes(policy: ArmRingFirst) {
             frame.x[..6].copy_from_slice(&[17, 23, 31, 41, 47, 53]);
             frame.x[8] = nr;
             let mut original = frame.x;
-            let refused = policy.is_strict() && matches!(nr, 96 | 103 | 122 | 134 | 178 | 260);
+            let refused = policy.is_strict() && matches!(nr, 73 | 96 | 103 | 122 | 134 | 178 | 260);
             if refused {
                 original[0] =
                     carrick_personality_linux::crossing::LINUX_ENOSYS.guest_retval() as u64;
