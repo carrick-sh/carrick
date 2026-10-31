@@ -124,17 +124,19 @@ login, with the hidden marker `<!-- carrick-reactor -->`:
   unedited owner comment. It is posted only when the PR passes `adopted_pr`
   or is an owned dispatch PR, no `dispatch-worker.yml` run is queued or in
   progress for that PR, and fewer than four dispatch runs are in flight.
-- At most one reactor round per PR head, unless a human (non-bot) comment
-  arrived after the last reactor round. State records the round's head and
+- At most one reactor round per PR head, unless an owner comment arrived
+  after the last reactor round. State records the round's head and
   time.
-- At most three reactor rounds on a PR in a row without a human comment in
+- At most three reactor rounds on a PR in a row without an owner comment in
   between, so a round whose push fails CI again cannot loop across heads.
 - A `reply` posts plain text; text starting with `/agent` is refused.
 - Dispatch outcome comments (from `github-actions[bot]` or
   `carrick-workers[bot]`, containing "Dispatch outcome") are events, so a
   finished, blocked or failed round gets a decision. Other bot comments and
   comments carrying the marker are not. Owner `/agent` commands do not ask
-  for a decision but count as a human comment. PRs labelled `agent:hold` are
+  for a decision but count as an owner comment. Only the owner's comments
+  reset the two round limits; anyone can comment on a public PR, so other
+  people's comments ask for a decision but do not re-enable a round. PRs labelled `agent:hold` are
   skipped.
 - Failed GitHub Actions runs are events. A completed run concluding
   `failure`, `timed_out`, `startup_failure` or `action_required` on a PR's

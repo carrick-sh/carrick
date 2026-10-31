@@ -105,9 +105,9 @@ pub(crate) struct Memory {
     candidate_head: Option<String>,
     last_round_head: Option<String>,
     last_round_at: Option<String>,
-    /// A non-bot, non-reactor comment arrived after the last reactor round.
+    /// An owner comment (not reactor-marked) arrived after the last reactor round.
     human_since_round: bool,
-    /// Reactor rounds since the last human comment.
+    /// Reactor rounds since the last owner comment.
     #[serde(default)]
     unattended_rounds: u32,
     seen: Vec<String>,
@@ -163,7 +163,8 @@ const OUTCOME_BOTS: [&str; 2] = ["github-actions[bot]", "carrick-workers[bot]"];
 /// How a comment or review counts: `None` is not an event (reactor-marked, or
 /// a bot other than a dispatch outcome). `trigger` asks for a decision; an
 /// owner `/agent` command does not (the dispatch workflow handles it) but is
-/// still `human`, which re-enables a round on the same head.
+/// still `human`. Only the owner is `human`: anyone can comment on a public
+/// PR, and `human` resets the round guards.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Class {
     trigger: bool,
@@ -184,7 +185,7 @@ pub(crate) fn classify(user: &Value, body: &str) -> Option<Class> {
     }
     Some(Class {
         trigger: !body.trim_start().starts_with("/agent"),
-        human: true,
+        human: user["login"] == "tjfontaine",
     })
 }
 
@@ -1119,7 +1120,12 @@ mod tests {
             log.iter().any(|l| l.contains("already rounded this head")),
             "{log:?}"
         );
-        // A human comment after the round re-enables one more round.
+        // A stranger's comment asks for a decision but does not reset the guard.
+        fake.comments = vec![comment(16, 13, "drive-by", "User", "run it again")];
+        let log = cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        assert_eq!(a.calls, 3);
+        assert_eq!(fake.posted.len(), 1, "{log:?}");
+        // An owner comment after the round re-enables one more round.
         fake.comments = vec![comment(
             16,
             10,
