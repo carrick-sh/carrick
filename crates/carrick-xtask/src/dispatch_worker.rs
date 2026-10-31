@@ -982,6 +982,12 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         // dispatch as overriding an owner pause.
         .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
         .env("AGY_DIRECTOR_ROUTES", "default")
+        .env(
+            "AGY_MODELS_SEED",
+            state
+                .join("director")
+                .join(crate::agent_runner::MODELS_SEED),
+        )
         .current_dir(root);
     // Held until the agent retires; the agent only validates and joins it.
     let (_lease, handoff) = agent_lease()?.unzip();

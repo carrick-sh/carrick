@@ -544,6 +544,16 @@ Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
 proposals and the comment tool refuse the marker.
 
+The coordinator launches with a model tier, which the pinned launcher
+resolves through the live `agy models` roster. When that lookup fails (it
+timed out at 60 s in run 41165350388, #1240), the launcher uses its last
+cached roster, then the seed roster pinned beside it in
+`scripts/ci/inputs/agent-tools.json` (`agy_models_seed`, staged as
+`director/agy-models-seed.json` and named by `AGY_MODELS_SEED` for the
+coordinator, the workers and the capacity probe). A fresh clone has no cache,
+so the seed is what keeps a slow lookup from ending the round. Refresh the
+seed when the agy pin or the account's models change.
+
 `[loop].loop_backend` and `[loop].loop_model` select the coordinator itself.
 They are omitted from its event budgets and do not constrain workers. Worker
 choice is the loop's own decision from `read_capacity` and task difficulty.
