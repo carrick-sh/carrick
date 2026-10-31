@@ -765,10 +765,15 @@ pub struct QueueRow {
     pub(crate) closing_authorized: bool,
 }
 
+/// Admission order within one scheduler, shared by host and guest queues.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct QueueOrder(u64);
+
 #[derive(Debug)]
 struct QueuedRow {
     row: QueueRow,
     obligation: DrainObligation,
+    order: QueueOrder,
 }
 
 impl std::ops::Deref for QueuedRow {
@@ -796,6 +801,7 @@ impl QueuedRow {
         let Self {
             row,
             mut obligation,
+            order: _,
         } = self;
         queue.claimed.fetch_add(1, Ordering::SeqCst);
         queue.claim_boundaries.fetch_add(1, Ordering::SeqCst);
@@ -1524,7 +1530,14 @@ impl RunQueueInner {
     fn retain_queued_row(&self, row: QueueRow) -> QueuedRow {
         let obligation = DrainObligation::retain(self, DrainPhase::Queued);
         self.total_queued.fetch_add(1, Ordering::SeqCst);
-        QueuedRow { row, obligation }
+        // Reuse the scheduler's event ordering, not a second clock. Moving
+        // this retained row to host fallback preserves its original place.
+        let order = QueueOrder(self.event_sequence.fetch_add(1, Ordering::Relaxed));
+        QueuedRow {
+            row,
+            obligation,
+            order,
+        }
     }
 
     fn release_queued(&self) {
@@ -1868,10 +1881,13 @@ impl RunQueueInner {
     }
 
     /// Pop `cpu`'s FIFO head (or the policy's choice), accounting the claim.
-    /// Pop `cpu`'s FIFO head (or the policy's choice), accounting the claim.
-    fn pop_local(&self, cpu: &GuestCpu) -> Option<ClaimedRow> {
+    /// A guest service already waiting on this CPU bounds eligible host rows.
+    fn pop_local(&self, cpu: &GuestCpu, before: Option<QueueOrder>) -> Option<ClaimedRow> {
         if !self.policy.inspects_queues() {
             let mut local = cpu.state.lock();
+            if before.is_some_and(|limit| local.rows.front().is_none_or(|row| row.order >= limit)) {
+                return None;
+            }
             let row = local.rows.pop_front()?;
             return Some(self.finish_removal(&mut local, cpu, row));
         }
@@ -1886,12 +1902,16 @@ impl RunQueueInner {
             local
                 .rows
                 .iter()
+                .filter(|row| before.is_none_or(|limit| row.order < limit))
                 .map(|row| {
                     let id = SchedThreadId::new(row.thread.key().serial.raw());
                     (id, (id, row.key))
                 })
                 .unzip()
         };
+        if queued.is_empty() {
+            return None;
+        }
 
         let chosen = self.policy.pick_next(&CpuQueueView {
             cpu: cpu.id,
@@ -1909,7 +1929,9 @@ impl RunQueueInner {
                 .find(|(id, _)| *id == chosen_id)
                 .map(|(_, key)| *key);
             if let Some(expected_key) = expected_key {
-                local.rows.iter().position(|row| row.key == expected_key)
+                local.rows.iter().position(|row| {
+                    row.key == expected_key && before.is_none_or(|limit| row.order < limit)
+                })
             } else {
                 None
             }
@@ -1917,8 +1939,14 @@ impl RunQueueInner {
             None
         };
 
-        // If stale or unpicked, take current FIFO head (index 0).
-        let pos = position.unwrap_or(0);
+        // A policy callback can race publication/removal. Revalidate the
+        // cutoff as well as the key; a younger row cannot bypass the service.
+        let pos = position.or_else(|| {
+            local
+                .rows
+                .iter()
+                .position(|row| before.is_none_or(|limit| row.order < limit))
+        })?;
         let row = local.rows.remove(pos)?;
         Some(self.finish_removal(&mut local, cpu, row))
     }
@@ -2761,7 +2789,7 @@ impl RunQueue {
             if executor.is_spare() {
                 self.park_spare(executor)?;
             }
-            match self.take_row_bound(executor, auditors, false)? {
+            match self.take_row_bound(executor, auditors, false, None)? {
                 BoundTake::Row(row) => return Ok(row),
                 BoundTake::Released | BoundTake::WouldPark => {}
             }
@@ -2774,6 +2802,7 @@ impl RunQueue {
         &self,
         executor: &ExecutorRegistration,
         auditors: Option<&crate::observe::AuditorChain>,
+        before: Option<QueueOrder>,
     ) -> Result<Option<ClaimedRow>, RunQueueError> {
         loop {
             if executor.in_host_wait() {
@@ -2782,7 +2811,7 @@ impl RunQueue {
             if executor.is_spare() {
                 self.park_spare(executor)?;
             }
-            match self.take_row_bound(executor, auditors, true)? {
+            match self.take_row_bound(executor, auditors, true, before)? {
                 BoundTake::Row(row) => return Ok(Some(row)),
                 BoundTake::Released => {}
                 BoundTake::WouldPark => return Ok(None),
@@ -2795,6 +2824,7 @@ impl RunQueue {
         executor: &ExecutorRegistration,
         auditors: Option<&crate::observe::AuditorChain>,
         nonblocking: bool,
+        before: Option<QueueOrder>,
     ) -> Result<BoundTake, RunQueueError> {
         let index = executor
             .bound_cpu()
@@ -2829,10 +2859,12 @@ impl RunQueue {
                 let local = cpu.state.lock();
                 local.wake_ticket
             };
-            if let Some(row) = self.inner.pop_local(&cpu) {
+            if let Some(row) = self.inner.pop_local(&cpu, before) {
                 return Ok(BoundTake::Row(self.claim_taken(&mut idle, cpu.id, row)));
             }
-            if let Some(row) = self.inner.try_steal(cpu.id) {
+            if before.is_none()
+                && let Some(row) = self.inner.try_steal(cpu.id)
+            {
                 return Ok(BoundTake::Row(self.claim_taken(&mut idle, cpu.id, row)));
             }
 
@@ -2855,11 +2887,13 @@ impl RunQueue {
             if transferred && self.inner.release_handoff(executor.id, true) {
                 return Ok(BoundTake::Released);
             }
-            if let Some(row) = self
-                .inner
-                .pop_local(&cpu)
-                .or_else(|| self.inner.try_steal(cpu.id))
-            {
+            if let Some(row) = self.inner.pop_local(&cpu, before).or_else(|| {
+                if before.is_none() {
+                    self.inner.try_steal(cpu.id)
+                } else {
+                    None
+                }
+            }) {
                 return Ok(BoundTake::Row(self.claim_taken(&mut idle, cpu.id, row)));
             }
 
@@ -3079,8 +3113,18 @@ impl RunQueue {
         recorder: Option<&dyn DiscardRecorder>,
         auditors: Option<&crate::observe::AuditorChain>,
     ) -> Result<Option<QueueClaim>, RunQueueError> {
+        self.try_take_before(executor, recorder, auditors, None)
+    }
+
+    fn try_take_before(
+        &self,
+        executor: &ExecutorRegistration,
+        recorder: Option<&dyn DiscardRecorder>,
+        auditors: Option<&crate::observe::AuditorChain>,
+        before: Option<QueueOrder>,
+    ) -> Result<Option<QueueClaim>, RunQueueError> {
         loop {
-            let Some(row) = self.try_take_row(executor, auditors)? else {
+            let Some(row) = self.try_take_row(executor, auditors, before)? else {
                 return Ok(None);
             };
             if let Some(claim) = self.claim_row(executor, row, recorder, auditors) {
@@ -4625,6 +4669,41 @@ impl Scheduler {
             .queue
             .try_take(executor, recorder.as_deref(), Some(&auditors))?
         {
+            Some(claim) => self.finish_take(executor, claim).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Offer local host rows admitted before this queued guest service to
+    /// the ordinary claim owner. The service remains queued when a host row
+    /// wins, and a requeued compute successor cannot jump the waiting row.
+    pub fn try_take_before_zone_service(
+        &self,
+        executor: &ExecutorRegistration,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Result<Option<RunnableThread>, RunQueueError> {
+        self.executors.authenticate(executor)?;
+        let key = QueueKey { thread, generation };
+        let before = self
+            .queue
+            .inner
+            .shard(key)
+            .lock()
+            .zone_held
+            .get(&key)
+            .map(|row| row.order);
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        let recorder = self.discard_recorder.lock().clone();
+        let auditors = self.kernel.auditors();
+        match self.queue.try_take_before(
+            executor,
+            recorder.as_deref(),
+            Some(&auditors),
+            Some(before),
+        )? {
             Some(claim) => self.finish_take(executor, claim).map(Some),
             None => Ok(None),
         }

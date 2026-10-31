@@ -1764,6 +1764,19 @@ fn probe_zone_runnable(
         // (`ExecutorKick::parking_spare`), so nothing waits there for it.
         return Ok(ZoneProbe::Consumed(scheduler.try_take(registration)?));
     }
+    // Both venues retain their enqueue order in the scheduler. Do not take
+    // the service record until older local host work has had its turn: each
+    // budget preemption otherwise replaces the compute task as a service
+    // ahead of the very fallback row that requested the preemption (#1106).
+    if let Some(record) = zone.runnable_head(slot).map(|head| zone.record_ref(head))
+        && zone.live(record).and_then(|rec| rec.handback())
+            == Some(carrick_el1_abi::Handback::Service)
+        && let Some((thread, generation)) = carrick_kernel::el1_zone::service_key(record)
+        && let Some(running) =
+            scheduler.try_take_before_zone_service(registration, thread, generation)?
+    {
+        return Ok(ZoneProbe::Consumed(Some(running)));
+    }
     if let Some(service) = zone.take_service_head_for_executor(slot) {
         let record = match service {
             carrick_el1_abi::ServiceHead::FirstEntry(custody) => {
