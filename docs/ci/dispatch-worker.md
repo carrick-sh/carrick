@@ -244,7 +244,7 @@ Claude Code session that keeps one subagent per PR. It has two parts:
   the same poll with no decision step. It appends one JSON line per new
   event to the mailbox: `{id, pr, kind, author, url, created_at, head,
   excerpt}`, where `kind` is `comment`, `review`, `review_comment`,
-  `outcome`, `ci_run`, `new_pr`, `quiet_pr` or `needs_closes`. The feed
+  `outcome`, `ci_run`, `ci_job`, `new_pr`, `quiet_pr` or `needs_closes`. The feed
   only reports facts; the session judges them. `ci_run` is any completed
   Actions run on a director or owned PR's current head, whatever its
   conclusion (`dispatch-worker.yml`'s own runs report through outcome
@@ -269,6 +269,21 @@ Claude Code session that keeps one subagent per PR. It has two parts:
   the PR's head SHA, since a fork PR can share the SHA and name its own
   jobs, and an untrusted PR shows no CI, title, branch or closing
   references at all.
+- `ci_job` reports a job that failed, was cancelled or timed out while its
+  run is still in progress (`actions/runs?branch=&status=in_progress`, then
+  the run's jobs), once per job and attempt, for this repository's runs on
+  the PR's head. So a broken build is visible before the whole run and
+  `ci-ok` finish; the run's `ci_run` still follows.
+- Long `wait_events` calls run as Claude Code background tasks (any
+  main-session MCP call over 120 s, `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`,
+  pinned in `start.sh`): the session ends its turn and the task's
+  completion wakes it. A wait lasts up to 25 minutes, under the 30-minute
+  stdio idle abort, or up to an hour when the call carries a
+  `progressToken`, with `notifications/progress` every 5 minutes. Read tools
+  carry `readOnlyHint`, so they can run in parallel. `read_diff` returns at
+  most 40,000 characters, below the 50,000 at which Claude Code saves a
+  result to a file the session can't open. The `pr-watcher` subagents run
+  on Sonnet (owner decision, #231).
 - Events reach the session through the `wait_events` tool, which follows
   the mailbox (`--mailbox`) and returns new lines; the last delivered id is
   kept in `--channel-state`, so a restart doesn't redeliver. With

@@ -236,6 +236,56 @@ pub(super) fn feed_cycle(
                 ));
             }
         }
+        // A job that fails inside a run still going is news now, not when
+        // the whole run (and `ci-ok`) finishes, perhaps an hour later.
+        if director || owned {
+            let branch = pr["head"]["ref"].as_str().unwrap_or_default();
+            for run in gh.active_runs(branch)? {
+                if run["head_sha"] != head
+                    || run["head_repository"]["full_name"] != REPOSITORY
+                    || run["path"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with("dispatch-worker.yml"))
+                {
+                    continue;
+                }
+                let Some(run_id) = run["id"].as_u64() else {
+                    continue;
+                };
+                for job in gh.run_jobs(run_id)? {
+                    let conclusion = job["conclusion"].as_str().unwrap_or_default();
+                    if !matches!(conclusion, "failure" | "cancelled" | "timed_out") {
+                        continue;
+                    }
+                    let id = format!("ci_job:{}:{}", job["id"], run["run_attempt"]);
+                    if memory.seen.contains(&id) {
+                        continue;
+                    }
+                    memory.seen.push(id.clone());
+                    let step = job["steps"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|s| s["conclusion"] == conclusion)
+                        .and_then(|s| s["name"].as_str())
+                        .map(|s| format!(", step \"{s}\""))
+                        .unwrap_or_default();
+                    out.push(line(
+                        id,
+                        "ci_job",
+                        "ci",
+                        job["html_url"].as_str().unwrap_or(url),
+                        job["completed_at"].as_str().unwrap_or(&at),
+                        &format!(
+                            "{} in {} ({}) {conclusion}{step}; the run is still in progress",
+                            job["name"].as_str().unwrap_or("?"),
+                            run["name"].as_str().unwrap_or("?"),
+                            run["event"].as_str().unwrap_or("?"),
+                        ),
+                    ));
+                }
+            }
+        }
         if director {
             let (_, count) = adoption_facts(gh, pr)?;
             if count != Some(1) && !memory.closes_flagged {
@@ -388,24 +438,24 @@ fn schema(props: Value, required: &[&str]) -> Value {
 pub(super) fn tools() -> Value {
     let pr = json!({"type":"integer","description":"PR number"});
     json!([
-        {"name":"read_pr","description":"PR title, body, head, base, labels, CI rollup, closing references, adoptable/owned.",
+        {"name":"read_pr","annotations":{"readOnlyHint":true},"description":"PR title, body, head, base, labels, CI rollup, closing references, adoptable/owned.",
          "inputSchema":schema(json!({"pr":pr}),&["pr"])},
-        {"name":"read_thread","description":"Issue comments, reviews and review comments, newest last.",
+        {"name":"read_thread","annotations":{"readOnlyHint":true},"description":"Issue comments, reviews and review comments, newest last.",
          "inputSchema":schema(json!({"pr":pr,"limit":{"type":"integer","description":"default 30, max 100"}}),&["pr"])},
-        {"name":"read_diff","description":"Unified diff of the PR, truncated to max_bytes.",
-         "inputSchema":schema(json!({"pr":pr,"max_bytes":{"type":"integer","description":"default 60000, max 400000"}}),&["pr"])},
-        {"name":"read_ci","description":"Failing checks and a bounded tail of the failing job logs.",
+        {"name":"read_diff","annotations":{"readOnlyHint":true},"description":"Unified diff of the PR, truncated to max_bytes (at most 40000, below Claude Code's 50000-character result limit).",
+         "inputSchema":schema(json!({"pr":pr,"max_bytes":{"type":"integer","description":"default and max 40000"}}),&["pr"])},
+        {"name":"read_ci","annotations":{"readOnlyHint":true},"description":"Failing checks and a bounded tail of the failing job logs.",
          "inputSchema":schema(json!({"pr":pr}),&["pr"])},
-        {"name":"read_outcomes","description":"Dispatch outcome comments on the PR.",
+        {"name":"read_outcomes","annotations":{"readOnlyHint":true},"description":"Dispatch outcome comments on the PR.",
          "inputSchema":schema(json!({"pr":pr}),&["pr"])},
-        {"name":"read_issue","description":"An issue's title, state, labels and body, plus its latest comments, newest last, when comments is set (the decision log #231 holds the owner's goals and the director lanes).",
+        {"name":"read_issue","annotations":{"readOnlyHint":true},"description":"An issue's title, state, labels and body, plus its latest comments, newest last, when comments is set (the decision log #231 holds the owner's goals and the director lanes).",
          "inputSchema":schema(json!({"n":{"type":"integer","description":"issue number"},"comments":{"type":"integer","description":"latest comments to include, default 0, max 30"}}),&["n"])},
         {"name":"reply","description":"Post a plain-text reply on the PR as the owner, marked as the reactor's. Never a command.",
          "inputSchema":schema(json!({"pr":pr,"text":{"type":"string"}}),&["pr","text"])},
         {"name":"request_round","description":"Post `/agent <brief>` to start one dispatch round. Refused unless the PR is adoptable or owned, no dispatch run is in flight for it, fewer than 4 runs are in flight, no reactor round already ran on this head, and fewer than 3 reactor rounds ran in a row, without an owner comment since.",
          "inputSchema":schema(json!({"pr":pr,"brief":{"type":"string","description":"what the worker should do and how to prove it"}}),&["pr","brief"])},
-        {"name":"wait_events","description":"Wait for the next pull request events from the mailbox and return them as {events:[{id,pr,kind,author,url,created_at,head,excerpt}]}, oldest first. Only owner and dispatch-bot events are returned. An empty list means the wait timed out; call again.",
-         "inputSchema":schema(json!({"timeout_seconds":{"type":"integer","description":"default 540, max 600"},"max_events":{"type":"integer","description":"default 20, max 100"}}),&[])}
+        {"name":"wait_events","description":"Wait for the next pull request events from the mailbox and return them as {events:[{id,pr,kind,author,url,created_at,head,excerpt}]}, oldest first. Only owner and dispatch-bot events are returned. An empty list means the wait timed out; call again. Long waits run in the background: end your turn and act on the task notification.",
+         "inputSchema":schema(json!({"timeout_seconds":{"type":"integer","description":"default 1500; up to 3600 when the call carries a progress token"},"max_events":{"type":"integer","description":"default 20, max 100"}}),&[])}
     ])
 }
 
@@ -604,8 +654,8 @@ impl Server<'_> {
                 let n = arg_u64(args, "pr")?;
                 let max = args["max_bytes"]
                     .as_u64()
-                    .unwrap_or(60_000)
-                    .clamp(1, 400_000) as usize;
+                    .unwrap_or(DIFF_MAX_BYTES)
+                    .clamp(1, DIFF_MAX_BYTES) as usize;
                 let pr = remote
                     .get(&format!("repos/{REPOSITORY}/pulls/{n}"))
                     .map_err(fail)?;
@@ -885,7 +935,7 @@ impl Server<'_> {
     }
 }
 
-const INSTRUCTIONS: &str = "Events from carrick-sh/carrick pull requests come from wait_events (or, when the session loads this server as a channel, as <channel source=\"carrick-reactor\" pr=... kind=... event_id=... author=... head=...> tags), one per event. kind is comment, review, review_comment (owner text), outcome (a dispatch outcome comment), ci_run (a completed GitHub Actions run on the PR's head, any conclusion), new_pr, quiet_pr or needs_closes. Route each event to the PR's own subagent pr-<N>: start it on the PR's first event and resume it with SendMessage after that. Subagents investigate with read_pr, read_thread, read_diff, read_ci, read_outcomes and read_issue, and act only through reply or request_round. When unsure, do nothing.";
+const INSTRUCTIONS: &str = "Events from carrick-sh/carrick pull requests come from wait_events (or, when the session loads this server as a channel, as <channel source=\"carrick-reactor\" pr=... kind=... event_id=... author=... head=...> tags), one per event. A long wait_events call runs in the background: end your turn and act on its task notification. kind is comment, review, review_comment (owner text), outcome (a dispatch outcome comment), ci_run (a completed GitHub Actions run on the PR's head, any conclusion), ci_job (a job that failed, was cancelled or timed out while its run is still in progress), new_pr, quiet_pr or needs_closes. Route each event to the PR's own subagent pr-<N>: start it on the PR's first event and resume it with SendMessage after that. Subagents investigate with read_pr, read_thread, read_diff, read_ci, read_outcomes and read_issue, and act only through reply or request_round. When unsure, do nothing.";
 
 /// Serialized stdout: one lock, one line per JSON-RPC message.
 pub(super) type Out = std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>;
@@ -988,19 +1038,39 @@ impl Follower {
 /// Shared between `serve` and the waits it spawns, so one cursor decides
 /// what has been delivered.
 pub(super) type SharedFollower = std::sync::Arc<std::sync::Mutex<Follower>>;
-const WAIT_DEFAULT_SECONDS: u64 = 540;
-const WAIT_MAX_SECONDS: u64 = 600;
+/// Claude Code saves a tool result over 50,000 characters to a file, which
+/// the reactor session (no file tools) can't open; diffs stay below it.
+const DIFF_MAX_BYTES: u64 = 40_000;
+/// Waits run in the background (Claude Code backgrounds a main-session call
+/// after 120 s), so a long one costs nothing until it answers. Without a
+/// progress token, stay under the 30-minute stdio idle abort; with one,
+/// progress every `WAIT_PROGRESS` resets it.
+const WAIT_DEFAULT_SECONDS: u64 = 1500;
+const WAIT_MAX_SECONDS: u64 = 3600;
+const WAIT_PROGRESS: Duration = Duration::from_secs(300);
 const WAIT_DEFAULT_EVENTS: u64 = 20;
 
 /// Answer one `wait_events` call on its own thread: block until the follower
 /// has events or the timeout passes. Running beside `serve` keeps the PR
 /// subagents' tool calls, which share this connection, from queueing behind
 /// a long wait.
-fn spawn_wait(follower: SharedFollower, out: Out, id: Value, args: &Value) {
+fn spawn_wait(
+    follower: SharedFollower,
+    out: Out,
+    id: Value,
+    args: &Value,
+    progress: Option<Value>,
+    every: Duration,
+) {
+    let cap = if progress.is_some() {
+        WAIT_MAX_SECONDS
+    } else {
+        WAIT_DEFAULT_SECONDS
+    };
     let seconds = args["timeout_seconds"]
         .as_u64()
         .unwrap_or(WAIT_DEFAULT_SECONDS)
-        .min(WAIT_MAX_SECONDS);
+        .min(cap);
     let max = usize::try_from(
         args["max_events"]
             .as_u64()
@@ -1009,8 +1079,21 @@ fn spawn_wait(follower: SharedFollower, out: Out, id: Value, args: &Value) {
     )
     .unwrap_or(20);
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(seconds);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(seconds);
+        let mut next_progress = started + every;
         let (text, error) = loop {
+            if let Some(token) = &progress
+                && Instant::now() >= next_progress
+            {
+                next_progress += every;
+                let note = json!({"jsonrpc":"2.0","method":"notifications/progress","params":{
+                    "progressToken":token,"progress":started.elapsed().as_secs_f64(),
+                    "total":seconds,"message":"waiting for pull request events"}});
+                if let Err(e) = send(&out, &note) {
+                    eprintln!("reactor mcp: wait_events progress failed: {e}");
+                }
+            }
             let taken = follower
                 .lock()
                 .map_err(|_| ScalerError::Guard("mailbox follower lock poisoned"))
@@ -1019,7 +1102,7 @@ fn spawn_wait(follower: SharedFollower, out: Out, id: Value, args: &Value) {
                 Ok(events) if !events.is_empty() || Instant::now() >= deadline => {
                     break (json!({ "events": events }).to_string(), false);
                 }
-                Ok(_) => std::thread::sleep(Duration::from_secs(1)),
+                Ok(_) => std::thread::sleep(every.min(Duration::from_secs(1))),
                 Err(e) => break (format!("mailbox read failed: {e}"), true),
             }
         };
@@ -1036,7 +1119,10 @@ fn spawn_wait(follower: SharedFollower, out: Out, id: Value, args: &Value) {
 pub(super) fn notification(event: &Value) -> Option<Value> {
     let kind = event["kind"].as_str()?;
     let author = event["author"].as_str().unwrap_or("?");
-    let synthetic = matches!(kind, "ci_run" | "new_pr" | "quiet_pr" | "needs_closes");
+    let synthetic = matches!(
+        kind,
+        "ci_run" | "ci_job" | "new_pr" | "quiet_pr" | "needs_closes"
+    );
     let kind_of = if author.ends_with("[bot]") {
         "Bot"
     } else {
@@ -1097,6 +1183,8 @@ pub(super) fn serve(
                 out.clone(),
                 id.clone(),
                 &msg["params"]["arguments"],
+                msg["params"]["_meta"].get("progressToken").cloned(),
+                WAIT_PROGRESS,
             );
             continue;
         }
@@ -1180,6 +1268,92 @@ mod tests {
             "head_sha":sha,"head_branch":"work/feed","head_repository":{"full_name":REPOSITORY},
             "conclusion":conclusion,"updated_at":"2026-10-30T23:58:00Z",
             "html_url":format!("https://github.com/{REPOSITORY}/actions/runs/{id}")})
+    }
+
+    /// #1244: a job that fails while its run is still going is an event
+    /// now, once, only for this repository's runs on the PR's head.
+    #[test]
+    fn dispatch_reactor_feed_reports_failed_jobs_before_the_run_ends() {
+        let mut fake = gh(vec![pr(20, "work/feed")], vec![]);
+        fake.facts = vec![json!({"number":20,"commits":{"nodes":[{"commit":{
+            "committedDate":"2026-10-31T00:00:00Z","statusCheckRollup":{"state":"PENDING"}}}]}})];
+        let active = |id: u64, sha: &str| {
+            let mut run = workflow_run(id, sha, "", ".github/workflows/ci.yml");
+            run["conclusion"] = Value::Null;
+            run["status"] = json!("in_progress");
+            run
+        };
+        let mut fork = active(201, SHA);
+        fork["head_repository"]["full_name"] = json!("mallory/carrick");
+        fake.active_runs = vec![active(200, SHA), fork, active(202, "feedface"), {
+            let mut d = active(203, SHA);
+            d["path"] = json!(".github/workflows/dispatch-worker.yml");
+            d
+        }];
+        let job = |id: u64, name: &str, conclusion: Value| {
+            json!({"id":id,"name":name,"conclusion":conclusion,"completed_at":"2026-10-31T00:01:00Z",
+                "html_url":format!("https://github.com/{REPOSITORY}/actions/runs/200/job/{id}"),
+                "steps":[{"name":"checkout","conclusion":"success"},{"name":"cargo build","conclusion":"failure"}]})
+        };
+        fake.jobs.insert(
+            200,
+            vec![
+                job(1, "linux-build", json!("failure")),
+                job(2, "fmt", json!("success")),
+                job(3, "macos", Value::Null),
+            ],
+        );
+        for id in [201, 202, 203] {
+            fake.jobs
+                .insert(id, vec![job(10 + id, "other", json!("failure"))]);
+        }
+        let mut state = FeedState::default();
+        let jobs: Vec<Value> = feed_cycle(&mut fake, &mut state, NOW)
+            .unwrap()
+            .into_iter()
+            .filter(|l| l["kind"] == "ci_job")
+            .collect();
+        assert_eq!(jobs.len(), 1, "{jobs:#?}");
+        assert_eq!(jobs[0]["id"], "ci_job:1:1");
+        assert_eq!(
+            jobs[0]["excerpt"],
+            "linux-build in ci (pull_request) failure, step \"cargo build\"; the run is still in progress"
+        );
+        // Seen once: the next cycle doesn't repeat it.
+        let again = feed_cycle(&mut fake, &mut state, NOW).unwrap();
+        assert!(again.iter().all(|l| l["kind"] != "ci_job"), "{again:#?}");
+        // And the session sees it: ci_job is a feed-made kind.
+        assert!(notification(&jobs[0]).is_some());
+    }
+
+    #[test]
+    fn dispatch_reactor_mcp_read_tools_are_read_only_and_diffs_fit_a_result() {
+        let tools = tools();
+        for tool in tools.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"] == true,
+                name.starts_with("read_"),
+                "{name}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("s.json");
+        let mut fake = remote();
+        fake.diff = "d".repeat(100_000);
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "read_diff",
+            json!({"pr":30,"max_bytes":400000}),
+        );
+        assert!(!err, "{text}");
+        assert!(text.chars().count() < 50_000, "{}", text.len());
+        assert!(
+            text.ends_with("[truncated at 40000 of 100000 bytes]"),
+            "{}",
+            &text[text.len() - 60..]
+        );
     }
 
     #[test]
@@ -1298,6 +1472,7 @@ mod tests {
         closing: Vec<u64>,
         runs: Vec<Value>,
         posted: Vec<(u64, String)>,
+        diff: String,
         /// `statusCheckRollup` entries, and Actions runs by id.
         checks: Vec<Value>,
         workflow_runs: BTreeMap<u64, Value>,
@@ -1328,6 +1503,9 @@ mod tests {
                 .push(args.iter().map(|a| (*a).to_owned()).collect());
             if args.first() == Some(&"run") {
                 return Ok(format!("log of run {}", args[2]));
+            }
+            if args.get(1) == Some(&"diff") {
+                return Ok(self.diff.clone());
             }
             Ok(json!({"statusCheckRollup":self.checks}).to_string())
         }
@@ -1890,6 +2068,57 @@ mod tests {
             "comment:3"
         );
         assert_eq!(Follower::new(mailbox, delivered).poll(&out).unwrap(), 0);
+    }
+
+    /// #1244: a long wait reports progress when the call carries a token,
+    /// so Claude Code's idle timer never aborts it; without a token it
+    /// stays silent.
+    #[test]
+    fn dispatch_reactor_mcp_wait_events_reports_progress_with_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = dir.path().join("mailbox.jsonl");
+        std::fs::write(&mailbox, "").unwrap();
+        let wait = |token: Option<Value>| {
+            let buffer = Buffer::default();
+            let out: Out = std::sync::Arc::new(std::sync::Mutex::new(Box::new(buffer.clone())));
+            let follower: SharedFollower = std::sync::Arc::new(std::sync::Mutex::new(
+                Follower::new(mailbox.clone(), dir.path().join("delivered.json")),
+            ));
+            spawn_wait(
+                follower,
+                out,
+                json!(7),
+                &json!({"timeout_seconds":1}),
+                token,
+                Duration::from_millis(100),
+            );
+            let start = Instant::now();
+            while !buffer.lines().iter().any(|l| l["id"] == 7)
+                && start.elapsed() < Duration::from_secs(10)
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            buffer.lines()
+        };
+        let lines = wait(Some(json!("tok-1")));
+        let progress: Vec<&Value> = lines
+            .iter()
+            .filter(|l| l["method"] == "notifications/progress")
+            .collect();
+        assert!(progress.len() >= 5, "{lines:#?}");
+        assert!(
+            progress
+                .iter()
+                .all(|p| p["params"]["progressToken"] == "tok-1")
+        );
+        assert_eq!(lines.last().unwrap()["id"], 7, "the reply comes last");
+        let quiet = wait(None);
+        assert!(
+            quiet
+                .iter()
+                .all(|l| l["method"] != "notifications/progress"),
+            "{quiet:#?}"
+        );
     }
 
     #[test]
