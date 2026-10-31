@@ -238,14 +238,18 @@ impl Ledger {
         now: u64,
         limit: Concurrency,
     ) -> Result<Record, ScalerError> {
-        self.reserve_lane(key, inventory, now, limit, CloneLane::Kvm)
+        let budget = CloneBudget {
+            kvm: limit,
+            agents: AgentClones::DEFAULT,
+        };
+        self.reserve_lane(key, inventory, now, budget, CloneLane::Kvm)
     }
     pub fn reserve_lane(
         &mut self,
         key: JobKey,
         inventory: &[PoolMember],
         now: u64,
-        limit: Concurrency,
+        budget: CloneBudget,
         lane: CloneLane,
     ) -> Result<Record, ScalerError> {
         assignment::supersession_capacity(&self.superseded)?;
@@ -269,10 +273,7 @@ impl Ledger {
                 "clone budget occupied by an unknown pool object",
             ));
         }
-        let lane_limit = match lane {
-            CloneLane::Kvm => usize::from(limit.get()),
-            CloneLane::Agent => 4,
-        };
+        let lane_limit = budget.of(lane);
         if active.iter().filter(|r| r.lane == lane).count() >= lane_limit {
             return Err(ScalerError::Guard("clone concurrency budget occupied"));
         }
@@ -453,6 +454,52 @@ fn save_json(value: &impl Serialize, path: &Path) -> Result<(), ScalerError> {
     file.persist(path).map_err(|e| ScalerError::Io(e.error))?;
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+/// Concurrent dispatch-agent clones on the standing controller (#1251): 4
+/// by default, 1 to 8. Agent clones idle mostly on model calls; the CPU and
+/// memory admission checks still gate each one.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct AgentClones(u8);
+impl AgentClones {
+    pub const DEFAULT: Self = Self(4);
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+impl TryFrom<u8> for AgentClones {
+    type Error = ScalerError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if (1..=8).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(ScalerError::Guard("max agent clones must be 1 to 8"))
+        }
+    }
+}
+impl std::str::FromStr for AgentClones {
+    type Err = ScalerError;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let value = text
+            .parse::<u8>()
+            .map_err(|_| ScalerError::Guard("max agent clones must be 1 to 8"))?;
+        Self::try_from(value)
+    }
+}
+
+/// Per-lane clone budgets: KVM clones and dispatch-agent clones.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct CloneBudget {
+    pub kvm: Concurrency,
+    pub agents: AgentClones,
+}
+impl CloneBudget {
+    pub fn of(self, lane: CloneLane) -> usize {
+        match lane {
+            CloneLane::Kvm => usize::from(self.kvm.get()),
+            CloneLane::Agent => usize::from(self.agents.get()),
+        }
+    }
 }
 
 /// Concurrent clone (or Mac runner) budget: 1 by default, never above 2.
@@ -939,6 +986,9 @@ pub enum ScalerAction {
         /// Concurrent clones, 1 (default) or 2.
         #[arg(long, default_value = "1")]
         max_concurrency: Concurrency,
+        /// Concurrent dispatch-agent clones (Contabo only), 1 to 8.
+        #[arg(long, default_value = "4")]
+        max_agent_clones: AgentClones,
     },
     /// Director-Mac controller for cloudmac: mint one JIT config per queued
     /// carrick-hvf job and feed it to one runner over SSH stdin.
@@ -1156,18 +1206,25 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             &state_dir,
             runner_group_id,
             one_job,
-            Concurrency::ONE,
+            CloneBudget {
+                kvm: Concurrency::ONE,
+                agents: AgentClones::DEFAULT,
+            },
         ),
         ScalerAction::Standing {
             state_dir,
             runner_group_id,
             max_concurrency,
+            max_agent_clones,
         } => live::controller(
             &Admission::Standing,
             &state_dir,
             runner_group_id,
             false,
-            max_concurrency,
+            CloneBudget {
+                kvm: max_concurrency,
+                agents: max_agent_clones,
+            },
         ),
         ScalerAction::MacJit {
             host,

@@ -1830,9 +1830,9 @@ pub(super) fn controller(
     dir: &Path,
     group: u64,
     one_job: bool,
-    limit: Concurrency,
+    budget: CloneBudget,
 ) -> Result<(), ScalerError> {
-    if matches!(admission, Admission::Pilot { .. }) && limit != Concurrency::ONE {
+    if matches!(admission, Admission::Pilot { .. }) && budget.kvm != Concurrency::ONE {
         return Err(ScalerError::Guard("the pilot admission is one clone only"));
     }
     let pve = Pve::local()?;
@@ -1934,7 +1934,13 @@ pub(super) fn controller(
             .filter(|r| r.state != State::Destroyed)
             .count();
         if !frozen
-            && active < usize::from(limit.get()) + if agents { 4 } else { 0 }
+            && active
+                < budget.of(CloneLane::Kvm)
+                    + if agents {
+                        budget.of(CloneLane::Agent)
+                    } else {
+                        0
+                    }
             && Instant::now() >= admit_after
         {
             match demand.and_then(|demand| {
@@ -1945,7 +1951,7 @@ pub(super) fn controller(
                     dir,
                     &path,
                     (group, admission, demand),
-                    limit,
+                    budget,
                 )
             }) {
                 Ok(()) => backoff.reset(),
@@ -1992,7 +1998,7 @@ fn reserve_admitted_clone(
     ledger: &mut Ledger,
     path: &Path,
     job: JobKey,
-    capacity: (Concurrency, CloneLane),
+    capacity: (CloneBudget, CloneLane),
     admit: impl FnOnce() -> Result<bool, ScalerError>,
     inventory: impl FnOnce() -> Result<Vec<PoolMember>, ScalerError>,
 ) -> Result<Option<Record>, ScalerError> {
@@ -2016,7 +2022,7 @@ fn admit_one(
     dir: &Path,
     path: &Path,
     demand: (u64, &Admission, Vec<JobKey>),
-    limit: Concurrency,
+    budget: CloneBudget,
 ) -> Result<(), ScalerError> {
     let (group, original_admission, kvm_demand) = demand;
     let agents = pve.site.node == site::CONTABO.node
@@ -2027,11 +2033,7 @@ fn admit_one(
         if lane == CloneLane::Agent && !agents {
             continue;
         }
-        let cap = if lane == CloneLane::Agent {
-            4
-        } else {
-            usize::from(limit.get())
-        };
+        let cap = budget.of(lane);
         if ledger
             .rows
             .iter()
@@ -2070,7 +2072,7 @@ fn admit_one(
         ledger,
         path,
         job,
-        (limit, lane),
+        (budget, lane),
         || {
             gh.vet(admission, job)?;
             match resource_admission(pve) {
@@ -2100,6 +2102,75 @@ mod security_tests;
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    /// #1251: the agent lane reserves up to `--max-agent-clones`, then
+    /// refuses; the KVM lane keeps its own budget; out-of-range caps fail.
+    #[test]
+    fn the_agent_clone_budget_is_the_configured_cap() {
+        assert!("0".parse::<AgentClones>().is_err());
+        assert!("9".parse::<AgentClones>().is_err());
+        assert_eq!("6".parse::<AgentClones>().unwrap().get(), 6);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ledger.json");
+        let budget = CloneBudget {
+            kvm: Concurrency::try_from(2).unwrap(),
+            agents: "6".parse().unwrap(),
+        };
+        let mut ledger = Ledger::default();
+        let job = |n: u64| JobKey {
+            run: RunId(10),
+            attempt: 1,
+            job: JobId(n),
+        };
+        for n in 0..6 {
+            let row = reserve_admitted_clone(
+                &mut ledger,
+                &path,
+                job(n),
+                (budget, CloneLane::Agent),
+                || Ok(true),
+                || Ok(Vec::new()),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(row.lane, CloneLane::Agent);
+        }
+        let seventh = reserve_admitted_clone(
+            &mut ledger,
+            &path,
+            job(6),
+            (budget, CloneLane::Agent),
+            || Ok(true),
+            || Ok(Vec::new()),
+        );
+        assert!(matches!(
+            seventh,
+            Err(ScalerError::Guard("clone concurrency budget occupied"))
+        ));
+        // The KVM lane is budgeted on its own.
+        for n in 7..9 {
+            reserve_admitted_clone(
+                &mut ledger,
+                &path,
+                job(n),
+                (budget, CloneLane::Kvm),
+                || Ok(true),
+                || Ok(Vec::new()),
+            )
+            .unwrap()
+            .unwrap();
+        }
+        assert!(
+            reserve_admitted_clone(
+                &mut ledger,
+                &path,
+                job(9),
+                (budget, CloneLane::Kvm),
+                || Ok(true),
+                || Ok(Vec::new()),
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn admit_early_returns_never_reserve() {
         let temp = tempfile::tempdir().unwrap();
@@ -2117,7 +2188,13 @@ mod tests {
             &mut ledger,
             &path,
             job,
-            (Concurrency::ONE, CloneLane::Kvm),
+            (
+                CloneBudget {
+                    kvm: Concurrency::ONE,
+                    agents: AgentClones::DEFAULT,
+                },
+                CloneLane::Kvm,
+            ),
             || Ok(false),
             || panic!("inventory must not be queried when resource_admission is false"),
         )
@@ -2130,7 +2207,13 @@ mod tests {
             &mut ledger,
             &path,
             job,
-            (Concurrency::ONE, CloneLane::Kvm),
+            (
+                CloneBudget {
+                    kvm: Concurrency::ONE,
+                    agents: AgentClones::DEFAULT,
+                },
+                CloneLane::Kvm,
+            ),
             || Ok(true),
             || Ok(Vec::new()),
         )
@@ -2143,7 +2226,13 @@ mod tests {
             &mut ledger,
             &path,
             job,
-            (Concurrency::ONE, CloneLane::Kvm),
+            (
+                CloneBudget {
+                    kvm: Concurrency::ONE,
+                    agents: AgentClones::DEFAULT,
+                },
+                CloneLane::Kvm,
+            ),
             || Ok(true),
             || Ok(Vec::new()),
         )

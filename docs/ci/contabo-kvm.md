@@ -33,9 +33,12 @@ adversarial isolation boundary.
 Selection is by `/etc/hostname` and fails closed: an unknown host is refused,
 never treated as Willow. Both sites use pool `carrick-ci`, template VMID 300
 and clone VMIDs 308-349. Willow keeps `--max-concurrency 1`. Contabo runs
-`--max-concurrency 2` (owner, 2026-10-31, #1209): two KVM clones beside the
-four agent clones, 48 vCPU and 112 GiB at most on a 48-thread, 125 GiB host,
-now that the static agent workers are destroyed. Every clone, in either lane,
+`--max-concurrency 2` (owner, 2026-10-31, #1209) and `--max-agent-clones 6`
+(#1251; 1 to 8, default 4): two KVM clones (8 vCPU, 16 GiB each) beside up
+to six agent clones (8 vCPU, 20 GiB each), 64 vCPU and 152 GiB nominal on a
+48-thread, 125 GiB host. That is overcommitted on paper: agent clones idle
+mostly on model calls, and admission reads live CPU and `MemAvailable`, so a
+busy or memory-tight host defers the next clone. Every clone, in either lane,
 still passes the 80% projected-CPU and memory admission checks, which defer a
 clone on a busy host; they are not cross-VM isolation.
 Each VM serializes its own builds, gates and oracle phases with a local lease.
@@ -175,7 +178,7 @@ LoadCredentialEncrypted=gh-token:/etc/credstore.encrypted/carrick-ci-gh-token
 LoadCredentialEncrypted=dispatch-app-key:/etc/credstore.encrypted/carrick-dispatch-app-key
 Environment=PATH=/root/carrick-ci/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # `$$` passes `$` to the shell; systemd would otherwise substitute it.
-ExecStart=/bin/sh -c 'GH_TOKEN=$$(cat "$${CREDENTIALS_DIRECTORY}/gh-token"); export GH_TOKEN; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1 --max-concurrency 2'
+ExecStart=/bin/sh -c 'GH_TOKEN=$$(cat "$${CREDENTIALS_DIRECTORY}/gh-token"); export GH_TOKEN; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1 --max-concurrency 2 --max-agent-clones 6'
 Restart=on-failure
 RestartSec=60
 
