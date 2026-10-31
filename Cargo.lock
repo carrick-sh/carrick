@@ -1038,7 +1038,9 @@ dependencies = [
 name = "carrick-softcpu-x86"
 version = "0.1.0"
 dependencies = [
+ "carrick-hal",
  "carrick-softmmu",
+ "carrick-x86",
  "goblin",
  "iced-x86",
  "libc",

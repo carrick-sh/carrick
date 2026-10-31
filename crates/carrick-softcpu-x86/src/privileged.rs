@@ -11,9 +11,7 @@
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use crate::cflow::compute_effective_va;
-use crate::context::{
-    DescriptorTablePtr, SoftCpuContext, SoftSegment, X86Exception, reg,
-};
+use crate::context::{DescriptorTablePtr, SoftCpuContext, SoftSegment, X86Exception, reg};
 use crate::cpuid::GuestCpuidView;
 use crate::decode::{SensitiveOp, gpr_index};
 use crate::mmu::{
@@ -28,6 +26,8 @@ const CR0_WP: u64 = 1 << 16;
 const CR0_NW: u64 = 1 << 29;
 const CR0_CD: u64 = 1 << 30;
 const CR0_PG: u64 = 1 << 31;
+// SDM Vol. 3A §2.5: bits [15:6], [17], and [28:19] in CR0[31:0] are reserved zero.
+const CR0_WRITABLE_MASK: u64 = 0xe005_003f;
 
 const CR4_DE: u64 = 1 << 3;
 const CR4_PAE: u64 = 1 << 5;
@@ -39,10 +39,10 @@ const CR4_PCIDE: u64 = 1 << 17;
 const CR4_OSXSAVE: u64 = 1 << 18;
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
-const CR4_UNSUPPORTED_MASK: u64 =
-    (0x7 << 13) | (1 << 19) | (0x3ff << 22) | 0xffff_ffff_0000_0000;
+const CR4_UNSUPPORTED_MASK: u64 = (0x7 << 13) | (1 << 19) | (0x3ff << 22) | 0xffff_ffff_0000_0000;
 
 const RFLAGS_IF: u64 = 1 << 9;
+const RFLAGS_NT: u64 = 1 << 14;
 const RFLAGS_RF: u64 = 1 << 16;
 const RFLAGS_VM: u64 = 1 << 17;
 const RFLAGS_AC: u64 = 1 << 18;
@@ -243,14 +243,13 @@ fn emulate_mov_to_cr(
                 return Err(X86Exception::general_protection(va, 0));
             }
             let long_mode_active = (ctx.efer & EFER_LMA) != 0;
-            if !pg && ((long_mode_active && ctx.cs.is_64bit_code()) || (ctx.cr4 & CR4_PCIDE) != 0)
-            {
+            if !pg && ((long_mode_active && ctx.cs.is_64bit_code()) || (ctx.cr4 & CR4_PCIDE) != 0) {
                 return Err(X86Exception::general_protection(va, 0));
             }
             if !pe && long_mode_active {
                 return Err(X86Exception::general_protection(va, 0));
             }
-            let next = val | CR0_ET;
+            let next = (val & CR0_WRITABLE_MASK) | CR0_ET;
             let tlb_sensitive = CR0_PG | CR0_WP | CR0_NW | CR0_CD;
             let flush = (ctx.cr0 & tlb_sensitive) != (next & tlb_sensitive);
             ctx.cr0 = next;
@@ -610,8 +609,8 @@ fn emulate_ltr<M: SoftMmuMemory>(
     }
     let raw_sel = match raw.op0_kind() {
         OpKind::Register => {
-            let idx = gpr_index(raw.op0_register())
-                .ok_or_else(|| X86Exception::invalid_opcode(va))?;
+            let idx =
+                gpr_index(raw.op0_register()).ok_or_else(|| X86Exception::invalid_opcode(va))?;
             (ctx.gpr[idx] & 0xffff) as u16
         }
         OpKind::Memory => {
@@ -627,15 +626,16 @@ fn emulate_ltr<M: SoftMmuMemory>(
         _ => return Err(X86Exception::invalid_opcode(va)),
     };
 
-    let idx = raw_sel >> 3;
-    if idx == 0 {
+    // SDM Vol. 2A `LTR`: only Index=0 && TI=0 (`0x0000..=0x0003`) is a null selector (#GP(0));
+    // TI=1 (LDT, including `0x0004`) raises #GP(selector & 0xfffc).
+    if (raw_sel & 0xfffc) == 0 {
         return Err(X86Exception::general_protection(va, 0));
     }
     let sel_err = u32::from(raw_sel & 0xfffc);
-    // SDM Vol. 2A `LTR` 64-Bit Mode: TI=1 (LDT) raises #GP(selector).
     if (raw_sel & 4) != 0 {
         return Err(X86Exception::general_protection(va, sel_err));
     }
+    let idx = raw_sel >> 3;
     let offset = u64::from(idx) * 8;
     if offset.saturating_add(15) > u64::from(ctx.gdtr.limit) {
         return Err(X86Exception::general_protection(va, sel_err));
@@ -672,9 +672,17 @@ fn emulate_ltr<M: SoftMmuMemory>(
     let typ = ((low >> 40) & 0xf) as u8;
     let s = ((low >> 44) & 1) != 0;
     let p = ((low >> 47) & 1) != 0;
-    // SDM Vol. 3A §7.2.3: 64-bit Available TSS requires S=0, Type=0x9, and bits [12:8] of upper dword == 0.
+    let raw_limit = ((low & 0xffff) | (((low >> 48) & 0xf) << 16)) as u32;
+    let g = ((low >> 55) & 1) != 0;
+    let limit = if g {
+        (raw_limit << 12) | 0xfff
+    } else {
+        raw_limit
+    };
+    // SDM Vol. 3A §7.2.2/§7.2.3: 64-bit Available TSS requires S=0, Type=0x9,
+    // upper dword bits [12:8] == 0, and byte limit >= 0x67 (104-byte TSS64).
     let upper_dword_zero_field = (high >> 40) & 0x1f;
-    if s || typ != 0x9 || upper_dword_zero_field != 0 {
+    if s || typ != 0x9 || upper_dword_zero_field != 0 || limit < 0x67 {
         return Err(X86Exception::general_protection(va, sel_err));
     }
     let base = ((low >> 16) & 0xffff)
@@ -693,13 +701,6 @@ fn emulate_ltr<M: SoftMmuMemory>(
     write_system_bytes(ctx, mem, desc_va, &busy_low.to_le_bytes())
         .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
 
-    let raw_limit = ((low & 0xffff) | (((low >> 48) & 0xf) << 16)) as u32;
-    let g = ((low >> 55) & 1) != 0;
-    let limit = if g {
-        (raw_limit << 12) | 0xfff
-    } else {
-        raw_limit
-    };
     let ar = (((busy_low >> 40) & 0xff) as u32) | ((((busy_low >> 52) & 0xf) as u32) << 12);
     ctx.tr = SoftSegment {
         selector: raw_sel,
@@ -711,11 +712,7 @@ fn emulate_ltr<M: SoftMmuMemory>(
     Ok(resume)
 }
 
-fn emulate_swapgs(
-    ctx: &mut SoftCpuContext,
-    va: u64,
-    resume: u64,
-) -> Result<u64, X86Exception> {
+fn emulate_swapgs(ctx: &mut SoftCpuContext, va: u64, resume: u64) -> Result<u64, X86Exception> {
     if ctx.cpl != 0 {
         return Err(X86Exception::general_protection(va, 0));
     }
@@ -785,6 +782,10 @@ fn emulate_iret<M: SoftMmuMemory>(
         Mnemonic::Iret => 2usize,
         _ => return Err(X86Exception::invalid_opcode(va)),
     };
+    // SDM Vol. 2A `IRET/IRETD/IRETQ` IA-32e-Mode: RFLAGS.NT == 1 raises #GP(0) before popping the stack.
+    if (ctx.rflags & RFLAGS_NT) != 0 {
+        return Err(X86Exception::general_protection(va, 0));
+    }
     let frame_bytes = slot * 5;
     let rsp = ctx.gpr[reg::RSP];
     if !is_canonical_va(rsp) || !is_canonical_va(rsp.wrapping_add((frame_bytes - 1) as u64)) {
@@ -792,8 +793,14 @@ fn emulate_iret<M: SoftMmuMemory>(
     }
 
     let mut frame = [0u8; 40];
-    read_guest_bytes(ctx, mem, rsp, &mut frame[..frame_bytes], SoftAccessKind::Read)
-        .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+    read_guest_bytes(
+        ctx,
+        mem,
+        rsp,
+        &mut frame[..frame_bytes],
+        SoftAccessKind::Read,
+    )
+    .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
 
     let read_slot = |index: usize| -> u64 {
         let base = index * slot;
@@ -902,11 +909,7 @@ fn emulate_iret<M: SoftMmuMemory>(
     // 5. Commit RFLAGS according to old CPL / IOPL rules (SDM Vol. 2A `IRET`).
     let old_cpl = ctx.cpl;
     let iopl = ((ctx.rflags >> 12) & 3) as u8;
-    let mut mask: u64 = if slot == 2 {
-        0x4dd5
-    } else {
-        0x0025_4dd5
-    };
+    let mut mask: u64 = if slot == 2 { 0x4dd5 } else { 0x0025_4dd5 };
     if old_cpl <= iopl {
         mask |= RFLAGS_IF;
     }
@@ -1003,11 +1006,7 @@ fn emulate_clac_stac(
     set_ac: bool,
 ) -> Result<u64, X86Exception> {
     // SDM Vol. 2A `CLAC`/`STAC`: #UD when CPL > 0, SMAP unsupported, or prefixed with F2/F3/66/LOCK.
-    if ctx.cpl != 0
-        || !cpuid.supports_smap()
-        || raw.has_rep_prefix()
-        || raw.has_repne_prefix()
-    {
+    if ctx.cpl != 0 || !cpuid.supports_smap() || raw.has_rep_prefix() || raw.has_repne_prefix() {
         return Err(X86Exception::invalid_opcode(va));
     }
     if set_ac {
@@ -1020,11 +1019,7 @@ fn emulate_clac_stac(
     Ok(resume)
 }
 
-fn emulate_xgetbv(
-    ctx: &mut SoftCpuContext,
-    va: u64,
-    resume: u64,
-) -> Result<u64, X86Exception> {
+fn emulate_xgetbv(ctx: &mut SoftCpuContext, va: u64, resume: u64) -> Result<u64, X86Exception> {
     if (ctx.cr4 & CR4_OSXSAVE) == 0 {
         return Err(X86Exception::invalid_opcode(va));
     }

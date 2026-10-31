@@ -27,13 +27,6 @@ pub use cpuid::{Cpl0CpuidView, CpuidRegs, GuestCpuidView, Level0CpuidView};
 pub use decode::{CflowKind, DecodedInsn, InsnClass, SensitiveOp, classify, gpr_index};
 pub use emit::{EmitError, EmittedBlock, JitStage, emit_block};
 pub use machine::{SoftMachine, SoftMachineExit};
-pub use msr::{
-    DEFAULT_IA32_APIC_BASE, DEFAULT_IA32_PAT, EFER_LMA, EFER_LME, EFER_NXE, EFER_SCE,
-    EFER_VALID_MASK, MSR_IA32_APIC_BASE, MSR_IA32_CSTAR, MSR_IA32_EFER, MSR_IA32_FMASK,
-    MSR_IA32_FS_BASE, MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE, MSR_IA32_LSTAR,
-    MSR_IA32_MISC_ENABLE, MSR_IA32_PAT, MSR_IA32_SFMASK, MSR_IA32_STAR, MSR_IA32_TSC,
-    MSR_IA32_TSC_DEADLINE, MsrCapabilities, MsrError, MsrFile, MsrIndex, MsrWriteEffects,
-};
 pub use mmu::{
     Access, AuthenticatedDescriptorWords, AuthenticatedGpa, Cpl, CpuAccessMode, DescriptorRefusal,
     DomainCompletion, ExtentEditError, ExtentRecord, ExtentTable, FrameGpa, GuestVa, HostVa,
@@ -47,4 +40,11 @@ pub use mmu::{
     SoftTlbEntry, SoftTlbPlane, SoftTlbStats, SoftTranslationError, SoftVcpuSeat, SoftWalker,
     Stage1Gpa, WalkOutcome, cpu_access_mode, is_canonical_va, read_guest_bytes, tlb_tag_mode_bits,
     translate_va, translate_with_frame, write_guest_bytes,
+};
+pub use msr::{
+    DEFAULT_IA32_APIC_BASE, DEFAULT_IA32_PAT, EFER_LMA, EFER_LME, EFER_NXE, EFER_SCE,
+    EFER_VALID_MASK, MSR_IA32_APIC_BASE, MSR_IA32_CSTAR, MSR_IA32_EFER, MSR_IA32_FMASK,
+    MSR_IA32_FS_BASE, MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE, MSR_IA32_LSTAR,
+    MSR_IA32_MISC_ENABLE, MSR_IA32_PAT, MSR_IA32_SFMASK, MSR_IA32_STAR, MSR_IA32_TSC,
+    MSR_IA32_TSC_DEADLINE, MsrCapabilities, MsrError, MsrFile, MsrIndex, MsrWriteEffects,
 };
