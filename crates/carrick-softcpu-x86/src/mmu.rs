@@ -131,9 +131,19 @@ fn walk_with_frame<M: SoftMmuMemory>(
     va: u64,
     kind: SoftAccessKind,
 ) -> Result<(*mut u8, AuthenticatedGpa), SoftPageFault> {
+    let mode = access.access_mode();
+    walk_with_frame_mode(access, mem, va, kind, mode)
+}
+
+fn walk_with_frame_mode<M: SoftMmuMemory>(
+    access: &mut HostAccess<'_>,
+    mem: &mut M,
+    va: u64,
+    kind: SoftAccessKind,
+    mode: CpuAccessMode,
+) -> Result<(*mut u8, AuthenticatedGpa), SoftPageFault> {
     let ctx = access.context_mut();
     let root = ctx.root_gpa().ok_or(SoftPageFault::new(va, 0))?;
-    let mode = ctx.access_mode();
     match ctx
         .walker
         .walk_and_fill(mem, &mut ctx.tlb, root, GuestVa::new(va), kind, mode)
@@ -170,16 +180,17 @@ pub fn translate_va<M: SoftMmuMemory>(
     kind: SoftAccessKind,
 ) -> Result<*mut u8, SoftPageFault> {
     let mut access = admit(ctx, mem, va)?;
-    probe_or_walk(&mut access, mem, va, kind)
+    let mode = access.access_mode();
+    probe_or_walk_mode(&mut access, mem, va, kind, mode)
 }
 
-fn probe_or_walk<M: SoftMmuMemory>(
+fn probe_or_walk_mode<M: SoftMmuMemory>(
     access: &mut HostAccess<'_>,
     mem: &mut M,
     va: u64,
     kind: SoftAccessKind,
+    mode: CpuAccessMode,
 ) -> Result<*mut u8, SoftPageFault> {
-    let mode = access.access_mode();
     if let Some(host_addr) = access
         .context_mut()
         .tlb
@@ -187,7 +198,7 @@ fn probe_or_walk<M: SoftMmuMemory>(
     {
         return Ok(host_addr as *mut u8);
     }
-    walk_with_frame(access, mem, va, kind).map(|(ptr, _)| ptr)
+    walk_with_frame_mode(access, mem, va, kind, mode).map(|(ptr, _)| ptr)
 }
 
 /// Read `dst.len()` bytes starting at guest `va`, pre-validating all spanned pages.
@@ -198,7 +209,8 @@ pub fn read_guest_bytes<M: SoftMmuMemory>(
     dst: &mut [u8],
     kind: SoftAccessKind,
 ) -> Result<(), SoftPageFault> {
-    walk_span(ctx, mem, va, dst.len(), kind, |off, ptr, chunk| {
+    let mode = ctx.access_mode();
+    walk_span_mode(ctx, mem, va, dst.len(), kind, mode, |off, ptr, chunk| {
         // SAFETY: `ptr` has at least `chunk` valid bytes within its 4 KiB page.
         unsafe { std::ptr::copy_nonoverlapping(ptr, dst[off..].as_mut_ptr(), chunk) };
     })
@@ -211,30 +223,80 @@ pub fn write_guest_bytes<M: SoftMmuMemory>(
     va: u64,
     src: &[u8],
 ) -> Result<(), SoftPageFault> {
+    let mode = ctx.access_mode();
     let w = SoftAccessKind::Write;
-    walk_span(ctx, mem, va, src.len(), w, |off, ptr, chunk| {
+    walk_span_mode(ctx, mem, va, src.len(), w, mode, |off, ptr, chunk| {
         // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
         unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
     })
 }
 
+/// Read `dst.len()` bytes using implicit supervisor system-table access rights
+/// (Intel SDM Vol. 3A §4.6.1: `Cpl::Ring0` with `AC` ignored for GDT/LDT/IDT/TSS).
+pub fn read_system_bytes<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    va: u64,
+    dst: &mut [u8],
+) -> Result<(), SoftPageFault> {
+    let mode = ctx.system_access_mode();
+    walk_span_mode(
+        ctx,
+        mem,
+        va,
+        dst.len(),
+        SoftAccessKind::Read,
+        mode,
+        |off, ptr, chunk| {
+            // SAFETY: `ptr` has at least `chunk` valid bytes within its 4 KiB page.
+            unsafe { std::ptr::copy_nonoverlapping(ptr, dst[off..].as_mut_ptr(), chunk) };
+        },
+    )
+}
+
+/// Write `src` using implicit supervisor system-table access rights (`Cpl::Ring0`, `AC=false`).
+pub fn write_system_bytes<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    va: u64,
+    src: &[u8],
+) -> Result<(), SoftPageFault> {
+    let mode = ctx.system_access_mode();
+    walk_span_mode(
+        ctx,
+        mem,
+        va,
+        src.len(),
+        SoftAccessKind::Write,
+        mode,
+        |off, ptr, chunk| {
+            // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
+            unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+        },
+    )
+}
+
 /// Validate then copy a span. One admission covers both passes and every
 /// copy, so no pointer outlives the CPU's admission.
-fn walk_span<M: SoftMmuMemory>(
+fn walk_span_mode<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
     va: u64,
     len: usize,
     kind: SoftAccessKind,
+    mode: CpuAccessMode,
     mut commit: impl FnMut(usize, *mut u8, usize),
 ) -> Result<(), SoftPageFault> {
+    if len == 0 {
+        return Ok(());
+    }
     let mut access = admit(ctx, mem, va)?;
     for pass in [false, true] {
         let (mut cur, mut off) = (va, 0usize);
         while off < len {
             let chunk =
                 (len - off).min((SOFT_TLB_PAGE_SIZE - (cur & SOFT_TLB_OFFSET_MASK)) as usize);
-            let ptr = probe_or_walk(&mut access, mem, cur, kind)?;
+            let ptr = probe_or_walk_mode(&mut access, mem, cur, kind, mode)?;
             if pass {
                 commit(off, ptr, chunk);
             }

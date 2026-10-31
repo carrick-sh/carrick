@@ -11,11 +11,14 @@ use crate::context::{
     EXIT_REASON_CFLOW, EXIT_REASON_CONTINUE, EXIT_REASON_RESTART, EXIT_REASON_SENSITIVE,
     EXIT_REASON_SYSCALL, GUEST_MXCSR_MASK, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
 };
+use crate::cpuid::{GuestCpuidView, Level0CpuidView};
 use crate::decode::SensitiveOp;
 use crate::emit::{EmitError, emit_block};
 use crate::mmu::{
     SoftAccessKind, SoftMmuMemory, is_canonical_va, read_guest_bytes, write_guest_bytes,
 };
+use crate::msr::EFER_SCE;
+use crate::privileged::{PrivilegedOutcome, emulate_sensitive_op};
 
 #[cfg(test)]
 thread_local! {
@@ -45,6 +48,10 @@ pub enum SoftCpuExit {
         next_rip: u64,
     },
     Syscall {
+        rip: u64,
+        next_rip: u64,
+    },
+    Hlt {
         rip: u64,
         next_rip: u64,
     },
@@ -170,6 +177,7 @@ impl Drop for JitCodeBuffer {
 pub struct SoftCpu {
     ctx: Box<SoftCpuContext>,
     jit: JitCodeBuffer,
+    cpuid: Box<dyn GuestCpuidView>,
     pub max_block_insns: usize,
     pub max_block_span: usize,
 }
@@ -302,15 +310,37 @@ pub enum SoftCpuNewError {
 
 impl SoftCpu {
     /// Create a new [`SoftCpu`] initialized for 64-bit user mode (`CPL = 3`),
-    /// seated in `extents`' invalidation domain and parked.
+    /// seated in `extents`' invalidation domain and parked, using [`Level0CpuidView`].
     pub fn new(extents: &ExtentTable) -> Result<Self, SoftCpuNewError> {
-        let ctx = SoftCpuContext::new(extents).map_err(SoftCpuNewError::Seat)?;
+        Self::with_cpuid_view(extents, Box::new(Level0CpuidView))
+    }
+
+    /// Create a new [`SoftCpu`] configured with a custom [`GuestCpuidView`].
+    pub fn with_cpuid_view(
+        extents: &ExtentTable,
+        cpuid: Box<dyn GuestCpuidView>,
+    ) -> Result<Self, SoftCpuNewError> {
+        let mut ctx = SoftCpuContext::new(extents).map_err(SoftCpuNewError::Seat)?;
+        ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
         Ok(Self {
             ctx: Box::new(ctx),
             jit: JitCodeBuffer::new(DEFAULT_JIT_CAPACITY).ok_or(SoftCpuNewError::Jit)?,
+            cpuid,
             max_block_insns: 64,
             max_block_span: 4096,
         })
+    }
+
+    /// Inspect the installed [`GuestCpuidView`].
+    #[must_use]
+    pub fn cpuid_view(&self) -> &dyn GuestCpuidView {
+        &*self.cpuid
+    }
+
+    /// Replace the installed [`GuestCpuidView`] between runs, updating `MAXPHYADDR`.
+    pub fn set_cpuid_view(&mut self, cpuid: Box<dyn GuestCpuidView>) {
+        self.ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
+        self.cpuid = cpuid;
     }
 
     /// Run a sequence of blocks. Block entry inside the run costs own-line
@@ -367,6 +397,8 @@ impl SoftCpu {
         mem: &mut M,
     ) -> Result<SoftCpuExit, EmitError> {
         self.ctx.pending_exception = None;
+        self.ctx.halted = false;
+        self.ctx.sync_msr_mirrors();
         crate::context::prepare_gateway(self.ctx.rip)?;
         if !mem.extents().is_member(&self.ctx.seat) {
             return Err(EmitError::ForeignInventory { va: self.ctx.rip });
@@ -440,19 +472,21 @@ impl SoftCpu {
                     next_rip: self.ctx.rip,
                 })
             }
-            EXIT_REASON_SYSCALL => match planned.exit {
-                BlockExit::Syscall { va, resume, .. } => {
-                    self.ctx.rip = resume;
-                    Ok(SoftCpuExit::Syscall {
-                        rip: va,
-                        next_rip: resume,
-                    })
+            EXIT_REASON_SYSCALL => {
+                let (va, resume) = match planned.exit {
+                    BlockExit::Syscall { va, resume, .. } => (va, resume),
+                    _ => (self.ctx.exit_insn_va, self.ctx.rip),
+                };
+                self.ctx.sync_msr_mirrors();
+                if (self.ctx.efer & EFER_SCE) == 0 || !self.ctx.cs.is_64bit_code() {
+                    return self.raise(X86Exception::invalid_opcode(va));
                 }
-                _ => Ok(SoftCpuExit::Syscall {
-                    rip: self.ctx.exit_insn_va,
-                    next_rip: self.ctx.rip,
-                }),
-            },
+                self.ctx.rip = resume;
+                Ok(SoftCpuExit::Syscall {
+                    rip: va,
+                    next_rip: resume,
+                })
+            }
             EXIT_REASON_CFLOW => match &planned.exit {
                 BlockExit::ControlFlow { va, kind, raw, .. } => {
                     match resolve_cflow(raw, *va, *kind, &mut self.ctx, mem) {
@@ -488,194 +522,135 @@ impl SoftCpu {
         raw: &Instruction,
         mem: &mut M,
     ) -> Result<SoftCpuExit, EmitError> {
-        // SDM CLAC/STAC specify #UD at CPL>0, unlike ordinary privileged ops.
-        if self.ctx.cpl != 0 && matches!(op, SensitiveOp::Clac | SensitiveOp::Stac) {
-            return self.raise(X86Exception::invalid_opcode(va));
-        }
-        if self.ctx.cpl != 0
-            && self.ctx.cr4 & (1 << 11) != 0
-            && matches!(
-                op,
-                SensitiveOp::Sgdt
-                    | SensitiveOp::Sidt
-                    | SensitiveOp::Sldt
-                    | SensitiveOp::Str
-                    | SensitiveOp::Smsw
-            )
-        {
-            return self.raise(X86Exception::general_protection(va, 0));
-        }
-        if op.is_privileged() {
-            if self.ctx.cpl != 0 {
-                return self.raise(X86Exception::general_protection(va, 0));
-            }
-            self.ctx.rip = va;
-            return Ok(SoftCpuExit::Sensitive {
-                rip: va,
-                next_rip: resume,
-                op,
-            });
-        }
+        match emulate_sensitive_op(&mut self.ctx, &*self.cpuid, va, resume, op, raw, mem) {
+            PrivilegedOutcome::Continue { next_rip } => Ok(SoftCpuExit::Continue { next_rip }),
+            PrivilegedOutcome::Hlt { rip, next_rip } => Ok(SoftCpuExit::Hlt { rip, next_rip }),
+            PrivilegedOutcome::Exception(exc) => self.raise(exc),
+            PrivilegedOutcome::Unhandled => {
+                if op.is_privileged() {
+                    if self.ctx.cpl != 0 {
+                        return self.raise(X86Exception::general_protection(va, 0));
+                    }
+                    self.ctx.rip = va;
+                    return Ok(SoftCpuExit::Sensitive {
+                        rip: va,
+                        next_rip: resume,
+                        op,
+                    });
+                }
 
-        match op {
-            SensitiveOp::Icebp => self.raise(X86Exception::new(
-                X86ExceptionVector::Debug,
-                resume,
-                None,
-                None,
-            )),
-            SensitiveOp::Interrupt { vector } => {
-                self.ctx.rip = resume;
-                if raw.mnemonic() == iced_x86::Mnemonic::Int3 {
-                    return self.raise(X86Exception::new(
-                        X86ExceptionVector::Breakpoint,
+                match op {
+                    SensitiveOp::Icebp => self.raise(X86Exception::new(
+                        X86ExceptionVector::Debug,
                         resume,
                         None,
                         None,
-                    ));
-                }
-                Ok(SoftCpuExit::SoftwareInterrupt {
-                    vector,
-                    rip: va,
-                    next_rip: resume,
-                })
-            }
-            SensitiveOp::Ldmxcsr | SensitiveOp::Stmxcsr => {
-                let ea = compute_effective_va(raw, &self.ctx);
-                if !is_canonical_va(ea) || !is_canonical_va(ea.wrapping_add(3)) {
-                    return self.raise(X86Exception::general_protection(va, 0));
-                }
-                if let Err(exc) = crate::mmu::check_guest_alignment(
-                    &mut self.ctx,
-                    mem,
-                    ea,
-                    4,
-                    4,
-                    if op == SensitiveOp::Stmxcsr {
-                        SoftAccessKind::Write
-                    } else {
-                        SoftAccessKind::Read
-                    },
-                    va,
-                ) {
-                    return self.raise(exc);
-                }
-                let mut bytes = [0; 4];
-                let result = if op == SensitiveOp::Stmxcsr {
-                    bytes.copy_from_slice(&self.ctx.fxsave.0[24..28]);
-                    write_guest_bytes(&mut self.ctx, mem, ea, &bytes)
-                } else {
-                    read_guest_bytes(&mut self.ctx, mem, ea, &mut bytes, SoftAccessKind::Read)
-                };
-                if let Err(pf) = result {
-                    return self.raise(X86Exception::page_fault(va, pf.error_code, pf.cr2));
-                }
-                if op == SensitiveOp::Ldmxcsr {
-                    if u32::from_le_bytes(bytes) & !GUEST_MXCSR_MASK != 0 {
-                        return self.raise(X86Exception::general_protection(va, 0));
+                    )),
+                    SensitiveOp::Interrupt { vector } => {
+                        self.ctx.rip = resume;
+                        if raw.mnemonic() == iced_x86::Mnemonic::Int3 {
+                            return self.raise(X86Exception::new(
+                                X86ExceptionVector::Breakpoint,
+                                resume,
+                                None,
+                                None,
+                            ));
+                        }
+                        Ok(SoftCpuExit::SoftwareInterrupt {
+                            vector,
+                            rip: va,
+                            next_rip: resume,
+                        })
                     }
-                    self.ctx.fxsave.0[24..28].copy_from_slice(&bytes);
+                    SensitiveOp::Ldmxcsr | SensitiveOp::Stmxcsr => {
+                        let ea = compute_effective_va(raw, &self.ctx);
+                        if !is_canonical_va(ea) || !is_canonical_va(ea.wrapping_add(3)) {
+                            return self.raise(X86Exception::general_protection(va, 0));
+                        }
+                        if let Err(exc) = crate::mmu::check_guest_alignment(
+                            &mut self.ctx,
+                            mem,
+                            ea,
+                            4,
+                            4,
+                            if op == SensitiveOp::Stmxcsr {
+                                SoftAccessKind::Write
+                            } else {
+                                SoftAccessKind::Read
+                            },
+                            va,
+                        ) {
+                            return self.raise(exc);
+                        }
+                        let mut bytes = [0; 4];
+                        let result = if op == SensitiveOp::Stmxcsr {
+                            bytes.copy_from_slice(&self.ctx.fxsave.0[24..28]);
+                            write_guest_bytes(&mut self.ctx, mem, ea, &bytes)
+                        } else {
+                            read_guest_bytes(&mut self.ctx, mem, ea, &mut bytes, SoftAccessKind::Read)
+                        };
+                        if let Err(pf) = result {
+                            return self.raise(X86Exception::page_fault(va, pf.error_code, pf.cr2));
+                        }
+                        if op == SensitiveOp::Ldmxcsr {
+                            if u32::from_le_bytes(bytes) & !GUEST_MXCSR_MASK != 0 {
+                                return self.raise(X86Exception::general_protection(va, 0));
+                            }
+                            self.ctx.fxsave.0[24..28].copy_from_slice(&bytes);
+                        }
+                        self.ctx.rip = resume;
+                        Ok(SoftCpuExit::Continue { next_rip: resume })
+                    }
+                    SensitiveOp::Rdssp { .. } => {
+                        self.ctx.rip = resume;
+                        Ok(SoftCpuExit::Continue { next_rip: resume })
+                    }
+                    SensitiveOp::Rdpkru | SensitiveOp::Wrpkru | SensitiveOp::Rdtscp => {
+                        // These extensions are absent from this layer's CPUID/CR4 view.
+                        self.raise(X86Exception::invalid_opcode(va))
+                    }
+                    SensitiveOp::Rdtsc => {
+                        // SAFETY: TSC is a baseline x86_64 instruction advertised by CPUID.
+                        let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+                        self.ctx.gpr[reg::RAX] = tsc & 0xffff_ffff;
+                        self.ctx.gpr[reg::RDX] = tsc >> 32;
+                        self.ctx.rip = resume;
+                        Ok(SoftCpuExit::Continue { next_rip: resume })
+                    }
+                    SensitiveOp::Fnsave
+                    | SensitiveOp::Fnstenv
+                    | SensitiveOp::Fldenv
+                    | SensitiveOp::Frstor
+                    | SensitiveOp::Fwait => {
+                        if let Err(exc) = emulate_legacy_x87(&mut self.ctx, mem, raw, op, va) {
+                            return self.raise(exc);
+                        }
+                        self.ctx.rip = resume;
+                        Ok(SoftCpuExit::Continue { next_rip: resume })
+                    }
+                    SensitiveOp::Fxsave
+                    | SensitiveOp::Xsave
+                    | SensitiveOp::Xsaveopt
+                    | SensitiveOp::Xsavec
+                    | SensitiveOp::Fxrstor
+                    | SensitiveOp::Xrstor => {
+                        if let Err(exc) = emulate_xstate(&mut self.ctx, mem, raw, op, va) {
+                            return self.raise(exc);
+                        }
+                        self.ctx.rip = resume;
+                        Ok(SoftCpuExit::Continue { next_rip: resume })
+                    }
+                    _ => {
+                        self.ctx.rip = va;
+                        Ok(SoftCpuExit::Sensitive {
+                            rip: va,
+                            next_rip: resume,
+                            op,
+                        })
+                    }
                 }
-                self.ctx.rip = resume;
-                Ok(SoftCpuExit::Continue { next_rip: resume })
-            }
-            SensitiveOp::Rdssp { .. } => {
-                self.ctx.rip = resume;
-                Ok(SoftCpuExit::Continue { next_rip: resume })
-            }
-            SensitiveOp::Rdpkru | SensitiveOp::Wrpkru | SensitiveOp::Rdtscp => {
-                // These extensions are absent from this layer's CPUID/CR4 view.
-                self.raise(X86Exception::invalid_opcode(va))
-            }
-            SensitiveOp::Xgetbv => {
-                if self.ctx.gpr[reg::RCX] as u32 != 0 {
-                    return self.raise(X86Exception::general_protection(va, 0));
-                }
-                self.ctx.gpr[reg::RAX] = self.ctx.xcr0 & 0xffff_ffff;
-                self.ctx.gpr[reg::RDX] = self.ctx.xcr0 >> 32;
-                self.ctx.rip = resume;
-                Ok(SoftCpuExit::Continue { next_rip: resume })
-            }
-            SensitiveOp::Rdtsc => {
-                // SAFETY: TSC is a baseline x86_64 instruction advertised by CPUID.
-                let tsc = unsafe { core::arch::x86_64::_rdtsc() };
-                self.ctx.gpr[reg::RAX] = tsc & 0xffff_ffff;
-                self.ctx.gpr[reg::RDX] = tsc >> 32;
-                self.ctx.rip = resume;
-                Ok(SoftCpuExit::Continue { next_rip: resume })
-            }
-            SensitiveOp::Cpuid => {
-                let (a, b, c, d) = emulate_pinned_cpuid(
-                    self.ctx.gpr[reg::RAX] as u32,
-                    self.ctx.gpr[reg::RCX] as u32,
-                );
-                self.ctx.gpr[reg::RAX] = u64::from(a);
-                self.ctx.gpr[reg::RBX] = u64::from(b);
-                self.ctx.gpr[reg::RCX] = u64::from(c);
-                self.ctx.gpr[reg::RDX] = u64::from(d);
-                self.ctx.rip = resume;
-                Ok(SoftCpuExit::Continue { next_rip: resume })
-            }
-            SensitiveOp::Fnsave
-            | SensitiveOp::Fnstenv
-            | SensitiveOp::Fldenv
-            | SensitiveOp::Frstor
-            | SensitiveOp::Fwait => {
-                if let Err(exc) = emulate_legacy_x87(&mut self.ctx, mem, raw, op, va) {
-                    return self.raise(exc);
-                }
-                self.ctx.rip = resume;
-                Ok(SoftCpuExit::Continue { next_rip: resume })
-            }
-            SensitiveOp::Fxsave
-            | SensitiveOp::Xsave
-            | SensitiveOp::Xsaveopt
-            | SensitiveOp::Xsavec
-            | SensitiveOp::Fxrstor
-            | SensitiveOp::Xrstor => {
-                if let Err(exc) = emulate_xstate(&mut self.ctx, mem, raw, op, va) {
-                    return self.raise(exc);
-                }
-                self.ctx.rip = resume;
-                Ok(SoftCpuExit::Continue { next_rip: resume })
-            }
-            _ => {
-                self.ctx.rip = va;
-                Ok(SoftCpuExit::Sensitive {
-                    rip: va,
-                    next_rip: resume,
-                    op,
-                })
             }
         }
-    }
-}
-
-/// Fixed Level 0 view, independent of the host. Baseline integer/SSE2 state,
-/// emulated XSAVE legacy components only; no AVX, monitor, INVPCID, XSAVES,
-/// RDPID, CET, or other host extensions. Native admission remains a separate
-/// instruction-level allowlist: Level 0 is deliberately a partial ISA.
-/// CR0.EM=0 permits the admitted SSE subset; CPUID.FPU=0 promises no x87.
-fn emulate_pinned_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
-    match (leaf, subleaf) {
-        (0, _) => (
-            0x0d,
-            u32::from_le_bytes(*b"Genu"),
-            u32::from_le_bytes(*b"ntel"),
-            u32::from_le_bytes(*b"ineI"),
-        ),
-        (1, _) => (
-            0x0000_0663,
-            0,
-            (1 << 26) | (1 << 27),
-            (1 << 4) | (1 << 8) | (1 << 15) | (1 << 24) | (1 << 25) | (1 << 26),
-        ),
-        (0x0d, 0) => (3, 576, 576, 0),
-        (0x0d, 1) => (3, 576, 0, 0), // XSAVEOPT and XSAVEC, no supervisor state
-        (0x8000_0000, _) => (0x8000_0008, 0, 0, 0),
-        (0x8000_0001, _) => (0, 0, 1, (1 << 11) | (1 << 20) | (1 << 29)),
-        (0x8000_0008, _) => (48 | (48 << 8), 0, 0, 0),
-        _ => (0, 0, 0, 0),
     }
 }
 
@@ -698,6 +673,9 @@ fn emulate_xstate<M: SoftMmuMemory>(
             | Mnemonic::Xrstor64
     );
     let ext = !matches!(op, SensitiveOp::Fxsave | SensitiveOp::Fxrstor);
+    if ext && (ctx.cr4 & (1 << 18)) == 0 {
+        return Err(X86Exception::invalid_opcode(ip));
+    }
     let save = !matches!(op, SensitiveOp::Fxrstor | SensitiveOp::Xrstor);
     let compact = op == SensitiveOp::Xsavec;
     let ea = compute_effective_va(insn, ctx);

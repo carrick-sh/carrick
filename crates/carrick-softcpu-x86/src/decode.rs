@@ -180,6 +180,20 @@ const fn cr_number(reg: Register) -> Option<u8> {
     }
 }
 
+const fn dr_number(reg: Register) -> Option<u8> {
+    match reg {
+        Register::DR0 => Some(0),
+        Register::DR1 => Some(1),
+        Register::DR2 => Some(2),
+        Register::DR3 => Some(3),
+        Register::DR4 => Some(4),
+        Register::DR5 => Some(5),
+        Register::DR6 => Some(6),
+        Register::DR7 => Some(7),
+        _ => None,
+    }
+}
+
 /// Detect `rdsspd r32` (`F3 0F 1E C8..CF`) and `rdsspq r64` (`F3 48/49 0F 1E C8..CF`).
 fn decode_rdssp(bytes: &[u8]) -> Option<(usize, SensitiveOp)> {
     if bytes.first().copied() != Some(0xF3) {
@@ -256,7 +270,13 @@ pub fn classify(bytes: &[u8], va: u64) -> Option<DecodedInsn> {
 
 fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
     let simple = match insn.mnemonic() {
-        Mnemonic::Syscall => return InsnClass::Syscall,
+        Mnemonic::Syscall => {
+            return if insn.has_lock_prefix() {
+                InsnClass::InvalidOpcode
+            } else {
+                InsnClass::Syscall
+            };
+        }
         Mnemonic::Int1 => Some(SensitiveOp::Icebp),
         Mnemonic::Clts => Some(SensitiveOp::Clts),
         Mnemonic::Invd => Some(SensitiveOp::Invd),
@@ -315,11 +335,17 @@ fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
         _ => None,
     };
     if let Some(op) = simple {
+        if insn.has_lock_prefix() {
+            return InsnClass::InvalidOpcode;
+        }
         return InsnClass::Sensitive(op);
     }
 
     match insn.mnemonic() {
         Mnemonic::Out | Mnemonic::In => {
+            if insn.has_lock_prefix() {
+                return InsnClass::InvalidOpcode;
+            }
             let (is_out, size) = match insn.code() {
                 Code::Out_imm8_AL | Code::Out_DX_AL => (true, 1),
                 Code::Out_imm8_AX | Code::Out_DX_AX => (true, 2),
@@ -352,22 +378,37 @@ fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
                 insn.op0_register(),
                 insn.op1_register(),
             );
-            if k0 == OpKind::Register && k1 == OpKind::Register {
+            if r0.is_cr() || r1.is_cr() {
+                if insn.has_lock_prefix() || k0 != OpKind::Register || k1 != OpKind::Register {
+                    return InsnClass::InvalidOpcode;
+                }
                 if let (Some(gpr), Some(cr)) = (gpr_index(r0), cr_number(r1)) {
                     return InsnClass::Sensitive(SensitiveOp::MovFromCr { cr, gpr });
                 }
                 if let (Some(cr), Some(gpr)) = (cr_number(r0), gpr_index(r1)) {
                     return InsnClass::Sensitive(SensitiveOp::MovToCr { cr, gpr });
                 }
-                if r0.is_dr() || r1.is_dr() {
-                    return InsnClass::Sensitive(SensitiveOp::MovDr);
+                return InsnClass::InvalidOpcode;
+            }
+            if r0.is_dr() || r1.is_dr() {
+                // SDM Vol. 2B `MOV—Move to/from Debug Registers`: LOCK or REX.R=1 (DR8-DR15) raises #UD.
+                if insn.has_lock_prefix() || k0 != OpKind::Register || k1 != OpKind::Register {
+                    return InsnClass::InvalidOpcode;
                 }
-                if r0.is_segment_register() || r1.is_segment_register() {
-                    return InsnClass::Sensitive(SensitiveOp::MovSegment);
-                }
-            } else if (k0 == OpKind::Register && r0.is_segment_register())
+                let valid = (gpr_index(r0).is_some() && dr_number(r1).is_some())
+                    || (dr_number(r0).is_some() && gpr_index(r1).is_some());
+                return if valid {
+                    InsnClass::Sensitive(SensitiveOp::MovDr)
+                } else {
+                    InsnClass::InvalidOpcode
+                };
+            }
+            if (k0 == OpKind::Register && r0.is_segment_register())
                 || (k1 == OpKind::Register && r1.is_segment_register())
             {
+                if insn.has_lock_prefix() {
+                    return InsnClass::InvalidOpcode;
+                }
                 return InsnClass::Sensitive(SensitiveOp::MovSegment);
             }
         }
@@ -449,9 +490,13 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
     {
         return false;
     }
-    if (0..insn.op_count())
-        .any(|i| insn.op_kind(i) == OpKind::Register && insn.op_register(i).is_mm())
-    {
+    if (0..insn.op_count()).any(|i| {
+        if insn.op_kind(i) != OpKind::Register {
+            return false;
+        }
+        let r = insn.op_register(i);
+        r.is_mm() || r.is_cr() || r.is_dr() || r.is_tr()
+    }) {
         return false;
     }
     if matches!(
