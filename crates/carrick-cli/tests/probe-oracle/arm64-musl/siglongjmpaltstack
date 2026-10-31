@@ -1,4 +1,15 @@
-4dd1e3e55bc1cba3
+eef66596c855c504
+maperr_siglongjmp=true
+maperr_signal=11
+maperr_si_code=1
+maperr_si_addr_matches=true
+bus_setup_errno=0
+bus_siglongjmp=true
+bus_signal=7
+bus_si_code=2
+bus_si_addr_matches=true
+default_fault_signal=11
+blocked_fault_signal=11
 altstack_ok=true
 install_ok=true
 first_handler_seen=true
