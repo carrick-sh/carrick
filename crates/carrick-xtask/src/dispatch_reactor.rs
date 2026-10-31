@@ -156,8 +156,17 @@ const SECRET_SHAPES: [&str; 9] = [
     "AKIA",
     "ASIA",
 ];
+/// Case and whitespace don't hide a prefix: a token split across lines or
+/// upper-cased still matches.
 fn secret_shaped(text: &str) -> bool {
-    SECRET_SHAPES.iter().any(|shape| text.contains(shape))
+    let folded: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    SECRET_SHAPES
+        .iter()
+        .any(|shape| folded.contains(&shape.to_lowercase()))
 }
 pub(crate) fn enforce(decision: &Decision, gate: &Gate) -> Effect {
     let text = decision.text.trim();
@@ -1048,6 +1057,9 @@ mod tests {
             "github_pat_11AB",
             "-----BEGIN RSA PRIVATE KEY",
             "AKIAIOSFODNN7",
+            "split gh\np_0123 across lines",
+            "GHP_UPPER",
+            "- - - - - BEGIN spaced",
         ] {
             for action in [Act::Reply, Act::Round] {
                 assert_eq!(
