@@ -195,6 +195,12 @@ queues:
   [`fork-stage1-image.md`](conformance-contracts/fork-stage1-image.md)) rather
   than appending to this normative guide.
 
+An owner-memory wait during that admission (`NativeProcessError::OwnerWait`)
+is the same contention with a release notification: the fault entry parks the
+thread on the owner and reruns the faulting instruction with the payload still
+retained. The host-classified checkpoint has no rerun venue and forwards it
+like Busy.
+
 ### Retained in-ring read and ppoll copyout (#1035 / #898)
 
 `kernel.memory.owner-wait` covers the currently routed read and ppoll outputs.
