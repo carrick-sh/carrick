@@ -1,6 +1,21 @@
 {
   "director_repository": "carrick-sh/agy-director",
-  "director_sha": "29915c160f738bdedff125139b23309fbf28ede6",
+  "director_sha": "4fc5ae81bf21ba8c20c7017cee44ffe8a7058609",
+  "agy_models_seed": [
+    "gemini-4-argon-medium",
+    "gemini-4-argon-high",
+    "gemini-4-argon-low",
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low",
+    "claude-opus-5-5-low",
+    "claude-opus-5-5-medium",
+    "claude-opus-5-5-high",
+    "claude-sonnet-5-5-low",
+    "claude-sonnet-5-5-medium",
+    "claude-sonnet-5-5-high",
+    "gpt-oss-120b-medium"
+  ],
   "platforms": {
     "linux-x86_64": [
       {

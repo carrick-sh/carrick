@@ -31,6 +31,10 @@ pub enum Action {
 struct Manifest {
     director_repository: String,
     director_sha: String,
+    /// The roster the launcher falls back to when `agy models` fails and it
+    /// has no cache of its own (#1240): fresh clones start without one.
+    /// Refresh it when the agy pin or the account's models change.
+    agy_models_seed: Vec<String>,
     platforms: BTreeMap<String, Vec<Tool>>,
 }
 #[derive(Deserialize)]
@@ -41,6 +45,21 @@ struct Tool {
     sha256: Option<String>,
     sha512: Option<String>,
     member: String,
+}
+
+/// The launcher's fallback roster, inside the staged `director` tree.
+pub(crate) const MODELS_SEED: &str = "agy-models-seed.json";
+
+/// Model ids as `agy models` prints them: non-empty, lowercase, dotted or
+/// hyphenated, no spaces.
+fn valid_roster(models: &[String]) -> bool {
+    !models.is_empty()
+        && models.iter().all(|m| {
+            !m.is_empty()
+                && m.len() < 128
+                && m.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-._".contains(&b))
+        })
 }
 
 /// Run a bootstrap command. No inherited GitHub token reaches it; only the
@@ -349,6 +368,9 @@ fn bootstrap(
     {
         return Err(ScalerError::Guard("invalid pinned director identity"));
     }
+    if !valid_roster(&manifest.agy_models_seed) {
+        return Err(ScalerError::Guard("invalid pinned model roster seed"));
+    }
     let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let tools = manifest
         .platforms
@@ -411,6 +433,11 @@ fn bootstrap(
         "git",
         &["checkout", "--detach", "FETCH_HEAD"],
         None,
+    )?;
+    // Copied with the launcher into every model account (`AGY_MODELS_SEED`).
+    std::fs::write(
+        director.join(MODELS_SEED),
+        serde_json::to_vec(&serde_json::json!({ "models": manifest.agy_models_seed }))?,
     )?;
     let mut paths = std::fs::OpenOptions::new()
         .append(true)
@@ -703,5 +730,26 @@ printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         assert!(secret_file(&path, b"replace").is_err());
         assert_eq!(std::fs::read(path).unwrap(), b"opaque");
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    #![allow(clippy::unwrap_used)]
+    /// #1240: the pinned seed parses and is a usable roster.
+    #[test]
+    fn pinned_model_seed_is_a_valid_roster() {
+        let manifest: super::Manifest =
+            serde_json::from_str(include_str!("../../../scripts/ci/inputs/agent-tools.json"))
+                .unwrap();
+        assert!(super::valid_roster(&manifest.agy_models_seed));
+        assert!(
+            manifest
+                .agy_models_seed
+                .iter()
+                .any(|m| m.starts_with("gemini-"))
+        );
+        assert!(!super::valid_roster(&[]));
+        assert!(!super::valid_roster(&["Gemini High".into()]));
     }
 }
