@@ -23,7 +23,7 @@ pub use context::{
     X86Exception, X86ExceptionVector, reg,
 };
 pub use cpu::{JitCodeBuffer, RunningContext, RunningCpu, SoftCpu, SoftCpuExit, SoftCpuNewError};
-pub use cpuid::{Cpl0CpuidView, CpuidRegs, GuestCpuidView, Level0CpuidView};
+pub use cpuid::{Cpl0CpuidView, CpuidRegs, DEFAULT_TSC_HZ, GuestCpuidView, Level0CpuidView};
 pub use decode::{CflowKind, DecodedInsn, InsnClass, SensitiveOp, classify, gpr_index};
 pub use emit::{EmitError, EmittedBlock, JitStage, emit_block};
 pub use machine::{SoftMachine, SoftMachineExit};

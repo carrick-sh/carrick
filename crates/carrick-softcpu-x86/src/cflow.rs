@@ -61,8 +61,8 @@ pub fn compute_effective_va(insn: &Instruction, ctx: &SoftCpuContext) -> u64 {
         }
     };
     match insn.segment_prefix() {
-        Register::FS => addr = addr.wrapping_add(ctx.fs_base),
-        Register::GS => addr = addr.wrapping_add(ctx.gs_base),
+        Register::FS => addr = addr.wrapping_add(ctx.fs_base()),
+        Register::GS => addr = addr.wrapping_add(ctx.gs_base()),
         _ => {}
     }
     addr

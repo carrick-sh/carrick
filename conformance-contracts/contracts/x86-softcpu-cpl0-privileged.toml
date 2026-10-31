@@ -27,13 +27,16 @@ kind = "upper-bound"
 metric = "page_table_invalidations"
 maximum = 1
 layers = ["vm-free"]
-rationale = "Each TLB-invalidating privileged operation (`MOV CR3` without PCID NOFLUSH, `MOV CR0`/`CR4` paging-attribute edits, `WRMSR` to `IA32_PAT` or `IA32_EFER.NXE`, or `INVLPG`) issues at most one local SoftTlb invalidation (`flush_all` or single-VA `evict_va`)."
+rationale = "Each TLB-invalidating privileged operation (every `MOV CR3` write including `CR4.PCIDE=1` + `CR3[63]` until `SoftTlb` is PCID-tagged, `MOV CR0`/`CR4` paging-attribute edits, `WRMSR` to `IA32_PAT` or `IA32_EFER.NXE`, or `INVLPG`) issues at most one local SoftTlb invalidation (`flush_all` or single-VA `evict_va`)."
 
 [bindings]
 vm_free = [
   "carrick-softcpu-x86::softcpu_cpl0::cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state",
+  "carrick-softcpu-x86::softcpu_cpl0::faulting_iretq_and_idt_preserve_gdt_accessed_bit_and_cpuid_tsc_are_consistent",
   "carrick-softcpu-x86::softcpu_cpl0::hlt_invlpg_and_cpuid_view_enforce_sdm_contracts",
+  "carrick-softcpu-x86::softcpu_cpl0::idt_delivery_enforces_sdm_double_fault_classes",
   "carrick-softcpu-x86::softcpu_cpl0::lgdt_lidt_ltr_and_swapgs_enforce_descriptor_and_gs_semantics",
+  "carrick-softcpu-x86::softcpu_cpl0::mov_cr3_pcide_noflush_isolates_two_roots",
   "carrick-softcpu-x86::softcpu_cpl0::mov_cr_and_mov_dr_enforce_sdm_semantics_tlb_flushes_and_fault_ordering",
   "carrick-softcpu-x86::softcpu_cpl0::msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths",
   "carrick-softcpu-x86::softcpu_cpl0::sysret_and_iretq_enforce_privilege_transitions_and_fault_paths",

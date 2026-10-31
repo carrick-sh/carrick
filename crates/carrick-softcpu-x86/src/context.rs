@@ -65,26 +65,28 @@ pub(crate) const EXIT_REASON_RESTART: u64 = 5;
 /// Maximum completed REP elements per execution window (at most 32 KiB).
 pub const REP_ITERATION_BUDGET: u64 = 4096;
 
-pub const CTX_GPR_R14_OFF: usize = 0x70;
-pub const CTX_GPR_R15_OFF: usize = 0x78;
-pub const CTX_RIP_OFF: usize = 0x80;
-pub const CTX_FS_BASE_OFF: usize = 0x90;
-pub const CTX_GS_BASE_OFF: usize = 0x98;
-pub const CTX_TLB_TAG_BITS_OFF: usize = 0xA8;
-pub const CTX_EXIT_REASON_OFF: usize = 0xC0;
-pub const CTX_EXIT_INSN_VA_OFF: usize = 0xC8;
-pub const CTX_PROBE_SPILL0_OFF: usize = 0xD0;
-pub const CTX_PROBE_SPILL1_OFF: usize = 0xD8;
-pub const CTX_VIRT_SPILL0_OFF: usize = 0xE0;
-pub const CTX_VIRT_SPILL1_OFF: usize = 0xE8;
-pub const CTX_SAVED_LAHF_OFF: usize = 0xF0;
-pub const CTX_SLOW_PATH_FN_OFF: usize = 0xF8;
-pub const CTX_BOUNCE_COMMIT_FN_OFF: usize = 0x100;
-pub const CTX_COMPLEX_STEP_FN_OFF: usize = 0x108;
-pub const CTX_EXIT_TRAMPOLINE_FN_OFF: usize = 0x110;
+pub const CTX_GPR_R14_OFF: usize = offset_of!(SoftCpuContext, gpr) + reg::R14 * 8;
+pub const CTX_GPR_R15_OFF: usize = offset_of!(SoftCpuContext, gpr) + reg::R15 * 8;
+pub const CTX_RIP_OFF: usize = offset_of!(SoftCpuContext, rip);
+pub const CTX_FS_BASE_OFF: usize =
+    offset_of!(SoftCpuContext, msrs) + crate::msr::MsrFile::FS_BASE_OFFSET;
+pub const CTX_GS_BASE_OFF: usize =
+    offset_of!(SoftCpuContext, msrs) + crate::msr::MsrFile::GS_BASE_OFFSET;
+pub const CTX_TLB_TAG_BITS_OFF: usize = offset_of!(SoftCpuContext, tlb_tag_bits);
+pub const CTX_EXIT_REASON_OFF: usize = offset_of!(SoftCpuContext, exit_reason);
+pub const CTX_EXIT_INSN_VA_OFF: usize = offset_of!(SoftCpuContext, exit_insn_va);
+pub const CTX_PROBE_SPILL0_OFF: usize = offset_of!(SoftCpuContext, probe_spill);
+pub const CTX_PROBE_SPILL1_OFF: usize = offset_of!(SoftCpuContext, probe_spill) + 8;
+pub const CTX_VIRT_SPILL0_OFF: usize = offset_of!(SoftCpuContext, virt_spill);
+pub const CTX_VIRT_SPILL1_OFF: usize = offset_of!(SoftCpuContext, virt_spill) + 8;
+pub const CTX_SAVED_LAHF_OFF: usize = offset_of!(SoftCpuContext, saved_lahf);
+pub const CTX_SLOW_PATH_FN_OFF: usize = offset_of!(SoftCpuContext, slow_path_fn);
+pub const CTX_BOUNCE_COMMIT_FN_OFF: usize = offset_of!(SoftCpuContext, bounce_commit_fn);
+pub const CTX_COMPLEX_STEP_FN_OFF: usize = offset_of!(SoftCpuContext, complex_step_fn);
+pub const CTX_EXIT_TRAMPOLINE_FN_OFF: usize = offset_of!(SoftCpuContext, exit_trampoline_fn);
 pub(crate) const CTX_VIRT_RSP_SPILL_OFF: usize = offset_of!(SoftCpuContext, virt_rsp_spill);
-pub const CTX_FXSAVE_OFF: usize = 0x160;
-pub const CTX_TLB_READ_OFF: usize = 0x380;
+pub const CTX_FXSAVE_OFF: usize = offset_of!(SoftCpuContext, fxsave);
+pub const CTX_TLB_READ_OFF: usize = offset_of!(SoftCpuContext, tlb);
 pub const CTX_TLB_WRITE_OFF: usize = CTX_TLB_READ_OFF + SoftTlb::WRITE_PLANE_OFFSET;
 
 /// Architectural x86_64 exception vectors surfaced by `carrick-softcpu-x86`.
@@ -93,8 +95,12 @@ pub const CTX_TLB_WRITE_OFF: usize = CTX_TLB_READ_OFF + SoftTlb::WRITE_PLANE_OFF
 pub enum X86ExceptionVector {
     DivideError = 0,
     Debug = 1,
+    NonMaskableInterrupt = 2,
     Breakpoint = 3,
+    Overflow = 4,
+    BoundRangeExceeded = 5,
     InvalidOpcode = 6,
+    DeviceNotAvailable = 7,
     DoubleFault = 8,
     InvalidTss = 10,
     SegmentNotPresent = 11,
@@ -103,6 +109,7 @@ pub enum X86ExceptionVector {
     PageFault = 14,
     X87FloatingPoint = 16,
     AlignmentCheck = 17,
+    MachineCheck = 18,
     SimdFloatingPoint = 19,
 }
 
@@ -333,9 +340,6 @@ pub struct SoftCpuContext {
     pub gpr: [u64; 16],
     pub rip: u64,
     pub rflags: u64,
-    pub fs_base: u64,
-    pub gs_base: u64,
-    pub kernel_gs_base: u64,
     pub tlb_tag_bits: u64,
     host_rsp: u64,
     entry_exec_addr: u64,
@@ -362,7 +366,6 @@ pub struct SoftCpuContext {
     pub cr2: u64,
     pub cr3: u64,
     pub cr4: u64,
-    pub efer: u64,
     pub block_start_va: u64,
     pub pending_exception: Option<X86Exception>,
     bounce_writeback: BounceWriteback,
@@ -377,8 +380,8 @@ pub struct SoftCpuContext {
     pub x87_data_selector: u16,
     /// Membership in the physical inventory's invalidation domain.
     pub(crate) seat: SoftVcpuSeat,
-    /// Architectural MSR register file backing `RDMSR`, `WRMSR`, `SWAPGS`, `SYSCALL`, and `SYSRET`.
-    pub msrs: crate::msr::MsrFile,
+    /// Architectural MSR register file (single owner of `EFER`, `FS_BASE`, `GS_BASE`, `KERNEL_GS_BASE`).
+    msrs: crate::msr::MsrFile,
     pub cr8: u64,
     pub dr: [u64; 8],
     pub gdtr: DescriptorTablePtr,
@@ -392,25 +395,15 @@ pub struct SoftCpuContext {
     pub ldtr: SoftSegment,
     pub tr: SoftSegment,
     pub halted: bool,
-    msr_mirrors: (u64, u64, u64, u64),
 }
 
 const _: () = {
+    assert!(offset_of!(SoftCpuContext, gpr) == 0);
     assert!(offset_of!(SoftCpuContext, rip) == CTX_RIP_OFF);
-    assert!(offset_of!(SoftCpuContext, fs_base) == CTX_FS_BASE_OFF);
-    assert!(offset_of!(SoftCpuContext, gs_base) == CTX_GS_BASE_OFF);
-    assert!(offset_of!(SoftCpuContext, tlb_tag_bits) == CTX_TLB_TAG_BITS_OFF);
-    assert!(offset_of!(SoftCpuContext, exit_reason) == CTX_EXIT_REASON_OFF);
-    assert!(offset_of!(SoftCpuContext, exit_insn_va) == CTX_EXIT_INSN_VA_OFF);
-    assert!(offset_of!(SoftCpuContext, probe_spill) == CTX_PROBE_SPILL0_OFF);
-    assert!(offset_of!(SoftCpuContext, virt_spill) == CTX_VIRT_SPILL0_OFF);
-    assert!(offset_of!(SoftCpuContext, saved_lahf) == CTX_SAVED_LAHF_OFF);
-    assert!(offset_of!(SoftCpuContext, slow_path_fn) == CTX_SLOW_PATH_FN_OFF);
-    assert!(offset_of!(SoftCpuContext, bounce_commit_fn) == CTX_BOUNCE_COMMIT_FN_OFF);
-    assert!(offset_of!(SoftCpuContext, complex_step_fn) == CTX_COMPLEX_STEP_FN_OFF);
-    assert!(offset_of!(SoftCpuContext, exit_trampoline_fn) == CTX_EXIT_TRAMPOLINE_FN_OFF);
-    assert!(offset_of!(SoftCpuContext, fxsave) == CTX_FXSAVE_OFF);
-    assert!(offset_of!(SoftCpuContext, tlb) == CTX_TLB_READ_OFF);
+    assert!(CTX_FS_BASE_OFF < i32::MAX as usize);
+    assert!(CTX_GS_BASE_OFF < i32::MAX as usize);
+    assert!(CTX_FXSAVE_OFF.is_multiple_of(16));
+    assert!(CTX_TLB_READ_OFF.is_multiple_of(64));
 };
 
 /// A host-side guest access admitted for one CPU through a memory whose
@@ -480,15 +473,11 @@ impl SoftCpuContext {
         // never replaces either, preserving their 1:1 pairing.
         let seat = unsafe { extents.register_vcpu_unguarded(&mut tlb) }?;
         let gw = gateway_trampolines().ok();
-        let msrs = crate::msr::MsrFile::new();
-        let efer = msrs.efer;
+        let msrs = crate::msr::MsrFile::new_anchored();
         let mut ctx = Self {
             gpr: [0; 16],
             rip: 0,
             rflags: 0x202,
-            fs_base: 0,
-            gs_base: 0,
-            kernel_gs_base: 0,
             tlb_tag_bits: 0,
             host_rsp: 0,
             entry_exec_addr: 0,
@@ -515,7 +504,6 @@ impl SoftCpuContext {
             cr2: 0,
             cr3: 0,
             cr4: 0x0034_06f0,
-            efer,
             block_start_va: 0,
             pending_exception: None,
             bounce_writeback: BounceWriteback::default(),
@@ -548,8 +536,9 @@ impl SoftCpuContext {
                 ar: 0x008b,
             },
             halted: false,
-            msr_mirrors: (efer, 0, 0, 0),
         };
+        ctx.walker
+            .set_nxe((ctx.msrs.efer() & crate::msr::EFER_NXE) != 0);
         ctx.sync_tlb_tag_bits();
         Ok(ctx)
     }
@@ -573,51 +562,95 @@ impl SoftCpuContext {
         self.tlb.reset_stats();
     }
 
-    /// Synchronize direct field mutations (`efer`, `fs_base`, `gs_base`, `kernel_gs_base`)
-    /// with `self.msrs` so JIT fast-path fields and MSR reads/writes remain coherent.
-    pub fn sync_msr_mirrors(&mut self) {
-        let (last_efer, last_fs, last_gs, last_kgs) = self.msr_mirrors;
-        if self.efer != last_efer {
-            self.msrs.efer = self.efer;
-        } else if self.msrs.efer != last_efer {
-            self.efer = self.msrs.efer;
-        }
-        if self.fs_base != last_fs {
-            self.msrs.fs_base = self.fs_base;
-        } else if self.msrs.fs_base != last_fs {
-            self.fs_base = self.msrs.fs_base;
-        }
-        if self.gs_base != last_gs {
-            self.msrs.gs_base = self.gs_base;
-        } else if self.msrs.gs_base != last_gs {
-            self.gs_base = self.msrs.gs_base;
-        }
-        if self.kernel_gs_base != last_kgs {
-            self.msrs.kernel_gs_base = self.kernel_gs_base;
-        } else if self.msrs.kernel_gs_base != last_kgs {
-            self.kernel_gs_base = self.msrs.kernel_gs_base;
-        }
-        self.fs.base = self.fs_base;
-        self.gs.base = self.gs_base;
-        self.msr_mirrors = (self.efer, self.fs_base, self.gs_base, self.kernel_gs_base);
-        self.walker.set_nxe((self.efer & crate::msr::EFER_NXE) != 0);
-        self.sync_tlb_tag_bits();
+    /// Borrow the single architectural MSR authority for this vCPU.
+    #[must_use]
+    pub const fn msrs(&self) -> &crate::msr::MsrFile {
+        &self.msrs
     }
 
-    /// Publish MSR file values into the context's fast-path mirror fields after an MSR mutation.
-    pub(crate) fn commit_msrs(&mut self, flush_tlb: bool) {
-        self.efer = self.msrs.efer;
-        self.fs_base = self.msrs.fs_base;
-        self.gs_base = self.msrs.gs_base;
-        self.kernel_gs_base = self.msrs.kernel_gs_base;
-        self.fs.base = self.fs_base;
-        self.gs.base = self.gs_base;
-        self.msr_mirrors = (self.efer, self.fs_base, self.gs_base, self.kernel_gs_base);
-        self.walker.set_nxe((self.efer & crate::msr::EFER_NXE) != 0);
+    #[must_use]
+    pub const fn efer(&self) -> u64 {
+        self.msrs.efer()
+    }
+
+    #[must_use]
+    pub const fn fs_base(&self) -> u64 {
+        self.msrs.fs_base()
+    }
+
+    #[must_use]
+    pub const fn gs_base(&self) -> u64 {
+        self.msrs.gs_base()
+    }
+
+    #[must_use]
+    pub const fn kernel_gs_base(&self) -> u64 {
+        self.msrs.kernel_gs_base()
+    }
+
+    /// Validated MSR write (`WRMSR` rules) updating walker/TLB/segment state atomically.
+    pub fn write_msr(
+        &mut self,
+        index: crate::msr::MsrIndex,
+        value: u64,
+        caps: crate::msr::MsrCapabilities,
+    ) -> Result<crate::msr::MsrWriteEffects, crate::msr::MsrError> {
+        let effects = self.msrs.write(index, value, self.cr0, caps)?;
+        self.fs.base = self.msrs.fs_base();
+        self.gs.base = self.msrs.gs_base();
+        self.walker
+            .set_nxe((self.msrs.efer() & crate::msr::EFER_NXE) != 0);
         self.sync_tlb_tag_bits();
-        if flush_tlb {
+        if effects.flush_tlb {
             self.flush_tlb();
         }
+        Ok(effects)
+    }
+
+    pub fn set_efer(
+        &mut self,
+        efer: u64,
+        caps: crate::msr::MsrCapabilities,
+    ) -> Result<(), crate::msr::MsrError> {
+        self.write_msr(crate::msr::MSR_IA32_EFER, efer, caps)
+            .map(|_| ())
+    }
+
+    pub fn set_fs_base(&mut self, fs_base: u64) -> Result<(), crate::msr::MsrError> {
+        self.write_msr(
+            crate::msr::MSR_IA32_FS_BASE,
+            fs_base,
+            crate::msr::MsrCapabilities::default(),
+        )
+        .map(|_| ())
+    }
+
+    pub fn set_gs_base(&mut self, gs_base: u64) -> Result<(), crate::msr::MsrError> {
+        self.write_msr(
+            crate::msr::MSR_IA32_GS_BASE,
+            gs_base,
+            crate::msr::MsrCapabilities::default(),
+        )
+        .map(|_| ())
+    }
+
+    pub fn set_kernel_gs_base(&mut self, kernel_gs_base: u64) -> Result<(), crate::msr::MsrError> {
+        self.write_msr(
+            crate::msr::MSR_IA32_KERNEL_GS_BASE,
+            kernel_gs_base,
+            crate::msr::MsrCapabilities::default(),
+        )
+        .map(|_| ())
+    }
+
+    /// Exchange `IA32_GS_BASE` and `IA32_KERNEL_GS_BASE` (`SWAPGS`).
+    pub fn swapgs(&mut self) {
+        self.msrs.swapgs();
+        self.gs.base = self.msrs.gs_base();
+    }
+
+    pub(crate) fn sync_efer_lma(&mut self) {
+        self.msrs.sync_lma(self.cr0);
     }
 
     /// This CPU's membership in its inventory's invalidation domain.
@@ -759,7 +792,7 @@ impl SoftCpuContext {
             cr0_wp: (self.cr0 & (1 << 16)) != 0,
             cr4_smep: (self.cr4 & (1 << 20)) != 0,
             cr4_smap: (self.cr4 & (1 << 21)) != 0,
-            efer_nxe: (self.efer & (1 << 11)) != 0,
+            efer_nxe: (self.efer() & (1 << 11)) != 0,
             stack_access: false,
         }
     }
@@ -775,7 +808,7 @@ impl SoftCpuContext {
             cr0_wp: (self.cr0 & (1 << 16)) != 0,
             cr4_smep: (self.cr4 & (1 << 20)) != 0,
             cr4_smap: (self.cr4 & (1 << 21)) != 0,
-            efer_nxe: (self.efer & (1 << 11)) != 0,
+            efer_nxe: (self.efer() & (1 << 11)) != 0,
             stack_access: true,
         }
     }
@@ -1300,8 +1333,8 @@ fn step_maskmov(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result
         ctx.gpr[reg::RDI]
     };
     addr = addr.wrapping_add(match insn.segment_prefix() {
-        Register::FS => ctx.fs_base,
-        Register::GS => ctx.gs_base,
+        Register::FS => ctx.fs_base(),
+        Register::GS => ctx.gs_base(),
         _ => 0,
     });
     let mut destinations = [std::ptr::null_mut(); 16];

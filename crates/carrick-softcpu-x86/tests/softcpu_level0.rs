@@ -997,7 +997,8 @@ fn virtualized_r14_r15_and_fs_gs_bases_work_transparently() {
     ) = (data_va, 0x20);
     let target_addr = data_va + 0x20 * 4 + 0x10;
     mem.write_direct(target_addr, &1000u64.to_le_bytes());
-    (cpu.context_mut().fs_base, cpu.context_mut().gs_base) = (tls_va + 0x100, tls_va + 0x200);
+    cpu.context_mut().set_fs_base(tls_va + 0x100).unwrap();
+    cpu.context_mut().set_gs_base(tls_va + 0x200).unwrap();
     mem.write_direct(tls_va + 0x108, &200u64.to_le_bytes());
     mem.write_direct(tls_va + 0x210, &34u64.to_le_bytes());
 
@@ -1841,12 +1842,12 @@ fn unsupported_implicit_address_forms_refuse_before_mutation() {
         ctx.gpr[reg::RSI] = data;
         ctx.gpr[reg::RDI] = data + 8;
         ctx.gpr[reg::RBX] = data;
-        ctx.fs_base = 4096;
-        ctx.gs_base = 8192;
-        let before = (ctx.gpr, ctx.rflags, ctx.fs_base, ctx.gs_base);
+        ctx.set_fs_base(4096).unwrap();
+        ctx.set_gs_base(8192).unwrap();
+        let before = (ctx.gpr, ctx.rflags, ctx.fs_base(), ctx.gs_base());
         step_ok(&mut cpu, &mut mem, ud(va));
         let ctx = cpu.context();
-        assert_eq!((ctx.gpr, ctx.rflags, ctx.fs_base, ctx.gs_base), before);
+        assert_eq!((ctx.gpr, ctx.rflags, ctx.fs_base(), ctx.gs_base()), before);
         assert_eq!(mem.read_direct(data, 16).unwrap(), [0x55; 16]);
     }
 }

@@ -4,7 +4,11 @@
 //! operate over [`MsrFile`]. Unimplemented MSR indices, reserved bits, and non-canonical
 //! linear-address MSR writes fail closed with [`MsrError::GeneralProtection`] (`#GP(0)`).
 
-use crate::cpuid::GuestCpuidView;
+use std::mem::offset_of;
+use std::sync::OnceLock;
+use std::time::Instant;
+
+use crate::cpuid::{DEFAULT_TSC_HZ, GuestCpuidView};
 use crate::mmu::is_canonical_va;
 
 /// Typed 32-bit architectural MSR selector (`ECX` operand of `RDMSR`/`WRMSR`).
@@ -64,6 +68,7 @@ pub struct MsrCapabilities {
     pub nxe: bool,
     pub tsc_deadline: bool,
     pub x2apic: bool,
+    pub tsc_hz: u64,
 }
 
 impl Default for MsrCapabilities {
@@ -73,6 +78,7 @@ impl Default for MsrCapabilities {
             nxe: true,
             tsc_deadline: false,
             x2apic: false,
+            tsc_hz: DEFAULT_TSC_HZ,
         }
     }
 }
@@ -86,6 +92,7 @@ impl MsrCapabilities {
             nxe: view.supports_nxe(),
             tsc_deadline: view.supports_tsc_deadline(),
             x2apic: view.supports_x2apic(),
+            tsc_hz: view.tsc_hz(),
         }
     }
 }
@@ -97,22 +104,41 @@ pub struct MsrWriteEffects {
     pub flush_tlb: bool,
 }
 
-/// Per-vCPU architectural MSR register file.
+fn default_tsc_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Per-vCPU architectural MSR register file (single owner of `EFER`, `FS_BASE`,
+/// `GS_BASE`, `KERNEL_GS_BASE`, `SYSCALL` MSRs, and guest `TSC` state).
+///
+/// Fields are private so no direct field write can bypass [`Self::write`] validation:
+///
+/// ```compile_fail
+/// use carrick_softcpu_x86::MsrFile;
+/// fn bypass_msr(msrs: &mut MsrFile) { msrs.efer = 0; }
+/// ```
+/// ```compile_fail
+/// use carrick_softcpu_x86::SoftCpuContext;
+/// fn bypass_ctx(ctx: &mut SoftCpuContext) { ctx.fs_base = 0; }
+/// ```
+#[repr(C)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MsrFile {
-    pub tsc: u64,
-    pub apic_base: u64,
-    pub misc_enable: u64,
-    pub pat: u64,
-    pub tsc_deadline: u64,
-    pub efer: u64,
-    pub star: u64,
-    pub lstar: u64,
-    pub cstar: u64,
-    pub fmask: u64,
-    pub fs_base: u64,
-    pub gs_base: u64,
-    pub kernel_gs_base: u64,
+    fs_base: u64,
+    gs_base: u64,
+    kernel_gs_base: u64,
+    efer: u64,
+    star: u64,
+    lstar: u64,
+    cstar: u64,
+    fmask: u64,
+    apic_base: u64,
+    misc_enable: u64,
+    pat: u64,
+    tsc_deadline: u64,
+    tsc_base: u64,
+    tsc_anchor: Option<Instant>,
 }
 
 impl Default for MsrFile {
@@ -122,31 +148,120 @@ impl Default for MsrFile {
 }
 
 impl MsrFile {
+    pub(crate) const FS_BASE_OFFSET: usize = offset_of!(Self, fs_base);
+    pub(crate) const GS_BASE_OFFSET: usize = offset_of!(Self, gs_base);
+
     /// Construct an architectural 64-bit MSR file matching `SoftCpuContext` reset state.
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            tsc: 0,
-            apic_base: DEFAULT_IA32_APIC_BASE,
-            misc_enable: 1,
-            pat: DEFAULT_IA32_PAT,
-            tsc_deadline: 0,
+            fs_base: 0,
+            gs_base: 0,
+            kernel_gs_base: 0,
             efer: EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE,
             star: 0,
             lstar: 0,
             cstar: 0,
             fmask: 0,
-            fs_base: 0,
-            gs_base: 0,
-            kernel_gs_base: 0,
+            apic_base: DEFAULT_IA32_APIC_BASE,
+            misc_enable: 1,
+            pat: DEFAULT_IA32_PAT,
+            tsc_deadline: 0,
+            tsc_base: 0,
+            tsc_anchor: None,
         }
+    }
+
+    pub(crate) fn new_anchored() -> Self {
+        let mut msrs = Self::new();
+        msrs.tsc_anchor = Some(Instant::now());
+        msrs
+    }
+
+    #[must_use]
+    pub const fn efer(&self) -> u64 {
+        self.efer
+    }
+
+    #[must_use]
+    pub const fn star(&self) -> u64 {
+        self.star
+    }
+
+    #[must_use]
+    pub const fn lstar(&self) -> u64 {
+        self.lstar
+    }
+
+    #[must_use]
+    pub const fn cstar(&self) -> u64 {
+        self.cstar
+    }
+
+    #[must_use]
+    pub const fn fmask(&self) -> u64 {
+        self.fmask
+    }
+
+    #[must_use]
+    pub const fn fs_base(&self) -> u64 {
+        self.fs_base
+    }
+
+    #[must_use]
+    pub const fn gs_base(&self) -> u64 {
+        self.gs_base
+    }
+
+    #[must_use]
+    pub const fn kernel_gs_base(&self) -> u64 {
+        self.kernel_gs_base
+    }
+
+    #[must_use]
+    pub const fn apic_base(&self) -> u64 {
+        self.apic_base
+    }
+
+    #[must_use]
+    pub const fn misc_enable(&self) -> u64 {
+        self.misc_enable
+    }
+
+    #[must_use]
+    pub const fn pat(&self) -> u64 {
+        self.pat
+    }
+
+    #[must_use]
+    pub const fn tsc_deadline(&self) -> u64 {
+        self.tsc_deadline
+    }
+
+    /// Sample the guest TSC (`RDTSC` and `RDMSR(IA32_TSC)`) scaled by `tsc_hz`.
+    #[must_use]
+    pub fn read_tsc(&self, tsc_hz: u64) -> u64 {
+        let anchor = self.tsc_anchor.unwrap_or_else(default_tsc_epoch);
+        let nanos = Instant::now().saturating_duration_since(anchor).as_nanos();
+        let delta = (nanos.saturating_mul(u128::from(tsc_hz)) / 1_000_000_000) as u64;
+        self.tsc_base.wrapping_add(delta)
+    }
+
+    /// Synchronize hardware-owned `IA32_EFER.LMA` (`LME && CR0.PG`) after a `CR0` write.
+    pub(crate) fn sync_lma(&mut self, cr0: u64) {
+        let lma = if (self.efer & EFER_LME) != 0 && (cr0 & (1 << 31)) != 0 {
+            EFER_LMA
+        } else {
+            0
+        };
+        self.efer = (self.efer & !EFER_LMA) | lma;
     }
 
     /// Read an architectural MSR (`RDMSR`), returning `Err(MsrError::GeneralProtection)`
     /// for unknown or feature-disabled MSRs.
     pub fn read(&self, index: MsrIndex, caps: MsrCapabilities) -> Result<u64, MsrError> {
         match index {
-            MSR_IA32_TSC => Ok(self.tsc),
+            MSR_IA32_TSC => Ok(self.read_tsc(caps.tsc_hz)),
             MSR_IA32_APIC_BASE => Ok(self.apic_base),
             MSR_IA32_MISC_ENABLE => Ok(self.misc_enable),
             MSR_IA32_PAT => Ok(self.pat),
@@ -180,7 +295,8 @@ impl MsrFile {
         let mut effects = MsrWriteEffects::default();
         match index {
             MSR_IA32_TSC => {
-                self.tsc = value;
+                self.tsc_base = value;
+                self.tsc_anchor = Some(Instant::now());
             }
             MSR_IA32_APIC_BASE => {
                 let phy_limit = if caps.max_phy_addr >= 64 {

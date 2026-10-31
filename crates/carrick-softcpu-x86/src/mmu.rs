@@ -276,6 +276,17 @@ pub fn write_system_bytes<M: SoftMmuMemory>(
     )
 }
 
+/// Pre-validate an implicit supervisor system-table write of `len` bytes without modifying memory.
+pub(crate) fn check_system_write<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    va: u64,
+    len: usize,
+) -> Result<(), SoftPageFault> {
+    let mode = ctx.system_access_mode();
+    walk_span_mode(ctx, mem, va, len, SoftAccessKind::Write, mode, |_, _, _| {})
+}
+
 /// Validate then copy a span. One admission covers both passes and every
 /// copy, so no pointer outlives the CPU's admission.
 fn walk_span_mode<M: SoftMmuMemory>(
