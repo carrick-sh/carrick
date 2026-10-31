@@ -164,9 +164,20 @@ pub(crate) struct Class {
     trigger: bool,
     human: bool,
 }
-/// Whose text may reach the agent at all: a bot, or a [`TRUSTED`] association.
+/// Whose text may reach the agent at all: an [`OUTCOME_BOTS`] login or a
+/// [`TRUSTED`] association. A missing login (a deleted user) fails closed.
 fn trusted(user: &Value, association: &Value) -> bool {
-    bot(user) || association.as_str().is_some_and(|a| TRUSTED.contains(&a))
+    let Some(login) = user["login"].as_str() else {
+        return false;
+    };
+    if bot(user) {
+        // REST logins end in `[bot]`; GraphQL logins do not.
+        let name = login.trim_end_matches("[bot]");
+        return OUTCOME_BOTS
+            .iter()
+            .any(|b| b.trim_end_matches("[bot]") == name);
+    }
+    association.as_str().is_some_and(|a| TRUSTED.contains(&a))
 }
 pub(crate) fn classify(user: &Value, association: &Value, body: &str) -> Option<Class> {
     if body.contains(MARKER) {
@@ -1309,6 +1320,33 @@ mod tests {
                 human: true
             })
         );
+    }
+
+    #[test]
+    fn dispatch_reactor_history_admits_only_trusted_authors() {
+        let member = json!("MEMBER");
+        assert!(trusted(
+            &json!({"login":"tjfontaine","__typename":"User"}),
+            &json!("OWNER")
+        ));
+        assert!(trusted(
+            &json!({"login":"github-actions","__typename":"Bot"}),
+            &Value::Null
+        ));
+        assert!(trusted(
+            &json!({"login":"carrick-workers[bot]","type":"Bot"}),
+            &Value::Null
+        ));
+        // A deleted user has no login; another App's bot is not an outcome bot.
+        assert!(!trusted(&Value::Null, &member));
+        assert!(!trusted(
+            &json!({"login":"some-app[bot]","type":"Bot"}),
+            &member
+        ));
+        assert!(!trusted(
+            &json!({"login":"drive-by","__typename":"User"}),
+            &json!("NONE")
+        ));
     }
 
     #[test]
