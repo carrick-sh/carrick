@@ -467,6 +467,13 @@ fn loop_client_alias_sends_one_strict_json_request() {
     );
 }
 
+/// The guard's GraphQL issue-brief response for `issue`, unedited since filing.
+fn issue_brief(issue: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"data":{"repository":{"issue":{"number":issue["number"],
+        "author":{"login":issue["user"]["login"]},"lastEditedAt":null,"editor":null,
+        "body":issue["body"]}}}})
+}
+
 #[test]
 fn review_setup_failure_posts_fallback_only_on_the_admitted_pr() {
     use serde_json::json;
@@ -493,6 +500,7 @@ fn review_setup_failure_posts_fallback_only_on_the_admitted_pr() {
     for (name, value) in [
         ("pr.json", json!([pr.clone()])),
         ("pr-object.json", pr.clone()),
+        ("issue-brief.json", issue_brief(&issue)),
         ("issue.json", issue),
         ("run.json", run),
     ] {
@@ -508,6 +516,7 @@ set -eu
 printf '%s\n' "$@" >> "$RUNNER_TEMP/gh.args"
 if [ "$1" = api ]; then
   case "$2" in
+    graphql) cat "$RUNNER_TEMP/issue-brief.json" ;;
     */collaborators/tjfontaine/permission) echo '{"permission":"admin"}' ;;
     */actions/runs/42) cat "$RUNNER_TEMP/run.json" ;;
     */pulls/800) cat "$RUNNER_TEMP/pr-object.json" ;;
@@ -759,6 +768,7 @@ fn issue_triggers_default_to_run_branch_without_parsing_body_directives() {
             }
             let event_path = temp.path().join("event.json");
             for (path, value) in [
+                ("issue-brief.json", issue_brief(&event["issue"])),
                 ("event.json", event),
                 ("prs.json", if owned { json!([pr]) } else { json!([]) }),
                 ("run.json", run),
@@ -771,6 +781,7 @@ fn issue_triggers_default_to_run_branch_without_parsing_body_directives() {
                 &gh,
                 r#"#!/bin/sh
 case "$2" in
+ graphql) cat "$RUNNER_TEMP/issue-brief.json" ;;
  */collaborators/tjfontaine/permission) echo '{"permission":"admin"}' ;;
  *'/pulls?'*) cat "$RUNNER_TEMP/prs.json" ;;
  */actions/runs/42) cat "$RUNNER_TEMP/run.json" ;;
