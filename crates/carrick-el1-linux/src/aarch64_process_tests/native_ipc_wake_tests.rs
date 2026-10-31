@@ -818,6 +818,16 @@ fn serial_host_deliverable_signal_does_not_cancel_mm_edit_conflict() {
     };
     use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
 
+    struct RootRegistration<'a> {
+        registry: &'a NativeProcessRegistry<'a, Mm, Aarch64ParkedContext>,
+        runtime: Arc<NativeProcessRuntime<'a, Mm, Aarch64ParkedContext>>,
+    }
+    impl Drop for RootRegistration<'_> {
+        fn drop(&mut self) {
+            self.registry.unregister_root_for_test(&self.runtime);
+        }
+    }
+
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -836,10 +846,14 @@ fn serial_host_deliverable_signal_does_not_cancel_mm_edit_conflict() {
         )
         .unwrap(),
     );
-    let owner_registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+    let owner_registry = registry();
     owner_registry
         .register_root(runtime.clone(), source, &fixture.task, fixture.address)
         .unwrap();
+    let _registration = RootRegistration {
+        registry: owner_registry,
+        runtime: runtime.clone(),
+    };
     let binding = runtime
         .task_binding(TaskKey {
             id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
@@ -974,5 +988,19 @@ fn serial_host_deliverable_signal_does_not_cancel_mm_edit_conflict() {
             .waiters,
         0,
         "the prepared-transfer owner releases its edit waiter"
+    );
+    let weak_runtime = Arc::downgrade(&runtime);
+    drop(entry);
+    drop(_registration);
+    drop(runtime);
+    assert!(
+        owner_registry
+            .for_record(fixture.zone, binding.record)
+            .is_none()
+    );
+    assert_eq!(
+        weak_runtime.strong_count(),
+        0,
+        "registry teardown must release the root runtime and its signal summary"
     );
 }
