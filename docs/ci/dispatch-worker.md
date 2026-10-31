@@ -111,48 +111,59 @@ guard, clone admission, the controller and the loop. Owner reviews
 ### Reactor (#1193)
 
 `carrick-xtask dispatch-worker reactor once|run` runs on the owner's Mac as the
-owner's user and watches PR conversation so the owner does not have to type
-every `/agent`. Each cycle (`run` repeats every 60 s) reads open PRs, issue
-comments, PR review comments and reviews newer than a cursor, then asks a
-local agent (`claude -p`, model `--model`, default `sonnet`) for one JSON
-decision per PR with new events: `ignore`, `reply` or `round`.
+owner's user and helps open PRs get finished, so the owner does not have to
+type every `/agent`. Each cycle (`run` repeats every 60 s) reads open PRs,
+their comments, review comments, reviews and completed GitHub Actions runs,
+then asks a local agent (`claude -p`, model `--model`, default `sonnet`) for
+one JSON decision per PR with new events: `ignore`, `reply` or `round`.
 
-The agent only proposes; code decides what is posted, as the owner's `gh`
-login, with the hidden marker `<!-- carrick-reactor -->`:
+The agent judges; code only guards. Code decides nothing about what an
+event means. It gathers facts, wakes the agent, and checks what the agent
+proposes before posting it as the owner's `gh` login with the hidden marker
+`<!-- carrick-reactor -->`.
 
+**What wakes the agent** (every open PR, however old; PRs labelled
+`agent:hold` are skipped):
+
+- A comment, review comment or review from the owner, an org member or a
+  collaborator. Owner `/agent` commands are left to the dispatch workflow.
+- A dispatch outcome comment (from `github-actions[bot]` or
+  `carrick-workers[bot]`, containing "Dispatch outcome").
+- Any completed Actions run on the PR's current head SHA, whatever its
+  conclusion; the agent tells a code failure from an infrastructure one and
+  a green run from one that needs follow-up. `dispatch-worker.yml`'s own
+  runs report through outcome comments instead. Runs are read from
+  `actions/runs?status=completed`, created up to three hours before a
+  separate run cursor.
+- A director or owned dispatch PR whose head has had no push for 15
+  minutes, once per head, so a PR nobody is talking about still gets looked
+  at.
+
+**What the agent sees:** the PR's head, last push, CI rollup, whether it is
+a director PR, adoptable or owned, its closing-reference count, reactor
+rounds so far, whether a dispatch run is in flight, the last five trusted
+comments and the new events. It decides, for example, to ask for
+`Closes #N` when that is what blocks adoption.
+
+**What code enforces:**
+
+- Text from anyone outside the owner, org members and collaborators never
+  reaches the agent, including in the comment history. Bots other than the
+  two outcome bots are not events. Missing association fails closed.
 - A `round` posts `/agent <brief>`, which the dispatch guard admits as an
   unedited owner comment. It is posted only when the PR passes `adopted_pr`
   or is an owned dispatch PR, no `dispatch-worker.yml` run is queued or in
   progress for that PR, and fewer than four dispatch runs are in flight.
-- At most one reactor round per PR head, unless an owner comment arrived
-  after the last reactor round. State records the round's head and
-  time.
-- At most three reactor rounds on a PR in a row without an owner comment in
-  between, so a round whose push fails CI again cannot loop across heads.
+- At most one reactor round per PR head, and at most three in a row, unless
+  the owner commented after the last one. Only the owner's comments reset
+  these limits.
 - A `reply` posts plain text; text starting with `/agent` is refused.
-- Dispatch outcome comments (from `github-actions[bot]` or
-  `carrick-workers[bot]`, containing "Dispatch outcome") are events, so a
-  finished, blocked or failed round gets a decision. Other bot comments and
-  comments carrying the marker are not. Owner `/agent` commands do not ask
-  for a decision but count as an owner comment. Only the owner's comments
-  reset the two round limits; anyone can comment on a public PR, so other
-  people's comments ask for a decision but do not re-enable a round. PRs labelled `agent:hold` are
-  skipped.
-- Failed GitHub Actions runs are events. A completed run concluding
-  `failure`, `timed_out`, `startup_failure` or `action_required` on a PR's
-  current head SHA asks for a decision on that PR. This applies to every open
-  director PR and owned dispatch PR, however old: the point is to finish PRs
-  that already exist. Successful, skipped and cancelled runs, runs on an older
-  head, and `dispatch-worker.yml`'s own runs (reported through outcome
-  comments) are not events. Runs are read from
-  `actions/runs?status=completed`, created up to three hours before a
-  separate run cursor.
-- Every open PR is in scope, however old: the reactor exists to finish PRs.
-  A director PR without exactly one closing reference gets one reply asking
-  for `Closes #N`, once per PR, and an adoptable PR with no push for 15
-  minutes and no reactor round yet counts as one event per head. Label a PR
-  `agent:hold` to keep the reactor off it.
 - The reactor never merges, pushes, edits, labels or closes anything.
+- Each cycle reads the repo and org interaction limits and logs a warning
+  when either is not `collaborators_only` or expires within 30 days. GitHub
+  caps a limit at six months; renew with
+  `gh api -X PUT orgs/carrick-sh/interaction-limits -f limit=collaborators_only -f expiry=six_months`
+  (and the same on `repos/carrick-sh/carrick`).
 
 State (cursor and per-PR memory) lives in
 `~/Library/Application Support/carrick-reactor/state.json`, or `--state`.
