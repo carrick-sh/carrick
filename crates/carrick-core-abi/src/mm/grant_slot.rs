@@ -22,6 +22,43 @@ impl Default for PortalGrantSlot {
     }
 }
 impl PortalGrantSlot {
+    /// Included in the image ABI hash: older hosts cannot serve this demand.
+    pub const PREPARED_SELECTION_STATE: u64 = 5;
+
+    pub fn publish_prepared_fault_selection(
+        &self,
+        request_generation: u64,
+        window: PortalGrantWindow,
+    ) -> bool {
+        if window.range.len() != 4096
+            || window.range.start() != window.fault_page
+            || !self.publish_fault_selection(request_generation, window)
+        {
+            return false;
+        }
+        // The publishing ring lane still exclusively owns its slot. Intake
+        // cannot start until the lane stamps the retained service request.
+        self.state
+            .store(Self::PREPARED_SELECTION_STATE, Ordering::Release);
+        true
+    }
+
+    pub fn pending_prepared_fault_selection(
+        &self,
+        mm: u64,
+        address: u64,
+    ) -> Option<(u64, PortalGrantWindow)> {
+        if self.state.load(Ordering::Acquire) != Self::PREPARED_SELECTION_STATE {
+            return None;
+        }
+        let generation = self.fault_generation.load(Ordering::Relaxed);
+        let window = PortalGrantWindow::decode(core::array::from_fn(|i| {
+            self.window[i].load(Ordering::Relaxed)
+        }))?;
+        (window.operation.mm.raw() == mm && window.fault_page == address & !4095)
+            .then_some((generation, window))
+    }
+
     pub const fn new() -> Self {
         Self {
             state: AtomicU64::new(0),
@@ -97,6 +134,7 @@ impl PortalGrantSlot {
     pub fn native_fault_sequence(&self, mm: u64, address: u64) -> Option<core::num::NonZeroU64> {
         let (generation, window) = self
             .pending_cow_fault_selection(mm, address)
+            .or_else(|| self.pending_prepared_fault_selection(mm, address))
             .or_else(|| self.pending_fault_selection(mm, address))?;
         (generation == window.operation.sequence.get()).then_some(window.operation.sequence)
     }
@@ -120,7 +158,7 @@ impl PortalGrantSlot {
                 Err(ServiceError::Stale)
             };
         };
-        if !matches!(state, 3 | 4) {
+        if !matches!(state, 3 | 4 | Self::PREPARED_SELECTION_STATE) {
             return Err(ServiceError::Stale);
         }
         self.state
@@ -144,7 +182,9 @@ impl PortalGrantSlot {
             return Err(ServiceError::Stale);
         };
         self.state.store(0, Ordering::Release);
-        Ok(Some(if state == 4 {
+        Ok(Some(if state == Self::PREPARED_SELECTION_STATE {
+            ServiceFaultSupply::Prepared(window)
+        } else if state == 4 {
             ServiceFaultSupply::Cow(window)
         } else {
             ServiceFaultSupply::Backing(window)

@@ -180,6 +180,9 @@ const UXN: u64 = 1 << 54;
 // AP on a prepared leaf records host-buffer permission even while invalid;
 // AP_PRIV_RO denies a host-forwarded PROT_NONE access. Retired leaves retain
 // their output only for lease accounting, never access or permission authority.
+// 59: deferred fork COW (`SW_FORK_COW_DEFERRED`), only on an invalid prepared
+//     private leaf. Hardware ignores every bit of an invalid descriptor; on a
+//     valid one bits 62:59 are PBHA, so the marker is cleared before VALID.
 const SW_RETIRED: u64 = 1 << 55;
 /// Bit 55 is retirement only on invalid leaves. On valid EL1-private leaves
 /// it marks fork COW, separating hardware write restriction from mprotect.
@@ -220,6 +223,51 @@ const SW_EL1_PRIVATE: u64 = 1 << 56;
 const SW_EL1_MAY_WRITE: u64 = 1 << 57;
 /// EL1 execute ceiling.
 const SW_EL1_MAY_EXEC: u64 = 1 << 58;
+/// Deferred fork COW on an invalid prepared EL1-private leaf. Fork cannot
+/// arm [`SW_EL1_COW`] there (invalid bit 55 means retired), yet the leaf's
+/// retained output is now shared with the other side of the fork. Fork
+/// records the intent here instead; the first residency (a `Publish`, or a
+/// host revalidation) consumes it into the `arm_private_cow` encoding before
+/// VALID is set, so the first write takes the existing EL1 COW copy. Never
+/// present on a valid descriptor (bits 62:59 are PBHA there).
+const SW_FORK_COW_DEFERRED: u64 = 1 << 59;
+
+/// Whether `descriptor` is an invalid prepared leaf carrying deferred fork COW.
+pub fn terminal_descriptor_defers_fork_cow(descriptor: u64) -> bool {
+    descriptor & SW_FORK_COW_DEFERRED != 0
+        && el1_private_leaf_state(descriptor) == El1PrivateLeafState::Prepared
+}
+
+/// The fork arm of a resident private leaf, as `PtOp::ForkReadOnly` makes
+/// it: `arm_private_cow` records the current Linux write intent, then EL0
+/// write is revoked. Read-only and PROT_NONE permissions are kept.
+fn arm_resident_fork_cow(resident: u64) -> u64 {
+    let armed = arm_private_cow(resident);
+    if armed & AP_MASK == AP_RW {
+        (armed & !AP_MASK) | AP_RO
+    } else {
+        armed
+    }
+}
+
+/// Settle the deferred fork-COW marker of `before` in its edited successor
+/// `after`. Every descriptor edit goes through this one rule: a leaf that
+/// stays prepared keeps the marker (protect, invalidate, split, fork again);
+/// a leaf that becomes resident is fork-COW armed with the marker consumed;
+/// a retired, unowned or malformed result drops it.
+fn settle_deferred_fork_cow(before: u64, after: u64) -> u64 {
+    let after = after & !SW_FORK_COW_DEFERRED;
+    if before & SW_FORK_COW_DEFERRED == 0 {
+        return after;
+    }
+    match el1_private_leaf_state(after) {
+        El1PrivateLeafState::Prepared => after | SW_FORK_COW_DEFERRED,
+        El1PrivateLeafState::Resident => arm_resident_fork_cow(after),
+        El1PrivateLeafState::Unowned
+        | El1PrivateLeafState::Retired
+        | El1PrivateLeafState::Malformed => after,
+    }
+}
 
 pub use carrick_guest_arch::El1PrivateLeafState;
 
@@ -375,6 +423,137 @@ mod stage1_fault_kind_tests {
             assert!(kind.stale_retry_needs_invalidation(1));
             assert!(kind.stale_retry_needs_invalidation(2));
         }
+    }
+}
+
+/// Deferred fork COW on prepared leaves (#1107, #1146): the marker's one
+/// meaning, and the host editor's per-terminal rule over it.
+#[cfg(test)]
+mod deferred_fork_cow_tests {
+    use super::*;
+
+    const OUTPUT: u64 = 0x009b_4000_0000;
+
+    fn prepared(ap: u64) -> u64 {
+        OUTPUT
+            | (USER_PAGE_FLAGS & !VALID & !AP_MASK)
+            | ap
+            | NON_GLOBAL
+            | UXN
+            | SW_EL1_PRIVATE
+            | SW_EL1_MAY_WRITE
+    }
+
+    fn rule(rule: TerminalRule, desc: u64) -> Option<u64> {
+        terminal_rule_edit(true, rule, desc, 3, 0).unwrap()
+    }
+
+    fn forked(desc: u64) -> u64 {
+        rule(TerminalRule::fork_arm(false), desc).unwrap_or(desc)
+    }
+
+    #[test]
+    fn deferred_fork_cow_marker_has_one_meaning_and_never_reaches_a_valid_leaf() {
+        // A software bit distinct from every hardware field Carrick encodes
+        // and from every other EL1 software tag, valid or invalid.
+        for other in [
+            VALID,
+            TYPE_BITS,
+            0b111 << 2, // AttrIndx
+            1 << 5,     // NS
+            AP_MASK,
+            0b11 << 8, // SH
+            ACCESS_FLAG,
+            NON_GLOBAL,
+            PA_MASK_4KIB,
+            1 << 52, // Contiguous
+            1 << 53, // PXN
+            UXN,
+            SW_RETIRED,
+            SW_EL1_COW,
+            SW_EL1_PRIVATE,
+            SW_EL1_MAY_WRITE,
+            SW_EL1_MAY_EXEC,
+        ] {
+            assert_eq!(SW_FORK_COW_DEFERRED & other, 0, "{other:#x}");
+        }
+        let leaf = forked(prepared(AP_RW));
+        assert_eq!(leaf, prepared(AP_RW) | SW_FORK_COW_DEFERRED);
+        // On an invalid leaf the marker changes no classification.
+        assert_eq!(el1_private_leaf_state(leaf), El1PrivateLeafState::Prepared);
+        assert!(terminal_descriptor_defers_fork_cow(leaf));
+        assert!(!terminal_descriptor_defers_fork_cow(prepared(AP_RW)));
+        assert!(!terminal_descriptor_is_retired(leaf));
+        assert!(!terminal_descriptor_is_fork_cow(leaf));
+        for access in [LeafAccess::Read, LeafAccess::Write, LeafAccess::Execute] {
+            assert_eq!(
+                terminal_descriptor_permits_host_buffer(leaf, access),
+                terminal_descriptor_permits_host_buffer(prepared(AP_RW), access),
+                "{access:?}"
+            );
+        }
+        // Every host revalidation clears it before VALID and arms fork COW.
+        for (op, writable) in [
+            (PtOp::ReadWrite { exec: false }, true),
+            (PtOp::ReadOnly { exec: false }, false),
+            (PtOp::KernelReadOnly { exec: false }, false),
+        ] {
+            let valid = rule(TerminalRule::pt(op), leaf).unwrap();
+            assert_eq!(valid & (VALID | SW_FORK_COW_DEFERRED), VALID, "{op:?}");
+            assert!(terminal_descriptor_is_fork_cow(valid), "{op:?}");
+            assert!(
+                !terminal_descriptor_permits_el0(valid, LeafAccess::Write),
+                "{op:?}"
+            );
+            assert_eq!(terminal_descriptor_may_write(valid), writable, "{op:?}");
+            assert_eq!(valid & PA_MASK_4KIB, OUTPUT, "{op:?}");
+        }
+        // Without the marker the same revalidation stays an ordinary leaf.
+        let plain = rule(
+            TerminalRule::pt(PtOp::ReadWrite { exec: false }),
+            prepared(AP_RW),
+        )
+        .unwrap();
+        assert!(!terminal_descriptor_is_fork_cow(plain));
+        assert!(terminal_descriptor_permits_el0(plain, LeafAccess::Write));
+    }
+
+    #[test]
+    fn host_rules_preserve_or_consume_deferred_fork_cow_on_prepared_leaves() {
+        let leaf = forked(prepared(AP_RW));
+        // Fork again (a grandchild): already recorded, nothing to store.
+        assert_eq!(rule(TerminalRule::fork_arm(false), leaf), None);
+        assert_eq!(rule(TerminalRule::fork_arm(true), leaf), None);
+        // Host PROT_NONE invalidation keeps it.
+        let none = rule(
+            TerminalRule::Pt {
+                op: Some(PtOp::Invalidate),
+                reset_retired: false,
+                deny_host_buffers: true,
+                fork_arm: false,
+                adopt_private: false,
+            },
+            leaf,
+        )
+        .unwrap_or(leaf);
+        assert!(terminal_descriptor_defers_fork_cow(none));
+        // munmap retirement drops it with the lease.
+        let retired = rule(TerminalRule::pt(PtOp::Retire), leaf).unwrap();
+        assert_eq!(retired & SW_FORK_COW_DEFERRED, 0);
+        assert!(terminal_descriptor_is_retired(retired));
+        // A BUS tail removes private authority and the marker with it.
+        let bus = rule(TerminalRule::BusFault, leaf).unwrap();
+        assert_eq!(bus & SW_FORK_COW_DEFERRED, 0);
+        assert!(!terminal_descriptor_has_el1_private_authority(bus));
+        // PROT_NONE across two forks stays deferred; a later RW
+        // revalidation still arms COW instead of granting a shared write.
+        let prot_none = forked(prepared(AP_PRIV_RO));
+        assert!(terminal_descriptor_defers_fork_cow(prot_none));
+        assert_eq!(rule(TerminalRule::fork_arm(false), prot_none), None);
+        let rw = rule(TerminalRule::pt(PtOp::ReadWrite { exec: false }), prot_none).unwrap();
+        assert!(terminal_descriptor_is_fork_cow(rw));
+        assert!(!terminal_descriptor_permits_el0(rw, LeafAccess::Write));
+        assert!(terminal_descriptor_may_write(rw));
     }
 }
 
@@ -1205,11 +1384,12 @@ pub(crate) fn pt_terminal_edit(
             // later in-place edit or split treats as carrying one.
             PtOp::Invalidate | PtOp::Retire | PtOp::ForkReadOnly if empty => true,
             // A speculative EL1 grant leaf has no live EL0 write
-            // permission to revoke at fork. Keep its current AP as
-            // Linux intent until first touch publishes the page under
-            // the backend's armed physical COW authority.
+            // permission to revoke at fork, and invalid bit 55 would mean
+            // retirement. Keep its current AP as Linux intent and record
+            // deferred fork COW, which its first residency consumes into
+            // the armed COW encoding. A grandchild fork finds it recorded.
             PtOp::ForkReadOnly if terminal_descriptor_is_prepared_private(desc) => {
-                desc & NON_GLOBAL != 0
+                desc & NON_GLOBAL != 0 && desc & SW_FORK_COW_DEFERRED != 0
             }
             _ => pt_satisfies(
                 asid_scoped_leaves,
@@ -1291,7 +1471,13 @@ pub(crate) fn pt_terminal_edit(
         | PtOp::ReadWrite { .. }
         | PtOp::KernelReadOnly { .. } => pt_desc_for(asid_scoped_leaves, op, block_start, level),
     };
-    Some(new_desc)
+    Some(
+        if matches!(op, PtOp::ForkReadOnly) && terminal_descriptor_is_prepared_private(desc) {
+            new_desc | SW_FORK_COW_DEFERRED
+        } else {
+            settle_deferred_fork_cow(desc, new_desc)
+        },
+    )
 }
 
 /// One range rule that the host editor ([`PageTableManager::apply_rule`]) and
@@ -1404,7 +1590,10 @@ pub fn terminal_rule_edit(
             El1PrivateLeafState::Resident => Err(TerminalRefusal::Resident),
             El1PrivateLeafState::Malformed => Err(TerminalRefusal::Malformed),
             El1PrivateLeafState::Prepared => Ok(Some(
-                desc & !(SW_EL1_PRIVATE | SW_EL1_MAY_WRITE | SW_EL1_MAY_EXEC),
+                desc & !(SW_EL1_PRIVATE
+                    | SW_EL1_MAY_WRITE
+                    | SW_EL1_MAY_EXEC
+                    | SW_FORK_COW_DEFERRED),
             )),
             El1PrivateLeafState::Unowned | El1PrivateLeafState::Retired => Ok(None),
         },

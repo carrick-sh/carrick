@@ -175,6 +175,7 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
                         crate::aarch64::descriptor_txn::DescriptorOp::Prepare {
                             resident, ..
                         } => resident,
+                        crate::aarch64::descriptor_txn::DescriptorOp::Publish { span, .. } => span,
                         _ => return WireOutcome::Refused(DescriptorRefusal::BadEncoding),
                     },
                     tables_linked,
@@ -199,6 +200,37 @@ impl X86Mmu {
         consume: impl FnOnce(&DescriptorTxn<'_>) -> T,
     ) -> Result<T, DescriptorRefusal> {
         use crate::aarch64::descriptor_txn::DescriptorOp as WireOp;
+        if let WireOp::Publish {
+            span,
+            expected_ipa,
+            access,
+        } = txn.op
+        {
+            let root = Self::root(register).map_err(|_| DescriptorRefusal::StaleRoot)?;
+            if root.address().raw() != txn.root.raw() || !txn.tables.as_slice().is_empty() {
+                return Err(DescriptorRefusal::StaleRoot);
+            }
+            let range = UserRange::checked(UserVa::new(span.va), GuestLen::new(span.len))
+                .ok_or(DescriptorRefusal::BadRange)?;
+            // SAFETY: the shared grant owner retains the exact-MM editor and
+            // authenticated mapping window through descriptor execution.
+            let owner = unsafe { EditOwner::issue(root, txn.id.mm_key, txn.id.generation) };
+            let intent = EditIntent::checked(
+                owner,
+                range,
+                EditOperation::Publish {
+                    expected: FrameGpa::new(expected_ipa.raw()),
+                    access: match access {
+                        LeafAccess::Read => carrick_guest_arch::Access::Read,
+                        LeafAccess::Write => carrick_guest_arch::Access::Write,
+                        LeafAccess::Execute => carrick_guest_arch::Access::Execute,
+                    },
+                },
+                &[],
+            )
+            .ok_or(DescriptorRefusal::BadRange)?;
+            return Ok(consume(&DescriptorTxn::from_intent(&intent)?));
+        }
         let WireOp::Prepare {
             publication,
             resident,

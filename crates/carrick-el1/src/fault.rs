@@ -253,6 +253,9 @@ impl PreparedPageResolver for HardwarePreparedResolver {
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
         Ok(outcome)
     }
+    fn inherited_prepared_supply(&self) -> bool {
+        true
+    }
 }
 
 /// Invalidate this CPL0 CPU's TLB entry for the page holding `va` in the
@@ -1561,16 +1564,41 @@ fn dispatch_classified_fault<
                 }
                 Err(_) => return None,
             };
-            let window = match prepared
-                .as_mut()?
+            let path = prepared.as_mut()?;
+            let window = match path
                 .resolver
                 .select_backing_window(editor.grant().ttbr0, window)
             {
                 Ok(window) => window,
-                Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied) => {
-                    // Same verdict as an occupied reply at application: a
-                    // concurrent publication invalidates the observed fault,
-                    // not the instruction. Re-enter without physical supply.
+                Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied)
+                    if path.resolver.inherited_prepared_supply() =>
+                {
+                    // The output exists but is still invalid. The child's
+                    // inherited physical custody, not fresh zero backing, must
+                    // authorize this page's first publication.
+                    let mut page = window;
+                    page.host_backing = match window.host_backing {
+                        Some(source) => {
+                            Some(source.advance(window.fault_page - window.range.start())?)
+                        }
+                        None => None,
+                    };
+                    page.range = carrick_el1_abi::ReservationRange::new(
+                        window.fault_page,
+                        window.fault_page.checked_add(4096)?,
+                    )?;
+                    let slot = owner.slots.grant(slot as usize)?;
+                    return slot
+                        .publish_prepared_fault_selection(window.operation.sequence.get(), page)
+                        .then_some(());
+                }
+                // A valid publication raced the observed fault, or this lane
+                // has no inherited-prepared supply for an occupied leaf.
+                // Re-enter without physical supply.
+                Err(
+                    carrick_mmu_core::descriptor_refusal::DescriptorRefusal::AlreadyValid
+                    | carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied,
+                ) => {
                     retry = true;
                     return None;
                 }

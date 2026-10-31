@@ -25,7 +25,21 @@ pub fn select_backing_window<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             continue;
         }
         if page == window.fault_page {
-            return Err(DescriptorRefusal::Occupied);
+            // Occupancy is not residency: fork also inherits invalid prepared
+            // outputs without a lazy-grant residency row. Only a live walk
+            // under the caller's editor can authorize retrying the instruction.
+            let root = B::root(root).map_err(|_| DescriptorRefusal::StaleRoot)?;
+            return match B::translate(
+                words,
+                root,
+                carrick_guest_arch::UserVa::new(page),
+                carrick_mmu_core::aarch64::LeafAccess::Read,
+                false,
+            ) {
+                Ok(Some(_)) => Err(DescriptorRefusal::AlreadyValid),
+                Ok(None) => Err(DescriptorRefusal::Occupied),
+                Err(_) => Err(DescriptorRefusal::Malformed),
+            };
         }
         if page < window.fault_page {
             start = page + 4096;
@@ -252,6 +266,55 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
         };
         if !authenticated {
             return DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot);
+        }
+        if let DescriptorOp::Publish { span, access, .. } = txn.op {
+            // This reply owns existing fork custody, not a fresh grant. The
+            // descriptor executor checks the exact output and consumes the
+            // leaf's deferred fork COW: the output is published COW-armed,
+            // so the first write from either process copies it.
+            let permitted = match access {
+                carrick_mmu_core::aarch64::LeafAccess::Read => {
+                    window
+                        .protection
+                        .permits(carrick_core_abi::ReservationProtection::READ)
+                        || window
+                            .protection
+                            .permits(carrick_core_abi::ReservationProtection::WRITE)
+                }
+                carrick_mmu_core::aarch64::LeafAccess::Execute => window
+                    .protection
+                    .permits(carrick_core_abi::ReservationProtection::EXECUTE),
+                carrick_mmu_core::aarch64::LeafAccess::Write => false,
+            };
+            if window.range.len() != 4096
+                || window.range.start() != window.fault_page
+                || span.va != window.fault_page
+                || span.len != 4096
+                || !txn.tables.as_slice().is_empty()
+                || !permitted
+            {
+                return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
+            }
+            // Another publisher may have made this instruction usable while
+            // the owner retained its reply, including at a different output
+            // after COW. Do not turn that valid publication into WrongBacking
+            // and a fatal native completion. An invalid leaf still needs the
+            // exact retained output authenticated by Publish below.
+            if let Ok(root) = B::root(grant.ttbr0)
+                && matches!(
+                    B::translate(
+                        words,
+                        root,
+                        carrick_guest_arch::UserVa::new(window.fault_page),
+                        access,
+                        true
+                    ),
+                    Ok(Some(_))
+                )
+            {
+                return DescriptorOutcome::Refused(DescriptorRefusal::Occupied);
+            }
+            return B::execute_grant(words, grant.ttbr0, txn);
         }
         let DescriptorOp::Prepare {
             publication,

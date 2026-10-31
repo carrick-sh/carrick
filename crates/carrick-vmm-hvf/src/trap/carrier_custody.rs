@@ -469,6 +469,7 @@ pub struct CarrierVmCustody {
         Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<carrick_hal::asid::AsidGeneration>>,
     >,
     pub(crate) native_exec_receipt_sequence: std::sync::atomic::AtomicU64,
+    pub(crate) guest_capture: std::sync::Arc<crate::guest_capture::GuestCapture>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -810,6 +811,7 @@ impl CarrierVmCustody {
             native_exec_preparations: parking_lot::Mutex::new(Vec::new()),
             native_exec_predecessors: parking_lot::Mutex::new(Vec::new()),
             native_exec_receipt_sequence: std::sync::atomic::AtomicU64::new(0),
+            guest_capture: std::sync::Arc::new(crate::guest_capture::GuestCapture::new()),
         }
     }
 

@@ -15,6 +15,7 @@ impl RecordPinVenue for PinVenue {
 #[derive(Debug)]
 pub(super) struct PhysicalChild {
     _inherited: RecordPin<PinVenue>,
+    pub inherited: Vec<carrick_el1_abi::PortalForkCustody>,
     pub supplied: Option<carrick_hal::physical_grants::NativePhysicalGrants<SupplyBacking>>,
 }
 impl carrick_hal::physical_grants::NativeSupplyCustody for PhysicalChild {
@@ -23,6 +24,31 @@ impl carrick_hal::physical_grants::NativeSupplyCustody for PhysicalChild {
         &mut self,
     ) -> Option<&mut carrick_hal::physical_grants::NativePhysicalGrants<SupplyBacking>> {
         self.supplied.as_mut()
+    }
+}
+impl carrick_hal::physical_grants::NativePreparedSupplyCustody for PhysicalChild {
+    fn retained_prepared_frame(
+        &self,
+        address: UserVa,
+    ) -> Option<carrick_el1_abi::PortalForkCustody> {
+        self.inherited.iter().copied().find(|row| {
+            matches!(row, carrick_el1_abi::PortalForkCustody::Frame { va, len, shared: false, .. }
+                if address.raw() >= *va && address.raw() + 4096 <= *va + *len)
+        })
+    }
+    fn prepared_supply(
+        &mut self,
+        owner: carrick_hal::GuestFrameOwner,
+    ) -> (
+        &mut carrick_hal::physical_grants::NativePhysicalGrants<Self::Backing>,
+        Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
+    ) {
+        (
+            self.supplied.get_or_insert_with(|| {
+                carrick_hal::physical_grants::NativePhysicalGrants::new(owner)
+            }),
+            Arc::default(),
+        )
     }
 }
 pub(super) struct SupplyBacking {
@@ -200,10 +226,26 @@ impl PhysicalStock {
                 settlement,
                 |_| true,
                 |_| true,
-                |_, _, _| {
+                |_, address, count| {
+                    // SAFETY: reserve_custody retains the actual native fork's
+                    // initialized wire array through this synchronous callback.
+                    let rows = if count == 0 {
+                        &[][..]
+                    } else {
+                        unsafe {
+                            core::slice::from_raw_parts(
+                                address.raw() as *const [u64; 4],
+                                count as usize,
+                            )
+                        }
+                    };
                     Ok(PhysicalChild {
                         _inherited: pin_record(&mut self.record.lock().unwrap(), identity, venue)
                             .unwrap(),
+                        inherited: rows
+                            .iter()
+                            .map(|row| carrick_el1_abi::PortalForkCustody::decode(*row).unwrap())
+                            .collect(),
                         supplied: None,
                     })
                 },

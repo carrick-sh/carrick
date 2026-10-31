@@ -1045,13 +1045,23 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
         let mm = owner.mm();
         let key = MmKey::of(mm).ok_or(ForkStockServiceError::StaleExecution)?;
-        if count == 0
-            || count > MAX_TABLE_GRANTS
+        if count > MAX_TABLE_GRANTS
             || self.child_owner(mm) != Some(owner)
             || self.child_root(mm) != Some(root)
             || self.quarantine.contains_key(&key)
         {
             return Err(ForkStockServiceError::StaleExecution);
+        }
+        if count == 0 {
+            // Publishing an inherited leaf needs no table storage. Do not
+            // visit or reorder unrelated spare pages for each first touch.
+            return Ok(NativeDescriptorTableReservation {
+                key,
+                mm,
+                root,
+                pages: Vec::new(),
+                descriptor_tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants::NONE,
+            });
         }
         if self.tables.len() < count {
             self.counters.descriptor_capacity_refusals =
@@ -1195,6 +1205,60 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         }
         self.tables.extend(unused);
         Ok(())
+    }
+
+    /// Authenticate one inherited prepared-page request against the live
+    /// fork owner. Backends provide only generation-pinned frame storage;
+    /// this owner chooses and retains the one-page publication transaction.
+    pub fn stage_native_prepared_reply(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        reply: &carrick_el1_abi::PortalGrantSlot,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>, crate::TrapError>
+    where
+        C: crate::physical_grants::NativePreparedSupplyCustody,
+    {
+        let invalid =
+            || crate::TrapError::Hypervisor("native inherited backing custody mismatch".into());
+        if self.child_owner(owner.mm()) != Some(owner)
+            || self.child_root(owner.mm()) != Some(root)
+            || window.operation.carrier != owner.carrier()
+            || window.operation.mm != owner.mm()
+            || window.operation.incarnation != owner.incarnation()
+            || self.is_quarantined(owner.mm())
+        {
+            return Ok(None);
+        }
+        let physical = self
+            .child_physical_mut(owner.mm(), root)
+            .ok_or_else(invalid)?;
+        let Some(selected) =
+            physical.retained_prepared_frame(carrick_guest_arch::UserVa::new(window.fault_page))
+        else {
+            return Ok(None);
+        };
+        let frame_owner = crate::GuestFrameOwner {
+            native_mm: carrick_guest_arch::MmGeneration::new(
+                NonZeroU64::new(owner.mm().raw()).ok_or_else(invalid)?,
+            ),
+            root_generation: carrick_guest_arch::ContextGeneration::new(owner.incarnation()),
+        };
+        let (grants, rollback) = physical.prepared_supply(frame_owner);
+        if grants.owner() != frame_owner || grants.failed() || rollback.failed() {
+            return Err(invalid());
+        }
+        let txn = grants.stage_prepared_reply(reply, window, root, selected, rollback)?;
+        // No tables or residency slots are consumed, but cancellation and
+        // acknowledgment still settle through the same exact transaction.
+        let tables = self
+            .reserve_native_descriptor_tables(ledger, owner, root, 0)
+            .map_err(|_| invalid())?;
+        self.track_native_descriptor_tables(ledger, tables, txn)
+            .map_err(|_| invalid())?;
+        Ok(Some(txn))
     }
 
     /// One neutral physical/table/transport settlement owner. Guest candidates

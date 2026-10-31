@@ -34,6 +34,36 @@ impl carrick_el1::fault::PreparedPageResolver for SelectionWords<'_> {
     > {
         panic!("this fixture faults only on absent leaves or private COW leaves")
     }
+    fn inherited_prepared_supply(&self) -> bool {
+        true
+    }
+}
+/// The same live selection on a lane whose host cannot serve inherited
+/// prepared supply yet (x86 CPL0, #1186).
+struct NoInheritedSupply<'a>(SelectionWords<'a>);
+impl carrick_el1::fault::PreparedPageResolver for NoInheritedSupply<'_> {
+    fn select_backing_window(
+        &mut self,
+        root: u64,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<
+        carrick_el1_abi::PortalGrantWindow,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        self.0.select_backing_window(root, window)
+    }
+    fn commit_prepared(
+        &mut self,
+        root: u64,
+        va: u64,
+        ipa: u64,
+        access: carrick_mmu_core::aarch64::LeafAccess,
+    ) -> Result<
+        carrick_mmu_core::aarch64::GuestPreparedCommit,
+        carrick_mmu_core::aarch64::GuestPreparedCommitError,
+    > {
+        self.0.commit_prepared(root, va, ipa, access)
+    }
 }
 
 fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
@@ -76,10 +106,23 @@ impl carrick_el1::memory::AnonymousBackingProbe for FixtureMapping<'_> {
 impl carrick_el1::memory::AnonymousPermissionEditor for FixtureMapping<'_> {
     fn protect_and_invalidate(
         &mut self,
-        _: carrick_guest_arch::AddressSpaceRegister,
-        _: carrick_mmu_core::aarch64::GuestPermissionEdit,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        edit: carrick_mmu_core::aarch64::GuestPermissionEdit,
     ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
-        panic!("new mapping has no resident permission work")
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, InlineJournal, TableGrants, execute_descriptor_op,
+        };
+        assert!(matches!(
+            execute_descriptor_op(
+                self.words,
+                carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
+                DescriptorOp::Protect(edit),
+                &TableGrants::NONE,
+                &mut InlineJournal::new(),
+            ),
+            DescriptorOutcome::Applied(_)
+        ));
+        Ok(())
     }
 }
 impl carrick_el1::memory::AnonymousRetirementEditor for FixtureMapping<'_> {
@@ -252,11 +295,134 @@ fn native_backing_table_failure_retains_applied_receipt_without_ack() {
     composed_native_supply(false, None, false, SupplyEnd::FailTables);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparedScenario {
+    None,
+    UntouchedGrant,
+    /// Untouched grant, then a child write and a parent write while both
+    /// processes stay live.
+    UntouchedGrantWrites,
+    ProtNoneAcrossFork,
+    /// PROT_NONE across fork, then child `mprotect(RW)` and a child write.
+    ProtNoneAcrossForkWritable,
+    ResidentTranslationRetry,
+    CompetingValidPreparedReply,
+}
+
+/// The first publication of an inherited prepared leaf is the fork COW
+/// encoding (`arm_private_cow`): VALID, EL0 read-only, bit 55 armed, bit 57
+/// the leaf's Linux write intent, and the invalid-only deferred marker
+/// (bit 59) consumed. Output, ceilings and every other attribute survive.
+fn assert_inherited_publication_cow_armed(before: u64, published: u64, writable: bool) {
+    const VALID: u64 = 1;
+    const AP: u64 = 3 << 6;
+    const COW: u64 = 1 << 55;
+    const MAY_WRITE: u64 = 1 << 57;
+    const DEFERRED: u64 = 1 << 59;
+    assert_eq!(published & VALID, VALID, "published leaf {published:#x}");
+    assert_eq!(
+        published & AP,
+        AP,
+        "inherited publication must be EL0 read-only: {published:#x}"
+    );
+    assert_ne!(
+        published & COW,
+        0,
+        "inherited publication must arm fork COW: before={before:#x} published={published:#x}"
+    );
+    assert_eq!(published & DEFERRED, 0, "marker cleared before VALID");
+    assert_eq!(published & MAY_WRITE != 0, writable, "Linux write intent");
+    let kept = !(VALID | AP | COW | MAY_WRITE | DEFERRED);
+    assert_eq!(published & kept, before & kept, "output and tags survive");
+}
+
+#[test]
+fn native_inherited_prepared_writes_stay_private_to_each_live_process() {
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::UntouchedGrantWrites,
+    );
+}
+
+#[test]
+fn native_child_mprotect_rw_after_prot_none_fork_cannot_write_parent_frame() {
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::ProtNoneAcrossForkWritable,
+    );
+}
+
 fn composed_native_supply(
     competing_publication: bool,
     absent_page: Option<usize>,
     replace_cow: bool,
     end: SupplyEnd,
+) {
+    composed_native_supply_with_prepared(
+        competing_publication,
+        absent_page,
+        replace_cow,
+        end,
+        PreparedScenario::None,
+    );
+}
+
+#[test]
+fn native_child_first_touch_of_inherited_prepared_leaf_makes_progress() {
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::UntouchedGrant,
+    );
+}
+
+#[test]
+fn native_child_prot_none_across_fork_preserves_parent_bytes() {
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::ProtNoneAcrossFork,
+    );
+}
+
+#[test]
+fn native_child_translation_retry_requires_an_already_valid_leaf() {
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::ResidentTranslationRetry,
+    );
+}
+
+#[test]
+fn native_prepared_reply_retries_after_competing_valid_publication() {
+    composed_native_supply_with_prepared(
+        false,
+        None,
+        false,
+        SupplyEnd::Resume,
+        PreparedScenario::CompetingValidPreparedReply,
+    );
+}
+
+fn composed_native_supply_with_prepared(
+    competing_publication: bool,
+    absent_page: Option<usize>,
+    replace_cow: bool,
+    end: SupplyEnd,
+    prepared: PreparedScenario,
 ) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     // Keep descriptor grants disjoint from the original 32-page fork arena.
@@ -264,6 +430,37 @@ fn composed_native_supply(
     let mut table_words = core::mem::take(&mut fixture.tables.words).into_vec();
     table_words.extend((0..32 * 512).map(|_| core::sync::atomic::AtomicU64::new(0)));
     fixture.tables.words = table_words.into_boxed_slice();
+    match prepared {
+        PreparedScenario::None | PreparedScenario::ResidentTranslationRetry => {}
+        PreparedScenario::UntouchedGrant
+        | PreparedScenario::UntouchedGrantWrites
+        | PreparedScenario::CompetingValidPreparedReply => {
+            // Untouched private anonymous stock has an output but is invalid.
+            // Keep the non-identity IPA and Linux RW intent from the parent leaf.
+            let descriptor = fixture.tables.words[1536].load(Ordering::Relaxed);
+            fixture.tables.words[1536]
+                .store((descriptor & !1) | (1 << 56) | (1 << 57), Ordering::Relaxed);
+            assert!(
+                carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private(
+                    fixture.tables.words[1536].load(Ordering::Relaxed)
+                )
+            );
+        }
+        PreparedScenario::ProtNoneAcrossFork | PreparedScenario::ProtNoneAcrossForkWritable => {
+            crate::mm_portal::test_support::change_policy(
+                fixture.region,
+                crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+                ReservationMm::new(1).unwrap(),
+                &fixture.tables,
+                Some(carrick_el1_abi::ReservationProtection::NONE),
+            );
+            assert!(
+                carrick_mmu_core::aarch64::terminal_descriptor_is_prepared_private(
+                    fixture.tables.words[1536].load(Ordering::Relaxed)
+                )
+            );
+        }
+    }
     if let Some(absent_page) = absent_page {
         // Parent's two-page reservation has only one page resident.
         // Actual native fork must carry that descriptor into the child even
@@ -381,6 +578,538 @@ fn composed_native_supply(
         .unwrap();
     let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
     let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    let publish_inherited = |window: carrick_el1_abi::PortalGrantWindow, root: u64| {
+        let reply = Box::new(carrick_el1_abi::PortalGrantSlot::new());
+        let root = carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+            root & AARCH64_ROOT_ADDRESS_MASK,
+        ))
+        .unwrap();
+        let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
+        let txn = stock
+            .owner
+            .stage_native_prepared_reply(
+                &mut carrick_hal::fork_stock::NoTableLedger,
+                handle,
+                root,
+                &reply,
+                window,
+            )
+            .unwrap()
+            .expect("actual native fork must retain the inherited physical frame");
+        assert!(matches!(
+            txn.op,
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::Publish { .. }
+        ));
+        assert!(
+            txn.tables.as_slice().is_empty(),
+            "existing backing links no tables"
+        );
+        assert!(
+            stock
+                .owner
+                .child_physical_mut(handle.mm(), root)
+                .unwrap()
+                .supplied
+                .as_mut()
+                .unwrap()
+                .offer_backing_reply(&reply, &txn)
+        );
+        reply
+    };
+    // The live parent keeps the fixture's original root and MM.
+    const PARENT_ROOT: u64 = 0x10000;
+    const PARENT_MM: u64 = 1;
+    // Hardware model of one EL0 store: a leaf that permits the write stores
+    // through its output frame; any other leaf faults before storing.
+    let store_through = |root: u64, offset: usize, byte: u8| {
+        let current = leaf(words, root, VA);
+        carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
+            current,
+            carrick_mmu_core::aarch64::LeafAccess::Write,
+        ) && {
+            memory
+                .pages
+                .borrow_mut()
+                .get_mut(&(current & AARCH64_ROOT_ADDRESS_MASK))
+                .unwrap()[offset] = byte;
+            true
+        }
+    };
+    let observed = |root: u64, offset: usize| {
+        memory.pages.borrow()[&(leaf(words, root, VA) & AARCH64_ROOT_ADDRESS_MASK)][offset]
+    };
+    let cow_backing = |id: u64| carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+        frame_id: NonZeroU64::new(id).unwrap(),
+        mapping_id: NonZeroU64::new(id).unwrap(),
+        owner_generation: NonZeroU64::MIN,
+        inventory_revision: NonZeroU64::MIN,
+    };
+    // Child store: a refused store re-enters through the production fault
+    // entry, whose EL1 COW path copies the compound at write time.
+    let child_store = |frame: &mut carrick_el1_abi::TrapFrame,
+                       resolver: &mut FaultResolver<'_>,
+                       root: u64,
+                       offset: usize,
+                       byte: u8| {
+        if store_through(root, offset, byte) {
+            return;
+        }
+        if pool.ready(identity.mm).count() == 0 {
+            pool.publish(identity.mm, 0xa000_0000, cow_backing(21))
+                .unwrap();
+        }
+        frame.esr = 0x9200004f;
+        frame.far = VA + offset as u64;
+        let cow = OwnerFaultSupply::new(portal).with_handle(handle);
+        assert_eq!(
+            carrick_el1::fault::dispatch_fault_with_prepared(
+                frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+                crate::cow_resolver::native_fault_supply(
+                    true,
+                    carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                    &cow,
+                ),
+                Some(carrick_el1::fault::PreparedFaultPath {
+                    residency,
+                    resolver: &mut carrick_el1::fault::NoopPreparedResolver,
+                    roots: Some(fixture.region.table()),
+                    file_slots: Some(portal),
+                }),
+                resolver,
+            ),
+            carrick_el1_abi::Action::Served,
+            "the child's write fault must resolve through the EL1 COW copy"
+        );
+        assert!(
+            store_through(root, offset, byte),
+            "COW leaves the child's own copy writable"
+        );
+    };
+    // Parent store: the parent is live but not the scheduled task, so its
+    // refused store drives the same production COW resolver directly.
+    let parent_store = |resolver: &mut FaultResolver<'_>, offset: usize, byte: u8| {
+        if store_through(PARENT_ROOT, offset, byte) {
+            return;
+        }
+        if pool.ready(PARENT_MM).count() == 0 {
+            pool.publish(PARENT_MM, 0xa000_4000, cow_backing(22))
+                .unwrap();
+        }
+        assert_eq!(
+            resolver.resolve_cow_outcome(PARENT_ROOT, PARENT_MM, VA + offset as u64),
+            CowResolution::Resolved,
+            "the parent's write fault must resolve through the EL1 COW copy"
+        );
+        assert!(
+            store_through(PARENT_ROOT, offset, byte),
+            "COW leaves the parent's own copy writable"
+        );
+    };
+    match prepared {
+        PreparedScenario::None => {}
+        PreparedScenario::UntouchedGrant
+        | PreparedScenario::UntouchedGrantWrites
+        | PreparedScenario::ResidentTranslationRetry
+        | PreparedScenario::CompetingValidPreparedReply => {
+            frame.esr = 0x92000006;
+            frame.far = VA;
+            let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+            assert!(residency.lookup(identity.mm, VA).is_none());
+            if prepared == PreparedScenario::UntouchedGrant {
+                let index = access.find(identity.mm).unwrap();
+                let held = access
+                    .try_begin_edit(index, identity.mm, NonZeroU64::new(2).unwrap())
+                    .unwrap();
+                let busy = OwnerFaultSupply::new(portal).with_handle(handle);
+                assert_eq!(
+                    carrick_el1::fault::dispatch_fault_with_prepared(
+                        &mut frame,
+                        &counters,
+                        core::slice::from_ref(&fixture.task),
+                        access,
+                        crate::cow_resolver::native_fault_supply(
+                            true,
+                            carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                            &busy
+                        ),
+                        Some(carrick_el1::fault::PreparedFaultPath {
+                            residency,
+                            resolver: &mut SelectionWords(words),
+                            roots: Some(fixture.region.table()),
+                            file_slots: Some(portal),
+                        }),
+                        &mut resolver,
+                    ),
+                    carrick_el1_abi::Action::Forward
+                );
+                let OwnerFaultSupplyOutcome::Wait(wait) = busy.outcome() else {
+                    panic!("Busy must retain an owner wait");
+                };
+                assert_eq!(wait.handle(), handle);
+                assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Editor);
+                drop(held);
+                // A lane whose host does not read state 5 (x86 CPL0) keeps
+                // re-entering without supply instead of selecting it.
+                let x86_lane = OwnerFaultSupply::new(portal).with_handle(handle);
+                assert_eq!(
+                    carrick_el1::fault::dispatch_fault_with_prepared(
+                        &mut frame,
+                        &counters,
+                        core::slice::from_ref(&fixture.task),
+                        access,
+                        crate::cow_resolver::native_fault_supply(
+                            true,
+                            carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                            &x86_lane
+                        ),
+                        Some(carrick_el1::fault::PreparedFaultPath {
+                            residency,
+                            resolver: &mut NoInheritedSupply(SelectionWords(words)),
+                            roots: Some(fixture.region.table()),
+                            file_slots: Some(portal),
+                        }),
+                        &mut resolver,
+                    ),
+                    carrick_el1_abi::Action::Served
+                );
+                assert!(
+                    portal
+                        .grant(0)
+                        .unwrap()
+                        .pending_prepared_fault_selection(identity.mm, VA)
+                        .is_none()
+                );
+                assert!(!portal.grant(0).unwrap().has_outstanding_for(identity.mm));
+            }
+            let action = carrick_el1::fault::dispatch_fault_with_prepared(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                access,
+                crate::cow_resolver::native_fault_supply(
+                    true,
+                    carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                    &supply,
+                ),
+                Some(carrick_el1::fault::PreparedFaultPath {
+                    residency,
+                    resolver: &mut SelectionWords(words),
+                    roots: Some(fixture.region.table()),
+                    file_slots: Some(portal),
+                }),
+                &mut resolver,
+            );
+            let root = access
+                .grant(access.find(identity.mm).unwrap(), identity.mm)
+                .unwrap()
+                .ttbr0;
+            assert!(
+                action == carrick_el1_abi::Action::Forward
+                    && supply.outcome() == OwnerFaultSupplyOutcome::Selected
+                    || leaf(words, root, VA) & 1 != 0,
+                "first-touch must publish a usable translation or request backing, not retry the same invalid leaf: action={action:?} supply={:?} leaf={:#x}",
+                supply.outcome(),
+                leaf(words, root, VA),
+            );
+            if prepared == PreparedScenario::ResidentTranslationRetry {
+                assert_eq!(action, carrick_el1_abi::Action::Served);
+                assert_eq!(supply.outcome(), OwnerFaultSupplyOutcome::Unavailable);
+                return;
+            }
+            let (_, selected) = portal
+                .grant(0)
+                .unwrap()
+                .pending_prepared_fault_selection(identity.mm, VA)
+                .unwrap();
+            let before = leaf(words, root, VA);
+            let reply = publish_inherited(selected, root);
+            let mut competing = None;
+            if prepared == PreparedScenario::CompetingValidPreparedReply {
+                use carrick_mmu_core::aarch64::descriptor_txn::{
+                    AliasAccess, BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal,
+                    PageSpan, TableGrants, execute_descriptor_op,
+                };
+                // A second publisher installs an already-retained neighboring
+                // frame through the shipping descriptor executor while this
+                // reply still retains the original expected output.
+                let _editor = access
+                    .try_begin_edit(
+                        access.find(identity.mm).unwrap(),
+                        identity.mm,
+                        NonZeroU64::new(2).unwrap(),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    execute_descriptor_op(
+                        words,
+                        carrick_mmu_core::aarch64::SubstrateGpa(root & AARCH64_ROOT_ADDRESS_MASK),
+                        DescriptorOp::MapAlias {
+                            access: AliasAccess::User {
+                                writable: false,
+                                executable: false
+                            },
+                            span: PageSpan::new(VA, 4096),
+                            target_ipa: carrick_mmu_core::aarch64::SubstrateGpa(IPA + 4096),
+                            backing: BackingIdentity {
+                                frame_id: NonZeroU64::MIN,
+                                mapping_id: NonZeroU64::MIN,
+                                owner_generation: NonZeroU64::MIN,
+                                inventory_revision: NonZeroU64::MIN,
+                            },
+                        },
+                        &TableGrants::NONE,
+                        &mut InlineJournal::new(),
+                    ),
+                    DescriptorOutcome::Applied(_)
+                ));
+                competing = Some(leaf(words, root, VA));
+            }
+            NativeProcessService::apply_fault_reply(
+                &mut service,
+                &reply,
+                crate::native_process_runtime::FaultReplyDisposition::Apply,
+            )
+            .unwrap();
+            if let Some(competing) = competing {
+                assert_eq!(
+                    leaf(words, root, VA),
+                    competing,
+                    "late reply must preserve the competing translation"
+                );
+                assert_eq!(memory.pages.borrow()[&IPA], vec![17; 4096]);
+                return;
+            }
+            let published = leaf(words, root, VA);
+            assert_eq!(
+                memory.pages.borrow()[&(published & AARCH64_ROOT_ADDRESS_MASK)],
+                vec![17; 4096]
+            );
+            assert_eq!(memory.pages.borrow()[&IPA], vec![17; 4096]);
+            assert_eq!(
+                memory.copies.get(),
+                0,
+                "publication allocates and copies no backing"
+            );
+            if prepared == PreparedScenario::UntouchedGrantWrites {
+                // Both processes stay live: the child stores, then the
+                // parent's own first touch commits its inherited prepared
+                // leaf through the shared Publish executor and stores.
+                child_store(&mut frame, &mut resolver, root, 13, 99);
+                assert_eq!(
+                    observed(PARENT_ROOT, 13),
+                    17,
+                    "the live parent must not observe the child's write"
+                );
+                let parent_before = leaf(words, PARENT_ROOT, VA);
+                {
+                    use carrick_mmu_core::aarch64::descriptor_txn::{
+                        DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
+                        execute_descriptor_op,
+                    };
+                    assert!(matches!(
+                        execute_descriptor_op(
+                            words,
+                            carrick_mmu_core::aarch64::SubstrateGpa(PARENT_ROOT),
+                            DescriptorOp::Publish {
+                                span: PageSpan::new(VA, 4096),
+                                expected_ipa: carrick_mmu_core::aarch64::SubstrateGpa(IPA),
+                                access: carrick_mmu_core::aarch64::LeafAccess::Write,
+                            },
+                            &TableGrants::NONE,
+                            &mut InlineJournal::new(),
+                        ),
+                        DescriptorOutcome::Applied(_)
+                    ));
+                }
+                assert_eq!(parent_before & 1, 0, "parent leaf was prepared");
+                assert_inherited_publication_cow_armed(
+                    parent_before,
+                    leaf(words, PARENT_ROOT, VA),
+                    true,
+                );
+                parent_store(&mut resolver, 21, 55);
+                assert_eq!(
+                    observed(root, 21),
+                    17,
+                    "the live child must not observe the parent's write"
+                );
+                assert_eq!(observed(root, 13), 99);
+                assert_eq!(observed(PARENT_ROOT, 13), 17);
+                assert_eq!(observed(PARENT_ROOT, 21), 55);
+                assert_eq!(
+                    memory.pages.borrow()[&IPA],
+                    vec![17; 4096],
+                    "the shared inherited frame is never written"
+                );
+                let copies = memory.copies.get();
+                assert!(
+                    (2..=8).contains(&copies),
+                    "one compound copy per writer, at write time: {copies}"
+                );
+            }
+            assert_inherited_publication_cow_armed(before, published, true);
+            return;
+        }
+        PreparedScenario::ProtNoneAcrossFork | PreparedScenario::ProtNoneAcrossForkWritable => {
+            let writable = prepared == PreparedScenario::ProtNoneAcrossForkWritable;
+            let mut inherited = None;
+            let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+            frame.x[8] = 226;
+            frame.x[..3].copy_from_slice(&[VA, 4096, if writable { 3 } else { 1 }]);
+            assert_eq!(
+                carrick_el1::memory::serve_delegated_anonymous(
+                    &mut frame,
+                    &counters,
+                    &fixture.task,
+                    access,
+                    fixture.region.table(),
+                    &mut FixtureMapping { words, residency },
+                    None,
+                ),
+                carrick_el1::memory::DelegatedAnonymous::Served,
+            );
+            assert_eq!(frame.x[0], 0);
+            let root = access
+                .grant(access.find(identity.mm).unwrap(), identity.mm)
+                .unwrap()
+                .ttbr0;
+            if leaf(words, root, VA) & 1 == 0 {
+                frame.esr = 0x92000006;
+                frame.far = VA;
+                let action = carrick_el1::fault::dispatch_fault_with_prepared(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    access,
+                    crate::cow_resolver::native_fault_supply(
+                        true,
+                        carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                        &supply,
+                    ),
+                    Some(carrick_el1::fault::PreparedFaultPath {
+                        residency,
+                        resolver: &mut SelectionWords(words),
+                        roots: Some(fixture.region.table()),
+                        file_slots: Some(portal),
+                    }),
+                    &mut resolver,
+                );
+                if action == carrick_el1_abi::Action::Forward
+                    && supply.outcome() == OwnerFaultSupplyOutcome::Selected
+                {
+                    if let Some((_, window)) = portal
+                        .grant(0)
+                        .unwrap()
+                        .pending_prepared_fault_selection(identity.mm, VA)
+                    {
+                        let before = leaf(words, root, VA);
+                        let reply = publish_inherited(window, root);
+                        NativeProcessService::apply_fault_reply(
+                            &mut service,
+                            &reply,
+                            crate::native_process_runtime::FaultReplyDisposition::Apply,
+                        )
+                        .unwrap();
+                        inherited = Some((before, leaf(words, root, VA)));
+                    } else {
+                        let (_, window) = portal
+                            .grant(0)
+                            .unwrap()
+                            .pending_fault_selection(identity.mm, VA)
+                            .unwrap();
+                        memory.pages.borrow_mut().insert(0xa0020000, vec![0; 4096]);
+                        let id = NonZeroU64::MIN;
+                        let txn = carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn {
+                            id: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxnId {
+                                mm_key: NonZeroU64::new(identity.mm).unwrap(),
+                                generation: window.operation.sequence,
+                            },
+                            root: carrick_mmu_core::aarch64::SubstrateGpa(
+                                root & AARCH64_ROOT_ADDRESS_MASK,
+                            ),
+                            op: carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::Prepare {
+                                publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                                    va: window.range.start(),
+                                    ipa: 0xa0020000,
+                                    len: 4096,
+                                    writable: false,
+                                    executable: false,
+                                },
+                                resident: carrick_mmu_core::aarch64::descriptor_txn::PageSpan::new(
+                                    VA, 4096,
+                                ),
+                                backing:
+                                    carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                                        frame_id: id,
+                                        mapping_id: id,
+                                        owner_generation: id,
+                                        inventory_revision: id,
+                                    },
+                            },
+                            tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants::NONE,
+                        };
+                        let slot = portal.grant(0).unwrap();
+                        assert!(slot.submit(window, &txn));
+                        let mm_owner = crate::mm_portal::MmPortal::<
+                            crate::mm_portal::test_support::NoPin,
+                        >::for_zone(
+                            NonZeroU64::MIN, fixture.region.table(), fixture.zone
+                        );
+                        let receipt = carrick_core::mm::frames::serve_grant(
+                            &mm_owner,
+                            slot,
+                            words,
+                            residency,
+                            u32::from(fixture.slot.raw()),
+                            || {},
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert!(matches!(
+                            receipt.outcome,
+                            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(
+                                _
+                            )
+                        ));
+                        assert!(slot.take_receipt(window, &txn).is_some());
+                    }
+                }
+            }
+            let child_leaf = leaf(words, root, VA);
+            assert_ne!(
+                child_leaf & 1,
+                0,
+                "child page must be readable after mprotect(PROT_READ): leaf={child_leaf:#x}"
+            );
+            let child_ipa = child_leaf & AARCH64_ROOT_ADDRESS_MASK;
+            assert_eq!(
+                memory.pages.borrow()[&child_ipa],
+                vec![17; 4096],
+                "PROT_NONE across fork must preserve parent's written bytes, not replace with zeros (child_ipa={child_ipa:#x})"
+            );
+            if writable {
+                child_store(&mut frame, &mut resolver, root, 13, 99);
+                assert_eq!(observed(root, 13), 99);
+                assert_eq!(
+                    memory.pages.borrow()[&IPA],
+                    vec![17; 4096],
+                    "child mprotect(RW) after a PROT_NONE fork must not grant writes onto the parent's frame"
+                );
+                assert_eq!(
+                    leaf(words, PARENT_ROOT, VA) & AARCH64_ROOT_ADDRESS_MASK,
+                    IPA,
+                    "the parent keeps its original frame"
+                );
+            }
+            let (before, published) =
+                inherited.expect("the child publishes its inherited prepared leaf");
+            assert_inherited_publication_cow_armed(before, published, writable);
+            return;
+        }
+    }
     if let Some(absent_page) = absent_page {
         let fault_page = VA + absent_page as u64 * 4096;
         let neighbor = VA + (1 - absent_page) as u64 * 4096;

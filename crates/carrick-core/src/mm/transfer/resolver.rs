@@ -90,6 +90,14 @@ pub trait PreparedPageResolver {
         expected_ipa: u64,
         access: LeafAccess,
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError>;
+    /// Whether this lane's owner publishes an inherited invalid prepared
+    /// output through `PortalGrantSlot::PREPARED_SELECTION_STATE`. Only the
+    /// aarch64 owner serves it; the x86 CPL0 host does not read that state
+    /// yet (seam #1186), so its occupied fault keeps re-entering without
+    /// supply.
+    fn inherited_prepared_supply(&self) -> bool {
+        false
+    }
 }
 
 pub struct NoopPreparedResolver;
