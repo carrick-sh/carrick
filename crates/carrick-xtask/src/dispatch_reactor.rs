@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "dispatch_reactor_session.rs"]
+mod session;
+
 pub(crate) const MARKER: &str = "<!-- carrick-reactor -->";
 const GLOBAL_CAP: usize = 4;
 const QUIET_SECS: u64 = 15 * 60;
@@ -26,6 +29,10 @@ pub enum Mode {
     Once(Opts),
     /// Poll every 60 seconds until killed.
     Run(Opts),
+    /// Append new PR events to a mailbox for a listening session.
+    Feed(session::FeedOpts),
+    /// Stdio MCP server with the session's read and act tools.
+    Mcp(session::McpOpts),
 }
 #[derive(clap::Args, Debug)]
 pub struct Opts {
@@ -145,8 +152,8 @@ const OUTCOME_BOTS: [&str; 2] = ["github-actions[bot]", "carrick-workers[bot]"];
 /// still `human`, which re-enables a round on the same head.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Class {
-    trigger: bool,
-    human: bool,
+    pub trigger: bool,
+    pub human: bool,
 }
 pub(crate) fn classify(user: &Value, body: &str) -> Option<Class> {
     if body.contains(MARKER) {
@@ -191,28 +198,26 @@ fn clip(text: &str) -> String {
     text[..end].to_owned()
 }
 
-struct Event {
-    id: String,
-    who: String,
-    kind: &'static str,
-    body: String,
-    class: Class,
+pub(super) struct Event {
+    pub id: String,
+    pub who: String,
+    pub kind: &'static str,
+    pub body: String,
+    pub class: Class,
+    pub at: String,
+    pub url: String,
 }
 
-/// One poll cycle. Returns the human log lines it would print.
-pub(crate) fn cycle(
-    gh: &mut dyn Github,
-    agent: &mut dyn Agent,
-    state: &mut State,
-    now: u64,
-    epoch: &str,
-    dry_run: bool,
-) -> Result<Vec<String>, ScalerError> {
-    let mut log = Vec::new();
-    let since = state
-        .cursor
-        .clone()
-        .unwrap_or_else(|| iso(now.saturating_sub(3600)));
+/// Everything one poll reads, shared by `cycle` and the session feed.
+pub(super) struct Gathered {
+    pub prs: Vec<Value>,
+    pub facts: BTreeMap<u64, Value>,
+    pub active: Vec<Value>,
+    pub events: BTreeMap<u64, Vec<Event>>,
+    pub cursor: String,
+}
+pub(super) fn gather(gh: &mut dyn Github, since: &str) -> Result<Gathered, ScalerError> {
+    let since = since.to_owned();
     let prs = gh.open_prs()?;
     let facts: BTreeMap<u64, Value> = gh
         .pr_facts()?
@@ -242,7 +247,7 @@ pub(crate) fn cycle(
             cursor = at.to_owned();
         }
         let kind = if c.get("pull_request_url").is_some() {
-            "review comment"
+            "review_comment"
         } else {
             "comment"
         };
@@ -254,6 +259,8 @@ pub(crate) fn cycle(
                 kind,
                 body: body.to_owned(),
                 class,
+                at: c["created_at"].as_str().unwrap_or(at).to_owned(),
+                url: c["html_url"].as_str().unwrap_or_default().to_owned(),
             });
         }
     }
@@ -273,10 +280,62 @@ pub(crate) fn cycle(
                     kind: "review",
                     body: format!("[{}] {body}", r["state"].as_str().unwrap_or("")),
                     class,
+                    at: at.to_owned(),
+                    url: r["url"].as_str().unwrap_or_default().to_owned(),
                 });
             }
         }
     }
+    Ok(Gathered {
+        prs,
+        facts,
+        active,
+        events,
+        cursor,
+    })
+}
+
+/// Adoption verdict and closing-reference count for a director PR.
+pub(super) fn adoption_facts(
+    gh: &mut dyn Github,
+    pr: &Value,
+) -> Result<(bool, Option<usize>), ScalerError> {
+    let mut closing = None;
+    let adoption = adopted_pr(pr, |read| {
+        let value = gh.adoption(read)?;
+        if value.get("data").is_some() {
+            closing = Some(value.clone());
+        }
+        Ok(value)
+    })?;
+    let count = closing
+        .as_ref()
+        .and_then(|c| super::parse_closing_references(c).ok())
+        .map(|r| r.all.len());
+    Ok((adoption.is_some(), count))
+}
+
+/// One poll cycle. Returns the human log lines it would print.
+pub(crate) fn cycle(
+    gh: &mut dyn Github,
+    agent: &mut dyn Agent,
+    state: &mut State,
+    now: u64,
+    epoch: &str,
+    dry_run: bool,
+) -> Result<Vec<String>, ScalerError> {
+    let mut log = Vec::new();
+    let since = state
+        .cursor
+        .clone()
+        .unwrap_or_else(|| iso(now.saturating_sub(3600)));
+    let Gathered {
+        prs,
+        facts,
+        active,
+        mut events,
+        cursor,
+    } = gather(gh, &since)?;
     let open: Vec<u64> = prs.iter().filter_map(|p| p["number"].as_u64()).collect();
     state.prs.retain(|n, _| open.contains(n));
     let mut active_total = active.len();
@@ -306,19 +365,8 @@ pub(crate) fn cycle(
         // Automatic behaviours only for PRs created since the reactor's epoch.
         let recent = pr["created_at"].as_str().is_some_and(|c| c >= epoch);
         if director {
-            let mut closing = None;
-            let adoption = adopted_pr(pr, |read| {
-                let value = gh.adoption(read)?;
-                if value.get("data").is_some() {
-                    closing = Some(value.clone());
-                }
-                Ok(value)
-            })?;
-            adoptable = adoption.is_some();
-            let count = closing
-                .as_ref()
-                .and_then(|c| super::parse_closing_references(c).ok())
-                .map(|r| r.all.len());
+            let (verdict, count) = adoption_facts(gh, pr)?;
+            adoptable = verdict;
             if recent && count != Some(1) && !memory.closes_asked {
                 memory.closes_asked = true;
                 let body = format!("{CLOSES_ASK}\n\n{MARKER}");
@@ -345,6 +393,8 @@ pub(crate) fn cycle(
                         trigger: true,
                         human: false,
                     },
+                    at: iso(now),
+                    url: String::new(),
                 });
             }
         }
@@ -431,6 +481,11 @@ fn emit(
     }
 }
 
+/// `YYYY-MM-DDTHH:MM:SSZ`, the only epoch spelling accepted.
+fn rfc3339(text: &str) -> bool {
+    regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$").is_ok_and(|re| re.is_match(text))
+}
+
 /// UTC `YYYY-MM-DDTHH:MM:SSZ`, the shape GitHub returns (sorts lexically).
 pub(crate) fn iso(secs: u64) -> String {
     let (days, rem) = ((secs / 86400) as i64, secs % 86400);
@@ -454,7 +509,7 @@ pub(crate) fn iso(secs: u64) -> String {
 struct Live<'a> {
     root: &'a Path,
 }
-const FACTS_QUERY: &str = r#"query{repository(owner:"carrick-sh",name:"carrick"){pullRequests(states:OPEN,first:100){nodes{number commits(last:1){nodes{commit{committedDate statusCheckRollup{state}}}} reviews(last:10){nodes{databaseId state body submittedAt author{login __typename}}} comments(last:5){nodes{body author{login __typename}}}}}}}"#;
+const FACTS_QUERY: &str = r#"query{repository(owner:"carrick-sh",name:"carrick"){pullRequests(states:OPEN,first:100){nodes{number commits(last:1){nodes{commit{committedDate statusCheckRollup{state}}}} reviews(last:10){nodes{databaseId url state body submittedAt author{login __typename}}} comments(last:5){nodes{body author{login __typename}}}}}}}"#;
 impl Github for Live<'_> {
     fn open_prs(&mut self) -> Result<Vec<Value>, ScalerError> {
         Ok(serde_json::from_str(&super::gh(
@@ -491,8 +546,19 @@ impl Github for Live<'_> {
         }
         Ok(all)
     }
+    /// Authenticated through the owner's `gh` login: `adoption_read` falls
+    /// back to anonymous curl without `GH_TOKEN`, whose 60-per-hour quota a
+    /// 60 s poll exhausts (HTTP 403).
     fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError> {
-        super::adoption_read(self.root, read)
+        match read {
+            AdoptionRead::ClosingReferences(number) => {
+                super::closing_references_response(self.root, number)
+            }
+            AdoptionRead::Issue(number) => Ok(serde_json::from_str(&super::gh(
+                self.root,
+                &["api", &format!("repos/{REPOSITORY}/issues/{number}")],
+            )?)?),
+        }
     }
     fn runs(&mut self) -> Result<Vec<Value>, ScalerError> {
         Ok(serde_json::from_str(&super::gh(
@@ -605,9 +671,7 @@ fn once(root: &Path, opts: &Opts) -> Result<(), ScalerError> {
         .map_err(|_| ScalerError::Guard("clock before epoch"))?
         .as_secs();
     if let Some(since) = &opts.since
-        && !regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-            .map_err(|_| ScalerError::Guard("epoch pattern"))?
-            .is_match(since)
+        && !rfc3339(since)
     {
         return Err(ScalerError::Usage(format!(
             "--since must be YYYY-MM-DDTHH:MM:SSZ, got {since:?}"
@@ -654,9 +718,26 @@ fn once(root: &Path, opts: &Opts) -> Result<(), ScalerError> {
     }
     Ok(())
 }
+/// Every reactor GitHub read goes through the owner's `gh` login, never the
+/// anonymous curl fallback in `dispatch_worker::api` (60 requests an hour,
+/// which a 60 s poll exhausts with HTTP 403). Refuse to start without one.
+fn require_gh_login(root: &Path) -> Result<(), ScalerError> {
+    let token = super::gh(root, &["auth", "token"]).map_err(|_| {
+        ScalerError::Guard("reactor needs an authenticated gh login (gh auth token failed)")
+    })?;
+    if token.trim().is_empty() {
+        return Err(ScalerError::Guard(
+            "reactor needs an authenticated gh login (empty gh auth token)",
+        ));
+    }
+    Ok(())
+}
 pub(crate) fn run(root: &Path, mode: Mode) -> Result<(), ScalerError> {
+    require_gh_login(root)?;
     match mode {
         Mode::Once(opts) => once(root, &opts),
+        Mode::Feed(opts) => session::feed(root, &opts),
+        Mode::Mcp(opts) => session::mcp(root, &opts),
         Mode::Run(opts) => loop {
             if let Err(error) = once(root, &opts) {
                 eprintln!("reactor: cycle failed: {error}");
@@ -671,13 +752,13 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct FakeGh {
-        prs: Vec<Value>,
-        facts: Vec<Value>,
-        comments: Vec<Value>,
-        runs: Vec<Value>,
-        closing: Vec<u64>,
-        posted: Vec<(u64, String)>,
+    pub(super) struct FakeGh {
+        pub prs: Vec<Value>,
+        pub facts: Vec<Value>,
+        pub comments: Vec<Value>,
+        pub runs: Vec<Value>,
+        pub closing: Vec<u64>,
+        pub posted: Vec<(u64, String)>,
     }
     impl Github for FakeGh {
         fn open_prs(&mut self) -> Result<Vec<Value>, ScalerError> {
@@ -736,18 +817,18 @@ mod tests {
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
     const NOW: u64 = 1_793_404_800; // 2026-10-31T00:00:00Z
     const EPOCH: &str = "2026-10-30T23:00:00Z";
-    fn pr(number: u64, branch: &str) -> Value {
+    pub(super) fn pr(number: u64, branch: &str) -> Value {
         json!({"number":number,"state":"open","title":format!("PR {number}"),
             "created_at":"2026-10-30T23:10:00Z",
             "user":{"login":"tjfontaine","type":"User"},"labels":[],
             "head":{"ref":branch,"sha":SHA,"repo":{"full_name":REPOSITORY}},
             "base":{"ref":"main","repo":{"full_name":REPOSITORY}}})
     }
-    fn comment(number: u64, id: u64, login: &str, kind: &str, body: &str) -> Value {
+    pub(super) fn comment(number: u64, id: u64, login: &str, kind: &str, body: &str) -> Value {
         json!({"id":id,"issue_url":format!("https://api.github.com/repos/{REPOSITORY}/issues/{number}"),
             "user":{"login":login,"type":kind},"body":body,"updated_at":"2026-10-30T23:59:00Z"})
     }
-    fn gh(prs: Vec<Value>, comments: Vec<Value>) -> FakeGh {
+    pub(super) fn gh(prs: Vec<Value>, comments: Vec<Value>) -> FakeGh {
         FakeGh {
             prs,
             comments,
@@ -1025,6 +1106,31 @@ mod tests {
         cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
         assert_eq!(a.calls, 1);
         assert_eq!(fake.posted.len(), 1);
+    }
+
+    /// The anonymous curl branch lives only in `dispatch_worker::api` and
+    /// `adoption_read`, which calls it. Reactor sources must never reach
+    /// either; their GitHub traffic goes through `super::gh` (the owner's
+    /// login) or the `Github`/`Remote` traits.
+    #[test]
+    fn dispatch_reactor_never_takes_the_anonymous_curl_branch() {
+        for (name, source) in [
+            ("dispatch_reactor.rs", include_str!("dispatch_reactor.rs")),
+            (
+                "dispatch_reactor_session.rs",
+                include_str!("dispatch_reactor_session.rs"),
+            ),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            for forbidden in [
+                "super::api(",
+                "super::super::api(",
+                "adoption_read(",
+                "\"curl\"",
+            ] {
+                assert!(!code.contains(forbidden), "{name} uses {forbidden}");
+            }
+        }
     }
 
     #[test]

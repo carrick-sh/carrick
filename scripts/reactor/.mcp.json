@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "carrick-reactor": {
+      "command": "/Volumes/CaseSensitive/carrick-director/bin/carrick-reactor",
+      "args": [
+        "dispatch-worker",
+        "reactor",
+        "mcp",
+        "--state",
+        "/Volumes/CaseSensitive/carrick-director/reactor/state/tools-state.json"
+      ]
+    }
+  }
+}

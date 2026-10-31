@@ -172,6 +172,30 @@ the state unchanged. A launchd agent keeps it running:
 Save it as `~/Library/LaunchAgents/sh.carrick.reactor.plist` and load it with
 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/sh.carrick.reactor.plist`.
 
+#### Session mode
+
+Session mode replaces the one-shot `claude -p` decision with a long-running
+Claude Code session that keeps one subagent per PR. It has two parts:
+
+- `dispatch-worker reactor feed [--mailbox P] [--state P] [--since T] [--once]`
+  runs the same poll with no decision step. It appends one JSON line per new
+  event to the mailbox: `{id, pr, kind, author, url, created_at, head,
+  excerpt}`, where `kind` is `comment`, `review`, `review_comment`,
+  `outcome`, `ci_red`, `new_pr`, `quiet_pr` or `needs_closes`. The
+  classification, epoch and `agent:hold` rules are those described above.
+  Its state file is separate from `run`'s.
+- `dispatch-worker reactor mcp [--state P] [--dry-run]` is a stdio MCP server.
+  Its read tools are `read_pr`, `read_thread`, `read_diff`, `read_ci`,
+  `read_outcomes` and `read_issue`. Its only act tools are `reply` and
+  `request_round`, and both go through the same `enforce` gates as `run`.
+  The server records round heads and times in its own state file and
+  re-checks for later human comments live before allowing another round on
+  the same head.
+
+`scripts/reactor/` is the session workspace: `CLAUDE.md` (the routing role),
+a `pr-watcher` subagent, `.mcp.json`, permission settings and `start.sh`,
+which starts the feed and the session in the tmux session `carrick-reactor`.
+
 ## Accounts and credentials
 
 The runner holds the job-scoped `GITHUB_TOKEN` with exactly `contents: write`,
