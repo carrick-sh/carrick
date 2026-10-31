@@ -1,4 +1,4 @@
-# Owner-triggered dispatch (#797, #799, #800)
+# Collaborator-triggered dispatch (#797, #799, #800, #1214)
 
 Every trigger enters one agent loop on an owner's `[carrick-agent]` disposable
 JIT clone. The controller caps the pool at four clones; the job cap is 85
@@ -7,19 +7,30 @@ VM-local leases and template 9000 remain as in [Contabo setup](contabo-kvm.md).
 
 ## Admission and scope
 
-The owner (`tjfontaine`, account type `User`) can start a run by:
+Any repository collaborator with write access or higher (a human account,
+type `User`) can start a run by (owner decision recorded on #231, #1214):
 
-- Applying `dispatch` or any `dispatch:*` label to an owner-authored issue.
-  The suffix is free-text context for the model, never a model selector.
-- Creating an unedited `/agent [free text]` comment on an owner-authored
-  open issue or an owned dispatch PR, including a merge-conflicted PR.
+- Applying `dispatch` or any `dispatch:*` label to an open issue. The issue
+  can have any author, including the carrick-workers App. The suffix is
+  free-text context for the model, never a model selector.
+- Creating an unedited `/agent [free text]` comment on an open issue or an
+  owned dispatch PR, including a merge-conflicted PR.
 - Submitting a `changes_requested` review on an owned dispatch PR.
 
-The sender and triggering actor must both be the owner; the comment or review
-author must also be the owner. A comment must have identical creation/update
-timestamps, match `/agent` followed by whitespace or end-of-body, and still
-match the original webhook when admission fetches it. Edited events and
-non-owner triggers are refused. The guard never parses issue structure. The
+Trust is checked live. The guard, clone admission, the controller and the
+token mint read `GET repos/carrick-sh/carrick/collaborators/{login}/permission`
+for the sender, the triggering actor, the comment or review author and, for
+workflow runs, the run's actor and triggering actor. Only `admin`, `maintain`
+and `write` are accepted; `read`, `triage`, `none`, a malformed login, a 404
+and any API error are refused. The workflow's `if:` is only a cheap
+pre-filter: comment and review triggers need an `OWNER`, `MEMBER` or
+`COLLABORATOR` author association, and label events already need triage
+access to apply a label. A trusted actor's label, comment or review is the
+approval, so the issue or PR author no longer matters. A comment must have
+identical creation/update timestamps, match `/agent` followed by whitespace or
+end-of-body, and still match the original webhook when admission fetches it.
+Edited events and triggers from anyone without write access are refused. The
+guard never parses issue structure. The
 loop reads the full issue, so #587's problem statement and acceptance need no
 special heading. Unclear work can finish blocked with a question for the owner.
 
@@ -27,7 +38,7 @@ For issue work, the server starts `work/dispatch-<issue>-<run>`. The loop can
 select another linked `work/dispatch-*` branch before invoking workers. A
 candidate must have an open owned dispatch draft PR closing this issue, or an
 authenticated earlier run's handoff recording its publication. The server
-verifies the original run, workflow, owner identities and issue-scoped artifact
+verifies the original run, workflow, collaborator identities and issue-scoped artifact
 name, then reads the live remote tip. Without an open PR, the tip must equal
 the latest authenticated handoff publication for that branch. A branch with
 any closed or merged PR is refused. Reviews stay on the reviewed branch and
@@ -35,7 +46,7 @@ cannot call `select_branch`. A suggestive branch name alone grants no
 authority. Other issues' branches, non-dispatch names and unlinked branches are
 refused. The explicit `select_branch` tool is the sole request schema with a
 branch field; no schema has issue, PR, repository or scope fields. PR triggers
-start on their owned branch and require an open owner-authored linked issue.
+start on their owned branch and require an open linked issue.
 The branch never comes from issue prose or coordinator notes. The checkout
 preserves a conflicted branch and supplies the admitted main commit at
 `refs/carrick/dispatch-main`. Rebasing and conflict resolution happen in the
@@ -48,7 +59,7 @@ comments, the hosted guard emits the observed head; clone admission and the
 controller refuse a changed head. REST issue-comment runs lack the triggering
 comment ID: successful steps in the trusted-main guard expose the webhook
 issue/comment IDs and observed PR head in their names. The controller fetches
-the comment and issue/PR independently, checking the owner, command, unedited
+the comment and issue/PR independently, checking the collaborator, command, unedited
 timestamps, ownership and head before provisioning or reassignment. No comment
 body is used as a branch or executable selector.
 
@@ -66,8 +77,9 @@ head ref. The expected-tip push lease closes cross-key races.
 ### Adopting a director PR (#1175)
 
 Dispatch can also continue a PR it did not open, such as a director session's
-`work/986-slice4`. The owner adopts it for one round by commenting `/agent` on
-the PR, with the same unedited-owner-comment rules as above. Adoption needs
+`work/986-slice4`. A collaborator adopts it for one round by commenting
+`/agent` on the PR, with the same unedited-comment and live-permission rules as
+above. Adoption needs
 all of these, checked against the live PR when the comment is admitted:
 
 - The PR is open, its head branch is in this repository, and it targets
@@ -75,16 +87,16 @@ all of these, checked against the live PR when the comment is admitted:
 - The head branch is a valid `work/*` name that is not a
   `work/dispatch-<issue>-<run>` name. Dispatch-named branches always take
   the owned-PR path above.
-- The PR was opened by the owner or by the carrick-workers App.
 - GitHub lists exactly one closing issue for the PR (`Closes #N` in the body
-  or a sidebar link), and that issue is open and owner-authored. It becomes
+  or a sidebar link), and that issue is an open issue in this repository. It
+  becomes
   the run's issue: the loop reads it, the board updates it, and commits may
   close only it.
 
 The PR head the hosted guard observes becomes the admitted tip. That is the
 head when the guard runs, not when the comment was written: runs for one PR
 wait in a concurrency queue, so a push made while the run is queued is adopted
-under the owner's comment. Clone admission and the controller refuse a
+under the collaborator's comment. Clone admission and the controller refuse a
 different head, as for owned PRs. The run can push only to the adopted
 branch, with `--force-with-lease` set to that tip, and it cannot call
 `select_branch`. If someone pushes to the PR after the guard, the run pushes
@@ -105,8 +117,10 @@ PR, edits the body or changes draft status; a worker's proposed PR body is
 refused and the outcome says so. The outcome comment goes on the PR with the
 usual run footer. One predicate, `adopted_pr` in
 `crates/carrick-xtask/src/dispatch_worker.rs`, makes this decision for the
-guard, clone admission, the controller and the loop. Owner reviews
-(`changes_requested`) on adopted PRs are not supported yet.
+guard, clone admission, the controller and the loop. The PR's author is not
+checked: a same-repository head already needs write access, and the trusted
+`/agent` comment is the approval. Reviews (`changes_requested`) on adopted PRs
+are not supported yet.
 
 ### Reactor (#1193)
 
@@ -121,7 +135,9 @@ The agent only proposes; code decides what is posted, as the owner's `gh`
 login, with the hidden marker `<!-- carrick-reactor -->`:
 
 - A `round` posts `/agent <brief>`, which the dispatch guard admits as an
-  unedited owner comment. It is posted only when the PR passes `adopted_pr`
+  unedited comment from the owner, a write collaborator. The reactor itself
+  stays owner-local: it watches only PRs opened by the owner or the
+  carrick-workers App, though adoption no longer checks the PR author. It is posted only when the PR passes `adopted_pr`
   or is an owned dispatch PR, no `dispatch-worker.yml` run is queued or in
   progress for that PR, and fewer than four dispatch runs are in flight.
 - At most one reactor round per PR head, unless a human (non-bot) comment
@@ -327,9 +343,9 @@ There are no tool arguments for issue, PR, repository or scope. Only `select_bra
 | `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; includes project-1 status for this issue and its current owned dispatch PR when present. Board reads use the separate on-demand board token, are tagged `github-api(project-1)` and untrusted, and degrade to `unavailable` on missing credentials or API failure. The query caps fields and each item’s project memberships at 100 and rejects truncated connections; responses are capped at 64 KiB. Includes the label/comment/review trigger verbatim and provenance. Optional sources degrade individually to `unavailable` with endpoint, HTTP status when available, and bounded redacted stderr; unverifiable authors remain `unverified`. Errors are request-scoped, deduplicated and tagged `github-api(error)` with `untrusted:true`. `sources` is a fixed response field retained when chronological context is clipped; `sources_omitted` reports overflow of its half-response budget. Only trigger/issue reads are mandatory. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
 | `set_status {status}` | Three attempts. Accepts exactly `Todo`, `In progress`, `In review` or `Blocked`; Done stays with merges. The server freshly resolves only the admitted issue and its owned dispatch PR in org project 1. No item/project fields are accepted. Items absent from the board are left absent. An item with any other set status (including Done) is left alone and reported as `left: <status>`. Each confirmed mutation is recorded; a partial failure reports only confirmed changes and marks the board unavailable without failing the run. |
 | `select_branch {branch}` | Before workers begin, selects the new run branch or an authenticated issue-linked branch. Reads and retains its remote tip for the publication lease. |
-| `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity, a completed `carrick-agent` worker with successful upload, and the issue-derived upload bundle name. Review runs must keep the workflow blob from their head’s merge base with main. The returned contract, handoff or worker-transcript text is tagged with its dispatch provenance and marked untrusted. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
+| `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run identity with live collaborator actors, a completed `carrick-agent` worker with successful upload, and the issue-derived upload bundle name. Review runs must keep the workflow blob from their head’s merge base with main. The returned contract, handoff or worker-transcript text is tagged with its dispatch provenance and marked untrusted. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
 | `read_capacity {}` | Runs pinned `agy_worker.py capacity --json` as the worker account. Reads the real `backends` map from `capacity_report`, with `installed`, `free_slots`, `quota_free`, `score` and agy `quota.groups`/`group_scores`. Augments it with exact current IDs from the launcher's live `models --backend` roster, excluding superseded IDs. Returns numeric capacity and model IDs only, never credentials or raw diagnostics. Only successful capacity reports are cached. Each admitted worker consumes its snapshot, so the next worker requires a fresh report; refused choices can reuse the current successful report. Total probes are capped at `workers + refused_workers`. Each subprocess/output is bounded (120 s, 64 KiB) inside the event wall budget. |
-| `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Checks remaining worker, tool-call and time budgets before consulting the cached capacity snapshot; refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Three refused worker requests exhaust their separate refusal budget without charging workers. Runs workers sequentially on the selected branch; each later worker sees earlier commits and a server-built handoff of contract summaries, tests and risks. All workers share 60 total minutes; owner trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
+| `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Checks remaining worker, tool-call and time budgets before consulting the cached capacity snapshot; refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Three refused worker requests exhaust their separate refusal budget without charging workers. Runs workers sequentially on the selected branch; each later worker sees earlier commits and a server-built handoff of contract summaries, tests and risks. All workers share 60 total minutes; trusted trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
 | `publish {}` | Shared receipt/ownership checks; refuses `.github/workflows/*`; only the admitted branch, fixed refspec and expected-tip lease. Creates a draft with the first commit’s title or continues the owned PR. A worker can write `pr-body.md` beside `result.json`, outside its checkout, to propose a body (8 KiB, regular UTF-8 file, no symlinks). The server masks tokens, neutralises mentions with a U+2060 WORD JOINER, strips template instructions, refuses extra closing references and supplied run footers, then adds exactly one `Closes #N` line and its run footer. A refused proposal is reported with its reason and never blocks the commit push. The same body is used for creation or a REST `PATCH` on continuation. After each write, the server verifies closing references with the job token using the bounded consistency protocol below. An observed extra reference or persistent read error restores the default template on create, or the previous body on edit. A deadline alone keeps the locally validated new body and reports it as unverified. Both restorations are verified. Failure outcomes are posted on the PR, and an unverified restoration puts a manual repair warning first. The creation-run footer stays in the PR body to preserve branch ownership, and an edit ends with the current run footer. An earlier checkpoint’s proposal is passed to later workers for revision and retained when they write no proposal. With no proposal, creation fills today’s template and continuation leaves the body alone. Bodies remain untrusted dispatch-agent text in later reads. |
 | `comment {body}` | At most 8 KiB; posts only on this issue or its continued PR, with token masking, credential redaction, mentions neutralised with a WORD JOINER and a verified run footer. |
 | `finish {status, summary}` | `done`, `blocked` or `failed`; posts a human-readable outcome led by a markdown list of server-confirmed commits pushed (short SHAs), whether the body was created, updated, refused or left alone, and confirmed board changes or protected items left alone. Loop and worker statements are separately labelled as unverified claims; the loop summary is blockquoted and retained separately as `loop_summary` in `contract.json`. Raw contracts, backend/model choices and budgets sit in collapsed details. The full claims remain in artifacts. One attempt, exempt from call budget; failed posting stops the loop and triggers one server fallback. |
@@ -437,7 +453,7 @@ cancellation or GitHub failure can prevent that network report.
 
 Provenance is information, never authority. `owner` requires the owner User;
 `dispatch-agent(run N)` requires a bot post with a verified last run footer,
-repository, workflow, owner actors and a completed worker job on an agent
+repository, workflow, collaborator actors (live write permission) and a completed worker job on an agent
 runner; comment and PR-body provenance survives artifact expiry or failed
 uploads. Issue and comment footer runs additionally need exactly one successful
 `Dispatch issue N` marker in their successful hosted guard job, matching the
@@ -565,5 +581,5 @@ not establish them.
 Then label #587 as written with `dispatch`, observe a draft PR, request changes
 as owner, and observe a new commit on that PR branch plus an outcome comment.
 Exercise `/agent` on an issue and a merge-conflicted owned PR, verify refusal
-of edited/non-owner comments and an unowned PR, and confirm both model uids
+of edited comments, comments from read-only or non-collaborator accounts and an unowned PR, and confirm both model uids
 retired. These trials also complete #799's pending live acceptance.

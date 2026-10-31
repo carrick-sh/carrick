@@ -168,7 +168,9 @@ pub(crate) fn classify(user: &Value, body: &str) -> Option<Class> {
 }
 
 /// Same-repository `work/*` PR into main by the owner or publish App: the
-/// population that adoption admits once it closes exactly one issue.
+/// PRs this owner-local reactor watches. Adoption itself no longer checks
+/// the PR author (#1214); the reactor posts `/agent` as the owner, so it
+/// deliberately stays on the owner's and the App's PRs.
 fn director_pr(pr: &Value) -> bool {
     let branch = pr["head"]["ref"].as_str().unwrap_or_default();
     pr["head"]["repo"]["full_name"] == REPOSITORY

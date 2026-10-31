@@ -486,7 +486,11 @@ impl Github {
         if comment["id"].as_u64() != Some(comment_id)
             || comment["issue_url"]
                 != format!("https://api.github.com/repos/{REPOSITORY}/issues/{number}")
-            || !crate::dispatch_worker::agent_comment(&comment)
+            || !crate::dispatch_worker::agent_comment(&comment, &mut |login: &str| {
+                crate::dispatch_worker::write_collaborator(login, |endpoint| {
+                    request("GET", endpoint, None, false)
+                })
+            })
             || crate::dispatch_worker::comment_digest(&comment) != *digest
         {
             return Ok(false);
@@ -563,6 +567,11 @@ impl Github {
                     None
                 })
                 .as_ref(),
+                &mut |login: &str| {
+                    crate::dispatch_worker::write_collaborator(login, |endpoint| {
+                        request("GET", endpoint, None, false)
+                    })
+                },
             ) {
                 return Ok(false);
             }
@@ -573,9 +582,8 @@ impl Github {
                 false,
             )?;
         }
-        Ok(issue["user"]["login"] == "tjfontaine"
-            && issue["user"]["type"] == "User"
-            && issue["state"] == "open")
+        // Any issue author (#1214); the trusted comment is the approval.
+        Ok(issue["state"] == "open")
     }
 
     /// Both queued demand and the final pre-clone/reassignment vet use this
@@ -588,6 +596,17 @@ impl Github {
     ) -> Result<bool, ScalerError> {
         let checked = (|| -> Result<bool, ScalerError> {
             if !admission.identifies_run(run) {
+                return Ok(false);
+            }
+            // Run shape is structural; the run's actors must be live
+            // write collaborators (#1214) before any demand or vet.
+            if matches!(admission, Admission::Agent)
+                && !crate::dispatch_worker::dispatch_run_admitted(run, None, &mut |login: &str| {
+                    crate::dispatch_worker::write_collaborator(login, |endpoint| {
+                        request("GET", endpoint, None, false)
+                    })
+                })
+            {
                 return Ok(false);
             }
             if matches!(admission, Admission::Agent) && run["event"] == "issue_comment" {
@@ -631,6 +650,11 @@ impl Github {
                             None
                         })
                         .as_ref(),
+                        &mut |login: &str| {
+                            crate::dispatch_worker::write_collaborator(login, |endpoint| {
+                                request("GET", endpoint, None, false)
+                            })
+                        },
                     )
             }) {
                 return Ok(false);
@@ -840,8 +864,24 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    /// Live permission answers (#1214): `tjfontaine` admin, `collaborator`
+    /// write, `reader` read; `api-down` fails; anyone else is a 404.
+    fn permission(endpoint: &str) -> Result<Value, ScalerError> {
+        let login = endpoint
+            .strip_prefix(&format!("repos/{REPOSITORY}/collaborators/"))
+            .and_then(|rest| rest.strip_suffix("/permission"))
+            .unwrap();
+        match login {
+            "tjfontaine" => Ok(json!({"permission":"admin"})),
+            "collaborator" => Ok(json!({"permission":"write"})),
+            "reader" => Ok(json!({"permission":"read"})),
+            "api-down" => Err(ScalerError::GithubGone),
+            _ => Err(ScalerError::Guard("gh: Not Found (HTTP 404)")),
+        }
+    }
+
     #[test]
-    fn agent_comment_controller_rechecks_owner_unedited_comment_and_owned_pr() {
+    fn agent_comment_controller_rechecks_collaborator_unedited_comment_and_owned_pr() {
         let mut run = review_run(99);
         run["event"] = "issue_comment".into();
         run["head_branch"] = "main".into();
@@ -858,7 +898,12 @@ mod tests {
             ("wrong_command", false),
             ("unowned", false),
             ("stale", false),
-            ("other_issue_author", false),
+            // #1214: the issue author no longer matters; the commenter's live
+            // write permission does.
+            ("other_issue_author", true),
+            ("collaborator", true),
+            ("reader", false),
+            ("api-down", false),
             ("no_guard", false),
             ("wrong_issue", false),
         ] {
@@ -867,8 +912,8 @@ mod tests {
             if case == "same_timestamp_edit" {
                 comment["body"] = "/agent changed".into();
             }
-            if case == "outsider" {
-                comment["user"]["login"] = "outsider".into();
+            if ["outsider", "collaborator", "reader", "api-down"].contains(&case) {
+                comment["user"]["login"] = case.into();
             }
             if case == "edited" {
                 comment["updated_at"] = "2026-10-24T00:01:00Z".into();
@@ -899,6 +944,7 @@ mod tests {
                 else if endpoint.ends_with("/pulls/800") { pr.clone() }
                 else if endpoint.ends_with("/actions/runs/42") { original.clone() }
                 else if endpoint.ends_with("/issues/799") { issue.clone() }
+                else if endpoint.contains("/collaborators/") { permission(endpoint)? }
                 else { panic!("unexpected endpoint {endpoint}") })
             }, &mut |_, _, _, _| None).unwrap();
             if admitted != allowed {
@@ -924,11 +970,15 @@ mod tests {
             ("head_main", false),
             ("non_work_ref", false),
             ("dispatch_ref", false),
-            ("third_party_author", false),
+            // #1214: neither the PR nor the issue author is checked.
+            ("third_party_author", true),
+            ("app_issue", true),
+            ("collaborator", true),
+            ("reader", false),
             ("no_reference", false),
             ("two_references", false),
             ("closed_issue", false),
-            ("other_issue_author", false),
+            ("other_issue_author", true),
             ("stale", false),
             ("edited", false),
             ("outsider", false),
@@ -941,8 +991,8 @@ mod tests {
             if case == "edited" {
                 comment["updated_at"] = "2026-10-30T00:01:00Z".into();
             }
-            if case == "outsider" {
-                comment["user"]["login"] = "outsider".into();
+            if ["outsider", "collaborator", "reader"].contains(&case) {
+                comment["user"]["login"] = case.into();
             }
             let mut pr = json!({"number":1150,"state":"open","draft":false,"user":{"login":"carrick-workers[bot]","type":"Bot"},
                 "head":{"ref":"work/986-slice4","sha":tip,"repo":{"full_name":REPOSITORY}},
@@ -961,6 +1011,7 @@ mod tests {
                 "two_references" => references.push(987),
                 "closed_issue" => issue["state"] = "closed".into(),
                 "other_issue_author" => issue["user"]["login"] = "outsider".into(),
+                "app_issue" => issue["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"}),
                 "stale" => pr["head"]["sha"] = "b".repeat(40).into(),
                 "closed_pr" => pr["state"] = "closed".into(),
                 _ => {}
@@ -1000,6 +1051,7 @@ mod tests {
                 else if endpoint.ends_with("/pulls/1150") { pr.clone() }
                 else if endpoint.ends_with("/issues/986") { issue.clone() }
                 else if endpoint.ends_with("/actions/runs/42") { original.clone() }
+                else if endpoint.contains("/collaborators/") { permission(endpoint)? }
                 else { panic!("unexpected endpoint {endpoint}") })
             }, &mut |_, _, _, _| None).unwrap();
             if case == "dispatch_ref" {
@@ -1088,6 +1140,8 @@ mod tests {
                         )
                     } else if endpoint.ends_with("/jobs?per_page=100") {
                         Ok(json!([{"jobs":review_jobs(9)}]))
+                    } else if endpoint.contains("/collaborators/") {
+                        permission(endpoint)
                     } else {
                         panic!("unexpected API endpoint: {endpoint}")
                     }
@@ -1124,7 +1178,8 @@ mod tests {
                 else if endpoint.contains("/contents/") {
                     blobs.push(endpoint.to_owned());
                     Ok(json!({"type":"file","sha":if endpoint.ends_with(&"a".repeat(40)) {head_blob.repeat(40)} else {"b".repeat(40)}}))
-                } else { panic!("unexpected endpoint {endpoint}") }
+                } else if endpoint.contains("/collaborators/") { permission(endpoint) }
+                else { panic!("unexpected endpoint {endpoint}") }
             }, &mut |_, _, _, _| None).unwrap();
             assert_eq!(admitted, allowed);
             assert_eq!(blobs.len(), 2);
@@ -1231,6 +1286,9 @@ mod tests {
                 |_, endpoint, _, paginated| {
                     if endpoint.ends_with("/42") {
                         return Ok(run.clone());
+                    }
+                    if endpoint.contains("/collaborators/") {
+                        return permission(endpoint);
                     }
                     assert_eq!(
                         endpoint,

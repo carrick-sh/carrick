@@ -508,6 +508,7 @@ set -eu
 printf '%s\n' "$@" >> "$RUNNER_TEMP/gh.args"
 if [ "$1" = api ]; then
   case "$2" in
+    */collaborators/tjfontaine/permission) echo '{"permission":"admin"}' ;;
     */actions/runs/42) cat "$RUNNER_TEMP/run.json" ;;
     */pulls/800) cat "$RUNNER_TEMP/pr-object.json" ;;
     */issues/799) cat "$RUNNER_TEMP/issue.json" ;;
@@ -646,7 +647,17 @@ fn guard_skips_reviews_outside_dispatch_changes_requests() {
     ))
     .unwrap();
     let condition = docs[0]["jobs"]["guard"]["if"].as_str().unwrap();
-    assert!(condition.contains("github.actor == 'tjfontaine'"));
+    // #1214: no hard-coded login; an association pre-filter on comments and
+    // reviews, with the guard's live permission check authoritative.
+    assert!(!condition.contains("tjfontaine") && !condition.contains("github.actor"));
+    for association in [
+        "github.event.comment.author_association",
+        "github.event.review.author_association",
+    ] {
+        assert!(condition.contains(&format!(
+            "contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), {association})"
+        )));
+    }
     for trigger in [
         "github.event_name == 'issues'",
         "github.event_name == 'issue_comment'",
@@ -760,6 +771,7 @@ fn issue_triggers_default_to_run_branch_without_parsing_body_directives() {
                 &gh,
                 r#"#!/bin/sh
 case "$2" in
+ */collaborators/tjfontaine/permission) echo '{"permission":"admin"}' ;;
  *'/pulls?'*) cat "$RUNNER_TEMP/prs.json" ;;
  */actions/runs/42) cat "$RUNNER_TEMP/run.json" ;;
  */issues/comments/123) cat "$RUNNER_TEMP/comment.json" ;;
@@ -838,7 +850,7 @@ fn guard_skips_labels_that_cannot_be_admitted() {
     assert_eq!(
         docs[0]["jobs"]["guard"]["if"].as_str(),
         Some(
-            "github.actor == 'tjfontaine' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/agent')) || (github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))"
+            "github.event.sender.type == 'User' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), github.event.comment.author_association) && startsWith(github.event.comment.body, '/agent')) || (github.event_name == 'pull_request_review' && contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), github.event.review.author_association) && github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))"
         )
     );
 }
