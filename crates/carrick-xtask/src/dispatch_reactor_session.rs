@@ -394,8 +394,8 @@ pub(super) fn tools() -> Value {
          "inputSchema":schema(json!({"pr":pr}),&["pr"])},
         {"name":"read_outcomes","description":"Dispatch outcome comments on the PR.",
          "inputSchema":schema(json!({"pr":pr}),&["pr"])},
-        {"name":"read_issue","description":"An issue's title, state, labels and body.",
-         "inputSchema":schema(json!({"n":{"type":"integer","description":"issue number"}}),&["n"])},
+        {"name":"read_issue","description":"An issue's title, state, labels and body, plus its latest comments, newest last, when comments is set (the decision log #231 holds the owner's goals and the director lanes).",
+         "inputSchema":schema(json!({"n":{"type":"integer","description":"issue number"},"comments":{"type":"integer","description":"latest comments to include, default 0, max 30"}}),&["n"])},
         {"name":"reply","description":"Post a plain-text reply on the PR as the owner, marked as the reactor's. Never a command.",
          "inputSchema":schema(json!({"pr":pr,"text":{"type":"string"}}),&["pr","text"])},
         {"name":"request_round","description":"Post `/agent <brief>` to start one dispatch round. Refused unless the PR is adoptable or owned, no dispatch run is in flight for it, fewer than 4 runs are in flight, no reactor round already ran on this head, and fewer than 3 reactor rounds ran in a row, without an owner comment since.",
@@ -646,6 +646,33 @@ impl Server<'_> {
                     );
                 } else {
                     out["body_untrusted"] = json!(true);
+                }
+                let limit = args["comments"].as_u64().unwrap_or(0).min(30) as usize;
+                if limit > 0 {
+                    let mut all = remote
+                        .list(&format!(
+                            "repos/{REPOSITORY}/issues/{n}/comments?per_page=100"
+                        ))
+                        .map_err(fail)?;
+                    let skip = all.len().saturating_sub(limit);
+                    out["comments"] = all
+                        .split_off(skip)
+                        .iter()
+                        .map(|c| {
+                            let body: String = c["body"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .chars()
+                                .take(6000)
+                                .collect();
+                            gated(
+                                "comment",
+                                &c["user"],
+                                &c["created_at"],
+                                json!({"url":c["html_url"],"body":body}),
+                            )
+                        })
+                        .collect();
                 }
                 Ok(out.to_string())
             }
@@ -1481,6 +1508,35 @@ mod tests {
         let (_, thread) = call(&mut fake, &state, "read_thread", json!({"pr":30}));
         let thread: Value = serde_json::from_str(&thread).unwrap();
         assert_eq!(thread[1]["body"], "yes, go again");
+        // read_issue's comments (the decision log) are gated the same way.
+        let (err, text) = call(
+            &mut fake,
+            &state,
+            "read_issue",
+            json!({"n":30,"comments":1}),
+        );
+        let issue: Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            !err && issue["comments"].as_array().unwrap().len() == 1,
+            "{text}"
+        );
+        assert_eq!(issue["comments"][0]["body"], "yes, go again");
+        let (_, text) = call(
+            &mut fake,
+            &state,
+            "read_issue",
+            json!({"n":30,"comments":5}),
+        );
+        let issue: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(issue["comments"][0]["untrusted"], true);
+        assert!(issue["comments"][0].get("body").is_none(), "{text}");
+        let (_, text) = call(&mut fake, &state, "read_issue", json!({"n":30}));
+        assert!(
+            serde_json::from_str::<Value>(&text)
+                .unwrap()
+                .get("comments")
+                .is_none()
+        );
         assert!(!call(&mut fake, &state, "request_round", brief).0);
         assert_eq!(fake.posted.len(), 2);
 
