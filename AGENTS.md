@@ -690,8 +690,8 @@ SendMessage.
 - **cloudmac is shared with CI** ([`docs/ci/mac-hvf-runner.md`](docs/ci/mac-hvf-runner.md)):
   the persistent `carrick-hvf` runner (`hvf-kernel`), the `carrick-macos-ci` PR
   runner (`ci` user) and director gates (`remote-accept`, `just accept`) run on
-  separate internal APFS volumes (`carrick-hvf`, `carrick-ci` with its 35 GB quota
-  raised, and `carrick-gate`), with cold/cached `rentamac` data
+  separate internal APFS volumes (`carrick-hvf`, `carrick-ci` with a 35 GB quota to be
+  enlarged, and `carrick-gate`), with cold/cached `rentamac` data
   (`sccache`, fixtures, evidence) on external USB `/Volumes/carrick`. Serialize
   build-heavy and signed work through `/tmp/carrick-host-lease.lock` (`carrick-macos-ci`
   holds shared `just lease carrick`; `hvf-kernel` and director gates hold
