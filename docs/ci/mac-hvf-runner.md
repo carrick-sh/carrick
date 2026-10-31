@@ -48,11 +48,12 @@ artifacts move to the external USB volume (`/Volumes/carrick`, 233 GB total):
    - director fixture archives and retained gate evidence/home archives under
      `/Volumes/carrick/dev/`;
    - reclaims ~45 GB in the internal APFS container for active CI and gate worktrees.
-2. **Raise the 35 GB quota on `/Volumes/carrick-ci`:**
-   - Check it with `diskutil apfs list`, then raise it so `carrick-macos-ci` PR shards
-     don't fail at the quota, e.g.
-     `sudo diskutil apfs setQuota <carrick-ci volume disk id> 60g`. Record the before
-     and after `diskutil apfs list` lines on #1225.
+2. **Give `carrick-macos-ci` more than its 35 GB quota:**
+   - `diskutil` has no verb that changes an existing APFS volume's quota (`diskutil apfs`
+     on macOS 27 lists none). While the `ci` runner is drained, either recreate `carrick-ci`
+     with `diskutil apfs addVolume … -quota 60g` and re-register the runner (worktree
+     admission keys on device+inode, so re-admit rather than copy), or move its `_work`
+     onto a larger volume. Record the before and after `diskutil apfs list` lines on #1225.
 3. **Create a dedicated internal APFS volume `/Volumes/carrick-hvf`:**
    - Add an internal APFS volume `carrick-hvf` in the internal NVMe container with a
      reserve, so other volumes cannot starve it:
@@ -142,18 +143,19 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
    ```sh
    sudo install -d -o carrick-hvf -g staff -m 755 /Volumes/carrick-hvf/runner
    sudo -u carrick-hvf tar -xzf "actions-runner-osx-arm64-$VERSION.tar.gz" -C /Volumes/carrick-hvf/runner
-   # The registration token never goes in argv (visible to every user in `ps`).
-   # Save it to a 0600 file owned by carrick-hvf, pass it through the runner's
-   # ACTIONS_RUNNER_INPUT_TOKEN input variable, then delete the file.
-   sudo -u carrick-hvf env ACTIONS_RUNNER_INPUT_TOKEN="$(sudo cat /Volumes/carrick-hvf/registration-token)" \
-     /Volumes/carrick-hvf/runner/config.sh \
+   # The registration token never appears in any argv (`ps` shows argv to every
+   # user, including sudo's). Save it to /Volumes/carrick-hvf/registration-token,
+   # owned by carrick-hvf with mode 0600; the inner shell reads it into the
+   # runner's ACTIONS_RUNNER_INPUT_TOKEN input variable. Delete the file after.
+   sudo -u carrick-hvf sh -c 'export ACTIONS_RUNNER_INPUT_TOKEN="$(cat /Volumes/carrick-hvf/registration-token)"; \
+     exec /Volumes/carrick-hvf/runner/config.sh \
      --unattended \
      --url https://github.com/carrick-sh/carrick \
      --runnergroup carrick-hvf \
      --name cloudmac-hvf \
      --labels carrick-hvf \
      --work _work \
-     --disableupdate
+     --disableupdate'
 
    cat <<'EOF' | sudo tee /Volumes/carrick-hvf/runner/.env >/dev/null
    ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/libexec/carrick-ci/hvf-job-started.sh
@@ -184,13 +186,13 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
    # Re-grant only _work and _diag to carrick-hvf. Every local macOS user's
    # primary group is `staff`, including `ci`, which runs same-repo PR code on
    # this host, so nothing here may be group- or world-readable through staff.
-   sudo chown -R carrick-hvf:carrick-hvf \
+   sudo chown -R carrick-hvf:wheel \
      /Volumes/carrick-hvf/runner/_work \
      /Volumes/carrick-hvf/runner/_diag
    # The runner identity (.runner, .credentials, .credentials_rsaparams) is
    # readable by carrick-hvf alone: anyone who can read it can pose as
    # cloudmac-hvf, take trusted main jobs and upload receipts.
-   sudo chown carrick-hvf:carrick-hvf \
+   sudo chown carrick-hvf:wheel \
      /Volumes/carrick-hvf/runner/.runner /Volumes/carrick-hvf/runner/.credentials*
    sudo chmod 0400 /Volumes/carrick-hvf/runner/.runner /Volumes/carrick-hvf/runner/.credentials*
    ```
@@ -199,6 +201,9 @@ Performed by the owner on `cloudmac` before enabling `sh.carrick.hvf-runner`:
    the director user `rentamac` cannot read any runner identity file:
 
    ```sh
+   # The glob must match the files first, or the check below passes vacuously.
+   sudo ls -l /Volumes/carrick-hvf/runner/.runner /Volumes/carrick-hvf/runner/.credentials \
+     /Volumes/carrick-hvf/runner/.credentials_rsaparams || echo "MISSING identity file"
    for u in ci rentamac; do
      for f in /Volumes/carrick-hvf/runner/.runner /Volumes/carrick-hvf/runner/.credentials*; do
        sudo -u "$u" test -r "$f" && echo "READABLE by $u: $f"
@@ -349,7 +354,8 @@ Disk exhaustion fails up front with a clear GitHub annotation rather than mid-bu
      `sudo launchctl bootout system /Library/LaunchDaemons/sh.carrick.hvf-runner.plist`
      and deregister it so queued jobs don't wait on the offline registration
      (GitHub has no per-runner disable switch):
-     `sudo -u carrick-hvf env ACTIONS_RUNNER_INPUT_TOKEN="$(sudo cat /Volumes/carrick-hvf/removal-token)" /Volumes/carrick-hvf/runner/config.sh remove`.
+     `sudo -u carrick-hvf sh -c 'export ACTIONS_RUNNER_INPUT_TOKEN="$(cat /Volumes/carrick-hvf/removal-token)"; exec /Volumes/carrick-hvf/runner/config.sh remove'`
+     (the removal token in a `carrick-hvf`-owned 0600 file, as for registration).
    - Rollback needs space on `/Volumes/carrick-build`: cutover step 1 must already have moved
      the director data to USB, or `mac-jit`'s own 60 GiB disk admission refuses the job.
    - Start `carrick-ci-mac-jit.service` on `carrick-ctb`:
