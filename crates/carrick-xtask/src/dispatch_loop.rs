@@ -4052,8 +4052,9 @@ API
             };
             // This is the real foreground process: it writes its own contract,
             // stdout evidence and work before the deadline runner can kill it.
+            // The launcher's stream-json session sits beside the checkout.
             let source = format!(
-                "printf 'fixture agent started\n' > \"$1\"; printf '%s' \"$3\" > \"$2\"; {script}"
+                "printf 'fixture agent started\n' > \"$1\"; printf '%s' \"$3\" > \"$2\"; mkdir -p ../runtime/dispatch; printf '{{\"event\":\"init\"}}\\n' > ../runtime/dispatch/worker.log; {script}"
             );
             let contract = json!({"structured_output":{"status":"done","summary":"fixture worker progress","tests":[],"risks":[]}}).to_string();
             let mut command = Command::new("/bin/sh");
@@ -4551,6 +4552,13 @@ API
                     .expect("earlier worker body proposal was discarded")
                     .contains("Explain the completed fix.")
             );
+            // Each worker's whole session reaches the upload, one file each.
+            for index in [1, 2] {
+                let session =
+                    regular_text(&root.join(format!("dispatch-output/worker-{index}.jsonl")))
+                        .unwrap();
+                assert_eq!(session, "{\"event\":\"init\"}\n", "worker {index}");
+            }
         });
     }
     #[test]
