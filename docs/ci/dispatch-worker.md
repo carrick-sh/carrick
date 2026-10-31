@@ -147,12 +147,11 @@ login, with the hidden marker `<!-- carrick-reactor -->`:
   comments) are not events. Runs are read from
   `actions/runs?status=completed`, created up to three hours before a
   separate run cursor.
-- Automatic behaviour applies only to PRs created after the reactor's epoch
-  (recorded in state on the first real run; `--since <YYYY-MM-DDTHH:MM:SSZ>`
-  overrides it): a director PR without exactly one closing reference gets
-  one reply asking for `Closes #N`, once per PR, and an adoptable PR with no
-  push for 15 minutes and no reactor round yet counts as one event per head.
-  Comments and reviews on any PR are still events.
+- Every open PR is in scope, however old: the reactor exists to finish PRs.
+  A director PR without exactly one closing reference gets one reply asking
+  for `Closes #N`, once per PR, and an adoptable PR with no push for 15
+  minutes and no reactor round yet counts as one event per head. Label a PR
+  `agent:hold` to keep the reactor off it.
 - The reactor never merges, pushes, edits, labels or closes anything.
 
 State (cursor and per-PR memory) lives in

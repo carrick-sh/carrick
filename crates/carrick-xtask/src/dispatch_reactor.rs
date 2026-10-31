@@ -44,10 +44,6 @@ pub struct Opts {
     /// State file (cursor and per-PR memory).
     #[arg(long)]
     state: Option<PathBuf>,
-    /// Reactor epoch override (`YYYY-MM-DDTHH:MM:SSZ`): only PRs created since
-    /// get quiet pickup and the closing-reference ask.
-    #[arg(long)]
-    since: Option<String>,
     /// Model for the deciding agent (`claude -p --model`).
     #[arg(long, default_value = "sonnet")]
     model: String,
@@ -91,8 +87,6 @@ pub(crate) struct Decision {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct State {
-    /// First real run; automatic pickup and asks apply only to PRs created since.
-    epoch: Option<String>,
     cursor: Option<String>,
     /// Latest `updated_at` of a completed workflow run already read.
     run_cursor: Option<String>,
@@ -255,7 +249,6 @@ pub(crate) fn cycle(
     agent: &mut dyn Agent,
     state: &mut State,
     now: u64,
-    epoch: &str,
     dry_run: bool,
 ) -> Result<Vec<String>, ScalerError> {
     let mut log = Vec::new();
@@ -371,8 +364,6 @@ pub(crate) fn cycle(
         let node = facts.get(&number).cloned().unwrap_or(Value::Null);
         let commit = &node["commits"]["nodes"][0]["commit"];
         let mut adoptable = false;
-        // Automatic behaviours only for PRs created since the reactor's epoch.
-        let recent = pr["created_at"].as_str().is_some_and(|c| c >= epoch);
         // A failed run finishes existing work, so it counts on any open PR a
         // round could target, however old.
         if director || owned {
@@ -398,7 +389,7 @@ pub(crate) fn cycle(
                 .as_ref()
                 .and_then(|c| super::parse_closing_references(c).ok())
                 .map(|r| r.all.len());
-            if recent && count != Some(1) && !memory.closes_asked {
+            if count != Some(1) && !memory.closes_asked {
                 memory.closes_asked = true;
                 let body = format!("{CLOSES_ASK}\n\n{MARKER}");
                 log.push(format!("#{number}: ask for a closing reference"));
@@ -408,7 +399,6 @@ pub(crate) fn cycle(
                 .as_str()
                 .is_some_and(|d| d <= iso(now.saturating_sub(QUIET_SECS)).as_str());
             if adoptable
-                && recent
                 && quiet
                 && memory.rounds == 0
                 && memory.candidate_head.as_deref() != Some(head.as_str())
@@ -729,24 +719,6 @@ fn once(root: &Path, opts: &Opts) -> Result<(), ScalerError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ScalerError::Guard("clock before epoch"))?
         .as_secs();
-    if let Some(since) = &opts.since
-        && !regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-            .map_err(|_| ScalerError::Guard("epoch pattern"))?
-            .is_match(since)
-    {
-        return Err(ScalerError::Usage(format!(
-            "--since must be YYYY-MM-DDTHH:MM:SSZ, got {since:?}"
-        )));
-    }
-    if !opts.dry_run && state.epoch.is_none() {
-        state.epoch = Some(iso(now));
-    }
-    let epoch = opts
-        .since
-        .clone()
-        .or_else(|| state.epoch.clone())
-        .unwrap_or_else(|| iso(now));
-    println!("reactor: epoch {epoch}");
     let log = cycle(
         &mut Live { root },
         &mut Claude {
@@ -754,7 +726,6 @@ fn once(root: &Path, opts: &Opts) -> Result<(), ScalerError> {
         },
         &mut state,
         now,
-        &epoch,
         opts.dry_run,
     )?;
     for line in &log {
@@ -864,7 +835,6 @@ mod tests {
     }
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
     const NOW: u64 = 1_793_404_800; // 2026-10-31T00:00:00Z
-    const EPOCH: &str = "2026-10-30T23:00:00Z";
     fn pr(number: u64, branch: &str) -> Value {
         json!({"number":number,"state":"open","title":format!("PR {number}"),
             "created_at":"2026-10-30T23:10:00Z",
@@ -949,7 +919,7 @@ mod tests {
         fake.closing = vec![7, 8];
         let mut a = agent(Act::Round, "fix CI");
         let mut state = State::default();
-        let log = cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        let log = cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(a.calls, 1);
         assert_eq!(fake.posted.len(), 1);
         assert!(fake.posted[0].1.starts_with(CLOSES_ASK));
@@ -973,7 +943,6 @@ mod tests {
                 &mut agent(Act::Round, "go"),
                 &mut state,
                 NOW,
-                EPOCH,
                 false,
             )
             .unwrap();
@@ -1000,7 +969,6 @@ mod tests {
             &mut agent(Act::Round, "go"),
             &mut State::default(),
             NOW,
-            EPOCH,
             false,
         )
         .unwrap();
@@ -1025,7 +993,7 @@ mod tests {
         );
         let mut a = agent(Act::Reply, "hello");
         let mut state = State::default();
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(a.calls, 0);
         assert!(fake.posted.is_empty());
         assert_eq!(state.cursor.as_deref(), Some("2026-10-30T23:59:00Z"));
@@ -1037,15 +1005,15 @@ mod tests {
         fake.closing = vec![];
         let mut state = State::default();
         let mut a = agent(Act::Ignore, "");
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(fake.posted.len(), 1);
         assert!(fake.posted[0].1.ends_with(MARKER));
         assert!(state.prs[&13].closes_asked);
         // Dry run reports the ask but posts nothing.
         let mut dry = gh(vec![pr(13, "work/no-closes")], vec![]);
         dry.closing = vec![];
-        let log = cycle(&mut dry, &mut a, &mut State::default(), NOW, EPOCH, true).unwrap();
+        let log = cycle(&mut dry, &mut a, &mut State::default(), NOW, true).unwrap();
         assert!(dry.posted.is_empty());
         assert!(log.iter().any(|l| l.contains("would post")));
     }
@@ -1058,8 +1026,8 @@ mod tests {
         ];
         let mut a = agent(Act::Ignore, "");
         let mut state = State::default();
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(a.calls, 1);
         assert!(fake.posted.is_empty());
     }
@@ -1086,7 +1054,7 @@ mod tests {
             ],
         );
         let mut a = agent(Act::Ignore, "");
-        cycle(&mut fake, &mut a, &mut State::default(), NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut State::default(), NOW, false).unwrap();
         assert_eq!(a.calls, 1);
     }
 
@@ -1098,7 +1066,7 @@ mod tests {
         );
         let mut a = agent(Act::Round, "fix CI");
         let mut state = State::default();
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(fake.posted.len(), 1);
         assert_eq!(state.prs[&16].last_round_head.as_deref(), Some(SHA));
         assert_eq!(
@@ -1113,7 +1081,7 @@ mod tests {
             "Bot",
             "Dispatch outcome: failed",
         )];
-        let log = cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        let log = cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(a.calls, 2);
         assert_eq!(fake.posted.len(), 1, "{log:?}");
         assert!(
@@ -1122,7 +1090,7 @@ mod tests {
         );
         // A stranger's comment asks for a decision but does not reset the guard.
         fake.comments = vec![comment(16, 13, "drive-by", "User", "run it again")];
-        let log = cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        let log = cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(a.calls, 3);
         assert_eq!(fake.posted.len(), 1, "{log:?}");
         // An owner comment after the round re-enables one more round.
@@ -1133,34 +1101,29 @@ mod tests {
             "User",
             "try the other approach",
         )];
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(fake.posted.len(), 2);
     }
 
     #[test]
-    fn dispatch_reactor_old_pr_gets_no_automatic_behaviour() {
+    fn dispatch_reactor_old_pr_gets_pickup_and_closing_ask() {
+        // Existing PRs are the work to finish: age does not exempt them.
         let mut old = pr(17, "work/old");
         old["created_at"] = json!("2026-10-01T00:00:00Z");
-        let mut unclosed = pr(18, "work/old-unclosed");
-        unclosed["created_at"] = json!("2026-10-01T00:00:00Z");
-        let mut fake = gh(vec![old, unclosed], vec![]);
+        let mut fake = gh(vec![old.clone()], vec![]);
         fake.facts = vec![
             json!({"number":17,"commits":{"nodes":[{"commit":{"committedDate":"2026-10-01T00:00:00Z"}}]}}),
         ];
         let mut a = agent(Act::Round, "go");
-        let mut state = State::default();
-        // FakeGh answers closing references for every PR alike; run each case.
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
-        fake.closing = vec![];
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
-        assert_eq!(a.calls, 0);
-        assert!(fake.posted.is_empty());
-        // An explicit owner comment on an old PR is still an event.
-        fake.closing = vec![7];
-        fake.comments = vec![comment(17, 11, "tjfontaine", "User", "please fix")];
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut State::default(), NOW, false).unwrap();
         assert_eq!(a.calls, 1);
-        assert_eq!(fake.posted.len(), 1);
+        assert_eq!(fake.posted, vec![(17, format!("/agent go\n\n{MARKER}"))]);
+        // An old PR without a closing reference gets the ask.
+        let mut unclosed = gh(vec![old], vec![]);
+        unclosed.closing = vec![];
+        cycle(&mut unclosed, &mut a, &mut State::default(), NOW, false).unwrap();
+        assert_eq!(unclosed.posted.len(), 1);
+        assert!(unclosed.posted[0].1.starts_with(CLOSES_ASK));
     }
 
     fn workflow_run(id: u64, sha: &str, conclusion: &str, path: &str) -> Value {
@@ -1181,7 +1144,7 @@ mod tests {
         ];
         let mut a = agent(Act::Ignore, "");
         let mut state = State::default();
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(a.calls, 1);
         assert!(state.prs[&19].seen.iter().any(|s| s == "run:100:1"));
         assert!(
@@ -1192,7 +1155,7 @@ mod tests {
         );
         assert_eq!(state.run_cursor.as_deref(), Some("2026-10-30T23:58:00Z"));
         // The same run read again is not a new event.
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(a.calls, 1);
         // Control: only successful runs ask for nothing.
         fake.workflow_runs = vec![workflow_run(
@@ -1201,7 +1164,7 @@ mod tests {
             "success",
             ".github/workflows/ci.yml",
         )];
-        cycle(&mut fake, &mut a, &mut State::default(), NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut State::default(), NOW, false).unwrap();
         assert_eq!(a.calls, 1);
     }
 
@@ -1217,7 +1180,7 @@ mod tests {
             workflow_run(111, "feedface", "failure", ".github/workflows/ci.yml"),
         ];
         let mut a = agent(Act::Round, "fix");
-        cycle(&mut fake, &mut a, &mut State::default(), NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut State::default(), NOW, false).unwrap();
         // The old director PR gets its round; the non-director PR asks nothing.
         assert_eq!(a.calls, 1);
         assert_eq!(fake.posted, vec![(20, format!("/agent fix\n\n{MARKER}"))]);
@@ -1239,13 +1202,13 @@ mod tests {
                 "failure",
                 ".github/workflows/ci.yml",
             )];
-            cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+            cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         }
         assert_eq!(fake.posted.len(), UNATTENDED_ROUNDS as usize);
         // A human comment re-enables one round on the same head.
         fake.workflow_runs = vec![];
         fake.comments = vec![comment(21, 12, "tjfontaine", "User", "one more try")];
-        cycle(&mut fake, &mut a, &mut state, NOW, EPOCH, false).unwrap();
+        cycle(&mut fake, &mut a, &mut state, NOW, false).unwrap();
         assert_eq!(fake.posted.len(), UNATTENDED_ROUNDS as usize + 1);
     }
 
