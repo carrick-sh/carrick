@@ -8,8 +8,8 @@
 //! [`super::enforce`] under the same gates as the poll loop.
 use super::{
     Act, AdoptionRead, Class, Decision, Effect, Gate, Github, Live, MARKER, QUIET_SECS, REPOSITORY,
-    ScalerError, adopted_pr, adoption_facts, classify, clip, director_pr, enforce, gather, iso,
-    outcome_bot, owned_pr, trusted_owner,
+    ScalerError, UNATTENDED_ROUNDS, adopted_pr, adoption_facts, classify, clip, director_pr,
+    enforce, gather, iso, limit_warnings, lookback, outcome_bot, owned_pr, trusted_owner,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,12 +26,9 @@ pub struct FeedOpts {
     /// Mailbox (JSON lines, appended).
     #[arg(long)]
     mailbox: Option<PathBuf>,
-    /// Feed state (cursor, epoch, per-PR memory); separate from `run`'s state.
+    /// Feed state (cursors, per-PR memory); separate from `run`'s state.
     #[arg(long)]
     state: Option<PathBuf>,
-    /// Epoch override (`YYYY-MM-DDTHH:MM:SSZ`) for new/quiet/needs-closes events.
-    #[arg(long)]
-    since: Option<String>,
     /// One poll, then exit (otherwise poll every 60 s).
     #[arg(long)]
     once: bool,
@@ -95,31 +92,66 @@ fn held(pr: &Value) -> bool {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(super) struct FeedState {
-    epoch: Option<String>,
     cursor: Option<String>,
+    /// Latest `updated_at` of a completed workflow run already read.
+    run_cursor: Option<String>,
     prs: BTreeMap<u64, FeedMemory>,
 }
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FeedMemory {
     seen: Vec<String>,
     announced: bool,
-    ci_red_head: Option<String>,
     quiet_head: Option<String>,
     closes_flagged: bool,
 }
 
-/// One poll: the new mailbox lines, in order.
+/// Completed workflow runs since the run cursor, keyed by head SHA. Every
+/// conclusion is kept; the session judges what it means. Dispatch's own runs
+/// report through outcome comments instead.
+fn completed_runs(
+    gh: &mut dyn Github,
+    state: &mut FeedState,
+    since: &str,
+) -> Result<BTreeMap<String, Vec<Value>>, ScalerError> {
+    let run_since = state.run_cursor.clone().unwrap_or_else(|| since.to_owned());
+    let mut cursor = run_since.clone();
+    let mut by_head: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for run in gh.workflow_runs(&lookback(&run_since))? {
+        let (Some(at), Some(sha)) = (run["updated_at"].as_str(), run["head_sha"].as_str()) else {
+            continue;
+        };
+        if at < run_since.as_str() {
+            continue;
+        }
+        if at > cursor.as_str() {
+            cursor = at.to_owned();
+        }
+        if run["conclusion"].is_string()
+            && !run["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("dispatch-worker.yml"))
+        {
+            by_head.entry(sha.to_owned()).or_default().push(run);
+        }
+    }
+    state.run_cursor = Some(cursor);
+    Ok(by_head)
+}
+
+/// One poll: the new mailbox lines, in order. Every open PR is in scope,
+/// however old: the session exists to finish PRs, and `agent:hold` opts one
+/// out.
 pub(super) fn feed_cycle(
     gh: &mut dyn Github,
     state: &mut FeedState,
     now: u64,
-    epoch: &str,
 ) -> Result<Vec<Value>, ScalerError> {
     let since = state
         .cursor
         .clone()
         .unwrap_or_else(|| iso(now.saturating_sub(3600)));
     let mut g = gather(gh, &since)?;
+    let mut runs = completed_runs(gh, state, &since)?;
     let open: Vec<u64> = g.prs.iter().filter_map(|p| p["number"].as_u64()).collect();
     state.prs.retain(|n, _| open.contains(n));
     let mut out = Vec::new();
@@ -150,12 +182,12 @@ pub(super) fn feed_cycle(
         let excess = memory.seen.len().saturating_sub(SEEN_LIMIT);
         memory.seen.drain(..excess);
         let director = director_pr(pr);
-        let recent = pr["created_at"].as_str().is_some_and(|c| c >= epoch);
+        let owned = owned_pr(pr);
         let url = pr["html_url"].as_str().unwrap_or_default();
         let author = pr["user"]["login"].as_str().unwrap_or("?");
         let title = pr["title"].as_str().unwrap_or_default();
         let at = iso(now);
-        if director && recent && !memory.announced {
+        if director && !memory.announced {
             memory.announced = true;
             out.push(line(
                 format!("new_pr:{number}"),
@@ -167,25 +199,30 @@ pub(super) fn feed_cycle(
             ));
         }
         let commit = &g.facts.get(&number).unwrap_or(&Value::Null)["commits"]["nodes"][0]["commit"];
-        let ci = commit["statusCheckRollup"]["state"]
-            .as_str()
-            .unwrap_or_default();
-        if (director || owned_pr(pr))
-            && matches!(ci, "FAILURE" | "ERROR")
-            && memory.ci_red_head.as_deref() != Some(head)
-        {
-            memory.ci_red_head = Some(head.to_owned());
-            out.push(line(
-                format!("ci_red:{number}:{head}"),
-                "ci_red",
-                "ci",
-                url,
-                &at,
-                &format!("CI {ci} on {head}"),
-            ));
+        if director || owned {
+            for run in runs.remove(head).unwrap_or_default() {
+                let id = format!("ci_run:{}:{}", run["id"], run["run_attempt"]);
+                if memory.seen.contains(&id) {
+                    continue;
+                }
+                memory.seen.push(id.clone());
+                let name = run["name"].as_str().unwrap_or("?");
+                out.push(line(
+                    id,
+                    "ci_run",
+                    "ci",
+                    run["html_url"].as_str().unwrap_or(url),
+                    run["updated_at"].as_str().unwrap_or(&at),
+                    &format!(
+                        "{name} ({}) concluded {}",
+                        run["event"].as_str().unwrap_or("?"),
+                        run["conclusion"].as_str().unwrap_or("?")
+                    ),
+                ));
+            }
         }
-        if director && recent {
-            let (adoptable, count) = adoption_facts(gh, pr)?;
+        if director {
+            let (_, count) = adoption_facts(gh, pr)?;
             if count != Some(1) && !memory.closes_flagged {
                 memory.closes_flagged = true;
                 out.push(line(
@@ -200,20 +237,22 @@ pub(super) fn feed_cycle(
                     ),
                 ));
             }
-            let quiet = commit["committedDate"]
-                .as_str()
-                .is_some_and(|d| d <= iso(now.saturating_sub(QUIET_SECS)).as_str());
-            if adoptable && quiet && memory.quiet_head.as_deref() != Some(head) {
-                memory.quiet_head = Some(head.to_owned());
-                out.push(line(
-                    format!("quiet_pr:{number}:{head}"),
-                    "quiet_pr",
-                    author,
-                    url,
-                    &at,
-                    "Adoptable director PR with no push for 15 minutes",
-                ));
-            }
+        }
+        // A quiet head is a wake-up, once per head, so a PR nobody is talking
+        // about still gets looked at; what it needs is the session's call.
+        let quiet = commit["committedDate"]
+            .as_str()
+            .is_some_and(|d| d <= iso(now.saturating_sub(QUIET_SECS)).as_str());
+        if (director || owned) && quiet && memory.quiet_head.as_deref() != Some(head) {
+            memory.quiet_head = Some(head.to_owned());
+            out.push(line(
+                format!("quiet_pr:{number}:{head}"),
+                "quiet_pr",
+                author,
+                url,
+                &at,
+                "No push to this head for 15 minutes",
+            ));
         }
     }
     state.cursor = Some(g.cursor);
@@ -231,16 +270,10 @@ fn feed_once(root: &Path, opts: &FeedOpts) -> Result<(), ScalerError> {
         .map_or_else(|| support("mailbox.jsonl"), Ok)?;
     let mut state: FeedState = load(&state_path)?;
     let now = now()?;
-    if let Some(since) = &opts.since
-        && !super::rfc3339(since)
-    {
-        return Err(ScalerError::Usage(format!(
-            "--since must be YYYY-MM-DDTHH:MM:SSZ, got {since:?}"
-        )));
+    for warning in limit_warnings(root, now) {
+        println!("{warning}");
     }
-    let epoch = state.epoch.get_or_insert_with(|| iso(now)).clone();
-    let epoch = opts.since.clone().unwrap_or(epoch);
-    let lines = feed_cycle(&mut Live { root }, &mut state, now, &epoch)?;
+    let lines = feed_cycle(&mut Live { root }, &mut state, now)?;
     if let Some(parent) = mailbox.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -253,11 +286,7 @@ fn feed_once(root: &Path, opts: &FeedOpts) -> Result<(), ScalerError> {
     }
     file.flush()?;
     save(&state_path, &state)?;
-    println!(
-        "reactor feed: {} event(s) at {} (epoch {epoch})",
-        lines.len(),
-        iso(now)
-    );
+    println!("reactor feed: {} event(s) at {}", lines.len(), iso(now));
     Ok(())
 }
 pub(super) fn feed(root: &Path, opts: &FeedOpts) -> Result<(), ScalerError> {
@@ -323,6 +352,9 @@ struct RoundMemory {
     rounds: u32,
     last_round_head: Option<String>,
     last_round_at: Option<String>,
+    /// Reactor rounds since the last owner comment.
+    #[serde(default)]
+    unattended: u32,
 }
 
 pub(super) struct Server<'a> {
@@ -352,7 +384,7 @@ pub(super) fn tools() -> Value {
          "inputSchema":schema(json!({"n":{"type":"integer","description":"issue number"}}),&["n"])},
         {"name":"reply","description":"Post a plain-text reply on the PR as the owner, marked as the reactor's. Never a command.",
          "inputSchema":schema(json!({"pr":pr,"text":{"type":"string"}}),&["pr","text"])},
-        {"name":"request_round","description":"Post `/agent <brief>` to start one dispatch round. Refused unless the PR is adoptable or owned, no dispatch run is in flight for it, fewer than 4 runs are in flight, and no reactor round already ran on this head without a human comment since.",
+        {"name":"request_round","description":"Post `/agent <brief>` to start one dispatch round. Refused unless the PR is adoptable or owned, no dispatch run is in flight for it, fewer than 4 runs are in flight, no reactor round already ran on this head, and fewer than 3 reactor rounds ran in a row, without an owner comment since.",
          "inputSchema":schema(json!({"pr":pr,"brief":{"type":"string","description":"what the worker should do and how to prove it"}}),&["pr","brief"])},
         {"name":"wait_events","description":"Wait for the next pull request events from the mailbox and return them as {events:[{id,pr,kind,author,url,created_at,head,excerpt}]}, oldest first. Only owner and dispatch-bot events are returned. An empty list means the wait timed out; call again.",
          "inputSchema":schema(json!({"timeout_seconds":{"type":"integer","description":"default 540, max 600"},"max_events":{"type":"integer","description":"default 20, max 100"}}),&[])}
@@ -621,6 +653,7 @@ impl Server<'_> {
         }
         let head = pr["head"]["sha"].as_str().unwrap_or_default().to_owned();
         let mut state: ToolState = load(&self.state).map_err(fail)?;
+        let mut human_reset = false;
         let (decision, gate) = if name == "reply" {
             let decision = Decision {
                 action: Act::Reply,
@@ -634,6 +667,7 @@ impl Server<'_> {
                     pr_run_active: false,
                     active_total: 0,
                     repeat_round: false,
+                    unattended: false,
                 },
             )
         } else {
@@ -654,12 +688,16 @@ impl Server<'_> {
                 .iter()
                 .any(|r| r["displayTitle"] == pr["title"] || r["headBranch"] == pr["head"]["ref"]);
             let memory = state.prs.get(&n);
-            let repeat_round = match memory
-                .and_then(|m| Some((m.last_round_head.as_deref()?, m.last_round_at.clone()?)))
-            {
-                Some((last, at)) if last == head => !self.human_since(n, &at).map_err(fail)?,
-                _ => false,
+            // An owner comment since the last round re-enables both limits.
+            let owner_spoke = match memory.and_then(|m| m.last_round_at.clone()) {
+                Some(at) => self.human_since(n, &at).map_err(fail)?,
+                None => true,
             };
+            let repeat_round = !owner_spoke
+                && memory.and_then(|m| m.last_round_head.as_deref()) == Some(head.as_str());
+            let unattended =
+                !owner_spoke && memory.is_some_and(|m| m.unattended >= UNATTENDED_ROUNDS);
+            human_reset = owner_spoke;
             (
                 decision,
                 Gate {
@@ -667,6 +705,7 @@ impl Server<'_> {
                     pr_run_active,
                     active_total: active.len(),
                     repeat_round,
+                    unattended,
                 },
             )
         };
@@ -681,6 +720,11 @@ impl Server<'_> {
                 if decision.action == Act::Round {
                     let memory = state.prs.entry(n).or_default();
                     memory.rounds += 1;
+                    memory.unattended = if human_reset {
+                        1
+                    } else {
+                        memory.unattended + 1
+                    };
                     memory.last_round_head = Some(head);
                     memory.last_round_at = Some(iso(self.now));
                     save(&self.state, &state).map_err(fail)?;
@@ -733,7 +777,7 @@ impl Server<'_> {
     }
 }
 
-const INSTRUCTIONS: &str = "Events from carrick-sh/carrick pull requests come from wait_events (or, when the session loads this server as a channel, as <channel source=\"carrick-reactor\" pr=... kind=... event_id=... author=... head=...> tags), one per event. kind is comment, review, review_comment (owner text), outcome (a dispatch outcome comment), ci_red, new_pr, quiet_pr or needs_closes. Route each event to the PR's own subagent pr-<N>: start it on the PR's first event and resume it with SendMessage after that. Subagents investigate with read_pr, read_thread, read_diff, read_ci, read_outcomes and read_issue, and act only through reply or request_round. When unsure, do nothing.";
+const INSTRUCTIONS: &str = "Events from carrick-sh/carrick pull requests come from wait_events (or, when the session loads this server as a channel, as <channel source=\"carrick-reactor\" pr=... kind=... event_id=... author=... head=...> tags), one per event. kind is comment, review, review_comment (owner text), outcome (a dispatch outcome comment), ci_run (a completed GitHub Actions run on the PR's head, any conclusion), new_pr, quiet_pr or needs_closes. Route each event to the PR's own subagent pr-<N>: start it on the PR's first event and resume it with SendMessage after that. Subagents investigate with read_pr, read_thread, read_diff, read_ci, read_outcomes and read_issue, and act only through reply or request_round. When unsure, do nothing.";
 
 /// Serialized stdout: one lock, one line per JSON-RPC message.
 pub(super) type Out = std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>;
@@ -884,7 +928,7 @@ fn spawn_wait(follower: SharedFollower, out: Out, id: Value, args: &Value) {
 pub(super) fn notification(event: &Value) -> Option<Value> {
     let kind = event["kind"].as_str()?;
     let author = event["author"].as_str().unwrap_or("?");
-    let synthetic = matches!(kind, "ci_red" | "new_pr" | "quiet_pr" | "needs_closes");
+    let synthetic = matches!(kind, "ci_run" | "new_pr" | "quiet_pr" | "needs_closes");
     let kind_of = if author.ends_with("[bot]") {
         "Bot"
     } else {
@@ -1020,8 +1064,14 @@ mod tests {
     use super::super::tests::{FakeGh, comment, gh, pr};
     use super::*;
 
-    const EPOCH: &str = "2026-10-30T23:00:00Z";
     const NOW: u64 = 1_793_404_800;
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn workflow_run(id: u64, sha: &str, conclusion: &str, path: &str) -> Value {
+        json!({"id":id,"run_attempt":1,"name":"ci","path":path,"event":"pull_request",
+            "head_sha":sha,"conclusion":conclusion,"updated_at":"2026-10-30T23:58:00Z",
+            "html_url":format!("https://github.com/{REPOSITORY}/actions/runs/{id}")})
+    }
 
     #[test]
     fn dispatch_reactor_feed_writes_event_lines() {
@@ -1043,14 +1093,37 @@ mod tests {
         );
         fake.facts = vec![json!({"number":20,"commits":{"nodes":[{"commit":{
             "committedDate":"2026-10-30T23:00:00Z","statusCheckRollup":{"state":"FAILURE"}}}]}})];
+        // Every conclusion on the head is an event; dispatch's own run and a
+        // stale head's run are not.
+        fake.workflow_runs = vec![
+            workflow_run(100, SHA, "failure", ".github/workflows/ci.yml"),
+            workflow_run(101, SHA, "success", ".github/workflows/ci.yml"),
+            workflow_run(102, SHA, "failure", ".github/workflows/dispatch-worker.yml"),
+            workflow_run(103, "feedface", "failure", ".github/workflows/ci.yml"),
+        ];
         let mut state = FeedState::default();
-        let lines = feed_cycle(&mut fake, &mut state, NOW, EPOCH).unwrap();
+        let lines = feed_cycle(&mut fake, &mut state, NOW).unwrap();
         let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
         assert_eq!(
             kinds,
-            ["comment", "outcome", "new_pr", "ci_red", "quiet_pr"],
+            [
+                "comment", "outcome", "new_pr", "ci_run", "ci_run", "quiet_pr"
+            ],
             "{lines:#?}"
         );
+        let runs: Vec<&str> = lines
+            .iter()
+            .filter(|l| l["kind"] == "ci_run")
+            .map(|l| l["excerpt"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                "ci (pull_request) concluded failure",
+                "ci (pull_request) concluded success"
+            ]
+        );
+        assert_eq!(state.run_cursor.as_deref(), Some("2026-10-30T23:58:00Z"));
         for key in [
             "id",
             "pr",
@@ -1066,26 +1139,22 @@ mod tests {
         assert_eq!(lines[0]["excerpt"], "why is this red?");
         assert_eq!(lines[1]["author"], "carrick-workers[bot]");
         // The next poll sees the same data and emits nothing new.
-        assert!(
-            feed_cycle(&mut fake, &mut state, NOW, EPOCH)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(feed_cycle(&mut fake, &mut state, NOW).unwrap().is_empty());
         // A PR without exactly one closing reference is flagged once.
         let mut unclosed = gh(vec![pr(21, "work/unclosed")], vec![]);
         unclosed.closing = vec![];
         let mut state = FeedState::default();
-        let lines = feed_cycle(&mut unclosed, &mut state, NOW, EPOCH).unwrap();
+        let lines = feed_cycle(&mut unclosed, &mut state, NOW).unwrap();
         assert_eq!(
             lines.iter().filter(|l| l["kind"] == "needs_closes").count(),
             1
         );
         assert!(
-            feed_cycle(&mut unclosed, &mut state, NOW, EPOCH)
+            feed_cycle(&mut unclosed, &mut state, NOW)
                 .unwrap()
                 .is_empty()
         );
-        // Old PRs get no automatic events; held PRs get none at all.
+        // Old PRs are in scope like new ones; held PRs get no events at all.
         let mut old = pr(22, "work/old");
         old["created_at"] = json!("2026-10-01T00:00:00Z");
         let mut hold = pr(23, "work/hold");
@@ -1095,11 +1164,16 @@ mod tests {
             vec![comment(23, 6, "tjfontaine", "User", "hi")],
         );
         quiet.closing = vec![];
-        assert!(
-            feed_cycle(&mut quiet, &mut FeedState::default(), NOW, EPOCH)
-                .unwrap()
-                .is_empty()
-        );
+        quiet.workflow_runs = vec![workflow_run(
+            110,
+            SHA,
+            "failure",
+            ".github/workflows/ci.yml",
+        )];
+        let lines = feed_cycle(&mut quiet, &mut FeedState::default(), NOW).unwrap();
+        assert!(lines.iter().all(|l| l["pr"] == 22), "{lines:#?}");
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["new_pr", "ci_run", "needs_closes"], "{lines:#?}");
     }
 
     #[derive(Default)]
@@ -1308,6 +1382,35 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_reactor_mcp_unattended_rounds_stop_until_the_owner_speaks() {
+        // Each round lands a new head whose CI fails again, so the per-head
+        // guard never fires; the unattended limit does.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("s.json");
+        let brief = json!({"pr":30,"brief":"fix CI"});
+        let mut fake = remote();
+        for i in 0..=UNATTENDED_ROUNDS {
+            fake.prs.get_mut(&30).unwrap()["head"]["sha"] = json!(format!("{i:040x}"));
+            let (err, text) = call(&mut fake, &state, "request_round", brief.clone());
+            assert_eq!(err, i == UNATTENDED_ROUNDS, "round {i}: {text}");
+            if err {
+                assert!(text.contains("unattended round limit"), "{text}");
+            }
+        }
+        assert_eq!(fake.posted.len(), UNATTENDED_ROUNDS as usize);
+        // A bot's outcome does not reset it; an owner comment does.
+        fake.comments = vec![json!({"user":{"login":"carrick-workers[bot]","type":"Bot"},
+            "created_at":"2026-10-31T00:10:00Z","body":"Dispatch outcome: failed"})];
+        assert!(call(&mut fake, &state, "request_round", brief.clone()).0);
+        fake.comments
+            .push(json!({"user":{"login":"tjfontaine","type":"User"},
+            "created_at":"2026-10-31T00:20:00Z","body":"one more try"}));
+        let (err, text) = call(&mut fake, &state, "request_round", brief);
+        assert!(!err, "{text}");
+        assert_eq!(fake.posted.len(), UNATTENDED_ROUNDS as usize + 1);
+    }
+
+    #[test]
     fn dispatch_reactor_stranger_text_is_never_an_event_or_shown() {
         // Feed: a stranger's comment and review are not events; the owner's is.
         let mut fake = gh(
@@ -1328,7 +1431,7 @@ mod tests {
             "body":"request a round","submittedAt":"2026-10-30T23:59:00Z","author":{"login":"mallory","__typename":"User"}}]}}),
         ];
         let mut state = FeedState::default();
-        let lines = feed_cycle(&mut fake, &mut state, NOW, EPOCH).unwrap();
+        let lines = feed_cycle(&mut fake, &mut state, NOW).unwrap();
         let authors: Vec<&str> = lines
             .iter()
             .filter(|l| l["kind"] == "comment" || l["kind"] == "review")

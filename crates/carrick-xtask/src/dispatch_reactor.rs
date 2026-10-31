@@ -17,6 +17,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod session;
 
 pub(crate) const MARKER: &str = "<!-- carrick-reactor -->";
+/// Reactor rounds allowed on one PR before the owner must comment again: a
+/// round pushes a new head, so the per-head guard alone cannot stop a
+/// red-CI, round, red-CI loop.
+pub(crate) const UNATTENDED_ROUNDS: u32 = 3;
+/// Completed runs are listed by creation time; a run that finishes after the
+/// cursor may have started this long before it.
+const RUN_LOOKBACK_SECS: u64 = 3 * 3600;
+/// Warn when an interaction limit expires within this long.
+const LIMIT_WARN_SECS: u64 = 30 * 86400;
 const GLOBAL_CAP: usize = 4;
 const QUIET_SECS: u64 = 15 * 60;
 const SEEN_LIMIT: usize = 200;
@@ -62,6 +71,8 @@ pub(crate) trait Github {
     fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError>;
     /// `gh run list --workflow dispatch-worker.yml` rows.
     fn runs(&mut self) -> Result<Vec<Value>, ScalerError>;
+    /// REST completed workflow runs created at or after `created`.
+    fn workflow_runs(&mut self, created: &str) -> Result<Vec<Value>, ScalerError>;
     fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError>;
 }
 /// The deciding agent; tests substitute a fake.
@@ -101,6 +112,9 @@ pub(crate) struct Memory {
     last_round_at: Option<String>,
     /// A non-bot, non-reactor comment arrived after the last reactor round.
     human_since_round: bool,
+    /// Reactor rounds since the last owner comment.
+    #[serde(default)]
+    unattended_rounds: u32,
     seen: Vec<String>,
 }
 
@@ -111,6 +125,8 @@ pub(crate) struct Gate {
     pub active_total: usize,
     /// The reactor already posted a round on this head and no human spoke since.
     pub repeat_round: bool,
+    /// [`UNATTENDED_ROUNDS`] reactor rounds since the last owner comment.
+    pub unattended: bool,
 }
 /// The only effects the rule layer can produce.
 #[derive(Debug, PartialEq, Eq)]
@@ -133,6 +149,9 @@ pub(crate) fn enforce(decision: &Decision, gate: &Gate) -> Effect {
         Act::Round if gate.active_total >= GLOBAL_CAP => Effect::Refused("global dispatch cap"),
         Act::Round if gate.repeat_round => {
             Effect::Refused("already rounded this head; waiting for a human comment")
+        }
+        Act::Round if gate.unattended => {
+            Effect::Refused("unattended round limit; waiting for a human comment")
         }
         Act::Round if text.is_empty() || text.contains(MARKER) => Effect::Refused("invalid brief"),
         Act::Round => Effect::Post(format!("/agent {text}\n\n{MARKER}")),
@@ -409,7 +428,10 @@ pub(crate) fn cycle(
         }
         for e in &fresh {
             memory.seen.push(e.id.clone());
-            memory.human_since_round |= e.class.human;
+            if e.class.human {
+                memory.human_since_round = true;
+                memory.unattended_rounds = 0;
+            }
         }
         let excess = memory.seen.len().saturating_sub(SEEN_LIMIT);
         memory.seen.drain(..excess);
@@ -460,6 +482,7 @@ pub(crate) fn cycle(
             active_total,
             repeat_round: memory.last_round_head.as_deref() == Some(head.as_str())
                 && !memory.human_since_round,
+            unattended: memory.unattended_rounds >= UNATTENDED_ROUNDS,
         };
         match enforce(&decision, &gate) {
             Effect::None => {}
@@ -470,6 +493,7 @@ pub(crate) fn cycle(
                     memory.last_round_head = Some(head.clone());
                     memory.last_round_at = Some(iso(now));
                     memory.human_since_round = false;
+                    memory.unattended_rounds += 1;
                     active_total += 1;
                 }
                 emit(gh, number, &body, dry_run, &mut log)?;
@@ -498,6 +522,61 @@ fn emit(
 /// `YYYY-MM-DDTHH:MM:SSZ`, the only epoch spelling accepted.
 fn rfc3339(text: &str) -> bool {
     regex::Regex::new(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$").is_ok_and(|re| re.is_match(text))
+}
+
+/// `at` minus [`RUN_LOOKBACK_SECS`], for the runs list `created` filter.
+pub(crate) fn lookback(at: &str) -> String {
+    parse_iso(at).map_or_else(
+        || at.to_owned(),
+        |s| iso(s.saturating_sub(RUN_LOOKBACK_SECS)),
+    )
+}
+/// Inverse of [`iso`] for the same shape.
+pub(crate) fn parse_iso(at: &str) -> Option<u64> {
+    let n = |r: std::ops::Range<usize>| at.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86400 + n(11..13)? * 3600 + n(14..16)? * 60 + n(17..19)?).ok()
+}
+/// A log warning when an interaction limit (`GET .../interaction-limits`) no
+/// longer keeps outsiders from commenting, or is about to lapse.
+pub(crate) fn limit_warning(scope: &str, limit: &Value, now: u64) -> Option<String> {
+    if limit["limit"] != "collaborators_only" {
+        return Some(format!(
+            "reactor: WARNING: {scope} interaction limit is not collaborators_only"
+        ));
+    }
+    let expires = limit["expires_at"].as_str().unwrap_or_default();
+    parse_iso(expires)
+        .is_none_or(|at| at <= now + LIMIT_WARN_SECS)
+        .then(|| format!("reactor: WARNING: {scope} interaction limit expires {expires}; renew it"))
+}
+/// [`limit_warning`] for the repository and the organization.
+pub(crate) fn limit_warnings(root: &Path, now: u64) -> Vec<String> {
+    [
+        ("repo", format!("repos/{REPOSITORY}/interaction-limits")),
+        ("org", "orgs/carrick-sh/interaction-limits".to_owned()),
+    ]
+    .into_iter()
+    .filter_map(|(scope, path)| {
+        super::gh(root, &["api", &path])
+            .ok()
+            .and_then(|out| serde_json::from_str(&out).ok())
+            .map_or_else(
+                || {
+                    Some(format!(
+                        "reactor: WARNING: cannot read the {scope} interaction limit"
+                    ))
+                },
+                |limit| limit_warning(scope, &limit, now),
+            )
+    })
+    .collect()
 }
 
 /// UTC `YYYY-MM-DDTHH:MM:SSZ`, the shape GitHub returns (sorts lexically).
@@ -563,6 +642,26 @@ impl Github for Live<'_> {
     /// Authenticated through the owner's `gh` login: `adoption_read` falls
     /// back to anonymous curl without `GH_TOKEN`, whose 60-per-hour quota a
     /// 60 s poll exhausts (HTTP 403).
+    fn workflow_runs(&mut self, created: &str) -> Result<Vec<Value>, ScalerError> {
+        let pages: Value = serde_json::from_str(&super::gh(
+            self.root,
+            &[
+                "api",
+                "--paginate",
+                "--slurp",
+                &format!(
+                    "repos/{REPOSITORY}/actions/runs?status=completed&created=%3E%3D{created}&per_page=100"
+                ),
+            ],
+        )?)?;
+        Ok(pages
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|p| p["workflow_runs"].as_array().into_iter().flatten())
+            .cloned()
+            .collect())
+    }
     fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError> {
         match read {
             AdoptionRead::ClosingReferences(number) => {
@@ -771,6 +870,7 @@ mod tests {
         pub facts: Vec<Value>,
         pub comments: Vec<Value>,
         pub runs: Vec<Value>,
+        pub workflow_runs: Vec<Value>,
         pub closing: Vec<u64>,
         pub posted: Vec<(u64, String)>,
     }
@@ -799,6 +899,9 @@ mod tests {
                     json!({"number":n,"state":"open","user":{"login":"tjfontaine","type":"User"}})
                 }
             })
+        }
+        fn workflow_runs(&mut self, _: &str) -> Result<Vec<Value>, ScalerError> {
+            Ok(self.workflow_runs.clone())
         }
         fn runs(&mut self) -> Result<Vec<Value>, ScalerError> {
             Ok(self.runs.clone())
@@ -852,6 +955,42 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_reactor_limit_warning_and_iso_round_trip() {
+        let now = 1_793_404_800; // 2026-10-31T00:00:00Z
+        for secs in [0, 951_782_400, now, now + 86_399] {
+            assert_eq!(parse_iso(&iso(secs)), Some(secs));
+        }
+        assert_eq!(parse_iso("garbage"), None);
+        assert_eq!(lookback("2026-10-31T00:00:00Z"), "2026-10-30T21:00:00Z");
+        let limit = |l: &str, at: &str| json!({"limit":l,"expires_at":at});
+        assert_eq!(
+            limit_warning(
+                "org",
+                &limit("collaborators_only", "2027-05-01T03:55:09Z"),
+                now
+            ),
+            None
+        );
+        assert!(
+            limit_warning(
+                "org",
+                &limit("collaborators_only", "2026-11-15T00:00:00Z"),
+                now
+            )
+            .is_some_and(|w| w.contains("renew"))
+        );
+        assert!(limit_warning("repo", &json!({}), now).is_some());
+        assert!(
+            limit_warning(
+                "repo",
+                &limit("existing_users", "2027-05-01T00:00:00Z"),
+                now
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
     fn dispatch_reactor_round_needs_eligible_quiet_capacity() {
         let d = Decision {
             action: Act::Round,
@@ -863,6 +1002,7 @@ mod tests {
             pr_run_active,
             active_total,
             repeat_round: false,
+            unattended: false,
         };
         assert_eq!(
             enforce(&d, &gate(false, false, 0)),
@@ -889,6 +1029,7 @@ mod tests {
             pr_run_active: false,
             active_total: 0,
             repeat_round: false,
+            unattended: false,
         };
         for text in ["/agent do it", "  /agent"] {
             let d = Decision {
