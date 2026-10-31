@@ -4,7 +4,6 @@
     "allow": [
       "mcp__carrick-reactor",
       "mcp__carrick-reactor__*",
-      "Read",
       "Agent",
       "SendMessage",
       "ListAgents"
@@ -16,7 +15,11 @@
       "Write",
       "NotebookEdit",
       "WebFetch",
-      "WebSearch"
+      "WebSearch",
+      "Read",
+      "Glob",
+      "Grep"
     ]
-  }
+  },
+  "disableAllHooks": true
 }
