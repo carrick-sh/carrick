@@ -191,7 +191,8 @@ jobs:
         with:
           tool: just,cargo-deny
 
-      # The job's CARGO_HOME is fresh per run. Restore verifies fixture
+      # CARGO_HOME is runner-private and may persist across runs on the
+      # persistent runner, but nothing below relies on that. Restore verifies fixture
       # input identity offline, so populate the cache from every fixture
       # lockfile first; this is the job's only network step for fixtures.
       # rust-cache above saves only when the whole job succeeds, so keep the
@@ -495,7 +496,10 @@ jobs:
       contents: read
       actions: read
     needs: [hvf-kernel]
-    if: ${{ !cancelled() && github.event_name == 'push' && needs.hvf-kernel.result != 'skipped' }}
+    # A coalesced (superseded) hvf-kernel ends `cancelled` while the run
+    # itself is not, so `!cancelled()` alone would run this gate with no
+    # candidate receipt. The newer push's run gates that range instead.
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.hvf-kernel.result != 'skipped' && needs.hvf-kernel.result != 'cancelled' }}
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
@@ -688,18 +692,54 @@ jobs:
     needs: [signed-fixtures, hvf-kernel, kvm-tests-willow, hvf-gate, kvm-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     steps:
+      # Job-level concurrency on hvf-kernel coalesces queued push jobs to the
+      # newest main push; the dropped job ends `cancelled`. Only a push whose
+      # HVF job was cancelled while a newer kernel-runtime push run exists is
+      # superseded. Any other cancel (a manual one, or on the newest run) stays
+      # red.
+      - name: Detect a superseded HVF lane
+        id: superseded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HVF: ${{ needs.hvf-kernel.result }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          superseded=false
+          if [ "$EVENT" = push ] && [ "$HVF" = cancelled ]; then
+            newer=$(gh api "repos/$REPO/actions/workflows/kernel-runtime.yml/runs?branch=main&event=push&per_page=20" \
+              --jq "[.workflow_runs[] | select(.run_number > $RUN_NUMBER)] | length")
+            if [ "${newer:-0}" -gt 0 ]; then
+              superseded=true
+              echo "::notice::HVF lane superseded by a newer main push; that run's receipt gate covers this commit."
+            fi
+          fi
+          echo "superseded=$superseded" >> "$GITHUB_OUTPUT"
       - name: Require both trusted-hardware lanes (and their gates on push)
         env:
+          SUPERSEDED: ${{ steps.superseded.outputs.superseded }}
           HVF: ${{ needs.hvf-kernel.result }}
           KVM: ${{ needs.kvm-tests-willow.result }}
           HVF_GATE: ${{ needs.hvf-gate.result }}
           KVM_GATE: ${{ needs.kvm-gate.result }}
           EVENT: ${{ github.event_name }}
         run: |
-          echo "hvf-kernel=$HVF kvm=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE"
-          test "$HVF" = success
+          echo "hvf-kernel=$HVF kvm=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE superseded=$SUPERSEDED"
           test "$KVM" = success
+          if [ "$SUPERSEDED" = true ]; then
+            # The newer push's run carries the HVF lane and its gate.
+            test "$EVENT" = push
+            test "$HVF" = cancelled
+            test "$HVF_GATE" = skipped
+            test "$KVM_GATE" = success
+            exit 0
+          fi
+          test "$HVF" = success
           if [ "$EVENT" = push ]; then
             test "$HVF_GATE" = success
             test "$KVM_GATE" = success

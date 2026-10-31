@@ -675,7 +675,7 @@ SendMessage.
   Workflow: [`.agents/skills/carrick-stacked-prs`](.agents/skills/carrick-stacked-prs/SKILL.md).
 - **Lanes:** hosted Linux/macOS jobs in `ci.yml`. Heavy pull requests run the
   full macOS suite; same-repo PRs run it on the self-hosted `carrick-macos-ci`
-  runners (a non-admin `ci` user on carrick-m4; #650), forks on hosted
+  runners (a non-admin `ci` user on carrick-m4 and on cloudmac; #650), forks on hosted
   `macos-15`.
   Merge groups run `macos-build`, `macos-clippy` and `macos-authority`
   on hosted macOS as skew and compiler-authority checks;
@@ -690,8 +690,8 @@ SendMessage.
 - **cloudmac is shared with CI** ([`docs/ci/mac-hvf-runner.md`](docs/ci/mac-hvf-runner.md)):
   the persistent `carrick-hvf` runner (`hvf-kernel`), the `carrick-macos-ci` PR
   runner (`ci` user) and director gates (`remote-accept`, `just accept`) run on
-  separate internal APFS volumes (`carrick-hvf`, `carrick-ci` with its 33 GB cap
-  lifted per #994, and `carrick-gate`), with cold/cached `rentamac` data
+  separate internal APFS volumes (`carrick-hvf`, `carrick-ci` with its 35 GB quota
+  raised, and `carrick-gate`), with cold/cached `rentamac` data
   (`sccache`, fixtures, evidence) on external USB `/Volumes/carrick`. Serialize
   build-heavy and signed work through `/tmp/carrick-host-lease.lock` (`carrick-macos-ci`
   holds shared `just lease carrick`; `hvf-kernel` and director gates hold
