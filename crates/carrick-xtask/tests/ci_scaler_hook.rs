@@ -240,9 +240,33 @@ fn agent_auth_provisions_all_worker_credentials_and_only_agy_for_loop() {
         std::fs::write(&event, serde_json::json!({"repository":{"full_name":"carrick-sh/carrick"},
             "action":"labeled","sender":{"login":"tjfontaine","type":"User"},
             "label":{"name":label},"issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Fixture","body":"## Brief\nImplement fixture"}}).to_string()).unwrap();
+        // The guard checks the trigger's collaborator permission and reads
+        // the issue brief live (#1214). A fake `gh` answers both, so the test
+        // never reaches GitHub through a developer's logged-in `gh`.
+        let fake_bin = temp.path().join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let fake_gh = fake_bin.join("gh");
+        std::fs::write(
+            &fake_gh,
+            r###"#!/bin/sh
+case " $* " in
+  *collaborators/tjfontaine/permission*) echo '{"permission":"admin"}' ;;
+  *graphql*) printf '%s\n' '{"data":{"repository":{"issue":{"number":634,"author":{"login":"tjfontaine"},"lastEditedAt":null,"editor":null,"body":"## Brief\nImplement fixture"}}}}' ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 1 ;;
+esac
+"###,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         let invoke = |args: &[&str]| {
             Command::new(xtask)
                 .args(args)
+                .env("PATH", &path)
                 .env_remove("GH_TOKEN")
                 .env_remove("GITHUB_TOKEN")
                 .env("GITHUB_SHA", "a".repeat(40))
