@@ -73,5 +73,19 @@ gh stack view                                 # layers, PRs and their state
    layer `UNMERGEABLE`, so until that is resolved land one layer at a time
    (`gh stack merge <bottom PR>`, then the next once it merges).
    `gh stack modify` is refused while any layer is queued.
+   - **A bare number is read as a stack number first.** Stack numbers
+     share the PR number range: on 2026-10-31 stack #1120 was the
+     #1061/#1119 stack, not PR #1120. Look the stack up with
+     `gh api repos/carrick-sh/carrick/stacks` and pass its stack number
+     (`gh stack merge 1082` merged #1077, #1081, #1118 and #1121). Check
+     that its listed head SHAs equal the SHAs the signed gate ran on.
+   - **Marking layers ready starts a fresh full CI run on each.** Until
+     every layer's new run finishes, the atomic merge fails with
+     `Required status check "ci-ok" is expected` and merges nothing. Wait
+     for each layer's latest `Hosted CI` run to complete; an older passing
+     `ci-ok` doesn't count.
+   - Since `gh-stack` added atomic stack merge, `gh stack merge` queues the
+     chosen layers all-or-nothing. The one-layer-at-a-time advice above
+     predates it.
 5. After landing: `gh stack sync --prune` and remove every layer's
    worktree and `target/` on every host.
