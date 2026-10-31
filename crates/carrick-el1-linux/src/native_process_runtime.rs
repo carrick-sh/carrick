@@ -2763,6 +2763,14 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
         let address = self.page.control_address(entry)?;
         owned_control(self.page, self.control, address)
     }
+    fn live_pool_entry(&self, index: usize) -> Option<EntryRef> {
+        let (generation, state) = self.page.state(index)?;
+        matches!(
+            state,
+            carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+        )
+        .then_some(EntryRef::new(index as u32, generation))
+    }
     fn is_live_member_control(&self, member: &NativeMember<'a, C>) -> bool {
         let control = member.control.control();
         if carrick_core::lifecycle::MemberControl::exit_custody(control).exit_claimed_or_terminal()
@@ -2771,17 +2779,7 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
             return false;
         }
         match control.entry() {
-            Some(entry) => self
-                .page
-                .state(entry.index())
-                .is_some_and(|(generation, state)| {
-                    generation == entry.generation()
-                        && matches!(
-                            state,
-                            carrick_el1_abi::EntryState::Born
-                                | carrick_el1_abi::EntryState::Published
-                        )
-                }),
+            Some(entry) => self.live_pool_entry(entry.index()) == Some(entry),
             // Registration consumes the page's host-birth receipt. Retained
             // control custody owns liveness after adoption, until exit above.
             None => control.host_birth_identity() == Some(member.expected_host),
@@ -2850,16 +2848,9 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
             }
         }
         for index in 0..self.page.entry_count() {
-            let Some((generation, state)) = self.page.state(index) else {
+            let Some(entry) = self.live_pool_entry(index) else {
                 continue;
             };
-            if !matches!(
-                state,
-                carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
-            ) {
-                continue;
-            }
-            let entry = EntryRef::new(index as u32, generation);
             let Some(identity) = self.page.identity(entry) else {
                 continue;
             };
@@ -2913,16 +2904,9 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
             }
         }
         for index in 0..self.page.entry_count() {
-            let Some((generation, state)) = self.page.state(index) else {
+            let Some(entry) = self.live_pool_entry(index) else {
                 continue;
             };
-            if !matches!(
-                state,
-                carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
-            ) {
-                continue;
-            }
-            let entry = EntryRef::new(index as u32, generation);
             let Some(address) = self.page.control_address(entry) else {
                 continue;
             };
