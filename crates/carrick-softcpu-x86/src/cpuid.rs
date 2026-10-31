@@ -102,6 +102,21 @@ pub trait GuestCpuidView: Send + Sync {
     }
 }
 
+const LEAF1_EDX: u32 = (1 << 2)
+    | (1 << 4)
+    | (1 << 5)
+    | (1 << 6)
+    | (1 << 7)
+    | (1 << 8)
+    | (1 << 9)
+    | (1 << 11)
+    | (1 << 13)
+    | (1 << 15)
+    | (1 << 16)
+    | (1 << 24)
+    | (1 << 25)
+    | (1 << 26);
+
 /// Default pinned Level 0 `CPUID` view (`SoftCpu::new`), independent of the host CPU.
 ///
 /// Advertises baseline 64-bit integer/SSE2, legacy `XSAVE`/`XSAVEOPT`/`XSAVEC`
@@ -119,25 +134,7 @@ impl GuestCpuidView for Level0CpuidView {
                 u32::from_le_bytes(*b"ntel"),
                 u32::from_le_bytes(*b"ineI"),
             ),
-            (1, _) => CpuidRegs::new(
-                0x0000_0663,
-                0,
-                (1 << 26) | (1 << 27),
-                (1 << 2)
-                    | (1 << 4)
-                    | (1 << 5)
-                    | (1 << 6)
-                    | (1 << 7)
-                    | (1 << 8)
-                    | (1 << 9)
-                    | (1 << 11)
-                    | (1 << 13)
-                    | (1 << 15)
-                    | (1 << 16)
-                    | (1 << 24)
-                    | (1 << 25)
-                    | (1 << 26),
-            ),
+            (1, _) => CpuidRegs::new(0x0000_0663, 0, (1 << 26) | (1 << 27), LEAF1_EDX),
             (7, 0) => CpuidRegs::new(0, (1 << 7) | (1 << 20), 1 << 2, 0),
             (0x0d, 0) => CpuidRegs::new(3, 576, 576, 0),
             (0x0d, 1) => CpuidRegs::new(3, 576, 0, 0),
@@ -169,16 +166,7 @@ pub struct Cpl0CpuidView {
 
 impl Default for Cpl0CpuidView {
     fn default() -> Self {
-        Self {
-            apic_id: 0,
-            tsc_hz: 2_000_000_000,
-            max_phy_addr: 48,
-            smep: true,
-            smap: true,
-            umip: true,
-            pcid: true,
-            tsc_deadline: true,
-        }
+        Self::new(0, 2_000_000_000)
     }
 }
 
@@ -218,21 +206,7 @@ impl GuestCpuidView for Cpl0CpuidView {
                     ecx |= 1 << 24;
                 }
                 let ebx = (u32::from(self.apic_id) << 24) | (8 << 8);
-                let edx = (1 << 2)
-                    | (1 << 4)
-                    | (1 << 5)
-                    | (1 << 6)
-                    | (1 << 7)
-                    | (1 << 8)
-                    | (1 << 9)
-                    | (1 << 11)
-                    | (1 << 13)
-                    | (1 << 15)
-                    | (1 << 16)
-                    | (1 << 24)
-                    | (1 << 25)
-                    | (1 << 26);
-                CpuidRegs::new(0x0000_0663, ebx, ecx, edx)
+                CpuidRegs::new(0x0000_0663, ebx, ecx, LEAF1_EDX)
             }
             (7, 0) => {
                 let mut ebx = 0u32;
