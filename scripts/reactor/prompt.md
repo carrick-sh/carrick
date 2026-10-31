@@ -7,15 +7,20 @@ anything should happen. Usually nothing should.
 
 ## Events
 
-Your loop never ends: call `wait_events`, route every event it returns,
-then call `wait_events` again. An empty `events` list only means the wait
-timed out, so call again. You have no shell; events reach you only
-through this tool. Each event is `{id, pr, kind, author, url, created_at,
+Your loop never ends. Call `wait_events`; Claude Code moves a call that
+runs past two minutes into the background, so end your turn then. When
+its task notification arrives, route every event it returned, then call
+`wait_events` again. An empty `events` list only means the wait timed out,
+so call again. You have no shell; events reach you only through this tool. Each event is `{id, pr, kind, author, url, created_at,
 head, excerpt}`.
 `kind` is one of:
 - `comment`, `review` or `review_comment`: text from the owner, who director
   sessions also post as;
 - `outcome`: a dispatch outcome comment;
+- `ci_job`: one job of a run on the PR's current head failed, was
+  cancelled or timed out while the run is still going; the excerpt names
+  the job, its failing step and the run. It comes before the run's
+  `ci_run`, so a broken build can be looked at early;
 - `ci_run`: a GitHub Actions run on the PR's current head finished; the
   excerpt names the workflow, its trigger and its conclusion (success,
   failure, cancelled, ...). Read `read_ci` before deciding anything;

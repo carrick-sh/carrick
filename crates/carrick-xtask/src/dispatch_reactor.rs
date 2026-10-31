@@ -73,6 +73,10 @@ pub(crate) trait Github {
     fn runs(&mut self) -> Result<Vec<Value>, ScalerError>;
     /// REST completed workflow runs created at or after `created`.
     fn workflow_runs(&mut self, created: &str) -> Result<Vec<Value>, ScalerError>;
+    /// REST in-progress workflow runs on `branch`.
+    fn active_runs(&mut self, branch: &str) -> Result<Vec<Value>, ScalerError>;
+    /// REST jobs of one run's latest attempt.
+    fn run_jobs(&mut self, run: u64) -> Result<Vec<Value>, ScalerError>;
     fn post(&mut self, pr: u64, body: &str) -> Result<(), ScalerError>;
 }
 /// The deciding agent; tests substitute a fake.
@@ -707,6 +711,37 @@ impl Github for Live<'_> {
             .cloned()
             .collect())
     }
+    fn active_runs(&mut self, branch: &str) -> Result<Vec<Value>, ScalerError> {
+        let page: Value = serde_json::from_str(&super::gh(
+            self.root,
+            &[
+                "api",
+                "-X",
+                "GET",
+                &format!("repos/{REPOSITORY}/actions/runs"),
+                "-f",
+                &format!("branch={branch}"),
+                "-f",
+                "status=in_progress",
+                "-f",
+                "per_page=50",
+            ],
+        )?)?;
+        Ok(page["workflow_runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+    fn run_jobs(&mut self, run: u64) -> Result<Vec<Value>, ScalerError> {
+        let page: Value = serde_json::from_str(&super::gh(
+            self.root,
+            &[
+                "api",
+                &format!("repos/{REPOSITORY}/actions/runs/{run}/jobs?filter=latest&per_page=100"),
+            ],
+        )?)?;
+        Ok(page["jobs"].as_array().cloned().unwrap_or_default())
+    }
     fn adoption(&mut self, read: AdoptionRead) -> Result<Value, ScalerError> {
         match read {
             AdoptionRead::ClosingReferences(number) => {
@@ -916,6 +951,8 @@ mod tests {
         pub comments: Vec<Value>,
         pub runs: Vec<Value>,
         pub workflow_runs: Vec<Value>,
+        pub active_runs: Vec<Value>,
+        pub jobs: std::collections::BTreeMap<u64, Vec<Value>>,
         pub closing: Vec<u64>,
         pub posted: Vec<(u64, String)>,
     }
@@ -947,6 +984,17 @@ mod tests {
         }
         fn workflow_runs(&mut self, _: &str) -> Result<Vec<Value>, ScalerError> {
             Ok(self.workflow_runs.clone())
+        }
+        fn active_runs(&mut self, branch: &str) -> Result<Vec<Value>, ScalerError> {
+            Ok(self
+                .active_runs
+                .iter()
+                .filter(|r| r["head_branch"] == branch)
+                .cloned()
+                .collect())
+        }
+        fn run_jobs(&mut self, run: u64) -> Result<Vec<Value>, ScalerError> {
+            Ok(self.jobs.get(&run).cloned().unwrap_or_default())
         }
         fn runs(&mut self) -> Result<Vec<Value>, ScalerError> {
             Ok(self.runs.clone())

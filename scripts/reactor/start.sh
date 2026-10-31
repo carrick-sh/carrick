@@ -42,7 +42,10 @@ fi
 AGENTS=$(cat "$WS/agents.json")
 PROMPT='You are the Carrick reactor. Start your wait_events loop now and route each event to its pr-<N> subagent as your instructions describe. Never stop the loop.'
 # Keep the pane after claude exits, so a startup failure stays readable.
+# Long wait_events calls run as background tasks whose completion wakes
+# the session; pin the threshold so a default change can't switch that off.
 tmux new-session -d -s carrick-reactor -n session -c "$REPO" \
+  env CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=120000 \
   claude "$PROMPT" \
     --name carrick-reactor \
     --settings "$WS/settings.json" \
