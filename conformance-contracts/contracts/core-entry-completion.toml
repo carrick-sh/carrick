@@ -50,14 +50,14 @@ ISA adapter. The existing return-work and x86 context witnesses still apply.
 [bindings]
 vm_free = [
   "carrick-core::entry_completion::{requeued_terminal_attempt_restores_membership_and_admission_before_return,losing_requeue_cas_keeps_membership_and_admission_for_commit,refused_requeue_lock_keeps_membership_and_admission_for_commit,host_home_terminal_release_commits_the_same_exit_ownership}",
-  "carrick-el1-abi::entry_binding_fatal::tests::{fatal_detail_round_trip_and_formatter,entry_binding_fatal_maximum_width_fits_the_terminal_record}",
   "carrick-el1-linux::dispatch::tests::physical_custody_reasons_preserve_fatal_codes_and_debug_text (diagnostic reason selection and host Debug compatibility)",
-  "carrick-el1-linux::native_process_runtime::tests::delayed_child_exit_notifies_adopter_when_selected_parent_exits_on_peer",
-  "carrick-kernel-example::root_exit_full_width::linux_host_adapter_preserves_exit_and_signal_wait_encodings",
   "carrick-kernel-example::root_exit_full_width::root_exit_record_codec_preserves_full_width_termination",
-  "carrick-personality-linux::dispatch::ring_first_tests::{x86_signal_return_restores_frame_with_owned_wait_work_pending,x86_owned_wait4_survives_pending_host_work,strict_arm_preserves_family_declines_handback_and_owed_work}",
-  "carrick-personality-linux::signal_return_contract::public_arm_frame_preserves_same_entry_completion",
+  "carrick-kernel-example::root_exit_full_width::linux_host_adapter_preserves_exit_and_signal_wait_encodings",
   "carrick-personality-linux::x86_wave2::x4_linux_common_entry",
+  "carrick-personality-linux::signal_return_contract::public_arm_frame_preserves_same_entry_completion",
+  "carrick-el1-linux::native_process_runtime::tests::delayed_child_exit_notifies_adopter_when_selected_parent_exits_on_peer",
+  "carrick-personality-linux::dispatch::ring_first_tests::{x86_signal_return_restores_frame_with_owned_wait_work_pending,x86_owned_wait4_survives_pending_host_work,strict_arm_preserves_family_declines_handback_and_owed_work}",
+  "carrick-el1-abi::entry_binding_fatal::tests::{fatal_detail_round_trip_and_formatter,entry_binding_fatal_maximum_width_fits_the_terminal_record}",
   "carrick-runtime::vcpu_loop::memory::tests::arm_entry_binding_diagnostic_reaches_the_fatal_record_without_truncation (diagnostic payload/formatter only: reason round trip, caller coordinates, every retained field within the fixed fatal record; existing semantic/work bindings remain required)",
 ]
 

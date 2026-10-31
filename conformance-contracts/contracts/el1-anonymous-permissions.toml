@@ -37,8 +37,7 @@ embed = [
   "carrick-embed::el1_sched::el1_anonymous_permission_transitions_stay_in_guest",
 ]
 docker = [
-  "native-arm64 same-source permission-transitions fixture at 256, 1024 and 4096 pages",
-  "docs/perf-results/2026-09-27-el1-anonymous-permissions",
+  "native-arm64 same-source permission-transitions fixture at 256, 1024 and 4096 pages; docs/perf-results/2026-09-27-el1-anonymous-permissions",
 ]
 
 [bindings.unresolved]

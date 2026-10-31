@@ -184,7 +184,7 @@ queues:
   `embed`, `docker`, and `ecosystem`) as multi-line string arrays with one entry
   and trailing comma per line, keeping the primary evidence binding at `[0]`
   (for `vm_free`, `embed`, and `docker`, matching `check-contract-change.py`)
-  with additional bindings `[1..]` in sorted order (`ecosystem` sorted `[0..]`);
+  and preserving declaration order where an entry refers to neighbouring bindings;
 - `.gitattributes` applies `merge=union` only to `conformance-contracts/surfaces.toml`
   and `docs/conformance-contracts/*.md`, leaving `conformance-contracts/contracts/*.toml`
   on ordinary 3-way merge so deleted bindings or conflicting multiline edits stay

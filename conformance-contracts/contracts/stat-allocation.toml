@@ -16,8 +16,7 @@ embed = [
   "carrick-conformance-next::generic_probe_shard_{0,1,2}; CARRICK_PROBE_FILTER=fdstat,statfdino,fstatatflags,linkstat (semantic only)",
 ]
 docker = [
-  "cached probe oracles: fdstat,statfdino,fstatatflags,linkstat; musl and gnu",
-  "source-hash validated",
+  "cached probe oracles: fdstat,statfdino,fstatatflags,linkstat; musl and gnu; source-hash validated",
 ]
 
 [bindings.unresolved]

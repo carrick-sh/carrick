@@ -11,16 +11,15 @@ fn check_contracts_bin() -> &'static str {
     env!("CARGO_BIN_EXE_check-contracts")
 }
 
-fn seed_crate_fn(root: &Path, crate_name: &str, fn_name: &str) {
+fn seed_crate_fn(root: &Path, crate_name: &str, fn_name: &str) -> std::io::Result<()> {
     let src_dir = root.join("crates").join(crate_name).join("src");
-    fs::create_dir_all(&src_dir).expect("create crate src dir");
+    fs::create_dir_all(&src_dir)?;
     fs::write(src_dir.join("lib.rs"), format!("pub fn {fn_name}() {{}}\n"))
-        .expect("write crate lib.rs");
 }
 
-fn seed_minimal_crates(root: &Path) {
-    seed_crate_fn(root, "carrick-conformance-contract", "test_binding");
-    seed_crate_fn(root, "carrick-embed", "test_binding");
+fn seed_minimal_crates(root: &Path) -> std::io::Result<()> {
+    seed_crate_fn(root, "carrick-conformance-contract", "test_binding")?;
+    seed_crate_fn(root, "carrick-embed", "test_binding")
 }
 
 const VALID_CONTRACT: &str = r#"
@@ -84,7 +83,7 @@ surfaces = [
     )
     .expect("write surfaces.toml");
 
-    seed_minimal_crates(root);
+    seed_minimal_crates(root).expect("seed minimal crates");
 
     let inventory_file = root.join("conformance-contracts/inventory.json");
     assert!(
@@ -140,7 +139,7 @@ fn check_contracts_rejects_missing_concrete_binding_crate() {
         "schema_version = 1\nsurfaces = []\n",
     )
     .expect("write surfaces.toml");
-    seed_minimal_crates(temp.path());
+    seed_minimal_crates(temp.path()).expect("seed minimal crates");
 
     let bad_binding_contract = VALID_CONTRACT.replace(
         "  \"carrick-conformance-contract::test_binding\",",
@@ -179,7 +178,7 @@ fn check_contracts_rejects_missing_module_in_existing_crate() {
         "schema_version = 1\nsurfaces = []\n",
     )
     .expect("write surfaces.toml");
-    seed_minimal_crates(temp.path());
+    seed_minimal_crates(temp.path()).expect("seed minimal crates");
 
     let bad_vm_free_module = VALID_CONTRACT.replace(
         "  \"carrick-conformance-contract::test_binding\",",
@@ -246,7 +245,7 @@ surfaces = [
     )
     .expect("write surfaces.toml");
 
-    seed_minimal_crates(temp.path());
+    seed_minimal_crates(temp.path()).expect("seed minimal crates");
 
     let output = Command::new(check_contracts_bin())
         .arg("--root")
@@ -346,13 +345,13 @@ fn two_prs_adding_surfaces_and_contract_bindings_merge_without_conflict() {
         VALID_CONTRACT.replace("id = \"test.contract.one\"", "id = \"test.contract.two\"");
     fs::write(contracts_dir.join("two.toml"), second_contract).expect("write two.toml");
 
-    seed_minimal_crates(root);
-    seed_crate_fn(root, "carrick-alpha", "pr_one_binding");
-    seed_crate_fn(root, "carrick-b", "base_one");
-    seed_crate_fn(root, "carrick-d", "base_two");
-    seed_crate_fn(root, "carrick-f", "base_three");
-    seed_crate_fn(root, "carrick-h", "base_four");
-    seed_crate_fn(root, "carrick-zeta", "pr_two_binding");
+    seed_minimal_crates(root).expect("seed minimal crates");
+    seed_crate_fn(root, "carrick-alpha", "pr_one_binding").expect("seed carrick-alpha");
+    seed_crate_fn(root, "carrick-b", "base_one").expect("seed carrick-b");
+    seed_crate_fn(root, "carrick-d", "base_two").expect("seed carrick-d");
+    seed_crate_fn(root, "carrick-f", "base_three").expect("seed carrick-f");
+    seed_crate_fn(root, "carrick-h", "base_four").expect("seed carrick-h");
+    seed_crate_fn(root, "carrick-zeta", "pr_two_binding").expect("seed carrick-zeta");
 
     fs::create_dir_all(root.join("src")).expect("create src");
     for file in ["src/a.rs", "src/hot.rs", "src/z.rs"] {
@@ -496,7 +495,11 @@ fn contract_toml_deletion_with_adjacent_edit_stays_a_merge_conflict() {
 
     assert!(run_git(&["init", "-b", "main"]).status.success());
     assert!(run_git(&["config", "user.name", "Test"]).status.success());
-    assert!(run_git(&["config", "user.email", "test@carrick.invalid"]).status.success());
+    assert!(
+        run_git(&["config", "user.email", "test@carrick.invalid"])
+            .status
+            .success()
+    );
 
     let gitattributes =
         fs::read_to_string(repo_root().join(".gitattributes")).expect("read .gitattributes");
@@ -517,16 +520,28 @@ fn contract_toml_deletion_with_adjacent_edit_stays_a_merge_conflict() {
     assert!(run_git(&["commit", "-m", "base"]).status.success());
 
     // Branch A deletes obsolete_binding.
-    assert!(run_git(&["checkout", "-b", "delete-branch"]).status.success());
+    assert!(
+        run_git(&["checkout", "-b", "delete-branch"])
+            .status
+            .success()
+    );
     fs::write(
         contracts_dir.join("one.toml"),
         base_contract.replace("  \"carrick-b::obsolete_binding\",\n", ""),
     )
     .expect("delete binding");
-    assert!(run_git(&["commit", "-am", "delete obsolete binding"]).status.success());
+    assert!(
+        run_git(&["commit", "-am", "delete obsolete binding"])
+            .status
+            .success()
+    );
 
     // Branch B edits the immediately adjacent neighbor_binding.
-    assert!(run_git(&["checkout", "-b", "edit-branch", "main"]).status.success());
+    assert!(
+        run_git(&["checkout", "-b", "edit-branch", "main"])
+            .status
+            .success()
+    );
     fs::write(
         contracts_dir.join("one.toml"),
         base_contract.replace(
@@ -535,7 +550,11 @@ fn contract_toml_deletion_with_adjacent_edit_stays_a_merge_conflict() {
         ),
     )
     .expect("edit adjacent binding");
-    assert!(run_git(&["commit", "-am", "edit neighbor binding"]).status.success());
+    assert!(
+        run_git(&["commit", "-am", "edit neighbor binding"])
+            .status
+            .success()
+    );
 
     // Without merge=union on contract TOMLs, git must flag a real conflict rather
     // than silently resurrecting the deleted binding.
