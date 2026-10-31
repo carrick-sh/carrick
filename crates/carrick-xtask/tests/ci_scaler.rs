@@ -720,6 +720,20 @@ fn workflow_runner_labels_are_the_controller_label_constants() {
     assert_ne!(HVF_CLOSURE_LABELS, HVF_LABELS);
 }
 
+/// The trusted-hardware-ok step that decides the aggregate verdict.
+fn trusted_hardware_decision(jobs: &yaml_rust2::Yaml) -> &yaml_rust2::Yaml {
+    jobs["trusted-hardware-ok"]["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("Require both trusted-hardware lanes"))
+        })
+        .expect("trusted-hardware-ok decision step")
+}
+
 /// The Willow KVM backend is the sole KVM lane: kvm-tests-willow runs when
 /// CARRICK_SELF_HOSTED_KVM == 'true', publishes the receipt, and kvm-gate
 /// and trusted-hardware-ok read its result directly.
@@ -739,7 +753,7 @@ fn kvm_willow_lane_is_sole_kvm_backend_and_read_directly() {
     );
     let gate_if = squash(jobs["kvm-gate"]["if"].as_str().unwrap());
     assert!(gate_if.contains("needs.kvm-tests-willow.result != 'skipped'"));
-    let ok_env = &jobs["trusted-hardware-ok"]["steps"][0]["env"];
+    let ok_env = &trusted_hardware_decision(jobs)["env"];
     assert_eq!(
         ok_env["KVM"].as_str(),
         Some("${{ needs.kvm-tests-willow.result }}")
@@ -790,7 +804,9 @@ fn one_always_job_requires_both_trusted_hardware_lanes() {
     for job in ["hvf-kernel", "kvm-tests-willow", "hvf-gate", "kvm-gate"] {
         assert!(needs.contains(&job), "{job}");
     }
-    let script = ok["steps"][0]["run"].as_str().unwrap();
+    let script = trusted_hardware_decision(&docs[0]["jobs"])["run"]
+        .as_str()
+        .unwrap();
     assert!(script.contains("test \"$HVF\" = success"));
     assert!(script.contains("test \"$KVM\" = success"));
     assert!(script.contains("test \"$HVF_GATE\" = success"));
@@ -986,22 +1002,41 @@ fn template_sets_and_verifies_disk_boot_order_after_attaching_the_disk() {
 fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
     let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
     let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
-    let script = docs[0]["jobs"]["trusted-hardware-ok"]["steps"][0]["run"]
+    let script = trusted_hardware_decision(&docs[0]["jobs"])["run"]
         .as_str()
         .unwrap();
-    for (event, hvf, kvm, hvf_gate, kvm_gate, expected) in [
-        ("push", "success", "success", "success", "success", true),
-        ("push", "success", "success", "failure", "success", false),
-        ("push", "success", "success", "success", "failure", false),
-        ("push", "success", "success", "skipped", "skipped", false),
-        ("push", "skipped", "success", "success", "success", false),
-        ("push", "success", "cancelled", "success", "success", false),
+    for (event, hvf, kvm, hvf_gate, kvm_gate, superseded, expected) in [
+        (
+            "push", "success", "success", "success", "success", false, true,
+        ),
+        (
+            "push", "success", "success", "failure", "success", false, false,
+        ),
+        (
+            "push", "success", "success", "success", "failure", false, false,
+        ),
+        (
+            "push", "success", "success", "skipped", "skipped", false, false,
+        ),
+        (
+            "push", "skipped", "success", "success", "success", false, false,
+        ),
+        (
+            "push",
+            "success",
+            "cancelled",
+            "success",
+            "success",
+            false,
+            false,
+        ),
         (
             "workflow_dispatch",
             "success",
             "success",
             "skipped",
             "skipped",
+            false,
             true,
         ),
         (
@@ -1010,6 +1045,55 @@ fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
             "success",
             "skipped",
             "skipped",
+            false,
+            false,
+        ),
+        // A coalesced HVF job with a newer push run: superseded, not red.
+        (
+            "push",
+            "cancelled",
+            "success",
+            "skipped",
+            "success",
+            true,
+            true,
+        ),
+        // Superseded never excuses a failed KVM lane or gate.
+        (
+            "push",
+            "cancelled",
+            "success",
+            "skipped",
+            "failure",
+            true,
+            false,
+        ),
+        (
+            "push",
+            "cancelled",
+            "failure",
+            "skipped",
+            "success",
+            true,
+            false,
+        ),
+        // A cancel with no newer push run (manual, or newest) stays red.
+        (
+            "push",
+            "cancelled",
+            "success",
+            "skipped",
+            "success",
+            false,
+            false,
+        ),
+        (
+            "push",
+            "cancelled",
+            "success",
+            "cancelled",
+            "success",
+            false,
             false,
         ),
     ] {
@@ -1020,13 +1104,14 @@ fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
             .env("KVM", kvm)
             .env("HVF_GATE", hvf_gate)
             .env("KVM_GATE", kvm_gate)
+            .env("SUPERSEDED", if superseded { "true" } else { "false" })
             .env("KVM_BACKEND", "willow")
             .output()
             .unwrap();
         assert_eq!(
             output.status.success(),
             expected,
-            "{event}: hvf={hvf} kvm={kvm} hvf-gate={hvf_gate} kvm-gate={kvm_gate}"
+            "{event}: hvf={hvf} kvm={kvm} hvf-gate={hvf_gate} kvm-gate={kvm_gate} superseded={superseded}"
         );
     }
 }
@@ -1473,6 +1558,16 @@ fn cloudmac_hvf_workflow_enforces_disk_admission_before_checkout_and_signed_gate
         hvf["concurrency"]["cancel-in-progress"].as_bool(),
         Some(false)
     );
+    // A coalesced hvf-kernel ends `cancelled` in a run that is not cancelled:
+    // the receipt gate must not run without a candidate receipt, and the
+    // aggregate must tell a superseded lane from a manual cancel.
+    let gate_if = workflow["jobs"]["hvf-gate"]["if"].as_str().unwrap();
+    assert!(gate_if.contains("needs.hvf-kernel.result != 'cancelled'"));
+    let detect = workflow["jobs"]["trusted-hardware-ok"]["steps"][0]["run"]
+        .as_str()
+        .unwrap();
+    assert!(detect.contains("select(.run_number > $RUN_NUMBER)"));
+    assert!(detect.contains("[ \"$HVF\" = cancelled ]"));
 
     let steps = hvf["steps"].as_vec().unwrap();
     let position = |pred: &dyn Fn(&yaml_rust2::Yaml) -> bool| steps.iter().position(pred).unwrap();
