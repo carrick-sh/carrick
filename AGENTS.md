@@ -639,11 +639,19 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
   PR per independently reviewable layer, each under the size cap, with its
   own witness and issue link, and each PR based on the layer below. Fix a
   lower layer on its own branch, then `gh stack rebase` and `gh stack push`
-  (force-with-lease). The director reviews every layer, runs the signed gate
-  once at the top of the stack, and lands the stack with
-  `gh stack merge <top PR>`: it enters the merge queue as one merge group and
-  takes one HVF gate. Ejecting a layer ejects everything above it, so
-  independent work stays in separate PRs. Stacks have no auto-merge.
+  (force-with-lease). The director reviews every layer and runs the signed
+  gate once at the top of the stack.
+- **A stack lands as one PR, and never with a merge commit** (owner,
+  2026-10-31, #231). Our merge queue takes a stack one layer per pass
+  (`gh stack merge` leaves the upper layers `UNMERGEABLE`, then drops and
+  rebases them), so collapse it first: run `gh stack unstack <stack number>`,
+  retarget the top PR to `main` so it carries every layer's commits, and
+  land that PR alone. Then close the lower PRs as "landed via #top", along
+  with their issues. When the collapsed head is rebased on the current main
+  tip and `ci-ok` is green on that exact head, admin-merge it with
+  `gh pr merge <top> --admin --rebase`. That skips the merge-group-only
+  jobs (`macos-build`, `macos-clippy`, `macos-authority`, the KVM gate), so
+  confirm the PR's own CI covered those surfaces first.
   Workflow: [`.agents/skills/carrick-stacked-prs`](.agents/skills/carrick-stacked-prs/SKILL.md).
 - **Lanes:** hosted Linux/macOS jobs in `ci.yml`. Heavy pull requests run the
   full macOS suite; same-repo PRs run it on the self-hosted `carrick-macos-ci`

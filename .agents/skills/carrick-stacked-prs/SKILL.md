@@ -62,35 +62,38 @@ gh stack view                                 # layers, PRs and their state
 2. Run the signed gate and `just accept --profile linux-portable` once,
    at the top PR's SHA, in a dedicated detached worktree; the top contains
    every layer. Post the receipt on the top PR and link it from the others.
-3. Mark every layer ready and wait for each layer's `ci-ok`. A higher PR
-   can merge only when every PR below it has passing checks.
-4. Land with `gh stack merge <PR>`: it queues every layer up to and
-   including that PR. Plain `gh pr merge` is refused for a stacked PR
-   (`Auto-merge is not supported for stacked pull requests`), and admin
-   bypass is not supported for stacks; an owner admin merge needs
-   `gh stack unstack` first. GitHub documents a queued stack entering as one
-   merge group, but our pilot (#468) saw separate entries with the upper
-   layer `UNMERGEABLE`, so until that is resolved land one layer at a time
-   (`gh stack merge <bottom PR>`, then the next once it merges).
-   `gh stack modify` is refused while any layer is queued.
-   - **A bare number is read as a stack number first.** Stack numbers
-     share the PR number range: on 2026-10-31 stack #1120 was the
-     #1061/#1119 stack, not PR #1120. Look the stack up with
-     `gh api repos/carrick-sh/carrick/stacks` and pass its stack number
-     (`gh stack merge 1082` merged #1077, #1081, #1118 and #1121). Check
-     that its listed head SHAs equal the SHAs the signed gate ran on.
-   - **Marking layers ready starts a fresh full CI run on each.** Until
-     every layer's new run finishes, the atomic merge fails with
-     `Required status check "ci-ok" is expected` and merges nothing. Wait
-     for each layer's latest `Hosted CI` run to complete; an older passing
-     `ci-ok` doesn't count.
-   - `gh stack merge` is atomic only at enqueue: it adds every chosen layer
-     or none. In the queue, only the bottom layer is built
-     (`AWAITING_CHECKS`); the layers above sit `UNMERGEABLE` with
-     `head=null`. When the bottom merges, GitHub rebases the rest onto the
-     new main, drops them from the queue and retargets the next layer to
-     `main` (stack 1029 on 2026-10-29 and stack 1082 on 2026-10-31; #468).
-     Expect one layer per queue pass. Re-run `gh stack merge` for the rest
-     after their fresh `ci-ok`.
-5. After landing: `gh stack sync --prune` and remove every layer's
-   worktree and `target/` on every host.
+3. Mark every layer ready and wait for each layer's `ci-ok`. Marking
+   ready starts a fresh full CI run on each layer; an older passing `ci-ok`
+   doesn't count.
+4. **Collapse and land as one PR, never with a merge commit** (owner,
+   2026-10-31, #231). Our merge queue (REBASE method) takes a native stack
+   one layer per pass. After `gh stack merge`, only the bottom layer is
+   built; the layers above sit `UNMERGEABLE` with `head=null` and are
+   dropped and rebased when it merges (stack 1029 on 2026-10-29, stack
+   1082 on 2026-10-31; #468). So, instead of `gh stack merge`:
+   1. Dequeue any queued layer. Dequeuing the bottom one ejects the rest.
+   2. `gh stack unstack <stack number>`. This works only while no layer has
+      merged or is queued.
+   3. `gh pr edit <top> --base main`. The top PR now carries every layer's
+      commits.
+   4. Rebase the top branch onto the current main tip and push it with the
+      normal hook. Check that the rebase changed only what main changed
+      since the signed gate's base: the patch-ids of
+      `git diff <gated merge> HEAD` and `git diff <gated base> origin/main`
+      must match.
+   5. When `ci-ok` is green on that exact head, admin-merge it:
+      `gh pr merge <top> --admin --rebase`. That skips the merge-group-only
+      jobs (`macos-build`, `macos-clippy`, `macos-authority`, the KVM gate),
+      so confirm the PR's own CI covered those surfaces first. Without that
+      proof, enqueue the top PR as an ordinary PR.
+   6. Close the lower PRs with "landed via #top", and close their issues.
+
+   Traps:
+   - A bare number is read as a **stack** number first. Stack numbers share
+     the PR number range: stack #1120 is the #1061/#1119 stack, not PR
+     #1120. Look stacks up with `gh api repos/carrick-sh/carrick/stacks`.
+   - Plain `gh pr merge` and admin bypass are refused for a stacked PR,
+     which is why step 2 unstacks first.
+   - `gh stack modify` is refused while any layer is queued.
+5. After landing: remove every layer's branch, worktree and `target/` on
+   every host.
