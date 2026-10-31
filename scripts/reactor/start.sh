@@ -7,18 +7,19 @@
 # so nothing here changes how other Claude Code sessions in the checkout
 # behave:
 # - --settings: permissions. dontAsk refuses anything not allowed: the
-#   reactor tools, Read, Agent, SendMessage, Monitor and exactly one Bash
-#   command, the mailbox tail. File writes and web tools are denied.
+#   reactor tools, Read, Agent and SendMessage. Bash, Monitor, file writes
+#   and web tools are denied, so the session has no shell.
 # - --setting-sources user: skip the checkout's project and local settings
 #   and hooks.
 # - --mcp-config + --strict-mcp-config: only the carrick-reactor server.
 # - --append-system-prompt-file: the reactor role (prompt.md).
 # - --agents: the pr-watcher subagent (agents.json).
 #
-# Events reach the session through a Monitor on the mailbox, not a Claude
-# Code channel: a custom channel needs --dangerously-load-development-channels,
-# which asks for confirmation on every launch. The MCP server can still serve
-# as a channel once it is on an approved allowlist.
+# Events reach the session through the server's wait_events tool, not a
+# Claude Code channel: a custom channel needs
+# --dangerously-load-development-channels, which asks for confirmation on
+# every launch. `reactor mcp --channel` switches the server to channel
+# delivery if it ever lands on an approved allowlist.
 #
 # The feed that appends PR events to the mailbox is a separate launchd job
 # (`sh.carrick.reactor-feed`, see docs/ci/dispatch-worker.md), so events keep
@@ -34,7 +35,7 @@ if tmux has-session -t carrick-reactor 2>/dev/null; then
   exit 0
 fi
 AGENTS=$(cat "$WS/agents.json")
-PROMPT='You are the Carrick reactor. Start your mailbox Monitor now, then route each event to its pr-<N> subagent as your instructions describe.'
+PROMPT='You are the Carrick reactor. Start your wait_events loop now and route each event to its pr-<N> subagent as your instructions describe. Never stop the loop.'
 # Keep the pane after claude exits, so a startup failure stays readable.
 tmux new-session -d -s carrick-reactor -n session -c "$REPO" \
   claude "$PROMPT" \

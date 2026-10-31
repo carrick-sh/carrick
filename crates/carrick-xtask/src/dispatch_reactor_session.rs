@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EXCERPT: usize = 300;
 const SEEN_LIMIT: usize = 200;
@@ -44,9 +44,14 @@ pub struct McpOpts {
     /// Mailbox the feed writes; new lines become channel notifications.
     #[arg(long)]
     mailbox: Option<PathBuf>,
-    /// Channel delivery state (last delivered event id).
+    /// Delivery state (last delivered event id), shared by wait_events and
+    /// channel delivery.
     #[arg(long)]
     channel_state: Option<PathBuf>,
+    /// Push events as Claude Code channel notifications instead of serving
+    /// them through wait_events. Needs the session's development-channel flag.
+    #[arg(long)]
+    channel: bool,
     /// Report would-be comments instead of posting them.
     #[arg(long)]
     dry_run: bool,
@@ -348,7 +353,9 @@ pub(super) fn tools() -> Value {
         {"name":"reply","description":"Post a plain-text reply on the PR as the owner, marked as the reactor's. Never a command.",
          "inputSchema":schema(json!({"pr":pr,"text":{"type":"string"}}),&["pr","text"])},
         {"name":"request_round","description":"Post `/agent <brief>` to start one dispatch round. Refused unless the PR is adoptable or owned, no dispatch run is in flight for it, fewer than 4 runs are in flight, and no reactor round already ran on this head without a human comment since.",
-         "inputSchema":schema(json!({"pr":pr,"brief":{"type":"string","description":"what the worker should do and how to prove it"}}),&["pr","brief"])}
+         "inputSchema":schema(json!({"pr":pr,"brief":{"type":"string","description":"what the worker should do and how to prove it"}}),&["pr","brief"])},
+        {"name":"wait_events","description":"Wait for the next pull request events from the mailbox and return them as {events:[{id,pr,kind,author,url,created_at,head,excerpt}]}, oldest first. Only owner and dispatch-bot events are returned. An empty list means the wait timed out; call again.",
+         "inputSchema":schema(json!({"timeout_seconds":{"type":"integer","description":"default 540, max 600"},"max_events":{"type":"integer","description":"default 20, max 100"}}),&[])}
     ])
 }
 
@@ -597,6 +604,7 @@ impl Server<'_> {
                 Ok(out.to_string())
             }
             "reply" | "request_round" => self.act(name, args),
+            "wait_events" => Err("wait_events needs the mailbox follower".into()),
             _ => Err(format!("unknown tool {name}")),
         }
     }
@@ -725,7 +733,7 @@ impl Server<'_> {
     }
 }
 
-const INSTRUCTIONS: &str = "Events from carrick-sh/carrick pull requests arrive as <channel source=\"carrick-reactor\" pr=... kind=... event_id=... author=... head=...> tags, one per event. kind is comment, review, review_comment (owner text), outcome (a dispatch outcome comment), ci_red, new_pr, quiet_pr or needs_closes. Route each event to the PR's own subagent pr-<N>: start it on the PR's first event and resume it with SendMessage after that. Subagents investigate with read_pr, read_thread, read_diff, read_ci, read_outcomes and read_issue, and act only through reply or request_round. When unsure, do nothing.";
+const INSTRUCTIONS: &str = "Events from carrick-sh/carrick pull requests come from wait_events (or, when the session loads this server as a channel, as <channel source=\"carrick-reactor\" pr=... kind=... event_id=... author=... head=...> tags), one per event. kind is comment, review, review_comment (owner text), outcome (a dispatch outcome comment), ci_red, new_pr, quiet_pr or needs_closes. Route each event to the PR's own subagent pr-<N>: start it on the PR's first event and resume it with SendMessage after that. Subagents investigate with read_pr, read_thread, read_diff, read_ci, read_outcomes and read_issue, and act only through reply or request_round. When unsure, do nothing.";
 
 /// Serialized stdout: one lock, one line per JSON-RPC message.
 pub(super) type Out = std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>;
@@ -775,28 +783,32 @@ impl Follower {
         // An unknown id means the mailbox was replaced: start at its end.
         Ok(found.unwrap_or(bytes.len()))
     }
-    /// Deliver every complete new line; returns how many were sent.
-    pub(super) fn poll(&mut self, out: &Out) -> Result<usize, ScalerError> {
+    /// Up to `max` new events that pass the author gate, oldest first. The
+    /// cursor advances past every line read, delivered or dropped.
+    pub(super) fn take(&mut self, max: usize) -> Result<Vec<Value>, ScalerError> {
         let bytes = match std::fs::read(&self.mailbox) {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
         // Only complete lines; a partial trailing write waits for its newline.
         let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-        let start = match self.pos {
+        let mut pos = match self.pos {
             Some(pos) if pos <= complete => pos,
             Some(_) => 0, // truncated or rotated
             None => self.resume(&bytes[..complete])?,
         };
-        let mut sent = 0;
-        for line in bytes[start..complete].split_inclusive(|b| *b == b'\n') {
+        let mut events = Vec::new();
+        for line in bytes[pos..complete].split_inclusive(|b| *b == b'\n') {
+            if events.len() >= max {
+                break;
+            }
+            pos += line.len();
             let Ok(event) = serde_json::from_slice::<Value>(line) else {
                 continue;
             };
-            if let Some(note) = notification(&event) {
-                send(out, &note)?;
-                sent += 1;
+            if notification(&event).is_some() {
+                events.push(event.clone());
             }
             if let Some(id) = event["id"].as_str() {
                 save(
@@ -807,9 +819,64 @@ impl Follower {
                 )?;
             }
         }
-        self.pos = Some(complete);
-        Ok(sent)
+        self.pos = Some(pos);
+        Ok(events)
     }
+    /// Deliver every new event as a channel notification; returns how many.
+    pub(super) fn poll(&mut self, out: &Out) -> Result<usize, ScalerError> {
+        let events = self.take(usize::MAX)?;
+        for event in &events {
+            if let Some(note) = notification(event) {
+                send(out, &note)?;
+            }
+        }
+        Ok(events.len())
+    }
+}
+/// Shared between `serve` and the waits it spawns, so one cursor decides
+/// what has been delivered.
+pub(super) type SharedFollower = std::sync::Arc<std::sync::Mutex<Follower>>;
+const WAIT_DEFAULT_SECONDS: u64 = 540;
+const WAIT_MAX_SECONDS: u64 = 600;
+const WAIT_DEFAULT_EVENTS: u64 = 20;
+
+/// Answer one `wait_events` call on its own thread: block until the follower
+/// has events or the timeout passes. Running beside `serve` keeps the PR
+/// subagents' tool calls, which share this connection, from queueing behind
+/// a long wait.
+fn spawn_wait(follower: SharedFollower, out: Out, id: Value, args: &Value) {
+    let seconds = args["timeout_seconds"]
+        .as_u64()
+        .unwrap_or(WAIT_DEFAULT_SECONDS)
+        .min(WAIT_MAX_SECONDS);
+    let max = usize::try_from(
+        args["max_events"]
+            .as_u64()
+            .unwrap_or(WAIT_DEFAULT_EVENTS)
+            .clamp(1, 100),
+    )
+    .unwrap_or(20);
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        let (text, error) = loop {
+            let taken = follower
+                .lock()
+                .map_err(|_| ScalerError::Guard("mailbox follower lock poisoned"))
+                .and_then(|mut f| f.take(max));
+            match taken {
+                Ok(events) if !events.is_empty() || Instant::now() >= deadline => {
+                    break (json!({ "events": events }).to_string(), false);
+                }
+                Ok(_) => std::thread::sleep(Duration::from_secs(1)),
+                Err(e) => break (format!("mailbox read failed: {e}"), true),
+            }
+        };
+        let reply = json!({"jsonrpc":"2.0","id":id,"result":{
+            "content":[{"type":"text","text":text}],"isError":error}});
+        if let Err(e) = send(&out, &reply) {
+            eprintln!("reactor mcp: wait_events reply failed: {e}");
+        }
+    });
 }
 /// The channel notification for one mailbox line. Lines whose author is
 /// neither the owner nor an outcome bot are dropped here too, so a mailbox
@@ -846,6 +913,7 @@ pub(super) fn notification(event: &Value) -> Option<Value> {
 
 /// Answer JSON-RPC lines from `input` on `out` until EOF. `ready` is set once
 /// the client sends `notifications/initialized`; channel events wait for it.
+/// `wait_events` calls are answered from `follower` on their own thread.
 pub(super) fn serve(
     input: impl BufRead,
     out: &Out,
@@ -853,6 +921,7 @@ pub(super) fn serve(
     state: &Path,
     dry_run: bool,
     ready: &std::sync::atomic::AtomicBool,
+    follower: Option<&SharedFollower>,
 ) -> Result<(), ScalerError> {
     for line in input.lines() {
         let line = line?;
@@ -865,6 +934,19 @@ pub(super) fn serve(
             .is_ok_and(|m| m["method"] == "notifications/initialized")
         {
             ready.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let (Ok(msg), Some(follower)) = (&parsed, follower)
+            && msg["method"] == "tools/call"
+            && msg["params"]["name"] == "wait_events"
+            && let Some(id) = msg.get("id")
+        {
+            spawn_wait(
+                follower.clone(),
+                out.clone(),
+                id.clone(),
+                &msg["params"]["arguments"],
+            );
+            continue;
         }
         let reply = match parsed {
             Ok(msg) => Server {
@@ -899,20 +981,28 @@ pub(super) fn mcp(root: &Path, opts: &McpOpts) -> Result<(), ScalerError> {
         .clone()
         .map_or_else(|| support("channel-state.json"), Ok)?;
     let out: Out = std::sync::Arc::new(std::sync::Mutex::new(Box::new(std::io::stdout())));
-    let follower_out = out.clone();
     let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let follower_ready = ready.clone();
-    std::thread::spawn(move || {
-        let mut follower = Follower::new(mailbox, channel);
-        loop {
-            if follower_ready.load(std::sync::atomic::Ordering::Acquire)
-                && let Err(error) = follower.poll(&follower_out)
-            {
-                eprintln!("reactor mcp: mailbox follow failed: {error}");
+    let follower: SharedFollower =
+        std::sync::Arc::new(std::sync::Mutex::new(Follower::new(mailbox, channel)));
+    // Channel delivery is opt-in: a custom channel needs Claude Code's
+    // development flag. Without it, the session pulls with wait_events.
+    if opts.channel {
+        let (channel_out, channel_ready, channel_follower) =
+            (out.clone(), ready.clone(), follower.clone());
+        std::thread::spawn(move || {
+            loop {
+                if channel_ready.load(std::sync::atomic::Ordering::Acquire)
+                    && let Err(error) = channel_follower
+                        .lock()
+                        .map_err(|_| ScalerError::Guard("mailbox follower lock poisoned"))
+                        .and_then(|mut f| f.poll(&channel_out))
+                {
+                    eprintln!("reactor mcp: mailbox follow failed: {error}");
+                }
+                std::thread::sleep(Duration::from_secs(1));
             }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    });
+        });
+    }
     serve(
         std::io::stdin().lock(),
         &out,
@@ -920,6 +1010,7 @@ pub(super) fn mcp(root: &Path, opts: &McpOpts) -> Result<(), ScalerError> {
         &state,
         opts.dry_run,
         &ready,
+        (!opts.channel).then_some(&follower),
     )
 }
 
@@ -1118,7 +1209,8 @@ mod tests {
                 "read_outcomes",
                 "read_issue",
                 "reply",
-                "request_round"
+                "request_round",
+                "wait_events"
             ]
         );
         assert!(
@@ -1324,6 +1416,7 @@ mod tests {
             &dir.path().join("s.json"),
             true,
             &ready,
+            None,
         )
         .unwrap();
         assert!(ready.load(std::sync::atomic::Ordering::Acquire));
@@ -1380,6 +1473,85 @@ mod tests {
             "comment:3"
         );
         assert_eq!(Follower::new(mailbox, delivered).poll(&out).unwrap(), 0);
+    }
+
+    #[test]
+    fn dispatch_reactor_mcp_wait_events_returns_gated_lines_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = dir.path().join("mailbox.jsonl");
+        let delivered = dir.path().join("channel-state.json");
+        let append = |id: &str, author: &str| {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&mailbox)
+                .unwrap();
+            let line = json!({"id":id,"pr":1150,"kind":"comment","author":author,
+                "url":"https://x/1150","created_at":"2026-10-31T00:00:00Z","head":SHA_HEAD,"excerpt":"look"});
+            writeln!(f, "{line}").unwrap();
+        };
+        let call = |id: u64, timeout: u64| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"wait_events\",\"arguments\":{{\"timeout_seconds\":{timeout}}}}}}}\n"
+            )
+        };
+        let events_in = |reply: &Value| -> Vec<String> {
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            serde_json::from_str::<Value>(text).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // Wait for the spawned waits to answer, then read every reply.
+        let replies = |buffer: &Buffer, n: usize| {
+            let start = Instant::now();
+            while buffer.lines().len() < n && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            buffer.lines()
+        };
+        let run = |input: String, buffer: &Buffer, follower: &SharedFollower| {
+            let out: Out = std::sync::Arc::new(std::sync::Mutex::new(Box::new(buffer.clone())));
+            serve(
+                std::io::Cursor::new(input),
+                &out,
+                &mut remote(),
+                &dir.path().join("s.json"),
+                true,
+                &std::sync::atomic::AtomicBool::new(true),
+                Some(follower),
+            )
+            .unwrap();
+        };
+        let shared = |_: ()| -> SharedFollower {
+            std::sync::Arc::new(std::sync::Mutex::new(Follower::new(
+                mailbox.clone(),
+                delivered.clone(),
+            )))
+        };
+
+        // An owner line is returned; a stranger's line never is.
+        append("comment:1", "tjfontaine");
+        append("comment:2", "mallory");
+        let (buffer, follower) = (Buffer::default(), shared(()));
+        run(call(1, 5), &buffer, &follower);
+        let first = replies(&buffer, 1);
+        assert_eq!(first[0]["id"], 1);
+        assert_eq!(events_in(&first[0]), ["comment:1"]);
+
+        // Nothing new: the wait times out with an empty list.
+        let (buffer, follower) = (Buffer::default(), shared(()));
+        run(call(2, 0), &buffer, &follower);
+        assert!(events_in(&replies(&buffer, 1)[0]).is_empty());
+
+        // A restart resumes after the cursor and returns only the new line.
+        append("comment:3", "tjfontaine");
+        let (buffer, follower) = (Buffer::default(), shared(()));
+        run(call(3, 5), &buffer, &follower);
+        assert_eq!(events_in(&replies(&buffer, 1)[0]), ["comment:3"]);
     }
     const SHA_HEAD: &str = "1fcdaac3c5322b601f362a5aa5f915781456c7c7";
 }
