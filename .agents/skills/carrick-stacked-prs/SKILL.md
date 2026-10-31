@@ -84,8 +84,13 @@ gh stack view                                 # layers, PRs and their state
      `Required status check "ci-ok" is expected` and merges nothing. Wait
      for each layer's latest `Hosted CI` run to complete; an older passing
      `ci-ok` doesn't count.
-   - Since `gh-stack` added atomic stack merge, `gh stack merge` queues the
-     chosen layers all-or-nothing. The one-layer-at-a-time advice above
-     predates it.
+   - `gh stack merge` is atomic only at enqueue: it adds every chosen layer
+     or none. In the queue, only the bottom layer is built
+     (`AWAITING_CHECKS`); the layers above sit `UNMERGEABLE` with
+     `head=null`. When the bottom merges, GitHub rebases the rest onto the
+     new main, drops them from the queue and retargets the next layer to
+     `main` (stack 1029 on 2026-10-29 and stack 1082 on 2026-10-31; #468).
+     Expect one layer per queue pass. Re-run `gh stack merge` for the rest
+     after their fresh `ci-ok`.
 5. After landing: `gh stack sync --prune` and remove every layer's
    worktree and `target/` on every host.
