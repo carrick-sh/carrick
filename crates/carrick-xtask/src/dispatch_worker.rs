@@ -8,6 +8,8 @@ use std::process::{Command, Stdio};
 
 #[path = "dispatch_loop.rs"]
 mod agent_loop;
+#[path = "dispatch_live_log.rs"]
+mod live_log;
 #[path = "dispatch_reactor.rs"]
 mod reactor;
 
@@ -705,6 +707,7 @@ fn wait_account_serving(
     let mut stopped = false;
     let mut serving_error = None;
     loop {
+        live_log::pump();
         if !stopped {
             match serve() {
                 Ok(stop) => stopped = stop,
@@ -985,9 +988,14 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
     let mut isolated = account_command(&command, AGENT_USER, root, handoff);
     hand_over(&state)?;
     let logs = crate::agent_runner::state()?;
+    let label = format!(
+        "worker {}/{}",
+        dispatch.worker.backend, dispatch.worker.model
+    );
+    let label_err = format!("{label} stderr");
     isolated
-        .stdout(std::fs::File::create(logs.join("agent.out"))?)
-        .stderr(std::fs::File::create(logs.join("agent.err"))?);
+        .stdout(live_log::create(&label, &logs.join("agent.out"))?)
+        .stderr(live_log::create(&label_err, &logs.join("agent.err"))?);
     let remaining = dispatch
         .loop_deadline
         .map(|d| d.saturating_duration_since(std::time::Instant::now()))
@@ -998,6 +1006,8 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
             .min(limit)
             .min(crate::agent_runner::job_remaining(83)?),
     );
+    live_log::unfollow(&label);
+    live_log::unfollow(&label_err);
     let _harvest = dispatch.harvest_deadline.map(CommandWindow::until);
     retire_agent()?;
     let code = outcome?;
@@ -4688,6 +4698,75 @@ fn publish_commits(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    /// #1229: a running agent's output reaches the step log while it runs,
+    /// through the production serve loop, masked, line by line, with a
+    /// final partial line only once the writer exits.
+    #[test]
+    fn live_log_streams_an_agent_through_the_serve_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("agent.out");
+        let sink = live_log::capture();
+        live_log::set_token("fixture-token");
+        let writer = live_log::create("worker agy/m", &log).unwrap();
+        let mut seen_while_running = String::new();
+        // The child writes through the followed handle, then swaps the path
+        // for a link to a secret: the stream must keep reading the handle.
+        std::fs::write(dir.path().join("secret"), "SECRET-CONTENT\n").unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "printf 'first fixture-token\\n::add-mask::x\\n'; sleep 1; rm {p}; ln -s {s} {p}; printf 'tail'",
+                p = log.display(),
+                s = dir.path().join("secret").display()
+            ))
+            .stdout(writer);
+        let mut ticks = 0;
+        let code = wait_account_serving(
+            &mut command,
+            std::time::Duration::from_secs(20),
+            "nobody",
+            || {
+                ticks += 1;
+                if ticks == 6 {
+                    seen_while_running = String::from_utf8(sink.borrow().clone()).unwrap();
+                }
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        // The token is registered with the runner and commands suspended
+        // before any transcript line; then the complete lines stream.
+        let stop = seen_while_running
+            .lines()
+            .find_map(|l| l.strip_prefix("::stop-commands::"))
+            .expect("commands suspended while streaming")
+            .to_owned();
+        assert_eq!(
+            seen_while_running,
+            format!(
+                "::add-mask::fixture-token\n::stop-commands::{stop}\n[worker agy/m] first [REDACTED]\n[worker agy/m] ::add-mask::x\n"
+            ),
+            "complete lines stream while the agent runs; the partial waits"
+        );
+        live_log::unfollow("worker agy/m");
+        let all = String::from_utf8(sink.borrow().clone()).unwrap();
+        assert!(
+            all.ends_with(&format!("[worker agy/m] tail\n::{stop}::\n")),
+            "commands resume once nothing streams: {all}"
+        );
+        assert!(
+            all.lines()
+                .filter(|l| l.starts_with("[worker"))
+                .all(|l| !l.contains("fixture-token")),
+            "{all}"
+        );
+        assert!(
+            !all.contains("SECRET-CONTENT"),
+            "followed a swapped path: {all}"
+        );
+    }
     #[test]
     fn agent_account_command_adds_only_the_host_lease_handoff() {
         let mut command = Command::new("python3");

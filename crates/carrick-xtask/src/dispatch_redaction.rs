@@ -8,6 +8,11 @@ pub(crate) struct DiagnosticSecrets {
     secrets: Vec<String>,
 }
 impl DiagnosticSecrets {
+    /// Every secret value captured, for consumers that register them
+    /// elsewhere (the live log's `::add-mask::`).
+    pub(crate) fn values(&self) -> &[String] {
+        &self.secrets
+    }
     fn add(&mut self, value: &str) {
         if !value.is_empty() && !self.secrets.iter().any(|s| s == value) {
             self.secrets.push(value.to_owned());

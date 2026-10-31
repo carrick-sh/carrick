@@ -635,6 +635,30 @@ written by the final outcome post. The workflow uploads
 the whole `dispatch-output` directory, including these diagnostics. Worker contracts are claims for review; incomplete contracts
 fail the job. PR review and repository gates establish correctness.
 
+## Live transcripts (#1229)
+
+While a round runs, the step log shows the coordinator's and each worker's
+output as it is written, so a round can be watched instead of read from its
+artifacts afterwards. Lines are prefixed `[loop]`, `[loop stderr]`,
+`[worker <backend>/<model>]` or `[worker ... stderr]`.
+
+The repository and its run logs are public, and a live line skips the
+artifact scan, so:
+- each batch of complete lines goes through `agent_loop::masked`, the same
+  masking artifacts get (the job token, minted tokens, credential files and
+  credential shapes), before it is printed; a partial line waits for its
+  newline;
+- control characters are removed, lines are capped at 2000 characters, and
+  every printed line starts with its `[label]`, so model text can't start a
+  line with a workflow command (`::add-mask::`, `::stop-commands::`, `##[`);
+- the output files are created by the server (`O_NOFOLLOW`, truncated) and
+  read through that same open file, never reopened by name, so an agent
+  can't swap the path for a link to another file.
+
+The serve loop that waits on the coordinator and on every worker pumps the
+stream every 100 ms. The artifacts remain the record. Set
+`CARRICK_DISPATCH_LIVE_LOG=0` to turn streaming off.
+
 ## Compiler isolation
 
 Every worker-job step clears `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, both
