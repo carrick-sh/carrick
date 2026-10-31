@@ -720,6 +720,20 @@ fn workflow_runner_labels_are_the_controller_label_constants() {
     assert_ne!(HVF_CLOSURE_LABELS, HVF_LABELS);
 }
 
+/// The trusted-hardware-ok step that decides the aggregate verdict.
+fn trusted_hardware_decision(jobs: &yaml_rust2::Yaml) -> &yaml_rust2::Yaml {
+    jobs["trusted-hardware-ok"]["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("Require both trusted-hardware lanes"))
+        })
+        .expect("trusted-hardware-ok decision step")
+}
+
 /// The Willow KVM backend is the sole KVM lane: kvm-tests-willow runs when
 /// CARRICK_SELF_HOSTED_KVM == 'true', publishes the receipt, and kvm-gate
 /// and trusted-hardware-ok read its result directly.
@@ -739,7 +753,7 @@ fn kvm_willow_lane_is_sole_kvm_backend_and_read_directly() {
     );
     let gate_if = squash(jobs["kvm-gate"]["if"].as_str().unwrap());
     assert!(gate_if.contains("needs.kvm-tests-willow.result != 'skipped'"));
-    let ok_env = &jobs["trusted-hardware-ok"]["steps"][0]["env"];
+    let ok_env = &trusted_hardware_decision(jobs)["env"];
     assert_eq!(
         ok_env["KVM"].as_str(),
         Some("${{ needs.kvm-tests-willow.result }}")
@@ -790,7 +804,9 @@ fn one_always_job_requires_both_trusted_hardware_lanes() {
     for job in ["hvf-kernel", "kvm-tests-willow", "hvf-gate", "kvm-gate"] {
         assert!(needs.contains(&job), "{job}");
     }
-    let script = ok["steps"][0]["run"].as_str().unwrap();
+    let script = trusted_hardware_decision(&docs[0]["jobs"])["run"]
+        .as_str()
+        .unwrap();
     assert!(script.contains("test \"$HVF\" = success"));
     assert!(script.contains("test \"$KVM\" = success"));
     assert!(script.contains("test \"$HVF_GATE\" = success"));
@@ -986,22 +1002,41 @@ fn template_sets_and_verifies_disk_boot_order_after_attaching_the_disk() {
 fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
     let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
     let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
-    let script = docs[0]["jobs"]["trusted-hardware-ok"]["steps"][0]["run"]
+    let script = trusted_hardware_decision(&docs[0]["jobs"])["run"]
         .as_str()
         .unwrap();
-    for (event, hvf, kvm, hvf_gate, kvm_gate, expected) in [
-        ("push", "success", "success", "success", "success", true),
-        ("push", "success", "success", "failure", "success", false),
-        ("push", "success", "success", "success", "failure", false),
-        ("push", "success", "success", "skipped", "skipped", false),
-        ("push", "skipped", "success", "success", "success", false),
-        ("push", "success", "cancelled", "success", "success", false),
+    for (event, hvf, kvm, hvf_gate, kvm_gate, superseded, expected) in [
+        (
+            "push", "success", "success", "success", "success", false, true,
+        ),
+        (
+            "push", "success", "success", "failure", "success", false, false,
+        ),
+        (
+            "push", "success", "success", "success", "failure", false, false,
+        ),
+        (
+            "push", "success", "success", "skipped", "skipped", false, false,
+        ),
+        (
+            "push", "skipped", "success", "success", "success", false, false,
+        ),
+        (
+            "push",
+            "success",
+            "cancelled",
+            "success",
+            "success",
+            false,
+            false,
+        ),
         (
             "workflow_dispatch",
             "success",
             "success",
             "skipped",
             "skipped",
+            false,
             true,
         ),
         (
@@ -1010,6 +1045,55 @@ fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
             "success",
             "skipped",
             "skipped",
+            false,
+            false,
+        ),
+        // A coalesced HVF job with a newer push run: superseded, not red.
+        (
+            "push",
+            "cancelled",
+            "success",
+            "skipped",
+            "success",
+            true,
+            true,
+        ),
+        // Superseded never excuses a failed KVM lane or gate.
+        (
+            "push",
+            "cancelled",
+            "success",
+            "skipped",
+            "failure",
+            true,
+            false,
+        ),
+        (
+            "push",
+            "cancelled",
+            "failure",
+            "skipped",
+            "success",
+            true,
+            false,
+        ),
+        // A cancel with no newer push run (manual, or newest) stays red.
+        (
+            "push",
+            "cancelled",
+            "success",
+            "skipped",
+            "success",
+            false,
+            false,
+        ),
+        (
+            "push",
+            "cancelled",
+            "success",
+            "cancelled",
+            "success",
+            false,
             false,
         ),
     ] {
@@ -1020,13 +1104,14 @@ fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
             .env("KVM", kvm)
             .env("HVF_GATE", hvf_gate)
             .env("KVM_GATE", kvm_gate)
+            .env("SUPERSEDED", if superseded { "true" } else { "false" })
             .env("KVM_BACKEND", "willow")
             .output()
             .unwrap();
         assert_eq!(
             output.status.success(),
             expected,
-            "{event}: hvf={hvf} kvm={kvm} hvf-gate={hvf_gate} kvm-gate={kvm_gate}"
+            "{event}: hvf={hvf} kvm={kvm} hvf-gate={hvf_gate} kvm-gate={kvm_gate} superseded={superseded}"
         );
     }
 }
@@ -1444,4 +1529,231 @@ fn owner_comment_dispatch_run_is_admitted() {
     assert!(Admission::Agent.authorize(&context).is_ok());
     context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/pull/42/merge");
     assert!(Admission::Agent.authorize(&context).is_err());
+}
+
+#[test]
+fn cloudmac_hvf_workflow_enforces_disk_admission_before_checkout_and_signed_gate() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
+    assert!(
+        !kernel.contains("mac-jit") && !kernel.contains("docs/ci/mac-jit.md"),
+        "kernel-runtime.yml still references retired mac-jit path"
+    );
+    assert!(kernel.contains("docs/ci/mac-hvf-runner.md"));
+
+    let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
+    let workflow = &docs[0];
+    assert!(
+        workflow["concurrency"].is_badvalue(),
+        "workflow-level concurrency would coalesce KVM and fixture jobs together"
+    );
+
+    let hvf = &workflow["jobs"]["hvf-kernel"];
+    assert_eq!(
+        hvf["concurrency"]["group"].as_str(),
+        Some("hvf-kernel-${{ github.event_name }}")
+    );
+    assert_eq!(
+        hvf["concurrency"]["cancel-in-progress"].as_bool(),
+        Some(false)
+    );
+    // A coalesced hvf-kernel ends `cancelled` in a run that is not cancelled:
+    // the receipt gate must not run without a candidate receipt, and the
+    // aggregate must tell a superseded lane from a manual cancel.
+    let gate_if = workflow["jobs"]["hvf-gate"]["if"].as_str().unwrap();
+    assert!(gate_if.contains("needs.hvf-kernel.result != 'cancelled'"));
+    let detect = workflow["jobs"]["trusted-hardware-ok"]["steps"][0]["run"]
+        .as_str()
+        .unwrap();
+    assert!(detect.contains("select(.run_number > $RUN_NUMBER)"));
+    assert!(detect.contains("[ \"$HVF\" = cancelled ]"));
+
+    let steps = hvf["steps"].as_vec().unwrap();
+    let position = |pred: &dyn Fn(&yaml_rust2::Yaml) -> bool| steps.iter().position(pred).unwrap();
+    let checkout_idx = position(&|s| {
+        s["uses"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("actions/checkout@"))
+    });
+    assert_eq!(steps[0]["name"].as_str(), Some("Disk admission"));
+    assert!(
+        checkout_idx > 0,
+        "Disk admission must run before actions/checkout"
+    );
+    let floor = steps[0]["env"]["HVF_DISK_FLOOR_GIB"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| {
+            steps[0]["env"]["HVF_DISK_FLOOR_GIB"]
+                .as_i64()
+                .map(|n| n.to_string())
+        });
+    assert_eq!(floor.as_deref(), Some("60"));
+    let admission_script = steps[0]["run"].as_str().unwrap();
+    assert!(admission_script.contains("df -Pk \"$RUNNER_WORKSPACE\""));
+    assert!(admission_script.contains("::error"));
+
+    // Execute the workflow's exact Disk admission script against a stub `df`.
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = temp.path().join("bin");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let df_stub = bin_dir.join("df");
+    std::fs::write(
+        &df_stub,
+        "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/disk3s1 200000000 100000 %s 50%% /Volumes/carrick-hvf\\n' \"$STUB_AVAIL_KIB\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&df_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path_env = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
+
+    let run_admission = |avail_kib: &str, ws: Option<&std::path::Path>| {
+        let mut cmd = std::process::Command::new("bash");
+        cmd.args(["-c", admission_script])
+            .env("PATH", &path_env)
+            .env("HVF_DISK_FLOOR_GIB", "60")
+            .env("STUB_AVAIL_KIB", avail_kib);
+        match ws {
+            Some(dir) => {
+                cmd.env("RUNNER_WORKSPACE", dir);
+            }
+            None => {
+                cmd.env_remove("RUNNER_WORKSPACE");
+            }
+        }
+        cmd.output().unwrap()
+    };
+
+    // 1 KiB below 60 GiB fails closed with a GitHub ::error:: annotation.
+    let below = run_admission(&(60_u64 * 1_048_576 - 1).to_string(), Some(&workspace));
+    assert!(!below.status.success(), "59 GiB must fail disk admission");
+    let below_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&below.stdout),
+        String::from_utf8_lossy(&below.stderr)
+    );
+    assert!(below_out.contains("::error"), "{below_out}");
+    assert!(below_out.contains("59 GiB"), "{below_out}");
+
+    // Exact 60 GiB floor passes.
+    let exact = run_admission(&(60_u64 * 1_048_576).to_string(), Some(&workspace));
+    assert!(
+        exact.status.success(),
+        "60 GiB must pass disk admission: {}{}",
+        String::from_utf8_lossy(&exact.stdout),
+        String::from_utf8_lossy(&exact.stderr)
+    );
+
+    // Unset RUNNER_WORKSPACE and malformed df output both fail closed with ::error::.
+    let missing_ws = run_admission(&(80_u64 * 1_048_576).to_string(), None);
+    assert!(!missing_ws.status.success());
+    let missing_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&missing_ws.stdout),
+        String::from_utf8_lossy(&missing_ws.stderr)
+    );
+    assert!(missing_out.contains("::error"), "{missing_out}");
+
+    let bad_df = run_admission("not-a-number", Some(&workspace));
+    assert!(!bad_df.status.success());
+    let bad_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad_df.stdout),
+        String::from_utf8_lossy(&bad_df.stderr)
+    );
+    assert!(bad_out.contains("::error"), "{bad_out}");
+
+    // Pre-signed-acceptance 35 GiB check runs after pruning host-gate artifacts
+    // (even when `Host-only source gate` fails, provided pre-gate setup passed)
+    // and gates `Signed acceptance receipt`.
+    let setup_idx = position(&|s| s["id"].as_str() == Some("host-gate-setup"));
+    let host_gate_idx = position(&|s| s["name"].as_str() == Some("Host-only source gate"));
+    let prune_idx =
+        position(&|s| s["name"].as_str() == Some("Prune host-only gate build artifacts"));
+    let signed_disk_idx = position(&|s| {
+        s["run"]
+            .as_str()
+            .is_some_and(|r| r.trim() == "CARRICK_DISK_FLOOR_GIB=35 just check-disk")
+    });
+    let signed_receipt_idx = position(&|s| s["name"].as_str() == Some("Signed acceptance receipt"));
+    assert!(setup_idx < host_gate_idx);
+    assert!(host_gate_idx < prune_idx);
+    assert!(prune_idx < signed_disk_idx);
+    assert!(signed_disk_idx < signed_receipt_idx);
+
+    let signed_disk = &steps[signed_disk_idx];
+    assert_eq!(signed_disk["id"].as_str(), Some("signed-disk"));
+    let signed_disk_if = signed_disk["if"].as_str().unwrap();
+    assert!(signed_disk_if.contains("!cancelled()"), "{signed_disk_if}");
+    assert!(
+        signed_disk_if.contains("steps.host-gate-setup.outcome == 'success'"),
+        "{signed_disk_if}"
+    );
+
+    let prune_if = steps[prune_idx]["if"].as_str().unwrap();
+    assert!(
+        prune_if.contains("steps.host-gate-setup.outcome == 'success'"),
+        "{prune_if}"
+    );
+
+    let signed_receipt_if = steps[signed_receipt_idx]["if"].as_str().unwrap();
+    assert!(
+        signed_receipt_if.contains("!cancelled()")
+            && signed_receipt_if.contains("steps.signed-disk.outcome == 'success'"),
+        "{signed_receipt_if}"
+    );
+}
+
+#[test]
+fn cloudmac_ci_macos_runner_jobs_serialize_builds_and_tests_under_carrick_lease() {
+    let ci = include_str!("../../../.github/workflows/ci.yml");
+    let docs = yaml_rust2::YamlLoader::load_from_str(ci).unwrap();
+    let jobs = docs[0]["jobs"].as_hash().unwrap();
+
+    let mut macos_runner_jobs = Vec::new();
+    for (name, body) in jobs {
+        let name = name.as_str().unwrap();
+        if body["runs-on"]
+            .as_str()
+            .is_some_and(|r| r.contains("needs.changes.outputs.macos_runner"))
+        {
+            macos_runner_jobs.push(name.to_owned());
+            let steps = body["steps"].as_vec().unwrap();
+            let prebuild_idx = steps
+                .iter()
+                .position(|s| s["run"].as_str() == Some("just ci-prebuild-xtask"))
+                .unwrap_or_else(|| panic!("{name} must prebuild xtask before taking host lease"));
+            let mut leased = Vec::new();
+            for step in &steps[prebuild_idx + 1..] {
+                let Some(run) = step["run"].as_str() else {
+                    continue;
+                };
+                if run == "just build-cache" {
+                    continue;
+                }
+                assert!(
+                    run.starts_with("just lease carrick "),
+                    "{name} step after ci-prebuild-xtask must hold `just lease carrick`: {run}"
+                );
+                leased.push(run);
+            }
+            assert!(
+                !leased.is_empty(),
+                "{name} had no leased build or test steps"
+            );
+        }
+    }
+    macos_runner_jobs.sort();
+    assert_eq!(
+        macos_runner_jobs,
+        vec![
+            "macos-build",
+            "macos-clippy",
+            "macos-integration",
+            "macos-unit-a",
+            "macos-unit-b",
+        ]
+    );
 }
