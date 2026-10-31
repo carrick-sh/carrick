@@ -29,10 +29,20 @@ access to apply a label. A trusted actor's label, comment or review is the
 approval, so the issue or PR author no longer matters. A comment must have
 identical creation/update timestamps, match `/agent` followed by whitespace or
 end-of-body, and still match the original webhook when admission fetches it.
-Edited events and triggers from anyone without write access are refused. The
-guard never parses issue structure. The
+Edited events and triggers from anyone without write access are refused.
+
+The approval covers only issue text a collaborator saw or wrote. On every
+path that turns an issue body into the worker's brief (label, `/agent` on the
+issue, `/agent` or a review on an owned dispatch PR, and adoption), the guard
+and clone admission read the body through GraphQL together with
+`lastEditedAt` and `editor`, and use that body as the brief. The body is
+accepted only if it was never edited since filing, or its last editor passes
+the same live write check. Otherwise the round is refused with "issue body
+was last edited by a non-collaborator; a collaborator must edit or re-file
+it". GraphQL errors and missing fields are refused too. The guard never
+parses issue structure. The
 loop reads the full issue, so #587's problem statement and acceptance need no
-special heading. Unclear work can finish blocked with a question for the owner.
+special heading. Unclear work can finish blocked with a question for the requesting collaborator.
 
 For issue work, the server starts `work/dispatch-<issue>-<run>`. The loop can
 select another linked `work/dispatch-*` branch before invoking workers. A

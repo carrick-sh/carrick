@@ -245,6 +245,75 @@ pub(crate) fn adopted_pr(
         issue,
     }))
 }
+/// The issue body with its last writer, read in one GraphQL response so the
+/// check and the brief cannot diverge (#1218 review).
+pub(crate) const ISSUE_BRIEF_QUERY: &str = r#"query($number:Int!){repository(owner:"carrick-sh",name:"carrick"){issue(number:$number){number author{login} lastEditedAt editor{login} body}}}"#;
+/// The issue body a worker may take as its brief. Any issue author may be
+/// approved by a collaborator's label, comment or review (#1214), but the
+/// approval covers only text a collaborator saw or wrote: the body must be
+/// unedited since filing (`lastEditedAt` null), or last edited by a login
+/// that passes `trusted` ([`write_collaborator`]). Errors, a different issue
+/// and any missing field are refused.
+pub(crate) fn trusted_brief(
+    response: &Value,
+    number: u64,
+    trusted: &mut dyn FnMut(&str) -> bool,
+) -> Result<String, ScalerError> {
+    if response.get("errors").is_some() {
+        return Err(ScalerError::Guard("issue brief query returned errors"));
+    }
+    let issue = &response["data"]["repository"]["issue"];
+    let body = issue["body"]
+        .as_str()
+        .filter(|_| issue["number"].as_u64() == Some(number))
+        .ok_or(ScalerError::Guard("issue brief unavailable"))?;
+    match issue.get("lastEditedAt") {
+        Some(Value::Null) => Ok(body.to_owned()),
+        Some(Value::String(at)) if !at.is_empty() => {
+            if issue["editor"]["login"].as_str().is_some_and(trusted) {
+                Ok(body.to_owned())
+            } else {
+                Err(ScalerError::Guard(
+                    "issue body was last edited by a non-collaborator; a collaborator must edit or re-file it",
+                ))
+            }
+        }
+        _ => Err(ScalerError::Guard("issue brief edit history unavailable")),
+    }
+}
+/// Replace the event's issue body with the [`trusted_brief`] for that issue.
+/// Every path that admits a round (label, comment, review, adoption) ends
+/// here, so no issue body reaches a worker without this check.
+fn apply_trusted_brief(
+    event: &mut Value,
+    read: impl FnOnce(u64) -> Result<Value, ScalerError>,
+    trusted: &mut dyn FnMut(&str) -> bool,
+) -> Result<(), ScalerError> {
+    let number = event["issue"]["number"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .ok_or(ScalerError::Guard("missing issue number"))?;
+    let body = trusted_brief(&read(number)?, number, trusted)?;
+    event["issue"]["body"] = body.into();
+    Ok(())
+}
+fn issue_brief_response(root: &Path, number: u64) -> Result<Value, ScalerError> {
+    let response = gh(
+        root,
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={ISSUE_BRIEF_QUERY}"),
+            "-F",
+            &format!("number={number}"),
+        ],
+    )?;
+    if response.len() > 256 * 1024 {
+        return Err(ScalerError::Guard("issue brief response exceeds 256 KiB"));
+    }
+    Ok(serde_json::from_str(&response)?)
+}
 fn adoption_read(root: &Path, read: AdoptionRead) -> Result<Value, ScalerError> {
     match read {
         AdoptionRead::ClosingReferences(number) => closing_references_response(root, number),
@@ -2104,6 +2173,22 @@ fn admitted_head(event: &Value) -> Option<String> {
 /// An `/agent` comment on a PR no dispatch run named also returns the
 /// adoption proof that `validate_event_with_publication` requires.
 pub(crate) fn load_event(
+    root: &Path,
+    path: &Path,
+    trusted: &mut dyn FnMut(&str) -> bool,
+) -> Result<(Value, Option<Adoption>), ScalerError> {
+    let (mut event, adoption) = resolve_event(root, path, trusted)?;
+    // Whatever path resolved the issue (the label payload, a live re-read for
+    // an owned PR, or the adopted PR's closing issue), its body becomes the
+    // brief only through the last-writer check.
+    apply_trusted_brief(
+        &mut event,
+        |number| issue_brief_response(root, number),
+        trusted,
+    )?;
+    Ok((event, adoption))
+}
+fn resolve_event(
     root: &Path,
     path: &Path,
     trusted: &mut dyn FnMut(&str) -> bool,
@@ -7328,7 +7413,10 @@ fi
                 bin.join("gh"),
                 r#"#!/bin/sh
 test "$1" = api || exit 93
-if test "$2" = graphql; then cat "$ADOPTION_FIXTURE/graphql.json"; exit 0; fi
+if test "$2" = graphql; then
+ case "$*" in *lastEditedAt*) cat "$ADOPTION_FIXTURE/issue-graphql.json" ;; *) cat "$ADOPTION_FIXTURE/graphql.json" ;; esac
+ exit 0
+fi
 file="$ADOPTION_FIXTURE/$(printf '%s' "$2" | tr '/' '_')"
 test -f "$file" || { echo "unexpected endpoint $2" >&2; exit 91; }
 cat "$file"
@@ -7407,6 +7495,11 @@ cat "$file"
                 write("issues/comments/123", live_comment);
                 write("pulls/1150", pr);
                 write("issues/986", issue);
+                std::fs::write(
+                    fixture.join("issue-graphql.json"),
+                    issue_brief(issue, None).to_string(),
+                )
+                .unwrap();
                 std::fs::write(fixture.join("graphql.json"), references(refs).to_string()).unwrap();
                 std::fs::write(&event_path, event.to_string()).unwrap();
                 let (loaded, adoption) =
@@ -7591,6 +7684,235 @@ cat "$file"
             )
             .is_err()
         );
+    }
+    /// The [`ISSUE_BRIEF_QUERY`] response for `issue`, unedited when
+    /// `editor` is `None`.
+    fn issue_brief(issue: &Value, editor: Option<&str>) -> Value {
+        json!({"data":{"repository":{"issue":{
+            "number":issue["number"],
+            "author":{"login":issue["user"]["login"]},
+            "lastEditedAt":editor.map(|_| "2026-10-30T01:00:00Z"),
+            "editor":editor.map(|login| json!({"login":login})),
+            "body":issue["body"]}}}})
+    }
+    const BRIEF_PERMISSIONS: &[(&str, &str)] = &[("tjfontaine", "admin"), ("writer", "write")];
+    #[test]
+    fn issue_brief_must_be_unedited_or_last_written_by_a_collaborator() {
+        let issue = json!({"number":634,"body":"## Brief\nDo it","user":{"login":"outsider"}});
+        let check = |response: &Value| {
+            trusted_brief(response, 634, &mut fake_collaborators(BRIEF_PERMISSIONS))
+        };
+        // Unedited: the body is exactly what the approving collaborator saw.
+        assert_eq!(
+            check(&issue_brief(&issue, None)).unwrap(),
+            "## Brief\nDo it"
+        );
+        // Edited by a collaborator: the collaborator wrote the last word.
+        for editor in ["writer", "tjfontaine"] {
+            assert!(
+                check(&issue_brief(&issue, Some(editor))).is_ok(),
+                "{editor}"
+            );
+        }
+        // Edited by the outsider (or anyone without write) after approval.
+        for editor in ["outsider", "reader", "github-actions[bot]", ""] {
+            let error = check(&issue_brief(&issue, Some(editor))).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("last edited by a non-collaborator"),
+                "{editor}: {error}"
+            );
+        }
+        // Fail closed: errors, another issue, and every missing field.
+        let mut refused = vec![
+            json!({"errors":[{"message":"rate limited"}],"data":null}),
+            json!({"data":{"repository":{"issue":null}}}),
+            json!({}),
+        ];
+        let mut other = issue_brief(&issue, None);
+        other["data"]["repository"]["issue"]["number"] = 635.into();
+        refused.push(other);
+        for field in ["number", "body", "lastEditedAt"] {
+            let mut missing = issue_brief(&issue, None);
+            missing["data"]["repository"]["issue"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            refused.push(missing);
+        }
+        let mut no_editor = issue_brief(&issue, Some("writer"));
+        no_editor["data"]["repository"]["issue"]["editor"] = Value::Null;
+        refused.push(no_editor);
+        let mut empty_time = issue_brief(&issue, None);
+        empty_time["data"]["repository"]["issue"]["lastEditedAt"] = "".into();
+        refused.push(empty_time);
+        for response in refused {
+            assert!(check(&response).is_err(), "admitted {response}");
+        }
+        // The brief comes from the checked response, never the event's copy.
+        let mut event = json!({"issue":{"number":634,"body":"stale event body"}});
+        apply_trusted_brief(
+            &mut event,
+            |n| {
+                Ok(issue_brief(
+                    &json!({"number":n,"body":"live","user":{"login":"x"}}),
+                    None,
+                ))
+            },
+            &mut fake_collaborators(BRIEF_PERMISSIONS),
+        )
+        .unwrap();
+        assert_eq!(event["issue"]["body"], "live");
+        assert!(
+            apply_trusted_brief(
+                &mut event,
+                |_| Err(ScalerError::Guard("gh: HTTP 502")),
+                &mut fake_collaborators(BRIEF_PERMISSIONS),
+            )
+            .is_err()
+        );
+    }
+    /// The production `load_event` on every path that turns an issue body
+    /// into a brief: a label, an `/agent` comment on the issue, an `/agent`
+    /// follow-up on an owned dispatch PR, and adoption of a director PR.
+    #[test]
+    fn every_brief_path_refuses_an_issue_body_an_outsider_edited() {
+        const CHILD: &str = "CARRICK_TEST_DISPATCH_BRIEF";
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            crate::lock_file::tests::write_test_executable(
+                bin.join("gh"),
+                r#"#!/bin/sh
+test "$1" = api || exit 93
+test "$GH_TOKEN" = fixture-token || exit 92
+if test "$2" = graphql; then
+ case "$*" in *lastEditedAt*) cat "$BRIEF_FIXTURE/issue-graphql.json" ;; *) cat "$BRIEF_FIXTURE/graphql.json" ;; esac
+ exit 0
+fi
+file="$BRIEF_FIXTURE/$(printf '%s' "$2" | tr '/' '_')"
+test -f "$file" || { echo "unexpected endpoint $2" >&2; exit 91; }
+cat "$file"
+"#,
+                std::fs::Permissions::from_mode(0o700),
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("BRIEF_FIXTURE", temp.path())
+                .env("GH_TOKEN", "fixture-token")
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env_remove("CARRICK_DISPATCH_HEAD")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let fixture = PathBuf::from(std::env::var_os("BRIEF_FIXTURE").unwrap());
+        let write = |name: &str, value: &Value| {
+            std::fs::write(
+                fixture.join(format!("repos/{REPOSITORY}/{name}").replace('/', "_")),
+                value.to_string(),
+            )
+            .unwrap();
+        };
+        let tip = "a".repeat(40);
+        let comment = json!({"id":123,"user":{"login":"tjfontaine","type":"User"},"body":"/agent go","created_at":"2026-10-30T00:00:00Z","updated_at":"2026-10-30T00:00:00Z"});
+        write("issues/comments/123", &comment);
+        // An outsider filed #634; the label/comment snapshot is what a
+        // collaborator approved, and the live body is what the outsider
+        // wrote afterwards.
+        let issue = json!({"number":634,"state":"open","title":"Outsider issue","body":"edited by outsider","user":{"login":"outsider","type":"User"}});
+        write("issues/634", &issue);
+        let event_issue = json!({"number":634,"state":"open","title":"Outsider issue","body":"approved text","user":{"login":"outsider","type":"User"}});
+        let base = json!({"repository":{"full_name":REPOSITORY},"sender":{"login":"tjfontaine","type":"User"}});
+        let mut label = base.clone();
+        label["action"] = "labeled".into();
+        label["label"] = json!({"name":"dispatch"});
+        label["issue"] = event_issue.clone();
+        let mut on_issue = base.clone();
+        on_issue["action"] = "created".into();
+        on_issue["comment"] = comment.clone();
+        on_issue["issue"] = event_issue.clone();
+        // Owned follow-up: `/agent` on the dispatch PR re-reads issue 634.
+        let owned_pr = json!({"number":800,"state":"open","user":{"login":"github-actions[bot]","type":"Bot"},
+            "head":{"ref":"work/dispatch-634-42","sha":tip,"repo":{"full_name":REPOSITORY}},
+            "base":{"ref":"main","repo":{"full_name":REPOSITORY}},"draft":true,
+            "body":format!("Closes #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
+        write("pulls/800", &owned_pr);
+        write("actions/runs/42", &json!({"id":42}));
+        let mut owned = on_issue.clone();
+        owned["issue"] = json!({"number":800,"state":"open","pull_request":{"url":"pr"}});
+        // Adoption: `/agent` on a director PR closing issue 634.
+        let director_pr = json!({"number":1150,"state":"open","user":{"login":"tjfontaine","type":"User"},
+            "head":{"ref":"work/634-slice","sha":tip,"repo":{"full_name":REPOSITORY}},
+            "base":{"ref":"main","repo":{"full_name":REPOSITORY}},"body":"Closes #634"});
+        write("pulls/1150", &director_pr);
+        let connection = json!({"nodes":[{"number":634,"repository":{"nameWithOwner":REPOSITORY}}],"pageInfo":{"hasNextPage":false}});
+        std::fs::write(
+            fixture.join("graphql.json"),
+            json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":connection,"bodyReferences":connection}}}}).to_string(),
+        )
+        .unwrap();
+        let mut adopt = on_issue.clone();
+        adopt["issue"] = json!({"number":1150,"state":"open","pull_request":{"url":"pr"}});
+        let event_path = fixture.join("event.json");
+        for (path, event) in [
+            ("label", &label),
+            ("issue comment", &on_issue),
+            ("owned follow-up", &owned),
+            ("adoption", &adopt),
+        ] {
+            std::fs::write(&event_path, event.to_string()).unwrap();
+            let load = || {
+                load_event(
+                    &fixture,
+                    &event_path,
+                    &mut fake_collaborators(BRIEF_PERMISSIONS),
+                )
+            };
+            // Unedited since filing: accepted, and the brief is the live body.
+            std::fs::write(
+                fixture.join("issue-graphql.json"),
+                issue_brief(&issue, None).to_string(),
+            )
+            .unwrap();
+            let (loaded, _) = load().unwrap_or_else(|e| panic!("{path}: unedited refused: {e}"));
+            assert_eq!(loaded["issue"]["body"], "edited by outsider", "{path}");
+            // Edited by a collaborator: accepted.
+            std::fs::write(
+                fixture.join("issue-graphql.json"),
+                issue_brief(&issue, Some("writer")).to_string(),
+            )
+            .unwrap();
+            assert!(load().is_ok(), "{path}: collaborator edit refused");
+            // Edited by the outsider after approval: refused.
+            std::fs::write(
+                fixture.join("issue-graphql.json"),
+                issue_brief(&issue, Some("outsider")).to_string(),
+            )
+            .unwrap();
+            let error = load().map(|_| ()).unwrap_err().to_string();
+            assert!(error.contains("non-collaborator"), "{path}: {error}");
+            // GraphQL failure: refused.
+            std::fs::write(
+                fixture.join("issue-graphql.json"),
+                r#"{"errors":[{"message":"boom"}]}"#,
+            )
+            .unwrap();
+            assert!(load().is_err(), "{path}: GraphQL error admitted");
+        }
     }
     #[test]
     fn adoption_predicate_refuses_dispatch_named_refs_before_any_read() {
