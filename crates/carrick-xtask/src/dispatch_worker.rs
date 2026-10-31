@@ -383,6 +383,27 @@ pub(crate) struct AdmittedDispatch {
     pub dispatch: Dispatch,
     pub trigger: Value,
     event_digest: String,
+    /// Set only for a round the server chained from a Continuing outcome.
+    #[serde(default)]
+    pub chain: Option<ChainFacts>,
+}
+/// Rounds per owner trigger: the owner's round and three chained ones
+/// (owner decision on #1241, #231).
+pub(crate) const CHAIN_ROUNDS: u32 = 4;
+/// Server facts a chained round starts from, all read back from the
+/// authenticated Continuing outcome (#1241 part 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChainFacts {
+    /// This round's place in the chain: 2..=[`CHAIN_ROUNDS`].
+    pub round: u32,
+    /// The Continuing outcome this round was chained from.
+    pub from: String,
+    /// The branch and head that outcome's round pushed.
+    pub branch: String,
+    pub head: String,
+    /// The previous coordinator's brief: model text, information only.
+    pub brief: String,
 }
 fn event_digest(path: &Path) -> Result<String, ScalerError> {
     use sha2::{Digest, Sha256};
@@ -405,6 +426,7 @@ fn persist_admission(dispatch: &Dispatch, event: &Value, path: &Path) -> Result<
             event["label"].clone()
         },
         event_digest: event_digest(path)?,
+        chain: None,
     };
     crate::agent_runner::secret_file(
         &state.join("admission.json"),

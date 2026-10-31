@@ -611,6 +611,36 @@ commits are on the branch at `<head>`; then: <the exit>" and reads Blocked
 for review, instead of the "last worker failed" Failed of a round that
 produced nothing (#1253).
 
+### Rounds chain (#1241 part 3)
+
+The budget stays 60/67 minutes per round (owner decision, #231). When a
+round runs short with work left, the coordinator finishes with `continue`
+and a brief: the next step and how to prove it. The server reports
+`Dispatch outcome: Continuing` only when the round pushed a checkpoint (a
+worker's WIP push or a publish, read from the run's server-owned
+`published-tip`), the usual floors would not have turned a `done` into
+Blocked, and the round is below the chain limit; otherwise the outcome is
+Blocked with the server's reason. A chain has at most four rounds: the
+owner-triggered one and three chained ones. The worker contract keeps its
+own `done|blocked|failed` schema; a Continuing outcome records `blocked` in
+its outcome contract, since the work is not done.
+
+A Continuing outcome's server section adds, before the mailbox list:
+- `Chain: round k of at most 4` (`k = 1` for the owner's round);
+- `Chained from: <previous outcome url> (hop k-1/3)` on a chained round;
+  every chained outcome carries this line and its `Chain:` line, whatever
+  its status;
+- `Checkpoint: <branch> at <sha>`, the head the next round starts from;
+
+and after it, `Continuation brief:` with the brief as quoted (`> `) lines,
+so model text can't end the server section or add a server line. A
+Continuing round marks no mailbox entry as seen, so the next round is owed
+everything it took in. The comment tool refuses bodies carrying any of
+these server lines. A chained round's coordinator receives its chain
+position, the outcome it continues, the pushed branch and head, and the
+brief as facts in its prompt; the brief is the previous coordinator's
+text, information rather than authority.
+
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
 proposals and the comment tool refuse the marker.
