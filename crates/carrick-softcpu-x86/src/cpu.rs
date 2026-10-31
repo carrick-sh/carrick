@@ -209,16 +209,16 @@ impl RunningContext<'_> {
         self.ctx.rflags = rflags;
     }
 
-    pub fn set_fs_base(&mut self, fs_base: u64) {
-        self.ctx.fs_base = fs_base;
+    pub fn set_fs_base(&mut self, fs_base: u64) -> Result<(), crate::msr::MsrError> {
+        self.ctx.set_fs_base(fs_base)
     }
 
-    pub fn set_gs_base(&mut self, gs_base: u64) {
-        self.ctx.gs_base = gs_base;
+    pub fn set_gs_base(&mut self, gs_base: u64) -> Result<(), crate::msr::MsrError> {
+        self.ctx.set_gs_base(gs_base)
     }
 
-    pub fn set_kernel_gs_base(&mut self, kernel_gs_base: u64) {
-        self.ctx.kernel_gs_base = kernel_gs_base;
+    pub fn set_kernel_gs_base(&mut self, kernel_gs_base: u64) -> Result<(), crate::msr::MsrError> {
+        self.ctx.set_kernel_gs_base(kernel_gs_base)
     }
 
     pub fn set_cpl(&mut self, cpl: u8) {
@@ -398,7 +398,6 @@ impl SoftCpu {
     ) -> Result<SoftCpuExit, EmitError> {
         self.ctx.pending_exception = None;
         self.ctx.halted = false;
-        self.ctx.sync_msr_mirrors();
         crate::context::prepare_gateway(self.ctx.rip)?;
         if !mem.extents().is_member(&self.ctx.seat) {
             return Err(EmitError::ForeignInventory { va: self.ctx.rip });
@@ -477,8 +476,7 @@ impl SoftCpu {
                     BlockExit::Syscall { va, resume, .. } => (va, resume),
                     _ => (self.ctx.exit_insn_va, self.ctx.rip),
                 };
-                self.ctx.sync_msr_mirrors();
-                if (self.ctx.efer & EFER_SCE) == 0 || !self.ctx.cs.is_64bit_code() {
+                if (self.ctx.efer() & EFER_SCE) == 0 || !self.ctx.cs.is_64bit_code() {
                     return self.raise(X86Exception::invalid_opcode(va));
                 }
                 self.ctx.rip = resume;
@@ -522,6 +520,7 @@ impl SoftCpu {
         raw: &Instruction,
         mem: &mut M,
     ) -> Result<SoftCpuExit, EmitError> {
+        self.ctx.exit_insn_va = va;
         match emulate_sensitive_op(&mut self.ctx, &*self.cpuid, va, resume, op, raw, mem) {
             PrivilegedOutcome::Continue { next_rip } => Ok(SoftCpuExit::Continue { next_rip }),
             PrivilegedOutcome::Hlt { rip, next_rip } => Ok(SoftCpuExit::Hlt { rip, next_rip }),
@@ -614,17 +613,6 @@ impl SoftCpu {
                     SensitiveOp::Rdpkru | SensitiveOp::Wrpkru | SensitiveOp::Rdtscp => {
                         // These extensions are absent from this layer's CPUID/CR4 view.
                         self.raise(X86Exception::invalid_opcode(va))
-                    }
-                    SensitiveOp::Rdtsc => {
-                        if self.ctx.cpl != 0 && (self.ctx.cr4 & (1 << 2)) != 0 {
-                            return self.raise(X86Exception::general_protection(va, 0));
-                        }
-                        // SAFETY: TSC is a baseline x86_64 instruction advertised by CPUID.
-                        let tsc = unsafe { core::arch::x86_64::_rdtsc() };
-                        self.ctx.gpr[reg::RAX] = tsc & 0xffff_ffff;
-                        self.ctx.gpr[reg::RDX] = tsc >> 32;
-                        self.ctx.rip = resume;
-                        Ok(SoftCpuExit::Continue { next_rip: resume })
                     }
                     SensitiveOp::Fnsave
                     | SensitiveOp::Fnstenv

@@ -12,11 +12,11 @@ use carrick_softcpu_x86::{
     EFER_LMA, EFER_LME, EFER_NXE, EFER_SCE, ExtentRecord, ExtentTable, FrameGpa, GuestCpuidView,
     Level0CpuidView, LinearPlacement, MSR_IA32_APIC_BASE, MSR_IA32_CSTAR, MSR_IA32_EFER,
     MSR_IA32_FMASK, MSR_IA32_FS_BASE, MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE, MSR_IA32_LSTAR,
-    MSR_IA32_MISC_ENABLE, MSR_IA32_PAT, MSR_IA32_STAR, MSR_IA32_TSC_DEADLINE, MmioHoles,
-    MsrCapabilities, MsrError, MsrFile, MsrIndex, OwnerGeneration, PF_ERR_PRESENT, PF_ERR_USER,
-    PF_ERR_WRITE, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK, SOFT_TLB_PAGE_SIZE,
-    SoftAccessKind, SoftCpu, SoftCpuContext, SoftCpuExit, SoftMachine, SoftMachineExit,
-    SoftMmuMemory, SoftSegment, X86Exception, reg, translate_va,
+    MSR_IA32_MISC_ENABLE, MSR_IA32_PAT, MSR_IA32_STAR, MSR_IA32_TSC, MSR_IA32_TSC_DEADLINE,
+    MmioHoles, MsrCapabilities, MsrError, MsrFile, MsrIndex, OwnerGeneration, PF_ERR_PRESENT,
+    PF_ERR_USER, PF_ERR_WRITE, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK,
+    SOFT_TLB_PAGE_SIZE, SoftAccessKind, SoftCpu, SoftCpuContext, SoftCpuExit, SoftMachine,
+    SoftMachineExit, SoftMmuMemory, SoftSegment, X86Exception, reg, translate_va,
 };
 use carrick_x86::cpl0_entry::{CONTROL_PORT, CpuBinding};
 use carrick_x86::{
@@ -265,7 +265,7 @@ fn assert_vmx_valid(ctx: &SoftCpuContext) {
         ldtr: seg(ctx.ldtr),
         cr0: ctx.cr0,
         cr4: ctx.cr4,
-        efer: ctx.efer,
+        efer: ctx.efer(),
         rflags: ctx.rflags,
     };
     assert_eq!(check_vmx_guest_segments(&segs, false), Ok(()));
@@ -314,7 +314,7 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
     let eff = msrs
         .write(MSR_IA32_EFER, EFER_SCE | EFER_LME, cr0_pg, caps)
         .unwrap();
-    assert!(eff.flush_tlb && msrs.efer == (EFER_SCE | EFER_LME | EFER_LMA));
+    assert!(eff.flush_tlb && msrs.efer() == (EFER_SCE | EFER_LME | EFER_LMA));
     assert!(
         msrs.write(MSR_IA32_PAT, 0x0000_0104_0506_0700, cr0_pg, caps)
             .unwrap()
@@ -330,12 +330,27 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
 
     let (mut cpu, mut mem, _) =
         setup_cpl0_cpu(b"\x0f\x30\x0f\x32", Box::new(Cpl0CpuidView::default()));
+    let set_gp = Err(MsrError::GeneralProtection);
+    assert_eq!(cpu.context_mut().set_fs_base(NON_CANON), set_gp);
+    assert_eq!(cpu.context_mut().set_gs_base(NON_CANON), set_gp);
+    assert_eq!(cpu.context_mut().set_kernel_gs_base(NON_CANON), set_gp);
+    assert_eq!(
+        cpu.context_mut().set_efer(EFER_SCE | EFER_NXE, caps),
+        set_gp
+    );
     read_ok(&mut cpu, &mut mem, DATA_VA);
     read_ok(&mut cpu, &mut mem, DATA_VA);
     assert_eq!(cpu.context().tlb_stats().hits, 1);
 
     let ctx = cpu.context_mut();
-    ctx.gpr[reg::RCX] = 0xffff_ffff_0000_0000 | u64::from(MSR_IA32_TSC_DEADLINE.raw());
+    ctx.gpr[reg::RCX] = u64::from(MSR_IA32_TSC_DEADLINE.raw());
+    step_exc(&mut cpu, &mut mem, gp(CODE_VA, 0));
+    cpu.context_mut().rip = CODE_VA + 2;
+    step_exc(&mut cpu, &mut mem, gp(CODE_VA + 2, 0));
+
+    let ctx = cpu.context_mut();
+    ctx.rip = CODE_VA;
+    ctx.gpr[reg::RCX] = 0xffff_ffff_0000_0000 | u64::from(MSR_IA32_STAR.raw());
     ctx.gpr[reg::RAX] = 0xaaaa_bbbb_89ab_cdef;
     ctx.gpr[reg::RDX] = 0xcccc_dddd_0123_4567;
     step_ok(&mut cpu, &mut mem, CODE_VA + 2);
@@ -347,10 +362,30 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
         (0x89ab_cdef, 0x0123_4567)
     );
 
+    let (mut dl_cpu, mut dl_mem, _) = setup_cpl0_cpu(
+        b"\x0f\x30\x0f\x32",
+        Box::new(Cpl0CpuidView {
+            tsc_deadline: true,
+            ..Default::default()
+        }),
+    );
+    dl_cpu.context_mut().gpr[reg::RCX] = u64::from(MSR_IA32_TSC_DEADLINE.raw());
+    dl_cpu.context_mut().gpr[reg::RAX] = 0xdead_beef;
+    dl_cpu.context_mut().gpr[reg::RDX] = 0x0000_0012;
+    step_ok(&mut dl_cpu, &mut dl_mem, CODE_VA + 2);
+    step_ok(&mut dl_cpu, &mut dl_mem, CODE_VA + 4);
+    assert_eq!(
+        (
+            dl_cpu.context().gpr[reg::RAX],
+            dl_cpu.context().gpr[reg::RDX]
+        ),
+        (0xdead_beef, 0x0000_0012)
+    );
+
     cpu.context_mut().gpr[reg::RCX] = u64::from(MSR_IA32_LSTAR.raw());
     cpu.context_mut().gpr[reg::RDX] = 0x0000_8000;
     step_rax_gp(&mut cpu, &mut mem, CODE_VA, 0, 0);
-    assert_eq!(cpu.context().msrs.lstar, 0);
+    assert_eq!(cpu.context().msrs().lstar(), 0);
 
     let ctx = cpu.context_mut();
     (ctx.rip, ctx.gpr[reg::RCX]) = (CODE_VA, u64::from(MSR_IA32_PAT.raw()));
@@ -427,7 +462,13 @@ fn mov_cr_and_mov_dr_enforce_sdm_semantics_tlb_flushes_and_fault_ordering() {
     step_ok(&mut cpu, &mut mem, CODE_VA + 14);
     assert_eq!(cpu.context().gpr[reg::RAX], 12);
 
-    for bad_cr4 in [0x0034_06d0u64, 0x0034_16f0u64, 1u64 << 22] {
+    for bad_cr4 in [
+        0x0034_06f0u64 | 1,
+        0x0034_06f0u64 | 2,
+        0x0034_06d0u64,
+        0x0034_16f0u64,
+        1u64 << 22,
+    ] {
         step_rax_gp(&mut cpu, &mut mem, CODE_VA + 14, bad_cr4, 0);
     }
     cpu.context_mut().cr3 = 1;
@@ -446,7 +487,7 @@ fn mov_cr_and_mov_dr_enforce_sdm_semantics_tlb_flushes_and_fault_ordering() {
     assert_eq!(cpu.context().gpr[reg::RAX], 0x0007);
     cpu.context_mut().reset_tlb_stats();
     read_ok(&mut cpu, &mut mem, DATA_VA);
-    assert_eq!(cpu.context().tlb_stats().hits, 1);
+    assert_eq!(cpu.context().tlb_stats().misses, 1);
 
     step_ok(&mut cpu, &mut mem, CODE_VA + 25);
     let user_rdtsc = mem.map_page(USER_CODE_VA, Perms::USER_RX);
@@ -584,12 +625,12 @@ fn lgdt_lidt_ltr_and_swapgs_enforce_descriptor_and_gs_semantics() {
         data_frame.raw() + 0x600,
         &0xaaaa_bbbb_cccc_ddddu64.to_le_bytes(),
     );
-    cpu.context_mut().gs_base = gs_user_va;
-    cpu.context_mut().kernel_gs_base = gs_kern_va;
+    cpu.context_mut().set_gs_base(gs_user_va).unwrap();
+    cpu.context_mut().set_kernel_gs_base(gs_kern_va).unwrap();
     cpu.context_mut().rip = CODE_VA + 14;
     step_ok(&mut cpu, &mut mem, CODE_VA + 17);
-    assert_eq!(cpu.context().msrs.gs_base, gs_kern_va);
-    assert_eq!(cpu.context().msrs.kernel_gs_base, gs_user_va);
+    assert_eq!(cpu.context().gs_base(), gs_kern_va);
+    assert_eq!(cpu.context().kernel_gs_base(), gs_user_va);
     cpu.max_block_insns = 1;
     step_ok(&mut cpu, &mut mem, CODE_VA + 26);
     assert_eq!(cpu.context().gpr[reg::RAX], 0xaaaa_bbbb_cccc_dddd);
@@ -611,14 +652,22 @@ fn sysret_and_iretq_enforce_privilege_transitions_and_fault_paths() {
     ]);
     let gdt_bytes: Vec<u8> = gdt_words.iter().flat_map(|w| w.to_le_bytes()).collect();
     mem.write_gpa(data_frame.raw(), &gdt_bytes);
+    let caps = MsrCapabilities::default();
     cpu.context_mut().gdtr = DescriptorTablePtr::new((gdt_bytes.len() - 1) as u16, DATA_VA);
-    cpu.context_mut().msrs.star = boot.star;
+    cpu.context_mut()
+        .write_msr(MSR_IA32_STAR, boot.star, caps)
+        .unwrap();
 
-    cpu.context_mut().efer &= !EFER_SCE;
+    let base_efer = cpu.context().efer();
+    cpu.context_mut()
+        .set_efer(base_efer & !EFER_SCE, caps)
+        .unwrap();
     enter_cpl3(cpu.context_mut(), USER_CODE_VA + 1);
     mem.write_gpa(user_page.raw() + 1, &[0x48, 0x0F, 0x07]);
     step_exc(&mut cpu, &mut mem, ud(USER_CODE_VA + 1));
-    cpu.context_mut().efer |= EFER_SCE;
+    cpu.context_mut()
+        .set_efer(base_efer | EFER_SCE, caps)
+        .unwrap();
     cpu.context_mut().rip = USER_CODE_VA + 1;
     step_exc(&mut cpu, &mut mem, gp(USER_CODE_VA + 1, 0));
     mem.write_gpa(user_page.raw(), &[0x90, 0x48, 0xCF]);
@@ -994,15 +1043,15 @@ fn cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state() {
     let ctx = machine.context();
     assert_eq!(ctx.cpl, 0);
     assert_eq!(
-        (ctx.cr0, ctx.cr3, ctx.cr4, ctx.efer),
+        (ctx.cr0, ctx.cr3, ctx.cr4, ctx.efer()),
         (boot.cr0, layout.pml4_base, target_cr4, boot.efer)
     );
     assert_eq!(
-        (ctx.msrs.star, ctx.msrs.lstar, ctx.msrs.fmask),
+        (ctx.msrs().star(), ctx.msrs().lstar(), ctx.msrs().fmask()),
         (boot.star, layout.trampoline_base, boot.sfmask)
     );
     assert_eq!(
-        (ctx.fs_base, ctx.gs_base, ctx.kernel_gs_base),
+        (ctx.fs_base(), ctx.gs_base(), ctx.kernel_gs_base()),
         (user_tls_va, 0, binding_va)
     );
     assert_eq!(ctx.gpr[reg::R15], layout.trampoline_base);
@@ -1015,7 +1064,7 @@ fn cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state() {
     let expected_sum = 0xcafe_1234u32.wrapping_add(0x55aa_77cc);
     expect_port(&mut machine, expected_sum);
     assert_eq!(
-        (machine.context().cpl, machine.context().gs_base),
+        (machine.context().cpl, machine.context().gs_base()),
         (0, binding_va)
     );
     assert_vmx_valid(machine.context());
@@ -1059,4 +1108,312 @@ fn cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state() {
     );
     assert!(machine.context().halted);
     assert_vmx_valid(machine.context());
+}
+
+#[test]
+fn mov_cr3_pcide_noflush_isolates_two_roots() {
+    let code = [
+        0x0F, 0x22, 0xE0, // mov cr4, rax
+        0x48, 0x8B, 0x1F, // mov rbx, [rdi]
+        0x0F, 0x22, 0xD9, // mov cr3, rcx
+        0x48, 0x8B, 0x0F, // mov rcx, [rdi]
+        0xF4, // hlt
+    ];
+    let mut mem = Cpl0TestMemory::new();
+    let code_frame = mem.map_page(CODE_VA, Perms::KERNEL_RX);
+    mem.write_gpa(code_frame.raw(), &code);
+    let frame_a = mem.map_page(DATA_VA, Perms::KERNEL_RW);
+    mem.write_gpa(frame_a.raw(), &0x1111_2222_3333_4444u64.to_le_bytes());
+
+    let root_b = mem.alloc_frame();
+    mem.register_root(root_b.raw());
+    mem.map_at_root(root_b.raw(), CODE_VA, code_frame, Perms::KERNEL_RX);
+    let frame_b = mem.alloc_frame();
+    mem.write_gpa(frame_b.raw(), &0xaaaa_bbbb_cccc_ddddu64.to_le_bytes());
+    mem.map_at_root(root_b.raw(), DATA_VA, frame_b, Perms::KERNEL_RW);
+
+    let mut machine = SoftMachine::new(mem, Box::new(Cpl0CpuidView::default())).unwrap();
+    let ctx = machine.context_mut();
+    enter_cpl0(ctx, CODE_VA);
+    ctx.gpr[reg::RAX] = 0x0036_06f0; // CR4.PCIDE = 1
+    ctx.gpr[reg::RDI] = DATA_VA;
+    ctx.gpr[reg::RCX] = root_b.raw() | 0x0002 | (1u64 << 63); // NOFLUSH switch to root B
+
+    assert_eq!(
+        machine.run(8).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: CODE_VA + 12,
+            next_rip: CODE_VA + 13,
+        }
+    );
+    assert_eq!(machine.context().gpr[reg::RBX], 0x1111_2222_3333_4444);
+    assert_eq!(machine.context().gpr[reg::RCX], 0xaaaa_bbbb_cccc_dddd);
+}
+
+fn idt_gate64(handler: u64, cs: u16, ist: u8, dpl: u8, present: bool) -> [u8; 16] {
+    let mut g = [0u8; 16];
+    g[0..2].copy_from_slice(&(handler as u16).to_le_bytes());
+    g[2..4].copy_from_slice(&cs.to_le_bytes());
+    g[4] = ist & 0x7;
+    g[5] = 0x0e | ((dpl & 3) << 5) | (u8::from(present) << 7);
+    g[6..8].copy_from_slice(&((handler >> 16) as u16).to_le_bytes());
+    g[8..12].copy_from_slice(&((handler >> 32) as u32).to_le_bytes());
+    g
+}
+
+#[test]
+fn idt_delivery_enforces_sdm_double_fault_classes() {
+    let (mut cpu, mut mem, data_frame) =
+        setup_cpl0_cpu(&[0x0F, 0x0B], Box::new(Cpl0CpuidView::default()));
+    let code_gpa = translate_va(cpu.context_mut(), &mut mem, CODE_VA, SoftAccessKind::Read).unwrap()
+        as usize
+        - mem.placement().base_host_addr();
+    let stack_gpa = translate_va(cpu.context_mut(), &mut mem, STACK_VA, SoftAccessKind::Read)
+        .unwrap() as usize
+        - mem.placement().base_host_addr();
+    let (gp_h, np_h, pf_h, df_h) = (
+        CODE_VA + 0x100,
+        CODE_VA + 0x110,
+        CODE_VA + 0x120,
+        CODE_VA + 0x130,
+    );
+    for off in [0x100u64, 0x110, 0x120, 0x130, 0x200] {
+        mem.write_gpa(code_gpa as u64 + off, &[0xF4]);
+    }
+    mem.write_gpa(code_gpa as u64 + 0x20, &[0x0F, 0x32]); // rdmsr
+    mem.write_gpa(code_gpa as u64 + 0x30, &[0x48, 0x8B, 0x00]); // mov rax, [rax]
+
+    let user_code = mem.map_page(USER_CODE_VA, Perms::USER_RX);
+    mem.write_gpa(user_code.raw(), &[0xCC]); // int3
+    let user_stack_va = 0x0000_0000_0050_0000u64;
+    let _user_stack = mem.map_page(user_stack_va, Perms::USER_RW);
+
+    let boot = X8664GuestArch::bootstrap_sysregs();
+    let mut gdt_bytes: Vec<u8> = boot.gdt.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let tss_va = DATA_VA + 0x400;
+    gdt_bytes.extend_from_slice(&tss64(tss_va, 0x67, 0xb, false, true, 0));
+    mem.write_gpa(data_frame.raw(), &gdt_bytes);
+    mem.write_gpa(
+        data_frame.raw() + 0x400 + 4,
+        &(STACK_VA + 0x800).to_le_bytes(),
+    ); // RSP0
+    mem.write_gpa(
+        data_frame.raw() + 0x400 + 36,
+        &(STACK_VA + 0xc00).to_le_bytes(),
+    ); // IST1
+
+    let idt_va = DATA_VA + 0x800;
+    let idt_gpa = data_frame.raw() + 0x800;
+    mem.write_gpa(
+        idt_gpa + 3 * 16,
+        &idt_gate64(CODE_VA + 0x200, 0x08, 0, 0, true),
+    );
+    mem.write_gpa(
+        idt_gpa + 6 * 16,
+        &idt_gate64(CODE_VA + 0x200, 0x08, 0, 0, false),
+    );
+    mem.write_gpa(idt_gpa + 8 * 16, &idt_gate64(df_h, 0x08, 1, 0, true));
+    mem.write_gpa(idt_gpa + 11 * 16, &idt_gate64(np_h, 0x08, 0, 0, true));
+    mem.write_gpa(idt_gpa + 13 * 16, &idt_gate64(gp_h, 0x08, 0, 0, true));
+    mem.write_gpa(idt_gpa + 14 * 16, &idt_gate64(pf_h, 0x08, 1, 0, true));
+
+    let ctx = cpu.context_mut();
+    ctx.gdtr = DescriptorTablePtr::new((gdt_bytes.len() - 1) as u16, DATA_VA);
+    ctx.idtr = DescriptorTablePtr::new(0x0fff, idt_va);
+    ctx.tr = SoftSegment::tss64_busy(0x28, tss_va, 0x67);
+    let mut machine = SoftMachine::from_parts(cpu, mem);
+
+    // 1. Benign #BP (`int3` at CPL3) through DPL0 gate 3 -> serial #GP((3*8)+2), fault RIP = int3 VA.
+    enter_cpl3(machine.context_mut(), USER_CODE_VA);
+    machine.context_mut().gpr[reg::RSP] = user_stack_va + 0x800;
+    assert_eq!(
+        machine.run(8).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: gp_h,
+            next_rip: gp_h + 1
+        }
+    );
+    let rsp_off = (machine.context().gpr[reg::RSP] - STACK_VA) + stack_gpa as u64;
+    assert_eq!(machine.mem().read_u64(rsp_off), 3 * 8 + 2);
+    assert_eq!(machine.mem().read_u64(rsp_off + 8), USER_CODE_VA);
+
+    // 2. Benign #UD with gate 6 not present -> serial #NP((6*8)+2+1).
+    enter_cpl0(machine.context_mut(), CODE_VA);
+    machine.context_mut().gpr[reg::RSP] = STACK_VA + 0x800;
+    assert_eq!(
+        machine.run(8).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: np_h,
+            next_rip: np_h + 1
+        }
+    );
+    let rsp_off = (machine.context().gpr[reg::RSP] - STACK_VA) + stack_gpa as u64;
+    assert_eq!(machine.mem().read_u64(rsp_off), 6 * 8 + 2 + 1);
+    assert_eq!(machine.mem().read_u64(rsp_off + 8), CODE_VA);
+
+    // 3. Contributory #GP followed by #PF (unmapped CPL0 stack) -> serial #PF on IST1, not #DF.
+    enter_cpl0(machine.context_mut(), CODE_VA + 0x20);
+    machine.context_mut().gpr[reg::RCX] = 0xdead_beef;
+    machine.context_mut().gpr[reg::RSP] = 0x0000_0000_7777_0800;
+    assert_eq!(
+        machine.run(8).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: pf_h,
+            next_rip: pf_h + 1
+        }
+    );
+    assert_eq!(machine.context().cr2, 0x0000_0000_7777_0800 - 48);
+
+    // 4. Contributory #GP during #GP delivery (gate 13 null CS) -> #DF.
+    machine
+        .mem_mut()
+        .write_gpa(idt_gpa + 13 * 16, &idt_gate64(gp_h, 0, 0, 0, true));
+    enter_cpl0(machine.context_mut(), CODE_VA + 0x20);
+    machine.context_mut().gpr[reg::RCX] = 0xdead_beef;
+    machine.context_mut().gpr[reg::RSP] = STACK_VA + 0x800;
+    assert_eq!(
+        machine.run(8).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: df_h,
+            next_rip: df_h + 1
+        }
+    );
+    let rsp_off = (machine.context().gpr[reg::RSP] - STACK_VA) + stack_gpa as u64;
+    assert_eq!(machine.mem().read_u64(rsp_off), 0);
+    assert_eq!(machine.mem().read_u64(rsp_off + 8), CODE_VA + 0x20);
+
+    // 5. #PF followed by contributory #NP (gate 14 not present) -> #DF; then #DF fault -> TripleFault.
+    machine
+        .mem_mut()
+        .write_gpa(idt_gpa + 14 * 16, &idt_gate64(pf_h, 0x08, 1, 0, false));
+    enter_cpl0(machine.context_mut(), CODE_VA + 0x30);
+    machine.context_mut().gpr[reg::RAX] = 0x0000_0000_7777_0000;
+    machine.context_mut().gpr[reg::RSP] = STACK_VA + 0x800;
+    assert_eq!(
+        machine.run(8).unwrap(),
+        SoftMachineExit::Hlt {
+            rip: df_h,
+            next_rip: df_h + 1
+        }
+    );
+
+    machine
+        .mem_mut()
+        .write_gpa(idt_gpa + 8 * 16, &idt_gate64(df_h, 0x08, 1, 0, false));
+    enter_cpl0(machine.context_mut(), CODE_VA + 0x30);
+    machine.context_mut().gpr[reg::RAX] = 0x0000_0000_7777_0000;
+    machine.context_mut().gpr[reg::RSP] = STACK_VA + 0x800;
+    assert_eq!(
+        machine.run(8).unwrap(),
+        SoftMachineExit::TripleFault {
+            last_exception: np(CODE_VA + 0x30, 8 * 8 + 2 + 1),
+        }
+    );
+}
+
+#[test]
+fn faulting_iretq_and_idt_preserve_gdt_accessed_bit_and_cpuid_tsc_are_consistent() {
+    let cpl0_view = Cpl0CpuidView::default();
+    let leaf1 = cpl0_view.cpuid(1, 0);
+    assert_eq!(
+        leaf1.edx & ((1 << 9) | (1 << 11)),
+        0,
+        "APIC and SEP must be clear"
+    );
+    assert_eq!(leaf1.ecx & (1 << 24), 0, "TSC_Deadline must be clear");
+
+    // WRMSR(IA32_TSC) -> RDTSC -> RDMSR(IA32_TSC) share one consistent TSC source.
+    let tsc_code = [0x0F, 0x30, 0x0F, 0x31, 0x49, 0x89, 0xC0, 0x0F, 0x32];
+    let (mut tcpu, mut tmem, _) = setup_cpl0_cpu(&tsc_code, Box::new(cpl0_view));
+    let base_tsc = 0x0000_0010_0000_0000u64;
+    let ctx = tcpu.context_mut();
+    ctx.gpr[reg::RCX] = u64::from(MSR_IA32_TSC.raw());
+    ctx.gpr[reg::RAX] = base_tsc & 0xffff_ffff;
+    ctx.gpr[reg::RDX] = base_tsc >> 32;
+    step_ok(&mut tcpu, &mut tmem, CODE_VA + 2); // wrmsr
+    step_ok(&mut tcpu, &mut tmem, CODE_VA + 4); // rdtsc
+    let rdtsc_val = (tcpu.context().gpr[reg::RDX] << 32) | tcpu.context().gpr[reg::RAX];
+    tcpu.context_mut().rip = CODE_VA + 7;
+    tcpu.context_mut().gpr[reg::RCX] = u64::from(MSR_IA32_TSC.raw());
+    step_ok(&mut tcpu, &mut tmem, CODE_VA + 9); // rdmsr
+    let rdmsr_val = (tcpu.context().gpr[reg::RDX] << 32) | tcpu.context().gpr[reg::RAX];
+    assert!(
+        (base_tsc..base_tsc + 2_000_000_000).contains(&rdtsc_val) && rdmsr_val >= rdtsc_val,
+        "RDTSC ({rdtsc_val:#x}) and RDMSR(IA32_TSC) ({rdmsr_val:#x}) must track guest TSC base ({base_tsc:#x})"
+    );
+
+    // Unaccessed (A=0) GDT descriptors: 0x08=kcode(A=0), 0x10=kdata(A=0), 0x18=udata(A=0), 0x20=ucode(A=0).
+    let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(
+        &[0x48, 0xCF, 0x0F, 0x0B],
+        Box::new(Cpl0CpuidView::default()),
+    );
+    let user_page = mem.map_page(USER_CODE_VA, Perms::USER_RX);
+    mem.write_gpa(user_page.raw(), &[0x90]);
+    let user_stack_va = 0x0000_0000_0050_0000u64;
+    let _user_stack = mem.map_page(user_stack_va, Perms::USER_RW);
+
+    let gdt_unaccessed = [
+        0u64,
+        0x00af_9a00_0000_ffff, // 0x08: 64-bit DPL0 code, A=0
+        0x00cf_9200_0000_ffff, // 0x10: DPL0 writable data, A=0
+        0x00cf_f200_0000_ffff, // 0x18: DPL3 writable data, A=0
+        0x00af_fa00_0000_ffff, // 0x20: 64-bit DPL3 code, A=0
+        0x00cf_7200_0000_ffff, // 0x28: DPL3 data, P=0, A=0
+    ];
+    let gdt_bytes: Vec<u8> = gdt_unaccessed
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    mem.write_gpa(data_frame.raw(), &gdt_bytes);
+    cpu.context_mut().gdtr = DescriptorTablePtr::new((gdt_bytes.len() - 1) as u16, DATA_VA);
+
+    let frame_va = DATA_VA + 0x200;
+    let put_iret = |m: &mut Cpl0TestMemory, words: [u64; 5]| {
+        let b: Vec<u8> = words.into_iter().flat_map(u64::to_le_bytes).collect();
+        m.write_gpa(data_frame.raw() + 0x200, &b);
+    };
+    let ustk = user_stack_va + 0x400;
+    for (words, exc) in [
+        ([NON_CANON, 0x23, 0x202, ustk, 0x1b], gp(CODE_VA, 0)),
+        ([USER_CODE_VA, 0x23, 0x202, ustk, 0], gp(CODE_VA, 0)),
+        ([USER_CODE_VA, 0x23, 0x202, ustk, 0x2b], ss(CODE_VA, 0x28)),
+        ([USER_CODE_VA, 0x23, 0x202, NON_CANON, 0x1b], ss(CODE_VA, 0)),
+    ] {
+        put_iret(&mut mem, words);
+        enter_cpl0(cpu.context_mut(), CODE_VA);
+        cpu.context_mut().gpr[reg::RSP] = frame_va;
+        step_exc(&mut cpu, &mut mem, exc);
+        assert_eq!(mem.read_u64(data_frame.raw() + 0x18) & (1 << 40), 0);
+        assert_eq!(mem.read_u64(data_frame.raw() + 0x20) & (1 << 40), 0);
+    }
+
+    // Valid IRETQ commits Accessed=1 on both CS (0x20) and SS (0x18).
+    put_iret(&mut mem, [USER_CODE_VA, 0x23, 0x202, ustk, 0x1b]);
+    enter_cpl0(cpu.context_mut(), CODE_VA);
+    cpu.context_mut().gpr[reg::RSP] = frame_va;
+    step_ok(&mut cpu, &mut mem, USER_CODE_VA);
+    assert_ne!(mem.read_u64(data_frame.raw() + 0x18) & (1 << 40), 0);
+    assert_ne!(mem.read_u64(data_frame.raw() + 0x20) & (1 << 40), 0);
+
+    // Faulting IDT delivery (target CS=0x08 has A=0, inter-privilege TSS unusable -> #TS) preserves A=0.
+    let idt_va = DATA_VA + 0x400;
+    mem.write_gpa(
+        data_frame.raw() + 0x400 + 6 * 16,
+        &idt_gate64(CODE_VA, 0x08, 0, 0, true),
+    );
+    mem.write_gpa(
+        data_frame.raw() + 0x400 + 8 * 16,
+        &idt_gate64(CODE_VA, 0x08, 0, 0, false),
+    );
+    cpu.context_mut().idtr = DescriptorTablePtr::new(0x0fff, idt_va);
+    cpu.context_mut().tr = SoftSegment::unusable();
+    mem.write_gpa(user_page.raw(), &[0x0F, 0x0B]); // CPL3 ud2
+    enter_cpl3(cpu.context_mut(), USER_CODE_VA);
+    let mut machine = SoftMachine::from_parts(cpu, mem);
+    let _ = machine.step().unwrap();
+    assert_eq!(
+        machine.mem().read_u64(data_frame.raw() + 0x08) & (1 << 40),
+        0,
+        "faulting IDT delivery must not set CS Accessed bit"
+    );
 }

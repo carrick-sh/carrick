@@ -200,60 +200,109 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
 
 /// IA-32e `SYSCALL` transition into Ring 0 (`LSTAR`, `STAR[47:32]`, `FMASK`).
 fn deliver_syscall(ctx: &mut SoftCpuContext, next_rip: u64) {
-    ctx.sync_msr_mirrors();
     ctx.gpr[reg::RCX] = next_rip;
     ctx.gpr[reg::R11] = (ctx.rflags & 0x003c_7fd7) | 0x2;
-    ctx.rflags = ((ctx.rflags & !ctx.msrs.fmask) & !(RFLAGS_RF | RFLAGS_VM)) | 0x2;
-    let star_k = ((ctx.msrs.star >> 32) & 0xfffc) as u16;
+    ctx.rflags = ((ctx.rflags & !ctx.msrs().fmask()) & !(RFLAGS_RF | RFLAGS_VM)) | 0x2;
+    let star_k = ((ctx.msrs().star() >> 32) & 0xfffc) as u16;
     ctx.cs = SoftSegment::kernel_code64(star_k);
     ctx.ss = SoftSegment::kernel_data(star_k.wrapping_add(8));
     ctx.set_cpl(0);
     ctx.halted = false;
-    ctx.rip = ctx.msrs.lstar;
+    ctx.rip = ctx.msrs().lstar();
+}
+
+/// Architectural exception class for double-fault resolution (Intel SDM Vol. 3A §6.15, Table 6-4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExceptionClass {
+    Benign,
+    Contributory,
+    PageFault,
+    DoubleFault,
+}
+
+const fn exception_class(vector: X86ExceptionVector) -> ExceptionClass {
+    match vector {
+        X86ExceptionVector::DivideError
+        | X86ExceptionVector::InvalidTss
+        | X86ExceptionVector::SegmentNotPresent
+        | X86ExceptionVector::StackSegmentFault
+        | X86ExceptionVector::GeneralProtection => ExceptionClass::Contributory,
+        X86ExceptionVector::PageFault => ExceptionClass::PageFault,
+        X86ExceptionVector::DoubleFault => ExceptionClass::DoubleFault,
+        X86ExceptionVector::Debug
+        | X86ExceptionVector::NonMaskableInterrupt
+        | X86ExceptionVector::Breakpoint
+        | X86ExceptionVector::Overflow
+        | X86ExceptionVector::BoundRangeExceeded
+        | X86ExceptionVector::InvalidOpcode
+        | X86ExceptionVector::DeviceNotAvailable
+        | X86ExceptionVector::X87FloatingPoint
+        | X86ExceptionVector::AlignmentCheck
+        | X86ExceptionVector::MachineCheck
+        | X86ExceptionVector::SimdFloatingPoint => ExceptionClass::Benign,
+    }
+}
+
+/// SDM Vol. 3A §6.15, Table 6-5: conditions for generating a double fault (`#DF`).
+const fn escalates_to_double_fault(first: ExceptionClass, second: ExceptionClass) -> bool {
+    matches!(
+        (first, second),
+        (ExceptionClass::Contributory, ExceptionClass::Contributory)
+            | (
+                ExceptionClass::PageFault,
+                ExceptionClass::Contributory | ExceptionClass::PageFault
+            )
+    )
 }
 
 fn deliver_exception_with_escalation<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
-    exc: X86Exception,
+    initial: X86Exception,
 ) -> Option<SoftMachineExit> {
-    let vector = exc.vector as u8;
-    let is_bp = exc.vector == X86ExceptionVector::Breakpoint;
-    match deliver_idt_vector(
-        ctx,
-        mem,
-        vector,
-        exc.rip,
-        exc.rip,
-        exc.error_code,
-        exc.cr2,
-        is_bp,
-    ) {
-        Ok(()) => None,
-        Err(secondary) => {
-            if let Some(cr2) = secondary.cr2 {
-                ctx.cr2 = cr2;
-            }
-            if exc.vector == X86ExceptionVector::DoubleFault {
-                return Some(SoftMachineExit::TripleFault {
-                    last_exception: secondary,
-                });
-            }
-            let df = X86Exception::double_fault(exc.rip);
-            match deliver_idt_vector(
-                ctx,
-                mem,
-                X86ExceptionVector::DoubleFault as u8,
-                df.rip,
-                df.rip,
-                df.error_code,
-                None,
-                false,
-            ) {
-                Ok(()) => None,
-                Err(_) => Some(SoftMachineExit::TripleFault {
-                    last_exception: exc,
-                }),
+    let mut current = initial;
+    let mut sw_origin = current.vector == X86ExceptionVector::Breakpoint;
+    let mut fault_va = if sw_origin {
+        ctx.exit_insn_va
+    } else {
+        current.rip
+    };
+    let mut saved_rip = current.rip;
+
+    loop {
+        if let Some(cr2) = current.cr2 {
+            ctx.cr2 = cr2;
+        }
+        match deliver_idt_vector(
+            ctx,
+            mem,
+            current.vector as u8,
+            fault_va,
+            saved_rip,
+            current.error_code,
+            current.cr2,
+            sw_origin,
+        ) {
+            Ok(()) => return None,
+            Err(secondary) => {
+                if let Some(cr2) = secondary.cr2 {
+                    ctx.cr2 = cr2;
+                }
+                let first_class = exception_class(current.vector);
+                if first_class == ExceptionClass::DoubleFault {
+                    return Some(SoftMachineExit::TripleFault {
+                        last_exception: secondary,
+                    });
+                }
+                let second_class = exception_class(secondary.vector);
+                current = if escalates_to_double_fault(first_class, second_class) {
+                    X86Exception::double_fault(fault_va)
+                } else {
+                    secondary
+                };
+                sw_origin = false;
+                fault_va = current.rip;
+                saved_rip = current.rip;
             }
         }
     }
@@ -317,8 +366,9 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
         return Err(X86Exception::general_protection(fault_va, ext));
     }
     let cs_err = u32::from(target_cs_sel & 0xfffc) | ext;
-    let (cs_desc, mut new_cs) =
+    let mut cs_loaded =
         load_gdt_code_or_data_descriptor(ctx, mem, fault_va, target_cs_sel, cs_err)?;
+    let cs_desc = cs_loaded.desc;
     let cs_type = ((cs_desc >> 40) & 0xf) as u8;
     let cs_s = ((cs_desc >> 44) & 1) != 0;
     let cs_dpl = ((cs_desc >> 45) & 3) as u8;
@@ -333,7 +383,7 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     }
     let conforming = (cs_type & 0x4) != 0;
     let new_cpl = if conforming { ctx.cpl } else { cs_dpl };
-    new_cs.selector = (target_cs_sel & 0xfffc) | u16::from(new_cpl);
+    cs_loaded.seg.selector = (target_cs_sel & 0xfffc) | u16::from(new_cpl);
 
     let old_cpl = ctx.cpl;
     let old_rsp = ctx.gpr[reg::RSP];
@@ -373,14 +423,15 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     frame_buf[cursor + 24..cursor + 32].copy_from_slice(&old_rsp.to_le_bytes());
     frame_buf[cursor + 32..cursor + 40].copy_from_slice(&u64::from(old_ss).to_le_bytes());
 
-    // Set CR2 before memory push if delivering a #PF, while preserving secondary #PF updates on failure.
+    cs_loaded.precheck_accessed_write(ctx, mem, fault_va)?;
     if let Some(cr2) = cr2_update {
         ctx.cr2 = cr2;
     }
     write_system_bytes(ctx, mem, new_rsp, &frame_buf[..frame_len])
         .map_err(|pf| X86Exception::page_fault(fault_va, pf.error_code, pf.cr2))?;
+    cs_loaded.commit_accessed_write(ctx, mem, fault_va)?;
 
-    ctx.cs = new_cs;
+    ctx.cs = cs_loaded.seg;
     if new_cpl < old_cpl {
         // SDM Vol. 3A §6.14.2: Inter-privilege interrupt/exception loads NULL SS selector with RPL = new_cpl.
         ctx.ss = SoftSegment {

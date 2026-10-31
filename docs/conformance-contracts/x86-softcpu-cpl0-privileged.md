@@ -10,10 +10,10 @@ bringup (`X8664GuestArch::bootstrap_sysregs`, `BringupLayout`,
 Ring-0 instructions (`MOV CR0/CR2/CR3/CR4/CR8`, `MOV DR0..DR7`, `RDMSR`/`WRMSR`,
 `LGDT`/`LIDT`/`LTR`, `SWAPGS`, `SYSRETQ`, `IRETQ`, `HLT`, `INVLPG`, `CLI`/`STI`,
 `CLAC`/`STAC`, `XGETBV`/`XSETBV`, `CR4.TSD`-gated `RDTSC`, and `CPUID`) execute
-against `MsrFile`, `GuestCpuidView`, and `SoftMmuMemory` without leaking host
-registers or host `CPUID`; 32-bit compatibility-mode (`CS.L = 0`) returns fail
-closed with `#GP` before mutating state. Each TLB-invalidating operation issues
-at most one local `SoftTlb` flush (`flush_all` or `evict_va`). VM-free bindings
-in `crates/carrick-softcpu-x86/tests/softcpu_cpl0.rs` cover `#GP`/`#UD`/`#PF`
-ordering and `SoftMachine` CPL0 bootstrap parity with KVM; carrier and Docker
-layers follow in later #578 slices.
+against single-owner `MsrFile` (including unified leaf-`0x15` TSC),
+`GuestCpuidView`, and `SoftMmuMemory` without leaking host registers or host
+`CPUID`; 32-bit compatibility-mode (`CS.L = 0`) returns fail closed with `#GP`
+before mutating state or GDT Accessed bits. Every `MOV CR3` write flushes
+`SoftTlb` until PCID tagging lands, and `SoftMachine` enforces SDM benign,
+contributory, `#PF`, `#DF`, and triple-fault classes across VM-free witnesses in
+`crates/carrick-softcpu-x86/tests/softcpu_cpl0.rs`.

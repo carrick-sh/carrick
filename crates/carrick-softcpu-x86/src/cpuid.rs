@@ -90,9 +90,31 @@ pub trait GuestCpuidView: Send + Sync {
         (self.cpuid(1, 0).ecx & (1 << 21)) != 0
     }
 
+    /// `CPUID.01H:EDX.VME[bit 1]`.
+    fn supports_vme(&self) -> bool {
+        (self.cpuid(1, 0).edx & (1 << 1)) != 0
+    }
+
     /// `CPUID.80000001H:EDX.NX[bit 20]`.
     fn supports_nxe(&self) -> bool {
         (self.cpuid(0x8000_0001, 0).edx & (1 << 20)) != 0
+    }
+
+    /// Nominal guest TSC frequency in Hz derived from `CPUID.15H` (`ECX * EBX / EAX`),
+    /// defaulting to `DEFAULT_TSC_HZ` (2 GHz) when leaf `0x15` is unpopulated.
+    fn tsc_hz(&self) -> u64 {
+        if self.cpuid(0, 0).eax >= 0x15 {
+            let l15 = self.cpuid(0x15, 0);
+            if l15.eax != 0 && l15.ebx != 0 && l15.ecx != 0 {
+                let hz = (u128::from(l15.ecx) * u128::from(l15.ebx)) / u128::from(l15.eax);
+                if let Ok(hz64) = u64::try_from(hz)
+                    && hz64 != 0
+                {
+                    return hz64;
+                }
+            }
+        }
+        DEFAULT_TSC_HZ
     }
 
     /// Supported `XCR0` component bitmap from `CPUID.(EAX=0DH,ECX=0H):EDX:EAX`.
@@ -102,14 +124,16 @@ pub trait GuestCpuidView: Send + Sync {
     }
 }
 
+/// Default guest TSC crystal frequency (2 GHz) advertised via `CPUID.15H`.
+pub const DEFAULT_TSC_HZ: u64 = 2_000_000_000;
+
+// Excludes unimplemented VME (1), APIC (9), and SEP/SYSENTER (11).
 const LEAF1_EDX: u32 = (1 << 2)
     | (1 << 4)
     | (1 << 5)
     | (1 << 6)
     | (1 << 7)
     | (1 << 8)
-    | (1 << 9)
-    | (1 << 11)
     | (1 << 13)
     | (1 << 15)
     | (1 << 16)
@@ -120,8 +144,8 @@ const LEAF1_EDX: u32 = (1 << 2)
 /// Default pinned Level 0 `CPUID` view (`SoftCpu::new`), independent of the host CPU.
 ///
 /// Advertises baseline 64-bit integer/SSE2, legacy `XSAVE`/`XSAVEOPT`/`XSAVEC`
-/// (`XCR0` mask `0x3`, 576-byte area), `SMEP`, `SMAP`, `UMIP`, `NX`, `SYSCALL`, and
-/// 48-bit physical/linear addressing while keeping `FPU=0` and `AVX=0`.
+/// (`XCR0` mask `0x3`, 576-byte area), `SMEP`, `SMAP`, `UMIP`, `NX`, `SYSCALL`,
+/// leaf `0x15` TSC frequency, and 48-bit addressing while keeping `FPU=0` and `AVX=0`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Level0CpuidView;
 
@@ -129,7 +153,7 @@ impl GuestCpuidView for Level0CpuidView {
     fn cpuid(&self, leaf: u32, subleaf: u32) -> CpuidRegs {
         match (leaf, subleaf) {
             (0, _) => CpuidRegs::new(
-                0x0d,
+                0x15,
                 u32::from_le_bytes(*b"Genu"),
                 u32::from_le_bytes(*b"ntel"),
                 u32::from_le_bytes(*b"ineI"),
@@ -138,6 +162,7 @@ impl GuestCpuidView for Level0CpuidView {
             (7, 0) => CpuidRegs::new(0, (1 << 7) | (1 << 20), 1 << 2, 0),
             (0x0d, 0) => CpuidRegs::new(3, 576, 576, 0),
             (0x0d, 1) => CpuidRegs::new(3, 576, 0, 0),
+            (0x15, 0) => CpuidRegs::new(1, 1, DEFAULT_TSC_HZ as u32, 0),
             (0x8000_0000, _) => CpuidRegs::new(0x8000_0008, 0, 0, 0),
             (0x8000_0001, _) => CpuidRegs::new(0, 0, 1, (1 << 11) | (1 << 20) | (1 << 29)),
             (0x8000_0008, _) => CpuidRegs::new(48 | (48 << 8), 0, 0, 0),
@@ -151,7 +176,8 @@ impl GuestCpuidView for Level0CpuidView {
 }
 
 /// Configurable CPL0 supervisor `CPUID` view matching the Carrick x86 CPL0 carrier contract
-/// (including `0x15` crystal/TSC frequency, APIC ID, `TSC_Deadline`, `SMEP`, `SMAP`, `PCID`).
+/// (leaf `0x15` crystal/TSC frequency, APIC ID, `SMEP`, `SMAP`, `PCID`; unimplemented
+/// `APIC`, `SEP`, and `TSC_Deadline` stay clear by default).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cpl0CpuidView {
     pub apic_id: u8,
@@ -166,7 +192,7 @@ pub struct Cpl0CpuidView {
 
 impl Default for Cpl0CpuidView {
     fn default() -> Self {
-        Self::new(0, 2_000_000_000)
+        Self::new(0, DEFAULT_TSC_HZ as u32)
     }
 }
 
@@ -182,7 +208,7 @@ impl Cpl0CpuidView {
             smap: true,
             umip: true,
             pcid: true,
-            tsc_deadline: true,
+            tsc_deadline: false,
         }
     }
 }

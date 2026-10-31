@@ -15,10 +15,10 @@ use crate::context::{DescriptorTablePtr, SoftCpuContext, SoftSegment, X86Excepti
 use crate::cpuid::GuestCpuidView;
 use crate::decode::{SensitiveOp, gpr_index};
 use crate::mmu::{
-    SoftAccessKind, SoftMmuMemory, check_guest_alignment, is_canonical_va, read_guest_bytes,
-    read_system_bytes, write_guest_bytes, write_system_bytes,
+    SoftAccessKind, SoftMmuMemory, check_guest_alignment, check_system_write, is_canonical_va,
+    read_guest_bytes, read_system_bytes, write_guest_bytes, write_system_bytes,
 };
-use crate::msr::{EFER_LMA, EFER_SCE, MsrCapabilities, MsrIndex};
+use crate::msr::{EFER_LMA, EFER_LME, EFER_SCE, MsrCapabilities, MsrIndex};
 
 const CR0_PE: u64 = 1 << 0;
 const CR0_ET: u64 = 1 << 4;
@@ -29,6 +29,9 @@ const CR0_PG: u64 = 1 << 31;
 // SDM Vol. 3A §2.5: bits [15:6], [17], and [28:19] in CR0[31:0] are reserved zero.
 const CR0_WRITABLE_MASK: u64 = 0xe005_003f;
 
+const CR4_VME: u64 = 1 << 0;
+const CR4_PVI: u64 = 1 << 1;
+const CR4_TSD: u64 = 1 << 2;
 const CR4_DE: u64 = 1 << 3;
 const CR4_PAE: u64 = 1 << 5;
 const CR4_PGE: u64 = 1 << 7;
@@ -77,15 +80,52 @@ fn dr_index(r: Register) -> Option<usize> {
     }
 }
 
-/// Read an 8-byte non-system descriptor from `GDTR` at selector `sel`, marking its
-/// architectural Accessed bit (`bit 40`) in memory when not already set.
+/// Decoded GDT segment descriptor with deferred Accessed-bit (`bit 40`) writeback,
+/// committed only after all instruction/gate checks succeed.
+pub(crate) struct LoadedGdtSegment {
+    pub desc: u64,
+    pub seg: SoftSegment,
+    desc_va: u64,
+    writeback_desc: Option<u64>,
+}
+
+impl LoadedGdtSegment {
+    pub(crate) fn precheck_accessed_write<M: SoftMmuMemory>(
+        &self,
+        ctx: &mut SoftCpuContext,
+        mem: &mut M,
+        va: u64,
+    ) -> Result<(), X86Exception> {
+        if self.writeback_desc.is_some() {
+            check_system_write(ctx, mem, self.desc_va, 8)
+                .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_accessed_write<M: SoftMmuMemory>(
+        &self,
+        ctx: &mut SoftCpuContext,
+        mem: &mut M,
+        va: u64,
+    ) -> Result<(), X86Exception> {
+        if let Some(accessed) = self.writeback_desc {
+            write_system_bytes(ctx, mem, self.desc_va, &accessed.to_le_bytes())
+                .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+        }
+        Ok(())
+    }
+}
+
+/// Read an 8-byte non-system descriptor from `GDTR` at selector `sel`, staging its
+/// architectural Accessed bit (`bit 40`) without mutating memory until commit.
 pub(crate) fn load_gdt_code_or_data_descriptor<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
     va: u64,
     sel: u16,
     sel_err: u32,
-) -> Result<(u64, SoftSegment), X86Exception> {
+) -> Result<LoadedGdtSegment, X86Exception> {
     if (sel & 4) != 0 {
         return Err(X86Exception::general_protection(va, sel_err));
     }
@@ -104,15 +144,8 @@ pub(crate) fn load_gdt_code_or_data_descriptor<M: SoftMmuMemory>(
     let desc = u64::from_le_bytes(raw_bytes);
     let s = ((desc >> 44) & 1) != 0;
     let p = ((desc >> 47) & 1) != 0;
-    // Only write back Accessed bit when descriptor is a present code/data segment with A=0.
-    let final_desc = if s && p && (desc & (1 << 40)) == 0 {
-        let accessed = desc | (1 << 40);
-        write_system_bytes(ctx, mem, desc_va, &accessed.to_le_bytes())
-            .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
-        accessed
-    } else {
-        desc
-    };
+    let writeback_desc = (s && p && (desc & (1 << 40)) == 0).then_some(desc | (1 << 40));
+    let final_desc = writeback_desc.unwrap_or(desc);
     let raw_limit = ((final_desc & 0xffff) | (((final_desc >> 48) & 0xf) << 16)) as u32;
     let g = ((final_desc >> 55) & 1) != 0;
     let limit = if g {
@@ -130,7 +163,12 @@ pub(crate) fn load_gdt_code_or_data_descriptor<M: SoftMmuMemory>(
         limit,
         ar,
     };
-    Ok((final_desc, seg))
+    Ok(LoadedGdtSegment {
+        desc: final_desc,
+        seg,
+        desc_va,
+        writeback_desc,
+    })
 }
 
 /// Emulate CPL0 privileged and system instructions on `ctx` before falling back to host exit.
@@ -149,6 +187,7 @@ pub(crate) fn emulate_sensitive_op<M: SoftMmuMemory>(
         SensitiveOp::MovDr => emulate_mov_dr(ctx, va, resume, raw),
         SensitiveOp::Rdmsr => emulate_rdmsr(ctx, cpuid, va, resume),
         SensitiveOp::Wrmsr => emulate_wrmsr(ctx, cpuid, va, resume),
+        SensitiveOp::Rdtsc => emulate_rdtsc(ctx, cpuid, va, resume),
         SensitiveOp::Lgdt => emulate_lgdt_lidt(ctx, mem, va, resume, raw, true),
         SensitiveOp::Lidt => emulate_lgdt_lidt(ctx, mem, va, resume, raw, false),
         SensitiveOp::Sgdt => emulate_sgdt_sidt(ctx, mem, va, resume, raw, true),
@@ -228,7 +267,6 @@ fn emulate_mov_to_cr(
     if gpr >= ctx.gpr.len() {
         return Err(X86Exception::invalid_opcode(va));
     }
-    ctx.sync_msr_mirrors();
     let val = ctx.gpr[gpr];
     match cr {
         0 => {
@@ -242,7 +280,11 @@ fn emulate_mov_to_cr(
             if (pg && !pe) || (nw && !cd) {
                 return Err(X86Exception::general_protection(va, 0));
             }
-            let long_mode_active = (ctx.efer & EFER_LMA) != 0;
+            let efer = ctx.efer();
+            let long_mode_active = (efer & EFER_LMA) != 0;
+            if pg && (efer & EFER_LME) != 0 && (ctx.cr4 & CR4_PAE) == 0 {
+                return Err(X86Exception::general_protection(va, 0));
+            }
             if !pg && ((long_mode_active && ctx.cs.is_64bit_code()) || (ctx.cr4 & CR4_PCIDE) != 0) {
                 return Err(X86Exception::general_protection(va, 0));
             }
@@ -253,6 +295,7 @@ fn emulate_mov_to_cr(
             let tlb_sensitive = CR0_PG | CR0_WP | CR0_NW | CR0_CD;
             let flush = (ctx.cr0 & tlb_sensitive) != (next & tlb_sensitive);
             ctx.cr0 = next;
+            ctx.sync_efer_lma();
             ctx.sync_tlb_tag_bits();
             if flush {
                 ctx.flush_tlb();
@@ -269,29 +312,24 @@ fn emulate_mov_to_cr(
                 (1u64 << max_phy) - 1
             };
             ctx.walker.set_max_phy_addr(max_phy);
-            if (ctx.cr4 & CR4_PCIDE) != 0 {
-                let no_flush = (val & (1 << 63)) != 0;
-                let clean = val & !(1 << 63);
-                if (clean & !phy_limit) != 0 {
-                    return Err(X86Exception::general_protection(va, 0));
-                }
-                ctx.cr3 = clean;
-                if !no_flush {
-                    ctx.flush_tlb();
-                }
+            let clean = if (ctx.cr4 & CR4_PCIDE) != 0 {
+                val & !(1 << 63)
             } else {
-                if (val & !phy_limit) != 0 {
-                    return Err(X86Exception::general_protection(va, 0));
-                }
-                ctx.cr3 = val;
-                ctx.flush_tlb();
+                val
+            };
+            if (clean & !phy_limit) != 0 {
+                return Err(X86Exception::general_protection(va, 0));
             }
+            ctx.cr3 = clean;
+            // `SoftTlb` has no PCID/ASID tag yet: flush unconditionally on every CR3 write
+            // so `CR4.PCIDE=1` + `CR3[63]` (NOFLUSH) cannot leak translations across roots.
+            ctx.flush_tlb();
         }
         4 => {
             if (val & CR4_UNSUPPORTED_MASK) != 0 {
                 return Err(X86Exception::general_protection(va, 0));
             }
-            let long_mode_active = (ctx.efer & EFER_LMA) != 0;
+            let long_mode_active = (ctx.efer() & EFER_LMA) != 0;
             // SDM Vol. 3A §4.1.1: clearing CR4.PAE or toggling CR4.LA57 while EFER.LMA=1 raises #GP(0).
             if long_mode_active
                 && ((val & CR4_PAE) == 0 || (val & CR4_LA57) != (ctx.cr4 & CR4_LA57))
@@ -302,6 +340,8 @@ fn emulate_mov_to_cr(
                 return Err(X86Exception::general_protection(va, 0));
             }
             for (bit, supported) in [
+                (CR4_VME, cpuid.supports_vme()),
+                (CR4_PVI, cpuid.supports_vme()),
                 (CR4_UMIP, cpuid.supports_umip()),
                 (CR4_FSGSBASE, cpuid.supports_fsgsbase()),
                 (CR4_OSXSAVE, cpuid.supports_xsave()),
@@ -414,11 +454,10 @@ fn emulate_rdmsr(
     if ctx.cpl != 0 {
         return Err(X86Exception::general_protection(va, 0));
     }
-    ctx.sync_msr_mirrors();
     let index = MsrIndex::new(ctx.gpr[reg::RCX] as u32);
     let caps = MsrCapabilities::from_cpuid(cpuid);
     let val = ctx
-        .msrs
+        .msrs()
         .read(index, caps)
         .map_err(|_| X86Exception::general_protection(va, 0))?;
     ctx.gpr[reg::RAX] = val & 0xffff_ffff;
@@ -436,15 +475,27 @@ fn emulate_wrmsr(
     if ctx.cpl != 0 {
         return Err(X86Exception::general_protection(va, 0));
     }
-    ctx.sync_msr_mirrors();
     let index = MsrIndex::new(ctx.gpr[reg::RCX] as u32);
     let val = ((ctx.gpr[reg::RDX] & 0xffff_ffff) << 32) | (ctx.gpr[reg::RAX] & 0xffff_ffff);
     let caps = MsrCapabilities::from_cpuid(cpuid);
-    let effects = ctx
-        .msrs
-        .write(index, val, ctx.cr0, caps)
+    ctx.write_msr(index, val, caps)
         .map_err(|_| X86Exception::general_protection(va, 0))?;
-    ctx.commit_msrs(effects.flush_tlb);
+    ctx.rip = resume;
+    Ok(resume)
+}
+
+fn emulate_rdtsc(
+    ctx: &mut SoftCpuContext,
+    cpuid: &dyn GuestCpuidView,
+    va: u64,
+    resume: u64,
+) -> Result<u64, X86Exception> {
+    if ctx.cpl != 0 && (ctx.cr4 & CR4_TSD) != 0 {
+        return Err(X86Exception::general_protection(va, 0));
+    }
+    let tsc = ctx.msrs().read_tsc(cpuid.tsc_hz());
+    ctx.gpr[reg::RAX] = tsc & 0xffff_ffff;
+    ctx.gpr[reg::RDX] = tsc >> 32;
     ctx.rip = resume;
     Ok(resume)
 }
@@ -692,9 +743,7 @@ fn emulate_swapgs(ctx: &mut SoftCpuContext, va: u64, resume: u64) -> Result<u64,
     if ctx.cpl != 0 {
         return Err(X86Exception::general_protection(va, 0));
     }
-    ctx.sync_msr_mirrors();
-    ctx.msrs.swapgs();
-    ctx.commit_msrs(false);
+    ctx.swapgs();
     ctx.rip = resume;
     Ok(resume)
 }
@@ -704,16 +753,16 @@ fn emulate_sysret(
     va: u64,
     raw: &Instruction,
 ) -> Result<u64, X86Exception> {
-    ctx.sync_msr_mirrors();
+    let efer = ctx.efer();
     // SDM Vol. 2B `SYSRET` Operation: EFER.SCE == 0 raises #UD BEFORE checking CPL != 0.
-    if (ctx.efer & EFER_SCE) == 0 || (ctx.efer & EFER_LMA) == 0 || !ctx.cs.is_64bit_code() {
+    if (efer & EFER_SCE) == 0 || (efer & EFER_LMA) == 0 || !ctx.cs.is_64bit_code() {
         return Err(X86Exception::invalid_opcode(va));
     }
     if ctx.cpl != 0 {
         return Err(X86Exception::general_protection(va, 0));
     }
 
-    let star_hi = ((ctx.msrs.star >> 48) & 0xffff) as u16;
+    let star_hi = ((ctx.msrs().star() >> 48) & 0xffff) as u16;
     if raw.mnemonic() == Mnemonic::Sysretq {
         let rcx = ctx.gpr[reg::RCX];
         if !is_canonical_va(rcx) {
@@ -803,7 +852,8 @@ fn emulate_iret<M: SoftMmuMemory>(
         return Err(X86Exception::general_protection(va, cs_err));
     }
 
-    let (cs_desc, mut new_cs) = load_gdt_code_or_data_descriptor(ctx, mem, va, cs_sel, cs_err)?;
+    let mut cs_loaded = load_gdt_code_or_data_descriptor(ctx, mem, va, cs_sel, cs_err)?;
+    let cs_desc = cs_loaded.desc;
     let cs_type = ((cs_desc >> 40) & 0xf) as u8;
     let cs_s = ((cs_desc >> 44) & 1) != 0;
     let cs_dpl = ((cs_desc >> 45) & 3) as u8;
@@ -824,7 +874,7 @@ fn emulate_iret<M: SoftMmuMemory>(
     if !cs_l || cs_db {
         return Err(X86Exception::general_protection(va, cs_err));
     }
-    new_cs.selector = cs_sel;
+    cs_loaded.seg.selector = cs_sel;
 
     // 2. Validate return RIP canonicality.
     if !is_canonical_va(new_rip) {
@@ -834,22 +884,26 @@ fn emulate_iret<M: SoftMmuMemory>(
     // 3. Validate return SS selector and descriptor.
     // SDM Vol. 2A `IRET` IA-32e Mode: NULL SS selector is permitted when returning to CPL < 3,
     // and forbidden (#GP(0)) when returning to CPL == 3.
-    let new_ss = if (ss_sel & 0xfffc) == 0 {
+    let (new_ss, ss_loaded) = if (ss_sel & 0xfffc) == 0 {
         if rpl == 3 || ((ss_sel & 3) as u8 != rpl && ss_sel != 0) {
             return Err(X86Exception::general_protection(va, 0));
         }
-        SoftSegment {
-            selector: ss_sel,
-            base: 0,
-            limit: 0,
-            ar: SoftSegment::UNUSABLE_BIT,
-        }
+        (
+            SoftSegment {
+                selector: ss_sel,
+                base: 0,
+                limit: 0,
+                ar: SoftSegment::UNUSABLE_BIT,
+            },
+            None,
+        )
     } else {
         let ss_err = u32::from(ss_sel & 0xfffc);
         if (ss_sel & 3) as u8 != rpl {
             return Err(X86Exception::general_protection(va, ss_err));
         }
-        let (ss_desc, mut seg) = load_gdt_code_or_data_descriptor(ctx, mem, va, ss_sel, ss_err)?;
+        let mut loaded = load_gdt_code_or_data_descriptor(ctx, mem, va, ss_sel, ss_err)?;
+        let ss_desc = loaded.desc;
         let ss_type = ((ss_desc >> 40) & 0xf) as u8;
         let ss_s = ((ss_desc >> 44) & 1) != 0;
         let ss_dpl = ((ss_desc >> 45) & 3) as u8;
@@ -861,14 +915,26 @@ fn emulate_iret<M: SoftMmuMemory>(
         if !ss_p {
             return Err(X86Exception::stack_segment_fault(va, ss_err));
         }
-        seg.selector = ss_sel;
-        seg
+        loaded.seg.selector = ss_sel;
+        let seg = loaded.seg;
+        (seg, Some(loaded))
     };
 
     // 4. Validate return RSP canonicality.
     if !is_canonical_va(new_rsp) {
         return Err(X86Exception::stack_segment_fault(va, 0));
     }
+
+    // 4b. Precheck then commit GDT Accessed bits only after all CS/RIP/SS/RSP checks pass.
+    cs_loaded.precheck_accessed_write(ctx, mem, va)?;
+    if let Some(ss) = &ss_loaded {
+        ss.precheck_accessed_write(ctx, mem, va)?;
+    }
+    cs_loaded.commit_accessed_write(ctx, mem, va)?;
+    if let Some(ss) = &ss_loaded {
+        ss.commit_accessed_write(ctx, mem, va)?;
+    }
+    let new_cs = cs_loaded.seg;
 
     // 5. Commit RFLAGS according to old CPL / IOPL rules (SDM Vol. 2A `IRET`).
     let old_cpl = ctx.cpl;
