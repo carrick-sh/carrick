@@ -253,9 +253,7 @@ impl GuestCpuidView for Cpl0CpuidView {
             (0x8000_0000, _) => CpuidRegs::new(0x8000_0008, 0, 0, 0),
             (0x8000_0001, _) => CpuidRegs::new(0, 0, 1, (1 << 11) | (1 << 20) | (1 << 29)),
             (0x8000_0007, _) => CpuidRegs::new(0, 0, 0, 1 << 8),
-            (0x8000_0008, _) => {
-                CpuidRegs::new(u32::from(self.max_phy_addr) | (48 << 8), 0, 0, 0)
-            }
+            (0x8000_0008, _) => CpuidRegs::new(u32::from(self.max_phy_addr) | (48 << 8), 0, 0, 0),
             _ => CpuidRegs::ZERO,
         }
     }

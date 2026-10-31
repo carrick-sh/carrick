@@ -1,0 +1,37 @@
+schema_version = 1
+id = "x86.softcpu.cpl0-privileged"
+title = "Software x86_64 CPL0 privileged instruction emulation, MSR file, and SoftMachine bootstrap match SDM and KVM state"
+guest_surfaces = ["isa:x86_64", "vmm:soft", "fault:general-protection", "fault:invalid-opcode", "fault:page-fault", "fault:stack-segment", "fault:segment-not-present", "fault:debug", "tlb:soft-tlb"]
+semantic_authority = [
+  "Intel SDM Vol. 2A/2B & Vol. 3A Ch. 2/4/5/6/7: MOV CR/DR, RDMSR/WRMSR, LGDT/LIDT/LTR, SWAPGS, SYSRET/IRETQ, HLT, INVLPG, RDTSC, and CPUID privilege and exception ordering (#UD, #GP, #PF, #SS, #NP, #DB)",
+  "Intel SDM Vol. 4: Architectural MSRs IA32_EFER, IA32_STAR, IA32_LSTAR, IA32_CSTAR, IA32_FMASK, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_PAT, IA32_APIC_BASE, IA32_TSC_DEADLINE, IA32_MISC_ENABLE",
+  "AMD64 Architecture Programmer's Manual Vol. 2: canonical 64-bit descriptor bases, EFER.LMA/LME/SCE/NXE invariants, and 64-bit interrupt-gate / SYSRET / IRETQ transitions",
+  "carrick-x86 & carrick-hal KVM CPL0 bringup contracts: X8664GuestArch::bootstrap_sysregs, BringupLayout, write_fault_tables_with, FaultDoorbellRecord, and check_vmx_guest_segments",
+]
+fixture = "carrick-softcpu-x86::softcpu_cpl0"
+scale_points = [1, 8, 64]
+rationale = """
+Slice #668 (#578) adds clean-room Ring-0 system state (`MsrFile`), `GuestCpuidView`
+(`Level0CpuidView`, `Cpl0CpuidView`), CPL0 privileged instruction emulation
+(`MOV CR0/CR2/CR3/CR4/CR8`, `MOV DR0..DR7`, `RDMSR`/`WRMSR`, `LGDT`/`LIDT`/`LTR`,
+`SWAPGS`, `SYSRETQ`, `IRETQ`, `HLT`, `INVLPG`, `CLI`/`STI`, `CLAC`/`STAC`,
+`XGETBV`/`XSETBV`, `CR4.TSD`-gated `RDTSC`, and `CPUID`), and `SoftMachine`
+(`SYSCALL` and 64-bit `IDT` + `TSS` `RSP0`/`IST` exception delivery) in
+`carrick-softcpu-x86`. No host system registers or host `CPUID` leak into guest
+execution, and compatibility-mode (`CS.L = 0`) returns fail closed with `#GP`
+before mutating architectural state.
+"""
+
+[[structural_budgets]]
+kind = "upper-bound"
+metric = "page_table_invalidations"
+maximum = 1
+layers = ["vm-free"]
+rationale = "Each TLB-invalidating privileged operation (`MOV CR3` without PCID NOFLUSH, `MOV CR0`/`CR4` paging-attribute edits, `WRMSR` to `IA32_PAT` or `IA32_EFER.NXE`, or `INVLPG`) issues at most one local SoftTlb invalidation (`flush_all` or single-VA `evict_va`)."
+
+[bindings]
+vm_free = "carrick-softcpu-x86::softcpu_cpl0::{msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths,mov_cr_and_mov_dr_enforce_sdm_semantics_tlb_flushes_and_fault_ordering,lgdt_lidt_ltr_and_swapgs_enforce_descriptor_and_gs_semantics,sysret_and_iretq_enforce_privilege_transitions_and_fault_paths,hlt_invlpg_and_cpuid_view_enforce_sdm_contracts,cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state}"
+
+[bindings.unresolved]
+embed_structural = "Software vCPU carrier integration (`carrick-vmm-soft`) lands in follow-up slices of #578; slice #668 proves CPL0 privileged instructions and SoftMachine bootstrap VM-free against carrick-x86's KVM/VMX contracts."
+docker = "Docker is unavailable on the x86 worker; slice #668 validates architectural SDM state transitions and CPL0 fault-doorbell frames VM-free over SoftMachine."

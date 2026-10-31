@@ -587,7 +587,13 @@ impl SoftCpu {
                             bytes.copy_from_slice(&self.ctx.fxsave.0[24..28]);
                             write_guest_bytes(&mut self.ctx, mem, ea, &bytes)
                         } else {
-                            read_guest_bytes(&mut self.ctx, mem, ea, &mut bytes, SoftAccessKind::Read)
+                            read_guest_bytes(
+                                &mut self.ctx,
+                                mem,
+                                ea,
+                                &mut bytes,
+                                SoftAccessKind::Read,
+                            )
                         };
                         if let Err(pf) = result {
                             return self.raise(X86Exception::page_fault(va, pf.error_code, pf.cr2));
@@ -610,6 +616,9 @@ impl SoftCpu {
                         self.raise(X86Exception::invalid_opcode(va))
                     }
                     SensitiveOp::Rdtsc => {
+                        if self.ctx.cpl != 0 && (self.ctx.cr4 & (1 << 2)) != 0 {
+                            return self.raise(X86Exception::general_protection(va, 0));
+                        }
                         // SAFETY: TSC is a baseline x86_64 instruction advertised by CPUID.
                         let tsc = unsafe { core::arch::x86_64::_rdtsc() };
                         self.ctx.gpr[reg::RAX] = tsc & 0xffff_ffff;
