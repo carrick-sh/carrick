@@ -1147,6 +1147,10 @@ fn owner_dispatch_requires_both_original_and_triggering_actor() {
     assert!(Admission::Standing.identifies_run(&standing_run("push", "main")));
 }
 
+const DEFAULT_BUDGET: CloneBudget = CloneBudget {
+    kvm: Concurrency::ONE,
+    agents: AgentClones::DEFAULT,
+};
 #[test]
 fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
     let dir = tempfile::tempdir().unwrap();
@@ -1160,7 +1164,7 @@ fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
     let mut ids = std::collections::BTreeSet::new();
     for n in 1..=4 {
         let row = ledger
-            .reserve_lane(job(n), &inventory, n, Concurrency::ONE, CloneLane::Agent)
+            .reserve_lane(job(n), &inventory, n, DEFAULT_BUDGET, CloneLane::Agent)
             .unwrap();
         assert!(ids.insert(row.vm.get()));
     }
@@ -1168,7 +1172,7 @@ fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
     let mut ledger = Ledger::load(&path).unwrap();
     assert!(
         ledger
-            .reserve_lane(job(5), &inventory, 5, Concurrency::ONE, CloneLane::Agent)
+            .reserve_lane(job(5), &inventory, 5, DEFAULT_BUDGET, CloneLane::Agent)
             .is_err()
     );
     let kvm = ledger
@@ -1183,7 +1187,7 @@ fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
     ledger.rows[0].state = State::Destroyed;
     assert!(
         ledger
-            .reserve_lane(job(8), &inventory, 8, Concurrency::ONE, CloneLane::Agent)
+            .reserve_lane(job(8), &inventory, 8, DEFAULT_BUDGET, CloneLane::Agent)
             .is_ok()
     );
     let unknown = [PoolMember {
@@ -1194,7 +1198,7 @@ fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
     ledger.rows[1].state = State::Destroyed;
     assert!(
         ledger
-            .reserve_lane(job(9), &unknown, 9, Concurrency::ONE, CloneLane::Agent)
+            .reserve_lane(job(9), &unknown, 9, DEFAULT_BUDGET, CloneLane::Agent)
             .is_err()
     );
 }
