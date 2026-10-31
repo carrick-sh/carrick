@@ -1864,7 +1864,8 @@ impl Server<'_> {
             cleanup_agent_user()?;
             let report = state.join("checkpoint.md");
             std::fs::write(&report, "")?;
-            publish_with(
+            let mut receipt = receipt;
+            let first = publish_with(
                 self.root,
                 &self.dispatch,
                 &receipt,
@@ -1873,7 +1874,35 @@ impl Server<'_> {
                 &self.token,
                 &mut self.runs,
                 PublishMode::CommitsOnly,
-            )?;
+            );
+            // One workflow file must not cost the rest of the work (#1225):
+            // push everything else, and name what the owner must publish.
+            match first {
+                Err(ScalerError::Usage(why)) if why.starts_with("Refused workflow changes") => {
+                    let work = state.join("work");
+                    let left = strip_workflow_changes(&work, &self.dispatch.base)?;
+                    if left.is_empty() {
+                        return Err(ScalerError::Usage(why));
+                    }
+                    refresh_checkpoint_head(&state, &work)?;
+                    receipt = worker_checkpoint(&state, &self.dispatch)?
+                        .ok_or(ScalerError::Guard("checkpoint receipt lost"))?;
+                    publish_with(
+                        self.root,
+                        &self.dispatch,
+                        &receipt,
+                        &receipt.contract,
+                        &report,
+                        &self.token,
+                        &mut self.runs,
+                        PublishMode::CommitsOnly,
+                    )?;
+                    Applied::record(|a| a.workflow_left_out = left)?;
+                }
+                other => {
+                    other?;
+                }
+            }
             if RunLease::load(&state, "")?.current() != receipt.head {
                 return Ok(Some(
                     "WIP checkpoint not pushed: the existing branch was retained".into(),
@@ -4259,6 +4288,8 @@ fi
         MissingResult,
         LauncherFailure,
         ReportedTimeout,
+        /// Work plus a workflow file, which dispatch can't publish (#1241).
+        Workflow,
     }
     struct NativeFixtureHost {
         turns: std::collections::VecDeque<FixtureTurn>,
@@ -4319,6 +4350,9 @@ fi
                     "rm ../result.json; printf partial > incomplete-output"
                 }
                 FixtureTurn::LauncherFailure | FixtureTurn::ReportedTimeout => "true",
+                FixtureTurn::Workflow => {
+                    "printf good > first-good; mkdir -p .github/workflows; printf 'on: push\\n' > .github/workflows/new.yml"
+                }
             };
             // This is the real foreground process: it writes its own contract,
             // stdout evidence and work before the deadline runner can kill it.
@@ -4733,6 +4767,53 @@ fi
     #[test]
     fn done_without_progress_on_a_current_pr_stays_done() {
         done_without_progress_fixture(0, true);
+    }
+    /// #1241 (round 41206003566 for #1225): one workflow file made the WIP
+    /// push fail, and ten other files of work never reached the remote.
+    /// The checkpoint now pushes everything else and names what's left out.
+    #[test]
+    fn a_workflow_change_does_not_cost_the_rest_of_the_checkpoint() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let (native, _) = native_fixture(vec![FixtureTurn::Workflow]);
+            server.launcher = Box::new(ObservedNativeLauncher(native));
+            std::fs::write(root.join("remote-tip"), "").unwrap();
+            let response = server.execute(worker_request()).unwrap();
+            let applied = Applied::load().unwrap();
+            let pushed = regular_text(&root.join("remote-tip")).unwrap();
+            let pushed = pushed.trim();
+            assert_eq!(applied.wip_pushed.as_deref(), Some(pushed), "{response}");
+            assert_eq!(
+                applied.workflow_left_out,
+                vec![".github/workflows/new.yml".to_owned()]
+            );
+            let state = crate::agent_runner::state().unwrap();
+            let work = state.join("work");
+            // The work is on the remote; the workflow file is not.
+            git(&work, &["cat-file", "-e", &format!("{pushed}:first-good")])
+                .expect("the rest of the work was pushed");
+            assert!(
+                git(
+                    &work,
+                    &[
+                        "cat-file",
+                        "-e",
+                        &format!("{pushed}:.github/workflows/new.yml")
+                    ]
+                )
+                .is_err()
+            );
+            assert!(
+                applied
+                    .report()
+                    .contains("leaves out the run's workflow changes (.github/workflows/new.yml)"),
+                "{}",
+                applied.report()
+            );
+        });
     }
     #[test]
     fn done_with_the_last_commit_pushed_stays_done() {
