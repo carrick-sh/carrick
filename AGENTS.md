@@ -687,13 +687,17 @@ SendMessage.
   signed gate stays on cloudmac. Land on a failure-set diff against main
   (`NEW=[]`), not an absolute zero; `NEW=[]` is evidence only when every step
   is itemized and every binary finished (#352/#353, fix #377).
-- **cloudmac is shared with CI** ([`docs/ci/mac-jit.md`](docs/ci/mac-jit.md)):
-  JIT jobs run unprivileged beside the gates, so admit build-heavy work
-  (`remote-accept`, gates) against running HVF jobs — an overlap on one
-  volume killed both with ENOSPC; the gate worktree now has its own
-  `carrick-gate` volume, CPU admission is still #376. Worktree admission keys on the
-  checkout root's device+inode: never copy or cross-volume move an admitted
-  checkout; remove and re-add it.
+- **cloudmac is shared with CI** ([`docs/ci/mac-hvf-runner.md`](docs/ci/mac-hvf-runner.md)):
+  the persistent `carrick-hvf` runner (`hvf-kernel`), the `carrick-macos-ci` PR
+  runner (`ci` user) and director gates (`remote-accept`, `just accept`) run on
+  separate internal APFS volumes (`carrick-hvf`, `carrick-ci` with its 33 GB cap
+  lifted per #994, and `carrick-gate`), with cold/cached `rentamac` data
+  (`sccache`, fixtures, evidence) on external USB `/Volumes/carrick`. Serialize
+  build-heavy and signed work through `/tmp/carrick-host-lease.lock` (`carrick-macos-ci`
+  holds shared `just lease carrick`; `hvf-kernel` and director gates hold
+  exclusive `gate`). Worktree admission keys on the checkout root's
+  device+inode: never copy or cross-volume move an admitted checkout; remove
+  and re-add it.
 - **KVM evidence comes from the merge queue** (PRs never run `kvm-tests`,
   so an admin merge has none). The `kvm-tests` lane produces
   a receipt and `kvm-gate` fails on NEW failures against the merge-group base.
