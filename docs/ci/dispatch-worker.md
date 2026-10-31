@@ -156,9 +156,10 @@ login, with the hidden marker `<!-- carrick-reactor -->`:
   carrick-workers App, though adoption no longer checks the PR author. It is posted only when the PR passes `adopted_pr`
   or is an owned dispatch PR, no `dispatch-worker.yml` run is queued or in
   progress for that PR, and fewer than four dispatch runs are in flight.
-- At most one reactor round per PR head, unless a human (non-bot) comment
-  arrived after the last reactor round. State records the round's head and
-  time.
+- At most one reactor round per PR head, and at most three in a row,
+  unless an owner comment arrived after the last reactor round. A round
+  pushes a new head, so the second limit is what stops a red CI, round, red
+  CI loop. State records the round's head, time and count.
 - A `reply` posts plain text; text starting with `/agent` is refused.
 - Dispatch outcome comments (from `github-actions[bot]` or
   `carrick-workers[bot]`, containing "Dispatch outcome") are events, so a
@@ -166,12 +167,16 @@ login, with the hidden marker `<!-- carrick-reactor -->`:
   comments carrying the marker are not. Owner `/agent` commands do not ask
   for a decision but count as a human comment. PRs labelled `agent:hold` are
   skipped.
-- Automatic behaviour applies only to PRs created after the reactor's epoch
-  (recorded in state on the first real run; `--since <YYYY-MM-DDTHH:MM:SSZ>`
-  overrides it): a director PR without exactly one closing reference gets
-  one reply asking for `Closes #N`, once per PR, and an adoptable PR with no
-  push for 15 minutes and no reactor round yet counts as one event per head.
-  Comments and reviews on any PR are still events.
+- Every open PR is in scope, however old: the reactor exists to finish PRs.
+  Label a PR `agent:hold` to keep the reactor off it. In `run` mode a
+  director PR without exactly one closing reference gets one reply asking
+  for `Closes #N`, and an adoptable PR with no push for 15 minutes and no
+  reactor round yet counts as one event per head.
+- Each poll reads the repository and organization interaction limits and
+  logs a warning when either is not `collaborators_only`, cannot be read, or
+  expires within 30 days. GitHub caps a limit at six months, so renew both:
+  `gh api -X PUT orgs/carrick-sh/interaction-limits -f limit=collaborators_only -f expiry=six_months`
+  and the same on `repos/carrick-sh/carrick`.
 - The reactor never merges, pushes, edits, labels or closes anything.
 
 State (cursor and per-PR memory) lives in
@@ -209,13 +214,19 @@ Save it as `~/Library/LaunchAgents/sh.carrick.reactor.plist` and load it with
 Session mode replaces the one-shot `claude -p` decision with a long-running
 Claude Code session that keeps one subagent per PR. It has two parts:
 
-- `dispatch-worker reactor feed [--mailbox P] [--state P] [--since T] [--once]`
-  runs the same poll with no decision step. It appends one JSON line per new
+- `dispatch-worker reactor feed [--mailbox P] [--state P] [--once]` runs
+  the same poll with no decision step. It appends one JSON line per new
   event to the mailbox: `{id, pr, kind, author, url, created_at, head,
   excerpt}`, where `kind` is `comment`, `review`, `review_comment`,
-  `outcome`, `ci_red`, `new_pr`, `quiet_pr` or `needs_closes`. The
-  classification, epoch and `agent:hold` rules are those described above.
-  Its state file is separate from `run`'s.
+  `outcome`, `ci_run`, `new_pr`, `quiet_pr` or `needs_closes`. The feed
+  only reports facts; the session judges them. `ci_run` is any completed
+  Actions run on a director or owned PR's current head, whatever its
+  conclusion (`dispatch-worker.yml`'s own runs report through outcome
+  comments). Runs are read from `actions/runs?status=completed`, created up
+  to three hours before a separate run cursor. `new_pr` and `needs_closes`
+  fire once per director PR, and `quiet_pr` once per quiet head on a
+  director or owned PR, however old. Its state file is separate from
+  `run`'s.
 - `dispatch-worker reactor mcp [--state P] [--dry-run]` is a stdio MCP server.
   Its read tools are `read_pr`, `read_thread`, `read_diff`, `read_ci`,
   `read_outcomes` and `read_issue`. Its only act tools are `reply` and
