@@ -133,8 +133,10 @@ impl Cpl0TestMemory {
             return cur & PTE_ADDR_MASK;
         }
         let child = self.alloc_frame().raw();
-        self.word_ref(slot)
-            .store(child | PTE_PRESENT | PTE_WRITABLE | PTE_USER, Ordering::Relaxed);
+        self.word_ref(slot).store(
+            child | PTE_PRESENT | PTE_WRITABLE | PTE_USER,
+            Ordering::Relaxed,
+        );
         child
     }
 
@@ -226,12 +228,6 @@ fn step_exc(cpu: &mut SoftCpu, mem: &mut Cpl0TestMemory, exc: X86Exception) {
     assert_eq!(cpu.step_block(mem).unwrap(), SoftCpuExit::Exception(exc));
 }
 
-fn step_rax_ok(cpu: &mut SoftCpu, mem: &mut Cpl0TestMemory, rip: u64, rax: u64, next_rip: u64) {
-    cpu.context_mut().rip = rip;
-    cpu.context_mut().gpr[reg::RAX] = rax;
-    step_ok(cpu, mem, next_rip);
-}
-
 fn step_rax_gp(cpu: &mut SoftCpu, mem: &mut Cpl0TestMemory, rip: u64, rax: u64, err: u32) {
     cpu.context_mut().rip = rip;
     cpu.context_mut().gpr[reg::RAX] = rax;
@@ -251,25 +247,22 @@ fn assert_cpl3_exc(insn: &[u8], rcx: u64, exc: X86Exception) {
     step_exc(&mut cpu, &mut mem, exc);
 }
 
-fn to_vmx_seg(s: SoftSegment) -> GuestSegment {
-    GuestSegment {
+fn assert_vmx_valid(ctx: &SoftCpuContext) {
+    let seg = |s: SoftSegment| GuestSegment {
         base: s.base,
         limit: s.limit,
         ar: s.ar,
         selector: s.selector,
-    }
-}
-
-fn assert_vmx_valid(ctx: &SoftCpuContext) {
+    };
     let segs = LongModeSegments {
-        cs: to_vmx_seg(ctx.cs),
-        ss: to_vmx_seg(ctx.ss),
-        ds: to_vmx_seg(ctx.ds),
-        es: to_vmx_seg(ctx.es),
-        fs: to_vmx_seg(ctx.fs),
-        gs: to_vmx_seg(ctx.gs),
-        tr: to_vmx_seg(ctx.tr),
-        ldtr: to_vmx_seg(ctx.ldtr),
+        cs: seg(ctx.cs),
+        ss: seg(ctx.ss),
+        ds: seg(ctx.ds),
+        es: seg(ctx.es),
+        fs: seg(ctx.fs),
+        gs: seg(ctx.gs),
+        tr: seg(ctx.tr),
+        ldtr: seg(ctx.ldtr),
         cr0: ctx.cr0,
         cr4: ctx.cr4,
         efer: ctx.efer,
@@ -280,31 +273,26 @@ fn assert_vmx_valid(ctx: &SoftCpuContext) {
 
 #[test]
 fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
-    let mut msrs = MsrFile::new();
-    let caps = MsrCapabilities::default();
-    let cr0_pg = 0x8005_0033u64;
-    let err_gp = Err(MsrError::GeneralProtection);
+    let (mut msrs, caps, cr0_pg) = (MsrFile::new(), MsrCapabilities::default(), 0x8005_0033u64);
+    let (rd_gp, wr_gp) = (
+        Err(MsrError::GeneralProtection),
+        Err(MsrError::GeneralProtection),
+    );
 
     assert_eq!(
         msrs.read(MSR_IA32_APIC_BASE, caps),
         Ok(DEFAULT_IA32_APIC_BASE)
     );
     assert_eq!(msrs.read(MSR_IA32_PAT, caps), Ok(DEFAULT_IA32_PAT));
-    assert_eq!(msrs.read(MSR_IA32_TSC_DEADLINE, caps), err_gp);
-    assert_eq!(msrs.read(MsrIndex::new(0xdead_beef), caps), err_gp);
+    assert_eq!(msrs.read(MSR_IA32_TSC_DEADLINE, caps), rd_gp);
+    assert_eq!(msrs.read(MsrIndex::new(0xdead_beef), caps), rd_gp);
 
-    for idx in [
-        MSR_IA32_LSTAR,
-        MSR_IA32_CSTAR,
-        MSR_IA32_FS_BASE,
-        MSR_IA32_GS_BASE,
-        MSR_IA32_KERNEL_GS_BASE,
-    ] {
-        let before = msrs.clone();
-        assert_eq!(msrs.write(idx, NON_CANON, cr0_pg, caps), err_gp);
-        assert_eq!(msrs, before);
-    }
     let bad_msrs = [
+        (MSR_IA32_LSTAR, NON_CANON),
+        (MSR_IA32_CSTAR, NON_CANON),
+        (MSR_IA32_FS_BASE, NON_CANON),
+        (MSR_IA32_GS_BASE, NON_CANON),
+        (MSR_IA32_KERNEL_GS_BASE, NON_CANON),
         (MSR_IA32_FMASK, 1u64 << 32),
         (MSR_IA32_PAT, 0x0007_0406_0007_0402),
         (MSR_IA32_PAT, 0x0007_0406_0007_0408),
@@ -319,7 +307,7 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
     ];
     for (idx, bad) in bad_msrs {
         let before = msrs.clone();
-        assert_eq!(msrs.write(idx, bad, cr0_pg, caps), err_gp);
+        assert_eq!(msrs.write(idx, bad, cr0_pg, caps), wr_gp);
         assert_eq!(msrs, before);
     }
 
@@ -327,22 +315,21 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
         .write(MSR_IA32_EFER, EFER_SCE | EFER_LME, cr0_pg, caps)
         .unwrap();
     assert!(eff.flush_tlb && msrs.efer == (EFER_SCE | EFER_LME | EFER_LMA));
-    let eff_pat = msrs
-        .write(MSR_IA32_PAT, 0x0000_0104_0506_0700, cr0_pg, caps)
-        .unwrap();
-    assert!(eff_pat.flush_tlb);
+    assert!(
+        msrs.write(MSR_IA32_PAT, 0x0000_0104_0506_0700, cr0_pg, caps)
+            .unwrap()
+            .flush_tlb
+    );
 
-    for insn in [&[0xF0, 0x0F, 0x30][..], &[0xF0, 0x0F, 0x32][..]] {
+    for insn in [b"\xf0\x0f\x30".as_slice(), b"\xf0\x0f\x32"] {
         assert_cpl3_exc(insn, 0, ud(USER_CODE_VA));
     }
-    for insn in [&[0x0F, 0x30][..], &[0x0F, 0x32][..]] {
+    for insn in [b"\x0f\x30".as_slice(), b"\x0f\x32"] {
         assert_cpl3_exc(insn, u64::from(MSR_IA32_STAR.raw()), gp(USER_CODE_VA, 0));
     }
 
-    let (mut cpu, mut mem, _) = setup_cpl0_cpu(
-        &[0x0F, 0x30, 0x0F, 0x32],
-        Box::new(Cpl0CpuidView::default()),
-    );
+    let (mut cpu, mut mem, _) =
+        setup_cpl0_cpu(b"\x0f\x30\x0f\x32", Box::new(Cpl0CpuidView::default()));
     read_ok(&mut cpu, &mut mem, DATA_VA);
     read_ok(&mut cpu, &mut mem, DATA_VA);
     assert_eq!(cpu.context().tlb_stats().hits, 1);
@@ -355,18 +342,19 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
     cpu.context_mut().gpr[reg::RAX] = u64::MAX;
     cpu.context_mut().gpr[reg::RDX] = u64::MAX;
     step_ok(&mut cpu, &mut mem, CODE_VA + 4);
-    assert_eq!(cpu.context().gpr[reg::RAX], 0x89ab_cdef);
-    assert_eq!(cpu.context().gpr[reg::RDX], 0x0123_4567);
+    assert_eq!(
+        (cpu.context().gpr[reg::RAX], cpu.context().gpr[reg::RDX]),
+        (0x89ab_cdef, 0x0123_4567)
+    );
 
     cpu.context_mut().gpr[reg::RCX] = u64::from(MSR_IA32_LSTAR.raw());
     cpu.context_mut().gpr[reg::RDX] = 0x0000_8000;
     step_rax_gp(&mut cpu, &mut mem, CODE_VA, 0, 0);
     assert_eq!(cpu.context().msrs.lstar, 0);
 
-    cpu.context_mut().rip = CODE_VA;
-    cpu.context_mut().gpr[reg::RCX] = u64::from(MSR_IA32_PAT.raw());
-    cpu.context_mut().gpr[reg::RAX] = 0x0007_0400;
-    cpu.context_mut().gpr[reg::RDX] = 0x0007_0406;
+    let ctx = cpu.context_mut();
+    (ctx.rip, ctx.gpr[reg::RCX]) = (CODE_VA, u64::from(MSR_IA32_PAT.raw()));
+    (ctx.gpr[reg::RAX], ctx.gpr[reg::RDX]) = (0x0007_0400, 0x0007_0406);
     step_ok(&mut cpu, &mut mem, CODE_VA + 2);
     cpu.context_mut().reset_tlb_stats();
     read_ok(&mut cpu, &mut mem, DATA_VA);
@@ -376,26 +364,25 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
 #[test]
 fn mov_cr_and_mov_dr_enforce_sdm_semantics_tlb_flushes_and_fault_ordering() {
     let ud_ops: [&[u8]; 8] = [
-        &[0x0F, 0x20, 0xC8],
-        &[0x0F, 0x22, 0xE8],
-        &[0x0F, 0x20, 0xF0],
-        &[0x0F, 0x22, 0xF8],
-        &[0x44, 0x0F, 0x20, 0xC8],
-        &[0xF0, 0x0F, 0x20, 0xC0],
-        &[0x44, 0x0F, 0x21, 0xC0],
-        &[0xF0, 0x0F, 0x23, 0xC0],
+        b"\x0f\x20\xc8",
+        b"\x0f\x22\xe8",
+        b"\x0f\x20\xf0",
+        b"\x0f\x22\xf8",
+        b"\x44\x0f\x20\xc8",
+        b"\xf0\x0f\x20\xc0",
+        b"\x44\x0f\x21\xc0",
+        b"\xf0\x0f\x23\xc0",
     ];
     for bytes in ud_ops {
         assert_cpl3_exc(bytes, 0, ud(USER_CODE_VA));
     }
-    let gp_ops: [&[u8]; 5] = [
-        &[0x0F, 0x20, 0xC0],
-        &[0x0F, 0x22, 0xD0],
-        &[0x0F, 0x20, 0xD8],
-        &[0x0F, 0x22, 0xE0],
-        &[0x44, 0x0F, 0x20, 0xC0],
-    ];
-    for bytes in gp_ops {
+    for bytes in [
+        b"\x0f\x20\xc0".as_slice(),
+        b"\x0f\x22\xd0",
+        b"\x0f\x20\xd8",
+        b"\x0f\x22\xe0",
+        b"\x44\x0f\x20\xc0",
+    ] {
         assert_cpl3_exc(bytes, 0, gp(USER_CODE_VA, 0));
     }
 
@@ -418,8 +405,10 @@ fn mov_cr_and_mov_dr_enforce_sdm_semantics_tlb_flushes_and_fault_ordering() {
     step_ok(&mut cpu, &mut mem, CODE_VA + 6);
     assert_eq!(cpu.context().gpr[reg::RAX], 0x8001_0033);
 
-    let mut view = Cpl0CpuidView::default();
-    view.max_phy_addr = 40;
+    let view = Cpl0CpuidView {
+        max_phy_addr: 40,
+        ..Default::default()
+    };
     let code = [
         0x0F, 0x22, 0xD0, 0x0F, 0x20, 0xD0, 0x44, 0x0F, 0x22, 0xC0, 0x44, 0x0F, 0x20, 0xC0, 0x0F,
         0x22, 0xE0, 0x0F, 0x22, 0xD8, 0x0F, 0x20, 0xD8, 0x0F, 0x31,
@@ -579,11 +568,7 @@ fn lgdt_lidt_ltr_and_swapgs_enforce_descriptor_and_gs_semantics() {
         cpu.context().tr,
         SoftSegment::tss64_busy(0x28, tss_base, 0x67)
     );
-    let updated = u64::from_le_bytes(
-        mem.read_gpa(data_frame.raw() + desc_off, 8)
-            .try_into()
-            .unwrap(),
-    );
+    let updated = mem.read_u64(data_frame.raw() + desc_off);
     assert_eq!((updated >> 40) & 0xf, 0xb);
 
     step_ok(&mut cpu, &mut mem, CODE_VA + 14);
@@ -605,6 +590,7 @@ fn lgdt_lidt_ltr_and_swapgs_enforce_descriptor_and_gs_semantics() {
     step_ok(&mut cpu, &mut mem, CODE_VA + 17);
     assert_eq!(cpu.context().msrs.gs_base, gs_kern_va);
     assert_eq!(cpu.context().msrs.kernel_gs_base, gs_user_va);
+    cpu.max_block_insns = 1;
     step_ok(&mut cpu, &mut mem, CODE_VA + 26);
     assert_eq!(cpu.context().gpr[reg::RAX], 0xaaaa_bbbb_cccc_dddd);
 }
@@ -727,9 +713,9 @@ impl GuestCpuidView for CustomCpuidView {
 
 #[test]
 fn hlt_invlpg_and_cpuid_view_enforce_sdm_contracts() {
-    let (mut cpu, mut mem, _) = setup_cpl0_cpu(&[0x0F, 0xA2], Box::new(CustomCpuidView));
+    let (mut cpu, mut mem, _) = setup_cpl0_cpu(b"\x0f\xa2", Box::new(CustomCpuidView));
     let user_cpuid = mem.map_page(USER_CODE_VA, Perms::USER_RX);
-    mem.write_gpa(user_cpuid.raw(), &[0x0F, 0xA2, 0xF4, 0x0F, 0x01, 0x3F]);
+    mem.write_gpa(user_cpuid.raw(), b"\x0f\xa2\xf4\x0f\x01\x3f");
     for (cpl, start_rip) in [(3u8, USER_CODE_VA), (0u8, CODE_VA)] {
         if cpl == 0 {
             enter_cpl0(cpu.context_mut(), start_rip);
@@ -737,16 +723,14 @@ fn hlt_invlpg_and_cpuid_view_enforce_sdm_contracts() {
             enter_cpl3(cpu.context_mut(), start_rip);
         }
         let ctx = cpu.context_mut();
-        ctx.gpr[reg::RAX] = 0xffff_ffff_0000_0007;
-        ctx.gpr[reg::RBX] = u64::MAX;
-        ctx.gpr[reg::RCX] = 0xffff_ffff_0000_0002;
-        ctx.gpr[reg::RDX] = u64::MAX;
+        (ctx.gpr[reg::RAX], ctx.gpr[reg::RBX]) = (0xffff_ffff_0000_0007, u64::MAX);
+        (ctx.gpr[reg::RCX], ctx.gpr[reg::RDX]) = (0xffff_ffff_0000_0002, u64::MAX);
         step_ok(&mut cpu, &mut mem, start_rip + 2);
         let g = &cpu.context().gpr;
-        assert_eq!(g[reg::RAX], 0xaa00_0007);
-        assert_eq!(g[reg::RBX], 0xbb00_0002);
-        assert_eq!(g[reg::RCX], 0xcc00_1234);
-        assert_eq!(g[reg::RDX], 0xdd00_5678);
+        assert_eq!(
+            (g[reg::RAX], g[reg::RBX], g[reg::RCX], g[reg::RDX]),
+            (0xaa00_0007, 0xbb00_0002, 0xcc00_1234, 0xdd00_5678)
+        );
     }
 
     enter_cpl3(cpu.context_mut(), USER_CODE_VA + 2);
@@ -755,17 +739,14 @@ fn hlt_invlpg_and_cpuid_view_enforce_sdm_contracts() {
     cpu.context_mut().rip = USER_CODE_VA + 3;
     step_exc(&mut cpu, &mut mem, gp(USER_CODE_VA + 3, 0));
 
-    let code = [
-        0x0F, 0x22, 0xE0, 0x0F, 0xA2, 0x0F, 0x01, 0x3F, 0x48, 0x8B, 0x07, 0xF4,
-    ];
-    let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(&code, Box::new(Level0CpuidView));
-    let bad_sys: [&[u8]; 4] = [
-        &[0xF0, 0xF4],
-        &[0xF0, 0x0F, 0x01, 0x3F],
-        &[0xF0, 0x0F, 0xA2],
-        &[0x0F, 0x01, 0xFA],
-    ];
-    for bad in bad_sys {
+    let code = b"\x0f\x22\xe0\x0f\xa2\x0f\x01\x3f\x48\x8b\x07\xf4";
+    let (mut cpu, mut mem, data_frame) = setup_cpl0_cpu(code, Box::new(Level0CpuidView));
+    for bad in [
+        b"\xf0\xf4".as_slice(),
+        b"\xf0\x0f\x01\x3f",
+        b"\xf0\x0f\xa2",
+        b"\x0f\x01\xfa",
+    ] {
         let f = mem.map_page(DATA_VA + 0x3000, Perms::KERNEL_RX);
         mem.write_gpa(f.raw(), bad);
         cpu.context_mut().flush_tlb();
@@ -773,24 +754,20 @@ fn hlt_invlpg_and_cpuid_view_enforce_sdm_contracts() {
         step_exc(&mut cpu, &mut mem, ud(DATA_VA + 0x3000));
     }
 
-    cpu.context_mut().rip = CODE_VA;
-    cpu.context_mut().gpr[reg::RAX] = 0x0030_06f0;
-    step_ok(&mut cpu, &mut mem, CODE_VA + 3);
-    cpu.context_mut().gpr[reg::RAX] = 1;
-    cpu.context_mut().gpr[reg::RCX] = 0;
-    step_ok(&mut cpu, &mut mem, CODE_VA + 5);
-    assert_eq!(cpu.context().gpr[reg::RCX] & (1 << 27), 0);
-
-    cpu.context_mut().rip = CODE_VA;
-    cpu.context_mut().gpr[reg::RAX] = 0x0034_06f0;
-    step_ok(&mut cpu, &mut mem, CODE_VA + 3);
-    cpu.context_mut().gpr[reg::RAX] = 1;
-    step_ok(&mut cpu, &mut mem, CODE_VA + 5);
-    assert_ne!(cpu.context().gpr[reg::RCX] & (1 << 27), 0);
+    for (cr4, expect_osxsave) in [(0x0030_06f0u64, false), (0x0034_06f0u64, true)] {
+        let ctx = cpu.context_mut();
+        (ctx.rip, ctx.gpr[reg::RAX], ctx.gpr[reg::RCX]) = (CODE_VA, cr4, 0);
+        step_ok(&mut cpu, &mut mem, CODE_VA + 3);
+        cpu.context_mut().gpr[reg::RAX] = 1;
+        step_ok(&mut cpu, &mut mem, CODE_VA + 5);
+        assert_eq!(
+            (cpu.context().gpr[reg::RCX] & (1 << 27)) != 0,
+            expect_osxsave
+        );
+    }
 
     for addr in [NON_CANON, 0x7777_0000] {
-        cpu.context_mut().rip = CODE_VA + 5;
-        cpu.context_mut().gpr[reg::RDI] = addr;
+        (cpu.context_mut().rip, cpu.context_mut().gpr[reg::RDI]) = (CODE_VA + 5, addr);
         step_ok(&mut cpu, &mut mem, CODE_VA + 8);
     }
 
@@ -811,15 +788,15 @@ fn hlt_invlpg_and_cpuid_view_enforce_sdm_contracts() {
     );
 
     let mut machine = SoftMachine::from_parts(cpu, mem);
-    machine.context_mut().rip = CODE_VA + 5;
-    machine.context_mut().gpr[reg::RDI] = DATA_VA;
-    assert_eq!(
-        machine.run(8).unwrap(),
-        SoftMachineExit::Hlt {
-            rip: CODE_VA + 11,
-            next_rip: CODE_VA + 12
-        }
-    );
+    (
+        machine.context_mut().rip,
+        machine.context_mut().gpr[reg::RDI],
+    ) = (CODE_VA + 5, DATA_VA);
+    let expected_hlt = SoftMachineExit::Hlt {
+        rip: CODE_VA + 11,
+        next_rip: CODE_VA + 12,
+    };
+    assert_eq!(machine.run(8).unwrap(), expected_hlt);
     assert!(machine.context().halted);
     assert_eq!(machine.context().gpr[reg::RAX], 0x9999_8888_7777_6666);
     machine.context_mut().reset_tlb_stats();
@@ -829,12 +806,14 @@ fn hlt_invlpg_and_cpuid_view_enforce_sdm_contracts() {
 }
 
 fn push_msr_write(buf: &mut Vec<u8>, msr: MsrIndex, val: u64) {
-    buf.push(0xB9);
-    buf.extend_from_slice(&msr.raw().to_le_bytes());
-    buf.push(0xB8);
-    buf.extend_from_slice(&(val as u32).to_le_bytes());
-    buf.push(0xBA);
-    buf.extend_from_slice(&((val >> 32) as u32).to_le_bytes());
+    for (op, imm) in [
+        (0xB9u8, msr.raw()),
+        (0xB8, val as u32),
+        (0xBA, (val >> 32) as u32),
+    ] {
+        buf.push(op);
+        buf.extend_from_slice(&imm.to_le_bytes());
+    }
     buf.extend_from_slice(&[0x0F, 0x30]);
 }
 
@@ -863,7 +842,9 @@ fn expect_port(m: &mut SoftMachine<Cpl0TestMemory>, expected: u32) {
             size: 4,
             value,
             ..
-        } => assert_eq!(value, expected),
+        } => {
+            assert_eq!(value, expected)
+        }
         other => panic!("unexpected exit {other:?}"),
     }
 }
@@ -876,7 +857,7 @@ fn cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state() {
         pml4_base: 0x0060_0000,
     };
     let boot = X8664GuestArch::bootstrap_sysregs();
-    let (boot_code_va, boot_data_va, kern_stack_va, binding_va) =
+    let (boot_code_va, boot_data_va, kern_stack_va, binding_va): (u64, u64, u64, u64) =
         (0x4e_0000, 0x4e_1000, 0x4e_2000, 0x4e_3000);
     let (user_code_va, user_data_va, user_tls_va, user_stack_va) =
         (0x01_0000, 0x01_1000, 0x01_2000, 0x01_3000);
@@ -923,9 +904,14 @@ fn cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state() {
     let kstack_top = kern_stack_va + 0xf00;
     mem.write_gpa(binding_va, &kstack_top.to_le_bytes());
     mem.write_gpa(binding_va + 16, &binding_va.to_le_bytes());
-    assert_eq!(std::mem::offset_of!(CpuBinding, kernel_stack), 0);
-    assert_eq!(std::mem::offset_of!(CpuBinding, user_stack), 8);
-    assert_eq!(std::mem::offset_of!(CpuBinding, self_address), 16);
+    assert_eq!(
+        (
+            std::mem::offset_of!(CpuBinding, kernel_stack),
+            std::mem::offset_of!(CpuBinding, user_stack),
+            std::mem::offset_of!(CpuBinding, self_address),
+        ),
+        (0, 8, 16)
+    );
     mem.write_gpa(user_tls_va, &0x0000_0000_cafe_1234u64.to_le_bytes());
     mem.write_gpa(user_data_va, &0x0000_0000_55aa_77ccu64.to_le_bytes());
 
@@ -947,11 +933,10 @@ fn cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state() {
     let fault_va = 0x0000_0000_dead_0000u64;
     let mut user_prog = vec![0x64, 0x48, 0x8B, 0x04, 0x25, 0, 0, 0, 0, 0x48, 0xBF];
     user_prog.extend_from_slice(&user_data_va.to_le_bytes());
-    let mid = [
+    user_prog.extend_from_slice(&[
         0x03, 0x07, 0x89, 0x47, 0x08, 0x48, 0x83, 0xC7, 0x08, 0x31, 0xF6, 0x0F, 0x05, 0xBE, 0x01,
         0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0x42, 0x00, 0x00, 0x00, 0x48, 0xBA,
-    ];
-    user_prog.extend_from_slice(&mid);
+    ]);
     user_prog.extend_from_slice(&fault_va.to_le_bytes());
     let fault_insn_rip = user_code_va + user_prog.len() as u64;
     user_prog.extend_from_slice(&[0x48, 0x8B, 0x0A]);
@@ -1000,46 +985,32 @@ fn cpl0_fixture_boot_sequence_on_softmachine_matches_kvm_state() {
 
     let mut machine =
         SoftMachine::new(mem, Box::new(Cpl0CpuidView::new(0, 2_000_000_000))).unwrap();
-    {
-        let ctx = machine.context_mut();
-        enter_cpl0(ctx, boot_code_va);
-        ctx.cr0 = 0x8000_0011;
-        ctx.cr3 = layout.pml4_base;
-        ctx.cr4 = 0x20;
-        ctx.tr = SoftSegment::unusable();
-        ctx.gpr[reg::RSP] = kstack_top;
-    }
+    let ctx = machine.context_mut();
+    enter_cpl0(ctx, boot_code_va);
+    (ctx.cr0, ctx.cr3, ctx.cr4) = (0x8000_0011, layout.pml4_base, 0x20);
+    (ctx.tr, ctx.gpr[reg::RSP]) = (SoftSegment::unusable(), kstack_top);
 
     expect_port(&mut machine, 0x07b0);
-    {
-        let ctx = machine.context();
-        assert_eq!(ctx.cpl, 0);
-        assert_eq!(
-            (ctx.cr0, ctx.cr3, ctx.cr4, ctx.efer),
-            (boot.cr0, layout.pml4_base, target_cr4, boot.efer)
-        );
-        assert_eq!(
-            (ctx.msrs.star, ctx.msrs.lstar, ctx.msrs.fmask),
-            (boot.star, layout.trampoline_base, boot.sfmask)
-        );
-        assert_eq!(
-            (ctx.fs_base, ctx.gs_base, ctx.kernel_gs_base),
-            (user_tls_va, 0, binding_va)
-        );
-        assert_eq!(ctx.gpr[reg::R15], layout.trampoline_base);
-        assert_eq!(ctx.gdtr, DescriptorTablePtr::new(55, layout.gdt_base));
-        assert_eq!(ctx.idtr, DescriptorTablePtr::new(0x0fff, idt_gpa));
-        assert_eq!(ctx.tr, SoftSegment::tss64_busy(0x28, tss_gpa, 0x67));
-        assert_vmx_valid(ctx);
-        let hz = u32::from_le_bytes(
-            machine
-                .mem()
-                .read_gpa(boot_data_va + 0x100, 4)
-                .try_into()
-                .unwrap(),
-        );
-        assert_eq!(hz, 2_000_000_000);
-    }
+    let ctx = machine.context();
+    assert_eq!(ctx.cpl, 0);
+    assert_eq!(
+        (ctx.cr0, ctx.cr3, ctx.cr4, ctx.efer),
+        (boot.cr0, layout.pml4_base, target_cr4, boot.efer)
+    );
+    assert_eq!(
+        (ctx.msrs.star, ctx.msrs.lstar, ctx.msrs.fmask),
+        (boot.star, layout.trampoline_base, boot.sfmask)
+    );
+    assert_eq!(
+        (ctx.fs_base, ctx.gs_base, ctx.kernel_gs_base),
+        (user_tls_va, 0, binding_va)
+    );
+    assert_eq!(ctx.gpr[reg::R15], layout.trampoline_base);
+    assert_eq!(ctx.gdtr, DescriptorTablePtr::new(55, layout.gdt_base));
+    assert_eq!(ctx.idtr, DescriptorTablePtr::new(0x0fff, idt_gpa));
+    assert_eq!(ctx.tr, SoftSegment::tss64_busy(0x28, tss_gpa, 0x67));
+    assert_vmx_valid(ctx);
+    assert_eq!(machine.mem().read_u32(boot_data_va + 0x100), 2_000_000_000);
 
     let expected_sum = 0xcafe_1234u32.wrapping_add(0x55aa_77cc);
     expect_port(&mut machine, expected_sum);

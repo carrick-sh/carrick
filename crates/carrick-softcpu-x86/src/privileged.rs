@@ -301,28 +301,23 @@ fn emulate_mov_to_cr(
             if !long_mode_active && (val & CR4_LA57) != 0 {
                 return Err(X86Exception::general_protection(va, 0));
             }
-            if (val & CR4_UMIP) != 0 && !cpuid.supports_umip() {
-                return Err(X86Exception::general_protection(va, 0));
-            }
-            if (val & CR4_FSGSBASE) != 0 && !cpuid.supports_fsgsbase() {
-                return Err(X86Exception::general_protection(va, 0));
-            }
-            if (val & CR4_PCIDE) != 0 {
-                if !cpuid.supports_pcid() || !long_mode_active {
-                    return Err(X86Exception::general_protection(va, 0));
-                }
-                // SDM Vol. 3A §4.10.1: 0->1 transition of CR4.PCIDE requires CR3[11:0] == 0.
-                if (ctx.cr4 & CR4_PCIDE) == 0 && (ctx.cr3 & 0xfff) != 0 {
+            for (bit, supported) in [
+                (CR4_UMIP, cpuid.supports_umip()),
+                (CR4_FSGSBASE, cpuid.supports_fsgsbase()),
+                (CR4_OSXSAVE, cpuid.supports_xsave()),
+                (CR4_SMEP, cpuid.supports_smep()),
+                (CR4_SMAP, cpuid.supports_smap()),
+            ] {
+                if (val & bit) != 0 && !supported {
                     return Err(X86Exception::general_protection(va, 0));
                 }
             }
-            if (val & CR4_OSXSAVE) != 0 && !cpuid.supports_xsave() {
-                return Err(X86Exception::general_protection(va, 0));
-            }
-            if (val & CR4_SMEP) != 0 && !cpuid.supports_smep() {
-                return Err(X86Exception::general_protection(va, 0));
-            }
-            if (val & CR4_SMAP) != 0 && !cpuid.supports_smap() {
+            // SDM Vol. 3A §4.10.1: 0->1 transition of CR4.PCIDE requires LMA=1 and CR3[11:0] == 0.
+            if (val & CR4_PCIDE) != 0
+                && (!cpuid.supports_pcid()
+                    || !long_mode_active
+                    || ((ctx.cr4 & CR4_PCIDE) == 0 && (ctx.cr3 & 0xfff) != 0))
+            {
                 return Err(X86Exception::general_protection(va, 0));
             }
             let tlb_sensitive = CR4_PAE | CR4_PGE | CR4_PCIDE | CR4_SMEP | CR4_SMAP;
@@ -475,10 +470,8 @@ fn emulate_lgdt_lidt<M: SoftMmuMemory>(
     let mut buf = [0u8; 10];
     read_guest_bytes(ctx, mem, ea, &mut buf, SoftAccessKind::Read)
         .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
-    let limit = u16::from_le_bytes([buf[0], buf[1]]);
-    let base = u64::from_le_bytes([
-        buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
-    ]);
+    let [l0, l1, b @ ..] = buf;
+    let (limit, base) = (u16::from_le_bytes([l0, l1]), u64::from_le_bytes(b));
     if !is_canonical_va(base) {
         return Err(X86Exception::general_protection(va, 0));
     }
@@ -648,26 +641,9 @@ fn emulate_ltr<M: SoftMmuMemory>(
     let mut desc_bytes = [0u8; 16];
     read_system_bytes(ctx, mem, desc_va, &mut desc_bytes)
         .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
-    let low = u64::from_le_bytes([
-        desc_bytes[0],
-        desc_bytes[1],
-        desc_bytes[2],
-        desc_bytes[3],
-        desc_bytes[4],
-        desc_bytes[5],
-        desc_bytes[6],
-        desc_bytes[7],
-    ]);
-    let high = u64::from_le_bytes([
-        desc_bytes[8],
-        desc_bytes[9],
-        desc_bytes[10],
-        desc_bytes[11],
-        desc_bytes[12],
-        desc_bytes[13],
-        desc_bytes[14],
-        desc_bytes[15],
-    ]);
+    let [l0, l1, l2, l3, l4, l5, l6, l7, h @ ..] = desc_bytes;
+    let low = u64::from_le_bytes([l0, l1, l2, l3, l4, l5, l6, l7]);
+    let high = u64::from_le_bytes(h);
 
     let typ = ((low >> 40) & 0xf) as u8;
     let s = ((low >> 44) & 1) != 0;
@@ -803,23 +779,11 @@ fn emulate_iret<M: SoftMmuMemory>(
     .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
 
     let read_slot = |index: usize| -> u64 {
-        let base = index * slot;
+        let s = &frame[index * slot..];
         match slot {
-            8 => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&frame[base..base + 8]);
-                u64::from_le_bytes(b)
-            }
-            4 => {
-                let mut b = [0u8; 4];
-                b.copy_from_slice(&frame[base..base + 4]);
-                u64::from(u32::from_le_bytes(b))
-            }
-            _ => {
-                let mut b = [0u8; 2];
-                b.copy_from_slice(&frame[base..base + 2]);
-                u64::from(u16::from_le_bytes(b))
-            }
+            8 => u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]),
+            4 => u64::from(u32::from_le_bytes([s[0], s[1], s[2], s[3]])),
+            _ => u64::from(u16::from_le_bytes([s[0], s[1]])),
         }
     };
 
