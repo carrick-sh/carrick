@@ -2866,6 +2866,442 @@ fn owner_fork_resident_child_cow_copies_with_production_classifier() {
     assert_eq!(&replacement.borrow()[..4], b"fork");
 }
 
+#[test]
+fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_writes() {
+    use carrick_el1::memory::{
+        AnonymousBackingProbe, AnonymousPermissionEditor, AnonymousRetirementEditor,
+        DelegatedAnonymous, Stage1Backing, classify_stage1_range, serve_delegated_anonymous,
+    };
+    use carrick_el1_abi::{Counters, CowDecline, CurrentTask, TrapFrame};
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, LiveDescriptorWords,
+        PageSpan, TableGrants, TableWindow, execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
+        LeafAccess, SubstrateGpa, protect_existing_el1_private_pages,
+        retire_existing_el1_private_pages, terminal_descriptor_is_fork_cow,
+        terminal_descriptor_permits_el0, terminal_descriptor_permits_host_buffer,
+    };
+    use carrick_sched_core::spaces::notification::SpaceAccess;
+
+    struct ForkAnonymousEditor<'a> {
+        arenas: &'a [&'a Tables],
+        pool: TableWindow,
+    }
+    impl ForkAnonymousEditor<'_> {
+        const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+        fn table_for(&self, ttbr0: u64) -> Option<&Tables> {
+            let root = ttbr0 & Self::TTBR_BADDR_MASK;
+            self.arenas.iter().copied().find(|table| table.base == root)
+        }
+    }
+    impl AnonymousBackingProbe for ForkAnonymousEditor<'_> {
+        fn backing(
+            &mut self,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
+            va: carrick_guest_arch::UserVa,
+            len: carrick_guest_arch::GuestLen,
+        ) -> Stage1Backing {
+            let root = ttbr0.raw() & Self::TTBR_BADDR_MASK;
+            let read = |pa: u64| {
+                self.arenas.iter().find_map(|table| {
+                    pa.checked_sub(table.base)
+                        .filter(|offset| offset.is_multiple_of(8))
+                        .and_then(|offset| table.words.get(offset as usize / 8))
+                        .map(|word| word.load(Ordering::Acquire))
+                })
+            };
+            classify_stage1_range(&read, root, va.raw(), len.raw())
+        }
+        fn stock_span(
+            &mut self,
+            _mm_key: carrick_el1_abi::ReservationMm,
+            _va: carrick_guest_arch::UserVa,
+        ) -> Option<carrick_guest_arch::UserRange> {
+            None
+        }
+    }
+    impl AnonymousPermissionEditor for ForkAnonymousEditor<'_> {
+        fn protect_and_invalidate(
+            &mut self,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
+            edit: GuestPermissionEdit,
+        ) -> Result<(), GuestPermissionEditError> {
+            let root = ttbr0.raw() & Self::TTBR_BADDR_MASK;
+            let table = self
+                .table_for(ttbr0.raw())
+                .ok_or(GuestPermissionEditError::TableOutsidePrimary)?;
+            unsafe {
+                protect_existing_el1_private_pages(
+                    table.words.as_ptr().cast_mut(),
+                    root,
+                    table.words.len() * 8,
+                    Some(self.pool),
+                    edit,
+                )?;
+            }
+            Ok(())
+        }
+    }
+    impl AnonymousRetirementEditor for ForkAnonymousEditor<'_> {
+        fn retire_and_invalidate(
+            &mut self,
+            _mm: carrick_el1_abi::ReservationMm,
+            ttbr0: carrick_guest_arch::AddressSpaceRegister,
+            address: carrick_guest_arch::UserVa,
+            len: carrick_guest_arch::GuestLen,
+        ) -> Result<(), GuestRetirementError> {
+            let root = ttbr0.raw() & Self::TTBR_BADDR_MASK;
+            let table = self
+                .table_for(ttbr0.raw())
+                .ok_or(GuestRetirementError::TableOutsidePrimary)?;
+            unsafe {
+                retire_existing_el1_private_pages(
+                    table.words.as_ptr().cast_mut(),
+                    root,
+                    table.words.len() * 8,
+                    Some(self.pool),
+                    address.raw(),
+                    len.raw(),
+                )?;
+            }
+            Ok(())
+        }
+    }
+
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let parent_tables = Tables::new(ROOT, IPA, 0);
+    let child = Tables::new(ROOT + 0x10_0000, 0, 0);
+    let supply = Tables::new(ROOT + 0x20_0000, 0, 0);
+    let nz = |v| NonZeroU64::new(v).unwrap();
+
+    // Publish two resident EL1-private RW pages at VA before the guest calls mprotect.
+    let prepared = execute_descriptor_op(
+        &parent_tables.live(&CallerInvalidatesAsid),
+        SubstrateGpa(ROOT),
+        DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: VA,
+                ipa: IPA,
+                len: 8192,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(VA, 8192),
+            backing: BackingIdentity {
+                frame_id: nz(1),
+                mapping_id: nz(2),
+                owner_generation: nz(3),
+                inventory_revision: nz(4),
+            },
+        },
+        &TableGrants::NONE,
+        &mut InlineJournal::new(),
+    );
+    assert!(
+        matches!(prepared, DescriptorOutcome::Applied(_)),
+        "{prepared:?}"
+    );
+
+    let copy_base = carrick_el1_abi::EL1_COW_COPY_BASE;
+    let indices = carrick_mmu_core::aarch64::indices(copy_base);
+    parent_tables.words[512 + indices[1]].store((ROOT + 0x4000) | 3, Ordering::Release);
+    parent_tables.words[2048 + indices[2]].store((ROOT + 0x5000) | 3, Ordering::Release);
+    for page in 0..2 {
+        parent_tables.words[2560 + indices[3] + page]
+            .store(copy_base + page as u64 * 4096, Ordering::Release);
+    }
+
+    let arenas = [&parent_tables, &child, &supply];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let fork_leaf = |root: u64, va: u64| -> u64 {
+        let mut table = root;
+        for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+            let descriptor = words.load(table + ((va >> shift) & 511) * 8).unwrap();
+            if level == 3 || descriptor & 3 != 3 {
+                return descriptor;
+            }
+            table = descriptor & 0x0000_ffff_ffff_f000;
+        }
+        unreachable!()
+    };
+    let counters = Box::new(Counters::default());
+    let guest_mprotect = |mm_key: u64, va: u64, len: u64, prot: u64| {
+        let task = CurrentTask::new();
+        task.execution.task.store(mm_key + 100, Ordering::Relaxed);
+        task.mm.thread_generation.store(1, Ordering::Relaxed);
+        task.mm.key.store(mm_key, Ordering::Relaxed);
+        let mut frame = TrapFrame {
+            slot: 0,
+            elr: 0x40004,
+            ..TrapFrame::default()
+        };
+        frame.x[0] = va;
+        frame.x[1] = len;
+        frame.x[2] = prot;
+        frame.x[8] = 226;
+        let mut editor = ForkAnonymousEditor {
+            arenas: &arenas,
+            pool: TableWindow {
+                words: supply.words.as_ptr().cast_mut(),
+                physical_base: supply.base,
+                byte_len: supply.words.len() * 8,
+            },
+        };
+        let route = serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &task,
+            SpaceAccess::source_free_with_context(&spaces),
+            region.table(),
+            &mut editor,
+            None,
+        );
+        (route, frame.x[0] as i64)
+    };
+
+    // Apply PROT_NONE through the guest path (nr 226) before fork, leaving a valid AP_PRIV_RO leaf.
+    assert_eq!(
+        guest_mprotect(77, VA, 8192, 0),
+        (DelegatedAnonymous::Served, 0)
+    );
+    for page in 0..2 {
+        let leaf = fork_leaf(ROOT, VA + page * 4096);
+        assert_ne!(leaf & 1, 0, "guest PROT_NONE keeps resident leaf valid");
+        assert!(!terminal_descriptor_permits_el0(leaf, LeafAccess::Read));
+        assert!(!terminal_descriptor_permits_host_buffer(
+            leaf,
+            LeafAccess::Read
+        ));
+    }
+
+    let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
+    let plan = portal
+        .prepare_fork(
+            request,
+            ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
+            &words,
+            0,
+        )
+        .unwrap();
+    let receipt = portal
+        .publish_fork(plan, &words, 0)
+        .unwrap()
+        .commit(&portal, 0)
+        .unwrap();
+    spaces.open(spaces.find(78).unwrap());
+    for root in [ROOT, child.base] {
+        for page in 0..2 {
+            let leaf = fork_leaf(root, VA + page * 4096);
+            assert!(terminal_descriptor_is_fork_cow(leaf));
+            assert!(!terminal_descriptor_permits_el0(leaf, LeafAccess::Read));
+            assert!(!terminal_descriptor_permits_el0(leaf, LeafAccess::Write));
+        }
+    }
+
+    // Child mprotect(PROT_READ), then widen to PROT_READ|PROT_WRITE and narrow page 1 back to PROT_READ.
+    assert_eq!(
+        guest_mprotect(78, VA, 8192, 1),
+        (DelegatedAnonymous::Served, 0)
+    );
+    for page in 0..2 {
+        let leaf = fork_leaf(child.base, VA + page * 4096);
+        assert!(terminal_descriptor_is_fork_cow(leaf));
+        assert!(terminal_descriptor_permits_el0(leaf, LeafAccess::Read));
+        assert!(!terminal_descriptor_permits_el0(leaf, LeafAccess::Write));
+        assert!(
+            !terminal_descriptor_permits_el0(fork_leaf(ROOT, VA + page * 4096), LeafAccess::Read),
+            "child mprotect must not alter parent descriptors"
+        );
+    }
+    assert_eq!(
+        guest_mprotect(78, VA, 8192, 3),
+        (DelegatedAnonymous::Served, 0)
+    );
+    assert_eq!(
+        guest_mprotect(78, VA + 4096, 4096, 1),
+        (DelegatedAnonymous::Served, 0)
+    );
+    for page in 0..2 {
+        let leaf = fork_leaf(child.base, VA + page * 4096);
+        assert!(terminal_descriptor_is_fork_cow(leaf));
+        assert!(
+            !terminal_descriptor_permits_el0(leaf, LeafAccess::Write),
+            "COW leaf must never grant EL0 write before COW copy"
+        );
+    }
+
+    // Parent also mprotects its COW-armed copy (widen to RW, narrow page 1 to PROT_NONE).
+    assert_eq!(
+        guest_mprotect(77, VA, 8192, 3),
+        (DelegatedAnonymous::Served, 0)
+    );
+    assert_eq!(
+        guest_mprotect(77, VA + 4096, 4096, 0),
+        (DelegatedAnonymous::Served, 0)
+    );
+    assert!(terminal_descriptor_is_fork_cow(fork_leaf(ROOT, VA)));
+    assert!(!terminal_descriptor_permits_el0(
+        fork_leaf(ROOT, VA),
+        LeafAccess::Write
+    ));
+    assert!(!terminal_descriptor_permits_el0(
+        fork_leaf(ROOT, VA + 4096),
+        LeafAccess::Read
+    ));
+
+    let original = [0x5a_u8; 8192];
+    let child_replacement = core::cell::RefCell::new([0_u8; 16384]);
+    let parent_replacement = core::cell::RefCell::new([0_u8; 16384]);
+    let pool = carrick_el1_abi::CowGrantPool::new();
+    let child_ipa = IPA + 0x10_0000;
+    let parent_ipa = IPA + 0x20_0000;
+    pool.publish(
+        78,
+        child_ipa,
+        BackingIdentity {
+            frame_id: nz(11),
+            mapping_id: nz(12),
+            owner_generation: nz(13),
+            inventory_revision: nz(14),
+        },
+    )
+    .unwrap();
+    pool.publish(
+        77,
+        parent_ipa,
+        BackingIdentity {
+            frame_id: nz(21),
+            mapping_id: nz(22),
+            owner_generation: nz(23),
+            inventory_revision: nz(24),
+        },
+    )
+    .unwrap();
+    let residency = residency();
+
+    // Child write to narrowed RO page 1 declines COW; write to widened RW page 0 COW-copies.
+    {
+        let _editor = spaces
+            .try_begin_edit(spaces.find(78).unwrap(), 78, nz(2))
+            .unwrap();
+        let child_venue = carrick_el1::cow::GuestCowVenue {
+            words: &words,
+            root: SubstrateGpa(child.base),
+            pool: &pool,
+            residency: &residency,
+            copy_window: carrick_el1::cow::CowCopyWindow::target(&words, SubstrateGpa(child.base)),
+            publish_executable: None,
+        };
+        assert_eq!(
+            carrick_el1::cow::resolve_guest_cow(
+                &child_venue,
+                receipt.child.mm().raw(),
+                VA + 4096,
+                |_, _| panic!("RO COW page must not copy"),
+                || {},
+            ),
+            Ok(carrick_el1::cow::GuestCowOutcome::Declined(
+                CowDecline::NoWriteIntent
+            ))
+        );
+        let outcome = carrick_el1::cow::resolve_guest_cow(
+            &child_venue,
+            receipt.child.mm().raw(),
+            VA,
+            |source, target| {
+                let source = fork_translate(&words, child.base, source) - IPA;
+                let target = fork_translate(&words, child.base, target) - child_ipa;
+                child_replacement.borrow_mut()[target as usize..target as usize + 4096]
+                    .copy_from_slice(&original[source as usize..source as usize + 4096]);
+            },
+            || {},
+        );
+        assert!(
+            matches!(outcome, Ok(carrick_el1::cow::GuestCowOutcome::Resolved(_))),
+            "{outcome:?}"
+        );
+    }
+    child_replacement.borrow_mut()[..4].copy_from_slice(b"chld");
+    assert_eq!(original, [0x5a; 8192]);
+    assert_eq!(fork_translate(&words, child.base, VA), child_ipa);
+    assert!(terminal_descriptor_permits_el0(
+        fork_leaf(child.base, VA),
+        LeafAccess::Write
+    ));
+    assert!(!terminal_descriptor_permits_el0(
+        fork_leaf(child.base, VA + 4096),
+        LeafAccess::Write
+    ));
+    assert_eq!(fork_translate(&words, ROOT, VA), IPA);
+
+    // Parent write to narrowed PROT_NONE page 1 declines COW; write to widened RW page 0 COW-copies
+    // from the untouched original bytes without observing or disturbing the child's private copy.
+    {
+        let _editor = spaces
+            .try_begin_edit(spaces.find(77).unwrap(), 77, nz(2))
+            .unwrap();
+        let parent_venue = carrick_el1::cow::GuestCowVenue {
+            words: &words,
+            root: SubstrateGpa(ROOT),
+            pool: &pool,
+            residency: &residency,
+            copy_window: carrick_el1::cow::CowCopyWindow::target(&words, SubstrateGpa(ROOT)),
+            publish_executable: None,
+        };
+        assert_eq!(
+            carrick_el1::cow::resolve_guest_cow(
+                &parent_venue,
+                parent.raw(),
+                VA + 4096,
+                |_, _| panic!("PROT_NONE COW page must not copy"),
+                || {},
+            ),
+            Ok(carrick_el1::cow::GuestCowOutcome::Declined(
+                CowDecline::NoWriteIntent
+            ))
+        );
+        let outcome = carrick_el1::cow::resolve_guest_cow(
+            &parent_venue,
+            parent.raw(),
+            VA,
+            |source, target| {
+                let source = fork_translate(&words, ROOT, source) - IPA;
+                let target = fork_translate(&words, ROOT, target) - parent_ipa;
+                parent_replacement.borrow_mut()[target as usize..target as usize + 4096]
+                    .copy_from_slice(&original[source as usize..source as usize + 4096]);
+            },
+            || {},
+        );
+        assert!(
+            matches!(outcome, Ok(carrick_el1::cow::GuestCowOutcome::Resolved(_))),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(&parent_replacement.borrow()[..4], &[0x5a; 4]);
+    parent_replacement.borrow_mut()[..4].copy_from_slice(b"prnt");
+    assert_eq!(&child_replacement.borrow()[..4], b"chld");
+    assert_eq!(original, [0x5a; 8192]);
+    assert_eq!(fork_translate(&words, ROOT, VA), parent_ipa);
+    assert_eq!(fork_translate(&words, child.base, VA), child_ipa);
+    assert!(terminal_descriptor_permits_el0(
+        fork_leaf(ROOT, VA),
+        LeafAccess::Write
+    ));
+    assert!(!terminal_descriptor_permits_el0(
+        fork_leaf(ROOT, VA + 4096),
+        LeafAccess::Read
+    ));
+}
+
 struct FailingForkWords<'a> {
     inner: ForkWords<'a>,
     live_cas: core::cell::Cell<usize>,

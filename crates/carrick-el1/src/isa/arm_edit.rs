@@ -66,6 +66,7 @@ pub fn lower_edit_intent(intent: EditIntent<'_, RootGpa>) -> Result<DescriptorTx
                 readable: permissions.readable,
                 writable: permissions.writable,
                 executable: permissions.executable,
+                cow_ceiling: None,
             })
         }
         EditOperation::Publish { expected, access } => DescriptorOp::Publish {
@@ -242,6 +243,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 executable: false,
+                cow_ceiling: None,
             })
         );
     }

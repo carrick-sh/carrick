@@ -2279,6 +2279,22 @@ impl<
         runs.finish()?;
         Ok(())
     }
+    /// Common [`ReservationPolicy::protection_ceiling`] across the contiguous
+    /// committed nodes covering `range`, or `None` if unadmitted or a hole
+    /// intersects `range`.
+    pub fn protection_ceiling(&mut self, range: ReservationRange) -> Option<ReservationProtection> {
+        if !self.is_admitted() {
+            return None;
+        }
+        let mut ceiling = ReservationProtection::READ_WRITE_EXECUTE.bits();
+        let mut cursor = range.start();
+        while cursor < range.end() {
+            let n = self.next(cursor).filter(|n| n.start <= cursor)?;
+            ceiling &= Policy::protection_ceiling(&n).bits();
+            cursor = n.end;
+        }
+        ReservationProtection::from_bits(ceiling)
+    }
     /// The Linux mapping around `[start, end)`: the adjacent run of nodes of
     /// one mapping starting with the node holding `start`, extended until it
     /// covers `end`. `None` when a hole or another mapping comes first.

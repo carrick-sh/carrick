@@ -91,6 +91,7 @@ impl ReservationProtection {
     pub const WRITE: Self = Self(2);
     pub const EXECUTE: Self = Self(4);
     pub const READ_WRITE: Self = Self(3);
+    pub const READ_WRITE_EXECUTE: Self = Self(7);
     pub const fn from_bits(bits: u64) -> Option<Self> {
         if bits & !7 == 0 {
             Some(Self(bits))
@@ -470,6 +471,7 @@ pub trait ReservationPolicy {
     fn root_editable(node: &ReservationNodeData) -> bool;
     fn flags(node: &ReservationNodeData) -> ReservationNodeFlags;
     fn protection(node: &ReservationNodeData) -> ReservationProtection;
+    fn protection_ceiling(node: &ReservationNodeData) -> ReservationProtection;
     fn charged_data(node: &ReservationNodeData) -> u64;
     fn charged_locked(node: &ReservationNodeData) -> u64;
     fn charges_within(node: &ReservationNodeData, start: u64, end: u64) -> Charges;

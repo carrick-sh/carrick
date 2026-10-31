@@ -579,6 +579,15 @@ pub struct GuestLeafPublication {
     pub executable: bool,
 }
 
+/// Mapping protection ceiling (`VM_MAY*`) authorizing a COW-armed private leaf
+/// permission edit when `SW_EL1_MAY_WRITE` carries current write intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestPermissionCeiling {
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
 /// One resident private-anonymous permission transition owned by guest EL1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestPermissionEdit {
@@ -587,6 +596,7 @@ pub struct GuestPermissionEdit {
     pub readable: bool,
     pub writable: bool,
     pub executable: bool,
+    pub cow_ceiling: Option<GuestPermissionCeiling>,
 }
 
 /// Why EL1 could not own a requested resident-anonymous protection edit.
@@ -11119,6 +11129,7 @@ mod tests {
                         readable,
                         writable,
                         executable: false,
+                        cow_ceiling: None,
                     },
                 )
             }
@@ -11160,6 +11171,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: true,
+                        cow_ceiling: None,
                     },
                 )
             },
@@ -11208,6 +11220,7 @@ mod tests {
                         readable: true,
                         writable: false,
                         executable: false,
+                        cow_ceiling: None,
                     },
                 )
             },
@@ -11237,6 +11250,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
+                        cow_ceiling: None,
                     },
                 )
             },
@@ -11601,6 +11615,7 @@ mod tests {
             readable: true,
             writable: false,
             executable: false,
+            cow_ceiling: None,
         })
         .expect("RW to RO");
         for page in 0..3 {
@@ -11626,6 +11641,7 @@ mod tests {
             readable: false,
             writable: false,
             executable: false,
+            cow_ceiling: None,
         })
         .expect("RO to PROT_NONE");
         for page in 0..3 {
@@ -11643,6 +11659,7 @@ mod tests {
             readable: true,
             writable: true,
             executable: false,
+            cow_ceiling: None,
         })
         .expect("PROT_NONE to RW");
         assert!(
@@ -11661,6 +11678,7 @@ mod tests {
                 readable: true,
                 writable: true,
                 executable: true,
+                cow_ceiling: None,
             }),
             Err(GuestPermissionEditError::PermissionWidening)
         );
@@ -11925,6 +11943,7 @@ mod tests {
                     readable,
                     writable,
                     executable: false,
+                    cow_ceiling: None,
                 })
                 .expect("permission edit must stay inside the target range");
         }
@@ -12167,6 +12186,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
+                        cow_ceiling: None,
                     },
                 )
             },
@@ -12454,6 +12474,7 @@ mod tests {
                 readable,
                 writable: false,
                 executable: false,
+                cow_ceiling: None,
             };
             assert_eq!(
                 unsafe {
@@ -12593,6 +12614,7 @@ mod tests {
                     readable,
                     writable,
                     executable: false,
+                    cow_ceiling: None,
                 };
                 assert_eq!(
                     unsafe {
