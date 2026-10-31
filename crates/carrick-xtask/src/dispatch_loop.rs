@@ -1608,6 +1608,49 @@ struct Server<'a> {
     capacity: Option<(Instant, Value)>,
     resume_fetched: bool,
 }
+/// Server-checked facts about a PR round's result (#1215).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoundFacts {
+    /// Commits this round added to the PR; `None` when unreadable.
+    pushed: Option<u64>,
+    /// Commits on `main` the PR head lacks.
+    behind: Option<u64>,
+    /// GitHub reports the PR as not mergeable.
+    conflicts: Option<bool>,
+}
+impl RoundFacts {
+    fn report(&self) -> String {
+        let known = |v: Option<String>| v.unwrap_or_else(|| "unknown".into());
+        format!(
+            "Server checked: commits pushed this round: {}; commits behind main: {}; conflicts with main: {}.",
+            known(self.pushed.map(|n| n.to_string())),
+            known(self.behind.map(|n| n.to_string())),
+            known(
+                self.conflicts
+                    .map(|c| if c { "yes" } else { "no" }.to_owned())
+            ),
+        )
+    }
+    /// A Done that pushed nothing on a PR that is behind or conflicting
+    /// left the PR where it was (#1134's false Done).
+    fn stalled(&self) -> Option<String> {
+        if self.pushed != Some(0) {
+            return None;
+        }
+        let behind = self.behind.filter(|n| *n > 0);
+        let conflicts = self.conflicts == Some(true);
+        match (behind, conflicts) {
+            (None, false) => None,
+            (Some(n), false) => Some(format!(
+                "nothing was pushed and the PR is {n} commits behind main"
+            )),
+            (None, true) => Some("nothing was pushed and the PR conflicts with main".into()),
+            (Some(n), true) => Some(format!(
+                "nothing was pushed and the PR is {n} commits behind main and conflicts with it"
+            )),
+        }
+    }
+}
 impl Server<'_> {
     fn post(&self, body: &str) -> Result<(), ScalerError> {
         let state = crate::agent_runner::state()?;
@@ -1676,24 +1719,34 @@ impl Server<'_> {
         let unpushed = (observations.is_empty() && status == ContractStatus::Done)
             .then(|| self.unpushed_head())
             .flatten();
+        let facts = self.pr.map(|pr| self.round_facts(pr));
+        let stalled =
+            (observations.is_empty() && unpushed.is_none() && status == ContractStatus::Done)
+                .then(|| facts.as_ref().and_then(RoundFacts::stalled))
+                .flatten();
         let status = if !observations.is_empty() {
             ContractStatus::Failed
         } else if applied.adoption_blocked.is_some() && status == ContractStatus::Done {
             // An adopted PR moved or was rewritten: nothing was pushed.
             ContractStatus::Blocked
-        } else if unpushed.is_some() {
-            // Done means pushed (#1168).
+        } else if unpushed.is_some() || stalled.is_some() {
+            // Done means pushed (#1168), and a Done that changed nothing
+            // must not leave the PR behind or conflicting (#1215).
             ContractStatus::Blocked
         } else {
             status
         };
-        let applied = if let Some(reason) = &unpushed {
+        let checked = facts
+            .as_ref()
+            .map(|f| format!("{}\n\n", f.report()))
+            .unwrap_or_default();
+        let applied = if let Some(reason) = unpushed.as_ref().or(stalled.as_ref()) {
             format!(
-                "Server observed: {reason}, so done is reported as blocked.\n\n{}",
+                "Server observed: {reason}, so done is reported as blocked.\n\n{checked}{}",
                 applied.report()
             )
         } else if observations.is_empty() {
-            applied.report()
+            format!("{checked}{}", applied.report())
         } else {
             format!(
                 "Server observed: {}.\n\n{}",
@@ -1835,6 +1888,54 @@ impl Server<'_> {
     }
     /// A `done` round must have pushed the worker's last commit: the live
     /// branch head equals the last harvested head, or the worker made none.
+    /// What the server can check about the PR at outcome time (#1215): a
+    /// coordinator's Done is a claim, these are facts. Each one that cannot
+    /// be read stays unknown and never changes the status.
+    fn round_facts(&self, pr: u64) -> RoundFacts {
+        let pushed = (|| -> Result<u64, ScalerError> {
+            let state = crate::agent_runner::state()?;
+            let Some(receipt) = worker_checkpoint(&state, &self.dispatch)? else {
+                return Ok(0);
+            };
+            if produced_nothing(&self.dispatch, &receipt) {
+                return Ok(0);
+            }
+            let from = match admitted_tip(&self.dispatch, &receipt) {
+                "" => self.dispatch.base.as_str(),
+                tip => tip,
+            };
+            let range = format!("{from}..{}", receipt.head);
+            git(&state.join("work"), &["rev-list", "--count", &range])?
+                .trim()
+                .parse()
+                .map_err(|_| ScalerError::Guard("commit count"))
+        })()
+        .ok();
+        let live = gh(
+            self.root,
+            &["api", &format!("repos/{REPOSITORY}/pulls/{pr}")],
+        )
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let head = live
+            .as_ref()
+            .and_then(|p| p["head"]["sha"].as_str())
+            .filter(|h| sha(h))
+            .map(str::to_owned);
+        let behind = head.and_then(|head| {
+            let compare = gh(
+                self.root,
+                &["api", &format!("repos/{REPOSITORY}/compare/main...{head}")],
+            )
+            .ok()?;
+            serde_json::from_str::<Value>(&compare).ok()?["behind_by"].as_u64()
+        });
+        RoundFacts {
+            pushed,
+            behind,
+            conflicts: live.and_then(|p| p["mergeable"].as_bool().map(|m| !m)),
+        }
+    }
     fn unpushed_head(&self) -> Option<String> {
         let check = || -> Result<Option<String>, ScalerError> {
             let state = crate::agent_runner::state()?;
@@ -2008,6 +2109,23 @@ impl Server<'_> {
             &trigger_provenance(&self.trigger),
             self.trigger.clone(),
         )];
+        // Server facts about an adopted round's scope (#1215). The
+        // coordinator judges what they mean; publication enforces them.
+        if let Continuation::Adopted {
+            pr, tip, rebase, ..
+        } = &self.dispatch.continuation
+        {
+            items.push(state_item(
+                "adoption",
+                "server",
+                json!({"pr":pr,"admitted_tip":tip,"rebase_allowed":rebase,
+                    "publication":if *rebase {
+                        "accepts a HEAD that descends from the admitted tip, or a rebase of it onto admitted main"
+                    } else {
+                        "accepts only a HEAD that descends from the admitted tip; the owner's trigger did not say `Rebase: allowed`"
+                    }}),
+            ));
+        }
         let prs = match linked_prs(self.root, self.dispatch.issue, "all") {
             Ok(prs) => prs,
             Err(error) => {
@@ -2705,6 +2823,43 @@ fn post_loop_capture(
     }
     capture
 }
+/// Why a loop that never called finish ended, for its fallback outcome. A
+/// coordinator that stopped before its first tool call never started the
+/// work (the launcher could not resolve its model, #1215): that is an
+/// infrastructure failure, and the outcome says so rather than reading as
+/// the requested work failing.
+fn fallback_reason(
+    used: &Used,
+    result: &Result<(), ScalerError>,
+    loop_err: Option<&str>,
+) -> String {
+    if used.finishes != 0 {
+        return "Finish outcome post failed; server fallback.".into();
+    }
+    let ended = result
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "Loop exited without calling finish".into());
+    if used.calls != 0 || ended.contains("timed out") {
+        return ended;
+    }
+    // Only the pinned launcher's own diagnostic line is quoted; the rest of
+    // stderr stays in the masked run artifacts.
+    let launcher = loop_err
+        .into_iter()
+        .flat_map(str::lines)
+        .rev()
+        .find(|line| line.starts_with("agy-worker: "))
+        .map(|line| {
+            let line: String = line.chars().take(300).collect();
+            format!(" Launcher: `{}`.", line.replace('`', "'"))
+        })
+        .unwrap_or_default();
+    format!(
+        "Infrastructure failure: the coordinator stopped before its first tool call, so no work was attempted ({ended}).{launcher} This says nothing about the requested work; the round can be rerun once the launcher is healthy."
+    )
+}
 fn loop_completion(code: Result<i32, std::io::Error>, finished: bool) -> Result<(), ScalerError> {
     match (code?, finished) {
         (124, false) => Err(ScalerError::Guard("loop timed out without finish")),
@@ -2896,15 +3051,10 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
     let _final_commands = CommandWindow::until(final_deadline);
     let retirement = cleanup_dispatch_users();
     if !server.finished {
-        let reason = if server.used.finishes != 0 {
-            "Finish outcome post failed; server fallback.".into()
-        } else {
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "Loop exited without calling finish".into())
-        };
+        let loop_err = crate::agent_runner::state()
+            .ok()
+            .and_then(|state| regular_text(&state.join("loop.err")).ok());
+        let reason = fallback_reason(&server.used, &result, loop_err.as_deref());
 
         server.checkpoint_publish();
         server.outcome(ContractStatus::Failed, &reason)?;
@@ -2970,6 +3120,7 @@ mod tests {
             s.dispatch.review = false;
             s.dispatch.branch = "work/986-slice4".into();
             s.dispatch.continuation = Continuation::Adopted {
+                rebase: false,
                 pr: 800,
                 branch: "work/986-slice4".into(),
                 tip: "a".repeat(40),
@@ -4496,6 +4647,56 @@ fi
             );
         });
     }
+    /// #1134's false Done: no commits, the PR 108 behind main and in
+    /// conflict. The server's facts turn it into Blocked; a current PR stays
+    /// Done, so answer-only rounds still finish (#1215).
+    fn done_without_progress_fixture(behind: u64, mergeable: bool) {
+        shared_fixture(|root| {
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            pr["head"]["sha"] = json!("b".repeat(40));
+            pr["mergeable"] = json!(mergeable);
+            std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
+            std::fs::write(root.join("behind"), behind.to_string()).unwrap();
+            server(root)
+                .execute(Request::Finish(Outcome {
+                    status: ContractStatus::Done,
+                    summary: "Rebased onto main".into(),
+                }))
+                .unwrap();
+            let outcome: Contract = serde_json::from_str(
+                &regular_text(&root.join("dispatch-output/contract.json")).unwrap(),
+            )
+            .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            if behind > 0 || !mergeable {
+                assert_eq!(outcome.status, ContractStatus::Blocked, "{posted}");
+                assert!(
+                    posted.starts_with("Dispatch outcome: Blocked")
+                        && posted.contains("nothing was pushed and the PR is 108 commits behind main and conflicts with it")
+                        && posted.contains("> loop claimed: done"),
+                    "{posted}"
+                );
+            } else {
+                assert_eq!(outcome.status, ContractStatus::Done, "{posted}");
+            }
+            assert!(
+                posted.contains(&format!(
+                    "Server checked: commits pushed this round: 0; commits behind main: {behind}; conflicts with main: {}.",
+                    if mergeable { "no" } else { "yes" }
+                )),
+                "{posted}"
+            );
+        });
+    }
+    #[test]
+    fn done_without_progress_on_a_stale_conflicting_pr_is_blocked() {
+        done_without_progress_fixture(108, false);
+    }
+    #[test]
+    fn done_without_progress_on_a_current_pr_stays_done() {
+        done_without_progress_fixture(0, true);
+    }
     #[test]
     fn done_with_the_last_commit_pushed_stays_done() {
         done_means_pushed_fixture(false);
@@ -5338,7 +5539,7 @@ case "$endpoint" in
  */actions/artifacts*) test ! -f "$RUNNER_TEMP/no-repo-scan" || { echo 'repository-wide artifact scan' >&2; exit 92; }; cat "$RUNNER_TEMP/repo-artifacts.json" ;;
  */workflows/dispatch-worker.yml/runs*) cat "$RUNNER_TEMP/workflow-runs.json" ;;
  */actions/runs/*/jobs*) cat "$RUNNER_TEMP/jobs.json" ;;
- */compare/main...*) printf '{"files":[],"merge_base_commit":{"sha":"%040d"}}' 1 ;;
+ */compare/main...*) printf '{"files":[],"merge_base_commit":{"sha":"%040d"},"behind_by":%s}' 1 "$(cat "$RUNNER_TEMP/behind" 2>/dev/null || echo 0)" ;;
  */contents/.github/workflows/dispatch-worker.yml*)
    case "$endpoint" in *ref=main) printf '{"type":"file","sha":"%040d"}' 0 ;; *ref=0000000000000000000000000000000000000001) if test -f "$RUNNER_TEMP/workflow-base.json"; then cat "$RUNNER_TEMP/workflow-base.json"; else printf '{"type":"file","sha":"%040d"}' 0; fi ;; *) cat "$RUNNER_TEMP/workflow.json" ;; esac ;;
  */actions/runs/10??/artifacts*)
@@ -5710,6 +5911,50 @@ exec /usr/bin/git "$@"
                 "wrong fallback reason: {reason}"
             );
         });
+    }
+    #[test]
+    fn a_coordinator_that_never_starts_is_an_infrastructure_failure() {
+        // Run 41165350388: the launcher timed out resolving the model tier.
+        let stderr = "starting\nagy-worker: cannot resolve the latest model: Command '['/x/bin/agy', 'models']' timed out after 60 seconds\n";
+        let exited = loop_completion(Ok(1), false);
+        let reason = fallback_reason(&Used::default(), &exited, Some(stderr));
+        assert!(
+            reason.starts_with(
+                "Infrastructure failure: the coordinator stopped before its first tool call"
+            ) && reason.contains("loop exited without finish")
+                && reason.contains("Launcher: `agy-worker: cannot resolve the latest model")
+                && !reason.contains("starting"),
+            "{reason}"
+        );
+        // No launcher line: still infrastructure, nothing else quoted.
+        let reason = fallback_reason(&Used::default(), &exited, Some("secret-ish noise\n"));
+        assert!(
+            reason.starts_with("Infrastructure failure") && !reason.contains("noise"),
+            "{reason}"
+        );
+        // Once the coordinator called a tool, the work did start.
+        let used = Used {
+            calls: 1,
+            ..Used::default()
+        };
+        assert_eq!(
+            fallback_reason(&used, &exited, Some(stderr)),
+            "loop exited without finish"
+        );
+        // A timeout is the coordinator's own budget, never "did not start".
+        let timed_out = loop_completion(Ok(124), false);
+        assert_eq!(
+            fallback_reason(&Used::default(), &timed_out, Some(stderr)),
+            "loop timed out without finish"
+        );
+        let used = Used {
+            finishes: 1,
+            ..Used::default()
+        };
+        assert_eq!(
+            fallback_reason(&used, &exited, None),
+            "Finish outcome post failed; server fallback."
+        );
     }
     #[test]
     fn review_lease_wait_leaves_final_reserve() {

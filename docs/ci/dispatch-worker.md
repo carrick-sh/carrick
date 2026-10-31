@@ -121,10 +121,21 @@ from the new head. The controller also checks that the issue the guard named
 in its `Dispatch issue` step is the one it resolves itself.
 
 The director owns the adopted branch's history. Workers add commits on top of
-the admitted tip and never rebase or rewrite it; keeping the branch current
-with `main` stays the director's job, so publication never rebases an adopted
-branch. If the published HEAD does not descend from the admitted tip, the run
-pushes nothing and ends blocked. Workflow-file and closing-reference checks
+the admitted tip and never rebase or rewrite it, unless the director consents
+(owner decision, #1215). Consent is a line that is exactly `Rebase: allowed`
+in the admitted `/agent` comment, from the owner account (which director
+sessions post as); a write collaborator's trigger cannot consent. The guard
+records it as `Continuation::Adopted.rebase`, the coordinator sees it in
+`read_state` as an `adoption` item (`rebase_allowed`), and the worker brief
+asks for a rebase onto admitted main. Publication then accepts a HEAD that
+descends from admitted main instead of the admitted tip, pushes it only under
+the same `--force-with-lease` that starts at the admitted tip, and reports
+"Rebased onto main". The rebase must keep the director's history: every
+non-merge commit from the merge-base with main to the admitted tip must
+reappear above main with the same author email and subject, or nothing is
+pushed. A commit whose patch changed while resolving conflicts is allowed and
+listed in the outcome for the reviewer (`git cherry`). Without consent, or when a rewritten HEAD descends from
+neither, the run pushes nothing and ends blocked. Workflow-file and closing-reference checks
 count only the run's own commits (admitted tip to HEAD), never the
 director's.
 
@@ -496,6 +507,23 @@ verdict and evidence appear first; the loop's claimed status and summary are
 quoted below them. A successful worker that adds a normal commit on top of a
 checkpoint clears the floor. The checkpoint commit remains in the published
 history.
+
+Every outcome on a PR carries a "Server checked" line: the commits this round
+pushed (from the worker checkpoint against the admitted tip), how many
+commits the PR head is behind `main` (the compare API) and whether GitHub
+reports a conflict (`mergeable`). A fact the server cannot read is reported
+as unknown and changes nothing. When the coordinator finishes done but the
+round pushed nothing and the PR is behind or conflicting, the outcome is
+Blocked with those facts (#1215: a rebase round once reported Done on a PR
+108 commits behind and in conflict). Otherwise the coordinator's own
+judgement stands, so answer-only and review-only rounds can still be done.
+
+When the coordinator ends without `finish` before its first tool call, the
+fallback outcome says it is an infrastructure failure: no work was
+attempted, so it says nothing about the requested work. Only the pinned
+launcher's own `agy-worker:` diagnostic line is quoted; the rest of its
+stderr stays in the masked artifacts. A timeout, or an exit after the
+coordinator called a tool, keeps the plain reason.
 
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
