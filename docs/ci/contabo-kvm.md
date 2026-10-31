@@ -14,7 +14,7 @@ needs a controller restart, not a template rebuild.
 The same standing service also serves issue-label agent clones from template
 9000; see [dispatch-worker.md](dispatch-worker.md) for the four-clone budget,
 runner-independent credentials and VM-local leases. The KVM placement
-and its one-clone budget below stay the same.
+and its two-clone budget below are separate from the agent budget.
 
 This is trusted-ref CI infrastructure for an experimental project, not an
 adversarial isolation boundary.
@@ -32,10 +32,12 @@ adversarial isolation boundary.
 
 Selection is by `/etc/hostname` and fails closed: an unknown host is refused,
 never treated as Willow. Both sites use pool `carrick-ci`, template VMID 300
-and clone VMIDs 308-349. `--max-concurrency` stays 1. Contabo has 48 threads. Before dispatch cutover, the four static agent
-workers hold 40 vCPU and 96 GiB; agent clones must also pass headroom
-admission until those workers are retired. The 80% CPU admission
-ceiling remains an additional admission check; it is not cross-VM isolation.
+and clone VMIDs 308-349. Willow keeps `--max-concurrency 1`. Contabo runs
+`--max-concurrency 2` (owner, 2026-10-31, #1209): two KVM clones beside the
+four agent clones, 48 vCPU and 112 GiB at most on a 48-thread, 125 GiB host,
+now that the static agent workers are destroyed. Every clone, in either lane,
+still passes the 80% projected-CPU and memory admission checks, which defer a
+clone on a busy host; they are not cross-VM isolation.
 Each VM serializes its own builds, gates and oracle phases with a local lease.
 
 On Contabo, clones sit on the private NAT bridge, which they share with the
@@ -173,7 +175,7 @@ LoadCredentialEncrypted=gh-token:/etc/credstore.encrypted/carrick-ci-gh-token
 LoadCredentialEncrypted=dispatch-app-key:/etc/credstore.encrypted/carrick-dispatch-app-key
 Environment=PATH=/root/carrick-ci/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # `$$` passes `$` to the shell; systemd would otherwise substitute it.
-ExecStart=/bin/sh -c 'GH_TOKEN=$$(cat "$${CREDENTIALS_DIRECTORY}/gh-token"); export GH_TOKEN; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1 --max-concurrency 1'
+ExecStart=/bin/sh -c 'GH_TOKEN=$$(cat "$${CREDENTIALS_DIRECTORY}/gh-token"); export GH_TOKEN; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1 --max-concurrency 2'
 Restart=on-failure
 RestartSec=60
 

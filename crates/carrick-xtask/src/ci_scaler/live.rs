@@ -1841,11 +1841,6 @@ pub(super) fn controller(
     let contabo_standing =
         pve.site.node == site::CONTABO.node && matches!(admission, Admission::Standing);
     let agents = contabo_standing && std::env::var("CARRICK_AGENT_CLONES").as_deref() != Ok("0");
-    if contabo_standing && limit != Concurrency::ONE {
-        return Err(ScalerError::Guard(
-            "Contabo reserves one KVM clone beside four agent clones",
-        ));
-    }
     let lanes = if agents {
         vec![CloneLane::Kvm, CloneLane::Agent]
     } else {
