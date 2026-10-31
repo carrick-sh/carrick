@@ -13,9 +13,8 @@
       "Edit",
       "Write",
       "NotebookEdit",
-      "WebFetch"
+      "WebFetch",
+      "WebSearch"
     ]
-  },
-  "enableAllProjectMcpServers": true,
-  "enabledMcpjsonServers": ["carrick-reactor"]
+  }
 }
