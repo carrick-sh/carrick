@@ -1285,6 +1285,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_with<
     control: &'static carrick_el1_abi::ThreadControlSlot,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     frame: &mut carrick_el1_abi::TrapFrame,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
     deliver: F,
 ) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
 where
@@ -1322,6 +1323,7 @@ where
     }
     // A host-classified fault returns through the durable signal checkpoint.
     // It is a fault return, never fatal-owner cancellation or syscall restart.
+    let entry_syndrome = (frame.esr, frame.far);
     if let Some((_, _, address, _)) = control.synchronous_fault() {
         frame.esr = HOST_CLASSIFIED_DATA_ABORT_ESR;
         frame.far = address;
@@ -1338,6 +1340,7 @@ where
             frame.far,
             |process| deliver(process, frame),
         ),
+        owner_wait,
     )?;
     // Admission can also close between venue selection and the owner retain.
     if action == Action::Forward
@@ -1345,19 +1348,35 @@ where
         && control.synchronous_fault().is_some()
     {
         control.synchronous_fault_default();
+        // The terminal verdict supersedes the owner dependency: nothing will
+        // rerun this fault in ring, so no receipt may park the thread.
+        *owner_wait = None;
+    }
+    if owner_wait.is_some() {
+        // Nothing was delivered. The parked thread resumes at the faulting
+        // instruction, so the entry syndrome must survive for that rerun.
+        (frame.esr, frame.far) = entry_syndrome;
     }
     Ok(action)
 }
 
 /// Admission refusals precede signal publication; the loaded host executor
 /// retains the fault on Forward. Only a broken binding is a carrier invariant.
+/// An owner-memory wait is contention with a release notification: it keeps
+/// the retained fault and hands the receipt to the caller, which parks the
+/// thread on the owner and reruns the fault, exactly as a supply wait does.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn declined_fault_admission_result(
+pub(crate) fn declined_fault_admission_result(
     result: Result<Action, super::native_process_runtime::NativeProcessError>,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
 ) -> Result<Action, super::native_process_runtime::NativeProcessError> {
     use super::native_process_runtime::NativeProcessError;
     match result {
         Ok(action) => Ok(action),
+        Err(NativeProcessError::OwnerWait(wait)) => {
+            *owner_wait = Some(wait);
+            Ok(Action::Forward)
+        }
         Err(
             error @ (NativeProcessError::Invalid
             | NativeProcessError::Stale
@@ -1387,20 +1406,25 @@ fn declined_fault_admission_busy_once_then_success() {
         NativeProcessError::GroupExitCustody,
         NativeProcessError::NoChild,
     ] {
+        let mut owner_wait = None;
         assert_eq!(
-            declined_fault_admission_result(Err(error)),
+            declined_fault_admission_result(Err(error), &mut owner_wait),
             Ok(Action::Forward)
         );
+        assert_eq!(owner_wait, None);
     }
     for error in [
         NativeProcessError::Invalid,
         NativeProcessError::Stale,
         NativeProcessError::Quarantined,
     ] {
-        assert_eq!(declined_fault_admission_result(Err(error)), Err(error));
+        assert_eq!(
+            declined_fault_admission_result(Err(error), &mut None),
+            Err(error)
+        );
     }
     assert_eq!(
-        declined_fault_admission_result(Ok(Action::Served)),
+        declined_fault_admission_result(Ok(Action::Served), &mut None),
         Ok(Action::Served)
     );
 }
@@ -1418,6 +1442,7 @@ pub(crate) fn arm_deliver_declined_fault_signal<X: super::aarch64_process::ForkS
     control: &'static carrick_el1_abi::ThreadControlSlot,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     frame: &mut carrick_el1_abi::TrapFrame,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
     deliver: F,
 ) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
 where
@@ -1433,7 +1458,7 @@ where
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 {
     arm_deliver_declined_fault_signal_with(
-        source, task, native, ttbr0, page, control, service, frame, deliver,
+        source, task, native, ttbr0, page, control, service, frame, owner_wait, deliver,
     )
 }
 
@@ -1441,7 +1466,10 @@ where
 /// and host-classified faults on a `SignalOwner` thread.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
-pub(crate) fn arm_deliver_declined_fault_signal_current(frame: &mut TrapFrame) -> Action {
+pub(crate) fn arm_deliver_declined_fault_signal_current(
+    frame: &mut TrapFrame,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
+) -> Action {
     let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
         unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
     let Some(task) = current_tasks.get(frame.slot as usize) else {
@@ -1468,6 +1496,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_current(frame: &mut TrapFrame) -
         control,
         &mut service,
         frame,
+        owner_wait,
         |process, frame| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
     .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding))
@@ -1503,7 +1532,9 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         if !classified_fault_entry_permitted(frame.esr) {
             invalid_completion(NativeInvariant::EntryBinding);
         }
-        return arm_deliver_declined_fault_signal_current(frame);
+        // This checkpoint has no fault rerun venue to park: an owner wait
+        // stays Forward with the host-retained payload, as Busy does (#1083).
+        return arm_deliver_declined_fault_signal_current(frame, &mut None);
     }
     let fatal_owner_cancel = frame.esr == 0xfffc;
     let Some(task) = current_tasks.get(frame.slot as usize) else {

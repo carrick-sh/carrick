@@ -11,6 +11,8 @@ structural_budgets = []
 [bindings]
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::{arm_classified_maperr_and_bus_use_signal_owner,arm_classified_fault_default_ignored_and_blocked_return_to_host_core_path,arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path,arm_classified_fault_racing_live_sibling_exit_group_settles,arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome,arm_permission_fault_keeps_signal_owner_after_admission_home_release}",
+  "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::declined_fault_owner_wait_parks_on_owner_and_reruns_with_retained_fault",
+  "carrick-el1-linux::dispatch::declined_fault_admission_busy_once_then_success",
   "carrick-conformance-contract::personality_boundary::tests::x86_signal_delivery_selects_through_one_shared_owner",
   "carrick-core-abi::entry::event_identity_tests::event_identity_rejects_reused_execution_or_thread_generation",
   "carrick-el1-abi::signal_ingress::tests::{full_queue_retains_owned_admission_until_drain,external_event_rejects_reused_task_binding_and_record,concurrent_ingress_delivers_every_record_once}",
