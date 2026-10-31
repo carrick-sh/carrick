@@ -224,7 +224,6 @@ host_crossings! {
     Pwritev = nr::PWRITEV, false, Permanent;
     Sendfile = nr::SENDFILE, false, Permanent;
     Pselect6 = nr::PSELECT6, false, Temporary;
-    Ppoll = nr::PPOLL, false, Temporary;
     Vmsplice = nr::VMSPLICE, false, Temporary;
     Splice = nr::SPLICE, false, Temporary;
     Tee = nr::TEE, false, Temporary;
@@ -446,8 +445,14 @@ mod tests {
     }
 
     #[test]
+    fn ppoll_has_no_host_syscall_fallback() {
+        assert!(!HostCrossingSet::Aarch64.is_allowed(nr::PPOLL));
+        assert!(!HostCrossingSet::X86.is_allowed(nr::PPOLL));
+    }
+
+    #[test]
     fn ring_first_census_guest_fd_and_memory_rows_are_temporary() {
-        for ordinal in [72, 73, 75, 76, 77, 199, 228, 229, 232, 233, 284] {
+        for ordinal in [72, 75, 76, 77, 199, 228, 229, 232, 233, 284] {
             assert_eq!(
                 AllowedHostCrossing::from_canonical_aarch64(CanonicalNr::new(ordinal))
                     .and_then(AllowedHostCrossing::kind),
@@ -534,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 123);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 122);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
@@ -546,8 +551,9 @@ mod tests {
         // Implemented families are not unported crossings. Their explicit declines
         // use typed family fallback and bypass this unported-call table.
         for wire_in_ring in [
-            CanonicalNr(27),  // inotify_add_watch
-            CanonicalNr(28),  // inotify_rm_watch
+            CanonicalNr(27), // inotify_add_watch
+            CanonicalNr(28), // inotify_rm_watch
+            nr::PPOLL,
             CanonicalNr(98),  // futex
             CanonicalNr(99),  // set_robust_list
             CanonicalNr(122), // sched_setaffinity

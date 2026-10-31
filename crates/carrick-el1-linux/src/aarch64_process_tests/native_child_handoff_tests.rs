@@ -3,6 +3,25 @@ use super::*;
 
 #[test]
 fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
+    fork_child_service_ack(false, false, false);
+}
+
+#[test]
+fn arm_native_fork_child_stdout_service_keeps_exact_entry() {
+    fork_child_service_ack(true, false, false);
+}
+
+#[test]
+fn arm_native_fork_child_stdout_retains_capability_after_root_exit_publication() {
+    fork_child_service_ack(true, true, false);
+}
+
+#[test]
+fn arm_native_fork_tree_releases_capability_after_last_exit() {
+    fork_child_service_ack(true, true, true);
+}
+
+fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
@@ -30,10 +49,65 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
         fixture.zone.record(child).claim(),
         carrick_sched_core::Claim::Queued { slot, .. } if slot == fixture.slot
     ));
+    let (weak_capability, weak_runtime) = {
+        let owner = registry()
+            .for_record(fixture.zone, fixture.zone.record_ref(child))
+            .expect("fork child is registered with the process owner");
+        (
+            owner.weak_exec_capability(),
+            std::sync::Arc::downgrade(&owner),
+        )
+    };
+    assert_eq!(
+        weak_capability.upgrade().map(|cap| cap.raw().get()),
+        Some(5)
+    );
+    assert!(weak_runtime.upgrade().is_some());
+    if root_exit {
+        // Real process exit publication removes the root from the live graph.
+        // A second executor can still be serving the child before the root's
+        // terminal carrier crossing stops the VM. The test crossing records
+        // that terminal request without stopping this VM-free test process.
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |entry| {
+                    assert!(matches!(
+                        entry.exit_group(0),
+                        carrick_personality_linux::lifecycle::LifecycleOutcome::Transferred { .. }
+                    ));
+                },
+            )
+            .unwrap();
+        assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+        assert!(
+            registry()
+                .for_record(fixture.zone, fixture.zone.record_ref(child))
+                .is_some()
+        );
+        assert_eq!(
+            weak_capability.upgrade().map(|cap| cap.raw().get()),
+            Some(5),
+            "surviving fork child retains the tree's host-file capability after root exit"
+        );
+        assert!(weak_runtime.upgrade().is_some());
+    }
+    // Use a distinct executor's task binding after root publication. The
+    // departed root still owes its terminal host-work doorbell; the child
+    // must not consume or inherit that executor-local obligation.
+    let task = if root_exit {
+        let task: &'static CurrentTask = Box::leak(Box::new(CurrentTask::new()));
+        service.task = task;
+        task
+    } else {
+        &fixture.task
+    };
     // The root's host continuation blocked and its executor detached the
     // loaded task. A native child is the only runnable work left.
     fixture.zone.publish_slot(fixture.slot, 0, None, 0);
-    fixture.task.mm.key.store(0, Ordering::Release);
+    task.mm.key.store(0, Ordering::Release);
     assert!(
         fixture
             .zone
@@ -50,7 +124,7 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
     };
     let action = super::super::dispatch::native_scheduler(
         &mut zone,
-        &fixture.task,
+        task,
         &counters,
         fixture.slot,
         &mut handoff,
@@ -75,7 +149,7 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
                 zone: fixture.zone,
                 slot: fixture.slot,
             },
-            &fixture.task,
+            task,
             child,
             &mut service,
         ),
@@ -88,7 +162,16 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
     let child_control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
     // Suspend this very child through the production service continuation.
     // Re-selecting a different MM would hide stale installed-space occupancy.
-    let saved = unsafe { *fixture.zone.record(child).ctx_mut() };
+    let mut saved = unsafe { *fixture.zone.record(child).ctx_mut() };
+    let stdout_bytes = b"mask-storm role=child sends=2000 send_failures=0 ok=true\n";
+    if stdout {
+        // Same SVC words as the signed sender's 57-byte stdout write.
+        saved.native.x[0] = 1;
+        saved.native.x[1] = stdout_bytes.as_ptr() as u64;
+        saved.native.x[2] = 0x39;
+        saved.native.x[8] = 64;
+        saved.native.pc = 0x2a6f20;
+    }
     let child_ttbr = cpu.ttbr;
     assert_eq!(fixture.zone.installed_space(fixture.slot), identity.mm);
     let result = with_process_entry(
@@ -96,23 +179,71 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
             zone: fixture.zone,
             slot: fixture.slot,
         },
-        &fixture.task,
+        task,
         &saved.native,
         child_ttbr.0,
         child_page,
         child_control,
         &mut service,
         |entry| {
-            let result = entry
-                .begin_service(
+            let result = if stdout {
+                use carrick_personality_linux::native_host_file::{
+                    DescriptionAccess, HostFileStage, NativeDescriptor,
+                };
+                let stage_frame = carrick_el1_abi::TrapFrame {
+                    x: saved.native.x,
+                    elr: saved.native.pc,
+                    esr: 0x56000000,
+                    slot: u64::from(fixture.slot.raw()),
+                    ..Default::default()
+                };
+                // Run the shipping staging entry point. A pre-encoded request
+                // bypasses its descriptor, input-copy and operation selection.
+                let Some(HostFileStage::Request {
+                    record,
+                    output,
+                    resolves_path,
+                    map,
+                }) = super::super::dispatch::native_host_file_stage(
+                    &stage_frame,
+                    task,
+                    &crate::file::HardwareValidator,
+                    [5, 1, 0],
+                    |fd| {
+                        assert_eq!(fd, 1);
+                        Some(NativeDescriptor::HostBacked {
+                            access: DescriptionAccess::WriteOnly,
+                        })
+                    },
+                    &mut |_| panic!("stdout releases no mapping sources"),
+                )
+                else {
+                    panic!("the fork child's stdout must stage a host request");
+                };
+                let result = entry.begin_host_file_service(record, output, resolves_path, map);
+                entry.settle_service_exit(
+                    result,
+                    super::super::native_process_runtime::NativeServiceExit::Bridge,
+                )
+            } else {
+                let result = entry.begin_service(
                     carrick_core_abi::service::ServiceOperation::CarrierWork {
                         entry: carrick_sched_core::object_wait::OwnerEntry::Exception,
                     },
                     None,
-                )
-                .unwrap();
-            assert!(entry.take_handoff_receipt().is_some());
-            result
+                );
+                assert!(entry.take_handoff_receipt().is_some());
+                result
+            };
+            assert!(
+                !matches!(
+                    result,
+                    Err(super::super::native_process_runtime::NativeProcessError::Stale)
+                ),
+                "child stdout refused Stale at {:?}",
+                entry.native_service_phase(),
+            );
+            result.unwrap()
         },
     )
     .unwrap();
@@ -127,7 +258,7 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
     assert_eq!(cpu.ttbr, (0x30000, 0x30000), "park left the child roots");
     assert_eq!(fixture.zone.installed_space(fixture.slot), 0);
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
-    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+    let selector = task.service_notice.take().unwrap().unwrap();
     let ticket = unsafe {
         carrick_core_abi::service::ServiceCell::claim_notice(
             &child_control.service,
@@ -137,6 +268,26 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
         )
     }
     .unwrap();
+    if stdout {
+        let carrick_core_abi::service::ServiceOperation::HostFile {
+            capability,
+            payload,
+        } = ticket.request().operation
+        else {
+            panic!("stdout must enter the host-file bridge");
+        };
+        assert_eq!(capability.raw().get(), 5);
+        // SAFETY: the exact pending owner retains this record until this ticket's ACK.
+        let record = unsafe {
+            core::slice::from_raw_parts_mut(
+                payload.address().raw() as *mut u8,
+                payload.length().raw() as usize,
+            )
+        };
+        let view = carrick_core_abi::host_file::HostFileRequestView::parse(record).unwrap();
+        assert_eq!(view.input(), stdout_bytes);
+        view.reply(57, &[]).unwrap();
+    }
     assert!(ticket.complete(true).is_ok());
     fixture
         .zone
@@ -161,7 +312,7 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
     assert_eq!(
         super::super::dispatch::native_scheduler(
             &mut zone,
-            &fixture.task,
+            task,
             &counters,
             fixture.slot,
             &mut handoff,
@@ -189,15 +340,16 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
             zone: fixture.zone,
             slot: fixture.slot,
         },
-        &fixture.task,
+        task,
         child,
         &mut service,
     );
     assert!(matches!(
         resumed,
         super::super::native_process_runtime::NativeResume::Returned(result)
-            if result.raw() as u64 == saved.native.x[0]
+            if result.raw() as u64 == if stdout { 57 } else { saved.native.x[0] }
     ));
+    drop(owner);
     assert_eq!(child_page.claimed_count(), 0);
     frame.x[8] = 172; // getpid, the child's first EL0 syscall.
     let cache = carrick_el1_abi::InotifyNameCache::new();
@@ -209,7 +361,7 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
     let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
         &mut frame,
         &counters,
-        core::slice::from_ref(&fixture.task),
+        core::slice::from_ref(task),
         &[],
         &[],
         &[],
@@ -236,6 +388,52 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
             | carrick_personality_linux::dispatch::CompletionRoute::WithWork
     ));
     assert_eq!(frame.x[0], child_pid);
+    if child_exit {
+        assert!(weak_capability.upgrade().is_some());
+        assert!(weak_runtime.upgrade().is_some());
+        let child_address = unsafe { fixture.zone.record(child).ctx_mut() }
+            .address_context()
+            .unwrap();
+        *service.crossing.zone.lock().unwrap() = Some(fixture.zone);
+        *service.crossing.child.lock().unwrap() = Some((
+            super::super::common_entry::execution_binding(task),
+            child_address,
+        ));
+        with_process_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            task,
+            &ThreadCtx::ZERO,
+            grant.ttbr0,
+            child_page,
+            child_control,
+            &mut service,
+            |entry| {
+                assert!(matches!(
+                    entry.exit_group(0),
+                    carrick_personality_linux::lifecycle::LifecycleOutcome::Transferred { .. }
+                ));
+            },
+        )
+        .unwrap();
+        assert!(
+            registry()
+                .for_record(fixture.zone, fixture.zone.record_ref(child))
+                .is_none()
+        );
+        assert_eq!(
+            weak_capability.strong_count(),
+            0,
+            "last member exit releases the tree's retained host-file capability"
+        );
+        assert_eq!(
+            weak_runtime.strong_count(),
+            0,
+            "last member exit releases the shared NativeProcessRuntime custody"
+        );
+    }
 }
 
 #[test]

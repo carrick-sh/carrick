@@ -174,6 +174,58 @@ pub(crate) fn el1_pwrite64<V: MemoryValidator>(
     unsafe { pwrite64_with(zf, cache_base, buf_va, count, offset, &mut user) }
 }
 
+/// Bind ring output to the existing exact-MM native write protocol. Input
+/// remains guarded copy; a refused output carries its producer observation.
+pub(crate) struct OwnerCopy<'a, 'p, U, C: carrick_core_abi::EntryContext> {
+    pub inner: U,
+    pub owner: Option<&'a mut (dyn carrick_personality_linux::lifecycle::ProcessNative<C> + 'p)>,
+    pub wait: Option<carrick_core::mm::transaction::CopyoutRequest>,
+}
+impl<U: UserCopy, C: carrick_core_abi::EntryContext> UserCopy for OwnerCopy<'_, '_, U, C> {
+    fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
+        self.inner.copy_in(dst, address)
+    }
+    fn copy_out(&mut self, address: u64, bytes: &[u8]) -> bool {
+        if self.inner.copy_out(address, bytes) {
+            return true;
+        }
+        if self.owner.is_some() {
+            self.wait = Some(carrick_core::mm::transaction::CopyoutRequest {
+                address: carrick_guest_arch::UserVa::new(address),
+                len: carrick_guest_arch::GuestLen::new(bytes.len() as u64),
+            });
+        }
+        false
+    }
+    fn take_copyout_refusal(&mut self) -> Option<carrick_core::mm::transaction::CopyoutRequest> {
+        self.wait.take()
+    }
+    fn yield_owned_operation(
+        &mut self,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::OwnedOperationYield {
+        match self.owner.as_deref_mut() {
+            Some(owner) => owner.yield_owned_operation(operation),
+            None => carrick_core::mm::transaction::OwnedOperationYield::Unrouted(operation),
+        }
+    }
+    fn prepare_copyout(
+        &mut self,
+        request: carrick_core::mm::transaction::CopyoutRequest,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        match self.owner.as_deref_mut() {
+            Some(owner) => owner.prepare_owned_copyout(request, operation),
+            None => carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation),
+        }
+    }
+    fn interrupt_pending_wait(&mut self) -> bool {
+        self.owner
+            .as_deref_mut()
+            .is_some_and(|owner| owner.interrupt_pending_wait())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {

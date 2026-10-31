@@ -303,6 +303,35 @@ impl MemoryValidator for HardwareValidator {
 /// `false` means the copy cannot be done exactly here, and the caller takes its
 /// fallback path (EL1 forwards to the host; the host recalls the object).
 pub trait UserCopy {
+    fn take_copyout_refusal(&mut self) -> Option<carrick_core::mm::transaction::CopyoutRequest> {
+        None
+    }
+    fn yield_owned_operation(
+        &mut self,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::OwnedOperationYield {
+        carrick_core::mm::transaction::OwnedOperationYield::Unrouted(operation)
+    }
+    fn prepare_copyout(
+        &mut self,
+        _request: carrick_core::mm::transaction::CopyoutRequest,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation)
+    }
+
+    /// Consume a typed owner refusal from the last output attempt. No byte
+    /// from the refused piece was committed; the operation must retain custody.
+    fn take_owner_wait(&mut self) -> Option<carrick_core_abi::PortalOwnerWait> {
+        None
+    }
+
+    /// Probe and consume a pending native signal interruption after queue
+    /// enrollment or on a Signal handback.
+    fn interrupt_pending_wait(&mut self) -> bool {
+        false
+    }
+
     /// Copy `src` to the user buffer at `dst_va`.
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool;
     /// Fill `dst` from the user buffer at `src_va`.

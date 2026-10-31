@@ -194,3 +194,88 @@ queues:
   [`futex-contention.md`](conformance-contracts/futex-contention.md) and
   [`fork-stage1-image.md`](conformance-contracts/fork-stage1-image.md)) rather
   than appending to this normative guide.
+
+An owner-memory wait during that admission (`NativeProcessError::OwnerWait`)
+is the same contention with a release notification: the fault entry parks the
+thread on the owner and reruns the faulting instruction with the payload still
+retained. The host-classified checkpoint has no rerun venue and forwards it
+like Busy.
+
+### Retained in-ring read and ppoll copyout (#1035 / #898)
+
+`kernel.memory.owner-wait` covers the currently routed read and ppoll outputs.
+The ring uses the shared native `MmPortal::write_user_bytes` protocol to break
+inherited COW and hold an exact-MM fence through each page-sized output piece.
+An owner refusal retains the IPC description pin and delivered-byte cursor on
+the owner's existing scheduler queue. Only delivered pipe bytes are consumed;
+resumption takes that same operation before looking up a numeric descriptor.
+A completed ppoll answer retains its bytes, original ready count and next
+unwritten byte in the existing native service owner. Handled signals do not
+cancel that internal memory wait; fatal cancellation discards remaining output.
+No copy permit, editor or object lock survives a park.
+
+The real-fork binding
+`fork_child_pipe_copyout_selects_owner_preparation_with_two_live_mms` was red
+on main at `Some(InRing)` and is now enabled. It proves owner-preparation
+selection, not VMM supply. The two-live-process pipe binding
+`two_live_process_pipe_owner_wait_retains_exact_bytes_and_cursor` uses a real
+owner selector, Gate producer and scheduler continuation with simulated user
+bytes; it requires exactly 8192 delivered bytes, a 4096-byte retained cursor,
+and no writes into the peer MM. If the peer drains the source while output
+waits, the binding requires the delivered prefix without another readiness
+park. The ppoll completion bindings inject the
+second-page refusal at the physical-service boundary and check disjoint output,
+the original result and zero further output after fatal cancellation. Fatal
+publication during enrollment transfers terminal custody without sleeping or
+returning an ordinary errno.
+
+The work bound is one owner transfer per page-aligned copy piece, with no
+replayed prefix on resume and no additional poll readiness query after its
+answer has completed. The existing transfer and IPC work bounds remain intact.
+Signed IPC and `el1_sched` binding, COW supply integration, runtime ratios and
+artifact promotion remain director-owned. Readv/pselect6 routing and x86 IPC
+binding remain the separately authorized work in #1040. Production ppoll
+admission and refusal policy are described below.
+
+The production AArch64 `TrapFrame` now admits ppoll to that same family.
+`production_trap_frame_routes_ppoll_to_the_poll_family` was red because it
+forwarded ordinal 73; the production-frame native completion binding also
+crosses the real classifier before suspending output on a Gate dependency.
+IPC poll snapshots use the shared pipe/eventfd readiness levels and zone-only
+epoll probe, with exact file-table lookup and independent duplicate entries.
+Unavailable or contended snapshots do not become POLLNVAL or false readiness.
+
+Output preparation begins only after a readiness decision completes. The old
+fallback dropped its local `PollContinuation` after clearing the executor;
+it is removed. Without a retained readiness venue, blocking and signal-mask
+polls remain unrouted and preserve user output (retained readiness: #1051).
+Ppoll has no host syscall
+allowlist fallback. Host-bound descriptors require an authenticated carrier
+readiness observation; a host-only selector cannot wait for an in-zone
+producer. These supported snapshots and copyout continuations are shared
+between ISAs; x86 IPC binding and broader routing remain #1040.
+
+Native pipe/eventfd copy faults settle their operation in ring, including a
+zero-byte read resumed after readiness or memory suspension. Genuine faults
+return errno 14 and release the operation pin; a delivered prefix remains a
+short read. The host-owned handback path retains its existing contract.
+
+Adapter service admission may itself refuse the retained IPC operation. The
+Busy-once binding `ipc_preparation_busy_once_requeues_then_completes_exact_operation`
+forces the production member-wait admission check to refuse once, then admits
+and acknowledges CarrierWork. It requires zero notices on refusal, one requeue,
+the same operation identity and endpoint pin, and successful completion after
+closing the numeric fd. The service-exit bindings exercise the production ARM
+closure's shared refusal mapping, including an empty receipt while preparation
+is still owed. They require resumption of the same record without restaging its
+owned IPC operation. Invalid, Stale and genuine Quarantined authentication
+failures remain invariants. These VM-free schedules reduce the admission seam;
+they do not emulate the mask storm's guest signal handlers or prove a signed
+pass rate. The director retains the five-run signed mask-storm check on #1044.
+
+The service-exit handback is scoped to CarrierWork with a retained IPC
+operation and pin. Native service tokens do not authorize it, and even a
+retained IPC token cannot authorize retrying the separately staged exec
+bridge. The bridge keeps its current outcome; retaining staged service input
+before adding an exec retry is follow-up #1116. This slice makes no new exec
+or vfork acceptance claim.

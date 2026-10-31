@@ -281,7 +281,7 @@ fn serve_with<C: ThreadCpu, U: UserWord, M: UserCopy>(
             WaitFor::Readable,
             snap,
             deadline,
-            interrupt,
+            &mut || user.interrupt_pending_wait() || interrupt(),
         ) {
             Parked::Done(served) => return served,
             // Readiness moved before the park: retire the record (the pin

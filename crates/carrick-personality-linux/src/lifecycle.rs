@@ -232,6 +232,15 @@ pub struct MapSourceTake {
     pub orphans: alloc::vec::Vec<carrick_core_abi::HostBackingIdentity>,
 }
 
+/// A bounded owner write either faults or retains its exact producer receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnedCopyError {
+    Fault,
+    Wait(carrick_core_abi::PortalOwnerWait),
+    /// The execution or preparation venue cannot authorize a copy here.
+    Unavailable,
+}
+
 /// Native process custody supplied by the execution lane. Registry decisions
 /// remain in the shared scheduler owner; this adapter retains machine context.
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
@@ -240,6 +249,8 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
         None
     }
+    /// Finish deferred physical enrollment after the operation frames unwind.
+    fn drain_owned_preparation(&mut self) {}
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }
@@ -248,8 +259,37 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     }
     /// An admitted process may retain an exact-MM write authority (including COW).
     /// None means this venue does not own user transfers.
-    fn copy_out_owned(&mut self, _dst: UserVa, _bytes: &[u8]) -> Option<bool> {
+    fn copy_out_owned(
+        &mut self,
+        _dst: UserVa,
+        _bytes: &[u8],
+    ) -> Option<Result<(), OwnedCopyError>> {
         None
+    }
+    fn yield_owned_operation(
+        &mut self,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::OwnedOperationYield {
+        carrick_core::mm::transaction::OwnedOperationYield::Unrouted(operation)
+    }
+    fn prepare_owned_copyout(
+        &mut self,
+        _request: carrick_core::mm::transaction::CopyoutRequest,
+        operation: carrick_sched_core::object_wait::OperationToken,
+    ) -> carrick_core::mm::transaction::CopyoutPreparation {
+        carrick_core::mm::transaction::CopyoutPreparation::Unrouted(operation)
+    }
+    /// Retain a completed answer while its destination waits for its owner.
+    fn complete_copyout(
+        &mut self,
+        _address: UserVa,
+        _bytes: alloc::vec::Vec<u8>,
+        _result: SyscallResult,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::new(carrick_syscall_abi::LINUX_EFAULT.guest_retval()),
+            work: false,
+        }
     }
     /// The private file byte source the native host-file venue retained for
     /// exactly this thread's retried `mmap` with `key`, consumed once, and

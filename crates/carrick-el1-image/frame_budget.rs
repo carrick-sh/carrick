@@ -235,7 +235,11 @@ impl Frames {
             + self.qualified("descriptor_txn::InlineJournal", "::reserve::")
             + allocation;
         let write = self.required("::copy_signal_bytes::")?
-            + self.required("::write_user_bytes::")?
+            + self.required("::access_user_target::")?
+            + self
+                .maximum("::write_user_bytes::")
+                .max(self.maximum("::prepare_user_write::"))
+            + self.maximum("::write_user_target::")
             + self.sum(&["::authorize::", "::root_for::"])
             + root;
         // A failed caught signal can force SIGSEGV once; a failed SIGSEGV
@@ -243,6 +247,7 @@ impl Frames {
         let delivery = self.required("::arm_signal::deliver_on_user_return::")?
             + 2 * self.required("::signal_delivery::deliver_signal_on_syscall_return::")?
             + self.maximum("::signal_delivery::force_delivery_fault::");
+        let _copyout = self.required("::finish_copyout::")?;
         let service = (entry
             + self.required("::dispatch::arm_native_service_exit::")?
             + self.required("::aarch64_process::with_process_entry::")?
@@ -252,7 +257,25 @@ impl Frames {
             + self
                 .required("::park_service::")?
                 .max(self.required("::park_owner_wait::")? + self.maximum("::finish_owner_wait::"))
-            + self.maximum("::finish_service::");
+            + self
+                .maximum("::finish_service::")
+                .max(self.maximum("::take_preparation_operation::"))
+                .max(self.maximum("::restore_preparation_operation::"));
+        // IPC dispatch returns before physical enrollment; the handoff
+        // boundary drains one captured request. Ready replies requeue to the
+        // scheduler checkpoint rather than nesting physical application here.
+        let adapter_stage = native
+            + self.sum(&[
+                "::take_handoff_receipt::",
+                "::drain_owned_preparation::",
+                "::begin_adapter_service::",
+                "::begin_service_inner::",
+                "::park_service::",
+            ])
+            + self
+                .maximum("::yield_service_checkpoint::")
+                .max(self.maximum("::take_preparation_operation::"))
+            + allocation;
         // FD inheritance is distinct from the page-table descriptor executor.
         // Optional helpers can inline into their caller in one feature closure
         // and remain emitted in another; charge both when both retain frames.
@@ -403,13 +426,84 @@ impl Frames {
                 "native service continuation",
                 service + self.maximum("::release_service_claim::") + allocation,
             ),
+            // Refusal folding runs after service preparation has returned.
+            // It can yield or retire an adapter, but never nests a backing
+            // reply under its own frame. Charge the new cold handoff path.
+            (
+                "native service refusal",
+                entry
+                    + self.required("::dispatch::arm_native_service_exit::")?
+                    + self.required("::aarch64_process::with_process_entry::")?
+                    + self.maximum("::arm_native_service_exit::_$u7b$$u7b$closure")
+                    + self.required("::settle_service_exit::")?
+                    + self.maximum("::yield_service_checkpoint::").max(
+                        self.sum(&[
+                            "::retire_adapter_result::",
+                            "::retire_adapter_operation::",
+                            "::retire_native_operation::",
+                            "::unpin_filtered::",
+                        ]) + fd_storage.max(fd_references)
+                            + fd_release.max(fd_notify).max(fd_deliver),
+                    )
+                    + allocation,
+            ),
             (
                 "native backing reply",
                 service
                     + self.required("::apply_fault_reply::")?
+                    // Application and physical settlement are sequential:
+                    // the aligned crossing buffer is not live in descent.
                     + (self.sum(&["::grant_target::", "::root_for::"]) + root)
-                        .max(self.maximum("::apply_grant::") + descriptors),
+                        .max(self.maximum("::apply_grant::") + descriptors)
+                        .max(self.required("::settle_native_descriptor_reply::")?),
             ),
+            // Completed output is re-driven only after the service stack has
+            // unwound. Charging `service + write` here would describe exactly
+            // the forbidden nested completion/copy chain.
+            (
+                "ring completed copyout",
+                native.max(resume)
+                    + self.sum(&[
+                        "::drain_copyout::",
+                        "::finish_copyout::",
+                        "::copy_owner_frame::",
+                        "::copy_owned_bytes::",
+                    ])
+                    + self.maximum("::complete_copyout::")
+                    + self.qualified("El1PendingFamilies", "::poll::")
+                    + self.maximum("::complete_poll_copyout::")
+                    + write,
+            ),
+            (
+                "ring poll readiness",
+                native
+                    + self.qualified("El1PendingFamilies", "::poll::")
+                    + self.sum(&[
+                        "::resolve_poll::",
+                        "::resolve_poll_with_host_readiness::",
+                        "::epoll_zone_only_ready_count::",
+                        "::epoll_ready_count::",
+                        "::member_level::",
+                    ])
+                    + self.maximum("::lock_epoll::"),
+            ),
+            (
+                "ring pipe copyout",
+                native
+                    + self.sum(&[
+                        "::ipc_transfer::",
+                        "::ipc::serve_ipc_with_sigpipe::",
+                        "::ipc::run::",
+                        "::substrate::ipc::transfer::",
+                        "::prepare_copyout::",
+                        "::prepare_owned_copyout::",
+                        "::prepare_owned_write::",
+                    ])
+                    + self.qualified("PrefixCopy", "::copy_out::")
+                    + self.qualified("OwnerCopy", "::copy_out::")
+                    + write,
+            ),
+            ("ring pipe backing preparation", adapter_stage),
             (
                 "native wait copy",
                 native.max(resume)
@@ -623,7 +717,9 @@ mod tests {
             "x::dispatch::arm_signal_user_return::h0",
             "x::aarch64_process::with_process_entry::h0",
             "x::copy_signal_bytes::h0",
+            "x::finish_copyout::h0",
             "x::write_user_bytes::h0",
+            "x::access_user_target::h0",
             "x::arm_signal::deliver_on_user_return::h0",
             "x::signal_delivery::deliver_signal_on_syscall_return::h0",
             "x::admit_entry_runtime::h0",
@@ -637,8 +733,10 @@ mod tests {
             "x::dispatch::arm_native_service_exit::h0",
             "x::park_service::h0",
             "x::begin_service_inner::h0",
+            "x::settle_service_exit::h0",
             "x::park_owner_wait::h0",
             "x::apply_fault_reply::h0",
+            "x::settle_native_descriptor_reply::h0",
             "x::setup_arm_signal_frame::h0",
             "x::restore_live_arm_signal_frame::h0",
             "x::serve_delegated_anonymous::h0",
@@ -648,6 +746,60 @@ mod tests {
             values.insert(name.to_owned(), 128);
         }
         Frames(values)
+    }
+
+    #[test]
+    fn native_descriptor_settlement_is_charged_to_the_backing_reply() {
+        let mut frames = small_frames();
+        frames
+            .0
+            .insert("x::settle_native_descriptor_reply::h0".to_owned(), 11000);
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("native backing reply"));
+    }
+
+    #[test]
+    fn retained_ring_copyout_chains_are_bounded() {
+        let mut frames = small_frames();
+        frames.0.insert("x::copy_owner_frame::h0".to_owned(), 11500);
+        frames
+            .0
+            .insert("x::prepare_owned_copyout::h0".to_owned(), 11500);
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("ring completed copyout"));
+        assert!(error.contains("ring pipe copyout"));
+    }
+
+    #[test]
+    fn native_service_refusal_charges_handoff_and_adapter_retirement() {
+        reject_fd_chain(
+            "native service refusal",
+            &[
+                "x::settle_service_exit",
+                "x::yield_service_checkpoint",
+                "x::dispatch::arm_native_service_exit",
+                "x::aarch64_process::with_process_entry",
+            ],
+        );
+        reject_fd_chain(
+            "native service refusal",
+            &[
+                "x::settle_service_exit",
+                "x::retire_adapter_result",
+                "x::retire_native_operation",
+                "x::unpin_filtered",
+            ],
+        );
+    }
+
+    #[test]
+    fn ring_poll_readiness_chain_is_bounded() {
+        let mut frames = small_frames();
+        frames
+            .0
+            .insert("x::epoll_ready_count::h0".to_owned(), 11500);
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("ring poll readiness"));
     }
 
     #[test]

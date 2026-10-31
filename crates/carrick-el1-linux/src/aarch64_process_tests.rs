@@ -4919,6 +4919,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
         fixture.control,
         &mut service,
         &mut frame,
+        &mut None,
         |_, _| panic!("Busy admission must not publish or deliver a signal"),
     );
     assert_eq!(refused, Ok(carrick_el1_abi::Action::Forward));
@@ -4959,6 +4960,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
                 fixture.control,
                 &mut service,
                 &mut frame,
+                &mut None,
                 |process, frame| {
                     super::arm_signal::deliver_on_user_return_with(
                         &fixture.task,
@@ -5052,6 +5054,7 @@ fn arm_permission_fault_sig_dfl_terminates_through_native_owner() {
             fixture.control,
             &mut service,
             &mut frame,
+            &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
                 fixture.control,
@@ -5129,6 +5132,7 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
             fixture.control,
             &mut service,
             &mut frame,
+            &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
                 fixture.control,
@@ -5170,6 +5174,7 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
             fixture.control,
             &mut service,
             &mut frame,
+            &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
                 fixture.control,
@@ -10912,6 +10917,7 @@ fn arm_classified_maperr_and_bus_use_signal_owner() {
                 fixture.control,
                 &mut service,
                 &mut frame,
+                &mut None,
                 |process, frame| super::arm_signal::deliver_on_user_return_with(
                     &fixture.task,
                     fixture.control,
@@ -11009,6 +11015,7 @@ fn arm_classified_fault_default_ignored_and_blocked_return_to_host_core_path() {
                 fixture.control,
                 &mut service,
                 &mut frame,
+                &mut None,
                 |process, frame| {
                     // A sibling changes disposition after fault publication, before
                     // the shared delivery operation selects it.
@@ -11113,6 +11120,7 @@ fn arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path() {
             fixture.control,
             &mut service,
             &mut frame,
+            &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
                 fixture.control,
@@ -11196,6 +11204,7 @@ fn arm_classified_fault_racing_live_sibling_exit_group_settles() {
                 control,
                 &mut service,
                 &mut frame,
+                &mut None,
                 |_, _| panic!("closed owner must not select a signal action")
             )
             .unwrap(),
@@ -11245,6 +11254,7 @@ fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() 
             fixture.control,
             &mut service,
             &mut frame,
+            &mut None,
             |_, _| panic!("non-fault entry must fail before delivery"),
         );
         assert_eq!(result, Err(NativeProcessError::Invalid));

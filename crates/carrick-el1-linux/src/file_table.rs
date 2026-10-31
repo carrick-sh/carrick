@@ -8,8 +8,8 @@
 //! existing zone tables and IPC venue, ignores negative descriptors, and reports
 //! `POLLNVAL` for absent nonnegative descriptors. Unconditional `ERR`, `HUP`, and
 //! `NVAL` are reported independently of requested events. Duplicate descriptors
-//! receive independent results. A blocking wait releases execution capacity
-//! through an owned continuation on the zone scheduler.
+//! receive independent results. A blocking wait requires a retained readiness
+//! venue; a snapshot alone cannot complete an unexpired wait.
 
 extern crate alloc;
 
@@ -23,7 +23,6 @@ use carrick_el1_abi::{
     DelegatedFile, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, HostObjectBinding,
     HostReadinessEntry, fd_map_lookup, lock_fd_map,
 };
-use carrick_sched_core::{SlotId, ZoneTables};
 pub use carrick_syscall_abi::{
     LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI,
     LINUX_POLLRDBAND, LINUX_POLLRDNORM, LINUX_POLLWRBAND, LINUX_POLLWRNORM,
@@ -694,12 +693,39 @@ pub fn host_readiness_entries(
     open_table: &[DelegatedOpenFile],
     file_table: u64,
     pollfds: &[PollFd],
+    ipc: Option<&crate::ipc::IpcVenue<'_>>,
 ) -> Option<Vec<HostReadinessEntry>> {
     let _guard = lock_fd_map(fd_map);
+    let namespace = ipc.and_then(|venue| {
+        venue
+            .tables
+            .table_for_file_table(file_table)
+            .map(|table| (venue, table))
+    });
     let mut host_entries = Vec::new();
     for (index, entry) in pollfds.iter().enumerate() {
         if entry.fd < 0 {
             continue;
+        }
+        if let Some((venue, table)) = namespace {
+            use carrick_el1_abi::ipc::{
+                IpcBacking,
+                fd::{Error, Fd, TableId},
+            };
+            match venue
+                .region
+                .fd(carrick_sched_core::ShortLockSpin)
+                .get(TableId::from_raw(table), Fd(entry.fd))
+            {
+                Ok(description)
+                    if matches!(
+                        IpcBacking::decode(description.backing),
+                        Some(IpcBacking::Host(_))
+                    ) => {}
+                Err(Error::BadFd) => continue,
+                // A host selector cannot wait for this guest-owned producer.
+                _ => return None,
+            }
         }
         let Some((handle, _)) = fd_map_lookup(fd_map, file_table, entry.fd) else {
             continue;
@@ -734,15 +760,15 @@ pub fn resolve_poll(
     fd_map: &[FdMapSlot],
     open_table: &[DelegatedOpenFile],
     _object_table: &[DelegatedFile],
-    _ipc: Option<&crate::ipc::IpcVenue<'_>>,
+    ipc: Option<&crate::ipc::IpcVenue<'_>>,
     file_table: u64,
     pollfds: &mut [PollFd],
-) -> i32 {
+) -> Option<i32> {
     resolve_poll_with_host_readiness(
         fd_map,
         open_table,
         _object_table,
-        _ipc,
+        ipc,
         file_table,
         pollfds,
         None,
@@ -755,18 +781,82 @@ pub fn resolve_poll_with_host_readiness(
     fd_map: &[FdMapSlot],
     open_table: &[DelegatedOpenFile],
     _object_table: &[DelegatedFile],
-    _ipc: Option<&crate::ipc::IpcVenue<'_>>,
+    ipc: Option<&crate::ipc::IpcVenue<'_>>,
     file_table: u64,
     pollfds: &mut [PollFd],
     host_entries: Option<&[HostReadinessEntry]>,
-) -> i32 {
+) -> Option<i32> {
     let _guard = lock_fd_map(fd_map);
     let mut ready_count = 0;
     let mut host_cursor = host_entries.unwrap_or(&[]).iter().peekable();
+    let namespace = ipc.and_then(|venue| {
+        venue
+            .tables
+            .table_for_file_table(file_table)
+            .map(|table| (venue, table))
+    });
+
     for (index, entry) in pollfds.iter_mut().enumerate() {
         if entry.fd < 0 {
             entry.revents = 0;
             continue;
+        }
+        let mut ipc_host = false;
+        if let Some((venue, table)) = namespace {
+            use carrick_el1_abi::ipc::{
+                IpcBacking,
+                epoll::{EpollMember, events},
+                fd::{Error, Fd, TableId},
+            };
+            let backing = match venue
+                .region
+                .fd(carrick_sched_core::ShortLockSpin)
+                .get(TableId::from_raw(table), Fd(entry.fd))
+            {
+                Ok(description) => IpcBacking::decode(description.backing)?,
+                Err(Error::BadFd) => {
+                    entry.revents = LINUX_POLLNVAL;
+                    ready_count += 1;
+                    continue;
+                }
+                Err(_) => return None,
+            };
+            let level = match backing {
+                IpcBacking::Host(_) => {
+                    ipc_host = true;
+                    None
+                }
+                IpcBacking::Epoll { object } => Some(
+                    if venue
+                        .region
+                        .epoll_zone_only_ready_count(object, 1, &carrick_sched_core::ShortLockSpin)
+                        .ok()??
+                        .records()
+                        != 0
+                    {
+                        events::IN | events::RDNORM
+                    } else {
+                        0
+                    },
+                ),
+                _ => {
+                    let (object, member) = EpollMember::of_backing(backing)?;
+                    Some(
+                        venue
+                            .region
+                            .lock(object, &carrick_sched_core::ShortLockSpin)
+                            .ok()?
+                            .member_level(member)
+                            .ok()?,
+                    )
+                }
+            };
+            if let Some(level) = level {
+                let level = level as i16;
+                entry.revents = level & (entry.events | LINUX_POLLERR | LINUX_POLLHUP);
+                ready_count += i32::from(entry.revents != 0);
+                continue;
+            }
         }
         if let Some((handle, _slot_idx)) = fd_map_lookup(fd_map, file_table, entry.fd)
             && handle > 0
@@ -774,14 +864,9 @@ pub fn resolve_poll_with_host_readiness(
         {
             let open_file = &open_table[(handle - 1) as usize];
             if open_file.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST {
-                let readiness = if host_cursor
-                    .peek()
-                    .is_some_and(|next| next.poll_index as usize == index)
-                {
-                    host_cursor.next().map_or(0, |next| next.revents)
-                } else {
-                    0
-                };
+                let readiness = host_cursor
+                    .next_if(|next| next.poll_index as usize == index)?
+                    .revents;
                 let mut revents = entry.events & readiness;
                 revents |= readiness & (LINUX_POLLERR | LINUX_POLLHUP | LINUX_POLLNVAL);
                 entry.revents = revents;
@@ -791,91 +876,22 @@ pub fn resolve_poll_with_host_readiness(
                 continue;
             }
         }
+        if ipc_host {
+            // The exact namespace names a real host object, but no carrier
+            // observation authenticated it. This is not an absent descriptor.
+            return None;
+        }
         // Absent descriptor: POLLNVAL unconditionally
         entry.revents = LINUX_POLLNVAL;
         ready_count += 1;
     }
-    ready_count
-}
-
-/// Owned continuation for a blocking poll.
-#[derive(Debug)]
-pub struct PollContinuation {
-    pub file_table: u64,
-    pub pollfds: Vec<PollFd>,
-    pub timeout_ms: i32,
-    pub user_va: u64,
-    pub slot: Option<SlotId>,
-}
-
-impl PollContinuation {
-    pub fn new(
-        file_table: u64,
-        pollfds: Vec<PollFd>,
-        timeout_ms: i32,
-        user_va: u64,
-        slot: Option<SlotId>,
-    ) -> Self {
-        Self {
-            file_table,
-            pollfds,
-            timeout_ms,
-            user_va,
-            slot,
-        }
-    }
-
-    /// Releases execution capacity on the zone scheduler by clearing the slot's current task.
-    pub fn release_capacity<C: carrick_el1_abi::EntryContext>(&mut self, zone: &ZoneTables<C>) {
-        if let Some(slot) = self.slot {
-            zone.clear_current(slot);
-        }
-    }
-
-    /// Re-evaluates poll against current table state.
-    pub fn poll(
-        &mut self,
-        fd_map: &[FdMapSlot],
-        open_table: &[DelegatedOpenFile],
-        object_table: &[DelegatedFile],
-        ipc: Option<&crate::ipc::IpcVenue<'_>>,
-    ) -> Option<i32> {
-        let ready = resolve_poll(
-            fd_map,
-            open_table,
-            object_table,
-            ipc,
-            self.file_table,
-            &mut self.pollfds,
-        );
-        if ready > 0 { Some(ready) } else { None }
-    }
-
-    /// Complete the wait unconditionally, returning (ready_count, pollfds).
-    pub fn complete(
-        mut self,
-        fd_map: &[FdMapSlot],
-        open_table: &[DelegatedOpenFile],
-        object_table: &[DelegatedFile],
-        ipc: Option<&crate::ipc::IpcVenue<'_>>,
-    ) -> (i32, Vec<PollFd>) {
-        let ready = resolve_poll(
-            fd_map,
-            open_table,
-            object_table,
-            ipc,
-            self.file_table,
-            &mut self.pollfds,
-        );
-        (ready, self.pollfds)
-    }
+    Some(ready_count)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use carrick_el1_abi::MAX_ZONE_OPEN_FILES;
-    use carrick_sched_core::ThreadIdentity;
 
     fn resolve_with_native_batch(
         fd_map: &[FdMapSlot],
@@ -884,7 +900,7 @@ mod tests {
         file_table: u64,
         pollfds: &mut [PollFd],
     ) -> i32 {
-        let mut entries = host_readiness_entries(fd_map, open_table, file_table, pollfds)
+        let mut entries = host_readiness_entries(fd_map, open_table, file_table, pollfds, None)
             .expect("host-bound fixture entries");
         for entry in &mut entries {
             let fd = entry
@@ -917,6 +933,7 @@ mod tests {
             pollfds,
             Some(&entries),
         )
+        .expect("complete carrier readiness observation")
     }
 
     #[test]
@@ -940,7 +957,7 @@ mod tests {
         }];
         assert_eq!(
             resolve_poll(&fd_map, &open_table, &object_table, None, 10, &mut pollfds),
-            0
+            None
         );
         assert_eq!(pollfds[0].revents, 0);
         unsafe {
@@ -1073,7 +1090,7 @@ mod tests {
             &mut entries,
             Some(&readiness),
         );
-        assert_eq!(ready, 2);
+        assert_eq!(ready, Some(2));
         assert_eq!(entries[0].revents, LINUX_POLLOUT);
         assert_eq!(entries[1].revents, LINUX_POLLNVAL);
         assert_eq!(
@@ -1303,7 +1320,7 @@ mod tests {
             file_table,
             &mut pfds,
         );
-        assert_eq!(ready, 1);
+        assert_eq!(ready, Some(1));
         assert_eq!(pfds[0].revents, LINUX_POLLNVAL);
     }
 
@@ -1347,7 +1364,7 @@ mod tests {
         assert_eq!(pfds[0].revents, 0); // negative ignored
         assert_eq!(pfds[1].revents, LINUX_POLLNVAL);
         assert_eq!(pfds[2].revents, LINUX_POLLNVAL);
-        assert_eq!(ready, 2);
+        assert_eq!(ready, Some(2));
     }
 
     #[test]
@@ -1624,7 +1641,7 @@ mod tests {
                 revents: 0,
             },
         ];
-        let mut entries = host_readiness_entries(&fd_map, &open_table, 10, &fds).unwrap();
+        let mut entries = host_readiness_entries(&fd_map, &open_table, 10, &fds, None).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].binding.host_fd().map(HostBoundFd::raw), Some(0));
         assert_eq!(entries[0].poll_index, 0);
@@ -1642,11 +1659,11 @@ mod tests {
                 &mut fds,
                 Some(&entries)
             ),
-            3
+            Some(3)
         );
         assert_eq!(fds[1].revents, 0);
         assert_eq!(fds[3].revents, LINUX_POLLNVAL);
-        assert!(host_readiness_entries(&fd_map, &open_table, 10, &fds[3..]).is_none());
+        assert!(host_readiness_entries(&fd_map, &open_table, 10, &fds[3..], None).is_none());
     }
 
     #[test]
@@ -1679,111 +1696,10 @@ mod tests {
                 revents: 0,
             },
         ];
-        let entries = host_readiness_entries(&fd_map, &open_table, 10, &fds)
+        let entries = host_readiness_entries(&fd_map, &open_table, 10, &fds, None)
             .expect("host descriptor remains in the batch");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].poll_index, 1);
-    }
-
-    #[test]
-    fn test_blocking_poll_releases_capacity_and_completes() {
-        const LOADED_MM: u64 = 0x5000;
-        let (fd_map, open_table, object_table) = setup_tables();
-        let file_table = 10;
-        let slot = SlotId::new(0);
-
-        // Allocate a zeroed ZoneTables
-        let layout = std::alloc::Layout::new::<ZoneTables>();
-        let zone: Box<ZoneTables> = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
-        };
-
-        let identity = ThreadIdentity {
-            tid: 41,
-            serial: 101,
-            mm: LOADED_MM,
-            file_table,
-            generation: 1,
-            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
-            affinity: 0,
-            lifecycle_page: 0,
-            control_slot: 0,
-        };
-        // A host-owned waiter runs only on a slot whose executor has its
-        // task (and address space) loaded: an idle executor cannot take it.
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, LOADED_MM, None, 0);
-        assert!(zone.occupancy.replace(
-            carrick_sched_core::ExecutionSlot::zone(slot),
-            0,
-            LOADED_MM
-        ));
-        let guard = zone
-            .lock(
-                ZoneTables::bucket_of(0, 0x1000),
-                &carrick_sched_core::BoundedSpin(100),
-            )
-            .unwrap();
-        let record = zone.alloc_record(identity).unwrap();
-        let seq = zone.next_seq(record);
-        zone.enqueue(&guard, record, seq, 0, 0x1000, u32::MAX, 0)
-            .unwrap();
-        zone.publish_park(record, seq);
-        drop(guard);
-
-        let guard = zone
-            .lock(
-                ZoneTables::bucket_of(0, 0x1000),
-                &carrick_sched_core::BoundedSpin(100),
-            )
-            .unwrap();
-        let mut woken = [const { carrick_sched_core::WakeRecord::Empty }; 1];
-        let n = zone
-            .wake(
-                &guard,
-                0,
-                0x1000,
-                u32::MAX,
-                1,
-                carrick_sched_core::Waker::El1 { slot },
-                &mut woken,
-            )
-            .unwrap();
-        assert_eq!(n, 1);
-        drop(guard);
-
-        assert_eq!(zone.switch_in(slot), Some(record));
-        // Verify executor slot has current task before release
-        assert_eq!(zone.slot(slot).current(), Some(record));
-
-        let pfds = vec![PollFd {
-            fd: 0,
-            events: LINUX_POLLIN,
-            revents: 0,
-        }];
-        let mut continuation = PollContinuation::new(file_table, pfds, 1000, 0x1000, Some(slot));
-
-        // Release execution capacity: this MUST clear current and free the executor!
-        continuation.release_capacity(&zone);
-        assert_eq!(
-            zone.slot(slot).current(),
-            None,
-            "release_capacity must vacate current slot, freeing the executor"
-        );
-
-        // Now complete the wait
-        admit_stdio(
-            &fd_map,
-            &open_table,
-            &object_table,
-            file_table,
-            [true, true, true],
-        );
-        let (ready, out_pfds) = continuation.complete(&fd_map, &open_table, &object_table, None);
-        assert_eq!(out_pfds.len(), 1);
-        assert!(ready >= 0);
     }
 
     #[test]

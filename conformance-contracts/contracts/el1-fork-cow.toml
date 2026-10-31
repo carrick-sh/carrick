@@ -1,3 +1,6 @@
+# #1044: owned-yield replies are typed separately from memory preparation.
+# The retained IPC/CarrierWork seam bindings below cover that API change;
+# existing fork, lifecycle, file and inotify acceptance remains unchanged.
 # #1101: fork lifecycle backing uses retained metadata custody.
 # Fork table loans, table population, and COW transitions are unchanged; only the custody of the backing for pre-existing lifecycle slots changes.
 # The component ownership/counter witnesses are registered under
@@ -29,6 +32,7 @@ rationale = "EL1 increment 2 fork copy-on-write checkpoint (TASK 2 and TASK 3). 
 
 [bindings]
 vm_free = [
+  "carrick-el1-linux::native_process_runtime::host_test_support::ipc_busy_yield_retains_operation_and_pin_through_carrier_work (owned-yield reply typing and exact token/pin custody only)",
   "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::native_child_empty_supply_resumes_cow_without_changing_parent (native fork, exact editor/root/gate waits before and after enrollment, empty COW pool, authenticated selection transfer, shared physical staging, ring resume, first syscall, request-owned backing prefix, child exit, USED settlement, exact-MM inventory retirement and neutral physical/structural retirement without a later Loan; parent isolation, initial two COW grants with executable physical capacity and at most four copied pages; host HVF mechanics remain signed-gate obligations)",
   "carrick-core-abi::service::tests::{fault_supply_transfer_survives_lane_reuse_and_cancellation,fault_supply_transfer_rejects_recycled_mm_incarnation,delayed_first_fault_take_cannot_steal_same_mm_page_successor}",
   "carrick-x86-cpl0-host::cpl0_boot::initial_reply_tests::{shared_physical_staging_rolls_back_before_exposure,inventory_retains_two_live_owner_selected_mms,initial_inventory_refuses_a_receipt_from_another_mm} (shared physical staging only: exact-MM publication custody and rollback before exposure; these staging-only fixtures do not confer signed acceptance)",

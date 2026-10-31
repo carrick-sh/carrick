@@ -43,6 +43,27 @@ pub enum EntryBindingFatalReason {
     SessionCollision = 25,
     SessionIndexLost = 26,
     AutoreapAccountingLost = 27,
+    NativeServiceInvalid = 28,
+    NativeServiceStale = 29,
+    NativeServiceExhausted = 30,
+    NativeServiceFault = 31,
+    NativeServiceOwnerWait = 32,
+    NativeServiceUnsupported = 33,
+    NativeServiceGroupExit = 34,
+    NativeServiceBusy = 35,
+    NativeServiceQuarantined = 36,
+    NativeServiceNoChild = 37,
+    NativeServiceCapStale = 38,
+    NativeServicePayloadStale = 39,
+    NativeServiceMemberStale = 40,
+    NativeServiceBirthStale = 41,
+    NativeServiceMmStale = 42,
+    NativeServiceBindStale = 43,
+    NativeServicePublishStale = 44,
+    NativeServiceNoticeStale = 45,
+    NativeServiceParkStale = 46,
+    NativeServiceSettleStale = 47,
+    NativeServiceCompleteStale = 48,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -74,6 +95,27 @@ impl EntryBindingFatalReason {
             25 => Some(Self::SessionCollision),
             26 => Some(Self::SessionIndexLost),
             27 => Some(Self::AutoreapAccountingLost),
+            28 => Some(Self::NativeServiceInvalid),
+            29 => Some(Self::NativeServiceStale),
+            30 => Some(Self::NativeServiceExhausted),
+            31 => Some(Self::NativeServiceFault),
+            32 => Some(Self::NativeServiceOwnerWait),
+            33 => Some(Self::NativeServiceUnsupported),
+            34 => Some(Self::NativeServiceGroupExit),
+            35 => Some(Self::NativeServiceBusy),
+            36 => Some(Self::NativeServiceQuarantined),
+            37 => Some(Self::NativeServiceNoChild),
+            38 => Some(Self::NativeServiceCapStale),
+            39 => Some(Self::NativeServicePayloadStale),
+            40 => Some(Self::NativeServiceMemberStale),
+            41 => Some(Self::NativeServiceBirthStale),
+            42 => Some(Self::NativeServiceMmStale),
+            43 => Some(Self::NativeServiceBindStale),
+            44 => Some(Self::NativeServicePublishStale),
+            45 => Some(Self::NativeServiceNoticeStale),
+            46 => Some(Self::NativeServiceParkStale),
+            47 => Some(Self::NativeServiceSettleStale),
+            48 => Some(Self::NativeServiceCompleteStale),
 
             _ => None,
         }
@@ -396,7 +438,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in 1..=27 {
+        for raw in 1..=48 {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
@@ -715,12 +757,15 @@ mod tests {
             let observed = capture.record.as_mut().unwrap();
             observed.claim = claim;
             observed.claim_after = claim;
-            let text = format!("{capture}");
-            assert!(
-                text.len() <= 1024,
-                "fatal sink truncates {} bytes: {text}",
-                text.len()
-            );
+            for reason in (1..=48).chain(core::iter::once(u64::MAX)) {
+                capture.registers.reason = Some(reason);
+                let text = format!("{capture}");
+                assert!(
+                    text.len() <= 1024,
+                    "fatal sink truncates {} bytes: {text}",
+                    text.len()
+                );
+            }
         }
         // Distinguish saved entry state from the architectural exception state.
         frame.x[0] = 0;

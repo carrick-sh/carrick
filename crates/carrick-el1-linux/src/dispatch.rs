@@ -151,6 +151,9 @@ impl GuestDispatchFrame for TrapFrame {
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64
     }
+    fn may_serve_poll(&self) -> bool {
+        self.x[8] == carrick_syscall_abi::nr::PPOLL.raw()
+    }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
         Some(self)
     }
@@ -876,7 +879,7 @@ impl<V: file::MemoryValidator> carrick_personality_linux::native_host_file::Host
 /// namespace by `descriptor`.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[inline(never)]
-fn native_host_file_stage<V: file::MemoryValidator>(
+pub(super) fn native_host_file_stage<V: file::MemoryValidator>(
     frame: &TrapFrame,
     task: &CurrentTask,
     validator: &V,
@@ -1007,7 +1010,6 @@ fn arm_native_service_exit(
     counters: &Counters,
 ) -> Option<Action> {
     use super::native_process_runtime::NativeResume;
-    use carrick_personality_linux::lifecycle::ProcessNative;
     let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
     let slot = SlotId::from_index(frame.slot as usize)?;
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
@@ -1039,7 +1041,7 @@ fn arm_native_service_exit(
         return Some(arm_signal_user_return(frame));
     }
     let mut service_wait = wait;
-    let (operation, exec_payload, host_file, retry_exec_stage) = loop {
+    let (operation, exec_payload, host_file, retry_exec_stage) = {
         let staged = match native_exec_stage(frame, task) {
             Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
             Some(NativeExecStage::Failed(errno)) => {
@@ -1123,10 +1125,8 @@ fn arm_native_service_exit(
             },
         };
         match staged {
-            NativeServiceStage::Exec(payload) => break (None, Some(payload), None, false),
-            NativeServiceStage::HostFile(staged) => {
-                break (None, None, Some(staged), false);
-            }
+            NativeServiceStage::Exec(payload) => (None, Some(payload), None, false),
+            NativeServiceStage::HostFile(staged) => (None, None, Some(staged), false),
             NativeServiceStage::Return(result) => {
                 frame.x[0] = result as u64;
                 return Some(arm_signal_user_return(frame));
@@ -1142,30 +1142,32 @@ fn arm_native_service_exit(
                 match super::cow_resolver::dispatch_fault(&mut synthetic, counters, &mut fault_wait)
                 {
                     Action::Served => {
-                        continue;
+                        // Staging made no descriptor/IPC effect. Re-enter the
+                        // ring at the same SVC rather than staging InRing into
+                        // ENOSYS after the owner resolved its destination.
+                        frame.elr = frame.elr.wrapping_sub(4);
+                        return Some(Action::Served);
                     }
                     Action::Forward | Action::ServedWithWork => {
                         service_wait = fault_wait;
-                        break (
+                        (
                             Some(carrick_core_abi::service::ServiceOperation::Fault(fault)),
                             None,
                             None,
                             true,
-                        );
+                        )
                     }
                     Action::Idle | Action::HostCustody => {
                         invalid_completion(NativeInvariant::EntryBinding)
                     }
                 }
             }
-            NativeServiceStage::Operation => {
-                break (
-                    Some(native_service_operation(frame, &task.linux, action)?),
-                    None,
-                    None,
-                    false,
-                );
-            }
+            NativeServiceStage::Operation => (
+                Some(native_service_operation(frame, &task.linux, action)?),
+                None,
+                None,
+                false,
+            ),
         }
     };
     // This CPU still exclusively owns its portal slot. Bind its selection
@@ -1186,7 +1188,7 @@ fn arm_native_service_exit(
     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
-    let result = super::aarch64_process::with_process_entry(
+    let (result, phase) = super::aarch64_process::with_process_entry(
         carrick_el1_abi::BornInZoneSource { zone, slot },
         task,
         &saved.native,
@@ -1195,56 +1197,57 @@ fn arm_native_service_exit(
         control,
         &mut service,
         |process| {
+            let exit = if matches!(
+                operation,
+                Some(carrick_core_abi::service::ServiceOperation::CarrierWork { .. })
+            ) {
+                super::native_process_runtime::NativeServiceExit::CarrierWork
+            } else {
+                super::native_process_runtime::NativeServiceExit::Bridge
+            };
             let result = if let Some(payload) = exec_payload {
                 if service_wait.is_some() {
-                    return Err(super::native_process_runtime::NativeProcessError::Quarantined);
+                    Err(super::native_process_runtime::NativeProcessError::Quarantined)
+                } else {
+                    process.begin_exec_service(payload)
                 }
-                process.begin_exec_service(payload)?
             } else if let Some(staged) = host_file {
                 if service_wait.is_some() {
-                    return Err(super::native_process_runtime::NativeProcessError::Quarantined);
+                    Err(super::native_process_runtime::NativeProcessError::Quarantined)
+                } else {
+                    let StagedHostFile {
+                        record,
+                        output,
+                        resolves_path,
+                        map,
+                    } = *staged;
+                    process.begin_host_file_service(record, output, resolves_path, map)
                 }
-                let StagedHostFile {
-                    record,
-                    output,
-                    resolves_path,
-                    map,
-                } = *staged;
-                process.begin_host_file_service(record, output, resolves_path, map)?
             } else if retry_exec_stage {
-                process.begin_exec_stage_fault_service(
-                    match operation {
-                        Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) => fault,
-                        _ => {
-                            return Err(
-                                super::native_process_runtime::NativeProcessError::Quarantined,
-                            );
-                        }
-                    },
-                    fault_sequence,
-                    service_wait,
-                )?
-            } else if let Some(wait) = service_wait {
-                process.begin_owner_service_wait(
-                    operation
-                        .ok_or(super::native_process_runtime::NativeProcessError::Quarantined)?,
-                    wait,
-                )?
+                match operation {
+                    Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) => {
+                        process.begin_exec_stage_fault_service(fault, fault_sequence, service_wait)
+                    }
+                    _ => Err(super::native_process_runtime::NativeProcessError::Quarantined),
+                }
+            } else if let Some(operation) = operation {
+                if let Some(wait) = service_wait {
+                    process.begin_owner_service_wait(operation, wait)
+                } else {
+                    process.begin_service(operation, fault_sequence)
+                }
             } else {
-                process.begin_service(
-                    operation
-                        .ok_or(super::native_process_runtime::NativeProcessError::Quarantined)?,
-                    fault_sequence,
-                )?
+                Err(super::native_process_runtime::NativeProcessError::Quarantined)
             };
-            if matches!(result, NativeResume::Left(_)) && process.take_handoff_receipt().is_none() {
-                return Err(super::native_process_runtime::NativeProcessError::Quarantined);
-            }
-            Ok(result)
+            let result = process.settle_service_exit(result, exit);
+            (result, process.native_service_phase())
         },
     )
-    .and_then(core::convert::identity)
-    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    // Keep entry admission separate from dispatch/settlement: these source
+    // locations and the exact error survive the existing fatal transport.
+    .unwrap_or_else(|error| invalid_completion(native_service_invariant(error)));
+    let result = result
+        .unwrap_or_else(|error| invalid_completion(native_service_invariant_at(error, phase)));
     Some(match result {
         NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
         NativeResume::NoPending => arm_signal_user_return(frame),
@@ -1282,6 +1285,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_with<
     control: &'static carrick_el1_abi::ThreadControlSlot,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     frame: &mut carrick_el1_abi::TrapFrame,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
     deliver: F,
 ) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
 where
@@ -1319,6 +1323,7 @@ where
     }
     // A host-classified fault returns through the durable signal checkpoint.
     // It is a fault return, never fatal-owner cancellation or syscall restart.
+    let entry_syndrome = (frame.esr, frame.far);
     if let Some((_, _, address, _)) = control.synchronous_fault() {
         frame.esr = HOST_CLASSIFIED_DATA_ABORT_ESR;
         frame.far = address;
@@ -1335,6 +1340,7 @@ where
             frame.far,
             |process| deliver(process, frame),
         ),
+        owner_wait,
     )?;
     // Admission can also close between venue selection and the owner retain.
     if action == Action::Forward
@@ -1342,19 +1348,35 @@ where
         && control.synchronous_fault().is_some()
     {
         control.synchronous_fault_default();
+        // The terminal verdict supersedes the owner dependency: nothing will
+        // rerun this fault in ring, so no receipt may park the thread.
+        *owner_wait = None;
+    }
+    if owner_wait.is_some() {
+        // Nothing was delivered. The parked thread resumes at the faulting
+        // instruction, so the entry syndrome must survive for that rerun.
+        (frame.esr, frame.far) = entry_syndrome;
     }
     Ok(action)
 }
 
 /// Admission refusals precede signal publication; the loaded host executor
 /// retains the fault on Forward. Only a broken binding is a carrier invariant.
+/// An owner-memory wait is contention with a release notification: it keeps
+/// the retained fault and hands the receipt to the caller, which parks the
+/// thread on the owner and reruns the fault, exactly as a supply wait does.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn declined_fault_admission_result(
+pub(crate) fn declined_fault_admission_result(
     result: Result<Action, super::native_process_runtime::NativeProcessError>,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
 ) -> Result<Action, super::native_process_runtime::NativeProcessError> {
     use super::native_process_runtime::NativeProcessError;
     match result {
         Ok(action) => Ok(action),
+        Err(NativeProcessError::OwnerWait(wait)) => {
+            *owner_wait = Some(wait);
+            Ok(Action::Forward)
+        }
         Err(
             error @ (NativeProcessError::Invalid
             | NativeProcessError::Stale
@@ -1384,20 +1406,25 @@ fn declined_fault_admission_busy_once_then_success() {
         NativeProcessError::GroupExitCustody,
         NativeProcessError::NoChild,
     ] {
+        let mut owner_wait = None;
         assert_eq!(
-            declined_fault_admission_result(Err(error)),
+            declined_fault_admission_result(Err(error), &mut owner_wait),
             Ok(Action::Forward)
         );
+        assert_eq!(owner_wait, None);
     }
     for error in [
         NativeProcessError::Invalid,
         NativeProcessError::Stale,
         NativeProcessError::Quarantined,
     ] {
-        assert_eq!(declined_fault_admission_result(Err(error)), Err(error));
+        assert_eq!(
+            declined_fault_admission_result(Err(error), &mut None),
+            Err(error)
+        );
     }
     assert_eq!(
-        declined_fault_admission_result(Ok(Action::Served)),
+        declined_fault_admission_result(Ok(Action::Served), &mut None),
         Ok(Action::Served)
     );
 }
@@ -1415,6 +1442,7 @@ pub(crate) fn arm_deliver_declined_fault_signal<X: super::aarch64_process::ForkS
     control: &'static carrick_el1_abi::ThreadControlSlot,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     frame: &mut carrick_el1_abi::TrapFrame,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
     deliver: F,
 ) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
 where
@@ -1430,7 +1458,7 @@ where
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 {
     arm_deliver_declined_fault_signal_with(
-        source, task, native, ttbr0, page, control, service, frame, deliver,
+        source, task, native, ttbr0, page, control, service, frame, owner_wait, deliver,
     )
 }
 
@@ -1438,7 +1466,10 @@ where
 /// and host-classified faults on a `SignalOwner` thread.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
-pub(crate) fn arm_deliver_declined_fault_signal_current(frame: &mut TrapFrame) -> Action {
+pub(crate) fn arm_deliver_declined_fault_signal_current(
+    frame: &mut TrapFrame,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
+) -> Action {
     let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
         unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
     let Some(task) = current_tasks.get(frame.slot as usize) else {
@@ -1465,6 +1496,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_current(frame: &mut TrapFrame) -
         control,
         &mut service,
         frame,
+        owner_wait,
         |process, frame| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
     .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding))
@@ -1500,7 +1532,9 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         if !classified_fault_entry_permitted(frame.esr) {
             invalid_completion(NativeInvariant::EntryBinding);
         }
-        return arm_deliver_declined_fault_signal_current(frame);
+        // This checkpoint has no fault rerun venue to park: an owner wait
+        // stays Forward with the host-retained payload, as Busy does (#1083).
+        return arm_deliver_declined_fault_signal_current(frame, &mut None);
     }
     let fatal_owner_cancel = frame.esr == 0xfffc;
     let Some(task) = current_tasks.get(frame.slot as usize) else {
@@ -1888,6 +1922,7 @@ impl PhysicalCustodyInvariant {
 /// fail-stop transport; a completed effect must never be replayed by forwarding.
 pub enum NativeInvariant {
     EntryBinding,
+    NativeService(carrick_el1_abi::EntryBindingFatalReason),
     PhysicalCustody(PhysicalCustodyInvariant),
     MissingNativeFrame,
     RevisionCredit,
@@ -1899,6 +1934,7 @@ impl core::fmt::Debug for NativeInvariant {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::EntryBinding => f.write_str("EntryBinding"),
+            Self::NativeService(error) => f.debug_tuple("NativeService").field(error).finish(),
             Self::PhysicalCustody(reason) => f
                 .debug_tuple("PhysicalCustody")
                 .field(&reason.as_str())
@@ -1920,6 +1956,7 @@ impl NativeInvariant {
         use carrick_el1_abi::EntryBindingFatalReason as Fatal;
         match self {
             NativeInvariant::EntryBinding => Fatal::EntryBinding,
+            NativeInvariant::NativeService(reason) => *reason,
             NativeInvariant::PhysicalCustody(reason) => match reason {
                 PhysicalCustodyInvariant::RootExitRefused => Fatal::RootExitRefused,
                 PhysicalCustodyInvariant::ForkCustodyRefused => Fatal::ForkCustodyRefused,
@@ -1954,6 +1991,65 @@ impl NativeInvariant {
     }
 }
 
+/// Encode before constructing the fatal envelope: an OwnerWait contains a
+/// dependency, which must not enlarge every EL1 invariant's by-value frame.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_service_invariant(
+    error: super::native_process_runtime::NativeProcessError,
+) -> NativeInvariant {
+    NativeInvariant::NativeService(native_service_fatal_reason(error))
+}
+
+/// A stale dispatch identifies the last actual owner entered, rather than
+/// implying that every stale refusal came from the service birth cell.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_service_invariant_at(
+    error: super::native_process_runtime::NativeProcessError,
+    phase: super::native_process_runtime::NativeServicePhase,
+) -> NativeInvariant {
+    use super::native_process_runtime::{NativeProcessError, NativeServicePhase as Phase};
+    use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+    if !matches!(&error, NativeProcessError::Stale) {
+        return native_service_invariant(error);
+    }
+    NativeInvariant::NativeService(match phase {
+        Phase::Unspecified => Fatal::NativeServiceStale,
+        Phase::Capability => Fatal::NativeServiceCapStale,
+        Phase::Payload => Fatal::NativeServicePayloadStale,
+        Phase::Member => Fatal::NativeServiceMemberStale,
+        Phase::Birth => Fatal::NativeServiceBirthStale,
+        Phase::Mm => Fatal::NativeServiceMmStale,
+        Phase::Bind => Fatal::NativeServiceBindStale,
+        Phase::Publication => Fatal::NativeServicePublishStale,
+        Phase::Notice => Fatal::NativeServiceNoticeStale,
+        Phase::Park => Fatal::NativeServiceParkStale,
+        Phase::Completion => Fatal::NativeServiceCompleteStale,
+        Phase::Settlement => Fatal::NativeServiceSettleStale,
+    })
+}
+
+/// Preserve the refused operation's error without changing refusal policy.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_service_fatal_reason(
+    error: super::native_process_runtime::NativeProcessError,
+) -> carrick_el1_abi::EntryBindingFatalReason {
+    use super::native_process_runtime::NativeProcessError as Error;
+    use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+    match error {
+        Error::Invalid => Fatal::NativeServiceInvalid,
+        Error::Stale => Fatal::NativeServiceStale,
+        Error::Exhausted => Fatal::NativeServiceExhausted,
+        Error::Fault => Fatal::NativeServiceFault,
+        Error::Unsupported => Fatal::NativeServiceUnsupported,
+        Error::GroupExitCustody => Fatal::NativeServiceGroupExit,
+        Error::Busy => Fatal::NativeServiceBusy,
+        Error::Quarantined => Fatal::NativeServiceQuarantined,
+        Error::NoChild => Fatal::NativeServiceNoChild,
+        Error::OwnerWait(_) => Fatal::NativeServiceOwnerWait,
+        Error::ForkRefused(refusal) => native_service_fatal_reason(refusal.error()),
+    }
+}
+
 #[track_caller]
 pub fn invalid_completion(reason: NativeInvariant) -> ! {
     #[cfg(target_os = "none")]
@@ -1963,6 +2059,48 @@ pub fn invalid_completion(reason: NativeInvariant) -> ! {
         "el1::entry_completion",
         "native entry invariant: {reason:?}"
     )
+}
+
+fn complete_poll_copyout<'p, C: carrick_core_abi::EntryContext>(
+    process: Option<&mut (dyn lifecycle::ProcessNative<C> + 'p)>,
+    task: &CurrentTask,
+    address: carrick_guest_arch::UserVa,
+    bytes: &[u8],
+    result: SyscallResult,
+) -> FamilyCompletion {
+    if let Some(process) = process {
+        return carrick_personality_linux::lifecycle::lifecycle_effect(&process.complete_copyout(
+            address,
+            bytes.to_vec(),
+            result,
+        ));
+    }
+    let mut copy = file::ValidatedCopy {
+        task,
+        validator: &file::HardwareValidator,
+    };
+    if copy.copy_out(address.raw(), bytes) {
+        FamilyCompletion::Complete(result.raw())
+    } else {
+        // Host-owned legacy callers retain their existing owner-memory path.
+        FamilyCompletion::Forward
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn host_owned_poll_copyout_refusal_keeps_the_host_fallback() {
+    let task = CurrentTask::new();
+    assert!(matches!(
+        complete_poll_copyout::<carrick_sched_core::ThreadCtx>(
+            None,
+            &task,
+            carrick_guest_arch::UserVa::new(carrick_guest_arch::USER_CEILING),
+            &[0; 8],
+            SyscallResult::new(1),
+        ),
+        FamilyCompletion::Forward
+    ));
 }
 
 pub struct El1PendingFamilies<
@@ -2069,7 +2207,10 @@ impl<
     fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt<Context>> {
         self.process
             .as_deref_mut()
-            .and_then(|process| process.take_handoff_receipt())
+            .and_then(|process| {
+                process.drain_owned_preparation();
+                process.take_handoff_receipt()
+            })
             .or_else(|| self.handoff.take().and_then(Context::arm_receipt))
     }
     fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {
@@ -2129,7 +2270,7 @@ impl<
         self.ipc_transfer()
     }
     fn poll(&mut self) -> FamilyCompletion {
-        let Some(task) = self.task() else {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
             return FamilyCompletion::Forward;
         };
         let fds_ptr = self.frame.argument(0).unwrap_or(0);
@@ -2194,11 +2335,16 @@ impl<
         };
         if nfds == 0 {
             let mut empty = [];
-            return FamilyCompletion::Complete(
-                self.frame
-                    .query_host_readiness(&mut empty, timeout_ms, sig_mask)
-                    .unwrap_or(0),
-            );
+            return match self
+                .frame
+                .query_host_readiness(&mut empty, timeout_ms, sig_mask)
+            {
+                Some(result) => FamilyCompletion::Complete(result),
+                None if timeout_ms == 0 && matches!(sig_mask, PollSignalMask::Inherit) => {
+                    FamilyCompletion::Complete(0)
+                }
+                None => FamilyCompletion::Forward,
+            };
         }
         if nfds > 1024 {
             return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
@@ -2230,6 +2376,7 @@ impl<
             self.open_table,
             file_table,
             &pollfds,
+            self.ipc,
         );
         if let Some(mut entries) = host_entries {
             let already_ready = super::file_table::resolve_poll_with_host_readiness(
@@ -2241,6 +2388,9 @@ impl<
                 &mut pollfds,
                 Some(&entries),
             );
+            let Some(already_ready) = already_ready else {
+                return FamilyCompletion::Forward;
+            };
             let host_timeout = if already_ready > 0 { 0 } else { timeout_ms };
             if let Some(result) =
                 self.frame
@@ -2258,33 +2408,32 @@ impl<
                     &mut pollfds,
                     Some(&entries),
                 );
+                let Some(ready) = ready else {
+                    return FamilyCompletion::Forward;
+                };
                 let out_bytes = unsafe {
                     core::slice::from_raw_parts(
                         pollfds.as_ptr() as *const u8,
                         nfds * core::mem::size_of::<super::file_table::PollFd>(),
                     )
                 };
-                let Some(task) = self.task() else {
+                let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
                     return FamilyCompletion::Forward;
                 };
-                let mut user = file::ValidatedCopy {
+                return complete_poll_copyout(
+                    self.process.as_deref_mut(),
                     task,
-                    validator: &file::HardwareValidator,
-                };
-                if !user.copy_out(fds_ptr, out_bytes) {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    );
-                }
-                return FamilyCompletion::Complete(ready as i64);
+                    carrick_guest_arch::UserVa::new(fds_ptr),
+                    out_bytes,
+                    SyscallResult::new(ready as i64),
+                );
             }
         }
-        let Some(task) = self.task() else {
+        if !matches!(sig_mask, PollSignalMask::Inherit) {
             return FamilyCompletion::Forward;
-        };
-        let mut user = file::ValidatedCopy {
-            task,
-            validator: &file::HardwareValidator,
+        }
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+            return FamilyCompletion::Forward;
         };
         let ready = super::file_table::resolve_poll(
             self.fd_map,
@@ -2294,26 +2443,28 @@ impl<
             file_table,
             &mut pollfds,
         );
+        let Some(ready) = ready else {
+            return FamilyCompletion::Forward;
+        };
         let out_bytes = unsafe {
             core::slice::from_raw_parts(
                 pollfds.as_ptr() as *const u8,
                 nfds * core::mem::size_of::<super::file_table::PollFd>(),
             )
         };
-        if !user.copy_out(fds_ptr, out_bytes) {
-            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
-        }
         if ready > 0 || timeout_ms == 0 {
-            FamilyCompletion::Complete(ready as i64)
+            complete_poll_copyout(
+                self.process.as_deref_mut(),
+                task,
+                carrick_guest_arch::UserVa::new(fds_ptr),
+                out_bytes,
+                SyscallResult::new(ready as i64),
+            )
         } else {
-            let slot = self.frame.slot();
-            let mut continuation = super::file_table::PollContinuation::new(
-                file_table, pollfds, timeout_ms, fds_ptr, slot,
-            );
-            if let (Some(zone), Some(_)) = (self.zone.as_ref(), slot) {
-                continuation.release_capacity(zone.tables);
-            }
-            FamilyCompletion::Complete(ready as i64)
+            // This venue has no retained readiness wait. Leave the call
+            // unrouted before output; clearing a slot and dropping a local
+            // continuation cannot authorize a timeout result.
+            FamilyCompletion::Forward
         }
     }
     fn descriptor(&mut self) -> FamilyCompletion {
@@ -3270,9 +3421,13 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         {
             let orig_x0 = frame.x[0];
             let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
-            let mut user = file::ValidatedCopy {
-                task,
-                validator: &file::HardwareValidator,
+            let mut user = file::OwnerCopy {
+                inner: file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                },
+                owner: self.process.as_deref_mut(),
+                wait: None,
             };
             let (disposition, sigpipe_owed) = ipc::serve_ipc_with_signals(
                 &mut sched,
@@ -3280,11 +3435,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 venue,
                 &mut user,
                 native_signals,
-                &mut || {
-                    self.process
-                        .as_deref_mut()
-                        .is_some_and(|process| process.interrupt_pending_wait())
-                },
+                &mut || false,
             );
             let result = frame.x[0] as i64;
             if sigpipe_owed {
@@ -3701,6 +3852,141 @@ mod tests {
     use super::super::native_process_runtime::NativeThreadGroupOwner;
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn blocking_poll_without_a_wait_venue_does_not_publish_timeout_output() {
+        let tasks = [CurrentTask::new()];
+        let counters = Counters::default();
+        let mut polls = [super::super::file_table::PollFd {
+            fd: -1,
+            events: 1,
+            revents: 0x1234,
+        }];
+        let timeout = [1i64, 0];
+        let mut frame = TrapFrame::default();
+        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+        frame.x[0] = polls.as_mut_ptr() as u64;
+        frame.x[1] = 1;
+        frame.x[2] = timeout.as_ptr() as u64;
+        let mut pending = El1PendingFamilies {
+            handoff: None,
+            lifecycle_user: None,
+            frame: &mut frame,
+            counters: &counters,
+            current_tasks: &tasks,
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &InotifyNameCache::new(),
+            zone: None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+            ipc: None,
+            lifecycle: None,
+            process: None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative>,
+            source: None,
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+        assert_eq!(
+            PendingFamilies::poll(&mut pending),
+            FamilyCompletion::Forward
+        );
+        assert_eq!(
+            polls[0].revents, 0x1234,
+            "an incomplete readiness decision owns no output"
+        );
+    }
+
+    #[test]
+    fn production_trap_frame_routes_ppoll_to_the_poll_family() {
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            5,
+        );
+        tasks[0].mm.thread_generation.store(1, Ordering::Relaxed);
+        let counters = Counters::default();
+        let mut frame = TrapFrame::default();
+        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+        frame.x[1] = 1025; // EINVAL is owned by poll, before touching a user pointer.
+        let action = dispatch_syscall_with_lifecycle(
+            &mut frame,
+            &counters,
+            &tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &InotifyNameCache::new(),
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0] as i64, -22);
+        assert_eq!(counters.served[73].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.refused[73].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn native_service_refusals_keep_the_error_in_the_fatal_transport() {
+        use super::super::native_process_runtime::NativeProcessError as Error;
+        use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+        for (error, expected) in [
+            (Error::Invalid, Fatal::NativeServiceInvalid),
+            (Error::Stale, Fatal::NativeServiceStale),
+            (Error::Exhausted, Fatal::NativeServiceExhausted),
+            (Error::Fault, Fatal::NativeServiceFault),
+            (Error::Unsupported, Fatal::NativeServiceUnsupported),
+            (Error::GroupExitCustody, Fatal::NativeServiceGroupExit),
+            (Error::Busy, Fatal::NativeServiceBusy),
+            (Error::Quarantined, Fatal::NativeServiceQuarantined),
+            (Error::NoChild, Fatal::NativeServiceNoChild),
+        ] {
+            let invariant = native_service_invariant(error);
+            let reason = invariant.fatal_reason();
+            assert_eq!(reason, expected);
+            assert_eq!(Fatal::from_raw(reason as u64), Some(expected));
+            assert_eq!(
+                std::format!("{invariant:?}"),
+                std::format!("NativeService({expected:?})")
+            );
+        }
+    }
+
+    #[test]
+    fn stale_service_diagnostic_distinguishes_owners_without_reclassifying_busy() {
+        use super::super::native_process_runtime::{
+            NativeProcessError as Error, NativeServicePhase as Phase,
+        };
+        use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+        for (phase, expected) in [
+            (Phase::Unspecified, Fatal::NativeServiceStale),
+            (Phase::Capability, Fatal::NativeServiceCapStale),
+            (Phase::Payload, Fatal::NativeServicePayloadStale),
+            (Phase::Member, Fatal::NativeServiceMemberStale),
+            (Phase::Birth, Fatal::NativeServiceBirthStale),
+            (Phase::Mm, Fatal::NativeServiceMmStale),
+            (Phase::Bind, Fatal::NativeServiceBindStale),
+            (Phase::Publication, Fatal::NativeServicePublishStale),
+            (Phase::Notice, Fatal::NativeServiceNoticeStale),
+            (Phase::Park, Fatal::NativeServiceParkStale),
+            (Phase::Completion, Fatal::NativeServiceCompleteStale),
+            (Phase::Settlement, Fatal::NativeServiceSettleStale),
+        ] {
+            let reason = native_service_invariant_at(Error::Stale, phase).fatal_reason();
+            assert_eq!(reason, expected);
+            assert_eq!(Fatal::from_raw(reason as u64), Some(expected));
+            assert_eq!(
+                native_service_invariant_at(Error::Busy, phase).fatal_reason(),
+                Fatal::NativeServiceBusy,
+                "diagnostic provenance cannot turn contention into stale identity"
+            );
+        }
+    }
 
     #[test]
     fn physical_custody_reasons_preserve_fatal_codes_and_debug_text() {
