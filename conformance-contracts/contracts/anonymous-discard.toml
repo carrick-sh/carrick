@@ -14,8 +14,8 @@ embed = [
   "carrick-conformance-next::deferred_anonymous_pristine_scrub_semantics",
 ]
 docker = [
-  "discard-boundary evidence",
   "same-source fixtures/pristine_scrub.py; pinned native ARM64 cpython-test image",
+  "discard-boundary evidence",
 ]
 [bindings.unresolved]
 embed_structural = "Actual zero-byte reduction and backing allocation budget require materialized backing retirement; current fallback eagerly clears."

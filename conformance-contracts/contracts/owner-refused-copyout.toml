@@ -14,6 +14,7 @@ rationale = "An admitted EL1 owner may refuse a host copyout or length read tran
 
 [bindings]
 vm_free = [
+  "carrick-kernel::dispatch::fs::rw::iovec_owner_wait_tests::readv_iovec_intake_preserves_direct_owner_refusal",
   "carrick-el1-linux::native_process_signals::tests::duplicate_member_projection_must_preserve_pending",
   "carrick-kernel::dispatch::copyout::tests",
   "carrick-kernel::dispatch::copyout::tests::s1_array_keeps_first_valid_permit_across_mapping_changes",
@@ -43,7 +44,6 @@ vm_free = [
   "carrick-kernel::dispatch::fs::ioctl::tests::procmap_query_with_4008_byte_name_and_tcgeta_on_regular_file_respect_owner_copyout_bounds",
   "carrick-kernel::dispatch::fs::legacy_aio::s1_tests::s1_aio_copyout_refusal_preserves_completion",
   "carrick-kernel::dispatch::fs::legacy_aio::s1_tests::s1_aio_large_output_preserves_minimum_and_refused_window",
-  "carrick-kernel::dispatch::fs::rw::iovec_owner_wait_tests::readv_iovec_intake_preserves_direct_owner_refusal",
   "carrick-kernel::dispatch::fs::stat::tests::statfs_and_fs_queries_wait_for_owner_refused_copyout_and_signalfd_retains_signal",
   "carrick-kernel::dispatch::fs::tests::fcntl_getlk_and_getown_ex_wait_for_owner_refused_copyout_without_mutating_locks",
   "carrick-kernel::dispatch::fs::tests::fs_queries_and_signalfd_wait_for_owner_refused_copyout_without_consuming_state",

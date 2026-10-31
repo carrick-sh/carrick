@@ -23,6 +23,7 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-vmm-hvf::gic::tests::mpidr_carries_res1_and_sgi_addressable_affinity",
   "carrick-conformance-contract::personality_boundary::tests::executable_publication_has_one_neutral_owner",
   "carrick-core-abi::executable_publication::{tests::publication_is_bounded_and_acknowledges_cancellation_before_reuse,layout_manifest::portal_executable_publication,layout_manifest::portal_executable_slot}",
   "carrick-el1-abi::mm_portal::layout_manifest::mm_portal_slots (neutral executable-publication ownership move only: retained wire sizes, offsets, bounded single-flight acknowledgment and cancellation/reuse; existing semantic and work bindings above remain required, no broader or signed acceptance claim)",
@@ -33,13 +34,12 @@ vm_free = [
   "carrick-mem::memory::el1_hook_kick::served_path_restores_el0_state_exactly",
   "carrick-mem::memory::kernel_only_range_tests::gic_window_is_below_the_trampoline_and_above_the_vdso",
   "carrick-mem::memory::syscall_mailbox_tests::mailbox_clock_layout_matches_every_emitted_variant (clock metadata and installed phases agree in every fd-ceiling, EL1 and IRQ mode; instruction placement unchanged)",
-  "carrick-mem::page_table::tests::boot_stage1_images_leave_the_gic_window_untranslated",
-  "carrick-mem::page_table::tests::stage1_publication_refuses_outputs_in_the_gic_window",
+  "carrick-mmu-core::aarch64::tests::boot_stage1_images_leave_the_gic_window_untranslated",
+  "carrick-mmu-core::aarch64::tests::stage1_publication_refuses_outputs_in_the_gic_window",
   "carrick-vmm-hvf::gic::tests::el0_view_of_id_aa64pfr0_hides_only_the_gic_field",
   "carrick-vmm-hvf::gic::tests::every_vcpu_is_configured_by_its_creation_wrapper",
   "carrick-vmm-hvf::gic::tests::geometry_must_fit_the_reserved_window",
   "carrick-vmm-hvf::gic::tests::gic_is_created_inside_the_vm_creation_funnel",
-  "carrick-vmm-hvf::gic::tests::mpidr_carries_res1_and_sgi_addressable_affinity",
   "carrick-vmm-hvf::gic::tests::only_the_exact_hatch_value_disables_the_gic",
   "carrick-vmm-hvf::gic::tests::raw_hv_gic_calls_stay_in_gic_rs",
   "carrick-vmm-hvf::trap::stage2_backend::stage2_map_refuses_the_gic_window",

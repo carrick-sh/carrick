@@ -10,6 +10,7 @@ rationale = "This native tooling contract exercises commands and fork-without-ex
 
 [bindings]
 vm_free = [
+  "carrick-xtask::tests::host_lease::runner_death_cancels_workload_before_releasing_exclusion",
   "carrick-xtask::host_lease::tests::account_handoff_lets_a_stripped_process_reuse_the_holders_lease",
   "carrick-xtask::host_lease::tests::nested_validation_never_owns_or_downgrades_gate",
   "carrick-xtask::lease_supervisor::cleanup_tests::expired_cleanup_deadline_cannot_block_on_lifetime_writer",
@@ -27,7 +28,6 @@ vm_free = [
   "carrick-xtask::tests::host_lease::nested_admission_requires_the_supervisor_scope_writer",
   "carrick-xtask::tests::host_lease::runner_death_cancels_detached_nested_workload_before_releasing_exclusion",
   "carrick-xtask::tests::host_lease::runner_death_cancels_nested_workload_before_releasing_exclusion",
-  "carrick-xtask::tests::host_lease::runner_death_cancels_workload_before_releasing_exclusion",
   "carrick-xtask::tests::host_lease::supervisor_sighup_cancels_before_releasing_exclusion",
   "carrick-xtask::tests::host_lease::supervisor_sigint_cancels_before_releasing_exclusion",
   "carrick-xtask::tests::host_lease::supervisor_sigterm_cancels_before_releasing_exclusion",

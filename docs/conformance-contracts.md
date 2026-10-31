@@ -178,10 +178,17 @@ To keep concurrent guest-visible PRs conflict-free across rebase and merge
 queues:
 
 - `conformance-contracts/surfaces.toml` stores one `{ path = "...", contract = "..." },`
-  entry per line in sorted `(path, contract)` order;
+  entry per line (or `{ path = "...", contracts = [] },` for classified paths
+  that intentionally carry no contract) in sorted `(path, contract)` order;
 - `conformance-contracts/contracts/*.toml` stores `[bindings]` layers (`vm_free`,
-  `embed`, `docker`, and `ecosystem`) as sorted multi-line string arrays with one
-  entry and trailing comma per line; and
+  `embed`, `docker`, and `ecosystem`) as multi-line string arrays with one entry
+  and trailing comma per line, keeping the primary evidence binding at `[0]`
+  (for `vm_free`, `embed`, and `docker`, matching `check-contract-change.py`)
+  with additional bindings `[1..]` in sorted order (`ecosystem` sorted `[0..]`);
+- `.gitattributes` applies `merge=union` only to `conformance-contracts/surfaces.toml`
+  and `docs/conformance-contracts/*.md`, leaving `conformance-contracts/contracts/*.toml`
+  on ordinary 3-way merge so deleted bindings or conflicting multiline edits stay
+  conflicts; and
 - per-contract and per-slice architecture notes live in separate files under
   [`conformance-contracts/`](conformance-contracts/) (for example,
   [`futex-contention.md`](conformance-contracts/futex-contention.md) and

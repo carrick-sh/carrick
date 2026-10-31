@@ -838,12 +838,84 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         self.assertEqual(res.returncode, 1)
         self.assertIn("uncovered guest surface", res.stderr)
 
+    def test_secondary_binding_crate_does_not_widen_evidence_scope(self):
+        self.use_single_contract_surface()
+        contract_file = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_file.write_text(
+            contract_file.read_text(encoding="utf-8").replace(
+                '  "carrick-kernel-example::futex_contention_contract",\n',
+                '  "carrick-kernel-example::futex_contention_contract",\n'
+                '  "carrick-secondary::extra_binding",\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        secondary_test = self.repo / "crates" / "carrick-secondary" / "tests" / "extra.rs"
+        secondary_test.parent.mkdir(parents=True, exist_ok=True)
+        secondary_test.write_text("// initial secondary test\n", encoding="utf-8")
+        self.add_surface("crates/carrick-secondary/tests/extra.rs", "kernel.futex.contention")
+        # Re-write surfaces with contracts = [] for secondary_test so adding it in base doesn't make it unit evidence on futex.
+        (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
+            "schema_version = 1\n"
+            "surfaces = [\n"
+            '  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.contention" },\n'
+            '  { path = "crates/carrick-secondary/tests/extra.rs", contracts = [] },\n'
+            "]\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed secondary binding"], cwd=self.repo, check=True)
+        seeded_base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+
+        # Editing only the secondary binding's crate must NOT satisfy primary evidence for futex.rs.
+        self.guest_file.write_text("// modified futex implementation\n", encoding="utf-8")
+        secondary_test.write_text("// modified secondary test only\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "touch secondary crate only"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=seeded_base)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("uncovered guest surface", res.stderr)
+
+    def test_empty_contracts_surface_marker_classifies_new_file(self):
+        new_file = self.repo / "crates" / "carrick-core" / "src" / "new_substrate.rs"
+        new_file.parent.mkdir(parents=True, exist_ok=True)
+        new_file.write_text("pub struct NewSubstrate;\n", encoding="utf-8")
+
+        surfaces = self.repo / "conformance-contracts" / "surfaces.toml"
+        lines = surfaces.read_text(encoding="utf-8").splitlines()
+        end_idx = max(i for i, line in enumerate(lines) if line.strip() == "]")
+        marker = '  { path = "crates/carrick-core/src/new_substrate.rs", contracts = [] },'
+        surfaces.write_text(
+            "\n".join(lines[:end_idx] + [marker] + lines[end_idx:]) + "\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "classify new file with empty contracts marker"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 0, msg=f"stdout={res.stdout}\nstderr={res.stderr}")
+
     def test_two_prs_adding_surfaces_bindings_and_docs_merge_cleanly(self):
         self.use_single_contract_surface()
         shutil.copy(REPO_ROOT / ".gitattributes", self.repo / ".gitattributes")
         shutil.copy(
             REPO_ROOT / "conformance-contracts" / "contracts" / "futex-requeue.toml",
             self.repo / "conformance-contracts" / "contracts" / "futex-requeue.toml",
+        )
+        contract_file = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_file.write_text(
+            contract_file.read_text(encoding="utf-8").replace(
+                '  "carrick-kernel-example::futex_contention_contract",\n',
+                '  "carrick-kernel-example::futex_contention_contract",\n'
+                '  "carrick-kernel-example::mid_one",\n'
+                '  "carrick-kernel-example::mid_two",\n'
+                '  "carrick-kernel-example::mid_three",\n'
+                '  "carrick-kernel-example::mid_four",\n',
+                1,
+            ),
+            encoding="utf-8",
         )
         contract_docs = self.repo / "docs" / "conformance-contracts"
         contract_docs.mkdir(parents=True, exist_ok=True)
@@ -853,16 +925,16 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         subprocess.run(["git", "commit", "-m", "seed gitattributes and contract docs"], cwd=self.repo, check=True)
         merge_base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
 
-        # PR A adds surface alpha.rs, adds a vm_free binding to futex-contention.toml, and appends a doc section.
+        # PR A adds surface alpha.rs, inserts a sorted follow-up vm_free binding in futex-contention.toml,
+        # and appends a doc section.
         subprocess.run(["git", "checkout", "-b", "pr-a", merge_base], cwd=self.repo, check=True)
         alpha = self.repo / "crates" / "carrick-kernel" / "src" / "dispatch" / "alpha.rs"
         alpha.write_text("pub fn alpha() {}\n", encoding="utf-8")
         self.add_surface("crates/carrick-kernel/src/dispatch/alpha.rs", "kernel.futex.contention")
-        contract_file = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
         contract_file.write_text(
             contract_file.read_text(encoding="utf-8").replace(
-                "vm_free = [\n",
-                'vm_free = [\n  "carrick-kernel-example::alpha_binding",\n',
+                '  "carrick-kernel-example::mid_one",\n',
+                '  "carrick-kernel-example::alpha_binding",\n  "carrick-kernel-example::mid_one",\n',
                 1,
             ),
             encoding="utf-8",
@@ -875,16 +947,17 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-m", "PR A"], cwd=self.repo, check=True)
 
-        # PR B branches from merge_base, touches the exact same insertion gaps in surfaces.toml,
-        # futex-contention.toml, and docs/conformance-contracts/futex-contention.md.
+        # PR B branches from merge_base, touches the exact same insertion gap in surfaces.toml and
+        # docs/conformance-contracts/futex-contention.md, and appends a sorted follow-up binding in
+        # futex-contention.toml without merge=union on contract TOMLs.
         subprocess.run(["git", "checkout", "-b", "pr-b", merge_base], cwd=self.repo, check=True)
         beta = self.repo / "crates" / "carrick-kernel" / "src" / "dispatch" / "beta.rs"
         beta.write_text("pub fn beta() {}\n", encoding="utf-8")
         self.add_surface("crates/carrick-kernel/src/dispatch/beta.rs", "kernel.futex.requeue")
         contract_file.write_text(
             contract_file.read_text(encoding="utf-8").replace(
-                "vm_free = [\n",
-                'vm_free = [\n  "carrick-kernel-example::beta_binding",\n',
+                '  "carrick-kernel-example::mid_four",\n',
+                '  "carrick-kernel-example::mid_four",\n  "carrick-kernel-example::zeta_binding",\n',
                 1,
             ),
             encoding="utf-8",

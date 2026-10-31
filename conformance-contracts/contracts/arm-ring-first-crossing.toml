@@ -36,8 +36,8 @@ changing either live policy.
 
 [bindings]
 vm_free = [
-  "carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors",
   "carrick-el1-linux::production_x86_family_absences_obey_eight_crossings_without_user_memory",
+  "carrick-el1-abi::tests::aperture_control_is_disjoint_from_service_copy_descriptors",
   "carrick-el1-linux::x86_context_selects_x86_crossings_without_arm_aperture",
   "carrick-el1-linux::x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal",
   "carrick-mem::memory::el1_shim_tests::mailbox_shim_routes_raw_clock_gettime_only_when_fast_paths_are_enabled",
@@ -51,11 +51,11 @@ vm_free = [
   "carrick-vmm-hvf::hatch::tests::carrier_admission_rejects_conflicting_ring_policy_without_changing_it",
 ]
 embed = [
+  "carrick-embed::arm_ring_first_strict_glibc_loader_witness",
   "carrick-embed::arm_ring_first_hatch_disabled_forward_witness",
   "carrick-embed::arm_ring_first_opt_out_glibc_fork_wait_witness",
   "carrick-embed::arm_ring_first_opt_out_glibc_loader_witness",
   "carrick-embed::arm_ring_first_strict_glibc_fork_wait_witness",
-  "carrick-embed::arm_ring_first_strict_glibc_loader_witness",
   "carrick-embed::arm_ring_first_strict_refusal_witness",
 ]
 

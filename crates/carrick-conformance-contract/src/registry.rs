@@ -12,6 +12,7 @@ pub struct ContractRegistry {
     contracts: BTreeMap<ContractId, ConformanceContract>,
     claims: BTreeMap<ClaimId, Claim>,
     surfaces: Vec<SurfaceAssignment>,
+    surface_entry_count: usize,
 }
 
 impl ContractRegistry {
@@ -65,27 +66,65 @@ impl ContractRegistry {
                 path: surfaces_path,
                 source,
             })?;
+        let surface_entry_count = surface_registry.surfaces.len();
         let mut grouped_surfaces: BTreeMap<String, BTreeSet<ContractId>> = BTreeMap::new();
+        let mut empty_surfaces: BTreeSet<String> = BTreeSet::new();
+        let mut previous_surface: Option<(String, Option<ContractId>)> = None;
         for entry in surface_registry.surfaces {
             if entry.path.trim().is_empty() {
                 return Err(RegistryError::EmptySurfacePath);
             }
-            if !contracts.contains_key(&entry.contract) {
-                return Err(RegistryError::UnknownSurfaceContract {
-                    surface: entry.path,
-                    contract: entry.contract,
-                });
+            match &entry.contract {
+                Some(contract) => {
+                    if !contracts.contains_key(contract) {
+                        return Err(RegistryError::UnknownSurfaceContract {
+                            surface: entry.path,
+                            contract: contract.clone(),
+                        });
+                    }
+                    if empty_surfaces.contains(&entry.path) {
+                        return Err(RegistryError::ConflictingEmptySurfaceEntry {
+                            surface: entry.path,
+                        });
+                    }
+                    if !grouped_surfaces
+                        .entry(entry.path.clone())
+                        .or_default()
+                        .insert(contract.clone())
+                    {
+                        return Err(RegistryError::DuplicateSurfaceEntry {
+                            surface: entry.path,
+                            contract: contract.clone(),
+                        });
+                    }
+                }
+                None => {
+                    if grouped_surfaces.contains_key(&entry.path) {
+                        return Err(RegistryError::ConflictingEmptySurfaceEntry {
+                            surface: entry.path,
+                        });
+                    }
+                    empty_surfaces.insert(entry.path.clone());
+                    grouped_surfaces.entry(entry.path.clone()).or_default();
+                }
             }
-            if !grouped_surfaces
-                .entry(entry.path.clone())
-                .or_default()
-                .insert(entry.contract.clone())
-            {
-                return Err(RegistryError::DuplicateSurfaceEntry {
-                    surface: entry.path,
-                    contract: entry.contract,
-                });
+            if let Some((previous_path, previous_contract)) = &previous_surface {
+                let prev_key = (
+                    previous_path.as_str(),
+                    previous_contract.as_ref().map_or("", ContractId::as_str),
+                );
+                let curr_key = (
+                    entry.path.as_str(),
+                    entry.contract.as_ref().map_or("", ContractId::as_str),
+                );
+                if curr_key < prev_key {
+                    return Err(RegistryError::UnsortedSurfaceEntries {
+                        previous_path: previous_path.clone(),
+                        current_path: entry.path,
+                    });
+                }
             }
+            previous_surface = Some((entry.path, entry.contract));
         }
         let surfaces = grouped_surfaces
             .into_iter()
@@ -99,6 +138,7 @@ impl ContractRegistry {
             contracts,
             claims,
             surfaces,
+            surface_entry_count,
         })
     }
 
@@ -130,6 +170,10 @@ impl ContractRegistry {
 
     pub fn surfaces(&self) -> &[SurfaceAssignment] {
         &self.surfaces
+    }
+
+    pub fn surface_entry_count(&self) -> usize {
+        self.surface_entry_count
     }
 }
 
@@ -214,6 +258,37 @@ fn validate_contract(contract: &ConformanceContract) -> Result<(), RegistryError
                     id: contract.id.clone(),
                     layer,
                     entry: entry.clone(),
+                });
+            }
+        }
+    }
+    for (layer, sorted_slice) in [
+        (
+            ExecutionLayer::VmFree,
+            contract.bindings.vm_free.get(1..).unwrap_or(&[]),
+        ),
+        (
+            ExecutionLayer::EmbedStructural,
+            contract.bindings.embed.get(1..).unwrap_or(&[]),
+        ),
+        (
+            ExecutionLayer::Docker,
+            contract.bindings.docker.get(1..).unwrap_or(&[]),
+        ),
+        (
+            ExecutionLayer::Ecosystem,
+            contract.bindings.ecosystem.as_slice(),
+        ),
+    ] {
+        for pair in sorted_slice.windows(2) {
+            if let [previous, current] = pair
+                && previous > current
+            {
+                return Err(RegistryError::UnsortedBindingEntries {
+                    id: contract.id.clone(),
+                    layer,
+                    previous: previous.clone(),
+                    current: current.clone(),
                 });
             }
         }
@@ -333,6 +408,17 @@ pub enum RegistryError {
         surface: String,
         contract: ContractId,
     },
+    #[error(
+        "surface {surface} cannot combine `contracts = []` with another surface entry for the same path"
+    )]
+    ConflictingEmptySurfaceEntry { surface: String },
+    #[error(
+        "surfaces.toml entries must be sorted by (path, contract): {current_path} appears after {previous_path}"
+    )]
+    UnsortedSurfaceEntries {
+        previous_path: String,
+        current_path: String,
+    },
     #[error("surface {surface} references unknown contract family {contract}")]
     UnknownSurfaceContract {
         surface: String,
@@ -372,5 +458,12 @@ pub enum RegistryError {
         id: ContractId,
         layer: ExecutionLayer,
         entry: String,
+    },
+    #[error("{id}: unsorted {layer} binding entries ({current:?} appears after {previous:?})")]
+    UnsortedBindingEntries {
+        id: ContractId,
+        layer: ExecutionLayer,
+        previous: String,
+        current: String,
     },
 }

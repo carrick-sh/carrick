@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use carrick_conformance_contract::{ContractRegistry, SyscallInventory};
+use carrick_conformance_contract::{BindingResolver, ContractRegistry, SyscallInventory};
 
 fn parse_args() -> Result<PathBuf, String> {
     let mut args = std::env::args().skip(1);
@@ -37,24 +37,9 @@ fn run(root: &Path) -> Result<(), String> {
     let registry =
         ContractRegistry::load(root).map_err(|e| format!("cannot load contract registry: {e}"))?;
 
-    // Check each contract's bindings
-    for contract in registry.contracts() {
-        // Registry validation already requires every absent binding to carry a
-        // non-empty unresolved reason. Once a VM-free binding is concrete,
-        // additionally prove that every target crate exists.
-        for vm_free in &contract.bindings.vm_free {
-            let target = vm_free.strip_prefix("doctest:").unwrap_or(vm_free);
-            let crate_name = target.split("::").next().unwrap_or(target);
-            let crate_path = root.join("crates").join(crate_name);
-            if !crate_path.exists() {
-                return Err(format!(
-                    "{}: missing vm_free target crate {}",
-                    contract.id,
-                    crate_path.display()
-                ));
-            }
-        }
-    }
+    BindingResolver::new(root)
+        .check_registry(&registry)
+        .map_err(|e| e.to_string())?;
 
     for surface in registry.surfaces() {
         let target = root.join(&surface.path);
@@ -70,10 +55,11 @@ fn run(root: &Path) -> Result<(), String> {
     let inventory = SyscallInventory::generate(&registry);
 
     println!(
-        "conformance contracts checked: {} contracts, {} claims, {} surfaces (inventory: {} syscalls, {} with claims)",
+        "conformance contracts checked: {} contracts, {} claims, {} unique surface paths ({} surface entries; inventory: {} syscalls, {} with claims)",
         registry.contracts().len(),
         registry.claims().len(),
         registry.surfaces().len(),
+        registry.surface_entry_count(),
         inventory.summary.total_entries,
         inventory.summary.with_claims
     );

@@ -22,8 +22,8 @@ rationale = "A zombie process remains a member of its process group until reaped
 
 [bindings]
 vm_free = [
-  "carrick-el1-linux::process_owner::tests::pending_reparented_zombie_keeps_process_group_until_adopter_reaps",
   "carrick-kernel-example::semantics::pgrp::zombie_keeps_process_group_membership_until_reaped",
+  "carrick-el1-linux::process_owner::tests::pending_reparented_zombie_keeps_process_group_until_adopter_reaps",
 ]
 embed = [
   "carrick-embed::wait_process_group",

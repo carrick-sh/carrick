@@ -37,15 +37,15 @@ path; those belong to the x86-run milestone and director acceptance.
 
 [bindings]
 vm_free = [
-  "carrick-el1::x86_initial_mm_tests::fresh_owner_maps_static_text_data_and_stack_with_publications",
+  "carrick-el1::isa::x86_initial_mm::tests::fresh_owner_maps_static_text_data_and_stack_with_publications",
+  "carrick-el1::isa::x86_initial_mm::tests::fresh_owner_enters_interpreter_but_break_and_auxv_belong_to_executable",
+  "carrick-el1::isa::x86_initial_mm::tests::guest_stack_has_sysv_order_and_exact_auxv_addresses",
+  "carrick-mem::x86_initial_image::dynamic_x86_image_enters_interpreter_with_executable_auxv",
   "carrick-mem::x86_initial_image::static_x86_image_reuses_elf_plan_without_host_mm_edits",
-  "carrick-x86-cpl0::mm_initial::tests::dynamic_x86_image_enters_interpreter_with_executable_auxv",
-  "carrick-x86-cpl0::mm_initial::tests::fresh_owner_enters_interpreter_but_break_and_auxv_belong_to_executable",
-  "carrick-x86-cpl0::mm_initial::tests::guest_stack_has_sysv_order_and_exact_auxv_addresses",
 ]
 embed = [
   "KVM-only carrier fixture: carrick-vmm-kvm::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven",
-  "production_enters_pt_interp_instead_of_executable_entry",
+  "carrick-vmm-kvm::cpl0_initial_mm::production_enters_pt_interp_instead_of_executable_entry",
 ]
 docker = [
   "Native x86 Linux static-ELF behavior is asserted by the exact exit status; Docker oracle and runtime ratio remain director-owned.",

@@ -1,3 +1,2 @@
 conformance-contracts/surfaces.toml merge=union
-conformance-contracts/contracts/*.toml merge=union
 docs/conformance-contracts/*.md merge=union

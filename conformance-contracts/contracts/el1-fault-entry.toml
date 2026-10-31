@@ -29,10 +29,10 @@ structural_budgets = []
 
 [bindings]
 vm_free = [
+  "carrick-el1-abi::tests (trap_frame_layout_and_offsets, counters_abi_layout)",
   "carrick-conformance-contract::personality_boundary::tests::executable_publication_has_one_neutral_owner",
   "carrick-core-abi::executable_publication::{tests::publication_is_bounded_and_acknowledges_cancellation_before_reuse,layout_manifest::portal_executable_publication,layout_manifest::portal_executable_slot}",
   "carrick-el1-abi::mm_portal::layout_manifest::mm_portal_slots (neutral executable-publication ownership move only: retained wire sizes, offsets, bounded single-flight acknowledgment and cancellation/reuse; existing semantic and work bindings above remain required, no broader or signed acceptance claim)",
-  "carrick-el1-abi::tests (trap_frame_layout_and_offsets, counters_abi_layout)",
   "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused (shared ABI identity now includes OnCpuRequested; image header acceptance/rejection only, no new el1-fault-entry semantic or signed acceptance claim)",
   "carrick-el1::fault::tests (dispatch_fault_increments_counter_and_forwards)",
   "carrick-mem::memory::el1_hook_kick (fault_hook_forward_restores_complete_architectural_context)",

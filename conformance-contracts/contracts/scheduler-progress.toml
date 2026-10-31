@@ -28,6 +28,7 @@ rationale = "Eligible syscall-free tasks rotate under a finite execution budget;
 
 [bindings]
 vm_free = [
+  "carrick-kernel::kernel::operations::thread::tests::{refused_reserved_thread_birth_failpoint_releases_context_readers,refused_reserved_thread_birth_closed_gate_releases_context_readers,refused_reserved_thread_birth_ledger_failure_releases_context_readers} (two live threads, exact refused-clone rollback, subscriber context reentry, bounded context reader and reservation reuse; no executor-pool or signed acceptance)",
   "carrick-core-abi::service::tests::{prepared_delivery_retains_cancelled_resources_until_cleanup_ack,prepared_delivery_rejects_old_mm_and_sequence_without_losing_custody} (owned prepared-result delivery: cancellation returns resource and ticket before ACK; stale MM/sequence cannot publish; delivery is not successor adoption)",
   "carrick-core::x86_acceleration::x3_shared_protocol (orders 3a/3b components only: both descriptor ISAs at 16/64/256 pages, exact grant generation and rollback; 4 KiB/16 KiB backing, logical leaf references and pin-before-return; dirty-load closure/drain, stale invalidation refusal, exact root nonce, failed arena retirement quarantine, and 20000-mapping retirement receipt authentication; no signed physical mapping census, production pool-exhaustion, exec/clear-tid or order-4 wait acceptance)",
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::arm_native_wait_runs_ready_child_before_host_handoff (accepted loan aliases survive guest initialization, inherited CPU-0 mask and real child handoff)",
@@ -45,7 +46,6 @@ vm_free = [
   "carrick-kernel-example::scheduler_affinity::{sibling_setaffinity_changes_only_the_named_thread,other_process_setaffinity_changes_only_the_named_thread,getaffinity_reads_the_named_thread_including_the_leader_from_a_sibling,affinity_errors_leave_both_masks_unchanged,affinity_permission_uses_the_named_threads_credentials}",
   "carrick-kernel-example::scheduler_handoff::{queued_affinity_change_requires_migration_before_claim,remote_affinity_exclusion_kicks_the_exact_running_thread,self_affinity_change_requires_migration_before_return} (two live processes or threads, no timer advance, one exact kick and migration, zero unrelated or widening kicks)",
   "carrick-kernel-example::scheduler_progress_contract",
-  "carrick-kernel::kernel::operations::thread::tests::{refused_reserved_thread_birth_failpoint_releases_context_readers,refused_reserved_thread_birth_closed_gate_releases_context_readers,refused_reserved_thread_birth_ledger_failure_releases_context_readers} (two live threads, exact refused-clone rollback, subscriber context reentry, bounded context reader and reservation reuse; no executor-pool or signed acceptance)",
   "carrick-kernel::kernel::scheduler::tests::serial_host::drain_work_double_release_is_fatal (conserved DrainWork/DrainObligation custody across SubmissionAuthority publication, queued rows, unactivated QueueClaim drop and checked release underflow; VM-free run-queue drain lifecycle only, no new preemption, scaling or runtime-ratio acceptance)",
   "carrick-kernel::kernel::scheduler::tests::serial_host::failed_zone_load_settlement_retires_only_its_owned_continuation (test-only extension: exact continuation transfer and failed-load retirement, zero queued rows after failure/stale delivery; no new preemption, scaling or runtime-ratio acceptance)",
   "carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation,zone_handback_before_registration_kicks_the_running_owner_once} (zone delivery target authentication, retired no-op, and one kick/zero queue rows before enrollment; no new preemption-policy or runtime-cost acceptance)",
@@ -70,8 +70,8 @@ embed = [
   "carrick-embed::scheduler_progress_contract",
 ]
 docker = [
-  "fixture:scheduler_preemption",
   "probe:schedaffinitysibling",
+  "fixture:scheduler_preemption",
 ]
 ecosystem = [
   "cpython:threading",
