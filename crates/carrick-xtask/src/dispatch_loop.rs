@@ -1719,7 +1719,8 @@ impl Server<'_> {
         let unpushed = (observations.is_empty() && status == ContractStatus::Done)
             .then(|| self.unpushed_head())
             .flatten();
-        let facts = self.pr.map(|pr| self.round_facts(pr));
+        let claimed_done = status == ContractStatus::Done;
+        let facts = self.pr.map(|pr| self.round_facts(pr, claimed_done));
         let stalled =
             (observations.is_empty() && unpushed.is_none() && status == ContractStatus::Done)
                 .then(|| facts.as_ref().and_then(RoundFacts::stalled))
@@ -1891,7 +1892,7 @@ impl Server<'_> {
     /// What the server can check about the PR at outcome time (#1215): a
     /// coordinator's Done is a claim, these are facts. Each one that cannot
     /// be read stays unknown and never changes the status.
-    fn round_facts(&self, pr: u64) -> RoundFacts {
+    fn round_facts(&self, pr: u64, claimed_done: bool) -> RoundFacts {
         let pushed = (|| -> Result<u64, ScalerError> {
             let state = crate::agent_runner::state()?;
             let Some(receipt) = worker_checkpoint(&state, &self.dispatch)? else {
@@ -1900,9 +1901,13 @@ impl Server<'_> {
             if produced_nothing(&self.dispatch, &receipt) {
                 return Ok(0);
             }
-            let from = match admitted_tip(&self.dispatch, &receipt) {
-                "" => self.dispatch.base.as_str(),
-                tip => tip,
+            // After a consented rebase the round's commits start above the
+            // rebased director tip, not the admitted one (#1215).
+            let rebased = Applied::load()?.rebase_tip;
+            let from = match (rebased.as_deref(), admitted_tip(&self.dispatch, &receipt)) {
+                (Some(tip), _) => tip,
+                (None, "") => self.dispatch.base.as_str(),
+                (None, tip) => tip,
             };
             let range = format!("{from}..{}", receipt.head);
             git(&state.join("work"), &["rev-list", "--count", &range])?
@@ -1911,12 +1916,15 @@ impl Server<'_> {
                 .map_err(|_| ScalerError::Guard("commit count"))
         })()
         .ok();
-        let live = gh(
-            self.root,
-            &["api", &format!("repos/{REPOSITORY}/pulls/{pr}")],
-        )
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let read_pr = || {
+            gh(
+                self.root,
+                &["api", &format!("repos/{REPOSITORY}/pulls/{pr}")],
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        };
+        let mut live = read_pr();
         let head = live
             .as_ref()
             .and_then(|p| p["head"]["sha"].as_str())
@@ -1930,6 +1938,17 @@ impl Server<'_> {
             .ok()?;
             serde_json::from_str::<Value>(&compare).ok()?["behind_by"].as_u64()
         });
+        // GitHub computes `mergeable` lazily and answers null until it has.
+        // Only when it alone decides a claimed Done is it worth one more
+        // read after a short wait; still null stays unknown.
+        if claimed_done
+            && pushed == Some(0)
+            && behind == Some(0)
+            && live.as_ref().is_some_and(|p| p["mergeable"].is_null())
+        {
+            std::thread::sleep(Duration::from_secs(3));
+            live = read_pr().or(live);
+        }
         RoundFacts {
             pushed,
             behind,
