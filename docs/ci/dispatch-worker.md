@@ -540,6 +540,13 @@ launcher's own `agy-worker:` diagnostic line is quoted; the rest of its
 stderr stays in the masked artifacts. A timeout, or an exit after the
 coordinator called a tool, keeps the plain reason.
 
+A WIP checkpoint whose commits change `.github/workflows/*` can't be pushed
+with dispatch's credentials. Instead of losing the round's other work (#1241:
+one workflow file kept ten others off the remote in run 41206003566), the
+server commits `.github/workflows/` back to its admitted-main state on top,
+pushes that under the same lease, and the outcome lists the workflow files
+left out for the owner to publish from `harvest.patch`.
+
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
 proposals and the comment tool refuse the marker.

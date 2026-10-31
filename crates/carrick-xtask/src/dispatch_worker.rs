@@ -2130,6 +2130,52 @@ fn produced_nothing(dispatch: &Dispatch, receipt: &Receipt) -> bool {
     receipt.head == admitted || (admitted.is_empty() && receipt.head == receipt.base)
 }
 
+/// Commit, on top of the harvested work, `.github/workflows/` as it is on
+/// admitted main, so the rest of the work can be pushed when dispatch's
+/// credentials can't publish the workflow changes (#1241). Returns the
+/// workflow paths left out; empty when there were none.
+fn strip_workflow_changes(work: &Path, base: &str) -> Result<Vec<String>, ScalerError> {
+    let changed: Vec<String> = git(
+        work,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            base,
+            "HEAD",
+            "--",
+            ".github/workflows/",
+        ],
+    )?
+    .split('\0')
+    .filter(|p| !p.is_empty())
+    .map(str::to_owned)
+    .collect();
+    if changed.is_empty() {
+        return Ok(changed);
+    }
+    for path in &changed {
+        let at_base = git(work, &["cat-file", "-e", &format!("{base}:{path}")]).is_ok();
+        if at_base {
+            git(work, &["checkout", base, "--", path])?;
+        } else {
+            git(work, &["rm", "-q", "--", path])?;
+        }
+    }
+    git(
+        work,
+        &[
+            "commit",
+            "-q",
+            "--no-verify",
+            "-m",
+            "chore(dispatch): leave workflow changes out of the WIP checkpoint\n\nDispatch credentials can't publish .github/workflows/*; the full patch\nis in the run's harvest.patch artifact.",
+        ],
+    )?;
+    Ok(changed)
+}
+
 /// Re-pair the checkpoint receipt with the tree after publication moved HEAD.
 fn refresh_checkpoint_head(state: &Path, work: &Path) -> Result<(), ScalerError> {
     use std::io::Write;
@@ -3158,6 +3204,10 @@ struct Applied {
     /// The last tip the server pushed as a WIP checkpoint after a worker.
     #[serde(default)]
     wip_pushed: Option<String>,
+    /// Workflow files a WIP checkpoint left out, because dispatch can't
+    /// publish `.github/workflows/*` (#1241); the owner publishes them.
+    #[serde(default)]
+    workflow_left_out: Vec<String>,
 }
 impl Applied {
     fn load() -> Result<Self, ScalerError> {
@@ -3186,7 +3236,17 @@ impl Applied {
                 .unwrap_or_default(),
             self.wip_pushed
                 .as_ref()
-                .map(|tip| format!("- Pushed WIP at `{tip}`.\n"))
+                .map(|tip| {
+                    let left = if self.workflow_left_out.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " It leaves out the run's workflow changes ({}), which dispatch can't publish: the owner publishes them from `{HARVEST_PATCH}`",
+                            self.workflow_left_out.join(", ")
+                        )
+                    };
+                    format!("- Pushed WIP at `{tip}`.{left}\n")
+                })
                 .unwrap_or_default(),
             if self.commits.is_empty() {
                 "none".into()
