@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "mcp__carrick-reactor",
+      "mcp__carrick-reactor__*",
+      "Read",
+      "Monitor",
+      "Agent",
+      "SendMessage",
+      "Bash(tail -n0 -F /Volumes/CaseSensitive/carrick-director/reactor/state/mailbox.jsonl)"
+    ],
+    "deny": [
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "WebFetch"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": ["carrick-reactor"]
+}
