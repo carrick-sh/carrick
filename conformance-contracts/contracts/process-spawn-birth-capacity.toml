@@ -9,8 +9,12 @@ rationale = "A process-only workload must not pay for executable runtime cells f
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-kernel-example::spawn_birth_capacity::{process_only_startup_reserves_no_sibling_runtime_capacity,first_host_thread_clone_primes_executable_sibling_capacity}"
-embed = "carrick-embed::el1_sched::{el1_thread_lifecycle_spawn_slope,el1_thread_lifecycle_exit_group_and_exec_during_clone_storm,el1_thread_lifecycle_rlimit_nproc_exact}"
+vm_free = [
+  "carrick-kernel-example::spawn_birth_capacity::{process_only_startup_reserves_no_sibling_runtime_capacity,first_host_thread_clone_primes_executable_sibling_capacity}",
+]
+embed = [
+  "carrick-embed::el1_sched::{el1_thread_lifecycle_spawn_slope,el1_thread_lifecycle_exit_group_and_exec_during_clone_storm,el1_thread_lifecycle_rlimit_nproc_exact}",
+]
 
 [bindings.unresolved]
 docker = "This task prohibits Docker; the existing Phase B impact evidence supplies the historical reference, not a refreshed differential."

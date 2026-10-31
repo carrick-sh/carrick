@@ -32,6 +32,13 @@ conformance-next shards. No runtime ratio is claimed.
 """
 
 [bindings]
-vm_free = "carrick-mmu-core::aarch64::tests::manager_from_live_image_copies_only_occupied_tables; carrick-vmm-hvf::trap::frame_inventory::tests::exec_plan_table_payload_is_the_occupied_prefix"
-embed = "carrick-conformance-next::probes_shard_{0,1,2}::generic_probe_shard_{0,1,2} (CARRICK_PROBE_FILTER=execvereset,execthreads,execsig,forkexecstorm,fexecveprobe,execpipe,execsocket,execfailsurvive,execpermitchurn,clonefilesexec,mmapexecshared,forkprotectexec,brkbeyondbreak)"
-docker = "probe:execvereset"
+vm_free = [
+  "carrick-mmu-core::aarch64::tests::manager_from_live_image_copies_only_occupied_tables",
+  "carrick-vmm-hvf::trap::frame_inventory::tests::exec_plan_table_payload_is_the_occupied_prefix",
+]
+embed = [
+  "carrick-conformance-next::probes_shard_{0,1,2}::generic_probe_shard_{0,1,2} (CARRICK_PROBE_FILTER=execvereset,execthreads,execsig,forkexecstorm,fexecveprobe,execpipe,execsocket,execfailsurvive,execpermitchurn,clonefilesexec,mmapexecshared,forkprotectexec,brkbeyondbreak)",
+]
+docker = [
+  "probe:execvereset",
+]

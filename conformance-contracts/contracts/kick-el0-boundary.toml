@@ -13,9 +13,31 @@ rationale = "A cross-thread kick that stops a vCPU inside Carrick's syscall vect
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-aarch64::owed_kick::tests::kick_absorbed_in_el1_vector_surfaces_at_the_el0_boundary; carrick-aarch64::owed_kick::tests::owed_kick_survives_internal_el1_exits_before_eret; carrick-aarch64::owed_kick::tests::surfaced_el1_exit_settles_the_owed_kick_in_spsr; carrick-aarch64::owed_kick::tests::absorbed_kick_is_published_to_the_el1_hook; carrick-mem::memory::el1_hook_kick::kick_absorbed_anywhere_in_served_hook_surfaces; carrick-mem::memory::el1_hook_kick::served_path_restores_el0_state_exactly; carrick-vmm-hvf::trap::virtual_irq_line_tests::kick_irq_asserts_the_sdk_irq_line; carrick-aarch64::owed_kick::tests::gic_pending_kick_survives_run_returns_and_is_withdrawn_when_served; carrick-vmm-hvf::gic::tests::kick_vehicle_is_chosen_in_one_place; carrick-vmm-hvf::gic::tests::run_to_exit_withdraws_an_in_loop_kick_on_every_surfaced_exit; carrick-mem::memory::el1_hook_kick::gic_kick_absorbed_anywhere_in_served_hook_surfaces; carrick-mem::memory::el1_hook_kick::gic_kick_taken_at_el0_leaves_through_the_kick_exit; carrick-mem::memory::el1_hook_kick::gic_el0_irq_hook_returns_exactly_and_loses_no_kick"
-embed = "carrick-embed::pt_pause_drain_pressure; carrick-embed::el1_kick_served_loop (signed; burst rounds under host oversubscription, watchdog-bounded)"
-ecosystem = ["go:testing", "go:time", "go:os_signal", "go:net_http"]
+vm_free = [
+  "carrick-aarch64::owed_kick::tests::absorbed_kick_is_published_to_the_el1_hook",
+  "carrick-aarch64::owed_kick::tests::gic_pending_kick_survives_run_returns_and_is_withdrawn_when_served",
+  "carrick-aarch64::owed_kick::tests::kick_absorbed_in_el1_vector_surfaces_at_the_el0_boundary",
+  "carrick-aarch64::owed_kick::tests::owed_kick_survives_internal_el1_exits_before_eret",
+  "carrick-aarch64::owed_kick::tests::surfaced_el1_exit_settles_the_owed_kick_in_spsr",
+  "carrick-mem::memory::el1_hook_kick::gic_el0_irq_hook_returns_exactly_and_loses_no_kick",
+  "carrick-mem::memory::el1_hook_kick::gic_kick_absorbed_anywhere_in_served_hook_surfaces",
+  "carrick-mem::memory::el1_hook_kick::gic_kick_taken_at_el0_leaves_through_the_kick_exit",
+  "carrick-mem::memory::el1_hook_kick::kick_absorbed_anywhere_in_served_hook_surfaces",
+  "carrick-mem::memory::el1_hook_kick::served_path_restores_el0_state_exactly",
+  "carrick-vmm-hvf::gic::tests::kick_vehicle_is_chosen_in_one_place",
+  "carrick-vmm-hvf::gic::tests::run_to_exit_withdraws_an_in_loop_kick_on_every_surfaced_exit",
+  "carrick-vmm-hvf::trap::virtual_irq_line_tests::kick_irq_asserts_the_sdk_irq_line",
+]
+embed = [
+  "carrick-embed::el1_kick_served_loop (signed; burst rounds under host oversubscription, watchdog-bounded)",
+  "carrick-embed::pt_pause_drain_pressure",
+]
+ecosystem = [
+  "go:net_http",
+  "go:os_signal",
+  "go:testing",
+  "go:time",
+]
 
 [bindings.unresolved]
 docker = "Hypervisor interrupt delivery is host-internal; Linux supplies no oracle for it. The Linux obligation is timely asynchronous interruption, carried by the ecosystem rows."

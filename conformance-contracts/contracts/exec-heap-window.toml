@@ -26,6 +26,12 @@ work meter or runtime ratio is claimed.
 """
 
 [bindings]
-vm_free = "carrick-vmm-hvf::trap::frame_inventory::tests::exec_rebuild_leaves_the_heap_window_unmapped"
-embed = "carrick-conformance-next::probes_shard_2::generic_probe_shard_2"
-docker = "probe:brkbeyondbreak"
+vm_free = [
+  "carrick-vmm-hvf::trap::frame_inventory::tests::exec_rebuild_leaves_the_heap_window_unmapped",
+]
+embed = [
+  "carrick-conformance-next::probes_shard_2::generic_probe_shard_2",
+]
+docker = [
+  "probe:brkbeyondbreak",
+]

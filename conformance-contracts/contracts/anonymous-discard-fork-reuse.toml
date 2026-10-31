@@ -13,7 +13,16 @@ rationale = "A thread stack is discarded from one Linux page above its mapping, 
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-vmm-hvf::trap::foreign_mm::tests::invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row"
-embed = "carrick-embed::discard_fork_threads::discard_fork_threads_contract"
-docker = "cached native ARM64 Docker oracle rows cpython-fork1 and cpython-wait4 (scripts/conformance/oracle-cache.jsonl)"
-ecosystem = ["cpython:fork1", "cpython:wait4"]
+vm_free = [
+  "carrick-vmm-hvf::trap::foreign_mm::tests::invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row",
+]
+embed = [
+  "carrick-embed::discard_fork_threads::discard_fork_threads_contract",
+]
+docker = [
+  "cached native ARM64 Docker oracle rows cpython-fork1 and cpython-wait4 (scripts/conformance/oracle-cache.jsonl)",
+]
+ecosystem = [
+  "cpython:fork1",
+  "cpython:wait4",
+]

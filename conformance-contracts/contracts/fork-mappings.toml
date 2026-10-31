@@ -17,10 +17,21 @@ rationale = "Fork memory mapping projection must scale affinely with populated V
 # production dispatcher publication/import and shared stock loan/reserve/commit.
 # It adds semantic source-scope and finite-capacity evidence. The many-source
 # binding bounds identity work during inherited custody lookup, not runtime ratio.
-vm_free = "carrick-kernel-example::fork_mappings_contract; carrick-vmm-hvf::trap::process_plan::tests::untouched_private_alias_repoints_retained_leaf_without_making_it_valid; carrick-kernel::dispatch::mem::delegated_tests::post_exec_native_fork_reserves_loaded_image_source_custody; carrick-kernel::dispatch::mem::host_backing::tests::fork_source_custody_bounds_identity_work_for_many_sources"
-embed = "carrick-embed::fork_mappings_contract"
-docker = "probe:forksnapshot"
-ecosystem = ["ltp:fork14"]
+vm_free = [
+  "carrick-kernel-example::fork_mappings_contract",
+  "carrick-kernel::dispatch::mem::delegated_tests::post_exec_native_fork_reserves_loaded_image_source_custody",
+  "carrick-kernel::dispatch::mem::host_backing::tests::fork_source_custody_bounds_identity_work_for_many_sources",
+  "carrick-vmm-hvf::trap::process_plan::tests::untouched_private_alias_repoints_retained_leaf_without_making_it_valid",
+]
+embed = [
+  "carrick-embed::fork_mappings_contract",
+]
+docker = [
+  "probe:forksnapshot",
+]
+ecosystem = [
+  "ltp:fork14",
+]
 
 [[structural_budgets]]
 kind = "exact"

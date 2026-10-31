@@ -28,8 +28,12 @@ scale_points = [1, 8, 32, 128]
 rationale = "A host regular file enters the zone at open(2), and only there. An operation the zone cannot model (here a shared mmap of the file) demotes the inode; the demoted open description then stays on the host path for its whole life: its later reads, writes and seeks are host-served, return the Linux results, and never re-enter the zone however many of them follow, and a watch added afterwards does not pull it back in. A new open(2) of the same file, after the demoted description is closed, enters the zone again. One entry and one exit per description replaces delegate-at-first-forward and its backoff, whose delegate/recall churn had no Linux counterpart."
 
 [bindings]
-vm_free = "carrick-kernel::el1_delegation::tests::serial_host::a_demoted_description_never_reenters_the_zone"
-embed = "carrick-embed::el1_zone_entry_at_open_contract"
+vm_free = [
+  "carrick-kernel::el1_delegation::tests::serial_host::a_demoted_description_never_reenters_the_zone",
+]
+embed = [
+  "carrick-embed::el1_zone_entry_at_open_contract",
+]
 
 [bindings.unresolved]
 docker = "The fixture checks the Linux results itself (bytes read back after the demotion and after the fresh open); EL1 serving is transparent to the Linux ABI."

@@ -17,10 +17,19 @@ scale_points = [1, 8, 32, 128]
 rationale = "Futex blocking must park once and wake in work proportional to affected waiters."
 
 [bindings]
-vm_free = "carrick-kernel-example::futex_contention_contract"
-embed = "carrick-embed::futex_contention_contract"
-docker = "probe:futexpingpong"
-ecosystem = ["go:sync", "cpython:concurrent_futures"]
+vm_free = [
+  "carrick-kernel-example::futex_contention_contract",
+]
+embed = [
+  "carrick-embed::futex_contention_contract",
+]
+docker = [
+  "probe:futexpingpong",
+]
+ecosystem = [
+  "cpython:concurrent_futures",
+  "go:sync",
+]
 
 [[structural_budgets]]
 kind = "affine"
@@ -72,9 +81,9 @@ fn futex_contract_has_structural_and_runtime_authority() {
         .get(&ContractId::new("kernel.futex.contention").expect("id"))
         .expect("futex contract");
     assert_eq!(contract.scale_points, vec![1, 8, 32, 128]);
-    assert!(contract.bindings.vm_free.is_some());
-    assert!(contract.bindings.embed.is_some());
-    assert!(contract.bindings.docker.is_some());
+    assert!(!contract.bindings.vm_free.is_empty());
+    assert!(!contract.bindings.embed.is_empty());
+    assert!(!contract.bindings.docker.is_empty());
     assert!(contract.runtime_ratio.is_some());
 }
 
@@ -97,8 +106,8 @@ fn duplicate_contract_ids_are_rejected() {
 #[test]
 fn unknown_binding_layers_are_rejected_as_toml() {
     let contract = COMPLETE_CONTRACT.replace(
-        "docker = \"probe:futexpingpong\"",
-        "docker = \"probe:futexpingpong\"\nmystery = \"not-a-layer\"",
+        "docker = [\n  \"probe:futexpingpong\",\n]",
+        "docker = [\n  \"probe:futexpingpong\",\n]\nmystery = [\"not-a-layer\"]",
     );
     let root = fixture_root(&contract, EMPTY_SURFACES);
 
@@ -183,12 +192,10 @@ fn affine_budgets_require_three_scale_points() {
 
 #[test]
 fn surfaces_must_reference_registered_contracts() {
-    let surfaces = r#"
-schema_version = 1
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/futex.rs"
-contracts = ["kernel.futex.missing"]
+    let surfaces = r#"schema_version = 1
+surfaces = [
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.missing" },
+]
 "#;
     let root = fixture_root(COMPLETE_CONTRACT, surfaces);
 
@@ -197,6 +204,81 @@ contracts = ["kernel.futex.missing"]
         Err(RegistryError::UnknownSurfaceContract { surface, contract })
             if surface == "crates/carrick-kernel/src/dispatch/futex.rs"
                 && contract.as_str() == "kernel.futex.missing"
+    ));
+}
+
+#[test]
+fn surfaces_group_multiple_contracts_and_reject_exact_duplicates() {
+    let second = COMPLETE_CONTRACT.replace(
+        "id = \"kernel.futex.contention\"",
+        "id = \"kernel.futex.requeue\"",
+    );
+    let surfaces = r#"schema_version = 1
+surfaces = [
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.requeue" },
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.contention" },
+]
+"#;
+    let root = fixture_root(COMPLETE_CONTRACT, surfaces);
+    fs::write(
+        root.path()
+            .join("conformance-contracts/contracts/requeue.toml"),
+        second,
+    )
+    .expect("requeue fixture");
+
+    let registry = ContractRegistry::load(root.path()).expect("grouped surfaces load");
+    assert_eq!(registry.surfaces().len(), 1);
+    assert_eq!(
+        registry.surfaces()[0].contracts,
+        vec![
+            ContractId::new("kernel.futex.contention").expect("id"),
+            ContractId::new("kernel.futex.requeue").expect("id"),
+        ]
+    );
+
+    let duplicate_surfaces = r#"schema_version = 1
+surfaces = [
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.contention" },
+]
+"#;
+    fs::write(
+        root.path().join("conformance-contracts/surfaces.toml"),
+        duplicate_surfaces,
+    )
+    .expect("duplicate surface fixture");
+    assert!(matches!(
+        ContractRegistry::load(root.path()),
+        Err(RegistryError::DuplicateSurfaceEntry { surface, contract })
+            if surface == "crates/carrick-kernel/src/dispatch/futex.rs"
+                && contract.as_str() == "kernel.futex.contention"
+    ));
+}
+
+#[test]
+fn empty_and_duplicate_binding_entries_are_rejected() {
+    let empty_entry = COMPLETE_CONTRACT.replace(
+        "  \"carrick-kernel-example::futex_contention_contract\",",
+        "  \"   \",",
+    );
+    let root = fixture_root(&empty_entry, EMPTY_SURFACES);
+    assert!(matches!(
+        ContractRegistry::load(root.path()),
+        Err(RegistryError::EmptyBindingEntry { id, .. })
+            if id.as_str() == "kernel.futex.contention"
+    ));
+
+    let dup_entry = COMPLETE_CONTRACT.replace(
+        "  \"carrick-kernel-example::futex_contention_contract\",",
+        "  \"carrick-kernel-example::futex_contention_contract\",\n  \"carrick-kernel-example::futex_contention_contract\",",
+    );
+    let root = fixture_root(&dup_entry, EMPTY_SURFACES);
+    assert!(matches!(
+        ContractRegistry::load(root.path()),
+        Err(RegistryError::DuplicateBindingEntry { id, entry, .. })
+            if id.as_str() == "kernel.futex.contention"
+                && entry == "carrick-kernel-example::futex_contention_contract"
     ));
 }
 
@@ -226,7 +308,7 @@ fn m1_descriptor_authorities_are_registered_with_explicit_open_layers() {
     for id in ["kernel.el1.ipc-fd-authority", "kernel.el1.fd-single-owner"] {
         let contract = registry.require(id).expect("M1 contract");
         assert_eq!(contract.scale_points, [65, 4096, 65536]);
-        assert!(contract.bindings.vm_free.is_some());
+        assert!(!contract.bindings.vm_free.is_empty());
         assert!(
             contract
                 .bindings

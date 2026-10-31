@@ -23,7 +23,9 @@ scale_points = [8, 32, 128]
 rationale = "After fork, EL1 serves mmap, munmap and mprotect for both the parent and the child through their delegated roots. The two-process witnesses prove the semantics the delegation must not change: (a) parent and child concurrently map, split, protect and unmap, and each process's own /proc/self/maps equals the exact rows the operation sequence implies after every step, with no row from the peer's mm and a byte-for-byte restore of the starting rows; both roles write distinct marks into a pre-fork COW-shared page and each sees only its own; (b) MAP_FIXED in the child over pages still COW-shared with the parent (one range untouched, one already COW-broken) leaves the parent's bytes intact, and a later parent MAP_FIXED over a range the child still shares leaves the child's bytes intact. The structural claim is the S3 migration target: the operations are served at EL1 (served mmap/munmap/mprotect at least the issued counts) and forwarded counts stay constant as the round count grows, rather than one host forward per call on a forked mm."
 
 [bindings]
-embed = "carrick-embed::el1_sched::{el1_delegated_root_concurrent_vma_ops,el1_delegated_root_map_fixed_over_cow_pages}"
+embed = [
+  "carrick-embed::el1_sched::{el1_delegated_root_concurrent_vma_ops,el1_delegated_root_map_fixed_over_cow_pages}",
+]
 
 [bindings.unresolved]
 vm_free = "The maps-exactness and COW-isolation claims need live guest page tables and two live address spaces; VM-free dispatch tests cannot execute EL0 data aborts or concurrent vCPUs."

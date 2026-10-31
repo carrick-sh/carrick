@@ -7,9 +7,15 @@ fixture = "inotify-watch-churn"
 scale_points = [1, 8, 32, 128]
 rationale = "Incremental watch descriptors prevent distinct unread removal events from spuriously coalescing. No queue scan or host vnode operation is needed for private rootfs churn."
 [bindings]
-vm_free = "carrick-kernel-example::inotify_churn_contract"
-embed = "carrick-conformance-next::inotify_lifecycle::case_inotify_watch_churn"
-docker = "Same-source inotify_lifecycle.py on pinned native ARM64 cpython-test image"
+vm_free = [
+  "carrick-kernel-example::inotify_churn_contract",
+]
+embed = [
+  "carrick-conformance-next::inotify_lifecycle::case_inotify_watch_churn",
+]
+docker = [
+  "Same-source inotify_lifecycle.py on pinned native ARM64 cpython-test image",
+]
 [bindings.unresolved]
 embed_structural = "Signed semantic binding does not yet emit registered work counters"
 embed_timing = "Independent queue-state timing and ratio observation binding pending"

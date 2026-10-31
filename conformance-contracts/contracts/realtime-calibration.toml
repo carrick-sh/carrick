@@ -9,7 +9,15 @@ structural_budgets = []
 rationale = "Without an explicit clock adjustment, sequential vDSO/syscall realtime reads must not move backwards when a sibling exec calibrates a new vvar page. Every page and syscall reader uses one immutable host-carrier calibration; guest clock adjustments remain independent container deltas. Publication performs exactly one atomic compare-exchange per stamp, with no retries, per-mm scans, or updates to existing pages. The VM-free regression checks coherence at each scale; it does not execute guest clocks or report a work-meter observation. The signed binding runs ten LTP comparisons alongside the declared number of sibling execs, and a companion test requires the container's first process (whose vvar page is stamped after its pending creation commits) to read the host realtime clock. No runtime-ratio acceptance is claimed by this semantic contract."
 
 [bindings]
-vm_free = "carrick-mem::vdso::tests::realtime_calibration_is_shared_by_existing_and_new_address_spaces"
-embed = "carrick-embed::realtime_calibration::realtime_calibration_survives_sibling_exec"
-docker = "ltp:clock_gettime04-with-sibling-exec"
-ecosystem = ["ltp:clock_gettime04"]
+vm_free = [
+  "carrick-mem::vdso::tests::realtime_calibration_is_shared_by_existing_and_new_address_spaces",
+]
+embed = [
+  "carrick-embed::realtime_calibration::realtime_calibration_survives_sibling_exec",
+]
+docker = [
+  "ltp:clock_gettime04-with-sibling-exec",
+]
+ecosystem = [
+  "ltp:clock_gettime04",
+]

@@ -196,15 +196,18 @@ enum BudgetKind {
     Affine,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LayerBindings {
     /// Explicit open binding work. Never authorizes execution or acceptance.
     #[serde(default)]
     pub unresolved: std::collections::BTreeMap<String, String>,
-    pub vm_free: Option<String>,
-    pub embed: Option<String>,
-    pub docker: Option<String>,
+    #[serde(default)]
+    pub vm_free: Vec<String>,
+    #[serde(default)]
+    pub embed: Vec<String>,
+    #[serde(default)]
+    pub docker: Vec<String>,
     #[serde(default)]
     pub ecosystem: Vec<String>,
 }
@@ -242,6 +245,13 @@ pub struct ConformanceContract {
 
 #[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct SurfaceEntry {
+    pub path: String,
+    pub contract: ContractId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SurfaceAssignment {
     pub path: String,
     pub contracts: Vec<ContractId>,
@@ -251,7 +261,7 @@ pub struct SurfaceAssignment {
 #[serde(deny_unknown_fields)]
 pub struct SurfaceRegistry {
     pub schema_version: u32,
-    pub surfaces: Vec<SurfaceAssignment>,
+    pub surfaces: Vec<SurfaceEntry>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, ::serde::Serialize)]

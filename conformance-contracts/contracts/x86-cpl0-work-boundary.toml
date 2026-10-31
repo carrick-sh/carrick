@@ -20,8 +20,12 @@ No polling, time extension, or executor serialization is part of the contract.
 """
 
 [bindings]
-vm_free = "carrick-x86-cpl0-host::cpl0_boot::production_work_port_tests::{completed_cpl0_work_has_a_production_boundary,work_boundary_consumes_only_the_stopped_tasks_flags_once}"
-embed = "KVM production carrier: carrick-cli::x86_kvm_run::{mounted_static_x86_signal_restarts_owned_wait4_matches_native,mounted_static_x86_signal_wait_pingpong_matches_native}"
+vm_free = [
+  "carrick-x86-cpl0-host::cpl0_boot::production_work_port_tests::{completed_cpl0_work_has_a_production_boundary,work_boundary_consumes_only_the_stopped_tasks_flags_once}",
+]
+embed = [
+  "KVM production carrier: carrick-cli::x86_kvm_run::{mounted_static_x86_signal_restarts_owned_wait4_matches_native,mounted_static_x86_signal_wait_pingpong_matches_native}",
+]
 
 [bindings.unresolved]
 embed_structural = "Exact physical work-doorbell counts and full wake-delivery closure are not yet emitted as a structural observation."

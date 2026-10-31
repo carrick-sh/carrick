@@ -99,17 +99,22 @@ rationale = "test rationale"
 structural_budgets = []
 
 [bindings]
-vm_free = "crate::binding"
-embed = "crate::embed"
-docker = "image:tag"
+vm_free = [
+  "crate::binding",
+]
+embed = [
+  "crate::embed",
+]
+docker = [
+  "image:tag",
+]
 "#;
     std::fs::write(contracts_dir.join("test.toml"), contract_toml).unwrap();
 
-    let surfaces_toml = r#"
-schema_version = 1
-[[surfaces]]
-path = "some/path.rs"
-contracts = ["test.contract"]
+    let surfaces_toml = r#"schema_version = 1
+surfaces = [
+  { path = "some/path.rs", contract = "test.contract" },
+]
 "#;
     std::fs::write(conf_contracts.join("surfaces.toml"), surfaces_toml).unwrap();
 

@@ -257,7 +257,7 @@ fn timing_ratio_failure_fails_closed() {
 fn unresolved_signed_binding_is_not_execution_coverage() {
     let registry = ContractRegistry::load(&repo_root()).unwrap();
     let mut contract = registry.require("kernel.fs.write-seek").unwrap().clone();
-    contract.bindings.embed = None;
+    contract.bindings.embed.clear();
     contract.bindings.unresolved.insert(
         "embed_structural".into(),
         "test: binding not implemented".into(),
@@ -307,7 +307,7 @@ fn native_syscall_contract_requires_measured_zero_counters() {
     let mut contract = registry.get(&id).expect("native syscall contract").clone();
     // Enable only a local synthetic binding to exercise the budget checker.
     // This never registers a production binding or claims guest execution.
-    contract.bindings.embed = Some("verifier-negative-control".into());
+    contract.bindings.embed = vec!["verifier-negative-control".into()];
     let mut obs = observation(ExecutionLayer::EmbedStructural, 1);
     obs.contract_id = id;
     obs.fixture_identity = contract.fixture.clone();

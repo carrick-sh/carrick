@@ -8,7 +8,10 @@ scale_points = [1, 16, 512]
 rationale = "Host fd-map entries are non-owning views. Ring dup/fork acquire explicit references in the same generation-authenticated lifetime that owns the host functional-reference group. Closing that host group cannot elect recall while a ring reference lives. The last release retains cleanup custody and publishes one indexed handoff; recall demotes bytes without recycling a live open record. The real-VFS witnesses fork through Aarch64NativeProcessService with two live graph tasks. ARM host-view dup/close still cross; owned native-child slots now close/dup in ring. EL1-owned mutation keeps copied child slots out of the host index and removes them before fd reuse. No registered structural-observation closure is claimed."
 structural_budgets = []
 [bindings]
-vm_free = "carrick-kernel::el1_delegation::tests::serial_host::{file_seam_ring_duplicate_survives_last_host_reference,file_seam_final_ring_release_has_one_terminal_handoff_at_each_population,file_seam_native_child_exit_preserves_parent_and_terminal_custody}; carrick-el1-abi::open_lifetime::tests"
+vm_free = [
+  "carrick-el1-abi::open_lifetime::tests",
+  "carrick-kernel::el1_delegation::tests::serial_host::{file_seam_ring_duplicate_survives_last_host_reference,file_seam_final_ring_release_has_one_terminal_handoff_at_each_population,file_seam_native_child_exit_preserves_parent_and_terminal_custody}",
+]
 [bindings.unresolved]
 embed_structural = "Director-owned full signed regression gate; the production non-Linux binding follows in F1b/F4."
 docker = "Linux dup/close/fork authority is public man pages; this slice's real-VFS proof targets internal reference custody. Neutral Open belongs to F4."

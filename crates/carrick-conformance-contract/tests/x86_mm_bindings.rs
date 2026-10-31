@@ -17,9 +17,8 @@ fn x1_owner_witness_is_bound_without_promoting_hardware_acceptance() {
             contract
                 .bindings
                 .vm_free
-                .as_deref()
-                .unwrap()
-                .contains("carrick-core::x86_acceleration::x1_shared_mm_owner"),
+                .iter()
+                .any(|entry| entry.contains("carrick-core::x86_acceleration::x1_shared_mm_owner")),
             "the shared order-1 witness must be registered for {id}"
         );
         assert!(contract.bindings.unresolved["x86_cpl0"].contains("orders 3a/3b"));
@@ -43,9 +42,8 @@ fn x3_custody_components_are_bound_with_remaining_execution_work_visible() {
             contract
                 .bindings
                 .vm_free
-                .as_deref()
-                .unwrap_or_default()
-                .contains("carrick-core::x86_acceleration::x3_shared_protocol"),
+                .iter()
+                .any(|entry| entry.contains("carrick-core::x86_acceleration::x3_shared_protocol")),
             "missing X3 component binding for {id}"
         );
         assert!(contract.bindings.unresolved["x86_cpl0"].contains("order 4"));

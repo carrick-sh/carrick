@@ -13,7 +13,9 @@ rationale = "Shared authority mutations must be visible to every observer. Host 
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}"
+vm_free = [
+  "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}",
+]
 
 [bindings.unresolved]
 embed_structural = "Signed EL0 ownership witness is required after Phase B and step-2 memory land. VM-free publication tests do not prove guest execution or carrier isolation."

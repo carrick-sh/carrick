@@ -12,8 +12,13 @@ structural_budgets = []
 # single pipe reads. Rerun lseek_data_and_hole_across_backends below as the
 # existing SEEK_DATA/SEEK_HOLE control; no new seek or work-budget proof.
 [bindings]
-vm_free = "carrick-portable::lseek_sparse_whole_file_tests (whole_file_answers_follow_lseek_without_hole_support, whole_file_seek_moves_the_position_and_reports_enxio); carrick-kernel::dispatch::fs::tests::lseek_data_and_hole_across_backends (dispatch whence mapping, ENXIO and offset update over dense and rootfs-backed files)"
-docker = "probe:seekholedata"
+vm_free = [
+  "carrick-kernel::dispatch::fs::tests::lseek_data_and_hole_across_backends (dispatch whence mapping, ENXIO and offset update over dense and rootfs-backed files)",
+  "carrick-portable::lseek_sparse_whole_file_tests (whole_file_answers_follow_lseek_without_hole_support, whole_file_seek_moves_the_position_and_reports_enxio)",
+]
+docker = [
+  "probe:seekholedata",
+]
 
 [bindings.unresolved]
 embed_structural = "No signed carrick-embed fixture seeks SEEK_DATA/SEEK_HOLE on a host file yet; the NetBSD fallback has no live NetBSD-host execution evidence."

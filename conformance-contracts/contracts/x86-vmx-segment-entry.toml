@@ -21,7 +21,11 @@ CR fixed masks and injected-interrupt state remain backend responsibilities.
 """
 
 [bindings]
-vm_free = "carrick-x86::segments::tests; carrick-x86::bringup_fns::tests::vmx_programmed_entry_segments_are_valid; carrick-vmm-kvm::kvm_x86_engine::vmx_segment_tests::vmx_restore_user_and_cpl0_segments_are_valid"
+vm_free = [
+  "carrick-vmm-kvm::kvm_x86_engine::vmx_segment_tests::vmx_restore_user_and_cpl0_segments_are_valid",
+  "carrick-x86::bringup_fns::tests::vmx_programmed_entry_segments_are_valid",
+  "carrick-x86::segments::tests",
+]
 
 [bindings.unresolved]
 embed_structural = "Live Intel and AMD KVM bindings are director-owned acceptance; this worker binds architectural state only, with no runtime work observation."

@@ -8,7 +8,9 @@ scale_points = [1, 7, 32]
 rationale = "A read-only shared file mapping over a retired anonymous arena grant initializes all bytes from its file snapshot, including the partial-page zero tail. It must not request anonymous backing maintenance from an admitted owner. The bounded VM-free fixture changes guest affinity policy and models the ARM owner's Unsupported scrub refusal; it does not execute a vCPU or establish migration behavior. Existing private-file lowering and anonymous reuse remain unchanged."
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::mem::tests::shared_file_reuse_after_affinity_change_needs_no_anonymous_scrub; actual anonymous mmap/munmap and sched_setaffinity dispatch, a dense file description, and counted shared-file initialization at 1/7/32 pages"
+vm_free = [
+  "carrick-kernel::dispatch::mem::tests::shared_file_reuse_after_affinity_change_needs_no_anonymous_scrub; actual anonymous mmap/munmap and sched_setaffinity dispatch, a dense file description, and counted shared-file initialization at 1/7/32 pages",
+]
 
 [bindings.unresolved]
 embed_structural = "Director-owned: el1_sched_futex_handoff_after_self_affinity_change must pass 10/10 on one signed artifact. HVF is unavailable on ctb-w3."

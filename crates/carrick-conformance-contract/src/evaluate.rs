@@ -95,11 +95,11 @@ pub fn evaluate(
         }
 
         let supported = match obs.layer {
-            ExecutionLayer::VmFree => contract.bindings.vm_free.is_some(),
+            ExecutionLayer::VmFree => !contract.bindings.vm_free.is_empty(),
             ExecutionLayer::EmbedStructural | ExecutionLayer::EmbedTiming => {
-                contract.bindings.embed.is_some()
+                !contract.bindings.embed.is_empty()
             }
-            ExecutionLayer::Docker => contract.bindings.docker.is_some(),
+            ExecutionLayer::Docker => !contract.bindings.docker.is_empty(),
             ExecutionLayer::Ecosystem => !contract.bindings.ecosystem.is_empty(),
         };
         if !supported {

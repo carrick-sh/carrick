@@ -7,9 +7,16 @@ fixture = "unit:forked-el1-stack-grant-discard"
 scale_points = [1, 2, 4]
 rationale = "HVPatch retires every 4 KiB Linux page through exact-MM alias and inventory authority, including partial 16 KiB host compounds. The old edge scrub invoked frame COW on retained outputs whose compound inventory had already been split. Fresh-zero provenance makes a later touch allocate new backing; fork peers retain their own image."
 [bindings]
-vm_free = "carrick-vmm-hvf::hvf_aarch64_engine::persistent_worker_tests::forked_el1_stack_grant_discards_64k_and_8m_without_edge_cow"
-embed = "carrick-conformance-next::deferred_anonymous_unaligned_discard"
-docker = "Same-source fixtures/unaligned_discard.py; pinned native ARM64 cpython-test image; discard-edges/oracle.json"
+vm_free = [
+  "carrick-vmm-hvf::hvf_aarch64_engine::persistent_worker_tests::forked_el1_stack_grant_discards_64k_and_8m_without_edge_cow",
+]
+embed = [
+  "carrick-conformance-next::deferred_anonymous_unaligned_discard",
+]
+docker = [
+  "Same-source fixtures/unaligned_discard.py; pinned native ARM64 cpython-test image",
+  "discard-edges/oracle.json",
+]
 [bindings.unresolved]
 production_carrier = "VM-free physical alias and inventory retirement failure injection remains pending."
 embed_structural = "Signed discard and fork tests must confirm zero physical edge scrubs."

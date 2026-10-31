@@ -597,19 +597,33 @@ pub fn contract_test_bindings(
         let Some(bindings) = parsed.get("bindings").and_then(toml::Value::as_table) else {
             continue;
         };
-        for value in bindings.values().filter_map(toml::Value::as_str) {
-            for binding in value.split(';') {
-                let path = binding.split_whitespace().next().unwrap_or("");
-                let mut segments = path.split("::");
-                let (Some(package), Some(target)) = (segments.next(), segments.next()) else {
+        for (layer, value) in bindings {
+            if layer == "unresolved" {
+                continue;
+            }
+            let Some(entries) = value.as_array() else {
+                errors.push(format!("{name}: bindings.{layer} must be a TOML array"));
+                continue;
+            };
+            for entry in entries {
+                let Some(text) = entry.as_str() else {
+                    errors.push(format!("{name}: bindings.{layer} entries must be strings"));
                     continue;
                 };
-                let target = target.split('{').next().unwrap_or(target);
-                if let Some(found) = targets
-                    .iter()
-                    .find(|t| t.package == package && t.target == target)
-                {
-                    bound.push((name.clone(), path.to_owned(), found.clone()));
+                for binding in text.split(';') {
+                    let path = binding.split_whitespace().next().unwrap_or("");
+                    let mut segments = path.split("::");
+                    let (Some(package), Some(target)) = (segments.next(), segments.next()) else {
+                        continue;
+                    };
+                    let package = package.strip_prefix("doctest:").unwrap_or(package);
+                    let target = target.split('{').next().unwrap_or(target);
+                    if let Some(found) = targets
+                        .iter()
+                        .find(|t| t.package == package && t.target == target)
+                    {
+                        bound.push((name.clone(), path.to_owned(), found.clone()));
+                    }
                 }
             }
         }
@@ -926,6 +940,63 @@ mod tests {
         assert!(
             errors[0].contains("my-vmm::probe: bin target contains #[test]"),
             "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn contract_test_bindings_reads_toml_arrays_and_rejects_strings() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let contracts_dir = temp_dir.path().join("conformance-contracts/contracts");
+        std::fs::create_dir_all(&contracts_dir).unwrap();
+        std::fs::write(
+            contracts_dir.join("valid.toml"),
+            r#"
+[bindings]
+vm_free = [
+  "pkg-a::target_one",
+  "doctest:pkg-a::target_two::case",
+]
+embed = [
+  "pkg-b::embed_target::{case_a,case_b}",
+]
+
+[bindings.unresolved]
+docker = "pending oracle"
+"#,
+        )
+        .unwrap();
+        let metadata = json!({"packages": [
+            package("pkg-a", &["target_one", "target_two"], json!({})),
+            package("pkg-b", &["embed_target"], json!({"*": "signed-hvf"})),
+        ]});
+        let (targets, resolve_errors) = resolve(&metadata);
+        assert!(resolve_errors.is_empty(), "{resolve_errors:?}");
+
+        let (bound, binding_errors) = contract_test_bindings(temp_dir.path(), &targets);
+        assert!(binding_errors.is_empty(), "{binding_errors:?}");
+        let matched: Vec<(&str, &str)> = bound
+            .iter()
+            .map(|(_, _, t)| (t.package.as_str(), t.target.as_str()))
+            .collect();
+        assert_eq!(
+            matched,
+            [
+                ("pkg-b", "embed_target"),
+                ("pkg-a", "target_one"),
+                ("pkg-a", "target_two"),
+            ]
+        );
+
+        std::fs::write(
+            contracts_dir.join("legacy.toml"),
+            "[bindings]\nvm_free = \"pkg-a::target_one\"\n",
+        )
+        .unwrap();
+        let (_bound, binding_errors) = contract_test_bindings(temp_dir.path(), &targets);
+        assert_eq!(binding_errors.len(), 1, "{binding_errors:?}");
+        assert!(
+            binding_errors[0].contains("legacy.toml: bindings.vm_free must be a TOML array"),
+            "{binding_errors:?}"
         );
     }
 }

@@ -20,10 +20,18 @@ scale_points = [1, 8, 32, 128]
 rationale = "The serial fixture isolates the exact four-syscall body of LTP inotify09. It binds structural work before the signed performance probe adds the upstream two-thread race."
 
 [bindings]
-vm_free = "carrick-kernel-example::inotify_hotpath_contract"
-embed = "carrick-embed::contracts::inotify_hotpath_structural_contract"
-docker = "probe:perf_inotify09_scale"
-ecosystem = ["ltp:inotify09"]
+vm_free = [
+  "carrick-kernel-example::inotify_hotpath_contract",
+]
+embed = [
+  "carrick-embed::contracts::inotify_hotpath_structural_contract",
+]
+docker = [
+  "probe:perf_inotify09_scale",
+]
+ecosystem = [
+  "ltp:inotify09",
+]
 
 [bindings.unresolved]
 embed_timing = "The decomposition probe emits 21-sample timing distributions; its signed-vs-Docker ratio parser is still required before timing evidence is accepted automatically."

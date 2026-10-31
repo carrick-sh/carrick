@@ -23,10 +23,20 @@ rationale = "Blocking futex operations must park without redispatch and wake wit
 # carrick-kernel-example::futex_contention_contract and unit tests in
 # crates/carrick-thread/src/thread.rs confirm contention scaling, continuation
 # budgets, and waiter enrollment invariants remain intact.
-vm_free = "carrick-kernel-example::futex_contention_contract; carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::futex_pi_lock_and_unlock_wait_for_owner_refused_copyout_without_waking_waiters"
-embed = "carrick-embed::futex_contention_contract"
-docker = "probe:futexpingpong"
-ecosystem = ["go:sync", "cpython:concurrent_futures"]
+vm_free = [
+  "carrick-kernel-example::futex_contention_contract",
+  "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::futex_pi_lock_and_unlock_wait_for_owner_refused_copyout_without_waking_waiters",
+]
+embed = [
+  "carrick-embed::futex_contention_contract",
+]
+docker = [
+  "probe:futexpingpong",
+]
+ecosystem = [
+  "cpython:concurrent_futures",
+  "go:sync",
+]
 
 [[structural_budgets]]
 kind = "affine"

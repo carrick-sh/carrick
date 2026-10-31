@@ -12,7 +12,10 @@ scale_points = [1, 8, 32, 128]
 rationale = "A participating host writer must revoke future content use and wait for affected active users before changing bytes. Unrelated physical pages are not revoked or drained. Captured code content is activated only inside its exact kernel running scope. This is not proof of private RX admission, hardware-write mediation, executable publication, or linked native execution."
 
 [bindings]
-vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_instruction_content_scope_contract (feature conformance-metrics); carrick-vmm-hvf::trap::code_content::execution_tests; real carrier instruction receipt and syscall writer regressions"
+vm_free = [
+  "carrick-runtime::vcpu_loop::memory::tests::native_instruction_content_scope_contract (feature conformance-metrics)",
+  "carrick-vmm-hvf::trap::code_content::execution_tests; real carrier instruction receipt and syscall writer regressions",
+]
 
 [bindings.unresolved]
 embed_structural = "No signed mixed native/HVF code publication or direct-link revocation binding yet. Guest hardware stores, writable aliases and private RX admission remain unresolved."

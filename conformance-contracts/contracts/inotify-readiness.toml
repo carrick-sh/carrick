@@ -27,10 +27,19 @@ is where that term dominates.
 """
 
 [bindings]
-vm_free = "carrick-kernel-example::inotify_readiness_contract"
-embed = "carrick-embed::inotify_readiness_contract"
-docker = "probe:inotifyqueue"
-ecosystem = ["ltp:inotify09", "ltp:inotify11"]
+vm_free = [
+  "carrick-kernel-example::inotify_readiness_contract",
+]
+embed = [
+  "carrick-embed::inotify_readiness_contract",
+]
+docker = [
+  "probe:inotifyqueue",
+]
+ecosystem = [
+  "ltp:inotify09",
+  "ltp:inotify11",
+]
 
 [[structural_budgets]]
 kind = "affine"
