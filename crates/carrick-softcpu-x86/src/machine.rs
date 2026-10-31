@@ -148,7 +148,9 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
             deliver_syscall(cpu.context_mut(), next_rip);
             None
         }
-        SoftCpuExit::Exception(exc) => deliver_exception_with_escalation(cpu.context_mut(), mem, exc),
+        SoftCpuExit::Exception(exc) => {
+            deliver_exception_with_escalation(cpu.context_mut(), mem, exc)
+        }
         SoftCpuExit::SoftwareInterrupt {
             vector,
             rip,
@@ -327,9 +329,8 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
         return Err(X86Exception::segment_not_present(fault_va, gate_err));
     }
 
-    let entry_rip = u64::from(offset_low)
-        | (u64::from(offset_mid) << 16)
-        | (u64::from(offset_high) << 32);
+    let entry_rip =
+        u64::from(offset_low) | (u64::from(offset_mid) << 16) | (u64::from(offset_high) << 32);
     if !is_canonical_va(entry_rip) {
         return Err(X86Exception::general_protection(fault_va, 0));
     }
@@ -372,7 +373,11 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
 
     // SDM Vol. 3A §6.14.2: IA-32e mode aligns RSP to a 16-byte boundary before pushing the frame.
     let aligned_rsp = raw_target_rsp & !0xf;
-    let frame_len = if error_code.is_some() { 48usize } else { 40usize };
+    let frame_len = if error_code.is_some() {
+        48usize
+    } else {
+        40usize
+    };
     let new_rsp = aligned_rsp.wrapping_sub(frame_len as u64);
     if !is_canonical_va(new_rsp) || !is_canonical_va(new_rsp.wrapping_add((frame_len - 1) as u64)) {
         return Err(X86Exception::stack_segment_fault(fault_va, ext));

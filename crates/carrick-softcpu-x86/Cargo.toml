@@ -17,7 +17,10 @@ iced-x86 = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+carrick-hal = { path = "../carrick-hal" }
+carrick-x86 = { path = "../carrick-x86" }
 goblin = { workspace = true }
 
 [package.metadata.carrick.test-lanes]
 softcpu_level0 = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs in the VM-free host lane on x86_64" }
+softcpu_cpl0 = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs VM-free CPL0 privileged instruction and SoftMachine boot tests on x86_64" }
