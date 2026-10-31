@@ -127,6 +127,9 @@ pub(crate) struct Gate {
     pub repeat_round: bool,
     /// [`UNATTENDED_ROUNDS`] reactor rounds since the last owner comment.
     pub unattended: bool,
+    /// A reply answers something: the PR is trusted and an owner event on
+    /// it is not yet answered.
+    pub reply_allowed: bool,
 }
 /// The only effects the rule layer can produce.
 #[derive(Debug, PartialEq, Eq)]
@@ -137,11 +140,35 @@ pub(crate) enum Effect {
 }
 
 /// Hard rules: the agent's decision becomes a comment only through here.
+/// Reply and brief length caps, in characters.
+const REPLY_LIMIT: usize = 2000;
+const BRIEF_LIMIT: usize = 4000;
+/// Prefixes of credentials that must never be posted (GitHub tokens, PEM
+/// keys, AWS access keys). Everything the reactor posts is public.
+const SECRET_SHAPES: [&str; 9] = [
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghu_",
+    "ghr_",
+    "github_pat_",
+    "-----BEGIN",
+    "AKIA",
+    "ASIA",
+];
+fn secret_shaped(text: &str) -> bool {
+    SECRET_SHAPES.iter().any(|shape| text.contains(shape))
+}
 pub(crate) fn enforce(decision: &Decision, gate: &Gate) -> Effect {
     let text = decision.text.trim();
     match decision.action {
         Act::Ignore => Effect::None,
+        _ if secret_shaped(text) => Effect::Refused("text looks like a credential"),
         Act::Reply if text.is_empty() => Effect::Refused("empty reply"),
+        Act::Reply if text.chars().count() > REPLY_LIMIT => Effect::Refused("reply too long"),
+        Act::Reply if !gate.reply_allowed => {
+            Effect::Refused("no unanswered owner message on a trusted PR")
+        }
         Act::Reply if text.starts_with("/agent") => Effect::Refused("reply may not be a command"),
         Act::Reply => Effect::Post(format!("{text}\n\n{MARKER}")),
         Act::Round if !gate.eligible => Effect::Refused("PR is neither adoptable nor owned"),
@@ -154,6 +181,7 @@ pub(crate) fn enforce(decision: &Decision, gate: &Gate) -> Effect {
             Effect::Refused("unattended round limit; waiting for a human comment")
         }
         Act::Round if text.is_empty() || text.contains(MARKER) => Effect::Refused("invalid brief"),
+        Act::Round if text.chars().count() > BRIEF_LIMIT => Effect::Refused("brief too long"),
         Act::Round => Effect::Post(format!("/agent {text}\n\n{MARKER}")),
     }
 }
@@ -212,6 +240,11 @@ fn director_pr(pr: &Value) -> bool {
         && dispatch_branch(branch).is_none()
         && ((pr["user"]["login"] == "tjfontaine" && pr["user"]["type"] == "User")
             || super::publish_app_author(&pr["user"]))
+}
+/// A PR whose author's text may reach the session: the owner or the
+/// publish App.
+pub(crate) fn trusted_pr(pr: &Value) -> bool {
+    trusted_owner(&pr["user"]) || super::publish_app_author(&pr["user"])
 }
 fn owned_pr(pr: &Value) -> bool {
     pr["head"]["repo"]["full_name"] == REPOSITORY
@@ -483,6 +516,7 @@ pub(crate) fn cycle(
             repeat_round: memory.last_round_head.as_deref() == Some(head.as_str())
                 && !memory.human_since_round,
             unattended: memory.unattended_rounds >= UNATTENDED_ROUNDS,
+            reply_allowed: trusted_pr(pr) && fresh.iter().any(|e| e.class.human),
         };
         match enforce(&decision, &gate) {
             Effect::None => {}
@@ -991,6 +1025,49 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_reactor_never_posts_credentials_or_unasked_replies() {
+        let gate = |reply_allowed| Gate {
+            eligible: true,
+            pr_run_active: false,
+            active_total: 0,
+            repeat_round: false,
+            unattended: false,
+            reply_allowed,
+        };
+        let decide = |action, text: &str| Decision {
+            action,
+            text: text.into(),
+            reason: String::new(),
+        };
+        assert_eq!(
+            enforce(&decide(Act::Reply, "CI is green."), &gate(false)),
+            Effect::Refused("no unanswered owner message on a trusted PR")
+        );
+        for text in [
+            "see ghs_0123",
+            "github_pat_11AB",
+            "-----BEGIN RSA PRIVATE KEY",
+            "AKIAIOSFODNN7",
+        ] {
+            for action in [Act::Reply, Act::Round] {
+                assert_eq!(
+                    enforce(&decide(action, text), &gate(true)),
+                    Effect::Refused("text looks like a credential"),
+                    "{text}"
+                );
+            }
+        }
+        assert_eq!(
+            enforce(&decide(Act::Round, &"b".repeat(4001)), &gate(true)),
+            Effect::Refused("brief too long")
+        );
+        assert_eq!(
+            enforce(&decide(Act::Reply, "CI is green."), &gate(true)),
+            Effect::Post(format!("CI is green.\n\n{MARKER}"))
+        );
+    }
+
+    #[test]
     fn dispatch_reactor_round_needs_eligible_quiet_capacity() {
         let d = Decision {
             action: Act::Round,
@@ -1003,6 +1080,7 @@ mod tests {
             active_total,
             repeat_round: false,
             unattended: false,
+            reply_allowed: true,
         };
         assert_eq!(
             enforce(&d, &gate(false, false, 0)),
@@ -1030,6 +1108,7 @@ mod tests {
             active_total: 0,
             repeat_round: false,
             unattended: false,
+            reply_allowed: true,
         };
         for text in ["/agent do it", "  /agent"] {
             let d = Decision {

@@ -7,8 +7,11 @@
 # so nothing here changes how other Claude Code sessions in the checkout
 # behave:
 # - --settings: permissions. dontAsk refuses anything not allowed: the
-#   reactor tools, Read, Agent, SendMessage and ListAgents. Bash, Monitor, file writes
-#   and web tools are denied, so the session has no shell.
+#   reactor tools, Agent, SendMessage and ListAgents. Bash, Monitor, Read,
+#   Glob, Grep, file writes and web tools are denied, so the session has no
+#   shell and reads no local files: everything it reads comes through the
+#   reactor tools, which gate it. disableAllHooks turns off the user's
+#   hooks, including plugin hooks.
 # - --setting-sources user: skip the checkout's project and local settings
 #   and hooks.
 # - --name carrick-reactor: the name the director session (carrick-director)

@@ -201,14 +201,24 @@ Claude Code session that keeps one subagent per PR. It has two parts:
   `request_round`, and both go through the same `enforce` gates as `run`.
   The server records round heads and times in its own state file and
   re-checks for a later owner comment live before allowing another round on
-  the same head.
-- The server is also a Claude Code channel. It declares
-  `experimental["claude/channel"]`, follows the mailbox (`--mailbox`), and
-  sends each new line as a `notifications/claude/channel` message with
-  `pr`, `kind`, `event_id`, `author` and `head` meta. The last delivered id
-  is kept in `--channel-state`, so a restart doesn't redeliver. The session
-  must be started with
-  `claude --dangerously-load-development-channels server:carrick-reactor`.
+  the same head. `reply` needs a trusted PR (the owner's or the publish
+  App's) and an owner event since the reactor's last reply on it, so there
+  is one reply per owner message. Replies are capped at 2000 characters and
+  briefs at 4000, and text containing a credential prefix (`ghp_`, `ghs_`,
+  `github_pat_`, `-----BEGIN`, `AKIA` and the like) is refused. A round
+  posted in the last ten minutes counts against the global cap until its
+  run is listed. `read_ci` keeps only Actions runs of this repository on
+  the PR's head SHA, since a fork PR can share the SHA and name its own
+  jobs, and an untrusted PR shows no CI, title, branch or closing
+  references at all.
+- Events reach the session through the `wait_events` tool, which follows
+  the mailbox (`--mailbox`) and returns new lines; the last delivered id is
+  kept in `--channel-state`, so a restart doesn't redeliver. With
+  `--channel` the server instead declares `experimental["claude/channel"]`
+  and pushes each line as a `notifications/claude/channel` message. That
+  needs `claude --dangerously-load-development-channels
+  server:carrick-reactor`, which asks for confirmation on every launch, so
+  the deployed session doesn't use it.
 
 The repository is public, so only the owner (`tjfontaine`, type User, which
 director sessions post as) can produce events, count as a human comment for
@@ -217,11 +227,15 @@ session. Dispatch outcome comments from the workflow bots are the only other
 events. Anyone else's comment shows as `{author, created_at, untrusted:
 true}`, and diffs and CI logs of other authors' PRs are withheld.
 
-`scripts/reactor/` is the session workspace: `prompt.md` (the routing
-role, appended to the system prompt), a `pr-watcher` subagent
-(`agents.json`), `mcp.json`, permission settings and `start.sh`, which
-starts the session as `carrick-reactor` in the tmux session of the same
-name; the feed runs as its own launchd job.
+`scripts/reactor/` holds the session workspace files: `prompt.md` (the
+routing role, appended to the system prompt), a `pr-watcher` subagent
+(`agents.json`), `mcp.json`, permission settings and `start.sh`. They are
+copied to `/Volumes/CaseSensitive/carrick-director/reactor/`, outside any
+checkout, and the mailbox and state files live in its `state/` directory.
+`start.sh` starts the session as `carrick-reactor` in the tmux session of
+the same name, in the repository checkout; the feed runs as its own
+launchd job. The session has no file tools: Read, Glob and Grep are
+denied, and user hooks are off (`disableAllHooks`).
 
 The reactor and the director session (`carrick-director`) agree on actions
 over Claude Code's SendMessage. At start the reactor reads AGENTS.md and the
