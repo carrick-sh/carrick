@@ -994,10 +994,10 @@ jobs:
         run: just ci-prebuild-xtask
       - name: Clippy (no-panic gate)
         if: ${{ !cancelled() }}
-        run: just clippy
+        run: just lease carrick just clippy
       - name: Live host-authority compiler census
         if: ${{ !cancelled() && github.event_name != 'merge_group' }}
-        run: just xtask authority-debt
+        run: just lease carrick just xtask authority-debt
 
       - name: Compiler cache statistics
         if: ${{ always() }}
@@ -1113,12 +1113,12 @@ jobs:
         run: just ci-prebuild-xtask
       - name: Workspace build
         if: ${{ !cancelled() }}
-        run: just check --workspace
+        run: just lease carrick just check --workspace
       # The live census and rustdoc retain macOS cfg/backend coverage.
       # Linux runs source-only authority checks and its own rustdoc separately.
       - name: Workspace rustdoc
         if: ${{ !cancelled() }}
-        run: just doc
+        run: just lease carrick just doc
 
       - name: Compiler cache statistics
         if: ${{ always() }}
@@ -1174,7 +1174,7 @@ jobs:
         run: just ci-prebuild-xtask
       - name: Unit tests shard A (host test lanes)
         if: ${{ !cancelled() }}
-        run: just ci-macos-test test-shard-a
+        run: just lease carrick just ci-macos-test test-shard-a
 
       - name: Compiler cache statistics
         if: ${{ always() }}
@@ -1230,7 +1230,7 @@ jobs:
         run: just ci-prebuild-xtask
       - name: Unit tests shard B (workspace + mm-owner + CLI + host + VFS + kernel + runtime + HVF + EL1)
         if: ${{ !cancelled() }}
-        run: just ci-macos-test test-shard-b
+        run: just lease carrick just ci-macos-test test-shard-b
 
       - name: Compiler cache statistics
         if: ${{ always() }}
@@ -1286,7 +1286,7 @@ jobs:
         run: just ci-prebuild-xtask
       - name: Host integration tests (no HVF)
         if: ${{ !cancelled() }}
-        run: just ci-macos-test test-integration
+        run: just lease carrick just ci-macos-test test-integration
 
       - name: Compiler cache statistics
         if: ${{ always() }}

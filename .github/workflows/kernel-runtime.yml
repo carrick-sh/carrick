@@ -2,9 +2,10 @@ name: Kernel runtime · trusted hardware
 
 # Self-hosted jobs here run once per landed commit on push to main, or
 # on an owner-triggered dispatch on main. There is no
-# pull_request trigger, and the JIT controllers (`carrick-xtask ci-scaler
-# standing|mac-jit`) plus each runner's job-start hook admit exactly these
-# events for this workflow file (docs/ci/mac-jit.md, docs/ci/willow-pilot.md).
+# pull_request trigger: the persistent HVF runner (`carrick-hvf`), the
+# standing KVM controller (`carrick-xtask ci-scaler standing`), and each
+# runner's job-start hook admit only these events for this workflow file
+# (docs/ci/mac-hvf-runner.md, docs/ci/willow-pilot.md).
 on:
   push:
     branches: [main]
@@ -98,20 +99,48 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-  # Focused signed execution on physical Apple Silicon (cloudmac, one JIT
-  # ephemeral runner per job from `ci-scaler mac-jit`). This is deliberately
-  # separate from public pull-request CI: hosted macOS Arm64 does not support
-  # the nested virtualization HVPatch requires. No workflow-level concurrency
-  # group: a pending job in a group is replaced by a newer one, which would
-  # cancel queued main-push runs. The controller runs one cloudmac runner
-  # at a time, so jobs wait in GitHub's queue instead.
+  # Focused signed execution on physical Apple Silicon (cloudmac persistent
+  # `carrick-hvf` runner on its dedicated internal APFS volume; see
+  # docs/ci/mac-hvf-runner.md). This is deliberately separate from public
+  # pull-request CI: hosted macOS Arm64 does not support the nested
+  # virtualization HVPatch requires. Job-level concurrency (`cancel-in-progress:
+  # false`, keyed by `github.event_name`) keeps a running job intact while
+  # GitHub coalesces queued `push` jobs to the newest main push without
+  # letting an owner `workflow_dispatch` displace a pending `push`.
   hvf-kernel:
     name: HVF · signed embed + cached probes
     if: ${{ !cancelled() && needs.signed-fixtures.result == 'success' }}
     needs: [signed-fixtures]
     runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
+    concurrency:
+      group: hvf-kernel-${{ github.event_name }}
+      cancel-in-progress: false
     timeout-minutes: 180
     steps:
+      - name: Disk admission
+        env:
+          HVF_DISK_FLOOR_GIB: "60"
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_WORKSPACE:-}" ] || [ ! -d "$RUNNER_WORKSPACE" ]; then
+            echo "::error title=HVF disk admission failed::RUNNER_WORKSPACE is unset or missing: ${RUNNER_WORKSPACE:-<unset>}"
+            exit 1
+          fi
+          avail_kib="$(df -Pk "$RUNNER_WORKSPACE" | awk 'NR == 2 { print $4 }')"
+          case "$avail_kib" in
+            '' | *[!0-9]*)
+              echo "::error title=HVF disk admission failed::unable to parse available KiB from df -Pk for $RUNNER_WORKSPACE"
+              exit 1
+              ;;
+          esac
+          floor_kib="$(( HVF_DISK_FLOOR_GIB * 1048576 ))"
+          avail_gib="$(( avail_kib / 1048576 ))"
+          if [ "$avail_kib" -lt "$floor_kib" ]; then
+            echo "::error title=HVF disk admission failed::only ${avail_gib} GiB (${avail_kib} KiB) free on $RUNNER_WORKSPACE, below the ${HVF_DISK_FLOOR_GIB} GiB floor"
+            exit 1
+          fi
+          echo "disk admission passed: ${avail_gib} GiB free on $RUNNER_WORKSPACE (floor ${HVF_DISK_FLOOR_GIB} GiB)"
+
       - uses: actions/checkout@v4
 
       - name: Verify Apple Silicon host
@@ -122,8 +151,8 @@ jobs:
           command -v otool
 
       # cloudmac provides a root-owned, read-only rustup toolchain (pinned by
-      # rust-toolchain.toml, with sccache) and a fresh per-job CARGO_HOME;
-      # jobs never install or update toolchains there (docs/ci/mac-jit.md).
+      # rust-toolchain.toml, with sccache) and a runner-private CARGO_HOME;
+      # jobs never install or update toolchains there (docs/ci/mac-hvf-runner.md).
       - name: Verify the read-only toolchain
         run: |
           test -n "$RUSTUP_HOME"
@@ -196,6 +225,7 @@ jobs:
       # crash post-mortem and `carrick-lldb`). Reordering and pruning keeps peak
       # `target/` at ~31.34 GiB instead of ~55.63 GiB without trimming debuginfo.
       - name: Install Semgrep
+        id: host-gate-setup
         # A venv, never the system interpreter (PEP 668 refuses a system-wide pip
         # install on cloudmac's Homebrew Python).
         run: just ci-install-semgrep
@@ -204,10 +234,11 @@ jobs:
         run: RUST_TEST_THREADS=1 just lease gate just ci
 
       # Save after the gate too: `just ci` downloads the workspace's own
-      # crates, which the fixture fetch alone does not. `!cancelled()` keeps
-      # the save independent of the gate's verdict, which is red on main.
+      # crates, which the fixture fetch alone does not. `!cancelled()` plus
+      # `host-gate-setup` keeps the save independent of the gate's verdict
+      # (red on main) without running if pre-checkout disk admission failed.
       - name: Save cargo registry
-        if: ${{ !cancelled() && steps.registry.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && steps.host-gate-setup.outcome == 'success' && steps.registry.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
@@ -220,7 +251,7 @@ jobs:
         # Must run even when `Host-only source gate` fails (`!cancelled()`), so
         # `Signed acceptance receipt` below starts with a clean worktree and can
         # still publish main's per-SHA baseline receipt without hitting the disk floor.
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.host-gate-setup.outcome == 'success' }}
         run: |
           rm -rf \
             target/debug \
@@ -229,18 +260,24 @@ jobs:
             target/host-authority-census \
             target/host-authority-escape-syntax
 
+      - name: Check disk headroom before signed acceptance
+        id: signed-disk
+        if: ${{ !cancelled() && steps.host-gate-setup.outcome == 'success' }}
+        run: CARRICK_DISK_FLOOR_GIB=35 just check-disk
+
       # The landing gate's signed phase (`xtask accept`): build + artifact
       # identity, el1 embed, fresh executable page, probe shards and cases,
       # with scoped cleanup per step. Its receipt is the lane's per-SHA
       # record; a FAIL receipt is still a receipt. Main is not green under
       # the strict signed gate, so this lane gates on NEW failures against
       # the base SHA's receipt (hosted hvf-gate job), not on the absolute verdict.
-      # `if: ${{ !cancelled() }}` ensures a red `Host-only source gate` on a
-      # main push cannot prevent the per-SHA baseline receipt from being
-      # produced and uploaded for `hvf-gate` (while the job itself still ends red).
+      # `if: ${{ !cancelled() && steps.signed-disk.outcome == 'success' }}` ensures
+      # a red `Host-only source gate` on a main push still produces and uploads the
+      # per-SHA baseline receipt for `hvf-gate` (while the job itself still ends red),
+      # whereas a failed 60 GiB or 35 GiB disk check stops before the ~28 GiB build.
       - name: Signed acceptance receipt
         id: signed-receipt
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.signed-disk.outcome == 'success' }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -264,7 +301,7 @@ jobs:
       # base receipt, so a queued entry can never hold the runner its base
       # entry needs. The hosted `*-gate` jobs compare.
       - name: Upload per-SHA receipt
-        if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
+        if: ${{ !cancelled() && steps.signed-receipt.outcome == 'success' && hashFiles('target/ci-receipts/receipt.json') != '' }}
         uses: actions/upload-artifact@v4
         with:
           # The attempt keeps a re-run from colliding with an earlier upload;
@@ -328,8 +365,8 @@ jobs:
           github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
           github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' }}
     needs: hvf-kernel
-    # Its own label (`ci_scaler::HVF_CLOSURE_LABELS`): `mac-jit` never serves
-    # it, so the 24-hour closure can never occupy the main-push runner.
+    # Its own label (`ci_scaler::HVF_CLOSURE_LABELS`): the persistent `carrick-hvf`
+    # runner never serves it, so the 24-hour closure can never occupy the main-push runner.
     runs-on: [self-hosted, macOS, ARM64, carrick-hvf-closure]
     timeout-minutes: 1440
     steps:
