@@ -2386,8 +2386,10 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 }
                 // Fork arming recorded the page's actual Linux write intent,
                 // not just the allocation ceiling. Read-only and PROT_NONE
-                // neighbors move with the compound without gaining access.
-                let private = repointed & !SW_EL1_COW;
+                // neighbors move with the compound without gaining EL0 access,
+                // while regaining the private frame's write ceiling for a
+                // later mprotect(PROT_WRITE).
+                let private = (repointed & !SW_EL1_COW) | SW_EL1_MAY_WRITE;
                 Ok(
                     if descriptor & SW_EL1_MAY_WRITE != 0 && descriptor & AP_MASK != AP_PRIV_RO {
                         (private & !AP_MASK) | AP_RW
@@ -4814,73 +4816,97 @@ mod tests {
 
         #[test]
         fn cow_compound_preserves_readonly_prot_none_and_prepared_neighbors() {
-            let words = fixture(3);
-            applied(run(
-                &words,
-                prepare(4, PageSpan::new(VA, 3 * PT_PAGE), true),
-                &TableGrants::NONE,
-            ));
-            for (index, readable) in [(1, true), (2, false)] {
+            for access in [
+                CowRepointAccess::RecordedPrivate,
+                CowRepointAccess::User {
+                    writable_pages: 0b0001,
+                },
+            ] {
+                let words = fixture(3);
                 applied(run(
                     &words,
-                    DescriptorOp::Protect(GuestPermissionEdit {
-                        va: VA + index * PT_PAGE,
-                        len: PT_PAGE,
-                        readable,
-                        writable: false,
-                        executable: false,
-                        cow_ceiling: None,
-                    }),
+                    prepare(4, PageSpan::new(VA, 3 * PT_PAGE), true),
                     &TableGrants::NONE,
                 ));
-            }
-            let before: Vec<_> = (0..4)
-                .map(|i| words.get(leaf_pa(VA + i * PT_PAGE)))
-                .collect();
-            unsafe {
-                arm_existing_el1_fork_pages(
-                    words.words.as_ptr().cast_mut(),
-                    ROOT,
-                    words.words.len() * 8,
-                    VA,
-                    4 * PT_PAGE,
-                )
-            }
-            .unwrap();
-            let destination = 0x009d_0000_0000;
-            applied(run(
-                &words,
-                DescriptorOp::CowRepoint {
-                    access: CowRepointAccess::RecordedPrivate,
-                    va: VA,
-                    len: 4 * PT_PAGE,
-                    old_ipa: SubstrateGpa(IPA),
-                    new_ipa: SubstrateGpa(destination),
-                    backing: backing(80),
-                },
-                &TableGrants::NONE,
-            ));
-            for index in 0..4 {
-                let leaf = words.get(leaf_pa(VA + index * PT_PAGE));
-                assert_eq!(leaf & PA_MASK_4KIB, destination + index * PT_PAGE);
+                for (index, readable) in [(1, true), (2, false)] {
+                    applied(run(
+                        &words,
+                        DescriptorOp::Protect(GuestPermissionEdit {
+                            va: VA + index * PT_PAGE,
+                            len: PT_PAGE,
+                            readable,
+                            writable: false,
+                            executable: false,
+                            cow_ceiling: None,
+                        }),
+                        &TableGrants::NONE,
+                    ));
+                }
+                let before: Vec<_> = (0..4)
+                    .map(|i| words.get(leaf_pa(VA + i * PT_PAGE)))
+                    .collect();
+                unsafe {
+                    arm_existing_el1_fork_pages(
+                        words.words.as_ptr().cast_mut(),
+                        ROOT,
+                        words.words.len() * 8,
+                        VA,
+                        4 * PT_PAGE,
+                    )
+                }
+                .unwrap();
+                let destination = 0x009d_0000_0000;
+                applied(run(
+                    &words,
+                    DescriptorOp::CowRepoint {
+                        access,
+                        va: VA,
+                        len: 4 * PT_PAGE,
+                        old_ipa: SubstrateGpa(IPA),
+                        new_ipa: SubstrateGpa(destination),
+                        backing: backing(80),
+                    },
+                    &TableGrants::NONE,
+                ));
+                for index in 0..4 {
+                    let leaf = words.get(leaf_pa(VA + index * PT_PAGE));
+                    assert_eq!(leaf & PA_MASK_4KIB, destination + index * PT_PAGE);
+                    assert_eq!(
+                        leaf & (VALID | AP_MASK | UXN),
+                        before[index as usize] & (VALID | AP_MASK | UXN)
+                    );
+                    assert!(!el1_cow(leaf));
+                }
+                assert!(!terminal_descriptor_permits_el0(
+                    words.get(leaf_pa(VA + PT_PAGE)),
+                    LeafAccess::Write
+                ));
+                assert!(!terminal_descriptor_permits_el0(
+                    words.get(leaf_pa(VA + 2 * PT_PAGE)),
+                    LeafAccess::Read
+                ));
                 assert_eq!(
-                    leaf & (VALID | AP_MASK | UXN),
-                    before[index as usize] & (VALID | AP_MASK | UXN)
+                    el1_private_leaf_state(words.get(leaf_pa(VA + 3 * PT_PAGE))),
+                    El1PrivateLeafState::Prepared
                 );
-                assert!(!el1_cow(leaf));
+                for index in [1, 2] {
+                    applied(run(
+                        &words,
+                        DescriptorOp::Protect(GuestPermissionEdit {
+                            va: VA + index * PT_PAGE,
+                            len: PT_PAGE,
+                            readable: true,
+                            writable: true,
+                            executable: false,
+                            cow_ceiling: None,
+                        }),
+                        &TableGrants::NONE,
+                    ));
+                    let leaf = words.get(leaf_pa(VA + index * PT_PAGE));
+                    assert_eq!(leaf & PA_MASK_4KIB, destination + index * PT_PAGE);
+                    assert!(terminal_descriptor_permits_el0(leaf, LeafAccess::Write));
+                }
             }
-            assert!(!terminal_descriptor_permits_el0(
-                words.get(leaf_pa(VA + PT_PAGE)),
-                LeafAccess::Write
-            ));
-            assert!(!terminal_descriptor_permits_el0(
-                words.get(leaf_pa(VA + 2 * PT_PAGE)),
-                LeafAccess::Read
-            ));
-            assert_eq!(
-                el1_private_leaf_state(words.get(leaf_pa(VA + 3 * PT_PAGE))),
-                El1PrivateLeafState::Prepared
-            );
         }
 
         #[test]

@@ -3302,6 +3302,141 @@ fn owner_fork_guest_prot_none_mprotect_serves_parent_and_child_and_cow_isolates_
         fork_leaf(ROOT, VA + 4096),
         LeafAccess::Read
     ));
+
+    // After the compound COW copy disarmed page 1 onto each process's new
+    // private frame, widening page 1 back to PROT_READ|PROT_WRITE must be
+    // served in ring (not refused as PermissionWidening -> Forward -> ENOSYS)
+    // and isolate subsequent writes to each process's private frame.
+    assert_eq!(
+        guest_mprotect(78, VA + 4096, 4096, 3),
+        (DelegatedAnonymous::Served, 0)
+    );
+    assert!(terminal_descriptor_permits_el0(
+        fork_leaf(child.base, VA + 4096),
+        LeafAccess::Write
+    ));
+    let child_page1_offset = (fork_translate(&words, child.base, VA + 4096) - child_ipa) as usize;
+    assert_eq!(child_page1_offset, 4096);
+    child_replacement.borrow_mut()[child_page1_offset..child_page1_offset + 4]
+        .copy_from_slice(b"chp1");
+    assert_eq!(original, [0x5a; 8192]);
+    assert_eq!(&parent_replacement.borrow()[4096..4100], &[0x5a; 4]);
+
+    assert_eq!(
+        guest_mprotect(77, VA + 4096, 4096, 3),
+        (DelegatedAnonymous::Served, 0)
+    );
+    assert!(terminal_descriptor_permits_el0(
+        fork_leaf(ROOT, VA + 4096),
+        LeafAccess::Write
+    ));
+    let parent_page1_offset = (fork_translate(&words, ROOT, VA + 4096) - parent_ipa) as usize;
+    assert_eq!(parent_page1_offset, 4096);
+    parent_replacement.borrow_mut()[parent_page1_offset..parent_page1_offset + 4]
+        .copy_from_slice(b"prp1");
+    assert_eq!(original, [0x5a; 8192]);
+    assert_eq!(&child_replacement.borrow()[4096..4100], b"chp1");
+    assert_eq!(&parent_replacement.borrow()[4096..4100], b"prp1");
+
+    // Host-lane COW repoint (`repoint_preserving_attributes` + `clear_el1_cow_arm` +
+    // `set_writable_preserving_attributes`) must likewise restore `SW_EL1_MAY_WRITE`
+    // as the write ceiling on a narrowed compound neighbour so a subsequent
+    // `guest_mprotect(PROT_READ | PROT_WRITE)` returns `Served` (not `Forward`).
+    #[derive(Clone, Copy)]
+    struct HostTableResolver {
+        base: u64,
+        ptr: *mut u8,
+        len: usize,
+    }
+    unsafe impl Send for HostTableResolver {}
+    unsafe impl Sync for HostTableResolver {}
+    unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for HostTableResolver {
+        fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
+            let offset = usize::try_from(base.checked_sub(self.base)?).ok()?;
+            (offset.is_multiple_of(8) && offset.checked_add(len)? <= self.len)
+                .then(|| unsafe { self.ptr.add(offset) })
+        }
+        fn publish_user_executable(
+            &self,
+            _output: u64,
+            _len: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            Ok(())
+        }
+    }
+    assert_eq!(
+        guest_mprotect(77, VA + 4096, 4096, 1),
+        (DelegatedAnonymous::Served, 0)
+    );
+    assert_eq!(
+        unsafe {
+            carrick_mmu_core::aarch64::arm_existing_el1_fork_pages(
+                parent_tables.words.as_ptr().cast_mut(),
+                ROOT,
+                parent_tables.words.len() * 8,
+                VA,
+                8192,
+            )
+        },
+        Ok(2)
+    );
+    let host_replacement = core::cell::RefCell::new([0_u8; 8192]);
+    host_replacement
+        .borrow_mut()
+        .copy_from_slice(&parent_replacement.borrow()[..8192]);
+    let host_ipa = IPA + 0x30_0000;
+    let resolver = std::sync::Arc::new(HostTableResolver {
+        base: ROOT,
+        ptr: parent_tables.words.as_ptr().cast::<u8>().cast_mut(),
+        len: parent_tables.words.len() * 8,
+    });
+    let mut host_live = unsafe {
+        carrick_mmu_core::aarch64::PageTableManager::new_live(
+            ROOT,
+            carrick_mmu_core::aarch64::PageTableLayoutConfig::new(
+                VA,
+                parent_tables.words.len() * 8,
+                0,
+                0,
+            ),
+            parent_tables.words.len() * 8,
+            resolver.clone(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        host_live.repoint_preserving_attributes(VA, host_ipa, 8192, None),
+        Ok(true)
+    );
+    assert_eq!(host_live.clear_el1_cow_arm(VA, 8192, None), Ok(true));
+    assert_eq!(
+        host_live.set_writable_preserving_attributes(VA, 4096, None),
+        Ok(true)
+    );
+    unsafe {
+        host_live.sync_to_host(*resolver).unwrap();
+    }
+    assert!(!terminal_descriptor_is_fork_cow(fork_leaf(ROOT, VA + 4096)));
+    assert!(!terminal_descriptor_permits_el0(
+        fork_leaf(ROOT, VA + 4096),
+        LeafAccess::Write
+    ));
+    assert_eq!(
+        guest_mprotect(77, VA + 4096, 4096, 3),
+        (DelegatedAnonymous::Served, 0)
+    );
+    assert!(terminal_descriptor_permits_el0(
+        fork_leaf(ROOT, VA + 4096),
+        LeafAccess::Write
+    ));
+    let host_page1_offset = (fork_translate(&words, ROOT, VA + 4096) - host_ipa) as usize;
+    assert_eq!(host_page1_offset, 4096);
+    host_replacement.borrow_mut()[host_page1_offset..host_page1_offset + 4]
+        .copy_from_slice(b"hsp1");
+    assert_eq!(original, [0x5a; 8192]);
+    assert_eq!(&child_replacement.borrow()[4096..4100], b"chp1");
+    assert_eq!(&parent_replacement.borrow()[4096..4100], b"prp1");
+    assert_eq!(&host_replacement.borrow()[4096..4100], b"hsp1");
 }
 
 struct FailingForkWords<'a> {

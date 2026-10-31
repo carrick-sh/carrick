@@ -6365,7 +6365,7 @@ impl PageTableManager {
             if !el1_cow(descriptor) {
                 continue;
             }
-            self.write_desc(loc, descriptor & !SW_EL1_COW)?;
+            self.write_desc(loc, (descriptor & !SW_EL1_COW) | SW_EL1_MAY_WRITE)?;
             changed = true;
         }
         Ok(changed)
@@ -12634,6 +12634,136 @@ mod tests {
                 terminal_descriptor(live.debug_walk(va + page * PT_PAGE))
             ));
         }
+    }
+
+    #[test]
+    fn host_cow_repoint_restores_write_ceiling_for_narrowed_compound_neighbor() {
+        let resolver = MockLiveResolver::new();
+        resolver.register_arena(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize);
+        unsafe {
+            hvpatch_manager()
+                .restore_quiesced_snapshot_to_host(&*resolver)
+                .unwrap();
+        }
+        let mut live = unsafe {
+            PageTableManager::new_live(
+                LINUX_PAGE_TABLES_BASE,
+                test_layout(),
+                LINUX_PAGE_TABLES_SIZE as usize,
+                Arc::clone(&resolver) as Arc<dyn HostArenaResolver + Send + Sync>,
+            )
+            .unwrap()
+        };
+        let va = LINUX_MMAP_BASE + 0x4080_0000;
+        let old_ipa = 0x009b_4000_0000;
+        let new_ipa = 0x009d_0000_0000;
+        live.publish_private_pages(
+            GuestLeafPublication {
+                va,
+                ipa: old_ipa,
+                len: 2 * PT_PAGE,
+                writable: true,
+                executable: false,
+            },
+            va,
+            None,
+        )
+        .unwrap();
+        live.set_rw(va, (2 * PT_PAGE) as usize, false, None)
+            .unwrap();
+        unsafe {
+            live.sync_to_host(&*resolver).unwrap();
+        }
+        let words = resolver
+            .host_ptr_for_base(LINUX_PAGE_TABLES_BASE)
+            .unwrap()
+            .cast();
+        assert_eq!(
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words,
+                    LINUX_PAGE_TABLES_BASE,
+                    LINUX_PAGE_TABLES_SIZE as usize,
+                    None,
+                    GuestPermissionEdit {
+                        va: va + PT_PAGE,
+                        len: PT_PAGE,
+                        readable: true,
+                        writable: false,
+                        executable: false,
+                        cow_ceiling: None,
+                    },
+                )
+            },
+            Ok(1)
+        );
+        assert_eq!(
+            unsafe {
+                arm_existing_el1_fork_pages(
+                    words,
+                    LINUX_PAGE_TABLES_BASE,
+                    LINUX_PAGE_TABLES_SIZE as usize,
+                    va,
+                    2 * PT_PAGE,
+                )
+            },
+            Ok(2)
+        );
+        let armed_neighbor = terminal_descriptor(live.debug_walk(va + PT_PAGE));
+        assert!(el1_cow(armed_neighbor));
+        assert_eq!(armed_neighbor & SW_EL1_MAY_WRITE, 0);
+
+        assert_eq!(
+            live.repoint_preserving_attributes(va, new_ipa, 2 * PT_PAGE, None),
+            Ok(true)
+        );
+        assert_eq!(
+            live.clear_el1_cow_arm(va, (2 * PT_PAGE) as usize, None),
+            Ok(true)
+        );
+        assert_eq!(
+            live.set_writable_preserving_attributes(va, PT_PAGE as usize, None),
+            Ok(true)
+        );
+        unsafe {
+            live.sync_to_host(&*resolver).unwrap();
+        }
+        let repointed_neighbor = terminal_descriptor(live.debug_walk(va + PT_PAGE));
+        assert_eq!(repointed_neighbor & PA_MASK_4KIB, new_ipa + PT_PAGE);
+        assert!(!el1_cow(repointed_neighbor));
+        assert!(!terminal_descriptor_permits_el0(
+            repointed_neighbor,
+            LeafAccess::Write
+        ));
+        assert_eq!(
+            unsafe {
+                protect_existing_el1_private_pages(
+                    words,
+                    LINUX_PAGE_TABLES_BASE,
+                    LINUX_PAGE_TABLES_SIZE as usize,
+                    None,
+                    GuestPermissionEdit {
+                        va: va + PT_PAGE,
+                        len: PT_PAGE,
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        cow_ceiling: None,
+                    },
+                )
+            },
+            Ok(1)
+        );
+        let widened_neighbor = terminal_descriptor(live.debug_walk(va + PT_PAGE));
+        assert_eq!(widened_neighbor & PA_MASK_4KIB, new_ipa + PT_PAGE);
+        assert!(terminal_descriptor_permits_el0(
+            widened_neighbor,
+            LeafAccess::Write
+        ));
+        assert!(terminal_descriptor_permits_host_buffer(
+            widened_neighbor,
+            LeafAccess::Write
+        ));
     }
 
     #[test]
