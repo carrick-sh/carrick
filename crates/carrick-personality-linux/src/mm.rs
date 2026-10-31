@@ -12,6 +12,7 @@ pub const LINUX_MMAP_SIZE_MAX: u64 = 0x88_0000_0000 - LINUX_MMAP_BASE;
 pub trait NodeFlagsPolicy {
     fn root_editable(self) -> bool;
     fn charges_data(self, protection: ReservationProtection) -> bool;
+    fn protection_ceiling(self, protection: ReservationProtection) -> ReservationProtection;
 }
 impl NodeFlagsPolicy for ReservationNodeFlags {
     /// EL1 may edit private anonymous or retained private file nodes,
@@ -27,6 +28,15 @@ impl NodeFlagsPolicy for ReservationNodeFlags {
         self.contains(Self::PRIVATE)
             && !self.contains(Self::GROWSDOWN)
             && protection.bits() & 2 != 0
+    }
+    /// Linux `MAP_PRIVATE` mappings carry `VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC`
+    /// (`do_mmap`); shared mappings conservatively cap at their committed `protection`.
+    fn protection_ceiling(self, protection: ReservationProtection) -> ReservationProtection {
+        if self.contains(Self::PRIVATE) {
+            ReservationProtection::READ_WRITE_EXECUTE
+        } else {
+            protection
+        }
     }
 }
 /// Linux-owned state projected through the neutral root's opaque wire payload.
@@ -220,6 +230,9 @@ impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
         ReservationProtection::from_bits(u64::from(node.prot))
             .unwrap_or(ReservationProtection::NONE)
     }
+    fn protection_ceiling(node: &ReservationNodeData) -> ReservationProtection {
+        Self::flags(node).protection_ceiling(Self::protection(node))
+    }
     fn charged_data(node: &ReservationNodeData) -> u64 {
         if Self::charges_data(Self::flags(node), Self::protection(node)) {
             node.end - node.start
@@ -345,6 +358,20 @@ mod flag_tests {
         assert!(ReservationNodeFlags::CARRIED.contains(image));
         assert!(!ReservationNodeFlags::ATTRIBUTES.contains(image));
         assert!(anon.union(image).root_editable());
+        assert_eq!(
+            anon.protection_ceiling(ReservationProtection::NONE),
+            ReservationProtection::READ_WRITE_EXECUTE
+        );
+        assert_eq!(
+            ReservationNodeFlags::PRIVATE
+                .union(ReservationNodeFlags::FILE)
+                .protection_ceiling(ReservationProtection::READ),
+            ReservationProtection::READ_WRITE_EXECUTE
+        );
+        assert_eq!(
+            ReservationNodeFlags::ANONYMOUS.protection_ceiling(ReservationProtection::READ),
+            ReservationProtection::READ
+        );
         assert_eq!(ReservationNodeFlags::from_bits(1 << 10), None);
     }
 }

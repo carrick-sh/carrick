@@ -5,7 +5,7 @@ pub mod reservations;
 use carrick_core::mm::reservation::ReservationGeometry;
 use carrick_el1_abi::{CurrentTask, TrapFrame};
 use carrick_mmu_core::aarch64::{
-    GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
+    GuestPermissionCeiling, GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
 };
 use carrick_personality_linux::mm::LinuxReservationPolicy;
 #[cfg(test)]
@@ -1032,12 +1032,25 @@ pub fn serve_delegated_anonymous<
         | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
             if request.operation == Protect || adopts_stock =>
         {
+            let cow_ceiling = if request.operation == Protect {
+                let Some(ceiling) = model.protection_ceiling(request.range) else {
+                    return refuse(pending, &mut model, Leave::RootUnavailable);
+                };
+                Some(GuestPermissionCeiling {
+                    readable: ceiling.bits() & PROT_READ != 0,
+                    writable: ceiling.bits() & PROT_WRITE != 0,
+                    executable: ceiling.bits() & PROT_EXEC != 0,
+                })
+            } else {
+                None
+            };
             let edit = GuestPermissionEdit {
                 va: start,
                 len: run_len,
                 readable: request.protection.bits() & PROT_READ != 0,
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
+                cow_ceiling,
             };
             match editor.protect_and_invalidate(
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -1259,6 +1272,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         readable: prot & PROT_READ != 0,
         writable: prot & PROT_WRITE != 0,
         executable: prot & PROT_EXEC != 0,
+        cow_ceiling: None,
     };
     match editor.protect_and_invalidate(
         carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -1386,6 +1400,7 @@ mod tests {
                     readable: true,
                     writable: false,
                     executable: false,
+                    cow_ceiling: None,
                 }
             )]
         );
@@ -2385,6 +2400,11 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
+                            cow_ceiling: Some(GuestPermissionCeiling {
+                                readable: true,
+                                writable: true,
+                                executable: true,
+                            }),
                         }
                     ),
                     Call::Probe(task.ttbr0, ARENA + 0x2000, 0x2000),
@@ -2677,6 +2697,7 @@ mod tests {
                             readable: true,
                             writable: false,
                             executable: false,
+                            cow_ceiling: None,
                         }
                     ),
                 ]
@@ -2757,6 +2778,7 @@ mod tests {
                         readable: true,
                         writable: true,
                         executable: false,
+                        cow_ceiling: None,
                     }
                 )]
             );
