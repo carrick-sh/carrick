@@ -1,11 +1,19 @@
-# cloudmac HVF JIT runners
+# cloudmac HVF JIT runners (legacy / cutover rollback)
 
-`kernel-runtime.yml`'s `hvf-kernel` job runs on cloudmac, the owner's Apple
+> **Status (#1225):** `kernel-runtime.yml`'s `hvf-kernel` lane now targets the
+> persistent `launchd` self-hosted runner on `/Volumes/carrick-hvf` — see
+> [`mac-hvf-runner.md`](mac-hvf-runner.md) for current host setup, storage
+> layout, baseline seeding, and cutover/rollback steps. `ci-scaler mac-jit` and
+> this document remain in tree during cutover until three consecutive `main`
+> runs finish green on the persistent runner, and as architectural context for
+> the shared assignment rendezvous ([`willow-pilot.md`](willow-pilot.md)).
+
+Historically, `kernel-runtime.yml`'s `hvf-kernel` job ran on cloudmac, the owner's Apple
 Silicon gate Mac, as **one JIT ephemeral runner per job**, admitted to trusted runs of
-`kernel-runtime.yml`, re-vetted at assignment. No runner is registered
-persistently, no long-lived GitHub or Cloudflare upload credential is ever
-written on cloudmac, and jobs run as an unprivileged account that owns
-nothing the next launch trusts.
+`kernel-runtime.yml`, re-vetted at assignment. No runner was registered
+persistently, no long-lived GitHub or Cloudflare upload credential was ever
+written on cloudmac, and jobs ran as an unprivileged account that owned
+nothing the next launch trusted.
 
 ```
 director's Mac                                cloudmac
@@ -303,98 +311,8 @@ and publishes through a short-held ledger mutex, preserving both lifecycle
 transitions and authenticated assignment decisions. Refusal history retains
 at most 4096 job keys; eviction never bypasses vetting.
 
-## Seeding baselines
-
-`kernel-runtime.yml` runs the HVF lane and selected KVM backend once per
-main push event on `push` to `main`, subject to queued-push coalescing. A
-single push can land several commits. Owner `workflow_dispatch` on `main` also
-runs both lanes to seed receipts. Neither pull requests, merge groups nor
-schedules run this workflow. The optional full-conformance `hvf-closure` job
-runs only on owner dispatch with its enable variable and dedicated runner.
-`ci.yml` retains its own PR, merge-group, push, schedule and dispatch
-triggers; only `ci-ok` is a merge requirement. The director owns pre-merge
-hardware evidence; the hardware run after landing is the backstop.
-
-On push, hosted `hvf-gate` and `kvm-gate` build the selector xtask from the
-trusted `github.event.before` commit, using its own checkout and lockfile.
-`ci-receipt select-baseline` rejects zero/malformed `before` values and any
-`before` outside the pushed SHA's first-parent ancestry (force pushes).
-Starting at `before`, it checks at most 50 first-parent commits and selects
-the nearest one with a trusted receipt for that lane. Pending or cancelled
-runs without a receipt do not prevent using an older receipted ancestor.
-
-The selector writes the exact baseline SHA and every intervening landed
-commit without its own receipt to the step summary and a notice annotation:
-**covered as a range, not individually**. This covers multi-commit PRs,
-stack landings and gaps in the hardware backlog. The pushed SHA has its own
-candidate receipt and is excluded from the uncovered list. Trust remains
-exact SHA, kernel-runtime workflow path, repository/head repository,
-push/dispatch event and main branch. Failed receipts remain usable baselines.
-
-The comparison builds the selected baseline's xtask in a separate clean
-checkout with that commit's lockfile; only candidate receipt data is graded.
-When `before` supplies the receipt, reuse its existing checkout/build. The
-candidate's Rust code is never built to grade itself. Hardware jobs never
-wait for a baseline. A missing baseline before the first-parent root fails
-as **No baseline**; exhausting 50 commits while older ancestry remains fails
-as **Baseline walk limit**. Both have explicit error annotations and summaries
-and neither is reported as a NEW regression.
-
-At initial rollout the trusted `before` may predate `select-baseline`. That
-push fails visibly as **Baseline selector unavailable**; seed current main
-with an owner dispatch. Subsequent pushes can use the new selector. The
-workflow never falls back to executing the candidate's selector code.
-
-Owner dispatch seeds the current main tip without comparing it to a parent:
-
-```sh
-gh workflow run kernel-runtime.yml --repo carrick-sh/carrick --ref main
-```
-
-After a gap, this supplies a baseline for subsequent pushes; it does not
-retroactively turn an earlier No baseline outcome into a comparison.
-`Trusted hardware OK` requires both hardware lanes, and on push also both
-receipt comparisons. It remains visible after landing and does not gate
-merging.
-
-### Retiring or renaming gated tests (`.github/retired-tests.toml`)
-
-When a PR legitimately renames or retires a passing test in an HVF or KVM
-receipt lane, the candidate commit may include a PR-scoped
-`.github/retired-tests.toml` with `[[retired]]` entries naming
-`test = "<bin>::<test>"`, `reason`, `pr`, and optional
-`replaced_by = "<bin>::<test>"`. The binary and every test-path segment must
-match `[A-Za-z_][A-Za-z0-9_]*`; receipt matches always include the binary.
-Hosted `hvf-gate` and `kvm-gate` build the comparison xtask from the
-selected receipted ancestor; `ci-receipt gate` fetches `--candidate-sha` from `origin`
-and inspects the candidate tree's `.github/retired-tests.toml` alongside the
-parent main commit's tree. A declaration drops `missing:` only when the
-retired test did not fail in the applicable receipt lane, is absent from the
-candidate's test sources, still existed in the base's test sources, and (when
-`replaced_by` is given) the replacement test started without failing in the
-candidate receipt. A replacement on another lane need not start unless the
-retired test actually started in this baseline receipt. Lane declarations
-accept strings and `{ lane = "..." }` tables, including wildcards; missing
-metadata means the `host` lane, and `manual` targets have no automated lane.
-An observed start remains authoritative even if metadata says another lane.
-
-The source check parses every Rust source file in each owning crate, including
-integration targets, `src/bin/` and explicit binary targets such as `carrick`.
-Only functions with test attributes (`#[test]`, `#[tokio::test]`, etc.) establish
-test presence; an ignored test still exists. Retirement is refused if a file
-cannot parse or the crate contains unresolved item macros (including
-`macro_rules!` generators), `#[path]` modules, `include!`, or explicit
-`[[test]] path` targets outside `tests/`. Explicit test, binary and library
-source paths must be Rust files inside the crate. Same-named tests in other
-modules conservatively prevent retirement.
-Symlink files and directories are skipped, including manifests and declarations.
-
-Stale entries (already absent in base source) are inert: they
-excuse nothing and appear as non-blocking `WARNING` lines in the gate summary.
-Remove these entries once `main`'s baseline receipt rolls past the rename;
-delete the file when no entries remain. Empty declaration files fail the gate.
-Selector changes take effect when they reach trusted event.before.
-Comparison changes take effect when that commit supplies the chosen receipt.
+Baseline selection, owner seeding, and `.github/retired-tests.toml` rules now
+live in [`mac-hvf-runner.md#seeding-baselines`](mac-hvf-runner.md#seeding-baselines).
 
 ## Lifecycle and recovery
 

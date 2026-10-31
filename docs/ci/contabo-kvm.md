@@ -132,7 +132,7 @@ without their own receipts as **covered as a range, not individually**.
 Missing ancestry-root baselines and exhausted walks fail distinctly as
 **No baseline** and **Baseline walk limit**, without claiming a regression.
 Owner dispatch seeds the current main tip without a baseline comparison.
-See [baseline selection and seeding](mac-jit.md#seeding-baselines), including
+See [baseline selection and seeding](mac-hvf-runner.md#seeding-baselines), including
 the first-rollout selector bootstrap requirement.
 
 ## Host setup (root on Contabo)
