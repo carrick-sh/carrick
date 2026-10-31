@@ -831,6 +831,10 @@ fn checkpoint(root: &Path, dispatch: &Dispatch) -> Result<bool, ScalerError> {
 
 const LOOP_LOG_BYTES: usize = 64 * 1024;
 const TRANSCRIPT_BYTES: usize = 512 * 1024;
+/// Each worker's full stream-json session, uploaded beside the clipped
+/// `raw.log` so a reader can replay the whole turn. Kept under the 20 MiB
+/// `regular_text` bound that `mask_artifacts` reads with.
+const WORKER_SESSION_BYTES: usize = 16 * 1024 * 1024;
 
 fn clip_diagnostic(mut text: String, limit: usize) -> String {
     if text.len() > limit {
@@ -845,6 +849,54 @@ fn clip_diagnostic(mut text: String, limit: usize) -> String {
 }
 /// The caller owns the ancestors and retires the model before reading model
 /// files. Refuse entry links/devices; retain complete lines at the byte bound.
+/// `worker-<n>.jsonl`: the upload name of the n-th worker session in a run.
+fn worker_session_name(name: &str) -> bool {
+    name.strip_prefix("worker-")
+        .and_then(|rest| rest.strip_suffix(".jsonl"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Copy a worker's stream-json session into the upload as the next
+/// `worker-<n>.jsonl`, keeping whole lines and redacting like every other
+/// diagnostic. An over-long session ends with one `truncated` event.
+fn record_worker_session(log: &Path, package: &Path) -> Result<(), ScalerError> {
+    use std::io::Read;
+    let Ok(file) = crate::safe_copy::open_text(log) else {
+        return Ok(());
+    };
+    let mut bytes = Vec::new();
+    file.take(WORKER_SESSION_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > WORKER_SESSION_BYTES;
+    if truncated {
+        let end = bytes[..WORKER_SESSION_BYTES]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |n| n + 1);
+        bytes.truncate(end);
+    }
+    let mut text = crate::dispatch_redaction::redact(&bytes);
+    if let Ok(token) = std::env::var("GH_TOKEN")
+        && !token.is_empty()
+    {
+        text = text.replace(&token, "[REDACTED]");
+    }
+    if truncated {
+        text.push_str(&format!(
+            "{}\n",
+            json!({"event": "truncated", "limit_bytes": WORKER_SESSION_BYTES})
+        ));
+    }
+    let mut index = 1;
+    for entry in std::fs::read_dir(package)? {
+        if entry?.file_name().to_str().is_some_and(worker_session_name) {
+            index += 1;
+        }
+    }
+    std::fs::write(package.join(format!("worker-{index}.jsonl")), text)?;
+    Ok(())
+}
+
 fn diagnostic_text(path: &Path) -> Result<String, ScalerError> {
     use std::io::Read;
     let file = crate::safe_copy::open_text(path)?;
@@ -2479,6 +2531,7 @@ fn produce(
         // pre-created private group lets runner read without becoming root.
         timed_phase("worker.hand_back", || host.hand_back(&actor))?;
         let (_, evidence) = read_result(&actor.join("result.json"));
+        record_worker_session(&actor.join("runtime/dispatch/worker.log"), &package)?;
         let prior_raw = std::mem::take(&mut raw);
         raw.push_str(&evidence);
         for name in ["runtime/dispatch/worker.log", "runtime/dispatch/worker.err"] {
@@ -2699,6 +2752,7 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
             HARVEST_PATCH,
         ]
         .contains(&name)
+            && !worker_session_name(name)
         {
             return Err(ScalerError::Guard("unexpected dispatch artifact"));
         }
@@ -6619,6 +6673,57 @@ fi
         assert_eq!(masked.status, ContractStatus::Done);
         std::fs::write(temp.path().join("extra"), "unexpected").unwrap();
         assert!(mask_artifacts(temp.path(), token).is_err());
+    }
+
+    #[test]
+    fn worker_sessions_upload_whole_lines_masked_and_numbered() {
+        let temp = tempfile::tempdir().unwrap();
+        let (package, logs) = (temp.path().join("package"), temp.path().join("logs"));
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        let token = "fixture-job-token";
+        for name in ["raw.log", "transcript.md", "diffstat.txt"] {
+            std::fs::write(package.join(name), "evidence\n").unwrap();
+        }
+        let contract = Contract {
+            loop_summary: None,
+            status: ContractStatus::Done,
+            summary: "done".into(),
+            tests: vec![],
+            risks: vec![],
+        };
+        std::fs::write(
+            package.join("contract.json"),
+            serde_json::to_vec(&contract).unwrap(),
+        )
+        .unwrap();
+        let first = logs.join("first.log");
+        std::fs::write(
+            &first,
+            format!("{{\"event\":\"init\"}}\n{{\"event\":\"tool\",\"text\":\"{token}\"}}\n"),
+        )
+        .unwrap();
+        record_worker_session(&first, &package).unwrap();
+        record_worker_session(&first, &package).unwrap();
+        // A worker that never started leaves no log and no session file.
+        record_worker_session(&logs.join("missing.log"), &package).unwrap();
+        mask_artifacts(&package, token).unwrap();
+        for index in [1, 2] {
+            let text = regular_text(&package.join(format!("worker-{index}.jsonl"))).unwrap();
+            assert!(!text.contains(token));
+            assert_eq!(
+                text.lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap()["event"].clone())
+                    .collect::<Vec<_>>(),
+                [json!("init"), json!("tool")]
+            );
+        }
+        assert!(!package.join("worker-3.jsonl").exists());
+        for name in ["worker-.jsonl", "worker-x.jsonl", "worker-1.json"] {
+            std::fs::write(package.join(name), "{}\n").unwrap();
+            assert!(mask_artifacts(&package, token).is_err(), "{name}");
+            std::fs::remove_file(package.join(name)).unwrap();
+        }
     }
 
     #[test]
