@@ -369,9 +369,31 @@ pub fn dispatch_fault(
                 }
                 continue;
             }
-            return settle_declined_owner_fault(venue, task, action, supply.outcome(), || {
-                crate::dispatch::arm_deliver_declined_fault_signal_current(frame)
+            let mut declined_wait = None;
+            let action = settle_declined_owner_fault(venue, task, action, supply.outcome(), || {
+                crate::dispatch::arm_deliver_declined_fault_signal_current(
+                    frame,
+                    &mut declined_wait,
+                )
             });
+            // Signal admission met an owner-memory dependency before publishing
+            // anything: park on the owner's release and rerun the fault.
+            if let Some(wait) = declined_wait {
+                if let Some(parked) = park_fault_owner_wait(
+                    zone,
+                    task,
+                    counters,
+                    slot,
+                    &mut crate::sched::HardwareCpu,
+                    &crate::sched::HardwareUserWord,
+                    frame,
+                    wait,
+                ) {
+                    return parked;
+                }
+                continue;
+            }
+            return action;
         }
     }
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]

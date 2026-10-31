@@ -3211,3 +3211,218 @@ fn reservation_supply_requests(count: usize) -> usize {
     }
     requests
 }
+
+/// A declined-fault signal admission that meets an owner-memory dependency
+/// (#1044 `NativeProcessError::OwnerWait`) is contention, not a fault and not
+/// a carrier invariant. The production classifier keeps the retained
+/// host-classified payload and hands back the real owner receipt; the
+/// `dispatch_fault` composition parks the faulting thread on the owner's
+/// release notification, the release wakes it, and production resumption
+/// reruns the exact faulting instruction with the payload still retained.
+#[test]
+fn declined_fault_owner_wait_parks_on_owner_and_reruns_with_retained_fault() {
+    use carrick_el1::fault::{GrantMailboxes, NoopCowResolver, PreparedFaultPath};
+    use carrick_signal_core::policy::Signal;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let sibling_slot = SlotId::new(1);
+    fixture.zone.drive(sibling_slot, 1);
+    fixture.zone.publish_slot(sibling_slot, 1, Some(1), 2);
+    fixture.zone.enter_guest(sibling_slot);
+    fixture.zone.install_space(sibling_slot, 1).unwrap();
+    let (_, sibling) =
+        imported_thread_on_slot(fixture, sibling_slot, |identity| identity.affinity = 2);
+    let mut service = fixture.process_service();
+    let portal = fixture.region.portal_slots();
+    assert!(portal.bind_carrier(NonZeroU64::MIN));
+    assert_eq!(fixture.page.live(), 2, "two live threads share the MM");
+    assert!(fixture.zone.live(sibling).is_some());
+    let mut cpu = crate::sched::FakeCpu::default();
+    let handle = crate::cow_resolver::admitted_fault_mm_handle(
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        fixture.slot,
+        &fixture.task,
+    )
+    .expect("admitted reservation root must supply the exact MM handle");
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    let index = access.find(handle.mm().raw()).unwrap();
+    let residency = carrick_el1::cow::test_support::residency_table();
+    let words = fixture.tables.live(&fixture.maintenance);
+    let counters = carrick_el1_abi::Counters::new();
+    let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0x92000046,
+        far: VA + 8,
+        elr: 0x401234,
+        ..Default::default()
+    };
+    frame.x[3] = 0x7abc;
+    // The host classified this thread's fault; delivery is still pending.
+    fixture
+        .control
+        .publish_synchronous_fault(Signal::SEGV, 1, VA + 8);
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (released_tx, released_rx) = std::sync::mpsc::channel();
+    struct ReleaseSiblingOnDrop(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseSiblingOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+    let table = fixture.region.table();
+    let zone = fixture.zone;
+    std::thread::scope(|scope| {
+        let mut release_guard = ReleaseSiblingOnDrop(Some(release_tx));
+        let holder = scope.spawn(move || {
+            let held_root = match table.lock_in(
+                crate::sched::object_wait::space_access(zone, sibling_slot),
+                index.index(),
+                handle.mm(),
+                u32::from(sibling_slot.raw()),
+            ) {
+                Ok(guard) => {
+                    let _ = locked_tx.send(Ok(()));
+                    guard
+                }
+                Err(error) => {
+                    let _ = locked_tx.send(Err(format!("{error:?}")));
+                    return;
+                }
+            };
+            let waited = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(held_root);
+            let _ = released_tx.send(waited);
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timed out waiting for the sibling to hold the owner")
+            .expect("sibling failed to hold the owner");
+        // Obtain the genuine owner receipt the sibling's custody produces.
+        let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+        assert_eq!(
+            carrick_el1::fault::dispatch_fault_with_prepared(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                access,
+                crate::cow_resolver::native_fault_supply(
+                    false,
+                    GrantMailboxes::own(&mailbox),
+                    &supply,
+                ),
+                Some(PreparedFaultPath {
+                    residency: &residency,
+                    resolver: &mut SelectionWords(&words),
+                    roots: Some(fixture.region.table()),
+                    file_slots: Some(portal),
+                }),
+                &mut NoopCowResolver,
+            ),
+            carrick_el1_abi::Action::Forward
+        );
+        let OwnerFaultSupplyOutcome::Wait(wait) = supply.outcome() else {
+            panic!("held owner must yield a wait: {:?}", supply.outcome());
+        };
+
+        // Production classifier: OwnerWait is Forward plus the receipt,
+        // never a carrier invariant and never a consumed or defaulted fault.
+        let mut declined_wait = None;
+        assert_eq!(
+            crate::dispatch::declined_fault_admission_result(
+                Err(NativeProcessError::OwnerWait(wait)),
+                &mut declined_wait,
+            ),
+            Ok(carrick_el1_abi::Action::Forward)
+        );
+        assert_eq!(declined_wait, Some(wait));
+        assert_eq!(
+            fixture.control.synchronous_fault(),
+            Some((Signal::SEGV, 1, VA + 8, false)),
+            "owner contention must neither consume nor default the fault"
+        );
+
+        // `dispatch_fault` parks on that receipt exactly as for a supply wait.
+        fixture.task.linux.mark_pending_host_work();
+        assert_eq!(
+            crate::cow_resolver::park_fault_owner_wait(
+                fixture.zone,
+                &fixture.task,
+                &counters,
+                fixture.slot,
+                &mut cpu,
+                &crate::sched::HardwareUserWord,
+                &mut frame,
+                declined_wait.take().unwrap(),
+            ),
+            Some(carrick_el1_abi::Action::Idle),
+            "the waiter releases its execution lease while the owner holds"
+        );
+        assert!(fixture.task.linux.take_host_work_doorbell().is_some());
+        assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
+        assert_eq!(fixture.zone.slot(fixture.slot).queued(), 0);
+        release_guard
+            .0
+            .take()
+            .unwrap()
+            .send(())
+            .expect("holder exited before release");
+        released_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timed out waiting for the holder to release")
+            .expect("holder timed out before the waiter parked");
+        holder.join().unwrap();
+    });
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).queued(),
+        1,
+        "the owner's release must wake the parked fault waiter"
+    );
+    assert_eq!(fixture.task.service_notice.take().unwrap(), None);
+    let mut handoff = None;
+    let mut prod_cpu = ProductionResumeCpu {
+        inner: cpu,
+        zone: fixture.zone,
+        task: &fixture.task,
+        service: &mut service,
+    };
+    let mut sched_zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut prod_cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    assert_eq!(
+        crate::dispatch::native_scheduler(
+            &mut sched_zone,
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff,
+        )
+        .idle_entry(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    let record = fixture.zone.slot(fixture.slot).current().unwrap();
+    assert!(
+        !fixture.zone.record(record).has_object_operation(),
+        "resumption consumes the owner-wait operation"
+    );
+    assert_eq!(frame.elr, 0x401234, "rerun the exact faulting instruction");
+    assert_eq!(frame.x[3], 0x7abc, "with the exact fault registers");
+    assert_eq!(
+        fixture.control.synchronous_fault(),
+        Some((Signal::SEGV, 1, VA + 8, false)),
+        "the retained fault survives the wait for the rerun to deliver"
+    );
+    assert_eq!(
+        fixture
+            .zone
+            .release_current(fixture.slot, record, &carrick_sched_core::ShortLockSpin,),
+        carrick_sched_core::CurrentRelease::Released
+    );
+}
