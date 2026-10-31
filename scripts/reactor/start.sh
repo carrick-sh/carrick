@@ -7,10 +7,12 @@
 # so nothing here changes how other Claude Code sessions in the checkout
 # behave:
 # - --settings: permissions. dontAsk refuses anything not allowed: the
-#   reactor tools, Read, Agent and SendMessage. Bash, Monitor, file writes
+#   reactor tools, Read, Agent, SendMessage and ListAgents. Bash, Monitor, file writes
 #   and web tools are denied, so the session has no shell.
 # - --setting-sources user: skip the checkout's project and local settings
 #   and hooks.
+# - --name carrick-reactor: the name the director session (carrick-director)
+#   uses to message this session, and the one it messages back.
 # - --mcp-config + --strict-mcp-config: only the carrick-reactor server.
 # - --append-system-prompt-file: the reactor role (prompt.md).
 # - --agents: the pr-watcher subagent (agents.json).
@@ -39,6 +41,7 @@ PROMPT='You are the Carrick reactor. Start your wait_events loop now and route e
 # Keep the pane after claude exits, so a startup failure stays readable.
 tmux new-session -d -s carrick-reactor -n session -c "$REPO" \
   claude "$PROMPT" \
+    --name carrick-reactor \
     --settings "$WS/settings.json" \
     --setting-sources user \
     --mcp-config "$WS/mcp.json" --strict-mcp-config \

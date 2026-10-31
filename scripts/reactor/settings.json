@@ -6,7 +6,8 @@
       "mcp__carrick-reactor__*",
       "Read",
       "Agent",
-      "SendMessage"
+      "SendMessage",
+      "ListAgents"
     ],
     "deny": [
       "Bash",

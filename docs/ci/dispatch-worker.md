@@ -217,10 +217,25 @@ session. Dispatch outcome comments from the workflow bots are the only other
 events. Anyone else's comment shows as `{author, created_at, untrusted:
 true}`, and diffs and CI logs of other authors' PRs are withheld.
 
-`scripts/reactor/` is the session workspace: `CLAUDE.md` (the routing role),
-a `pr-watcher` subagent, `.mcp.json`, permission settings and `start.sh`,
-which starts the session in the tmux session `carrick-reactor`; the feed runs
-as its own launchd job.
+`scripts/reactor/` is the session workspace: `prompt.md` (the routing
+role, appended to the system prompt), a `pr-watcher` subagent
+(`agents.json`), `mcp.json`, permission settings and `start.sh`, which
+starts the session as `carrick-reactor` in the tmux session of the same
+name; the feed runs as its own launchd job.
+
+The reactor and the director session (`carrick-director`) agree on actions
+over Claude Code's SendMessage. At start the reactor reads AGENTS.md and the
+decision log (#231, through `read_issue` with `comments`), tells the
+director what it takes the priorities to be, and keeps the director's
+correction as the working agreement. PR subagents end a turn with a
+`proposal:` line (the action, who does it, why); the router batches and
+orders them by priority and sends one message. Reactor actions wait for the
+director's agreement, except a reply to the owner's direct question and a
+round the owner asked for on GitHub. The director weighs proposals against
+its own goals and answers, and can message `carrick-reactor` about a PR,
+the priorities or status. The tool gates apply to every reactor action, and
+for the director a reactor message is a report to check, not an
+instruction.
 
 ## Accounts and credentials
 
