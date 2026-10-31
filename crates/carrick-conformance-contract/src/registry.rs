@@ -19,7 +19,7 @@ impl ContractRegistry {
     pub fn load(root: &Path) -> Result<Self, RegistryError> {
         let registry_root = root.join("conformance-contracts");
         let contracts_root = registry_root.join("contracts");
-        let mut paths = read_contract_paths(&contracts_root)?;
+        let mut paths = read_toml_contract_paths(&contracts_root)?;
         paths.sort();
 
         let mut contracts = BTreeMap::new();
@@ -40,7 +40,7 @@ impl ContractRegistry {
         let claims_root = registry_root.join("claims");
         let mut claims = BTreeMap::new();
         if claims_root.exists() {
-            let mut claim_paths = read_contract_paths(&claims_root)?;
+            let mut claim_paths = read_toml_contract_paths(&claims_root)?;
             claim_paths.sort();
             for path in claim_paths {
                 let text = read_to_string(&path)?;
@@ -177,25 +177,50 @@ impl ContractRegistry {
     }
 }
 
-fn read_contract_paths(root: &Path) -> Result<Vec<PathBuf>, RegistryError> {
-    let entries = fs::read_dir(root).map_err(|source| RegistryError::Io {
+#[derive(Debug)]
+pub(crate) struct RegistryIoError {
+    pub path: PathBuf,
+    pub source: std::io::Error,
+}
+
+impl From<RegistryIoError> for RegistryError {
+    fn from(err: RegistryIoError) -> Self {
+        Self::Io {
+            path: err.path,
+            source: err.source,
+        }
+    }
+}
+
+/// Enumerates immediate entries under `root` through the crate's reviewed
+/// `std::fs::read_dir` authority cohort (`registry::read_contract_paths`).
+pub(crate) fn read_contract_paths(
+    root: &Path,
+) -> Result<Vec<(PathBuf, fs::FileType)>, RegistryIoError> {
+    let entries = fs::read_dir(root).map_err(|source| RegistryIoError {
         path: root.to_path_buf(),
         source,
     })?;
     let mut paths = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| RegistryError::Io {
+        let entry = entry.map_err(|source| RegistryIoError {
             path: root.to_path_buf(),
             source,
         })?;
         let path = entry.path();
-        if !entry
-            .file_type()
-            .map_err(|source| RegistryError::Io {
-                path: path.clone(),
-                source,
-            })?
-            .is_file()
+        let file_type = entry.file_type().map_err(|source| RegistryIoError {
+            path: path.clone(),
+            source,
+        })?;
+        paths.push((path, file_type));
+    }
+    Ok(paths)
+}
+
+fn read_toml_contract_paths(root: &Path) -> Result<Vec<PathBuf>, RegistryError> {
+    let mut paths = Vec::new();
+    for (path, file_type) in read_contract_paths(root)? {
+        if !file_type.is_file()
             || path.extension().and_then(|extension| extension.to_str()) != Some("toml")
         {
             return Err(RegistryError::UnexpectedContractFile(path));
@@ -205,8 +230,10 @@ fn read_contract_paths(root: &Path) -> Result<Vec<PathBuf>, RegistryError> {
     Ok(paths)
 }
 
-fn read_to_string(path: &Path) -> Result<String, RegistryError> {
-    fs::read_to_string(path).map_err(|source| RegistryError::Io {
+/// Reads UTF-8 text from `path` through the crate's reviewed
+/// `std::fs::read_to_string` authority cohort (`registry::read_to_string`).
+pub(crate) fn read_to_string(path: &Path) -> Result<String, RegistryIoError> {
+    fs::read_to_string(path).map_err(|source| RegistryIoError {
         path: path.to_path_buf(),
         source,
     })
