@@ -343,8 +343,9 @@ Disk exhaustion fails up front with a clear GitHub annotation rather than mid-bu
 3. **Retiring `mac-jit`:** keep `carrick-ci-mac-jit.service` (stopped, not deleted),
    `/Volumes/carrick-build/carrick-ci`, and `crates/carrick-xtask/src/ci_scaler/mac.rs`
    in place until **three consecutive `main` runs** complete green on `cloudmac-hvf`, where green
-   means `Trusted hardware OK` succeeded with `HVF · receipt gate` reporting `NEW=[]`
-   (`hvf-kernel` itself stays red on main by design, so its own result is not the test). The
+   means both receipt gates (`HVF · receipt gate` and `KVM · receipt gate`) succeeded, with
+   `NEW=[]` against the receipted main ancestor. `hvf-kernel` and therefore `Trusted hardware OK`
+   stay red on main by design while main carries known EL1 failures, so neither is the test. The
    cutover also needs #1238's probe check (the #1196/#1119 probes MATCH on the new runner). Only
    then disable `carrick-ci-mac-jit.service` (`sudo systemctl disable carrick-ci-mac-jit.service`)
    and retire the legacy tree, posting the post-cutover note on `#231`.
