@@ -1982,13 +1982,33 @@ mod tests {
         }
     }
     impl Buffer {
+        /// Complete lines only: a writer thread may be mid-line. The bytes
+        /// are copied under the lock and parsed outside it, so a parse
+        /// panic can't poison the lock the writer still needs.
         fn lines(&self) -> Vec<Value> {
-            String::from_utf8(self.0.lock().unwrap().clone())
-                .unwrap()
+            let bytes = match self.0.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            let end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            String::from_utf8_lossy(&bytes[..end])
                 .lines()
                 .map(|l| serde_json::from_str(l).unwrap())
                 .collect()
         }
+    }
+
+    /// A reader that runs while a writer is mid-line sees only the
+    /// complete lines (the race behind #1246's run 41228014853).
+    #[test]
+    fn dispatch_reactor_test_buffer_ignores_a_half_written_line() {
+        let buffer = Buffer::default();
+        buffer
+            .0
+            .lock()
+            .unwrap()
+            .extend_from_slice(b"{\"id\":1}\n{\"jsonrpc\":\"2.0\",\"meth");
+        assert_eq!(buffer.lines(), vec![json!({"id":1})]);
     }
 
     #[test]
