@@ -442,7 +442,7 @@ pub(crate) fn agent_comment(comment: &Value, trusted: &mut dyn FnMut(&str) -> bo
 /// sessions post as, and has a line that is exactly `Rebase: allowed`.
 /// Write collaborators can trigger a round but not consent to a rewrite.
 fn rebase_consent(comment: &Value) -> bool {
-    comment["user"]["login"] == "tjfontaine"
+    comment["user"]["login"] == crate::ci_scaler::DISPATCH_OWNER
         && comment["user"]["type"] == "User"
         && comment["body"]
             .as_str()
@@ -3123,6 +3123,13 @@ struct Applied {
     /// Director commits whose patch changed in a consented rebase (#1215).
     #[serde(default)]
     rebase_changed: Vec<String>,
+    /// The rebased counterpart of the admitted tip; the run's own commits
+    /// start above it.
+    #[serde(default)]
+    rebase_tip: Option<String>,
+    /// `git range-diff -s` of the director's commits across the rebase.
+    #[serde(default)]
+    rebase_range_diff: Option<String>,
     body: AppliedBody,
     board_changes: Vec<String>,
     #[serde(default)]
@@ -3198,7 +3205,13 @@ impl Applied {
                             self.rebase_changed.join(", ")
                         )
                     };
-                    format!("\n- Rebased onto main at {base}.{changed}")
+                    let range = self
+                        .rebase_range_diff
+                        .as_ref()
+                        .filter(|r| !r.is_empty())
+                        .map(|r| format!("\n\n<details><summary>Director commits before and after the rebase</summary>\n\n```\n{r}\n```\n</details>"))
+                        .unwrap_or_default();
+                    format!("\n- Rebased onto main at {base}.{changed}{range}")
                 })
                 .unwrap_or_default(),
             match &self.body {
@@ -3840,60 +3853,166 @@ fn live_publication_main(work: &Path, token: &str) -> Result<String, ScalerError
 
 /// An adopted PR moved after admission, or the worker rewrote its history.
 /// Nothing is overwritten and the round ends blocked with the reason.
-/// A consented rebase must keep the director's history (#1215): every
-/// non-merge commit from the merge-base with main to the admitted tip must
-/// reappear above main, matched by author email and subject. Resolving a
-/// conflict changes a commit's patch, so a changed patch is allowed and
-/// listed for the reviewer (`git cherry`), but a dropped or replaced commit
-/// is refused. `Err` names the first missing commit; `Ok` lists the changed
-/// ones.
+/// What a consented rebase kept of the director's history (#1215).
+struct KeptRebase {
+    /// The rebased counterpart of the admitted tip: the run's own commits
+    /// start above it, so every later check measures from here.
+    director_tip: String,
+    /// Director commits whose patch changed while resolving conflicts.
+    changed: Vec<String>,
+    /// `git range-diff -s` of the director's commits, for the reviewer.
+    range_diff: String,
+}
+/// A consented rebase must keep the director's history: the director's
+/// commits from the merge-base with main to the admitted tip come first
+/// above admitted main, in order, each with the same author email and
+/// subject. Commits main already has (`git cherry` `-`) count as kept. A
+/// commit replaced by an empty one, or a path the director changed that the
+/// rebased history neither changes nor already matches, is refused. A
+/// changed patch is allowed (conflict resolution) and listed. `Err` says
+/// what was lost.
 fn rebase_kept_commits(
     work: &Path,
     admitted: &str,
     base: &str,
-) -> Result<Result<Vec<String>, String>, ScalerError> {
-    let fork = git(work, &["merge-base", admitted, base])?;
-    let fork = fork.trim();
-    let commits = |range: &str| -> Result<Vec<(String, String)>, ScalerError> {
+) -> Result<Result<KeptRebase, String>, ScalerError> {
+    let fork = git(work, &["merge-base", admitted, base])?
+        .trim()
+        .to_owned();
+    let empty = |sha: &str| -> Result<bool, ScalerError> {
         Ok(git(
             work,
-            &["log", "--no-merges", "--format=%H%x00%ae%x00%s", range],
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", sha],
         )?
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, '\0');
-            let sha = parts.next()?.to_owned();
-            let key = format!("{}\0{}", parts.next()?, parts.next()?);
-            Some((sha, key))
-        })
-        .collect())
+        .trim()
+        .is_empty())
     };
-    let original = commits(&format!("{fork}..{admitted}"))?;
-    let mut rebased: Vec<String> = commits(&format!("{base}..HEAD"))?
-        .into_iter()
-        .map(|(_, key)| key)
-        .collect();
-    for (sha, key) in &original {
-        match rebased.iter().position(|k| k == key) {
-            Some(index) => {
-                rebased.remove(index);
-            }
-            None => {
-                let subject = key.split('\0').nth(1).unwrap_or_default();
-                return Ok(Err(format!(
-                    "`{}` (\"{subject}\")",
-                    &sha[..12.min(sha.len())]
-                )));
-            }
+    // Every empty commit shares one patch-id, so an empty director commit
+    // is never "already in main".
+    let mut upstream = Vec::new();
+    for line in git(work, &["cherry", base, admitted, &fork])?.lines() {
+        if let Some(sha) = line.strip_prefix("- ")
+            && !empty(sha)?
+        {
+            upstream.push(sha.to_owned());
         }
     }
-    // `+` marks an admitted commit with no patch-equivalent above main.
-    let cherry = git(work, &["cherry", "HEAD", admitted, fork])?;
-    Ok(Ok(cherry
+    // Each commit's author and whole message are read on their own, never
+    // split out of one log stream a message could forge separators in; the
+    // whole message, so a rebased director commit can't gain a closing
+    // keyword.
+    let commits = |range: &str| -> Result<Vec<(String, String)>, ScalerError> {
+        git(work, &["rev-list", "--reverse", "--no-merges", range])?
+            .lines()
+            .filter(|sha| !sha.is_empty())
+            .map(|sha| {
+                let author = git(work, &["log", "-1", "--format=%ae", sha])?;
+                let message = git(work, &["log", "-1", "--format=%B", sha])?;
+                Ok((
+                    sha.to_owned(),
+                    format!("{}\0{}", author.trim(), message.trim_end()),
+                ))
+            })
+            .collect()
+    };
+    let original: Vec<_> = commits(&format!("{fork}..{admitted}"))?
+        .into_iter()
+        .filter(|(sha, _)| !upstream.contains(sha))
+        .collect();
+    // A rebase is linear: a merge above main could carry a closing keyword
+    // or changes past every check below.
+    let merges = git(work, &["rev-list", "--merges", &format!("{base}..HEAD")])?;
+    if let Some(merge) = merges.lines().next() {
+        return Ok(Err(format!(
+            "left a merge commit `{}` above main",
+            merge.chars().take(12).collect::<String>()
+        )));
+    }
+    let rebased = commits(&format!("{base}..HEAD"))?;
+    let short = |sha: &str| sha.chars().take(12).collect::<String>();
+    for (index, (sha, key)) in original.iter().enumerate() {
+        let subject = key
+            .split('\0')
+            .nth(1)
+            .and_then(|message| message.lines().next())
+            .unwrap_or_default();
+        let named = format!("`{}` (\"{subject}\")", short(sha));
+        let Some((new, new_key)) = rebased.get(index) else {
+            return Ok(Err(format!("dropped the director's commit {named}")));
+        };
+        if new_key != key {
+            return Ok(Err(format!(
+                "dropped or reordered the director's commit {named}"
+            )));
+        }
+        if empty(new)? && !empty(sha)? {
+            return Ok(Err(format!(
+                "replaced the director's commit {named} with an empty commit"
+            )));
+        }
+    }
+    let director_tip = original
+        .len()
+        .checked_sub(1)
+        .and_then(|last| rebased.get(last))
+        .map_or_else(|| base.to_owned(), |(sha, _)| sha.clone());
+    let paths = |from: &str, to: &str| -> Result<Vec<String>, ScalerError> {
+        Ok(git(
+            work,
+            &["diff", "--name-only", "--no-renames", "-z", from, to],
+        )?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect())
+    };
+    let touched = paths(base, &director_tip)?;
+    // Conflict resolution only edits files the director's own commits
+    // change; any other path in them would be the run's own work hidden
+    // from the run's checks.
+    let director = paths(&fork, admitted)?;
+    if let Some(path) = touched.iter().find(|p| !director.contains(p)) {
+        return Ok(Err(format!(
+            "changed `{path}` in the director's commits, which the director never changed"
+        )));
+    }
+    for path in director {
+        let same = |rev: &str| git(work, &["rev-parse", &format!("{rev}:{path}")]).ok();
+        if !touched.contains(&path) && same(&director_tip) != same(admitted) {
+            return Ok(Err(format!("dropped the director's change to `{path}`")));
+        }
+    }
+    let changed = git(work, &["cherry", &director_tip, admitted, &fork])?
         .lines()
         .filter_map(|line| line.strip_prefix("+ "))
-        .map(|sha| sha.chars().take(12).collect())
-        .collect()))
+        .filter(|sha| !upstream.iter().any(|u| u == sha))
+        .map(short)
+        .collect();
+    // range-diff refuses an empty range: then there is nothing to compare.
+    let range_diff = if fork == admitted || base == director_tip {
+        String::new()
+    } else {
+        git(
+            work,
+            &[
+                "range-diff",
+                "--no-color",
+                "-s",
+                &format!("{fork}..{admitted}"),
+                &format!("{base}..{director_tip}"),
+            ],
+        )?
+        .lines()
+        .take(30)
+        .map(|line| line.chars().take(200).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+    };
+    Ok(Ok(KeptRebase {
+        director_tip,
+        changed,
+        range_diff,
+    }))
 }
 fn adopted_publication_blocked(number: u64, why: &str) -> Result<ScalerError, ScalerError> {
     let reason = format!("Adopted PR #{number}: {why}");
@@ -4110,6 +4229,10 @@ fn publish_commits(
         }
     };
     let lease = RunLease::load(&state, admitted_tip(dispatch, receipt))?;
+    // After a consented rebase the run's own commits start above the
+    // rebased director tip, never above the admitted one (main's commits
+    // between the two are not the run's).
+    let mut rebased_director_tip: Option<String> = None;
     if work.is_dir()
         && (dispatch.resume || git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base)
     {
@@ -4143,18 +4266,21 @@ fn publish_commits(
                     )?);
                 }
                 match rebase_kept_commits(&work, admitted, &dispatch.base)? {
-                    Err(missing) => {
+                    Err(lost) => {
                         return Err(adopted_publication_blocked(
                             number,
-                            &format!(
-                                "the rebase dropped the director's commit {missing}. Nothing was pushed"
-                            ),
+                            &format!("the rebase {lost}. Nothing was pushed"),
                         )?);
                     }
-                    Ok(changed) => Applied::record(|a| {
-                        a.rebased_onto = Some(dispatch.base.clone());
-                        a.rebase_changed = changed;
-                    })?,
+                    Ok(kept) => {
+                        Applied::record(|a| {
+                            a.rebased_onto = Some(dispatch.base.clone());
+                            a.rebase_tip = Some(kept.director_tip.clone());
+                            a.rebase_changed = kept.changed;
+                            a.rebase_range_diff = Some(kept.range_diff);
+                        })?;
+                        rebased_director_tip = Some(kept.director_tip);
+                    }
                 }
             }
             // Fast-forward only, also over this run's own earlier pushes.
@@ -4183,7 +4309,9 @@ fn publish_commits(
         // An adopted run is measured from its admitted tip, so the
         // director's own commits are never charged to it.
         let mut base = match adopted {
-            Some((_, admitted)) => admitted.to_owned(),
+            Some((_, admitted)) => rebased_director_tip
+                .clone()
+                .unwrap_or_else(|| admitted.to_owned()),
             None => git(&work, &["merge-base", &live_main, "HEAD"])?
                 .trim()
                 .to_owned(),
@@ -4391,8 +4519,11 @@ fn publish_commits(
                     }
                 }
                 a.published_checkpoint = receipt.checkpointed;
-                // An adopted round's consented rebase was recorded above.
-                a.rebased_onto = rebased_onto.or(a.rebased_onto.take());
+                // An adopted round records its own consented rebase above;
+                // the owned-branch rebase detection does not apply to it.
+                if adopted.is_none() {
+                    a.rebased_onto = rebased_onto;
+                }
             })?;
         }
         if !retained {
@@ -5133,6 +5264,34 @@ mod tests {
         publication_fixture("adopted-rebase-drop");
     }
     #[test]
+    fn adopted_publication_measures_a_consented_rebase_from_the_rebased_director_tip() {
+        publication_fixture("adopted-rebase-main-moved");
+    }
+    #[test]
+    fn adopted_publication_refuses_a_consented_rebase_that_empties_a_director_commit() {
+        publication_fixture("adopted-rebase-empty");
+    }
+    #[test]
+    fn adopted_publication_refuses_a_consented_rebase_that_drops_a_director_path() {
+        publication_fixture("adopted-rebase-path");
+    }
+    #[test]
+    fn adopted_publication_keeps_a_consented_rebase_that_main_already_contains() {
+        publication_fixture("adopted-rebase-upstream");
+    }
+    #[test]
+    fn adopted_publication_refuses_run_work_hidden_in_a_rebased_director_commit() {
+        publication_fixture("adopted-rebase-hidden");
+    }
+    #[test]
+    fn adopted_publication_refuses_a_rebased_director_commit_with_a_new_message() {
+        publication_fixture("adopted-rebase-message");
+    }
+    #[test]
+    fn adopted_publication_refuses_a_merge_in_a_consented_rebase() {
+        publication_fixture("adopted-rebase-merge");
+    }
+    #[test]
     fn adopted_publication_refuses_a_consented_rewrite_off_main() {
         publication_fixture("adopted-rebase-off-main");
     }
@@ -5468,6 +5627,57 @@ fi
             ],
         )
         .unwrap();
+        // #1215 review P1: main moves after the director forked, with a
+        // workflow change and another issue's closing keyword; neither is
+        // the round's.
+        let director_fork = git(&work, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        if witness == "adopted-rebase-upstream" {
+            // Main already has the director's patch, under another subject.
+            std::fs::write(work.join("slice.txt"), "director v1\n").unwrap();
+            git(&work, &["add", "slice.txt"]).unwrap();
+            git(&work, &["commit", "-m", "chore: land the slice on main"]).unwrap();
+            git(
+                &work,
+                &[
+                    "--git-dir",
+                    outer.join("live-main.git").to_str().unwrap(),
+                    "fetch",
+                    work.to_str().unwrap(),
+                    "HEAD:refs/heads/main",
+                ],
+            )
+            .unwrap();
+        }
+        if witness == "adopted-rebase-main-moved" {
+            std::fs::create_dir_all(work.join(".github/workflows")).unwrap();
+            std::fs::write(work.join(".github/workflows/main.yml"), "on: push\n").unwrap();
+            git(&work, &["add", ".github/workflows/main.yml"]).unwrap();
+            git(&work, &["commit", "-m", "ci: main workflow"]).unwrap();
+            git(
+                &work,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fix(core): main fix\n\nCloses #999",
+                ],
+            )
+            .unwrap();
+            git(
+                &work,
+                &[
+                    "--git-dir",
+                    outer.join("live-main.git").to_str().unwrap(),
+                    "fetch",
+                    work.to_str().unwrap(),
+                    "HEAD:refs/heads/main",
+                ],
+            )
+            .unwrap();
+        }
         let base = git(&work, &["rev-parse", "HEAD"])
             .unwrap()
             .trim()
@@ -5522,7 +5732,7 @@ fi
         std::fs::write(&report, "").unwrap();
         if witness.starts_with("adopted") {
             let branch = "work/634-slice";
-            git(&work, &["checkout", "-B", branch, &receipt.base]).unwrap();
+            git(&work, &["checkout", "-B", branch, &director_fork]).unwrap();
             if witness == "adopted-director-history" {
                 // Director history below the tip: a closing reference to
                 // another issue and a workflow change main does not have.
@@ -5534,6 +5744,23 @@ fi
                     &["commit", "-m", "ci: director workflow\n\nFixes #999"],
                 )
                 .unwrap();
+            }
+            // Content witnesses give the director's slice a real change.
+            let content = matches!(
+                witness,
+                "adopted-rebase-main-moved"
+                    | "adopted-rebase-empty"
+                    | "adopted-rebase-path"
+                    | "adopted-rebase-hidden"
+                    | "adopted-rebase-upstream"
+            );
+            if content {
+                std::fs::write(work.join("slice.txt"), "director v1\n").unwrap();
+                git(&work, &["add", "slice.txt"]).unwrap();
+            }
+            if witness == "adopted-rebase-path" {
+                std::fs::write(work.join("keep.txt"), "director v1\n").unwrap();
+                git(&work, &["add", "keep.txt"]).unwrap();
             }
             git(
                 &work,
@@ -5569,6 +5796,117 @@ fi
                 ],
             )
             .unwrap();
+            if matches!(
+                witness,
+                "adopted-rebase-main-moved"
+                    | "adopted-rebase-empty"
+                    | "adopted-rebase-path"
+                    | "adopted-rebase-hidden"
+            ) {
+                git(&work, &["reset", "--hard", &receipt.base]).unwrap();
+                // main-moved: the conflict was resolved, so the patch
+                // changed. empty: the commit kept its name, lost its work.
+                // path: the work landed in another file.
+                match witness {
+                    "adopted-rebase-main-moved" => {
+                        std::fs::write(work.join("slice.txt"), "director v1 resolved\n").unwrap();
+                        git(&work, &["add", "slice.txt"]).unwrap();
+                    }
+                    "adopted-rebase-path" => {
+                        // Keeps one of the director's two files.
+                        std::fs::write(work.join("keep.txt"), "director v1\n").unwrap();
+                        git(&work, &["add", "keep.txt"]).unwrap();
+                    }
+                    "adopted-rebase-hidden" => {
+                        // The director's change, plus the run's own work
+                        // hidden inside the director's commit.
+                        std::fs::write(work.join("slice.txt"), "director v1\n").unwrap();
+                        std::fs::write(work.join("elsewhere.txt"), "run work\n").unwrap();
+                        git(&work, &["add", "slice.txt", "elsewhere.txt"]).unwrap();
+                    }
+                    _ => {}
+                }
+                for subject in [
+                    "refactor(core): director slice",
+                    "fix(core): continue the slice",
+                ] {
+                    git(
+                        &work,
+                        &[
+                            "commit",
+                            "--allow-empty",
+                            "--date=2026-01-01T00:00:00Z",
+                            "-m",
+                            subject,
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+            if witness == "adopted-rebase-merge" {
+                // The director's commit re-created, then merged with a side
+                // commit whose message closes another issue.
+                git(&work, &["reset", "--hard", &receipt.base]).unwrap();
+                git(
+                    &work,
+                    &[
+                        "commit",
+                        "--allow-empty",
+                        "--date=2026-01-01T00:00:00Z",
+                        "-m",
+                        "refactor(core): director slice",
+                    ],
+                )
+                .unwrap();
+                let director = git(&work, &["rev-parse", "HEAD"]).unwrap();
+                git(&work, &["checkout", "-q", "--detach", &receipt.base]).unwrap();
+                git(&work, &["commit", "--allow-empty", "-m", "side"]).unwrap();
+                let side = git(&work, &["rev-parse", "HEAD"]).unwrap();
+                git(&work, &["checkout", "-q", branch]).unwrap();
+                git(&work, &["reset", "--hard", director.trim()]).unwrap();
+                git(
+                    &work,
+                    &[
+                        "merge",
+                        "--no-ff",
+                        "-m",
+                        "merge\n\nCloses #999",
+                        side.trim(),
+                    ],
+                )
+                .unwrap();
+            }
+            if witness == "adopted-rebase-message" {
+                // Same author and subject, but the message gained another
+                // issue's closing keyword.
+                git(&work, &["reset", "--hard", &receipt.base]).unwrap();
+                git(
+                    &work,
+                    &[
+                        "commit",
+                        "--allow-empty",
+                        "--date=2026-01-01T00:00:00Z",
+                        "-m",
+                        "refactor(core): director slice\n\nCloses #999",
+                    ],
+                )
+                .unwrap();
+            }
+            if witness == "adopted-rebase-upstream" {
+                // A plain rebase drops the director's commit main already
+                // has; only the worker's commit remains above main.
+                git(&work, &["reset", "--hard", &receipt.base]).unwrap();
+                git(
+                    &work,
+                    &[
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "fix(core): continue the slice",
+                    ],
+                )
+                .unwrap();
+            }
             if witness == "adopted-rebase" {
                 // A real rebase: the director's commit is re-created above
                 // admitted main (same author and subject, new SHA), then the
@@ -5728,7 +6066,10 @@ fi
                 }
                 return;
             }
-            if witness == "adopted-rebase" {
+            if matches!(
+                witness,
+                "adopted-rebase" | "adopted-rebase-main-moved" | "adopted-rebase-upstream"
+            ) {
                 // Consent (#1215): the rebased history is pushed, still only
                 // under the lease that starts at the admitted tip.
                 assert_eq!(result.unwrap(), Some(800), "{}", applied.report());
@@ -5747,6 +6088,29 @@ fi
                     applied.report()
                 );
                 assert_eq!(applied.adoption_blocked, None);
+                // Only the worker's own commit is the round's: main's
+                // workflow and closing commits and the rebased director
+                // commit are not.
+                assert_eq!(applied.commits.len(), 1, "{}", applied.report());
+                assert!(applied.rebase_tip.is_some());
+                assert!(
+                    witness == "adopted-rebase-upstream"
+                        || applied
+                            .rebase_range_diff
+                            .as_deref()
+                            .is_some_and(|r| r.contains("director slice")),
+                    "{:?}",
+                    applied.rebase_range_diff
+                );
+                if witness == "adopted-rebase-main-moved" {
+                    // The resolved director commit is listed for review.
+                    assert_eq!(applied.rebase_changed.len(), 1, "{}", applied.report());
+                    assert!(
+                        applied.report().contains("patch changed while rebasing"),
+                        "{}",
+                        applied.report()
+                    );
+                }
                 return;
             }
             if matches!(witness, "adopted" | "adopted-director-history") {
@@ -5776,7 +6140,14 @@ fi
                 let expected = match witness {
                     "adopted-rewrite" => "did not consent to a rebase",
                     "adopted-rebase-off-main" => "does not descend from admitted main",
-                    "adopted-rebase-drop" => "dropped the director's commit",
+                    "adopted-rebase-drop" => "dropped or reordered the director's commit",
+                    "adopted-rebase-empty" => "with an empty commit",
+                    "adopted-rebase-path" => "dropped the director's change to `slice.txt`",
+                    "adopted-rebase-hidden" => {
+                        "changed `elsewhere.txt` in the director's commits, which the director never changed"
+                    }
+                    "adopted-rebase-message" => "dropped or reordered the director's commit",
+                    "adopted-rebase-merge" => "left a merge commit",
                     _ => "moved after admission",
                 };
                 assert!(error.contains(expected), "{error}");
@@ -5794,6 +6165,11 @@ fi
                         | "adopted-rewrite"
                         | "adopted-rebase-off-main"
                         | "adopted-rebase-drop"
+                        | "adopted-rebase-empty"
+                        | "adopted-rebase-path"
+                        | "adopted-rebase-hidden"
+                        | "adopted-rebase-message"
+                        | "adopted-rebase-merge"
                 ) {
                     assert!(
                         !outer.join("push-attempts").exists(),

@@ -130,11 +130,26 @@ records it as `Continuation::Adopted.rebase`, the coordinator sees it in
 asks for a rebase onto admitted main. Publication then accepts a HEAD that
 descends from admitted main instead of the admitted tip, pushes it only under
 the same `--force-with-lease` that starts at the admitted tip, and reports
-"Rebased onto main". The rebase must keep the director's history: every
-non-merge commit from the merge-base with main to the admitted tip must
-reappear above main with the same author email and subject, or nothing is
-pushed. A commit whose patch changed while resolving conflicts is allowed and
-listed in the outcome for the reviewer (`git cherry`). Without consent, or when a rewritten HEAD descends from
+"Rebased onto main". The rebase must keep the director's history:
+- the director's non-merge commits from the merge-base with main to the
+  admitted tip come first above admitted main, in order, each with the same
+  author email and the same full message (so none gains a closing keyword);
+  commits main already has (`git cherry` `-`, never an empty commit) count
+  as kept;
+- none of them is replaced by an empty commit, every path they changed is
+  changed by the rebased director commits or already matches, and the
+  rebased director commits change only paths the director's own commits
+  changed (conflict resolution stays within them); anything else would be
+  the run's own work hidden from its checks. Each commit's author and
+  message are read individually, never parsed out of one log stream;
+- a commit whose patch changed while resolving conflicts is allowed and
+  listed in the outcome, with a `git range-diff -s` summary of the director's
+  commits before and after.
+
+Otherwise nothing is pushed. The run's own commits start above the rebased
+director tip, so main's commits between the fork point and admitted main
+(their workflow changes and closing keywords) are never charged to the round,
+and neither are the director's. Without consent, or when a rewritten HEAD descends from
 neither, the run pushes nothing and ends blocked. Workflow-file and closing-reference checks
 count only the run's own commits (admitted tip to HEAD), never the
 director's.
