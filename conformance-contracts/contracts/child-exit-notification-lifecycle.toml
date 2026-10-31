@@ -51,8 +51,12 @@ layers = ["embed-structural"]
 rationale = "Only the root can receive a queued or kicked wake; exact authority rejects the already-reaped middle parent. The signed semantic ordering and zero reaped-wake rejections remain required."
 
 [bindings]
-embed = "carrick-embed::el1_sched_delayed_notification_survives_parent_reap (signed source 2e6e3794a; exact captured/reaped/released ordering, zero reaped wake attempts; controlled pre-fix method fails with one rejection); structural binding: carrick-embed::el1_sched_delayed_notification_survives_parent_reap with conformance-metrics; signed source 9ba825eac: visits 2, authentications 2, Queued/Kicked deliveries 1; complete observation and excess-work controls passed. Receipt: docs/perf-results/2026-09-29-el1-batch3-resume/notification-work/delivery-signed-artifacts.jsonl"
-vm_free = "carrick-runtime::vcpu_loop::wait_wake::tests::child_exit_notification_snapshot_cannot_wake_a_reaped_parent"
+embed = [
+  "carrick-embed::el1_sched_delayed_notification_survives_parent_reap (signed source 2e6e3794a; exact captured/reaped/released ordering, zero reaped wake attempts; controlled pre-fix method fails with one rejection); structural binding: carrick-embed::el1_sched_delayed_notification_survives_parent_reap with conformance-metrics; signed source 9ba825eac: visits 2, authentications 2, Queued/Kicked deliveries 1; complete observation and excess-work controls passed. Receipt: docs/perf-results/2026-09-29-el1-batch3-resume/notification-work/delivery-signed-artifacts.jsonl",
+]
+vm_free = [
+  "carrick-runtime::vcpu_loop::wait_wake::tests::child_exit_notification_snapshot_cannot_wake_a_reaped_parent",
+]
 
 
 [bindings.unresolved]

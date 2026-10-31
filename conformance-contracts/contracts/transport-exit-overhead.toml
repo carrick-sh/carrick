@@ -18,7 +18,9 @@ scale_points = [1, 8, 32, 128]
 rationale = "Forwarded mailbox syscalls deliver arguments, PC, and return values entirely via shared guest-host memory. The host exit path must perform zero vCPU register or system register reads/writes."
 
 [bindings]
-vm_free = "carrick-vmm-hvf::trap::transport_test::transport_exit_overhead_contract"
+vm_free = [
+  "carrick-vmm-hvf::trap::transport_test::transport_exit_overhead_contract",
+]
 
 [bindings.unresolved]
 embed_structural = "Signed guest contract for exact exit and boundary counts pending"

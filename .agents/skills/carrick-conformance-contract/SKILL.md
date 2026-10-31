@@ -12,9 +12,12 @@ A semantic pass never excuses a structural-budget or runtime-ratio failure.
 
 ## Required workflow
 
-1. Read `AGENTS.md`, `docs/conformance-contracts.md`, and the active controller.
+1. Read `AGENTS.md`, `docs/conformance-contracts.md`, any applicable note in
+   `docs/conformance-contracts/`, and the active controller.
 2. Name the guest surface and existing contract ID. If none exists, add the
-   contract red-first.
+   contract red-first (`conformance-contracts/surfaces.toml` sorted one entry
+   per line, `[bindings]` as sorted multi-line TOML arrays, and per-contract
+   notes under `docs/conformance-contracts/`).
 3. State the Linux semantic authority and Carrick structural invariant.
 4. Choose the cheapest capable layer and capture semantic and structural red
    evidence before changing implementation code.

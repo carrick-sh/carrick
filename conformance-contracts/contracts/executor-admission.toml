@@ -8,7 +8,9 @@ scale_points = [1, 8, 32, 128]
 rationale = "Rejecting an install on a vCPU slot that already runs an address space must leave the running occupant, its exact pause endpoint and its crash participation intact. Otherwise a mapping mutator can observe idle while the admitted owner still executes. The fixture rejects N replacement installs (another MM, another registry, the same thread) and then performs one drain kick per rejection; only the original owner may receive those kicks. Since increment 2 step 1 the population is vCPU slot occupancy, not a per-MM census of admitted threads. This is a prerequisite for both HVF and native execution, not a native executor binding."
 
 [bindings]
-vm_free = "carrick-kernel::kernel::mm_occupancy::tests::rejected_install_preserves_live_pause_endpoint"
+vm_free = [
+  "carrick-kernel::kernel::mm_occupancy::tests::rejected_install_preserves_live_pause_endpoint",
+]
 
 [bindings.unresolved]
 embed_structural = "Kernel occupancy regression is VM-free. Signed carrier lifecycle is supplementary; no signed race fixture for rejected native admission is registered."

@@ -28,6 +28,13 @@ meter or runtime-ratio acceptance is claimed.
 """
 
 [bindings]
-vm_free = "carrick-mem::vdso::tests::vdso_serves_coarse_clocks_without_kernel_entry; carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::coarse_clock_gettime_and_clock_getres_wait_for_owner_refused_copyout_instead_of_efault"
-embed = "carrick-embed::coarse_clock_vdso::coarse_clock_vdso_reads_forward_no_clock_syscall"
-docker = "probe:clockcoarsevdso"
+vm_free = [
+  "carrick-kernel::dispatch::proc::copyout_refusal_s3_tests::coarse_clock_gettime_and_clock_getres_wait_for_owner_refused_copyout_instead_of_efault",
+  "carrick-mem::vdso::tests::vdso_serves_coarse_clocks_without_kernel_entry",
+]
+embed = [
+  "carrick-embed::coarse_clock_vdso::coarse_clock_vdso_reads_forward_no_clock_syscall",
+]
+docker = [
+  "probe:clockcoarsevdso",
+]

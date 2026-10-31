@@ -18,7 +18,9 @@ rationale = "The EL1 IPC namespace and kernel dispatcher consume one shared perm
 # S3 migrates credential output writes without changing IPC permission selection.
 # The existing shm_permission_* bindings exercise owner/group/capability rules;
 # capget copyout tests alone do not establish these permission classes.
-vm_free = "carrick-core::ipc_permissions::tests::owner_group_and_other_are_exclusive_classes, carrick-personality-linux::ipc::namespace::tests::ipc_perm_accepts_creator_and_supplementary_group_but_not_other, carrick-kernel::dispatch::sysv::ipc_set_tests::{shm_permission_uses_creator_group_and_supplementary_membership,shm_permission_falls_back_to_etc_group_membership_when_override_absent,shm_permission_honors_cap_ipc_owner_rather_than_raw_euid_root}"
+vm_free = [
+  "carrick-core::ipc_permissions::tests::owner_group_and_other_are_exclusive_classes, carrick-personality-linux::ipc::namespace::tests::ipc_perm_accepts_creator_and_supplementary_group_but_not_other, carrick-kernel::dispatch::sysv::ipc_set_tests::{shm_permission_uses_creator_group_and_supplementary_membership,shm_permission_falls_back_to_etc_group_membership_when_override_absent,shm_permission_honors_cap_ipc_owner_rather_than_raw_euid_root}",
+]
 
 [bindings.unresolved]
 embed_structural = "Signed two-task IPC binding belongs to the director gate."

@@ -26,10 +26,18 @@ rationale = "Requeue operations must move waiters between queues with work propo
 # carrick-kernel-example::futex_requeue_contract and unit tests in
 # crates/carrick-thread/src/thread.rs confirm requeue batch movement,
 # queue-work scaling, and continuation enrollment invariants remain intact.
-vm_free = "carrick-kernel-example::futex_requeue_contract"
-embed = "carrick-embed::futex_requeue_contract"
-docker = "probe:futexrequeue"
-ecosystem = ["ltp:futex_cmp_requeue01"]
+vm_free = [
+  "carrick-kernel-example::futex_requeue_contract",
+]
+embed = [
+  "carrick-embed::futex_requeue_contract",
+]
+docker = [
+  "probe:futexrequeue",
+]
+ecosystem = [
+  "ltp:futex_cmp_requeue01",
+]
 
 [[structural_budgets]]
 kind = "affine"

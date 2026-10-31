@@ -41,9 +41,10 @@ fn run(root: &Path) -> Result<(), String> {
     for contract in registry.contracts() {
         // Registry validation already requires every absent binding to carry a
         // non-empty unresolved reason. Once a VM-free binding is concrete,
-        // additionally prove that its target crate exists.
-        if let Some(vm_free) = contract.bindings.vm_free.as_deref() {
-            let crate_name = vm_free.split("::").next().unwrap_or(vm_free);
+        // additionally prove that every target crate exists.
+        for vm_free in &contract.bindings.vm_free {
+            let target = vm_free.strip_prefix("doctest:").unwrap_or(vm_free);
+            let crate_name = target.split("::").next().unwrap_or(target);
             let crate_path = root.join("crates").join(crate_name);
             if !crate_path.exists() {
                 return Err(format!(

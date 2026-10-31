@@ -1,2154 +1,1059 @@
 schema_version = 1
-
-[[surfaces]]
-path = "crates/carrick-xtask/src/host_lease.rs"
-contracts = ["host.lease.workload-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-xtask/src/lease_supervisor.rs"
-contracts = ["host.lease.workload-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-xtask/src/lease_supervisor/macos_scope.rs"
-contracts = ["host.lease.workload-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-xtask/tests/host_lease.rs"
-contracts = ["host.lease.workload-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.wait.child-exit-notification-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-observability/src/work_meter.rs"
-contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density", "softmmu.x86.tlb-walker", "softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-mem/src/memory.rs"
-contracts = ["kernel.memory.owner-wait", "hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.el1.fault-entry", "kernel.el1.stage1-publication", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/el1_transparent.rs"
-contracts = ["kernel.el1.transparent"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/el1_fork_exec.rs"
-contracts = ["kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-aarch64/src/mailbox.rs"
-contracts = ["hvpatch.syscall.portal"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/syscall_mailbox.rs"
-contracts = ["kernel.memory.owner-wait", "hvpatch.syscall.portal", "kernel.el1.files.cross-process-readers"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/futex.rs"
-contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/continuation.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.futex.contention", "kernel.futex.requeue", "kernel.signal.temporary-wait-mask", "kernel.signal.socket-restart"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/continuation/tests.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.signal.socket-restart"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/net/lifecycle.rs"
-contracts = ["kernel.signal.socket-restart"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/ipc_permissions.rs"
-contracts = ["kernel.ipc.permission-classes"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/affinity.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/exec.rs"
-contracts = ["process.exec.custody"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/sysv.rs"
-contracts = ["kernel.ipc.permission-classes"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/ipc/namespace.rs"
-contracts = ["kernel.ipc.permission-classes"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/creds.rs"
-contracts = ["kernel.ipc.permission-classes"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs.rs"
-contracts = ["kernel.ipc.permission-classes", "kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-signal-core/src/wait.rs"
-contracts = ["kernel.signal.socket-restart"]
-
-[[surfaces]]
-path = "crates/carrick-thread/src/platform_futex.rs"
-contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
-
-[[surfaces]]
-path = "crates/carrick-host-bsd/src/futex.rs"
-contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
-
-[[surfaces]]
-path = "crates/carrick-thread/src/thread.rs"
-contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/semantics/futex_contention.rs"
-contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/shared_buffer_futex.rs"
-contracts = ["kernel.futex.contention"]
-
-[[surfaces]]
-path = "conformance-probes/src/bin/futexpingpong.rs"
-contracts = ["kernel.futex.contention"]
-
-[[surfaces]]
-path = "conformance-probes/src/bin/futexwakeexact.rs"
-contracts = ["kernel.futex.contention"]
-
-[[surfaces]]
-path = "conformance-probes/src/bin/futexrequeue.rs"
-contracts = ["kernel.futex.requeue"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/objects.rs"
-contracts = ["kernel.fork.filetable", "core.personality.files", "kernel.el1.open-lifetime", "kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/objects/task.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.fork.filetable", "kernel.dispatch.resource-scope", "kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/resources.rs"
-contracts = ["kernel.dispatch.resource-scope"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/operations.rs"
-contracts = ["kernel.fork.filetable"]
-
-[[surfaces]]
-path = "conformance-probes/src/bin/forkfiletable.rs"
-contracts = ["kernel.fork.filetable"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/semantics/fork_scaling.rs"
-contracts = ["kernel.fork.filetable", "kernel.fork.mappings"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.time.realtime-calibration", "kernel.mm.backing-maintenance-lookup", "kernel.el1.gic", "kernel.mm.metadata-refusal", "kernel.el1.stage1-publication", "kernel.mm.carrier-window-isolation"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs"
-contracts = ["kernel.el1.stage1-publication", "kernel.mm.image-page-permissions"]
-
-[[surfaces]]
-path = "crates/carrick-mem/src/vdso.rs"
-contracts = ["kernel.time.realtime-calibration", "kernel.time.coarse-clock-vdso"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/tools/vdso_fns.s"
-contracts = ["kernel.time.coarse-clock-vdso"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/coarse_clock_vdso.rs"
-contracts = ["kernel.time.coarse-clock-vdso"]
-
-[[surfaces]]
-path = "fixtures/linux-aarch64-hello/src/coarse_clock_vdso.rs"
-contracts = ["kernel.time.coarse-clock-vdso"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/realtime_calibration.rs"
-contracts = ["kernel.time.realtime-calibration"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/process_plan.rs"
-contracts = ["kernel.fork.mappings", "kernel.fork.stage1-image", "kernel.mm.image-page-permissions"]
-
-[[surfaces]]
-path = "crates/carrick-aarch64/src/stage1_authority.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.mm.metadata-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-aarch64/src/engine.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.native.arm-admission", "kernel.mm.private-file-fixed-replacement"]
-
-[[surfaces]]
-path = "crates/carrick-aarch64/src/descriptor_drain.rs"
-contracts = ["kernel.mm.private-file-fixed-replacement"]
-
-[[surfaces]]
-path = "crates/carrick-mmu-core/src/aarch64.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.el1.gic", "kernel.mm.metadata-refusal", "kernel.el1.stage1-publication", "kernel.exec.stage1-image", "kernel.mm.image-page-permissions"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/quiesce.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.mm.address-space-occupancy"]
-
-[[surfaces]]
-path = "conformance-probes/src/bin/forkserial.rs"
-contracts = ["kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/task_mapping_index.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.mm.backing-maintenance-lookup"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/memory_protection.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.mm.backing-maintenance-lookup"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.stage1-publication", "process.native.arm-admission", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.ipc.permission-classes", "kernel.fs.directory-copyout", "kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/kernel_context.rs"
-contracts = ["kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/event.rs"
-contracts = ["kernel.inotify.watch"]
-
-[[surfaces]]
-path = "crates/carrick-host-bsd/src/multiplexer.rs"
-contracts = ["kernel.inotify.watch"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/inotify.rs"
-contracts = [
-  "kernel.inotify.watch",
-  "kernel.inotify.readiness",
-  "kernel.inotify.mark-race-hotpath",
+surfaces = [
+  { path = "conformance-probes/src/bin/forkfiletable.rs", contract = "kernel.fork.filetable" },
+  { path = "conformance-probes/src/bin/forkserial.rs", contract = "kernel.fork.stage1-image" },
+  { path = "conformance-probes/src/bin/futexpingpong.rs", contract = "kernel.futex.contention" },
+  { path = "conformance-probes/src/bin/futexrequeue.rs", contract = "kernel.futex.requeue" },
+  { path = "conformance-probes/src/bin/futexwakeexact.rs", contract = "kernel.futex.contention" },
+  { path = "conformance-probes/src/bin/inotifymatrix.rs", contract = "kernel.inotify.watch" },
+  { path = "conformance-probes/src/bin/perf_inotify09_scale.rs", contract = "kernel.inotify.mark-race-hotpath" },
+  { path = "crates/carrick-aarch64/src/descriptor_drain.rs", contract = "kernel.mm.private-file-fixed-replacement" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.el1.task-load-entry" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.mm.private-file-fixed-replacement" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-aarch64/src/engine.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-aarch64/src/mailbox.rs", contract = "hvpatch.syscall.portal" },
+  { path = "crates/carrick-aarch64/src/owed_kick.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-aarch64/src/stage1_authority.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-aarch64/src/stage1_authority.rs", contract = "kernel.mm.metadata-refusal" },
+  { path = "crates/carrick-aarch64/src/user_transfer/staging.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-aarch64/src/user_transfer/staging.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-aarch64/src/vmm.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-aarch64/src/vmm.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-aarch64/src/vmm.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-aarch64/src/vmm.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-aarch64/src/vmm.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-aarch64/src/vmm.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-abi/src/x86_syscall_crosscheck.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-cli/tests/x86_kvm_run.rs", contract = "x86.carrier.cli-run" },
+  { path = "crates/carrick-conformance-next/tests/directory_copyout.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-conformance-next/tests/fixtures/directory-copyout/src/main.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-conformance-next/tests/fixtures/syscall_write_destinations.py", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-conformance-next/tests/syscall_write_destinations.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-core-abi/src/entry.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-core-abi/src/executable_publication.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-core-abi/src/executable_publication.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-core-abi/src/host_file.rs", contract = "kernel.native.host-file-venue" },
+  { path = "crates/carrick-core-abi/src/initial_boot.rs", contract = "kernel.el1.elastic-frame-extents" },
+  { path = "crates/carrick-core-abi/src/initial_boot.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-core-abi/src/lib.rs", contract = "core.personality.handle-table" },
+  { path = "crates/carrick-core-abi/src/mm/served.rs", contract = "kernel.mm.invalidation-domain" },
+  { path = "crates/carrick-core-abi/src/mm/transfer.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-core-abi/src/mm/transfer.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-core-abi/src/native_run_failure.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-core-abi/src/native_run_failure.rs", contract = "kernel.el1.arm-ring-first-crossing" },
+  { path = "crates/carrick-core-abi/src/native_run_failure.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-core-abi/src/native_run_failure_tests.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-core-abi/src/native_run_failure_tests.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-core-abi/src/open_lifetime.rs", contract = "core.personality.handle-table" },
+  { path = "crates/carrick-core-abi/src/prepare_stock.rs", contract = "kernel.el1.elastic-frame-extents" },
+  { path = "crates/carrick-core-abi/src/prepare_stock.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-core-abi/src/root_exit.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-core-abi/src/service.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-core-abi/src/service.rs", contract = "process.exec.custody" },
+  { path = "crates/carrick-core/src/affinity.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-core/src/cancellation.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-core/src/cancellation/loom_tests.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-core/src/entry.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-core/src/entry.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-core/src/entry.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-core/src/entry.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-core/src/exec.rs", contract = "process.exec.custody" },
+  { path = "crates/carrick-core/src/file.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-core/src/ipc_permissions.rs", contract = "kernel.ipc.permission-classes" },
+  { path = "crates/carrick-core/src/lib.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-core/src/lifecycle.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-core/src/mm/fork.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-core/src/mm/fork.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-core/src/mm/fork.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-core/src/mm/fork/reservation.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-core/src/mm/fork/reservation.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-core/src/mm/reservation/root.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-core/src/mm/reservation/stock.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-core/src/mm/retirement.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-core/src/mm/retirement/invalidation.rs", contract = "kernel.mm.invalidation-domain" },
+  { path = "crates/carrick-core/src/mm/retirement/invalidation/loom_models.rs", contract = "kernel.mm.invalidation-domain" },
+  { path = "crates/carrick-core/src/mm/retirement/invalidation/tests.rs", contract = "kernel.mm.invalidation-domain" },
+  { path = "crates/carrick-core/src/mm/transaction/owner.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-core/src/mm/transaction/owner.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-core/src/mm/transaction/user_write.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-core/src/mm/transaction/user_write.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-core/src/terminal.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-core/src/terminal.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-core/src/terminal.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-core/src/terminal.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-core/src/wait.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-core/tests/aarch64_fork_geometry.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-core/tests/aarch64_fork_geometry.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-core/tests/aarch64_fork_geometry.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-core/tests/entry_completion.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-core/tests/entry_completion.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-core/tests/x86_acceleration.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-core/tests/x86_acceleration.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-core/tests/x86_acceleration.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-core/tests/x86_acceleration/compact_context.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-core/tests/x86_acceleration/fork_cow.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-core/tests/x86_acceleration/fork_cow.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-abi/src/entry_binding_fatal.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1-abi/src/entry_binding_fatal.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-abi/src/file_region.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-el1-abi/src/fork_stock.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-el1-abi/src/fork_stock.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-abi/src/image_layout_tests.rs", contract = "kernel.el1.metadata-allocation" },
+  { path = "crates/carrick-el1-abi/src/image_layout_tests.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-el1-abi/src/image_layout_tests.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-el1-abi/src/internal_read.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-el1-abi/src/internal_read.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-el1-abi/src/kernel_fault_venues.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.fault-entry" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.metadata-allocation" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.open-lifetime" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-el1-abi/src/lib.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-abi/src/open_lifetime.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-el1-abi/src/open_lifetime.rs", contract = "kernel.el1.open-lifetime" },
+  { path = "crates/carrick-el1-abi/src/signal_ingress.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-abi/src/stack_overflow.rs", contract = "kernel.el1.fault-entry" },
+  { path = "crates/carrick-el1-control-abi/src/lib.rs", contract = "kernel.el1.metadata-allocation" },
+  { path = "crates/carrick-el1-image/frame_budget.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-el1-image/frame_budget.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-image/frame_budget.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/exit_group_hang_tests.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/exit_group_hang_tests.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_child_handoff_tests.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_child_handoff_tests.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_child_handoff_tests.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_ipc_wake_tests.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_retirement_tests.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-linux/src/arm_signal.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/src/cow_resolver.rs", contract = "kernel.el1.fault-entry" },
+  { path = "crates/carrick-el1-linux/src/cow_resolver.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "process.exec.custody" },
+  { path = "crates/carrick-el1-linux/src/dispatch.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-el1-linux/src/entry.rs", contract = "kernel.el1.fault-entry" },
+  { path = "crates/carrick-el1-linux/src/entry.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-el1-linux/src/exec_stage.rs", contract = "process.exec.custody" },
+  { path = "crates/carrick-el1-linux/src/file.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-el1-linux/src/file.rs", contract = "kernel.el1.files" },
+  { path = "crates/carrick-el1-linux/src/file.rs", contract = "kernel.el1.inotify" },
+  { path = "crates/carrick-el1-linux/src/file_table.rs", contract = "kernel.el1.fd-single-owner" },
+  { path = "crates/carrick-el1-linux/src/file_table.rs", contract = "kernel.el1.files" },
+  { path = "crates/carrick-el1-linux/src/file_table.rs", contract = "kernel.el1.open-lifetime" },
+  { path = "crates/carrick-el1-linux/src/file_table.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-el1-linux/src/file_table/exec.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-el1-linux/src/file_table/exec.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-el1-linux/src/file_table/exec.rs", contract = "process.exec.files" },
+  { path = "crates/carrick-el1-linux/src/fork_loan.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-el1-linux/src/fork_loan.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-linux/src/ipc.rs", contract = "kernel.el1.ipc-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/ipc.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/ipc.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-el1-linux/src/ipc/epoll.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/lifecycle.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1-linux/src/mm_portal/mod.rs", contract = "kernel.el1.elastic-frame-extents" },
+  { path = "crates/carrick-el1-linux/src/mm_portal/mod.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-linux/src/mm_portal/tests.rs", contract = "kernel.el1.elastic-frame-extents" },
+  { path = "crates/carrick-el1-linux/src/mm_portal/tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-linux/src/mm_portal/tests.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-el1-linux/src/mm_portal/tests.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-el1-linux/src/native_fork_refusal.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-el1-linux/src/native_ownership_tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1-linux/src/native_process_custody.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/native_process_entry.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1-linux/src/native_process_entry.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/native_process_entry.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-el1-linux/src/native_process_entry.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "process.exec.custody" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1-linux/src/native_process_signals.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-el1-linux/src/native_process_signals.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/src/native_process_signals.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/native_process_signals.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-el1-linux/src/native_run_failure.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1-linux/src/native_run_failure.rs", contract = "kernel.el1.arm-ring-first-crossing" },
+  { path = "crates/carrick-el1-linux/src/native_run_failure.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/process_owner.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/process_owner.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-el1-linux/src/process_owner.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-el1-linux/src/process_owner_tests.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/process_owner_tests.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-el1-linux/src/process_owner_tests.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-el1-linux/src/retired_spaces.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1-linux/src/sched/tests.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-el1-linux/src/sched/tests.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-el1-linux/src/sched/tests.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1-linux/src/signal_delivery.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/src/x86_signal.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.files" },
+  { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-el1-linux/tests/x86_production_forward.rs", contract = "kernel.el1.inotify" },
+  { path = "crates/carrick-el1/src/alloc.rs", contract = "kernel.el1.metadata-allocation" },
+  { path = "crates/carrick-el1/src/alloc.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-el1/src/cow/test_support.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-el1/src/fault.rs", contract = "kernel.el1.fault-entry" },
+  { path = "crates/carrick-el1/src/fault.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-el1/src/file.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-el1/src/file.rs", contract = "kernel.el1.files" },
+  { path = "crates/carrick-el1/src/file.rs", contract = "kernel.el1.inotify" },
+  { path = "crates/carrick-el1/src/isa/aarch64.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1/src/isa/aarch64.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-el1/src/isa/x86/context_resume.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-el1/src/isa/x86/context_resume.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-el1/src/isa/x86/fork_mm.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-el1/src/isa/x86/fork_mm.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1/src/isa/x86/initial_mm.rs", contract = "x86.mm.initial-image" },
+  { path = "crates/carrick-el1/src/isa/x86/live_context.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-el1/src/sched.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-el1/src/sched.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-el1/src/sched.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-el1/src/sched.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1/src/sched.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-el1/src/sched/hw.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-el1/src/sched/hw.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-el1/src/sched/object_wait.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-el1/src/substrate/mod.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-el1/src/substrate/zone_file_service.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-el1/src/substrate/zone_file_service.rs", contract = "kernel.el1.open-lifetime" },
+  { path = "crates/carrick-embed/src/contracts/inotify_hotpath.rs", contract = "kernel.inotify.mark-race-hotpath" },
+  { path = "crates/carrick-embed/tests/coarse_clock_vdso.rs", contract = "kernel.time.coarse-clock-vdso" },
+  { path = "crates/carrick-embed/tests/common/host_read_enrollment.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-embed/tests/el1_fork_exec.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-embed/tests/el1_gic.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-embed/tests/el1_kick_served_loop.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.anonymous-first-touch" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.delegated-root-fork" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.epoll-zone" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.fault-entry" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.metadata-allocation" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-embed/tests/el1_sched.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-embed/tests/el1_transparent.rs", contract = "kernel.el1.transparent" },
+  { path = "crates/carrick-embed/tests/el1_vcpu_lifetime.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-embed/tests/host_wait_policy.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-embed/tests/host_wait_policy.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-embed/tests/inotify_hotpath_contract.rs", contract = "kernel.inotify.mark-race-hotpath" },
+  { path = "crates/carrick-embed/tests/pt_pause_drain_pressure.rs", contract = "kernel.mm.pt-pause-drain-acknowledgement" },
+  { path = "crates/carrick-embed/tests/pt_pause_drain_pressure.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-embed/tests/realtime_calibration.rs", contract = "kernel.time.realtime-calibration" },
+  { path = "crates/carrick-embed/tests/scheduler_preemption.rs", contract = "kernel.scheduler.preemption-cost" },
+  { path = "crates/carrick-embed/tests/scheduler_preemption.rs", contract = "kernel.scheduler.preemption-lifecycle" },
+  { path = "crates/carrick-embed/tests/scheduler_preemption.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-embed/tests/shared_buffer_futex.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-fd-core/src/exec.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-fd-core/src/exec.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-fd-core/src/handle.rs", contract = "core.personality.handle-table" },
+  { path = "crates/carrick-fd-core/src/lib.rs", contract = "core.personality.handle-table" },
+  { path = "crates/carrick-fd-core/src/lib.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-fd-core/src/lib.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-fd-core/src/loom_models.rs", contract = "core.personality.handle-table" },
+  { path = "crates/carrick-fd-core/src/reservation.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-fd-core/src/reservation.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-fd-core/src/storage.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-fd-core/src/tests.rs", contract = "core.personality.handle-table" },
+  { path = "crates/carrick-fd-core/src/tests.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-fd-core/src/tests.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-guest-arch/src/lib.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-guest-mem/src/lib.rs", contract = "kernel.mm.private-file-fixed-replacement" },
+  { path = "crates/carrick-guest-mem/src/lib.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-hal/src/aarch64_arch.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-hal/src/aarch64_arch.rs", contract = "kernel.mm.user-va-ceiling" },
+  { path = "crates/carrick-hal/src/asid.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-hal/src/birth_serial.rs", contract = "core.lifecycle.publication" },
+  { path = "crates/carrick-hal/src/birth_serial.rs", contract = "kernel.el1.address-space-switch" },
+  { path = "crates/carrick-hal/src/birth_serial.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-hal/src/birth_serial.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-hal/src/event.rs", contract = "kernel.inotify.watch" },
+  { path = "crates/carrick-hal/src/foreign_mm.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-hal/src/foreign_mm.rs", contract = "kernel.mm.native-code-drain" },
+  { path = "crates/carrick-hal/src/fork_stock.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-hal/src/fork_stock.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-hal/src/fork_stock.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-hal/src/fork_stock/tests.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-hal/src/fork_stock/tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-hal/src/guest_arch.rs", contract = "kernel.mm.user-va-ceiling" },
+  { path = "crates/carrick-hal/src/guest_timer_bridge.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-hal/src/lib.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-hal/src/lib.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-hal/src/physical_grants.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-hal/src/physical_grants.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-hal/src/physical_grants.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-hal/src/posix_signal_kick.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-hal/src/posix_timer.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-hal/src/sigframe.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-hal/src/threaded.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-hal/src/threaded.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-hal/src/threaded.rs", contract = "kernel.mm.pt-pause-drain-acknowledgement" },
+  { path = "crates/carrick-hal/src/timer_delivery.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-hal/src/timer_delivery.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-hal/src/trap.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-hal/src/trap.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-hal/src/trap.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-hal/src/trap.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-hal/src/trap.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-hal/src/vcpu_run.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-hal/src/x8664_arch.rs", contract = "kernel.mm.user-va-ceiling" },
+  { path = "crates/carrick-host-bsd/src/futex.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-host-bsd/src/futex.rs", contract = "kernel.futex.requeue" },
+  { path = "crates/carrick-host-bsd/src/multiplexer.rs", contract = "kernel.inotify.watch" },
+  { path = "crates/carrick-host-bsd/src/signal_backend.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-host/src/host_mapping.rs", contract = "process.exec.backing" },
+  { path = "crates/carrick-kernel-example/tests/host_wait_cancellation.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel-example/tests/personality_handle_table.rs", contract = "core.personality.handle-table" },
+  { path = "crates/carrick-kernel-example/tests/root_exit_full_width.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-kernel-example/tests/scheduler_handoff.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel-example/tests/scheduler_preemption.rs", contract = "kernel.scheduler.preemption-cost" },
+  { path = "crates/carrick-kernel-example/tests/scheduler_preemption.rs", contract = "kernel.scheduler.preemption-lifecycle" },
+  { path = "crates/carrick-kernel-example/tests/scheduler_preemption.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-kernel-example/tests/seam_reserve_commit.rs", contract = "kernel.el1.anonymous-munmap" },
+  { path = "crates/carrick-kernel-example/tests/seam_reserve_commit.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-kernel-example/tests/semantics/fork_scaling.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-kernel-example/tests/semantics/fork_scaling.rs", contract = "kernel.fork.mappings" },
+  { path = "crates/carrick-kernel-example/tests/semantics/futex_contention.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-kernel-example/tests/semantics/futex_contention.rs", contract = "kernel.futex.requeue" },
+  { path = "crates/carrick-kernel-example/tests/semantics/inotify_watch.rs", contract = "kernel.inotify.watch" },
+  { path = "crates/carrick-kernel-example/tests/semantics/pgrp.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-kernel-example/tests/stdio_host_wait_contention.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel-example/tests/stdio_inherited_backpressure.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel/src/dispatch/copyout.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-kernel/src/dispatch/copyout.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/copyout_contention_tests.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/creds.rs", contract = "kernel.ipc.permission-classes" },
+  { path = "crates/carrick-kernel/src/dispatch/dispatcher.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-kernel/src/dispatch/dispatcher.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/dispatch/dispatcher.rs", contract = "kernel.ipc.permission-classes" },
+  { path = "crates/carrick-kernel/src/dispatch/dispatcher.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/exec_files.rs", contract = "process.exec.files" },
+  { path = "crates/carrick-kernel/src/dispatch/executable_authority.rs", contract = "process.exec.files" },
+  { path = "crates/carrick-kernel/src/dispatch/fd_table.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/dispatch/fd_table.rs", contract = "kernel.inotify.readiness" },
+  { path = "crates/carrick-kernel/src/dispatch/fd_wait.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/fd_wait/tests.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/format_time.rs", contract = "kernel.time.coarse-clock-vdso" },
+  { path = "crates/carrick-kernel/src/dispatch/fs.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/dispatch/fs.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/dispatch/fs.rs", contract = "kernel.ipc.permission-classes" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/directory.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/directory.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/locks.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/notify.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/notify.rs", contract = "kernel.inotify.mark-race-hotpath" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/notify.rs", contract = "kernel.inotify.readiness" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/notify.rs", contract = "kernel.inotify.watch" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/open.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/pathres.rs", contract = "process.exec.files" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/rw.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/rw.rs", contract = "kernel.fs.lseek-sparse" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/rw.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/stat.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/tests.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/dispatch/fs/tests.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.requeue" },
+  { path = "crates/carrick-kernel/src/dispatch/host_io.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel/src/dispatch/io_pipe.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel/src/dispatch/kernel_context.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-kernel/src/dispatch/mem.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-kernel/src/dispatch/mem.rs", contract = "kernel.mm.user-va-ceiling" },
+  { path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs", contract = "kernel.mm.private-file-fixed-replacement" },
+  { path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs", contract = "kernel.mm.user-va-ceiling" },
+  { path = "crates/carrick-kernel/src/dispatch/mem/fault.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs", contract = "kernel.mm.private-file-fixed-replacement" },
+  { path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs", contract = "kernel.mm.shared-file-reuse" },
+  { path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs", contract = "kernel.mm.user-va-ceiling" },
+  { path = "crates/carrick-kernel/src/dispatch/mem/native_successor.rs", contract = "kernel.native.host-file-venue" },
+  { path = "crates/carrick-kernel/src/dispatch/mm_mutation.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-kernel/src/dispatch/mm_quiesce.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-kernel/src/dispatch/mm_quiesce.rs", contract = "kernel.mm.pt-pause-drain-acknowledgement" },
+  { path = "crates/carrick-kernel/src/dispatch/mod.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/dispatch/mod.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/native_execution.rs", contract = "kernel.mm.native-code-drain" },
+  { path = "crates/carrick-kernel/src/dispatch/native_files.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/dispatch/native_files.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/native_files.rs", contract = "kernel.native.host-file-venue" },
+  { path = "crates/carrick-kernel/src/dispatch/net.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/net/epoll_ops/write_rearm.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel/src/dispatch/net/lifecycle.rs", contract = "kernel.signal.socket-restart" },
+  { path = "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs", contract = "kernel.net.connect-wake-scope" },
+  { path = "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests/loom_models.rs", contract = "kernel.net.connect-wake-scope" },
+  { path = "crates/carrick-kernel/src/dispatch/net/send_recv.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/net/send_recv.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-kernel/src/dispatch/net/send_recv.rs", contract = "kernel.signal.socket-restart" },
+  { path = "crates/carrick-kernel/src/dispatch/outcome.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/dispatch/outcome.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/request.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/dispatch/request.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/resources.rs", contract = "kernel.dispatch.resource-scope" },
+  { path = "crates/carrick-kernel/src/dispatch/rootfs_helpers.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-kernel/src/dispatch/signal.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/dispatch/sysv.rs", contract = "kernel.ipc.permission-classes" },
+  { path = "crates/carrick-kernel/src/dispatch/time.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/el1_delegation.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-kernel/src/el1_delegation.rs", contract = "kernel.el1.files" },
+  { path = "crates/carrick-kernel/src/el1_delegation.rs", contract = "kernel.el1.files.shared-inode" },
+  { path = "crates/carrick-kernel/src/el1_delegation.rs", contract = "kernel.el1.open-lifetime" },
+  { path = "crates/carrick-kernel/src/el1_delegation/owned_recall.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-kernel/src/el1_delegation/owned_recall.rs", contract = "kernel.el1.files" },
+  { path = "crates/carrick-kernel/src/el1_delegation/owned_recall.rs", contract = "kernel.el1.open-lifetime" },
+  { path = "crates/carrick-kernel/src/el1_delegation/owned_recall/zone_file_service_tests.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-kernel/src/el1_delegation/owned_recall/zone_file_service_tests.rs", contract = "kernel.el1.files" },
+  { path = "crates/carrick-kernel/src/el1_delegation/owned_recall/zone_file_service_tests.rs", contract = "kernel.el1.open-lifetime" },
+  { path = "crates/carrick-kernel/src/el1_ipc.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.el1.deferred-handback-identity" },
+  { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-kernel/src/el1_zone.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-kernel/src/inotify.rs", contract = "kernel.inotify.mark-race-hotpath" },
+  { path = "crates/carrick-kernel/src/inotify.rs", contract = "kernel.inotify.readiness" },
+  { path = "crates/carrick-kernel/src/inotify.rs", contract = "kernel.inotify.watch" },
+  { path = "crates/carrick-kernel/src/kernel/boot_launch.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-kernel/src/kernel/continuation.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/kernel/continuation.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-kernel/src/kernel/continuation.rs", contract = "kernel.futex.requeue" },
+  { path = "crates/carrick-kernel/src/kernel/continuation.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/continuation.rs", contract = "kernel.signal.socket-restart" },
+  { path = "crates/carrick-kernel/src/kernel/continuation.rs", contract = "kernel.signal.temporary-wait-mask" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/ipc.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/ipc.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/output.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/output.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/readiness.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/readiness.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/tests.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/tests.rs", contract = "kernel.signal.socket-restart" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/wait_service.rs", contract = "kernel.el1.deferred-handback-identity" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/wait_service.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-kernel/src/kernel/continuation/wait_service.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-kernel/src/kernel/exec.rs", contract = "process.exec.custody" },
+  { path = "crates/carrick-kernel/src/kernel/fd_exec.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/kernel/fd_exec.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-kernel/src/kernel/identity_page.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-kernel/src/kernel/identity_page.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-kernel/src/kernel/mm_access.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-kernel/src/kernel/mm_access.rs", contract = "kernel.mm.native-code-drain" },
+  { path = "crates/carrick-kernel/src/kernel/mm_access/instruction_content.rs", contract = "kernel.mm.native-code-drain" },
+  { path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs", contract = "kernel.el1.address-space-switch" },
+  { path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs", contract = "kernel.mm.executor-admission" },
+  { path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs", contract = "kernel.mm.pt-pause-drain-acknowledgement" },
+  { path = "crates/carrick-kernel/src/kernel/mm_occupancy/tests.rs", contract = "kernel.el1.address-space-switch" },
+  { path = "crates/carrick-kernel/src/kernel/mm_occupancy/tests.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-kernel/src/kernel/mm_occupancy/tests.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-kernel/src/kernel/mm_occupancy/tests.rs", contract = "kernel.mm.executor-admission" },
+  { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.el1.open-lifetime" },
+  { path = "crates/carrick-kernel/src/kernel/objects.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-kernel/src/kernel/objects/ipc.rs", contract = "kernel.el1.fd-single-owner" },
+  { path = "crates/carrick-kernel/src/kernel/objects/ipc.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/kernel/objects/signal.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/objects/task.rs", contract = "kernel.dispatch.resource-scope" },
+  { path = "crates/carrick-kernel/src/kernel/objects/task.rs", contract = "kernel.el1.ipc-fd-authority" },
+  { path = "crates/carrick-kernel/src/kernel/objects/task.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-kernel/src/kernel/objects/task.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/objects/thread.rs", contract = "kernel.el1.deferred-handback-identity" },
+  { path = "crates/carrick-kernel/src/kernel/objects/thread.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-kernel/src/kernel/objects/thread.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-kernel/src/kernel/objects/thread.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/objects/thread.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-kernel/src/kernel/objects/thread_control.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/operations.rs", contract = "kernel.fork.filetable" },
+  { path = "crates/carrick-kernel/src/kernel/operations/exit.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-kernel/src/kernel/operations/signal.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-kernel/src/kernel/operations/thread.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-kernel/src/kernel/registry.rs", contract = "core.lifecycle.publication" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler.rs", contract = "kernel.scheduler.preemption-cost" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler.rs", contract = "kernel.scheduler.preemption-lifecycle" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs", contract = "kernel.el1.deferred-handback-identity" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs", contract = "kernel.scheduler.preemption-cost" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs", contract = "kernel.scheduler.preemption-lifecycle" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs", contract = "kernel.scheduler.preemption-lifecycle" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/preemption.rs", contract = "kernel.scheduler.preemption-cost" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/preemption.rs", contract = "kernel.scheduler.preemption-lifecycle" },
+  { path = "crates/carrick-kernel/src/kernel/scheduler/preemption.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-kernel/src/kernel/thread_ledger.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-kernel/src/kernel/thread_ledger.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-kernel/tests/integration/syscall_fs_rw.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-mem/src/elf.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "hvpatch.syscall.portal" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.el1.fault-entry" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.el1.transparent" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-mem/src/memory.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-mem/src/memory/el1_clock.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-mem/src/memory/el1_hook_kick.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-mem/src/memory/el1_hook_kick.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-mem/src/memory/el1_hook_kick.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-mem/src/memory/el1_hook_kick.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-mem/src/memory/el1_hook_kick.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-mem/src/vdso.rs", contract = "kernel.time.coarse-clock-vdso" },
+  { path = "crates/carrick-mem/src/vdso.rs", contract = "kernel.time.realtime-calibration" },
+  { path = "crates/carrick-mem/src/x86_initial_image.rs", contract = "x86.mm.initial-image" },
+  { path = "crates/carrick-mem/tests/x86_initial_image.rs", contract = "x86.mm.initial-image" },
+  { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.exec.stage1-image" },
+  { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-mmu-core/src/aarch64.rs", contract = "kernel.mm.metadata-refusal" },
+  { path = "crates/carrick-mmu-core/src/live_descriptor_words.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-mmu-core/src/x86/copy_window.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-mmu-core/src/x86/copy_window.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-mmu-core/src/x86/descriptor_txn.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-mmu-core/src/x86/descriptor_txn/tests.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-observability/src/work_meter.rs", contract = "hvpatch.syscall.portal" },
+  { path = "crates/carrick-observability/src/work_meter.rs", contract = "kernel.execution.native-code-density" },
+  { path = "crates/carrick-observability/src/work_meter.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-observability/src/work_meter.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-observability/src/work_meter.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-personality-api/src/lib.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-api/src/lib.rs", contract = "core.personality.files" },
+  { path = "crates/carrick-personality-linux/src/abi/entry.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/abi/entry.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-personality-linux/src/abi/mod.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/abi/signal.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-personality-linux/src/abi/thread.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-personality-linux/src/abi/thread.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-personality-linux/src/abi/thread.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-personality-linux/src/arch_prctl.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/crossing.rs", contract = "kernel.el1.arm-ring-first-crossing" },
+  { path = "crates/carrick-personality-linux/src/dispatch.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/entry.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/identity.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-personality-linux/src/identity.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-personality-linux/src/identity.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-personality-linux/src/identity/credential_tests.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-personality-linux/src/ipc.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/ipc.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-personality-linux/src/ipc/namespace.rs", contract = "kernel.ipc.permission-classes" },
+  { path = "crates/carrick-personality-linux/src/lifecycle.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/lifecycle.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-personality-linux/src/lifecycle.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-personality-linux/src/lifecycle.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-personality-linux/src/native_host_file.rs", contract = "kernel.native.host-file-venue" },
+  { path = "crates/carrick-personality-linux/src/native_host_file/tests.rs", contract = "kernel.native.host-file-venue" },
+  { path = "crates/carrick-personality-linux/src/pending_anonymous.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/pending_anonymous.rs", contract = "kernel.el1.anonymous-munmap" },
+  { path = "crates/carrick-personality-linux/src/pending_anonymous.rs", contract = "kernel.el1.anonymous-permissions" },
+  { path = "crates/carrick-personality-linux/src/pending_anonymous.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-personality-linux/src/pending_file.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/pending_file.rs", contract = "kernel.el1.files" },
+  { path = "crates/carrick-personality-linux/src/pending_file.rs", contract = "kernel.el1.inotify" },
+  { path = "crates/carrick-personality-linux/src/sched.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/src/sched.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-personality-linux/src/signal.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-personality-linux/src/signal/arm.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-personality-linux/src/sysinfo.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-personality-linux/tests/futex_policy.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/tests/futex_policy.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-personality-linux/tests/signal_policy_contract.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-personality-linux/tests/x86_process_route.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/tests/x86_process_route.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-personality-linux/tests/x86_wave2.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/tests/x86_wave2/common_entry.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/tests/x86_wave2/common_entry.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-personality-linux/tests/x86_wave2/dispatch.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-personality-linux/tests/x86_wave2/dispatch.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-personality-linux/tests/x86_wave2/dispatch.rs", contract = "kernel.el1.files" },
+  { path = "crates/carrick-personality-linux/tests/x86_wave2/dispatch.rs", contract = "kernel.el1.inotify" },
+  { path = "crates/carrick-runtime/src/carrier.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-runtime/src/hvpatch/asid.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-runtime/src/hvpatch/mod.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-runtime/src/hvpatch/stage1_mm.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-runtime/src/lib.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/runtime.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-runtime/src/runtime/exec.rs", contract = "process.exec.files" },
+  { path = "crates/carrick-runtime/src/test_hooks.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/binding.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/binding.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/binding.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/binding.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/binding.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/binding.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/binding.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/crash.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/exec.rs", contract = "kernel.el1.task-load-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs", contract = "kernel.el1.files.cross-process-readers" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs", contract = "kernel.el1.task-load-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/binding.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs", contract = "kernel.scheduler.host-wait-handoff" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs", contract = "kernel.signal.temporary-wait-mask" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/residency.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/residency.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/settlement.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/shutdown_loom.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory.rs", contract = "kernel.mm.native-code-drain" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs", contract = "kernel.mm.current-read-reuse" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs", contract = "kernel.mm.native-syscall-buffers" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs", contract = "kernel.execution.native-code-density" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs", contract = "kernel.execution.native-data-demand" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs", contract = "kernel.mm.native-data-activation" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs", contract = "kernel.mm.native-execution-scope" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/mod.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/mod.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/mod.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/mod.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/mod.rs", contract = "kernel.signal.temporary-wait-mask" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/owner_wait.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/owner_wait_loom.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/quiesce.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/quiesce.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/signal.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/signal.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/signal_ingress_producer.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/thread_adoption.rs", contract = "kernel.el1.task-load-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/threads.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/threads.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs", contract = "kernel.wait.child-exit-notification-lifecycle" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/zone.rs", contract = "kernel.copyout.owner-refusal" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/zone.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/zone.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/zone.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/zone.rs", contract = "kernel.fs.directory-copyout" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/zone.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/zone.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-runtime/src/vcpu_loop/zone_affinity_tests.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-runtime/tools/vdso_fns.s", contract = "kernel.time.coarse-clock-vdso" },
+  { path = "crates/carrick-sched-core/src/aarch64_context.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/affinity.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-sched-core/src/affinity_source.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "kernel.el1.deferred-handback-identity" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-sched-core/src/lib.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-sched-core/src/loom_models.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/object_wait.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-sched-core/src/occupancy.rs", contract = "kernel.el1.address-space-switch" },
+  { path = "crates/carrick-sched-core/src/occupancy.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-sched-core/src/process.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/process.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-sched-core/src/process.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-sched-core/src/process.rs", contract = "process.exec.custody" },
+  { path = "crates/carrick-sched-core/src/process/birth.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/process/context.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/process/exec.rs", contract = "process.exec.custody" },
+  { path = "crates/carrick-sched-core/src/process/exit.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/process/exit.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-sched-core/src/process/exit.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-sched-core/src/process/exit_tests.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/process/exit_tests.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-sched-core/src/process/exit_tests.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-sched-core/src/process/identity_allocator.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/process/registry.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/process/registry.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-sched-core/src/process/registry.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-sched-core/src/process/wait.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-sched-core/src/process/wait.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-sched-core/src/process/wait_tests.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-sched-core/src/process/wait_tests.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-sched-core/src/spaces.rs", contract = "kernel.el1.address-space-switch" },
+  { path = "crates/carrick-sched-core/src/spaces.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.deferred-handback-identity" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.ipc-two-process" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "process.native.short-lock" },
+  { path = "crates/carrick-sched-core/src/tests.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-sched-core/src/timer_index.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-signal-core/src/policy.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-signal-core/src/wait.rs", contract = "kernel.signal.socket-restart" },
+  { path = "crates/carrick-signal-linux/src/fork_reset.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-signal-linux/src/lib.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-softcpu-x86/src/block.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softcpu-x86/src/cflow.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softcpu-x86/src/context.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-softcpu-x86/src/context.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softcpu-x86/src/cpu.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-softcpu-x86/src/cpu.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softcpu-x86/src/decode.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softcpu-x86/src/emit.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softcpu-x86/src/lib.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softcpu-x86/src/mmu.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-softcpu-x86/src/mmu.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softcpu-x86/tests/softcpu_level0.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-softcpu-x86/tests/softcpu_level0.rs", contract = "x86.softcpu.level0" },
+  { path = "crates/carrick-softmmu/src/domains.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-softmmu/src/domains.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-softmmu/src/lib.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-softmmu/src/lib.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-softmmu/src/placement.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-softmmu/src/retirement.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-softmmu/src/tlb.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-softmmu/src/walker.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-softmmu/src/walker.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-softmmu/test-support/retirement_unit.rs", contract = "softmmu.x86.physical-retirement" },
+  { path = "crates/carrick-softmmu/tests/softmmu_contract.rs", contract = "softmmu.x86.tlb-walker" },
+  { path = "crates/carrick-syscall-abi/src/capability.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-syscall-abi/src/errno.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-syscall-abi/src/ipc.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-syscall-abi/src/lib.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-syscall-abi/src/signal.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-syscall-abi/src/stat.rs", contract = "kernel.native.host-file-venue" },
+  { path = "crates/carrick-thread/src/fork_quiesce.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-thread/src/physical_grant.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-thread/src/physical_retirement.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-thread/src/platform_futex.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-thread/src/platform_futex.rs", contract = "kernel.futex.requeue" },
+  { path = "crates/carrick-thread/src/thread.rs", contract = "kernel.futex.contention" },
+  { path = "crates/carrick-thread/src/thread.rs", contract = "kernel.futex.requeue" },
+  { path = "crates/carrick-timer-core/src/gate.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-timer-core/src/itimer.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-timer-core/src/lib.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-vfs/src/vfs/rootfs.rs", contract = "kernel.inotify.mark-race-hotpath" },
+  { path = "crates/carrick-vfs/src/vfs/rootfs.rs", contract = "kernel.inotify.watch" },
+  { path = "crates/carrick-vfs/src/vfs/rootfs.rs", contract = "kernel.vfs.host-namespace-mutation-work" },
+  { path = "crates/carrick-vmm-bhyve/src/bhyve_x86_engine.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-vmm-hvf/src/fork_stock.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-vmm-hvf/src/fork_stock.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-vmm-hvf/src/fork_stock.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-vmm-hvf/src/fork_stock.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-vmm-hvf/src/fork_stock.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-vmm-hvf/src/gic.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-vmm-hvf/src/hatch.rs", contract = "kernel.el1.arm-ring-first-crossing" },
+  { path = "crates/carrick-vmm-hvf/src/host_signal.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.transport.exit-overhead" },
+  { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-vmm-hvf/src/itimer.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-vmm-hvf/src/metadata_grant.rs", contract = "kernel.el1.metadata-allocation" },
+  { path = "crates/carrick-vmm-hvf/src/metadata_grant.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-vmm-hvf/src/metadata_grant.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-vmm-hvf/src/metadata_grant.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs", contract = "kernel.scheduler.runnable-progress" },
+  { path = "crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs", contract = "process.exec.custody" },
+  { path = "crates/carrick-vmm-hvf/src/staged_cpu.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-vmm-hvf/src/syscall_mailbox.rs", contract = "hvpatch.syscall.portal" },
+  { path = "crates/carrick-vmm-hvf/src/syscall_mailbox.rs", contract = "kernel.el1.files.cross-process-readers" },
+  { path = "crates/carrick-vmm-hvf/src/syscall_mailbox.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-vmm-hvf/src/timer_delivery.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "kernel.transport.exit-overhead" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-vmm-hvf/src/trap.rs", contract = "process.native.arm-admission" },
+  { path = "crates/carrick-vmm-hvf/src/trap/admission_retry.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-vmm-hvf/src/trap/admission_retry.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-vmm-hvf/src/trap/code_content.rs", contract = "kernel.memory.owner-wait" },
+  { path = "crates/carrick-vmm-hvf/src/trap/code_content.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-vmm-hvf/src/trap/code_content.rs", contract = "kernel.mm.native-code-drain" },
+  { path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs", contract = "kernel.fork.mappings" },
+  { path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs", contract = "kernel.mm.backing-maintenance-lookup" },
+  { path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs", contract = "kernel.mm.metadata-refusal" },
+  { path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-vmm-hvf/src/trap/cow_engine.rs", contract = "kernel.time.realtime-calibration" },
+  { path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs", contract = "kernel.exec.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs", contract = "kernel.mm.carrier-window-isolation" },
+  { path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs", contract = "kernel.mm.exec-heap-window" },
+  { path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs", contract = "process.exec.backing" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs", contract = "kernel.mm.current-read-reuse" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs", contract = "kernel.mm.native-code-drain" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/current_read.rs", contract = "kernel.mm.current-read-reuse" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs", contract = "kernel.mm.native-code-drain" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs", contract = "kernel.mm.backing-maintenance-lookup" },
+  { path = "crates/carrick-vmm-hvf/src/trap/frame_inventory/tests.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-vmm-hvf/src/trap/global_frame/grant_ledger.rs", contract = "kernel.mm.native-code-content" },
+  { path = "crates/carrick-vmm-hvf/src/trap/global_frame/grant_ledger.rs", contract = "process.native.terminal-child" },
+  { path = "crates/carrick-vmm-hvf/src/trap/guest_alias.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs", contract = "kernel.mm.backing-maintenance-lookup" },
+  { path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-vmm-hvf/src/trap/host_writes.rs", contract = "kernel.mm.syscall-code-write" },
+  { path = "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-vmm-hvf/src/trap/memory_protection.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/memory_protection.rs", contract = "kernel.mm.backing-maintenance-lookup" },
+  { path = "crates/carrick-vmm-hvf/src/trap/memory_protection/tests/maintenance_lookup_budget.rs", contract = "kernel.mm.backing-maintenance-lookup" },
+  { path = "crates/carrick-vmm-hvf/src/trap/owner_fork.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/persistent_executor.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-vmm-hvf/src/trap/process_plan.rs", contract = "kernel.fork.mappings" },
+  { path = "crates/carrick-vmm-hvf/src/trap/process_plan.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/process_plan.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs", contract = "kernel.el1.stage1-publication" },
+  { path = "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs", contract = "kernel.mm.image-page-permissions" },
+  { path = "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs", contract = "process.exec.backing" },
+  { path = "crates/carrick-vmm-hvf/src/trap/task_mapping_index.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-hvf/src/trap/task_mapping_index.rs", contract = "kernel.mm.backing-maintenance-lookup" },
+  { path = "crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs", contract = "kernel.el1.gic" },
+  { path = "crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-vmm-hvf/src/trap/vcpu_topology.rs", contract = "kernel.vcpu.vm-lifetime" },
+  { path = "crates/carrick-vmm-hvf/src/vcpu_kick.rs", contract = "kernel.timer.delivery-gate" },
+  { path = "crates/carrick-vmm-hvf/tests/support/shutdown_kick.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-vmm-kvm/src/carrier_cpu.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-vmm-kvm/src/carrier_cpu.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-vmm-kvm/src/carrier_memory.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-vmm-kvm/src/carrier_memory/tests.rs", contract = "kernel.el1.elastic-frame-extents" },
+  { path = "crates/carrick-vmm-kvm/src/carrier_memory/tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-vmm-kvm/src/carrier_memory/tests.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-vmm-kvm/src/cpl0_boot.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-vmm-kvm/src/cpl0_boot.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-vmm-kvm/src/guest_setup.rs", contract = "kernel.fork.stage1-image" },
+  { path = "crates/carrick-vmm-kvm/src/kvm_x86_engine.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_entry.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_entry.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_fork_e2e.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_fork_e2e.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_fork_e2e.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_initial_mm.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_initial_mm.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_initial_mm.rs", contract = "x86.mm.initial-image" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_shared_entry.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_shared_entry.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_shared_entry.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-vmm-kvm/tests/cpl0_shared_entry.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-vmm-kvm/tests/fixtures/native_file_fork.S", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs", contract = "x86.run-elf.poll" },
+  { path = "crates/carrick-vmm-nvmm/src/nvmm_x86_engine.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-x86-carrier/src/entry.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-carrier/src/lib.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-carrier/src/native_execution.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-carrier/src/personality.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-carrier/src/table_span.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-cpl0-host/src/carrier_cpu.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-x86-cpl0-host/src/carrier_cpu.rs", contract = "kernel.vcpu.shutdown-entry" },
+  { path = "crates/carrick-x86-cpl0-host/src/carrier_memory.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86-cpl0-host/src/carrier_memory/test_support.rs", contract = "kernel.el1.elastic-frame-extents" },
+  { path = "crates/carrick-x86-cpl0-host/src/carrier_memory/test_support.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-x86-cpl0-host/src/carrier_memory/test_support.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86-cpl0-host/src/carrier_memory/tests.rs", contract = "kernel.el1.elastic-frame-extents" },
+  { path = "crates/carrick-x86-cpl0-host/src/carrier_memory/tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-x86-cpl0-host/src/cpl0_anonymous.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-x86-cpl0-host/src/cpl0_anonymous.rs", contract = "kernel.el1.elastic-frame-extents" },
+  { path = "crates/carrick-x86-cpl0-host/src/cpl0_anonymous.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-x86-cpl0-host/src/cpl0_boot.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86-cpl0-host/src/cpl0_private_witness.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-x86-cpl0-host/src/guest_ram.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "crates/carrick-x86-cpl0-host/src/lib.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86-cpl0/src/anonymous.rs", contract = "kernel.el1.anonymous-reservations" },
+  { path = "crates/carrick-x86-cpl0/src/anonymous.rs", contract = "kernel.el1.elastic-frame-extents" },
+  { path = "crates/carrick-x86-cpl0/src/anonymous.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-x86-cpl0/src/fixture_personality.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-cpl0/src/fixture_personality.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86-cpl0/src/lib.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-cpl0/src/lib.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86-cpl0/src/linux_personality.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-cpl0/src/linux_personality.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-x86-cpl0/src/linux_personality.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86-cpl0/src/native_execution.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-cpl0/src/native_execution.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "core.entry.completion" },
+  { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.el1.thread-lifecycle" },
+  { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.wait.child-rusage" },
+  { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.wait.process-group" },
+  { path = "crates/carrick-x86-cpl0/src/native_process.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86-cpl0/src/process.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-x86-cpl0/src/process.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-x86-cpl0/tests/file_region.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86/src/bringup_fns.rs", contract = "x86.run-elf.poll" },
+  { path = "crates/carrick-x86/src/bringup_fns.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-x86/src/bringup_fns/poll_tests.rs", contract = "x86.run-elf.poll" },
+  { path = "crates/carrick-x86/src/cpl0_entry.rs", contract = "kernel.x86.file-region" },
+  { path = "crates/carrick-x86/src/engine.rs", contract = "kernel.el1.signal-delivery-owner" },
+  { path = "crates/carrick-x86/src/fault.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-x86/src/segments.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-x86/src/vmm.rs", contract = "x86.vmx.segment-entry" },
+  { path = "crates/carrick-xtask/src/host_lease.rs", contract = "host.lease.workload-lifetime" },
+  { path = "crates/carrick-xtask/src/lease_supervisor.rs", contract = "host.lease.workload-lifetime" },
+  { path = "crates/carrick-xtask/src/lease_supervisor/macos_scope.rs", contract = "host.lease.workload-lifetime" },
+  { path = "crates/carrick-xtask/tests/host_lease.rs", contract = "host.lease.workload-lifetime" },
+  { path = "experiments/native-syscall-slice/src/compact_tests.rs", contract = "kernel.execution.native-code-density" },
+  { path = "experiments/native-syscall-slice/src/compact_tests.rs", contract = "kernel.execution.native-synchronous-syscall" },
+  { path = "experiments/native-syscall-slice/src/lib.rs", contract = "kernel.execution.native-code-density" },
+  { path = "experiments/native-syscall-slice/src/lib.rs", contract = "kernel.execution.native-data-demand" },
+  { path = "experiments/native-syscall-slice/src/lib.rs", contract = "kernel.execution.native-synchronous-syscall" },
+  { path = "experiments/native-syscall-slice/src/native.rs", contract = "kernel.execution.native-code-density" },
+  { path = "experiments/native-syscall-slice/src/native.rs", contract = "kernel.execution.native-data-demand" },
+  { path = "experiments/native-syscall-slice/src/native.rs", contract = "kernel.execution.native-synchronous-syscall" },
+  { path = "experiments/native-syscall-slice/src/native/compact.rs", contract = "kernel.execution.native-code-density" },
+  { path = "experiments/native-syscall-slice/src/native/compact.rs", contract = "kernel.execution.native-synchronous-syscall" },
+  { path = "fixtures/embed-el1-sched/src/host_read_gate.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "fixtures/embed-el1-sched/src/main.rs", contract = "kernel.el1.anonymous-first-touch" },
+  { path = "fixtures/embed-el1-sched/src/main.rs", contract = "kernel.el1.fault-entry" },
+  { path = "fixtures/embed-el1-sched/src/main.rs", contract = "kernel.el1.futex-handoff" },
+  { path = "fixtures/embed-el1-sched/src/main.rs", contract = "kernel.el1.guest-run-queue" },
+  { path = "fixtures/embed-el1-sched/src/main.rs", contract = "kernel.el1.guest-scheduler" },
+  { path = "fixtures/embed-el1-sched/src/main.rs", contract = "kernel.el1.metadata-allocation" },
+  { path = "fixtures/embed-el1-sched/src/main.rs", contract = "kernel.mm.address-space-occupancy" },
+  { path = "fixtures/embed-zone-readers/src/main.rs", contract = "kernel.el1.files.cross-process-readers" },
+  { path = "fixtures/linux-aarch64-hello/src/coarse_clock_vdso.rs", contract = "kernel.time.coarse-clock-vdso" },
+  { path = "fixtures/linux-aarch64-hello/src/el0_id_view.rs", contract = "kernel.el1.gic" },
+  { path = "fixtures/linux-aarch64-hello/src/el1_served_loop_kick.rs", contract = "kernel.vcpu.kick-el0-boundary" },
+  { path = "fixtures/linux-aarch64-hello/src/el1_vtimer_loop.rs", contract = "kernel.el1.gic" },
+  { path = "fixtures/linux-aarch64-hello/src/scheduler_preemption.rs", contract = "kernel.scheduler.preemption-cost" },
+  { path = "fixtures/linux-aarch64-hello/src/scheduler_preemption.rs", contract = "kernel.scheduler.preemption-lifecycle" },
+  { path = "fixtures/linux-aarch64-hello/src/scheduler_preemption.rs", contract = "kernel.scheduler.runnable-progress" },
 ]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/notify.rs"
-contracts = [
-  "kernel.inotify.watch",
-  "kernel.inotify.readiness",
-  "kernel.inotify.mark-race-hotpath",
-  "kernel.el1.ipc-fd-authority",
-]
-
-[[surfaces]]
-path = "crates/carrick-vfs/src/vfs/rootfs.rs"
-contracts = ["kernel.inotify.watch", "kernel.inotify.mark-race-hotpath", "kernel.vfs.host-namespace-mutation-work"]
-
-[[surfaces]]
-path = "conformance-probes/src/bin/perf_inotify09_scale.rs"
-contracts = ["kernel.inotify.mark-race-hotpath"]
-
-[[surfaces]]
-path = "crates/carrick-embed/src/contracts/inotify_hotpath.rs"
-contracts = ["kernel.inotify.mark-race-hotpath"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/inotify_hotpath_contract.rs"
-contracts = ["kernel.inotify.mark-race-hotpath"]
-
-[[surfaces]]
-path = "conformance-probes/src/bin/inotifymatrix.rs"
-contracts = ["kernel.inotify.watch"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/semantics/inotify_watch.rs"
-contracts = ["kernel.inotify.watch"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fd_table.rs"
-contracts = ["kernel.inotify.readiness", "kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs"
-contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.preemption-lifecycle", "kernel.el1.guest-run-queue"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/scheduler.rs"
-contracts = [
-  "kernel.el1.ipc-two-process",
-  "kernel.vcpu.shutdown-entry",
-  "kernel.scheduler.host-wait-handoff",
-  "kernel.scheduler.runnable-progress",
-  "kernel.scheduler.preemption-lifecycle",
-  "kernel.scheduler.preemption-cost",
-  "kernel.el1.guest-run-queue",
-]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/scheduler/preemption.rs"
-contracts = [
-  "kernel.scheduler.runnable-progress",
-  "kernel.scheduler.preemption-lifecycle",
-  "kernel.scheduler.preemption-cost",
-]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/scheduler_preemption.rs"
-contracts = [
-  "kernel.scheduler.runnable-progress",
-  "kernel.scheduler.preemption-lifecycle",
-  "kernel.scheduler.preemption-cost",
-]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/host_io.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/net/epoll_ops/write_rearm.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/io_pipe.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/scheduler_handoff.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/host_wait_cancellation.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/stdio_host_wait_contention.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/stdio_inherited_backpressure.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/host_wait_policy.rs"
-contracts = ["kernel.scheduler.host-wait-handoff", "kernel.el1.guest-run-queue"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/scheduler_preemption.rs"
-contracts = [
-  "kernel.scheduler.runnable-progress",
-  "kernel.scheduler.preemption-lifecycle",
-  "kernel.scheduler.preemption-cost",
-]
-
-[[surfaces]]
-path = "fixtures/linux-aarch64-hello/src/scheduler_preemption.rs"
-contracts = [
-  "kernel.scheduler.runnable-progress",
-  "kernel.scheduler.preemption-lifecycle",
-  "kernel.scheduler.preemption-cost",
-]
-
-[[surfaces]]
-path = "experiments/native-syscall-slice/src/native.rs"
-contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_floor.rs"
-contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.mm.native-execution-scope", "kernel.mm.native-data-activation"]
-
-[[surfaces]]
-path = "experiments/native-syscall-slice/src/native/compact.rs"
-contracts = ["kernel.execution.native-code-density", "kernel.execution.native-synchronous-syscall"]
-
-[[surfaces]]
-path = "experiments/native-syscall-slice/src/compact_tests.rs"
-contracts = ["kernel.execution.native-code-density", "kernel.execution.native-synchronous-syscall"]
-
-[[surfaces]]
-path = "experiments/native-syscall-slice/src/lib.rs"
-contracts = ["kernel.execution.native-code-density", "kernel.execution.native-data-demand", "kernel.execution.native-synchronous-syscall"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/code_content.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs"
-contracts = ["kernel.mm.native-code-content", "kernel.el1.anonymous-reservations"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/global_frame/grant_ledger.rs"
-contracts = ["kernel.mm.native-code-content", "process.native.terminal-child"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs"
-contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain", "kernel.mm.current-read-reuse", "kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/instruction_read.rs"
-contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs"
-contracts = ["kernel.mm.native-code-content", "kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/owner_fork.rs"
-contracts = ["kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/frame_inventory/tests.rs"
-contracts = ["kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/foreign_mm.rs"
-contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/mm_access.rs"
-contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/memory.rs"
-contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain", "kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/signal.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-thread/src/physical_grant.rs"
-contracts = ["kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/host_writes.rs"
-contracts = ["kernel.mm.syscall-code-write"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests/syscall_writes.rs"
-contracts = ["kernel.mm.syscall-code-write"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/tests/integration/syscall_fs_rw.rs"
-contracts = ["kernel.mm.syscall-code-write"]
-
-[[surfaces]]
-path = "crates/carrick-guest-mem/src/lib.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.mm.private-file-fixed-replacement"]
-
-[[surfaces]]
-path = "crates/carrick-aarch64/src/vmm.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "process.native.arm-admission"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.mm.backing-maintenance-lookup"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/rw.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fs.lseek-sparse", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/tests.rs"
-contracts = ["kernel.mm.syscall-code-write"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/net/send_recv.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.signal.socket-restart", "kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/runtime.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.el1.gic"]
-
-[[surfaces]]
-path = "crates/carrick-conformance-next/tests/syscall_write_destinations.rs"
-contracts = ["kernel.mm.syscall-code-write"]
-
-[[surfaces]]
-path = "crates/carrick-conformance-next/tests/fixtures/syscall_write_destinations.py"
-contracts = ["kernel.mm.syscall-code-write"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/mm_access/instruction_content.rs"
-contracts = ["kernel.mm.native-code-drain"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/native_execution.rs"
-contracts = ["kernel.mm.native-code-drain"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/semantics/pgrp.rs"
-contracts = ["kernel.wait.process-group"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.files.cross-process-readers", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.task-load-entry", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "fixtures/embed-zone-readers/src/main.rs"
-contracts = ["kernel.el1.files.cross-process-readers"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/frame_inventory.rs"
-contracts = ["kernel.mm.backing-maintenance-lookup"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/memory_protection/tests/maintenance_lookup_budget.rs"
-contracts = ["kernel.mm.backing-maintenance-lookup"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/mm_quiesce.rs"
-contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/mm_mutation.rs"
-contracts = ["kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/mm_occupancy.rs"
-contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.mm.address-space-occupancy", "kernel.mm.executor-admission", "kernel.el1.address-space-switch", "kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/mm_occupancy/tests.rs"
-contracts = ["kernel.mm.address-space-occupancy", "kernel.mm.executor-admission", "kernel.el1.address-space-switch", "kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/occupancy.rs"
-contracts = ["kernel.mm.address-space-occupancy", "kernel.el1.address-space-switch"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/spaces.rs"
-contracts = ["kernel.el1.address-space-switch", "kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/threaded.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.mm.pt-pause-drain-acknowledgement", "kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/birth_serial.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle", "core.lifecycle.publication", "kernel.el1.address-space-switch"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/mem.rs"
-contracts = ["kernel.el1.stage1-publication", "kernel.mm.user-va-ceiling"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/mem/fault.rs"
-contracts = ["kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-aarch64/src/owed_kick.rs"
-contracts = ["kernel.vcpu.kick-el0-boundary"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/pt_pause_drain_pressure.rs"
-contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.vcpu.kick-el0-boundary"]
-
-[[surfaces]]
-path = "crates/carrick-mem/src/memory/el1_hook_kick.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/el1_kick_served_loop.rs"
-contracts = ["kernel.vcpu.kick-el0-boundary"]
-
-[[surfaces]]
-path = "fixtures/linux-aarch64-hello/src/el1_served_loop_kick.rs"
-contracts = ["kernel.vcpu.kick-el0-boundary"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/staged_cpu.rs"
-contracts = ["kernel.vcpu.vm-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/vcpu_topology.rs"
-contracts = ["kernel.vcpu.vm-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs"
-contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.gic"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/admission_retry.rs"
-contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.gic"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs"
-contracts = ["kernel.vcpu.vm-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs"
-contracts = ["kernel.vcpu.vm-lifetime", "process.native.terminal-child"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor.rs"
-contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs"
-contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.scheduler.runnable-progress", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs"
-contracts = ["kernel.el1.guest-run-queue", "kernel.scheduler.host-wait-handoff", "kernel.signal.temporary-wait-mask", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/el1_vcpu_lifetime.rs"
-contracts = ["kernel.vcpu.vm-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/gic.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/el1_gic.rs"
-contracts = ["kernel.el1.gic"]
-
-[[surfaces]]
-path = "fixtures/linux-aarch64-hello/src/el0_id_view.rs"
-contracts = ["kernel.el1.gic"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs"
-contracts = ["kernel.el1.gic", "process.exec.backing"]
-
-[[surfaces]]
-path = "crates/carrick-el1-control-abi/src/lib.rs"
-contracts = ["kernel.el1.metadata-allocation"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/lib.rs"
-contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.stage1-publication", "process.native.terminal-child", "kernel.el1.open-lifetime", "kernel.x86.file-region", "kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/entry.rs"
-contracts = ["kernel.el1.fault-entry", "kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/fault.rs"
-contracts = ["kernel.el1.fault-entry", "kernel.el1.stage1-publication"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/cow/test_support.rs"
-contracts = ["kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/cow_resolver.rs"
-contracts = ["kernel.el1.fault-entry", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/alloc.rs"
-contracts = ["kernel.el1.metadata-allocation", "process.native.short-lock"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/metadata_grant.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.metadata-allocation", "process.native.terminal-child", "process.native.arm-admission"]
-
-[[surfaces]]
-path = "fixtures/linux-aarch64-hello/src/el1_vtimer_loop.rs"
-contracts = ["kernel.el1.gic"]
-
-[[surfaces]]
-path = "crates/carrick-mem/src/memory/el1_clock.rs"
-contracts = ["kernel.el1.gic"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/lib.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity", "process.native.short-lock", "process.native.terminal-child", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/tests.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.el1.thread-lifecycle", "kernel.el1.deferred-handback-identity", "process.native.short-lock", "kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.terminal-child"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/sched.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.short-lock"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/sched/hw.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/sched/tests.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/el1_zone.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/zone.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/el1_sched.rs"
-contracts = ["kernel.el1.epoll-zone", "kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.anonymous-reservations", "kernel.el1.fork-cow", "kernel.el1.ipc-two-process", "kernel.el1.delegated-root-fork", "kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/sigframe.rs"
-contracts = ["kernel.el1.guest-scheduler"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/aarch64_arch.rs"
-contracts = ["kernel.el1.guest-scheduler", "kernel.mm.user-va-ceiling"]
-
-[[surfaces]]
-path = "fixtures/embed-el1-sched/src/main.rs"
-contracts = ["kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/asid.rs"
-contracts = ["kernel.mm.address-space-occupancy"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/hvpatch/asid.rs"
-contracts = ["kernel.mm.address-space-occupancy"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/hvpatch/stage1_mm.rs"
-contracts = ["kernel.mm.address-space-occupancy"]
-
-[[surfaces]]
-path = "crates/carrick-thread/src/fork_quiesce.rs"
-contracts = ["kernel.mm.address-space-occupancy"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/crash.rs"
-contracts = ["kernel.mm.address-space-occupancy"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/current_read.rs"
-contracts = ["kernel.mm.current-read-reuse"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/memory/tests/native_buffers.rs"
-contracts = ["kernel.mm.current-read-reuse", "kernel.mm.native-syscall-buffers", "kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/objects/thread.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.deferred-handback-identity", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/continuation/wait_service.rs"
-contracts = ["kernel.el1.deferred-handback-identity", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/format_time.rs"
-contracts = ["kernel.time.coarse-clock-vdso"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs"
-contracts = ["kernel.mm.exec-heap-window", "kernel.exec.stage1-image", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.exec.backing"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/exec.rs"
-contracts = ["kernel.el1.task-load-entry"]
-
-[[surfaces]]
-path = "crates/carrick-mem/src/elf.rs"
-contracts = ["kernel.mm.image-page-permissions"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/trap/guest_alias.rs"
-contracts = ["kernel.mm.image-page-permissions"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/mod.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.mm.image-page-permissions", "kernel.signal.temporary-wait-mask", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/hvpatch/mod.rs"
-contracts = ["kernel.mm.carrier-window-isolation"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/identity_page.rs"
-contracts = ["kernel.mm.carrier-window-isolation", "kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-fd-core/src/tests.rs"
-contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority", "core.personality.handle-table"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/objects/ipc.rs"
-contracts = ["kernel.el1.fd-single-owner", "kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/file_table.rs"
-contracts = ["kernel.x86.file-region", "kernel.el1.files", "kernel.el1.fd-single-owner", "kernel.el1.open-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-x86/src/bringup_fns.rs"
-contracts = ["x86.run-elf.poll", "x86.vmx.segment-entry"]
-
-[[surfaces]]
-path = "crates/carrick-x86/src/bringup_fns/poll_tests.rs"
-contracts = ["x86.run-elf.poll"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs"
-contracts = ["kernel.net.connect-wake-scope"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests/loom_models.rs"
-contracts = ["kernel.net.connect-wake-scope"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs"
-contracts = ["x86.run-elf.poll"]
-
-[[surfaces]]
-path = "crates/carrick-mem/src/x86_initial_image.rs"
-contracts = ["x86.mm.initial-image"]
-
-[[surfaces]]
-path = "crates/carrick-mem/tests/x86_initial_image.rs"
-contracts = ["x86.mm.initial-image"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/isa/x86/initial_mm.rs"
-contracts = ["x86.mm.initial-image"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/tests/cpl0_initial_mm.rs"
-contracts = ["kernel.x86.file-region", "x86.mm.initial-image", "core.entry.completion"]
-
-# Fixture-only injection ownership for executor activation and rollback tests.
-[[surfaces]]
-path = "crates/carrick-runtime/src/test_hooks.rs"
-contracts = ["kernel.vcpu.vm-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-timer-core/src/gate.rs"
-contracts = ["kernel.timer.delivery-gate"]
-
-[[surfaces]]
-path = "crates/carrick-timer-core/src/itimer.rs"
-contracts = ["kernel.timer.delivery-gate"]
-
-[[surfaces]]
-path = "crates/carrick-timer-core/src/lib.rs"
-contracts = ["kernel.timer.delivery-gate"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/guest_timer_bridge.rs"
-contracts = ["kernel.timer.delivery-gate"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/posix_timer.rs"
-contracts = ["kernel.timer.delivery-gate"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/timer_delivery.rs"
-contracts = ["kernel.timer.delivery-gate", "kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/itimer.rs"
-contracts = ["kernel.timer.delivery-gate"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/timer_delivery.rs"
-contracts = ["kernel.timer.delivery-gate"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/vcpu_kick.rs"
-contracts = ["kernel.timer.delivery-gate"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/posix_signal_kick.rs"
-contracts = ["kernel.timer.delivery-gate"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_ownership_tests.rs"
-contracts = ["kernel.el1.mm-exclusive-owner"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/mm_portal/mod.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/mm_portal/tests.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
-
-# Order 5 moves entry ownership once; pending family hooks retain their existing
-# semantic contracts alongside the shared admission/completion contract.
-[[surfaces]]
-path = "crates/carrick-core/src/entry.rs"
-contracts = ["core.entry.completion", "process.native.short-lock", "process.native.terminal-child", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/entry.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-personality-api/src/lib.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/entry.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/arch_prctl.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-syscall-abi/src/lib.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-abi/src/x86_syscall_crosscheck.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/abi/entry.rs"
-contracts = ["core.entry.completion", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/abi/mod.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/dispatch.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/sched.rs"
-contracts = ["core.entry.completion", "kernel.el1.futex-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/lifecycle.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.scheduler.runnable-progress", "core.entry.completion", "kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/pending_file.rs"
-contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/pending_anonymous.rs"
-contracts = ["core.entry.completion", "kernel.el1.anonymous-reservations", "kernel.el1.anonymous-permissions", "kernel.el1.anonymous-munmap"]
-
-[[surfaces]]
-path = "crates/carrick-core/tests/entry_completion.rs"
-contracts = ["core.entry.completion", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/stack_overflow.rs"
-contracts = ["kernel.el1.fault-entry"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/entry_binding_fatal.rs"
-contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/tests/futex_policy.rs"
-contracts = ["core.entry.completion", "kernel.el1.futex-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/tests/x86_wave2.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/tests/x86_wave2/common_entry.rs"
-contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/tests/x86_wave2/dispatch.rs"
-contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify", "kernel.el1.anonymous-reservations"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/tests/cpl0_entry.rs"
-contracts = ["core.entry.completion", "kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/tests/cpl0_shared_entry.rs"
-contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner", "kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/tests/x86_production_forward.rs"
-contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify", "kernel.el1.anonymous-reservations", "kernel.el1.futex-handoff"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0/src/lib.rs"
-contracts = ["core.entry.completion", "kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-x86-carrier/src/lib.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-x86-carrier/src/entry.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-x86-carrier/src/native_execution.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-x86-carrier/src/personality.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-x86-carrier/src/table_span.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0/src/linux_personality.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "core.entry.completion", "kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0/src/fixture_personality.rs"
-contracts = ["core.entry.completion", "kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-cli/tests/x86_kvm_run.rs"
-contracts = ["x86.carrier.cli-run"]
-
-# Linux pending-signal policy and its unchanged VM-free owner contracts.
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/signal.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/tests/signal_policy_contract.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-host-bsd/src/signal_backend.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/guest_arch.rs"
-contracts = ["kernel.mm.user-va-ceiling"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/x8664_arch.rs"
-contracts = ["kernel.mm.user-va-ceiling"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs"
-contracts = ["kernel.mm.user-va-ceiling", "kernel.mm.private-file-fixed-replacement", "kernel.mm.shared-file-reuse"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs"
-contracts = ["kernel.mm.user-va-ceiling", "kernel.mm.private-file-fixed-replacement"]
-
-# Native process custody and Linux identity/exit/wait policy retain the shared lifecycle contracts.
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/boot_launch.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_process_signals.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_process_entry.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_process_runtime.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child", "process.native.arm-admission", "kernel.copyout.owner-refusal", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_process_runtime/tests/terminal_park.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child", "process.native.arm-admission", "kernel.copyout.owner-refusal", "kernel.vcpu.shutdown-entry", "kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle", "kernel.copyout.owner-refusal", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/fork_loan.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/retired_spaces.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_process_custody.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/process_owner.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/process_owner_tests.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.exec.custody"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process/exec.rs"
-contracts = ["process.exec.custody"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/exec.rs"
-contracts = ["process.exec.custody"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process/identity_allocator.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process/registry.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/aarch64_context.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process/context.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process/birth.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process/exit.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process/exit_tests.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process/wait.rs"
-contracts = ["kernel.wait.process-group", "kernel.wait.child-rusage"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/process/wait_tests.rs"
-contracts = ["kernel.wait.process-group", "kernel.wait.child-rusage"]
-
-[[surfaces]]
-path = "crates/carrick-syscall-abi/src/errno.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0/src/native_process.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/aarch64_process.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_fork_refusal.rs"
-contracts = ["process.native.arm-admission"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_child_handoff_tests.rs"
-contracts = ["kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.arm-admission"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs"
-contracts = ["kernel.el1.fork-cow", "kernel.el1.mm-exclusive-owner", "process.native.terminal-child"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission", "kernel.el1.ipc-fd-authority", "kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0/src/native_execution.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/isa/x86/context_resume.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/src/carrier_cpu.rs"
-contracts = ["kernel.mm.address-space-occupancy", "x86.vmx.segment-entry"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/tests/x86_process_route.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
-
-# Native MM adapters supply descriptor and physical custody venues to the existing owner.
-
-[[surfaces]]
-path = "crates/carrick-mmu-core/src/live_descriptor_words.rs"
-contracts = ["kernel.el1.mm-exclusive-owner"]
-
-[[surfaces]]
-path = "crates/carrick-mmu-core/src/x86/copy_window.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/isa/x86/live_context.rs"
-contracts = ["kernel.el1.mm-exclusive-owner"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/isa/x86/fork_mm.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/fork.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-core/tests/aarch64_fork_geometry.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/fork/reservation.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/fork_stock.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "process.native.terminal-child", "process.native.arm-admission"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/fork_stock.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/fork_stock.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/fork_stock/tests.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/prepare_stock.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/kernel_fault_venues.rs"
-contracts = ["kernel.el1.mm-exclusive-owner"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0/src/process.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0/src/anonymous.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.el1.anonymous-reservations"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/cpl0_anonymous.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.el1.anonymous-reservations"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/cpl0_private_witness.rs"
-contracts = ["kernel.el1.mm-exclusive-owner"]
-
-[[surfaces]]
-path = "crates/carrick-core/tests/x86_acceleration.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.mm.address-space-occupancy"]
-
-[[surfaces]]
-path = "crates/carrick-core/tests/x86_acceleration/fork_cow.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-core/tests/x86_acceleration/compact_context.rs"
-contracts = ["kernel.el1.mm-exclusive-owner"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/tests/cpl0_fork_e2e.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/carrier_memory/tests.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/carrier_cpu.rs"
-contracts = ["kernel.mm.address-space-occupancy", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/carrier_memory.rs"
-contracts = ["kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/cpl0_boot.rs"
-contracts = ["kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/guest_ram.rs"
-contracts = ["kernel.mm.address-space-occupancy"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/lib.rs"
-contracts = ["kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/crossing.rs"
-contracts = ["kernel.el1.arm-ring-first-crossing"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/hatch.rs"
-contracts = ["kernel.el1.arm-ring-first-crossing"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_run_failure.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.arm-ring-first-crossing"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/identity/credential_tests.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/native_run_failure_tests.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-syscall-abi/src/capability.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/identity.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/sysinfo.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/native_run_failure.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.arm-ring-first-crossing"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/ipc.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-syscall-abi/src/ipc.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/hvpatch_probe_support/kernel_memory.rs"
-contracts = []
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/hvpatch_probe_support/mod.rs"
-contracts = []
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/hvpatch_probe_support/svc_tax.rs"
-contracts = []
-
-# Canonical signal records and architecture frames retain the shared delivery owner.
-[[surfaces]]
-path = "crates/carrick-syscall-abi/src/signal.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/abi/signal.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/arm_signal.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/signal/arm.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/x86_signal.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/signal_delivery.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/signal_ingress.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/signal_ingress_producer.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-signal-core/src/policy.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-# Concurrent owned deadlines belong to the shared guest scheduler.
-[[surfaces]]
-path = "crates/carrick-sched-core/src/timer_index.rs"
-contracts = ["kernel.el1.guest-run-queue"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/personality.rs"
-contracts = []
-
-[[surfaces]]
-path = "crates/carrick-core/src/terminal.rs"
-contracts = ["kernel.el1.thread-lifecycle", "process.native.terminal-child", "kernel.memory.owner-wait", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/src/personality.rs"
-contracts = []
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/seam_reserve_commit.rs"
-contracts = ["kernel.el1.anonymous-reservations", "kernel.el1.anonymous-munmap"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/personality_stack_arguments.rs"
-contracts = []
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/personality_user_copy.rs"
-contracts = []
-
-[[surfaces]]
-path = "crates/carrick-core/src/wait.rs"
-contracts = ["process.native.short-lock"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/ipc.rs"
-contracts = ["kernel.el1.ipc-two-process", "process.native.short-lock", "kernel.el1.ipc-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-x86/src/segments.rs"
-contracts = ["x86.vmx.segment-entry"]
-
-[[surfaces]]
-path = "crates/carrick-x86/src/vmm.rs"
-contracts = ["x86.vmx.segment-entry"]
-
-[[surfaces]]
-path = "crates/carrick-x86/src/fault.rs"
-contracts = ["x86.vmx.segment-entry"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/src/kvm_x86_engine.rs"
-contracts = ["x86.vmx.segment-entry"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/src/cpl0_boot.rs"
-contracts = ["x86.vmx.segment-entry", "kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-nvmm/src/nvmm_x86_engine.rs"
-contracts = ["x86.vmx.segment-entry"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs"
-contracts = ["x86.vmx.segment-entry"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-bhyve/src/bhyve_x86_engine.rs"
-contracts = ["x86.vmx.segment-entry"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/initial_boot.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/file.rs"
-contracts = ["core.personality.files"]
-
-[[surfaces]]
-path = "crates/carrick-personality-api/src/lib.rs"
-contracts = ["core.personality.files"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/executable_publication.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/isa/aarch64.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "process.native.terminal-child", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/internal_read.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/mm/transfer.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/transaction/owner.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
-
-[[surfaces]]
-path = "crates/carrick-aarch64/src/user_transfer/staging.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/open_lifetime.rs"
-contracts = ["kernel.el1.open-lifetime", "core.personality.files"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/el1_delegation.rs"
-contracts = ["kernel.el1.open-lifetime", "kernel.el1.files", "kernel.el1.files.shared-inode", "core.personality.files"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/el1_delegation/owned_recall.rs"
-contracts = ["kernel.el1.open-lifetime", "kernel.el1.files", "core.personality.files"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/file.rs"
-contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/file.rs"
-contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/substrate/mod.rs"
-contracts = ["core.personality.files"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/substrate/zone_file_service.rs"
-contracts = ["core.personality.files", "kernel.el1.open-lifetime"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/el1_delegation/owned_recall/zone_file_service_tests.rs"
-contracts = ["core.personality.files", "kernel.el1.open-lifetime", "kernel.el1.files"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/root_exit.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/root_exit_full_width.rs"
-contracts = ["core.entry.completion"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/dispatch.rs"
-contracts = ["kernel.el1.ipc-two-process", "process.native.arm-admission", "core.entry.completion", "core.personality.files", "kernel.el1.ipc-fd-authority", "process.exec.custody", "kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/trap.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.scheduler.runnable-progress", "process.native.arm-admission", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "process.native.arm-admission", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/file_region.rs"
-contracts = ["kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0/tests/file_region.rs"
-contracts = ["kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/src/carrier_memory.rs"
-contracts = ["kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-x86/src/cpl0_entry.rs"
-contracts = ["kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/tests/fixtures/native_file_fork.S"
-contracts = ["kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/trap.rs"
-contracts = ["kernel.x86.file-region", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/transaction/user_write.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
-
-[[surfaces]]
-path = "crates/carrick-softmmu/src/lib.rs"
-contracts = ["softmmu.x86.tlb-walker", "softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-softmmu/src/domains.rs"
-contracts = ["softmmu.x86.tlb-walker", "softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-softmmu/src/placement.rs"
-contracts = ["softmmu.x86.tlb-walker"]
-
-[[surfaces]]
-path = "crates/carrick-softmmu/src/tlb.rs"
-contracts = ["softmmu.x86.tlb-walker"]
-
-[[surfaces]]
-path = "crates/carrick-softmmu/src/walker.rs"
-contracts = ["softmmu.x86.tlb-walker", "softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-softmmu/src/retirement.rs"
-contracts = ["softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-softmmu/test-support/retirement_unit.rs"
-contracts = ["softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-softmmu/tests/softmmu_contract.rs"
-contracts = ["softmmu.x86.tlb-walker"]
-
-[[surfaces]]
-path = "crates/carrick-mmu-core/src/x86/descriptor_txn.rs"
-contracts = ["softmmu.x86.tlb-walker"]
-
-[[surfaces]]
-path = "crates/carrick-mmu-core/src/x86/descriptor_txn/tests.rs"
-contracts = ["softmmu.x86.tlb-walker"]
-
-[[surfaces]]
-path = "crates/carrick-softcpu-x86/src/lib.rs"
-contracts = ["x86.softcpu.level0"]
-
-[[surfaces]]
-path = "crates/carrick-softcpu-x86/src/mmu.rs"
-contracts = ["x86.softcpu.level0", "softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-softcpu-x86/src/decode.rs"
-contracts = ["x86.softcpu.level0"]
-
-[[surfaces]]
-path = "crates/carrick-softcpu-x86/src/block.rs"
-contracts = ["x86.softcpu.level0"]
-
-[[surfaces]]
-path = "crates/carrick-softcpu-x86/src/cflow.rs"
-contracts = ["x86.softcpu.level0"]
-
-[[surfaces]]
-path = "crates/carrick-softcpu-x86/src/context.rs"
-contracts = ["x86.softcpu.level0", "softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-softcpu-x86/src/emit.rs"
-contracts = ["x86.softcpu.level0"]
-
-[[surfaces]]
-path = "crates/carrick-softcpu-x86/src/cpu.rs"
-contracts = ["x86.softcpu.level0", "softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-softcpu-x86/tests/softcpu_level0.rs"
-contracts = ["x86.softcpu.level0", "softmmu.x86.physical-retirement"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/lib.rs"
-contracts = ["core.personality.handle-table"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/open_lifetime.rs"
-contracts = ["core.personality.handle-table"]
-
-[[surfaces]]
-path = "crates/carrick-fd-core/src/lib.rs"
-contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority", "core.personality.handle-table"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/el1_ipc.rs"
-contracts = ["kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/locks.rs"
-contracts = ["kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs"
-contracts = ["kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/open.rs"
-contracts = ["kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-fd-core/src/storage.rs"
-contracts = ["kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-fd-core/src/handle.rs"
-contracts = ["core.personality.handle-table"]
-
-[[surfaces]]
-path = "crates/carrick-fd-core/src/loom_models.rs"
-contracts = ["core.personality.handle-table"]
-
-[[surfaces]]
-path = "crates/carrick-kernel-example/tests/personality_handle_table.rs"
-contracts = ["core.personality.handle-table"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/mm/served.rs"
-contracts = ["kernel.mm.invalidation-domain"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/retirement/invalidation.rs"
-contracts = ["kernel.mm.invalidation-domain"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/retirement/invalidation/tests.rs"
-contracts = ["kernel.mm.invalidation-domain"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/retirement/invalidation/loom_models.rs"
-contracts = ["kernel.mm.invalidation-domain"]
-
-[[surfaces]]
-path = "crates/carrick-x86-cpl0-host/src/carrier_memory/test_support.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/src/carrier_memory/tests.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.x86.file-region"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-kvm/src/guest_setup.rs"
-contracts = ["kernel.fork.stage1-image"]
-
-[[surfaces]]
-path = "crates/carrick-signal-linux/src/lib.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-signal-linux/src/fork_reset.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/host_signal.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
-
-# The host build inspects the actual release ARM image's retained entry frames.
-[[surfaces]]
-path = "crates/carrick-el1-image/frame_budget.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle", "kernel.el1.ipc-fd-authority"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/loom_models.rs"
-contracts = ["kernel.el1.thread-lifecycle"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/aarch64_process_tests/exit_group_hang_tests.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/copyout.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs"
-contracts = ["kernel.copyout.owner-refusal", "kernel.fs.directory-copyout", "kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/copyout_contention_tests.rs"
-contracts = ["kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/continuation/readiness.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/rootfs_helpers.rs"
-contracts = ["kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/stat.rs"
-contracts = ["kernel.copyout.owner-refusal"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/affinity.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/affinity.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/affinity_source.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/zone_affinity_tests.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/carrier.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/abi/thread.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.memory.owner-wait", "kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-guest-arch/src/lib.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-el1/src/sched/object_wait.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/thread_ledger.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/operations/thread.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/lifecycle.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/thread_adoption.rs"
-contracts = ["kernel.el1.task-load-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
-
-[[surfaces]]
-path = "crates/carrick-el1-abi/src/image_layout_tests.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.el1.metadata-allocation", "kernel.mm.image-page-permissions"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/mod.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/outcome.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/time.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/continuation/ipc.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/lib.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/residency.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/owner_wait.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/owner_wait_loom.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/cancellation.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/lib.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/objects/signal.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/objects/thread_control.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/operations/signal.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/signal.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/cancellation/loom_tests.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-embed/tests/common/host_read_enrollment.rs"
-contracts = ["kernel.el1.guest-run-queue"]
-
-[[surfaces]]
-path = "fixtures/embed-el1-sched/src/host_read_gate.rs"
-contracts = ["kernel.el1.guest-run-queue"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/directory.rs"
-contracts = ["kernel.fs.directory-copyout", "kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-conformance-next/tests/directory_copyout.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-conformance-next/tests/fixtures/directory-copyout/src/main.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/tests.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/mod.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/outcome.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/continuation.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/runtime.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/mod.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/zone.rs"
-contracts = ["kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/service.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.exec.custody"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/exec_stage.rs"
-contracts = ["process.exec.custody"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs"
-contracts = ["kernel.el1.ipc-two-process", "kernel.scheduler.runnable-progress", "process.native.terminal-child", "process.exec.custody"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.exec.custody"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/physical_grants.rs"
-contracts = ["kernel.x86.file-region", "kernel.el1.fork-cow", "kernel.el1.mm-exclusive-owner"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_retirement_tests.rs"
-contracts = ["process.native.terminal-child"]
-
-[[surfaces]]
-path = "crates/carrick-fd-core/src/exec.rs"
-contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/file_table/exec.rs"
-contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable", "process.exec.files"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/fd_exec.rs"
-contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
-
-[[surfaces]]
-path = "crates/carrick-fd-core/src/reservation.rs"
-contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/exec_files.rs"
-contracts = ["process.exec.files"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/executable_authority.rs"
-contracts = ["process.exec.files"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fs/pathres.rs"
-contracts = ["process.exec.files"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/runtime/exec.rs"
-contracts = ["process.exec.files"]
-
-[[surfaces]]
-path = "crates/carrick-host/src/host_mapping.rs"
-contracts = ["process.exec.backing"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/native_files.rs"
-contracts = ["kernel.native.host-file-venue", "kernel.fs.directory-copyout", "kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-core-abi/src/host_file.rs"
-contracts = ["kernel.native.host-file-venue"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/native_host_file.rs"
-contracts = ["kernel.native.host-file-venue"]
-
-[[surfaces]]
-path = "crates/carrick-personality-linux/src/native_host_file/tests.rs"
-contracts = ["kernel.native.host-file-venue"]
-
-[[surfaces]]
-path = "crates/carrick-syscall-abi/src/stat.rs"
-contracts = ["kernel.native.host-file-venue"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/mem/native_successor.rs"
-contracts = ["kernel.native.host-file-venue"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/scheduler/exit_drain_tests.rs"
-contracts = ["kernel.scheduler.host-wait-handoff", "kernel.scheduler.runnable-progress", "kernel.scheduler.preemption-lifecycle", "kernel.scheduler.preemption-cost", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/vcpu_run.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-hal/src/lib.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/binding.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/shutdown_loom.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-vmm-hvf/tests/support/shutdown_kick.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/settlement.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/threads.rs"
-contracts = ["kernel.vcpu.shutdown-entry", "kernel.el1.signal-delivery-owner"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/continuation/output.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/request.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.fs.directory-copyout"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/lifecycle.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/operations/exit.rs"
-contracts = ["kernel.vcpu.shutdown-entry"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/reservation/stock.rs"
-contracts = ["kernel.el1.anonymous-reservations"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/reservation/root.rs"
-contracts = ["kernel.el1.anonymous-reservations"]
-
-[[surfaces]]
-path = "crates/carrick-thread/src/physical_retirement.rs"
-contracts = ["kernel.el1.anonymous-reservations"]
-
-[[surfaces]]
-path = "crates/carrick-core/src/mm/retirement.rs"
-contracts = ["kernel.el1.anonymous-reservations"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/kernel/registry.rs"
-contracts = ["core.lifecycle.publication"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_ipc_wake_tests.rs"
-contracts = ["kernel.el1.ipc-two-process"]
-
-[[surfaces]]
-path = "crates/carrick-sched-core/src/object_wait.rs"
-contracts = ["kernel.el1.ipc-two-process"]
-
-[[surfaces]]
-path = "crates/carrick-el1-linux/src/ipc/epoll.rs"
-contracts = ["kernel.el1.ipc-two-process"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/net.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fd_wait.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-kernel/src/dispatch/fd_wait/tests.rs"
-contracts = ["kernel.memory.owner-wait"]
-
-[[surfaces]]
-path = "crates/carrick-x86/src/engine.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]

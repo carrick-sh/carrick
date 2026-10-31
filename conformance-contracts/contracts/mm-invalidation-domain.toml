@@ -26,7 +26,21 @@ layers = ["vm-free"]
 rationale = "The member safe-point check runs on every trap and syscall return. With no debt it performs exactly owed[2] + served[2] loads on the member's own coherence granule and no read-modify-write or store on any shared word, at every table size n (1, 2, 3 members). An instrumented ServedWord counts every RMW across all member words; the issue counter's value is checked unchanged."
 
 [bindings]
-vm_free = "carrick-core::mm::retirement::invalidation::tests::per_sender_cell_model_loses_stopped_member_debt_692; carrick-core::mm::retirement::invalidation::tests::domain_keeps_stopped_member_debt_across_later_requests; carrick-core::mm::retirement::invalidation::tests::running_member_serves_before_completion_and_stopped_debt_survives; carrick-core::mm::retirement::invalidation::tests::steady_state_check_is_own_line_loads_with_zero_rmws (evaluates the structural budget at n = 1, 2, 3); carrick-core::mm::retirement::invalidation::tests::exhausted_counter_pins_at_max_and_commit_refuses_without_publishing; carrick-core::mm::retirement::invalidation::tests::install_failure_leaves_debt_visible_and_served_on_entry; carrick-core::mm::retirement::invalidation::tests::seat_reuse_flushes_the_new_cache_before_adopting_the_watermark; carrick-core::mm::retirement::invalidation::tests::completion_from_another_domain_never_acknowledges_or_reclaims; carrick-core::mm::retirement::invalidation::tests::domain_request_counts_every_seated_member_whatever_its_context; carrick-core::mm::retirement::invalidation::tests::owning_handle_seat_moves_to_its_own_thread_and_serves_requests; carrick-core::mm::retirement::invalidation::tests::reclaim_iter_lists_outstanding_objects_until_their_exact_release; carrick-core::mm::retirement::invalidation::tests::a_later_domain_wide_completion_covers_earlier_domain_wide_reclaim_only; carrick-core::mm::retirement::invalidation::loom_models (just test-loom; hosted `loom` job; includes loom_models_claim_races_domain_request_counts_or_flushes)"
+vm_free = [
+  "carrick-core::mm::retirement::invalidation::loom_models (just test-loom; hosted `loom` job; includes loom_models_claim_races_domain_request_counts_or_flushes)",
+  "carrick-core::mm::retirement::invalidation::tests::a_later_domain_wide_completion_covers_earlier_domain_wide_reclaim_only",
+  "carrick-core::mm::retirement::invalidation::tests::completion_from_another_domain_never_acknowledges_or_reclaims",
+  "carrick-core::mm::retirement::invalidation::tests::domain_keeps_stopped_member_debt_across_later_requests",
+  "carrick-core::mm::retirement::invalidation::tests::domain_request_counts_every_seated_member_whatever_its_context",
+  "carrick-core::mm::retirement::invalidation::tests::exhausted_counter_pins_at_max_and_commit_refuses_without_publishing",
+  "carrick-core::mm::retirement::invalidation::tests::install_failure_leaves_debt_visible_and_served_on_entry",
+  "carrick-core::mm::retirement::invalidation::tests::owning_handle_seat_moves_to_its_own_thread_and_serves_requests",
+  "carrick-core::mm::retirement::invalidation::tests::per_sender_cell_model_loses_stopped_member_debt_692",
+  "carrick-core::mm::retirement::invalidation::tests::reclaim_iter_lists_outstanding_objects_until_their_exact_release",
+  "carrick-core::mm::retirement::invalidation::tests::running_member_serves_before_completion_and_stopped_debt_survives",
+  "carrick-core::mm::retirement::invalidation::tests::seat_reuse_flushes_the_new_cache_before_adopting_the_watermark",
+  "carrick-core::mm::retirement::invalidation::tests::steady_state_check_is_own_line_loads_with_zero_rmws (evaluates the structural budget at n = 1, 2, 3)",
+]
 
 [bindings.unresolved]
 embed_structural = "The softmmu venue (slice 2, `softmmu.x86.physical-retirement`) consumes the domain VM-free; no hypervisor venue consumes it yet. The signed binding arrives with HVF slice 4 and x86 CPL0 slice 5; until then no signed guest execution, kick delivery or architectural invalidation is claimed."

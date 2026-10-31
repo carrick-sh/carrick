@@ -13,7 +13,7 @@ pub use inventory::{InventorySummary, SyscallInventory, SyscallInventoryEntry};
 pub use model::{
     Budget, CapabilityClass, Claim, ClaimId, ConformanceContract, ContractId, CoverageState,
     ExecutionLayer, LayerBindings, ModelError, RuntimeRatioPolicy, StructuralBudget,
-    SurfaceAssignment, SurfaceRegistry, TimingStatistic, WorkMetric,
+    SurfaceAssignment, SurfaceEntry, SurfaceRegistry, TimingStatistic, WorkMetric,
 };
 pub use observation::{
     Completeness, ContractObservation, ObservationError, SemanticAssertion, TimingDistribution,

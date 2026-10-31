@@ -360,9 +360,13 @@ def load_surfaces(root: Path):
         return {}
     with surfaces_file.open("rb") as f:
         data = tomllib.load(f)
-    mapping = {}
+    mapping: dict[str, list[str]] = {}
     for entry in data.get("surfaces", []):
-        mapping[entry["path"]] = entry.get("contracts", [])
+        path = entry["path"]
+        contract = entry["contract"]
+        contracts_for_path = mapping.setdefault(path, [])
+        if contract not in contracts_for_path:
+            contracts_for_path.append(contract)
     return mapping
 
 
@@ -395,13 +399,18 @@ def is_evidence_path(path: str, contract_id: str, contracts: dict, surfaces: dic
     contract_data = contracts.get(contract_id, {})
     bindings = contract_data.get("bindings", {})
     for layer, target in bindings.items():
-        if isinstance(target, str):
-            if target.startswith("probe:"):
-                probe_name = target.split("probe:")[1]
+        if layer == "unresolved" or not isinstance(target, list):
+            continue
+        for entry in target:
+            if not isinstance(entry, str):
+                continue
+            if entry.startswith("probe:"):
+                probe_name = entry.split("probe:", 1)[1]
                 if probe_name in path:
                     return True
-            elif "::" in target:
-                crate_name = target.split("::")[0]
+            elif "::" in entry:
+                cleaned = entry.removeprefix("doctest:")
+                crate_name = cleaned.split("::", 1)[0]
                 if f"crates/{crate_name}/" in path and ("/tests/" in path or "/contracts.rs" in path or "contracts/" in path):
                     return True
     return False

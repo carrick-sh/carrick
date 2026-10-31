@@ -20,7 +20,9 @@ rationale = "EL1 increment 2, first-touch checkpoint (structural witness). Prior
 structural_budgets = []
 
 [bindings]
-embed = "carrick-embed::el1_sched (signed; el1_memory_first_touch_stays_in_guest passes semantic completion across 256, 1024 and 4096 pages per process and asserts incremental host-exit slope < 0.125 exits/page across both processes; exact committed exit counts 99/107/113 and slopes 0.0052/0.0010)"
+embed = [
+  "carrick-embed::el1_sched (signed; el1_memory_first_touch_stays_in_guest passes semantic completion across 256, 1024 and 4096 pages per process and asserts incremental host-exit slope < 0.125 exits/page across both processes; exact committed exit counts 99/107/113 and slopes 0.0052/0.0010)",
+]
 
 [bindings.unresolved]
 vm_free = "VM-free dispatcher tests verify memory layout and mapping semantics, but cannot execute EL0 translation faults, MMU data aborts, or ARM stage-1 page-table installation."

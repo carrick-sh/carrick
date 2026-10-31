@@ -26,7 +26,9 @@ also remain bound on the blocked continuation across all carriers.
 """
 
 [bindings]
-vm_free = "carrick-kernel::kernel::continuation::tests::red_until_step3_m3_cancel_leaves_temporary_wait_mask_installed"
+vm_free = [
+  "carrick-kernel::kernel::continuation::tests::red_until_step3_m3_cancel_leaves_temporary_wait_mask_installed",
+]
 
 [bindings.unresolved]
 embed_structural = "Signed embed binding remains open for batch acceptance."

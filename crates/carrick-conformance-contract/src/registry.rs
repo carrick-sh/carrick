@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -65,21 +65,40 @@ impl ContractRegistry {
                 path: surfaces_path,
                 source,
             })?;
-        for surface in &surface_registry.surfaces {
-            for contract in &surface.contracts {
-                if !contracts.contains_key(contract) {
-                    return Err(RegistryError::UnknownSurfaceContract {
-                        surface: surface.path.clone(),
-                        contract: contract.clone(),
-                    });
-                }
+        let mut grouped_surfaces: BTreeMap<String, BTreeSet<ContractId>> = BTreeMap::new();
+        for entry in surface_registry.surfaces {
+            if entry.path.trim().is_empty() {
+                return Err(RegistryError::EmptySurfacePath);
+            }
+            if !contracts.contains_key(&entry.contract) {
+                return Err(RegistryError::UnknownSurfaceContract {
+                    surface: entry.path,
+                    contract: entry.contract,
+                });
+            }
+            if !grouped_surfaces
+                .entry(entry.path.clone())
+                .or_default()
+                .insert(entry.contract.clone())
+            {
+                return Err(RegistryError::DuplicateSurfaceEntry {
+                    surface: entry.path,
+                    contract: entry.contract,
+                });
             }
         }
+        let surfaces = grouped_surfaces
+            .into_iter()
+            .map(|(path, contract_set)| SurfaceAssignment {
+                path,
+                contracts: contract_set.into_iter().collect(),
+            })
+            .collect();
 
         Ok(Self {
             contracts,
             claims,
-            surfaces: surface_registry.surfaces,
+            surfaces,
         })
     }
 
@@ -156,15 +175,12 @@ fn validate_contract(contract: &ConformanceContract) -> Result<(), RegistryError
     if contract.rationale.trim().is_empty() {
         return Err(RegistryError::MissingContractRationale(contract.id.clone()));
     }
-    for (layer, binding) in [
-        (ExecutionLayer::VmFree, contract.bindings.vm_free.as_deref()),
-        (
-            ExecutionLayer::EmbedStructural,
-            contract.bindings.embed.as_deref(),
-        ),
-        (ExecutionLayer::Docker, contract.bindings.docker.as_deref()),
+    for (layer, entries) in [
+        (ExecutionLayer::VmFree, &contract.bindings.vm_free),
+        (ExecutionLayer::EmbedStructural, &contract.bindings.embed),
+        (ExecutionLayer::Docker, &contract.bindings.docker),
     ] {
-        if binding.is_none_or(str::is_empty) {
+        if entries.is_empty() {
             if contract
                 .bindings
                 .unresolved
@@ -177,6 +193,29 @@ fn validate_contract(contract: &ConformanceContract) -> Result<(), RegistryError
                 id: contract.id.clone(),
                 layer,
             });
+        }
+    }
+    for (layer, entries) in [
+        (ExecutionLayer::VmFree, &contract.bindings.vm_free),
+        (ExecutionLayer::EmbedStructural, &contract.bindings.embed),
+        (ExecutionLayer::Docker, &contract.bindings.docker),
+        (ExecutionLayer::Ecosystem, &contract.bindings.ecosystem),
+    ] {
+        let mut seen = BTreeSet::new();
+        for entry in entries {
+            if entry.trim().is_empty() {
+                return Err(RegistryError::EmptyBindingEntry {
+                    id: contract.id.clone(),
+                    layer,
+                });
+            }
+            if !seen.insert(entry.as_str()) {
+                return Err(RegistryError::DuplicateBindingEntry {
+                    id: contract.id.clone(),
+                    layer,
+                    entry: entry.clone(),
+                });
+            }
         }
     }
     for (index, budget) in contract.structural_budgets.iter().enumerate() {
@@ -287,6 +326,13 @@ pub enum RegistryError {
     InvalidBudgetLayers { id: ContractId, index: usize },
     #[error("contract {id} scaling budget requires at least three scale points")]
     InsufficientScalePoints { id: ContractId },
+    #[error("surface entry has an empty path")]
+    EmptySurfacePath,
+    #[error("duplicate surface entry for {surface} -> {contract}")]
+    DuplicateSurfaceEntry {
+        surface: String,
+        contract: ContractId,
+    },
     #[error("surface {surface} references unknown contract family {contract}")]
     UnknownSurfaceContract {
         surface: String,
@@ -315,5 +361,16 @@ pub enum RegistryError {
     MissingBinding {
         id: ContractId,
         layer: ExecutionLayer,
+    },
+    #[error("{id}: empty {layer} binding entry")]
+    EmptyBindingEntry {
+        id: ContractId,
+        layer: ExecutionLayer,
+    },
+    #[error("{id}: duplicate {layer} binding entry {entry:?}")]
+    DuplicateBindingEntry {
+        id: ContractId,
+        layer: ExecutionLayer,
+        entry: String,
     },
 }

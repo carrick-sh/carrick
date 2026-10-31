@@ -8,7 +8,9 @@ scale_points = [1, 8, 32, 128]
 rationale = "After full validation and before any mutation, repeated native data activation must allocate nothing and walk no leaves. Reuse must revoke after changes in exact stage-1 authority, backend, VMA, inventory, mapping, owner or protection. This host CPU fixture uses production carrier COW and a real scope but executes no guest ELF."
 
 [bindings]
-vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_data_activation_cost_contract (conformance-metrics); native_carrier_elf_memory_control_round_trip supplies supplemental host execution semantics"
+vm_free = [
+  "carrick-runtime::vcpu_loop::memory::tests::native_data_activation_cost_contract (conformance-metrics); native_carrier_elf_memory_control_round_trip supplies supplemental host execution semantics",
+]
 
 [bindings.unresolved]
 embed_structural = "A bounded host ELF data/control round trip is covered; signed native execution, carrier code publication, signal/cancellation service and scheduling remain unintegrated."

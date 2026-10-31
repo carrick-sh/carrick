@@ -21,10 +21,19 @@ scale_points = [1, 8, 32, 128]
 rationale = "The fixture watches Carrick's private rootfs, whose mutations are complete in the unified kernel graph. Registration and removal stay virtual there; externally mutable bind mounts retain native vnode watches."
 
 [bindings]
-vm_free = "carrick-kernel-example::inotify_watch_contract"
-embed = "carrick-embed::inotify_watch_contract"
-docker = "probe:inotifymatrix"
-ecosystem = ["ltp:inotify09", "ltp:inotify11"]
+vm_free = [
+  "carrick-kernel-example::inotify_watch_contract",
+]
+embed = [
+  "carrick-embed::inotify_watch_contract",
+]
+docker = [
+  "probe:inotifymatrix",
+]
+ecosystem = [
+  "ltp:inotify09",
+  "ltp:inotify11",
+]
 
 [[structural_budgets]]
 kind = "exact"

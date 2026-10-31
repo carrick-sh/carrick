@@ -12,8 +12,12 @@ scale_points = [1, 8, 32]
 rationale = "Ceiling selection uses the existing syscall guest ABI and GuestArch seam, independent of host ISA or reported uname. An exhausted lower half refuses before backend protection work (exactly zero protect calls). Gap search retains the existing sort/merge and single pass over occupancy; the ceiling adds only constant-time range checks, never retries into the backend. No runtime ratio is claimed. The VM-free negative control must return a VA >= 2^47 before the fix."
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::mem::tests (x86_mmap_crowded_lower_half_refuses_noncanonical_gap, x86_mmap_last_lower_half_gap_and_invalid_hint, x86_mmap_fixed_outside_lower_half_returns_errno_12, x86_mmap_task_size_guard_matches_native_linux, arm_mmap_retains_48_bit_ceiling_and_tag_stripping, remap_file_pages_and_mincore_wait_for_owner_refused_copyout_without_mutating_snapshots); existing next_mmap_address_canonical_high_va_hint_and_gap_search and next_mmap_address_allocates_large_vmas_in_canonical_high_va_space pin ARM placement"
-docker = "not applicable on x86-w1: native x86_64 Linux oracle is explicitly authorized; committed fixture oracle.json records source hash, native kernel and binary hash"
+vm_free = [
+  "carrick-kernel::dispatch::mem::tests (x86_mmap_crowded_lower_half_refuses_noncanonical_gap, x86_mmap_last_lower_half_gap_and_invalid_hint, x86_mmap_fixed_outside_lower_half_returns_errno_12, x86_mmap_task_size_guard_matches_native_linux, arm_mmap_retains_48_bit_ceiling_and_tag_stripping, remap_file_pages_and_mincore_wait_for_owner_refused_copyout_without_mutating_snapshots); existing next_mmap_address_canonical_high_va_hint_and_gap_search and next_mmap_address_allocates_large_vmas_in_canonical_high_va_space pin ARM placement",
+]
+docker = [
+  "not applicable on x86-w1: native x86_64 Linux oracle is explicitly authorized; committed fixture oracle.json records source hash, native kernel and binary hash",
+]
 
 [bindings.unresolved]
 kvm_live = "The static fixture executes on Linux/KVM: mmap(NULL) bounds match native, but MAP_FIXED returns errno 38 (ENOSYS) from carrick-x86::bringup_fns::run_elf_service_loop (is_fixed rejection). This existing standalone service loop does not call the shared dispatcher. Native oracle returns 0 at 2^47-8192 and 12 at 2^47-4096 and above. The shared-dispatcher live binding is unavailable until Linux/x86 HVPatch is supported."

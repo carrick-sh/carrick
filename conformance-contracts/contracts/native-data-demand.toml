@@ -8,7 +8,9 @@ scale_points = [1, 8, 32, 128]
 rationale = "A bounded research interval which cannot reach a native memory access before a checkpoint needs execution authority but no data grant. Conservative control-flow analysis must include both conditional successors and backward edges, terminate at host checkpoints, reject invalid targets, and retain the existing backedge bound. Any interval that may access memory uses the unchanged activation path. This is private research code publication with mock stage-2, not product execution acceptance."
 
 [bindings]
-vm_free = "carrick-runtime::vcpu_loop::memory::tests::native_floor::native_data_demand_contract; native-syscall-slice control-flow and register tests"
+vm_free = [
+  "carrick-runtime::vcpu_loop::memory::tests::native_floor::native_data_demand_contract; native-syscall-slice control-flow and register tests",
+]
 
 [bindings.unresolved]
 embed_structural = "Carrier code publication, signed native execution, signal/cancellation and scheduling composition remain unbound."

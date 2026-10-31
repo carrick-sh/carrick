@@ -39,6 +39,12 @@ signal delivery, or the standalone loop's pre-existing ppoll approximation.
 """
 
 [bindings]
-vm_free = "carrick-x86::bringup_fns::poll_tests"
-embed = "not applicable: standalone run-elf loop; live binding is carrick-vmm-kvm::live_vcpu_x86::test_m2_musl_static_hello"
-docker = "committed crates/carrick-vmm-bhyve/fixtures/hello-x86_64/oracle.expected; refresh and cross-host execution remain director-owned"
+vm_free = [
+  "carrick-x86::bringup_fns::poll_tests",
+]
+embed = [
+  "not applicable: standalone run-elf loop; live binding is carrick-vmm-kvm::live_vcpu_x86::test_m2_musl_static_hello",
+]
+docker = [
+  "committed crates/carrick-vmm-bhyve/fixtures/hello-x86_64/oracle.expected; refresh and cross-host execution remain director-owned",
+]
