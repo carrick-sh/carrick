@@ -868,7 +868,6 @@ fn record_worker_session(log: &Path, package: &Path) -> Result<(), ScalerError> 
     let read = crate::safe_copy::open_text(log).and_then(|file| {
         file.take(WORKER_SESSION_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(Into::into)
     });
     if read.is_err() {
         return Ok(());
