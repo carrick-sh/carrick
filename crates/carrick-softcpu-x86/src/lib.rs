@@ -1,5 +1,6 @@
-//! `carrick-softcpu-x86` — Level 0 same-ISA copy-through dynamic binary translator
-//! for x86_64 user mode (`carrick-sh/carrick#578`, slice 1b `#581`).
+//! `carrick-softcpu-x86` — Level 0 + CPL0 same-ISA dynamic binary translator,
+//! architectural MSR file, privileged instruction emulator, and VM-free `SoftMachine`
+//! for x86_64 (`carrick-sh/carrick#578`).
 
 #![cfg(target_arch = "x86_64")]
 
@@ -7,18 +8,32 @@ pub mod block;
 pub mod cflow;
 pub mod context;
 pub mod cpu;
+pub mod cpuid;
 pub mod decode;
 pub mod emit;
+pub mod machine;
 pub mod mmu;
+pub mod msr;
+pub mod privileged;
 
 pub use block::{BlockExit, BlockFetchFault, MAX_INSN_BYTES, PlannedBlock, plan_block_from_memory};
 pub use cflow::{compute_effective_va, eval_cc, resolve_cflow};
 pub use context::{
-    AdmitRefused, FxsaveArea, HostAccess, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
+    AdmitRefused, DescriptorTablePtr, FxsaveArea, HostAccess, SoftCpuContext, SoftSegment,
+    X86Exception, X86ExceptionVector, reg,
 };
 pub use cpu::{JitCodeBuffer, RunningContext, RunningCpu, SoftCpu, SoftCpuExit, SoftCpuNewError};
+pub use cpuid::{Cpl0CpuidView, CpuidRegs, GuestCpuidView, Level0CpuidView};
 pub use decode::{CflowKind, DecodedInsn, InsnClass, SensitiveOp, classify, gpr_index};
 pub use emit::{EmitError, EmittedBlock, JitStage, emit_block};
+pub use machine::{SoftMachine, SoftMachineExit};
+pub use msr::{
+    DEFAULT_IA32_APIC_BASE, DEFAULT_IA32_PAT, EFER_LMA, EFER_LME, EFER_NXE, EFER_SCE,
+    EFER_VALID_MASK, MSR_IA32_APIC_BASE, MSR_IA32_CSTAR, MSR_IA32_EFER, MSR_IA32_FMASK,
+    MSR_IA32_FS_BASE, MSR_IA32_GS_BASE, MSR_IA32_KERNEL_GS_BASE, MSR_IA32_LSTAR,
+    MSR_IA32_MISC_ENABLE, MSR_IA32_PAT, MSR_IA32_SFMASK, MSR_IA32_STAR, MSR_IA32_TSC,
+    MSR_IA32_TSC_DEADLINE, MsrCapabilities, MsrError, MsrFile, MsrIndex, MsrWriteEffects,
+};
 pub use mmu::{
     Access, AuthenticatedDescriptorWords, AuthenticatedGpa, Cpl, CpuAccessMode, DescriptorRefusal,
     DomainCompletion, ExtentEditError, ExtentRecord, ExtentTable, FrameGpa, GuestVa, HostVa,

@@ -1,0 +1,300 @@
+//! Architectural Model-Specific Register (`MSR`) file for `carrick-softcpu-x86`.
+//!
+//! `RDMSR` (`0F 32`), `WRMSR` (`0F 30`), `SWAPGS` (`0F 01 F8`), `SYSCALL`, and `SYSRET`
+//! operate over [`MsrFile`]. Unimplemented MSR indices, reserved bits, and non-canonical
+//! linear-address MSR writes fail closed with [`MsrError::GeneralProtection`] (`#GP(0)`).
+
+use crate::cpuid::GuestCpuidView;
+use crate::mmu::is_canonical_va;
+
+/// Typed 32-bit architectural MSR selector (`ECX` operand of `RDMSR`/`WRMSR`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MsrIndex(pub u32);
+
+impl MsrIndex {
+    #[must_use]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+pub const MSR_IA32_TSC: MsrIndex = MsrIndex(0x0000_0010);
+pub const MSR_IA32_APIC_BASE: MsrIndex = MsrIndex(0x0000_001b);
+pub const MSR_IA32_MISC_ENABLE: MsrIndex = MsrIndex(0x0000_01a0);
+pub const MSR_IA32_PAT: MsrIndex = MsrIndex(0x0000_0277);
+pub const MSR_IA32_TSC_DEADLINE: MsrIndex = MsrIndex(0x0000_06e0);
+pub const MSR_IA32_EFER: MsrIndex = MsrIndex(0xc000_0080);
+pub const MSR_IA32_STAR: MsrIndex = MsrIndex(0xc000_0081);
+pub const MSR_IA32_LSTAR: MsrIndex = MsrIndex(0xc000_0082);
+pub const MSR_IA32_CSTAR: MsrIndex = MsrIndex(0xc000_0083);
+pub const MSR_IA32_FMASK: MsrIndex = MsrIndex(0xc000_0084);
+pub const MSR_IA32_SFMASK: MsrIndex = MSR_IA32_FMASK;
+pub const MSR_IA32_FS_BASE: MsrIndex = MsrIndex(0xc000_0100);
+pub const MSR_IA32_GS_BASE: MsrIndex = MsrIndex(0xc000_0101);
+pub const MSR_IA32_KERNEL_GS_BASE: MsrIndex = MsrIndex(0xc000_0102);
+
+/// `IA32_EFER` architectural bits (Intel SDM Vol. 4 / AMD64 APM Vol. 2 §3.1.7).
+pub const EFER_SCE: u64 = 1 << 0;
+pub const EFER_LME: u64 = 1 << 8;
+pub const EFER_LMA: u64 = 1 << 10;
+pub const EFER_NXE: u64 = 1 << 11;
+pub const EFER_VALID_MASK: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE;
+
+/// Reset value of `IA32_PAT` (`WB=6`, `WT=4`, `UC-=7`, `UC=0`).
+pub const DEFAULT_IA32_PAT: u64 = 0x0007_0406_0007_0406;
+/// Reset value of `IA32_APIC_BASE` (`0xfee0_0000 | BSP(0x100) | EN(0x800)`).
+pub const DEFAULT_IA32_APIC_BASE: u64 = 0xfee0_0900;
+
+/// Architectural refusal raised by an illegal `RDMSR`/`WRMSR` access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MsrError {
+    /// Raises `#GP(0)` without mutating architectural state.
+    GeneralProtection,
+}
+
+/// CPUID-derived capabilities consulted during `RDMSR`/`WRMSR` validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsrCapabilities {
+    pub max_phy_addr: u8,
+    pub nxe: bool,
+    pub tsc_deadline: bool,
+    pub x2apic: bool,
+}
+
+impl Default for MsrCapabilities {
+    fn default() -> Self {
+        Self {
+            max_phy_addr: 48,
+            nxe: true,
+            tsc_deadline: false,
+            x2apic: false,
+        }
+    }
+}
+
+impl MsrCapabilities {
+    /// Derive MSR validation capabilities from a [`GuestCpuidView`].
+    #[must_use]
+    pub fn from_cpuid(view: &dyn GuestCpuidView) -> Self {
+        Self {
+            max_phy_addr: view.max_phy_addr(),
+            nxe: view.supports_nxe(),
+            tsc_deadline: view.supports_tsc_deadline(),
+            x2apic: view.supports_x2apic(),
+        }
+    }
+}
+
+/// Side effects of a committed `WRMSR` on the owning vCPU context.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MsrWriteEffects {
+    /// `IA32_EFER.NXE` or `IA32_PAT` changed, requiring a local TLB flush.
+    pub flush_tlb: bool,
+}
+
+/// Per-vCPU architectural MSR register file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MsrFile {
+    pub tsc: u64,
+    pub apic_base: u64,
+    pub misc_enable: u64,
+    pub pat: u64,
+    pub tsc_deadline: u64,
+    pub efer: u64,
+    pub star: u64,
+    pub lstar: u64,
+    pub cstar: u64,
+    pub fmask: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub kernel_gs_base: u64,
+}
+
+impl Default for MsrFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MsrFile {
+    /// Construct an architectural 64-bit MSR file matching `SoftCpuContext` reset state.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            tsc: 0,
+            apic_base: DEFAULT_IA32_APIC_BASE,
+            misc_enable: 1,
+            pat: DEFAULT_IA32_PAT,
+            tsc_deadline: 0,
+            efer: EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE,
+            star: 0,
+            lstar: 0,
+            cstar: 0,
+            fmask: 0,
+            fs_base: 0,
+            gs_base: 0,
+            kernel_gs_base: 0,
+        }
+    }
+
+    /// Read an architectural MSR (`RDMSR`), returning `Err(MsrError::GeneralProtection)`
+    /// for unknown or feature-disabled MSRs.
+    pub fn read(&self, index: MsrIndex, caps: MsrCapabilities) -> Result<u64, MsrError> {
+        match index {
+            MSR_IA32_TSC => Ok(self.tsc),
+            MSR_IA32_APIC_BASE => Ok(self.apic_base),
+            MSR_IA32_MISC_ENABLE => Ok(self.misc_enable),
+            MSR_IA32_PAT => Ok(self.pat),
+            MSR_IA32_TSC_DEADLINE => {
+                if !caps.tsc_deadline {
+                    return Err(MsrError::GeneralProtection);
+                }
+                Ok(self.tsc_deadline)
+            }
+            MSR_IA32_EFER => Ok(self.efer),
+            MSR_IA32_STAR => Ok(self.star),
+            MSR_IA32_LSTAR => Ok(self.lstar),
+            MSR_IA32_CSTAR => Ok(self.cstar),
+            MSR_IA32_FMASK => Ok(self.fmask),
+            MSR_IA32_FS_BASE => Ok(self.fs_base),
+            MSR_IA32_GS_BASE => Ok(self.gs_base),
+            MSR_IA32_KERNEL_GS_BASE => Ok(self.kernel_gs_base),
+            _ => Err(MsrError::GeneralProtection),
+        }
+    }
+
+    /// Write an architectural MSR (`WRMSR`), validating SDM reserved bits, canonical
+    /// linear addresses, paging-active `EFER.LME` lock, and CPUID feature gates.
+    pub fn write(
+        &mut self,
+        index: MsrIndex,
+        value: u64,
+        cr0: u64,
+        caps: MsrCapabilities,
+    ) -> Result<MsrWriteEffects, MsrError> {
+        let mut effects = MsrWriteEffects::default();
+        match index {
+            MSR_IA32_TSC => {
+                self.tsc = value;
+            }
+            MSR_IA32_APIC_BASE => {
+                let phy_limit = if caps.max_phy_addr >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << caps.max_phy_addr) - 1
+                };
+                // Bits [7:0], bit 9, and bits >= MAXPHYADDR are reserved.
+                if (value & 0x2ff) != 0 || (value & !phy_limit) != 0 {
+                    return Err(MsrError::GeneralProtection);
+                }
+                let extd = (value & (1 << 10)) != 0;
+                let en = (value & (1 << 11)) != 0;
+                // SDM Vol. 3A §10.12.1: EXTD=1 requires x2APIC support and EN=1.
+                if extd && (!caps.x2apic || !en) {
+                    return Err(MsrError::GeneralProtection);
+                }
+                self.apic_base = value;
+            }
+            MSR_IA32_MISC_ENABLE => {
+                if (value >> 39) != 0 {
+                    return Err(MsrError::GeneralProtection);
+                }
+                self.misc_enable = value;
+            }
+            MSR_IA32_PAT => {
+                // SDM Vol. 3A §11.12.2: each of the 8 PAT fields must be 0, 1, 4, 5, 6, or 7.
+                for byte in value.to_le_bytes() {
+                    if !matches!(byte, 0 | 1 | 4 | 5 | 6 | 7) {
+                        return Err(MsrError::GeneralProtection);
+                    }
+                }
+                if self.pat != value {
+                    self.pat = value;
+                    effects.flush_tlb = true;
+                }
+            }
+            MSR_IA32_TSC_DEADLINE => {
+                if !caps.tsc_deadline {
+                    return Err(MsrError::GeneralProtection);
+                }
+                self.tsc_deadline = value;
+            }
+            MSR_IA32_EFER => {
+                if (value & !EFER_VALID_MASK) != 0 {
+                    return Err(MsrError::GeneralProtection);
+                }
+                if !caps.nxe && (value & EFER_NXE) != 0 {
+                    return Err(MsrError::GeneralProtection);
+                }
+                let paging = (cr0 & (1 << 31)) != 0;
+                // SDM Vol. 3A §9.8.5: modifying IA32_EFER.LME while CR0.PG=1 raises #GP(0).
+                if paging && ((value & EFER_LME) != (self.efer & EFER_LME)) {
+                    return Err(MsrError::GeneralProtection);
+                }
+                // IA32_EFER.LMA is read-only hardware state: LME && CR0.PG.
+                let lma = if (value & EFER_LME) != 0 && paging {
+                    EFER_LMA
+                } else {
+                    0
+                };
+                let next_efer = (value & !EFER_LMA) | lma;
+                if (next_efer & EFER_NXE) != (self.efer & EFER_NXE) {
+                    effects.flush_tlb = true;
+                }
+                self.efer = next_efer;
+            }
+            MSR_IA32_STAR => {
+                self.star = value;
+            }
+            MSR_IA32_LSTAR => {
+                if !is_canonical_va(value) {
+                    return Err(MsrError::GeneralProtection);
+                }
+                self.lstar = value;
+            }
+            MSR_IA32_CSTAR => {
+                if !is_canonical_va(value) {
+                    return Err(MsrError::GeneralProtection);
+                }
+                self.cstar = value;
+            }
+            MSR_IA32_FMASK => {
+                // SDM Vol. 4 IA32_FMASK: bits [63:32] are reserved and must be zero.
+                if (value >> 32) != 0 {
+                    return Err(MsrError::GeneralProtection);
+                }
+                self.fmask = value;
+            }
+            MSR_IA32_FS_BASE => {
+                if !is_canonical_va(value) {
+                    return Err(MsrError::GeneralProtection);
+                }
+                self.fs_base = value;
+            }
+            MSR_IA32_GS_BASE => {
+                if !is_canonical_va(value) {
+                    return Err(MsrError::GeneralProtection);
+                }
+                self.gs_base = value;
+            }
+            MSR_IA32_KERNEL_GS_BASE => {
+                if !is_canonical_va(value) {
+                    return Err(MsrError::GeneralProtection);
+                }
+                self.kernel_gs_base = value;
+            }
+            _ => return Err(MsrError::GeneralProtection),
+        }
+        Ok(effects)
+    }
+
+    /// Atomically exchange `IA32_GS_BASE` and `IA32_KERNEL_GS_BASE` (`SWAPGS`).
+    pub const fn swapgs(&mut self) {
+        std::mem::swap(&mut self.gs_base, &mut self.kernel_gs_base);
+    }
+}

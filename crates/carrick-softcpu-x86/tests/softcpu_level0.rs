@@ -817,29 +817,47 @@ fn general_protection_witnesses_privileged_at_cpl3_and_sensitive_at_cpl0() {
     for &(bytes, op) in cases {
         let (mut cpu, mut mem, code_va) = setup_snippet(bytes);
         let expected = match op {
-            SensitiveOp::Iretq => SoftCpuExit::Sensitive {
-                rip: code_va,
-                next_rip: code_va + bytes.len() as u64,
-                op,
-            },
             SensitiveOp::Clac | SensitiveOp::Stac => ud(code_va),
             _ => gp(code_va),
         };
         step_ok(&mut cpu, &mut mem, expected);
         mem.set_page_perms(code_va, PagePerms::KERNEL_RX);
+        mem.set_page_perms(0x0080_1000, PagePerms::KERNEL_RW);
         cpu.context_mut().set_cpl(0);
         cpu.context_mut().flush_tlb();
         cpu.context_mut().rip = code_va;
         let next_rip = code_va + bytes.len() as u64;
-        step_ok(
-            &mut cpu,
-            &mut mem,
-            SoftCpuExit::Sensitive {
+        let expected_cpl0 = match op {
+            SensitiveOp::OutImm { .. }
+            | SensitiveOp::OutDx { .. }
+            | SensitiveOp::InImm { .. }
+            | SensitiveOp::InDx { .. } => SoftCpuExit::Sensitive {
                 rip: code_va,
                 next_rip,
                 op,
             },
-        );
+            SensitiveOp::Hlt => SoftCpuExit::Hlt {
+                rip: code_va,
+                next_rip,
+            },
+            SensitiveOp::Cli
+            | SensitiveOp::Sti
+            | SensitiveOp::Swapgs
+            | SensitiveOp::MovFromCr { .. }
+            | SensitiveOp::MovToCr { .. }
+            | SensitiveOp::Clac
+            | SensitiveOp::Stac
+            | SensitiveOp::Invlpg => SoftCpuExit::Continue { next_rip },
+            SensitiveOp::Sysret => SoftCpuExit::Continue { next_rip: 0 },
+            SensitiveOp::Lgdt | SensitiveOp::Lidt => pf(code_va, 0, 0),
+            SensitiveOp::Iretq
+            | SensitiveOp::Wrmsr
+            | SensitiveOp::Rdmsr
+            | SensitiveOp::Xsetbv
+            | SensitiveOp::Ltr => gp(code_va),
+            _ => unreachable!(),
+        };
+        step_ok(&mut cpu, &mut mem, expected_cpl0);
     }
 }
 
@@ -2084,13 +2102,13 @@ fn alignment_check_covers_cold_and_warm_memory_paths() {
 
 #[test]
 fn cpl3_sensitive_vector_table_matches_sdm() {
-    // Legal system-state instructions leave via Sensitive for the machine
-    // owner to service, just like the existing LAR/LSL contract. Host state
-    // must never be read by a copy-through instruction.
+    // Emulated system queries read only guest architectural state when UMIP=0,
+    // while unemulated segment/descriptor queries leave via Sensitive. Host
+    // system state must never be read by any instruction.
     let cases: &[(&str, &[u8], Option<u8>)] = &[
         ("clac", &[0x0f, 0x01, 0xca], Some(6)),
         ("stac", &[0x0f, 0x01, 0xcb], Some(6)),
-        ("iretq", &[0x48, 0xcf], None),
+        ("iretq", &[0x48, 0xcf], Some(13)),
         ("clts", &[0x0f, 0x06], Some(13)),
         ("invd", &[0x0f, 0x08], Some(13)),
         ("wbinvd", &[0x0f, 0x09], Some(13)),
@@ -2098,11 +2116,6 @@ fn cpl3_sensitive_vector_table_matches_sdm() {
         ("lldt", &[0x0f, 0x00, 0xd0], Some(13)),
         ("mov from dr", &[0x0f, 0x21, 0xc0], Some(13)),
         ("mov to dr", &[0x0f, 0x23, 0xc0], Some(13)),
-        ("sgdt", &[0x0f, 0x01, 0x07], None),
-        ("sidt", &[0x0f, 0x01, 0x0f], None),
-        ("sldt", &[0x0f, 0x00, 0xc0], None),
-        ("str", &[0x0f, 0x00, 0xc8], None),
-        ("smsw", &[0x0f, 0x01, 0xe0], None),
         ("verr", &[0x0f, 0x00, 0xe0], None),
         ("verw", &[0x0f, 0x00, 0xe8], None),
         ("mov from ds", &[0x8c, 0xd8], None),
@@ -2138,6 +2151,39 @@ fn cpl3_sensitive_vector_table_matches_sdm() {
         "CPL3 vector table: {}",
         failures.join("; ")
     );
+
+    // UMIP=0 queries read only guest GDTR/IDTR/LDTR/TR/CR0, never host registers.
+    for (name, bytes, expected_rax) in [
+        ("sldt", &[0x0f, 0x00, 0xc0][..], Some(0u64)),
+        ("str", &[0x0f, 0x00, 0xc8][..], Some(0u64)),
+        ("smsw", &[0x0f, 0x01, 0xe0][..], Some(0x8005_0033u64)),
+        ("sgdt", &[0x0f, 0x01, 0x07][..], None),
+        ("sidt", &[0x0f, 0x01, 0x0f][..], None),
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        let dst = 0x2000_0000;
+        mem.map_range(dst, 4096, PagePerms::USER_RW);
+        mem.write_direct(dst, &[0xaa; 10]);
+        cpu.context_mut().cr4 &= !(1 << 11);
+        cpu.context_mut().gpr[reg::RDI] = dst;
+        cpu.context_mut().gpr[reg::RAX] = 0xdead_beef_cafe_babe;
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            SoftCpuExit::Continue {
+                next_rip: va + bytes.len() as u64,
+            },
+        );
+        if let Some(rax) = expected_rax {
+            assert_eq!(cpu.context().gpr[reg::RAX], rax, "{name} wrong guest value");
+        } else {
+            assert_eq!(
+                mem.read_direct(dst, 10).unwrap(),
+                [0u8; 10],
+                "{name} leaked host descriptor table"
+            );
+        }
+    }
 }
 
 #[test]
