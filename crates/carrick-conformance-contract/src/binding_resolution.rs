@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use proc_macro2::{Delimiter, TokenStream, TokenTree};
@@ -65,6 +64,15 @@ pub enum BindingResolutionError {
         layer: ExecutionLayer,
         target: String,
     },
+}
+
+impl From<crate::registry::RegistryIoError> for BindingResolutionError {
+    fn from(err: crate::registry::RegistryIoError) -> Self {
+        Self::Io {
+            path: err.path,
+            source: err.source,
+        }
+    }
 }
 
 impl BindingResolver {
@@ -289,12 +297,7 @@ impl CrateIndex {
 
         let manifest_path = crate_dir.join("Cargo.toml");
         let manifest = if manifest_path.is_file() {
-            let text = fs::read_to_string(&manifest_path).map_err(|source| {
-                BindingResolutionError::Io {
-                    path: manifest_path,
-                    source,
-                }
-            })?;
+            let text = crate::registry::read_to_string(&manifest_path)?;
             toml::from_str::<CargoManifestWire>(&text).ok()
         } else {
             None
@@ -442,11 +445,7 @@ impl CrateIndex {
             return Ok(());
         }
 
-        let content =
-            fs::read_to_string(file_path).map_err(|source| BindingResolutionError::Io {
-                path: file_path.to_path_buf(),
-                source,
-            })?;
+        let content = crate::registry::read_to_string(file_path)?;
         let stream = content
             .parse::<TokenStream>()
             .map_err(|err| BindingResolutionError::Lex {
@@ -622,18 +621,10 @@ impl CrateIndex {
 }
 
 fn read_sorted_dir(dir: &Path) -> Result<Vec<PathBuf>, BindingResolutionError> {
-    let entries = fs::read_dir(dir).map_err(|source| BindingResolutionError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| BindingResolutionError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        paths.push(entry.path());
-    }
+    let mut paths: Vec<PathBuf> = crate::registry::read_contract_paths(dir)?
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
     paths.sort();
     Ok(paths)
 }
@@ -870,6 +861,8 @@ fn split_segments(path: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use tempfile::TempDir;
 
