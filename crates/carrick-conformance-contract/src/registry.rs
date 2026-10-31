@@ -262,37 +262,6 @@ fn validate_contract(contract: &ConformanceContract) -> Result<(), RegistryError
             }
         }
     }
-    for (layer, sorted_slice) in [
-        (
-            ExecutionLayer::VmFree,
-            contract.bindings.vm_free.get(1..).unwrap_or(&[]),
-        ),
-        (
-            ExecutionLayer::EmbedStructural,
-            contract.bindings.embed.get(1..).unwrap_or(&[]),
-        ),
-        (
-            ExecutionLayer::Docker,
-            contract.bindings.docker.get(1..).unwrap_or(&[]),
-        ),
-        (
-            ExecutionLayer::Ecosystem,
-            contract.bindings.ecosystem.as_slice(),
-        ),
-    ] {
-        for pair in sorted_slice.windows(2) {
-            if let [previous, current] = pair
-                && previous > current
-            {
-                return Err(RegistryError::UnsortedBindingEntries {
-                    id: contract.id.clone(),
-                    layer,
-                    previous: previous.clone(),
-                    current: current.clone(),
-                });
-            }
-        }
-    }
     for (index, budget) in contract.structural_budgets.iter().enumerate() {
         if budget.layers.is_empty()
             || budget.layers.iter().any(|layer| {
@@ -458,12 +427,5 @@ pub enum RegistryError {
         id: ContractId,
         layer: ExecutionLayer,
         entry: String,
-    },
-    #[error("{id}: unsorted {layer} binding entries ({current:?} appears after {previous:?})")]
-    UnsortedBindingEntries {
-        id: ContractId,
-        layer: ExecutionLayer,
-        previous: String,
-        current: String,
     },
 }

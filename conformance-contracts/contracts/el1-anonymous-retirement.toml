@@ -33,8 +33,7 @@ embed = [
   "carrick-embed::el1_sched::el1_anonymous_discard_and_exit_return_frames",
 ]
 docker = [
-  "native-arm64 same-source mapping-retirement fixture at 256, 1024 and 4096 pages",
-  "docs/perf-results/2026-09-27-el1-anonymous-retirement",
+  "native-arm64 same-source mapping-retirement fixture at 256, 1024 and 4096 pages; docs/perf-results/2026-09-27-el1-anonymous-retirement",
 ]
 
 [bindings.unresolved]

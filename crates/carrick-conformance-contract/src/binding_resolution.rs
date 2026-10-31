@@ -49,7 +49,9 @@ pub enum BindingResolutionError {
     Lex { path: PathBuf, reason: String },
     #[error("{id}: malformed vm_free binding entry {entry:?} (expected `<crate>::<path>`)")]
     MalformedVmFreeEntry { id: ContractId, entry: String },
-    #[error("{id}: malformed embed binding entry {entry:?} (expected `<crate>::<path>` or `probe:<name>`)")]
+    #[error(
+        "{id}: malformed embed binding entry {entry:?} (expected `<crate>::<path>` or `probe:<name>`)"
+    )]
     MalformedEmbedEntry { id: ContractId, entry: String },
     #[error("{id}: missing {layer} target crate {}", crate_path.display())]
     MissingTargetCrate {
@@ -158,7 +160,10 @@ impl BindingResolver {
             targets.push((crate_name, raw_path));
         }
         for (_, crate_name, raw_path) in extract_embedded_carrick_targets(trimmed) {
-            if !targets.iter().any(|(c, p)| c == &crate_name && p == &raw_path) {
+            if !targets
+                .iter()
+                .any(|(c, p)| c == &crate_name && p == &raw_path)
+            {
                 targets.push((crate_name, raw_path));
             }
         }
@@ -321,7 +326,12 @@ impl CrateIndex {
                     if target.is_file() {
                         index.scan_file(&target, &[], true, &mut visited)?;
                         if let Some(name) = &bin.name {
-                            index.scan_file(&target, &[name.clone()], true, &mut visited)?;
+                            index.scan_file(
+                                &target,
+                                std::slice::from_ref(name),
+                                true,
+                                &mut visited,
+                            )?;
                         }
                     }
                 }
@@ -333,7 +343,7 @@ impl CrateIndex {
                         index.mods.insert(vec![name.clone()]);
                         index.mods.insert(vec!["tests".to_string(), name.clone()]);
                         index.scan_file(&target, &[], true, &mut visited)?;
-                        index.scan_file(&target, &[name.clone()], true, &mut visited)?;
+                        index.scan_file(&target, std::slice::from_ref(name), true, &mut visited)?;
                         index.scan_file(
                             &target,
                             &["tests".to_string(), name.clone()],
@@ -380,8 +390,13 @@ impl CrateIndex {
                         index.mods.insert(vec![name.clone()]);
                         index.mods.insert(vec!["tests".to_string(), name.clone()]);
                         index.scan_file(&entry, &[], true, &mut visited)?;
-                        index.scan_file(&entry, &[name.clone()], true, &mut visited)?;
-                        index.scan_file(&entry, &["tests".to_string(), name], true, &mut visited)?;
+                        index.scan_file(&entry, std::slice::from_ref(&name), true, &mut visited)?;
+                        index.scan_file(
+                            &entry,
+                            &["tests".to_string(), name],
+                            true,
+                            &mut visited,
+                        )?;
                     }
                 } else if entry.is_dir()
                     && let Some(dir_name) = entry.file_name().and_then(|s| s.to_str())
@@ -393,7 +408,12 @@ impl CrateIndex {
                             index.mods.insert(vec![name.clone()]);
                             index.mods.insert(vec!["tests".to_string(), name.clone()]);
                             index.scan_file(&root_rs, &[], true, &mut visited)?;
-                            index.scan_file(&root_rs, &[name.clone()], true, &mut visited)?;
+                            index.scan_file(
+                                &root_rs,
+                                std::slice::from_ref(&name),
+                                true,
+                                &mut visited,
+                            )?;
                             index.scan_file(
                                 &root_rs,
                                 &["tests".to_string(), name],
@@ -422,25 +442,20 @@ impl CrateIndex {
             return Ok(());
         }
 
-        let content = fs::read_to_string(file_path).map_err(|source| {
-            BindingResolutionError::Io {
+        let content =
+            fs::read_to_string(file_path).map_err(|source| BindingResolutionError::Io {
                 path: file_path.to_path_buf(),
                 source,
-            }
-        })?;
-        let stream =
-            content
-                .parse::<TokenStream>()
-                .map_err(|err| BindingResolutionError::Lex {
-                    path: file_path.to_path_buf(),
-                    reason: err.to_string(),
-                })?;
+            })?;
+        let stream = content
+            .parse::<TokenStream>()
+            .map_err(|err| BindingResolutionError::Lex {
+                path: file_path.to_path_buf(),
+                reason: err.to_string(),
+            })?;
 
         let file_dir = file_path.parent().unwrap_or(file_path);
-        let stem = file_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let is_root_or_mod = is_crate_root || matches!(stem, "lib" | "main" | "mod");
 
         self.scan_tokens(stream, file_dir, stem, is_root_or_mod, prefix, visited)
@@ -714,9 +729,9 @@ fn extract_embedded_carrick_targets(text: &str) -> Vec<(bool, String, String)> {
         };
         let start = idx + rel;
         let prev_ok = start == 0
-            || bytes.get(start - 1).is_none_or(|&b| {
-                !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            });
+            || bytes
+                .get(start - 1)
+                .is_none_or(|&b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
         let is_doctest = start >= "doctest:".len()
             && text.get(start - "doctest:".len()..start) == Some("doctest:")
             && (start == "doctest:".len()
@@ -851,4 +866,122 @@ fn split_segments(path: &str) -> Vec<String> {
         .filter(|seg| !seg.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_registry_with_bindings(
+        root: &Path,
+        vm_free_entry: &str,
+        embed_entry: &str,
+    ) -> Result<ContractRegistry, Box<dyn std::error::Error>> {
+        let contracts_dir = root.join("conformance-contracts/contracts");
+        fs::create_dir_all(&contracts_dir)?;
+        fs::write(
+            root.join("conformance-contracts/surfaces.toml"),
+            "schema_version = 1\nsurfaces = []\n",
+        )?;
+        let contract = format!(
+            r#"schema_version = 1
+id = "test.binding.resolution"
+title = "Binding resolution unit fixture"
+guest_surfaces = ["syscall:futex"]
+semantic_authority = ["man 2 futex"]
+fixture = "unit:binding-resolution"
+scale_points = [1, 2, 4]
+structural_budgets = []
+rationale = "Verify BindingResolver against existing crates with real vs nonexistent modules."
+
+[bindings]
+vm_free = [
+  "{vm_free_entry}",
+]
+embed = [
+  "{embed_entry}",
+]
+docker = [
+  "probe:futexpingpong",
+]
+"#
+        );
+        fs::write(contracts_dir.join("resolution.toml"), contract)?;
+        Ok(ContractRegistry::load(root)?)
+    }
+
+    fn seed_workspace_crates(root: &Path) -> Result<(), std::io::Error> {
+        let vm_free_src = root.join("crates/carrick-sample/src");
+        fs::create_dir_all(&vm_free_src)?;
+        fs::write(
+            vm_free_src.join("lib.rs"),
+            "pub mod real_module {\n    #[cfg(test)]\n    pub mod tests {\n        pub fn real_witness() {}\n    }\n}\n",
+        )?;
+
+        let embed_tests = root.join("crates/carrick-embed/tests");
+        fs::create_dir_all(&embed_tests)?;
+        fs::write(
+            root.join("crates/carrick-embed/src/lib.rs"),
+            "// library root\n",
+        )
+        .or_else(|_| {
+            fs::create_dir_all(root.join("crates/carrick-embed/src"))?;
+            fs::write(
+                root.join("crates/carrick-embed/src/lib.rs"),
+                "// library root\n",
+            )
+        })?;
+        fs::write(
+            embed_tests.join("real_embed.rs"),
+            "pub fn embed_witness() {}\n",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn real_crate_and_module_targets_pass_and_made_up_module_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new()?;
+        seed_workspace_crates(temp.path())?;
+
+        let valid_registry = write_registry_with_bindings(
+            temp.path(),
+            "carrick-sample::real_module::tests::real_witness",
+            "carrick-embed::real_embed::embed_witness",
+        )?;
+        BindingResolver::new(temp.path()).check_registry(&valid_registry)?;
+
+        let bad_vm_free_registry = write_registry_with_bindings(
+            temp.path(),
+            "carrick-sample::made_up_module::tests::real_witness",
+            "carrick-embed::real_embed::embed_witness",
+        )?;
+        let vm_free_err = BindingResolver::new(temp.path()).check_registry(&bad_vm_free_registry);
+        assert!(matches!(
+            vm_free_err,
+            Err(BindingResolutionError::UnresolvedTarget {
+                layer: ExecutionLayer::VmFree,
+                ref target,
+                ..
+            }) if target == "carrick-sample::made_up_module::tests::real_witness"
+        ));
+
+        let bad_embed_registry = write_registry_with_bindings(
+            temp.path(),
+            "carrick-sample::real_module::tests::real_witness",
+            "carrick-embed::made_up_embed_module::embed_witness",
+        )?;
+        let embed_err = BindingResolver::new(temp.path()).check_registry(&bad_embed_registry);
+        assert!(matches!(
+            embed_err,
+            Err(BindingResolutionError::UnresolvedTarget {
+                layer: ExecutionLayer::EmbedStructural,
+                ref target,
+                ..
+            }) if target == "carrick-embed::made_up_embed_module::embed_witness"
+        ));
+
+        Ok(())
+    }
 }

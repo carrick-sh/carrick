@@ -14,8 +14,7 @@ embed = [
   "carrick-conformance-next::deferred_anonymous_unaligned_discard",
 ]
 docker = [
-  "Same-source fixtures/unaligned_discard.py; pinned native ARM64 cpython-test image",
-  "discard-edges/oracle.json",
+  "Same-source fixtures/unaligned_discard.py; pinned native ARM64 cpython-test image; discard-edges/oracle.json",
 ]
 [bindings.unresolved]
 production_carrier = "VM-free physical alias and inventory retirement failure injection remains pending."

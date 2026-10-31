@@ -11,18 +11,18 @@ rationale = "The loader consumes retained filesystem and source capabilities rat
 [bindings]
 vm_free = [
   "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_keep_two_callers_without_host_task_bindings",
-  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_legacy_file_survives_last_descriptor_close",
-  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_magic_error_never_falls_back_to_host_alias",
-  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_memory_permission_follows_unlinked_inode",
-  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_proc_fd_keeps_memory_file_contents",
-  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_proc_fd_retains_open_inode_after_name_replacement",
+  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_resolve_nonleader_thread_self_after_task_release",
   "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_reject_foreign_context",
   "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_reject_predecessor_context_after_exec",
+  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_legacy_file_survives_last_descriptor_close",
+  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_memory_permission_follows_unlinked_inode",
   "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_resolve_dotdot_after_symlink",
-  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_resolve_nonleader_thread_self_after_task_release",
+  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_magic_error_never_falls_back_to_host_alias",
   "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_validate_raw_path_before_normalization",
-  "carrick-kernel::dispatch::executable_authority::tests::proc_exe_fd_keeps_original_source_after_process_exec_identity_changes",
+  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_proc_fd_retains_open_inode_after_name_replacement",
+  "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_proc_fd_keeps_memory_file_contents",
   "carrick-kernel::dispatch::executable_authority::tests::retained_host_source_rechecks_execute_mode_on_exact_object",
+  "carrick-kernel::dispatch::executable_authority::tests::proc_exe_fd_keeps_original_source_after_process_exec_identity_changes",
   "carrick-runtime::runtime::exec::tests",
 ]
 

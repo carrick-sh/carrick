@@ -306,7 +306,7 @@ surfaces = [
 }
 
 #[test]
-fn unsorted_surfaces_and_bindings_are_rejected() {
+fn unsorted_surfaces_are_rejected_and_neighbor_ordered_bindings_load() {
     let unsorted_surfaces = r#"schema_version = 1
 surfaces = [
   { path = "crates/z.rs", contract = "kernel.futex.contention" },
@@ -320,36 +320,24 @@ surfaces = [
             if previous_path == "crates/z.rs" && current_path == "crates/a.rs"
     ));
 
-    // Primary binding at [0] may precede alphabetically earlier follow-up bindings,
-    // provided follow-up bindings [1..] are sorted.
-    let valid_primary_plus_sorted_tail = COMPLETE_CONTRACT.replace(
-        "  \"carrick-kernel-example::futex_contention_contract\",",
-        "  \"carrick-z-primary::futex_contention_contract\",\n  \"carrick-a::follow_up\",\n  \"carrick-b::follow_up\",",
-    );
-    let root = fixture_root(&valid_primary_plus_sorted_tail, EMPTY_SURFACES);
-    ContractRegistry::load(root.path()).expect("primary + sorted tail loads");
-
-    let unsorted_tail = COMPLETE_CONTRACT.replace(
-        "  \"carrick-kernel-example::futex_contention_contract\",",
-        "  \"carrick-z-primary::futex_contention_contract\",\n  \"carrick-b::follow_up\",\n  \"carrick-a::follow_up\",",
-    );
-    let root = fixture_root(&unsorted_tail, EMPTY_SURFACES);
-    assert!(matches!(
-        ContractRegistry::load(root.path()),
-        Err(RegistryError::UnsortedBindingEntries { id, .. })
-            if id.as_str() == "kernel.futex.contention"
-    ));
-
-    let unsorted_ecosystem = COMPLETE_CONTRACT.replace(
-        "  \"cpython:concurrent_futures\",\n  \"go:sync\",",
-        "  \"go:sync\",\n  \"cpython:concurrent_futures\",",
-    );
-    let root = fixture_root(&unsorted_ecosystem, EMPTY_SURFACES);
-    assert!(matches!(
-        ContractRegistry::load(root.path()),
-        Err(RegistryError::UnsortedBindingEntries { id, .. })
-            if id.as_str() == "kernel.futex.contention"
-    ));
+    // Contracts whose entries refer to neighbouring bindings above/below retain
+    // their intentional declaration order rather than being forced into lexical sort.
+    let neighbor_ordered = COMPLETE_CONTRACT
+        .replace(
+            "  \"carrick-kernel-example::futex_contention_contract\",",
+            "  \"carrick-z-primary::futex_contention_contract\",\n  \"carrick-m::semantic_witness\",\n  \"carrick-a::layout_witness (existing semantic and work bindings above remain required)\",",
+        )
+        .replace(
+            "  \"cpython:concurrent_futures\",\n  \"go:sync\",",
+            "  \"go:sync\",\n  \"cpython:concurrent_futures\",",
+        );
+    let root = fixture_root(&neighbor_ordered, EMPTY_SURFACES);
+    let loaded = ContractRegistry::load(root.path()).expect("neighbor-ordered bindings load");
+    let contract = loaded
+        .require("kernel.futex.contention")
+        .expect("futex contract");
+    assert_eq!(contract.bindings.vm_free.len(), 3);
+    assert_eq!(contract.bindings.vm_free[1], "carrick-m::semantic_witness");
 }
 
 #[test]

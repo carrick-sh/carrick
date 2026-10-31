@@ -850,16 +850,16 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             ),
             encoding="utf-8",
         )
-        secondary_test = self.repo / "crates" / "carrick-secondary" / "tests" / "extra.rs"
-        secondary_test.parent.mkdir(parents=True, exist_ok=True)
-        secondary_test.write_text("// initial secondary test\n", encoding="utf-8")
-        self.add_surface("crates/carrick-secondary/tests/extra.rs", "kernel.futex.contention")
-        # Re-write surfaces with contracts = [] for secondary_test so adding it in base doesn't make it unit evidence on futex.
+        # Use `/contracts.rs` rather than `/tests/` so `is_evidence_path` reaches
+        # the `bindings` `[0]` crate check instead of the generic `/tests/` rule.
+        secondary_contracts = self.repo / "crates" / "carrick-secondary" / "src" / "contracts.rs"
+        secondary_contracts.parent.mkdir(parents=True, exist_ok=True)
+        secondary_contracts.write_text("// initial secondary contract helper\n", encoding="utf-8")
         (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
             "schema_version = 1\n"
             "surfaces = [\n"
             '  { path = "crates/carrick-kernel/src/dispatch/futex.rs", contract = "kernel.futex.contention" },\n'
-            '  { path = "crates/carrick-secondary/tests/extra.rs", contracts = [] },\n'
+            '  { path = "crates/carrick-secondary/src/contracts.rs", contracts = [] },\n'
             "]\n",
             encoding="utf-8",
         )
@@ -869,14 +869,36 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
         ).strip()
 
-        # Editing only the secondary binding's crate must NOT satisfy primary evidence for futex.rs.
+        # Editing only the secondary `[1]` binding's `/contracts.rs` must NOT satisfy primary evidence.
         self.guest_file.write_text("// modified futex implementation\n", encoding="utf-8")
-        secondary_test.write_text("// modified secondary test only\n", encoding="utf-8")
+        secondary_contracts.write_text("// modified secondary contract helper only\n", encoding="utf-8")
         subprocess.run(["git", "commit", "-am", "touch secondary crate only"], cwd=self.repo, check=True)
 
         res = self.run_check(base_sha=seeded_base)
         self.assertEqual(res.returncode, 1)
         self.assertIn("uncovered guest surface", res.stderr)
+
+        # Positive control: when `carrick-secondary` is `[0]` (primary), `/contracts.rs` DOES count.
+        contract_file.write_text(
+            contract_file.read_text(encoding="utf-8").replace(
+                '  "carrick-kernel-example::futex_contention_contract",\n'
+                '  "carrick-secondary::extra_binding",\n',
+                '  "carrick-secondary::extra_binding",\n'
+                '  "carrick-kernel-example::futex_contention_contract",\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "promote secondary to primary [0]"], cwd=self.repo, check=True)
+        promoted_base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+        self.guest_file.write_text("// modified futex implementation again\n", encoding="utf-8")
+        secondary_contracts.write_text("// modified primary contract helper\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "touch promoted primary crate"], cwd=self.repo, check=True)
+
+        res_primary = self.run_check(base_sha=promoted_base)
+        self.assertEqual(res_primary.returncode, 0, msg=f"stdout={res_primary.stdout}\nstderr={res_primary.stderr}")
 
     def test_empty_contracts_surface_marker_classifies_new_file(self):
         new_file = self.repo / "crates" / "carrick-core" / "src" / "new_substrate.rs"
