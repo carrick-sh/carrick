@@ -164,57 +164,35 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
         }
         SoftCpuExit::Sensitive { rip, next_rip, op } => {
             let ctx = cpu.context_mut();
-            let mask_val = |size: u8, raw: u64| -> u32 {
-                match size {
-                    1 => (raw & 0xff) as u32,
-                    2 => (raw & 0xffff) as u32,
-                    _ => (raw & 0xffff_ffff) as u32,
-                }
+            let dx_port = (ctx.gpr[reg::RDX] & 0xffff) as u16;
+            let (is_out, port, size) = match op {
+                SensitiveOp::OutImm { port, size } => (true, u16::from(port), size),
+                SensitiveOp::OutDx { size } => (true, dx_port, size),
+                SensitiveOp::InImm { port, size } => (false, u16::from(port), size),
+                SensitiveOp::InDx { size } => (false, dx_port, size),
+                _ => return Some(SoftMachineExit::UnhandledSensitive { rip, next_rip, op }),
             };
-            match op {
-                SensitiveOp::OutImm { port, size } => {
-                    let value = mask_val(size, ctx.gpr[reg::RAX]);
-                    ctx.rip = next_rip;
-                    Some(SoftMachineExit::IoOut {
-                        rip,
-                        next_rip,
-                        port: u16::from(port),
-                        size,
-                        value,
-                    })
-                }
-                SensitiveOp::OutDx { size } => {
-                    let port = (ctx.gpr[reg::RDX] & 0xffff) as u16;
-                    let value = mask_val(size, ctx.gpr[reg::RAX]);
-                    ctx.rip = next_rip;
-                    Some(SoftMachineExit::IoOut {
-                        rip,
-                        next_rip,
-                        port,
-                        size,
-                        value,
-                    })
-                }
-                SensitiveOp::InImm { port, size } => {
-                    ctx.rip = next_rip;
-                    Some(SoftMachineExit::IoIn {
-                        rip,
-                        next_rip,
-                        port: u16::from(port),
-                        size,
-                    })
-                }
-                SensitiveOp::InDx { size } => {
-                    let port = (ctx.gpr[reg::RDX] & 0xffff) as u16;
-                    ctx.rip = next_rip;
-                    Some(SoftMachineExit::IoIn {
-                        rip,
-                        next_rip,
-                        port,
-                        size,
-                    })
-                }
-                _ => Some(SoftMachineExit::UnhandledSensitive { rip, next_rip, op }),
+            ctx.rip = next_rip;
+            if is_out {
+                let value = match size {
+                    1 => (ctx.gpr[reg::RAX] & 0xff) as u32,
+                    2 => (ctx.gpr[reg::RAX] & 0xffff) as u32,
+                    _ => (ctx.gpr[reg::RAX] & 0xffff_ffff) as u32,
+                };
+                Some(SoftMachineExit::IoOut {
+                    rip,
+                    next_rip,
+                    port,
+                    size,
+                    value,
+                })
+            } else {
+                Some(SoftMachineExit::IoIn {
+                    rip,
+                    next_rip,
+                    port,
+                    size,
+                })
             }
         }
     }

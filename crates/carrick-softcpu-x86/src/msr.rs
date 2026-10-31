@@ -248,21 +248,7 @@ impl MsrFile {
                 }
                 self.efer = next_efer;
             }
-            MSR_IA32_STAR => {
-                self.star = value;
-            }
-            MSR_IA32_LSTAR => {
-                if !is_canonical_va(value) {
-                    return Err(MsrError::GeneralProtection);
-                }
-                self.lstar = value;
-            }
-            MSR_IA32_CSTAR => {
-                if !is_canonical_va(value) {
-                    return Err(MsrError::GeneralProtection);
-                }
-                self.cstar = value;
-            }
+            MSR_IA32_STAR => self.star = value,
             MSR_IA32_FMASK => {
                 // SDM Vol. 4 IA32_FMASK: bits [63:32] are reserved and must be zero.
                 if (value >> 32) != 0 {
@@ -270,23 +256,21 @@ impl MsrFile {
                 }
                 self.fmask = value;
             }
-            MSR_IA32_FS_BASE => {
+            MSR_IA32_LSTAR
+            | MSR_IA32_CSTAR
+            | MSR_IA32_FS_BASE
+            | MSR_IA32_GS_BASE
+            | MSR_IA32_KERNEL_GS_BASE => {
                 if !is_canonical_va(value) {
                     return Err(MsrError::GeneralProtection);
                 }
-                self.fs_base = value;
-            }
-            MSR_IA32_GS_BASE => {
-                if !is_canonical_va(value) {
-                    return Err(MsrError::GeneralProtection);
+                match index {
+                    MSR_IA32_LSTAR => self.lstar = value,
+                    MSR_IA32_CSTAR => self.cstar = value,
+                    MSR_IA32_FS_BASE => self.fs_base = value,
+                    MSR_IA32_GS_BASE => self.gs_base = value,
+                    _ => self.kernel_gs_base = value,
                 }
-                self.gs_base = value;
-            }
-            MSR_IA32_KERNEL_GS_BASE => {
-                if !is_canonical_va(value) {
-                    return Err(MsrError::GeneralProtection);
-                }
-                self.kernel_gs_base = value;
             }
             _ => return Err(MsrError::GeneralProtection),
         }
