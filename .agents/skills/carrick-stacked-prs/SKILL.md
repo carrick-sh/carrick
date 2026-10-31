@@ -78,14 +78,21 @@ gh stack view                                 # layers, PRs and their state
       commits.
    4. Rebase the top branch onto the current main tip and push it with the
       normal hook. Check that the rebase changed only what main changed
-      since the signed gate's base: the patch-ids of
-      `git diff <gated merge> HEAD` and `git diff <gated base> origin/main`
-      must match.
+      since the signed gate's base. `<signed>` is the commit the signed gate
+      ran on (the batch merge of the top onto `<signed base>`). These two
+      must print the same hash:
+
+      ```bash
+      git diff <signed> HEAD | git patch-id --stable | awk '{print $1}' | sort | md5sum
+      git diff <signed base> origin/main | git patch-id --stable | awk '{print $1}' | sort | md5sum
+      ```
    5. When `ci-ok` is green on that exact head, admin-merge it:
       `gh pr merge <top> --admin --rebase`. That skips the merge-group-only
-      jobs (`macos-build`, `macos-clippy`, `macos-authority`, the KVM gate),
-      so confirm the PR's own CI covered those surfaces first. Without that
-      proof, enqueue the top PR as an ordinary PR.
+      jobs (`macos-build`, `macos-clippy`, `macos-authority`) and the KVM
+      gate, which PRs never run. Admin-merge only stacks that touch no x86,
+      KVM, HAL or CPL0 code; enqueue those stacks instead, or attach a
+      `kvm-tests` run on the exact head. Without the proof, enqueue the top
+      PR as an ordinary PR.
    6. Close the lower PRs with "landed via #top", and close their issues.
 
    Traps:
