@@ -93,13 +93,17 @@ pub const CTX_TLB_WRITE_OFF: usize = CTX_TLB_READ_OFF + SoftTlb::WRITE_PLANE_OFF
 pub enum X86ExceptionVector {
     DivideError = 0,
     Debug = 1,
-    AlignmentCheck = 17,
     Breakpoint = 3,
-    SimdFloatingPoint = 19,
-    X87FloatingPoint = 16,
     InvalidOpcode = 6,
+    DoubleFault = 8,
+    InvalidTss = 10,
+    SegmentNotPresent = 11,
+    StackSegmentFault = 12,
     GeneralProtection = 13,
     PageFault = 14,
+    X87FloatingPoint = 16,
+    AlignmentCheck = 17,
+    SimdFloatingPoint = 19,
 }
 
 /// Typed architectural exception raised by guest execution without host signals.
@@ -131,8 +135,28 @@ impl X86Exception {
         Self::new(X86ExceptionVector::DivideError, rip, None, None)
     }
     #[must_use]
+    pub const fn debug(rip: u64) -> Self {
+        Self::new(X86ExceptionVector::Debug, rip, None, None)
+    }
+    #[must_use]
     pub const fn invalid_opcode(rip: u64) -> Self {
         Self::new(X86ExceptionVector::InvalidOpcode, rip, None, None)
+    }
+    #[must_use]
+    pub const fn double_fault(rip: u64) -> Self {
+        Self::new(X86ExceptionVector::DoubleFault, rip, Some(0), None)
+    }
+    #[must_use]
+    pub const fn invalid_tss(rip: u64, code: u32) -> Self {
+        Self::new(X86ExceptionVector::InvalidTss, rip, Some(code), None)
+    }
+    #[must_use]
+    pub const fn segment_not_present(rip: u64, code: u32) -> Self {
+        Self::new(X86ExceptionVector::SegmentNotPresent, rip, Some(code), None)
+    }
+    #[must_use]
+    pub const fn stack_segment_fault(rip: u64, code: u32) -> Self {
+        Self::new(X86ExceptionVector::StackSegmentFault, rip, Some(code), None)
     }
     #[must_use]
     pub const fn general_protection(rip: u64, code: u32) -> Self {
@@ -141,6 +165,118 @@ impl X86Exception {
     #[must_use]
     pub const fn page_fault(rip: u64, code: u32, cr2: u64) -> Self {
         Self::new(X86ExceptionVector::PageFault, rip, Some(code), Some(cr2))
+    }
+}
+
+/// Architectural `GDTR`/`IDTR` 10-byte pseudo-descriptor (`u16` byte limit + 64-bit linear base).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DescriptorTablePtr {
+    pub limit: u16,
+    pub base: u64,
+}
+
+impl DescriptorTablePtr {
+    #[must_use]
+    pub const fn new(limit: u16, base: u64) -> Self {
+        Self { limit, base }
+    }
+}
+
+/// Hidden segment descriptor cache (`CS`, `SS`, `DS`, `ES`, `FS`, `GS`, `LDTR`, `TR`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SoftSegment {
+    pub selector: u16,
+    pub base: u64,
+    pub limit: u32,
+    /// VMX-formatted access rights: bits `[7:0]` = Type/S/DPL/P, bits `[15:12]` = AVL/L/DB/G, bit 16 = unusable.
+    pub ar: u32,
+}
+
+impl SoftSegment {
+    pub const UNUSABLE_BIT: u32 = 1 << 16;
+
+    #[must_use]
+    pub const fn unusable() -> Self {
+        Self {
+            selector: 0,
+            base: 0,
+            limit: 0,
+            ar: Self::UNUSABLE_BIT,
+        }
+    }
+
+    #[must_use]
+    pub const fn kernel_code64(selector: u16) -> Self {
+        Self {
+            selector: selector & !3,
+            base: 0,
+            limit: 0xffff_ffff,
+            ar: 0xa09b,
+        }
+    }
+
+    #[must_use]
+    pub const fn kernel_data(selector: u16) -> Self {
+        Self {
+            selector: selector & !3,
+            base: 0,
+            limit: 0xffff_ffff,
+            ar: 0xc093,
+        }
+    }
+
+    #[must_use]
+    pub const fn user_code64(selector: u16) -> Self {
+        Self {
+            selector: selector | 3,
+            base: 0,
+            limit: 0xffff_ffff,
+            ar: 0xa0fb,
+        }
+    }
+
+    #[must_use]
+    pub const fn user_data(selector: u16) -> Self {
+        Self {
+            selector: selector | 3,
+            base: 0,
+            limit: 0xffff_ffff,
+            ar: 0xc0f3,
+        }
+    }
+
+    #[must_use]
+    pub const fn tss64_busy(selector: u16, base: u64, limit: u32) -> Self {
+        Self {
+            selector: selector & !3,
+            base,
+            limit,
+            ar: 0x008b,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_unusable(self) -> bool {
+        (self.ar & Self::UNUSABLE_BIT) != 0
+    }
+
+    #[must_use]
+    pub const fn is_present(self) -> bool {
+        !self.is_unusable() && (self.ar & (1 << 7)) != 0
+    }
+
+    #[must_use]
+    pub const fn dpl(self) -> u8 {
+        ((self.ar >> 5) & 3) as u8
+    }
+
+    #[must_use]
+    pub const fn is_64bit_code(self) -> bool {
+        !self.is_unusable()
+            && (self.ar & (1 << 4)) != 0
+            && (self.ar & (1 << 3)) != 0
+            && (self.ar & (1 << 13)) != 0
+            && (self.ar & (1 << 14)) == 0
     }
 }
 
@@ -241,6 +377,22 @@ pub struct SoftCpuContext {
     pub x87_data_selector: u16,
     /// Membership in the physical inventory's invalidation domain.
     pub(crate) seat: SoftVcpuSeat,
+    /// Architectural MSR register file backing `RDMSR`, `WRMSR`, `SWAPGS`, `SYSCALL`, and `SYSRET`.
+    pub msrs: crate::msr::MsrFile,
+    pub cr8: u64,
+    pub dr: [u64; 8],
+    pub gdtr: DescriptorTablePtr,
+    pub idtr: DescriptorTablePtr,
+    pub cs: SoftSegment,
+    pub ss: SoftSegment,
+    pub ds: SoftSegment,
+    pub es: SoftSegment,
+    pub fs: SoftSegment,
+    pub gs: SoftSegment,
+    pub ldtr: SoftSegment,
+    pub tr: SoftSegment,
+    pub halted: bool,
+    msr_mirrors: (u64, u64, u64, u64),
 }
 
 const _: () = {
@@ -328,6 +480,8 @@ impl SoftCpuContext {
         // never replaces either, preserving their 1:1 pairing.
         let seat = unsafe { extents.register_vcpu_unguarded(&mut tlb) }?;
         let gw = gateway_trampolines().ok();
+        let msrs = crate::msr::MsrFile::new();
+        let efer = msrs.efer;
         let mut ctx = Self {
             gpr: [0; 16],
             rip: 0,
@@ -361,7 +515,7 @@ impl SoftCpuContext {
             cr2: 0,
             cr3: 0,
             cr4: 0x0034_06f0,
-            efer: 0x0d01,
+            efer,
             block_start_va: 0,
             pending_exception: None,
             bounce_writeback: BounceWriteback::default(),
@@ -375,6 +529,26 @@ impl SoftCpuContext {
             x87_code_selector: 0,
             x87_data_selector: 0,
             seat,
+            msrs,
+            cr8: 0,
+            dr: [0, 0, 0, 0, 0, 0, 0xffff_0ff0, 0x0000_0400],
+            gdtr: DescriptorTablePtr::default(),
+            idtr: DescriptorTablePtr::default(),
+            cs: SoftSegment::user_code64(0x23),
+            ss: SoftSegment::user_data(0x1b),
+            ds: SoftSegment::unusable(),
+            es: SoftSegment::unusable(),
+            fs: SoftSegment::unusable(),
+            gs: SoftSegment::unusable(),
+            ldtr: SoftSegment::unusable(),
+            tr: SoftSegment {
+                selector: 0,
+                base: 0,
+                limit: 0xffff,
+                ar: 0x008b,
+            },
+            halted: false,
+            msr_mirrors: (efer, 0, 0, 0),
         };
         ctx.sync_tlb_tag_bits();
         Ok(ctx)
@@ -390,8 +564,60 @@ impl SoftCpuContext {
         self.tlb.flush_all();
     }
 
+    /// `invlpg`-style local eviction of one 4 KiB linear page in this CPU's TLB.
+    pub fn evict_tlb_va(&mut self, va: u64) {
+        self.tlb.evict_va(crate::mmu::GuestVa::new(va));
+    }
+
     pub fn reset_tlb_stats(&mut self) {
         self.tlb.reset_stats();
+    }
+
+    /// Synchronize direct field mutations (`efer`, `fs_base`, `gs_base`, `kernel_gs_base`)
+    /// with `self.msrs` so JIT fast-path fields and MSR reads/writes remain coherent.
+    pub fn sync_msr_mirrors(&mut self) {
+        let (last_efer, last_fs, last_gs, last_kgs) = self.msr_mirrors;
+        if self.efer != last_efer {
+            self.msrs.efer = self.efer;
+        } else if self.msrs.efer != last_efer {
+            self.efer = self.msrs.efer;
+        }
+        if self.fs_base != last_fs {
+            self.msrs.fs_base = self.fs_base;
+        } else if self.msrs.fs_base != last_fs {
+            self.fs_base = self.msrs.fs_base;
+        }
+        if self.gs_base != last_gs {
+            self.msrs.gs_base = self.gs_base;
+        } else if self.msrs.gs_base != last_gs {
+            self.gs_base = self.msrs.gs_base;
+        }
+        if self.kernel_gs_base != last_kgs {
+            self.msrs.kernel_gs_base = self.kernel_gs_base;
+        } else if self.msrs.kernel_gs_base != last_kgs {
+            self.kernel_gs_base = self.msrs.kernel_gs_base;
+        }
+        self.fs.base = self.fs_base;
+        self.gs.base = self.gs_base;
+        self.msr_mirrors = (self.efer, self.fs_base, self.gs_base, self.kernel_gs_base);
+        self.walker.set_nxe((self.efer & crate::msr::EFER_NXE) != 0);
+        self.sync_tlb_tag_bits();
+    }
+
+    /// Publish MSR file values into the context's fast-path mirror fields after an MSR mutation.
+    pub(crate) fn commit_msrs(&mut self, flush_tlb: bool) {
+        self.efer = self.msrs.efer;
+        self.fs_base = self.msrs.fs_base;
+        self.gs_base = self.msrs.gs_base;
+        self.kernel_gs_base = self.msrs.kernel_gs_base;
+        self.fs.base = self.fs_base;
+        self.gs.base = self.gs_base;
+        self.msr_mirrors = (self.efer, self.fs_base, self.gs_base, self.kernel_gs_base);
+        self.walker.set_nxe((self.efer & crate::msr::EFER_NXE) != 0);
+        self.sync_tlb_tag_bits();
+        if flush_tlb {
+            self.flush_tlb();
+        }
     }
 
     /// This CPU's membership in its inventory's invalidation domain.
@@ -516,7 +742,7 @@ impl SoftCpuContext {
     #[inline]
     #[must_use]
     pub const fn root_gpa(&self) -> Option<RootGpa> {
-        RootGpa::page_aligned(FrameGpa::new(self.cr3 & SOFT_TLB_PAGE_MASK))
+        RootGpa::page_aligned(FrameGpa::new(self.cr3 & 0x000f_ffff_ffff_f000))
     }
 
     #[inline]
@@ -535,6 +761,22 @@ impl SoftCpuContext {
             cr4_smap: (self.cr4 & (1 << 21)) != 0,
             efer_nxe: (self.efer & (1 << 11)) != 0,
             stack_access: false,
+        }
+    }
+
+    /// Implicit supervisor-mode access rights for hardware descriptor/TSS/IDT walks
+    /// (Intel SDM Vol. 3A §4.6.1: `Ring0` with `EFLAGS.AC` ignored under `CR4.SMAP`).
+    #[inline]
+    #[must_use]
+    pub const fn system_access_mode(&self) -> CpuAccessMode {
+        CpuAccessMode {
+            cpl: Cpl::Ring0,
+            ac: false,
+            cr0_wp: (self.cr0 & (1 << 16)) != 0,
+            cr4_smep: (self.cr4 & (1 << 20)) != 0,
+            cr4_smap: (self.cr4 & (1 << 21)) != 0,
+            efer_nxe: (self.efer & (1 << 11)) != 0,
+            stack_access: true,
         }
     }
 
