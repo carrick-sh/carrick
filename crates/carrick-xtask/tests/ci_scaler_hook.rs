@@ -251,7 +251,7 @@ fn agent_auth_provisions_all_worker_credentials_and_only_agy_for_loop() {
             r###"#!/bin/sh
 case " $* " in
   *collaborators/tjfontaine/permission*) echo '{"permission":"admin"}' ;;
-  *graphql*) printf '%s\n' '{"data":{"repository":{"issue":{"number":634,"author":{"login":"tjfontaine"},"lastEditedAt":null,"editor":null,"body":"## Brief\nImplement fixture"}}}}' ;;
+  *graphql*) printf '%s\n' '{"data":{"repository":{"issue":{"number":634,"author":{"login":"tjfontaine"},"title":"Fixture","lastEditedAt":null,"editor":null,"body":"## Brief\nImplement fixture","renames":{"pageInfo":{"hasPreviousPage":false},"nodes":[]}}}}}' ;;
   *) echo "fake gh: unexpected call: $*" >&2; exit 1 ;;
 esac
 "###,

@@ -467,11 +467,12 @@ fn loop_client_alias_sends_one_strict_json_request() {
     );
 }
 
-/// The guard's GraphQL issue-brief response for `issue`, unedited since filing.
+/// The guard's GraphQL issue-brief response for `issue`, unedited and unrenamed.
 fn issue_brief(issue: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"data":{"repository":{"issue":{"number":issue["number"],
-        "author":{"login":issue["user"]["login"]},"lastEditedAt":null,"editor":null,
-        "body":issue["body"]}}}})
+        "author":{"login":issue["user"]["login"]},"title":issue["title"],
+        "lastEditedAt":null,"editor":null,"body":issue["body"],
+        "renames":{"pageInfo":{"hasPreviousPage":false},"nodes":[]}}}}})
 }
 
 #[test]

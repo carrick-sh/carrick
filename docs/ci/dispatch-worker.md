@@ -32,15 +32,21 @@ end-of-body, and still match the original webhook when admission fetches it.
 Edited events and triggers from anyone without write access are refused.
 
 The approval covers only issue text a collaborator saw or wrote. On every
-path that turns an issue body into the worker's brief (label, `/agent` on the
-issue, `/agent` or a review on an owned dispatch PR, and adoption), the guard
-and clone admission read the body through GraphQL together with
-`lastEditedAt` and `editor`, and use that body as the brief. The body is
-accepted only if it was never edited since filing, or its last editor passes
-the same live write check. Otherwise the round is refused with "issue body
-was last edited by a non-collaborator; a collaborator must edit or re-file
-it". GraphQL errors and missing fields are refused too. The guard never
-parses issue structure. The
+path that admits an issue (label, `/agent` on the issue, `/agent` or a review
+on an owned dispatch PR, and adoption), the guard and clone admission read the
+issue's `title` and `body` in one GraphQL query together with `lastEditedAt`,
+`editor`, and the latest `RENAMED_TITLE_EVENT` timeline item, and populate
+`Dispatch.title` and `Dispatch.body` from that response. The body is accepted
+only if it was never edited since filing, or its last human editor passes the
+same live write check; otherwise the round is refused with "issue body was
+last edited by a non-collaborator; a collaborator must edit or re-file it".
+Because `lastEditedAt` tracks body edits only, the title is checked separately
+against the rename timeline and accepted only if the issue was never renamed,
+or the latest rename matches the current title and its human actor passes the
+same live write check; otherwise the round is refused with "issue title was
+last edited by a non-collaborator; a collaborator must retitle or re-file it".
+GraphQL errors, title mismatches and missing fields are refused too. The guard
+never parses issue structure. The
 loop reads the full issue, so #587's problem statement and acceptance need no
 special heading. Unclear work can finish blocked with a question for the requesting collaborator.
 

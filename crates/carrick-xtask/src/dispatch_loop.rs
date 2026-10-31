@@ -5264,8 +5264,8 @@ if test "$1 $2 $3" = 'api -X PATCH'; then
 fi
 if test "$1 $2" = 'api graphql' && test "$GH_TOKEN" = fixture-token; then
  case "$*" in *lastEditedAt*)
-  # The issue-brief read: the fixture issue, never edited since filing.
-  exec /usr/bin/python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); print(json.dumps({"data":{"repository":{"issue":{"number":i["number"],"author":{"login":i["user"]["login"]},"lastEditedAt":None,"editor":None,"body":i.get("body") or ""}}}}))' "$RUNNER_TEMP/issue.json" ;;
+  # The issue-brief read: the fixture issue, never edited or renamed since filing.
+  exec /usr/bin/python3 -c 'import json,sys; i=json.load(open(sys.argv[1])); print(json.dumps({"data":{"repository":{"issue":{"number":i["number"],"author":{"login":i["user"]["login"]},"title":i.get("title") or "","lastEditedAt":None,"editor":None,"body":i.get("body") or "","renames":{"pageInfo":{"hasPreviousPage":False},"nodes":[]}}}}}))' "$RUNNER_TEMP/issue.json" ;;
  esac
  echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[{"number":799,"repository":{"nameWithOwner":"carrick-sh/carrick"}}],"pageInfo":{"hasNextPage":false}},"bodyReferences":{"nodes":[{"number":799,"repository":{"nameWithOwner":"carrick-sh/carrick"}}],"pageInfo":{"hasNextPage":false}}}}}}'
  exit 0
