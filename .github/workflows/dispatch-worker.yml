@@ -11,11 +11,6 @@ on:
 permissions:
   contents: read
 
-# Issue events serialize by issue; reviews by head ref. The push lease closes cross-key races.
-concurrency:
-  group: dispatch-worker-${{ github.event.issue.number || github.event.pull_request.head.ref }}
-  cancel-in-progress: false
-
 jobs:
   guard:
     # Cheap pre-filter only (#1214). Comments and reviews need an OWNER, MEMBER or
@@ -27,6 +22,7 @@ jobs:
     outputs:
       base: ${{ steps.validate.outputs.base }}
       head: ${{ steps.validate.outputs.head }}
+      issue: ${{ steps.validate.outputs.issue }}
     steps:
       - name: Refuse stale owner reviews before checkout or build
         id: review-head
@@ -88,6 +84,13 @@ jobs:
 
   worker:
     needs: guard
+    # Workers serialize by dispatch issue (#1241). A trigger queued behind a
+    # running round collapses into it at start when that round's outcome
+    # lists it as seen; otherwise it runs. The push lease closes cross-key
+    # races.
+    concurrency:
+      group: dispatch-worker-${{ needs.guard.outputs.issue }}
+      cancel-in-progress: false
     runs-on: [carrick-agent]
     permissions:
       contents: write

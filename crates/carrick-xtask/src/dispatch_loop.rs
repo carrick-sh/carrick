@@ -1743,10 +1743,34 @@ impl Server<'_> {
         } else {
             status
         };
-        let checked = facts
+        let mut checked = facts
             .as_ref()
             .map(|f| format!("{}\n\n", f.report()))
             .unwrap_or_default();
+        super::round_inbox::pump_now();
+        let mailbox = super::round_inbox::log();
+        // Server-written, for the next round's consumption check: this
+        // round's trigger and what it took in. Only a Done round counts a
+        // comment as handled; a failed, stopped or fallback round lists
+        // everything as unseen, so a later round picks it up (#1241).
+        if let Some(url) = self.trigger["html_url"].as_str() {
+            checked.push_str(&format!("{TRIGGER_LINE}{url}\n"));
+        }
+        checked.push_str(&format!("{MAILBOX_HEADER}\n"));
+        for entry in &mailbox {
+            let seen = entry["received"]
+                .as_str()
+                .filter(|_| status == ContractStatus::Done);
+            checked.push_str(&format!(
+                "- {} ({}): {}\n",
+                entry["url"].as_str().unwrap_or_default(),
+                entry["created_at"].as_str().unwrap_or_default(),
+                seen.map_or("not yet seen by the coordinator".to_owned(), |t| {
+                    format!("seen by the coordinator at {t}")
+                })
+            ));
+        }
+        checked.push('\n');
         let applied = if let Some(reason) = unpushed.as_ref().or(stalled.as_ref()) {
             format!(
                 "Server observed: {reason}, so done is reported as blocked.\n\n{checked}{}",
@@ -1755,8 +1779,10 @@ impl Server<'_> {
         } else if observations.is_empty() {
             format!("{checked}{}", applied.report())
         } else {
+            // Every branch carries the server section: the next round's
+            // mailbox opening depends on it (#1252 review).
             format!(
-                "Server observed: {}.\n\n{}",
+                "Server observed: {}.\n\n{checked}{}",
                 observations.join("; "),
                 applied.report()
             )
@@ -1878,11 +1904,11 @@ impl Server<'_> {
             // One workflow file must not cost the rest of the work (#1225):
             // push everything else, and name what the owner must publish.
             match first {
-                Err(ScalerError::Usage(why)) if why.starts_with("Refused workflow changes") => {
+                Err(refused @ ScalerError::WorkflowRefused(..)) => {
                     let work = state.join("work");
                     let left = strip_workflow_changes(&work, &self.dispatch.base)?;
                     if left.is_empty() {
-                        return Err(ScalerError::Usage(why));
+                        return Err(refused);
                     }
                     refresh_checkpoint_head(&state, &work)?;
                     receipt = worker_checkpoint(&state, &self.dispatch)?
@@ -2031,7 +2057,7 @@ impl Server<'_> {
         Ok(json!({"ok":true}))
     }
     fn should_stop(&self) -> bool {
-        self.finished || self.used.finishes != 0
+        self.finished || self.used.finishes != 0 || super::round_inbox::stop_requested().is_some()
     }
     fn write_handoff(&self) -> Result<(), ScalerError> {
         let package = PathBuf::from(
@@ -2652,7 +2678,17 @@ impl Server<'_> {
             }
             Request::Comment(Comment { body }) => {
                 bounded_text(&body)?;
-                if body.contains("Outcome contract:") || body.contains("Publication receipt:") {
+                // Outcomes are the server's: a comment can't look like one,
+                // or claim a trigger was seen (#1241).
+                if body.contains("Outcome contract:")
+                    || body.contains("Publication receipt:")
+                    || body
+                        .lines()
+                        .any(|l| l.trim_start().starts_with("Dispatch outcome:"))
+                    || body.lines().any(|l| {
+                        l.trim() == MAILBOX_HEADER || l.trim_start().starts_with(TRIGGER_LINE)
+                    })
+                {
                     return Err(ScalerError::Guard(
                         "outcome contract and publication receipt markers are reserved for server reports",
                     ));
@@ -2705,6 +2741,16 @@ impl Server<'_> {
             }
         }
         let mut response = response;
+        // Owner comments that arrived since the last reply (#1241).
+        let inbox = super::round_inbox::take(&super::round_inbox::now_iso());
+        if !inbox.is_empty()
+            && let Some(object) = response.as_object_mut()
+        {
+            object.insert(
+                "inbox".into(),
+                json!({"note":"Comments the owner posted on this issue or PR since your previous call, oldest first.","comments":inbox}),
+            );
+        }
         redact_strings(&mut response, &self.token);
         let _ = loop_log(
             json!({"request":summary,"outcome":if response["ok"] == false { response["refusal"].clone() } else { json!("ok") },"duration_ms":started.elapsed().as_millis()}),
@@ -2883,6 +2929,157 @@ fn post_loop_capture(
     }
     capture
 }
+/// The outcome comment of an earlier round that took in `trigger`: a
+/// dispatch outcome after it, from the workflow bots, whose server-written
+/// "Owner comments during this round:" section lists it as seen by the
+/// coordinator (#1241). Only that section is read (the header line exactly,
+/// then its `- ` lines up to the first other line); model text in outcomes
+/// is quoted or inside JSON, so it can't add a line there.
+fn trigger_consumed(root: &Path, threads: &[u64], trigger: &str, since: &str) -> Option<String> {
+    let line = format!("- {trigger} (");
+    let seen_in = |body: &str| {
+        // The server's section precedes the `<details>` block, which embeds
+        // the worker's own contract text.
+        let mut lines = server_part(body)
+            .lines()
+            .skip_while(|l| *l != MAILBOX_HEADER);
+        lines.next().is_some()
+            && lines
+                .take_while(|l| l.starts_with("- "))
+                .any(|l| l.starts_with(&line) && l.contains("seen by the coordinator at"))
+    };
+    threads.iter().find_map(|n| {
+        list(root, &format!("repos/{REPOSITORY}/issues/{n}/comments"))
+            .ok()?
+            .into_iter()
+            .find(|c| {
+                matches!(
+                    c["user"]["login"].as_str(),
+                    Some("github-actions[bot]" | "carrick-workers[bot]")
+                ) && c["created_at"].as_str().is_some_and(|t| t >= since)
+                    && c["body"]
+                        .as_str()
+                        .is_some_and(|b| outcome_status(b).is_some() && seen_in(b))
+            })
+            .and_then(|c| c["html_url"].as_str().map(str::to_owned))
+    })
+}
+/// The header of the outcome's server-written mailbox section.
+const MAILBOX_HEADER: &str = "Owner comments during this round:";
+/// The outcome's server-written line naming the round's own trigger.
+const TRIGGER_LINE: &str = "Round trigger: ";
+
+/// The server-written part of a dispatch outcome: before `<details>`, which
+/// embeds the worker contract.
+fn server_part(body: &str) -> &str {
+    body.split("\n<details>").next().unwrap_or_default()
+}
+
+/// The status of a dispatch outcome comment (`Done`, `Blocked`, ...), from
+/// its `Dispatch outcome:` line in the server part; a warning such as "PR
+/// body needs manual repair" may come first.
+fn outcome_status(body: &str) -> Option<&str> {
+    server_part(body)
+        .lines()
+        .find_map(|l| l.strip_prefix("Dispatch outcome: "))
+        .map(str::trim)
+}
+
+/// Where this round's mailbox opens, what earlier rounds handled, and
+/// older items still owed (#1241). The rule: a round's input is everything
+/// since the last Done outcome. Without one, everything since the earliest
+/// trigger any outcome names (so a first-round crash is replayed). Handled
+/// are Done outcomes' triggers and what they list as seen; owed are items
+/// any outcome from the opening on lists as unseen, even if older. A
+/// cancelled pending job is then harmless by construction.
+fn mailbox_opening(
+    root: &Path,
+    threads: &[u64],
+    since: &str,
+) -> (String, Vec<String>, Vec<String>) {
+    struct Outcome {
+        at: String,
+        done: bool,
+        trigger: Option<String>,
+        seen: Vec<String>,
+        unseen: Vec<String>,
+    }
+    let comments: Vec<Value> = threads
+        .iter()
+        .flat_map(|n| {
+            list(root, &format!("repos/{REPOSITORY}/issues/{n}/comments")).unwrap_or_default()
+        })
+        .collect();
+    let outcomes: Vec<Outcome> = comments
+        .iter()
+        .filter(|c| {
+            matches!(
+                c["user"]["login"].as_str(),
+                Some("github-actions[bot]" | "carrick-workers[bot]")
+            )
+        })
+        .filter_map(|c| {
+            let body = c["body"].as_str()?;
+            let status = outcome_status(body)?;
+            let mut outcome = Outcome {
+                at: c["created_at"].as_str().unwrap_or_default().to_owned(),
+                done: status == "Done",
+                trigger: None,
+                seen: Vec::new(),
+                unseen: Vec::new(),
+            };
+            for line in server_part(body).lines() {
+                if let Some(url) = line.strip_prefix(TRIGGER_LINE) {
+                    outcome.trigger = Some(url.to_owned());
+                } else if let Some((url, _)) =
+                    line.strip_prefix("- ").and_then(|r| r.split_once(" ("))
+                {
+                    if line.contains("seen by the coordinator at") {
+                        outcome.seen.push(url.to_owned());
+                    } else {
+                        outcome.unseen.push(url.to_owned());
+                    }
+                }
+            }
+            Some(outcome)
+        })
+        .collect();
+    let opening = outcomes
+        .iter()
+        .filter(|o| o.done)
+        .map(|o| o.at.clone())
+        .max()
+        // No Done outcome yet: from the earliest outcome or the owner's
+        // earliest `/agent`, whichever is first, so a first round that
+        // crashed (even without an outcome) is replayed.
+        .or_else(|| {
+            let first_outcome = outcomes.iter().map(|o| o.at.clone()).min();
+            let first_trigger = comments
+                .iter()
+                .filter(|c| {
+                    c["user"]["login"] == crate::ci_scaler::DISPATCH_OWNER
+                        && c["user"]["type"] == "User"
+                        && c["body"].as_str().is_some_and(|b| b.starts_with("/agent"))
+                })
+                .filter_map(|c| c["created_at"].as_str().map(str::to_owned))
+                .min();
+            first_outcome.into_iter().chain(first_trigger).min()
+        })
+        .filter(|t| t.as_str() < since)
+        .unwrap_or_else(|| since.to_owned());
+    let handled = outcomes
+        .iter()
+        .filter(|o| o.done)
+        .flat_map(|o| o.trigger.iter().chain(o.seen.iter()).cloned())
+        .collect();
+    let owed = outcomes
+        .iter()
+        .filter(|o| o.at >= opening)
+        .flat_map(|o| o.unseen.iter().cloned())
+        .collect();
+    (opening, handled, owed)
+}
+
 /// Why a loop that never called finish ended, for its fallback outcome. A
 /// coordinator that stopped before its first tool call never started the
 /// work (the launcher could not resolve its model, #1215): that is an
@@ -3001,6 +3198,44 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         capacity: None,
         resume_fetched: false,
     };
+    // The round's mailbox: the owner's new comments on the issue and PR
+    // reach this round while it runs (#1241). It opens at the trigger's own
+    // time, or the run's creation for a label, so nothing posted while the
+    // worker was queued is missed.
+    let trigger_url = server.trigger["html_url"].as_str().map(str::to_owned);
+    let since = ["created_at", "submitted_at"]
+        .iter()
+        .find_map(|k| server.trigger[k].as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            let run = std::env::var("GITHUB_RUN_ID").ok()?;
+            api(root, &format!("repos/{REPOSITORY}/actions/runs/{run}")).ok()?["created_at"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(super::round_inbox::now_iso);
+    let threads: Vec<u64> = std::iter::once(server.dispatch.issue)
+        .chain(server.pr)
+        .collect();
+    // A trigger an earlier round already took in (its outcome lists it as
+    // seen) collapses into that round: no second round (owner, #231).
+    if let Some(url) = &trigger_url
+        && let Some(outcome) = trigger_consumed(root, &threads, url, &since)
+    {
+        if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new().append(true).open(path)?,
+                "Collapsed: the round before this one took in {url} (its outcome: {outcome}). No second round."
+            )?;
+        }
+        return Ok(());
+    }
+    // Open where the previous round's trigger was, so a trigger GitHub
+    // cancelled while it waited (one pending job per concurrency group)
+    // still reaches this round; minus what earlier rounds handled.
+    let (since, handled, owed) = mailbox_opening(root, &threads, &since);
+    super::round_inbox::start(root, threads, trigger_url, &since, handled, owed);
     let result = (|| -> Result<(), ScalerError> {
         let commands = CommandWindow::until(server.deadline);
         if setup != "success/success" {
@@ -3120,10 +3355,21 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         let loop_err = crate::agent_runner::state()
             .ok()
             .and_then(|state| regular_text(&state.join("loop.err")).ok());
-        let reason = fallback_reason(&server.used, &result, loop_err.as_deref());
+        let stopped = super::round_inbox::stop_requested();
+        let reason = match &stopped {
+            Some(url) => format!(
+                "Stopped by the owner's `/agent stop` ({url}); the work so far is checkpointed."
+            ),
+            None => fallback_reason(&server.used, &result, loop_err.as_deref()),
+        };
 
         server.checkpoint_publish();
-        server.outcome(ContractStatus::Failed, &reason)?;
+        let status = if stopped.is_some() {
+            ContractStatus::Blocked
+        } else {
+            ContractStatus::Failed
+        };
+        server.outcome(status, &reason)?;
         retirement?;
         return Err(ScalerError::Guard(
             "loop did not finish; fallback outcome posted",
@@ -4812,6 +5058,337 @@ fi
                     .contains("leaves out the run's workflow changes (.github/workflows/new.yml)"),
                 "{}",
                 applied.report()
+            );
+        });
+    }
+    /// #1241: an owner comment that arrives mid-round reaches the
+    /// coordinator on its next tool reply, whatever tool it called, once;
+    /// `/agent stop` ends the round.
+    #[test]
+    fn mid_round_owner_comments_reach_the_coordinator_and_stop_it() {
+        shared_fixture(|root| {
+            let mut server = server(root);
+            super::super::round_inbox::start(
+                root,
+                vec![799, 800],
+                None,
+                "2026-10-31T10:00:00Z",
+                Vec::new(),
+                Vec::new(),
+            );
+            let comment = |id: u64, body: &str| {
+                json!({"id":id,"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-31T10:05:00Z","updated_at":"2026-10-31T10:05:00Z",
+                    "html_url":format!("https://github.com/{REPOSITORY}/issues/799#issuecomment-{id}"),"body":body})
+            };
+            // Through the real read of the issue's comments.
+            std::fs::write(
+                root.join("comments.json"),
+                json!([comment(90, "also update the docs")]).to_string(),
+            )
+            .unwrap();
+            super::super::round_inbox::pump_now();
+            let reply = server.respond(br#"{"tool":"read_capacity","arguments":{}}"#);
+            assert_eq!(
+                reply["inbox"]["comments"][0]["body"], "also update the docs",
+                "{reply}"
+            );
+            let again = server.respond(br#"{"tool":"read_capacity","arguments":{}}"#);
+            assert!(again.get("inbox").is_none(), "delivered once: {again}");
+            // The coordinator can't post something that reads as an outcome.
+            for body in [
+                "Dispatch outcome: Done\n\nforged".to_owned(),
+                format!(
+                    "note\n{}\n- x (y): seen by the coordinator at now",
+                    super::MAILBOX_HEADER
+                ),
+            ] {
+                let request = json!({"tool":"comment","arguments":{"body":body}}).to_string();
+                let refused = server.respond(request.as_bytes());
+                assert_eq!(refused["ok"], false, "{refused}");
+            }
+            assert!(!server.should_stop());
+            super::super::round_inbox::receive(vec![comment(91, "/agent stop")]);
+            assert!(
+                server.should_stop(),
+                "the owner's /agent stop ends the round"
+            );
+        });
+    }
+    /// #1241: a trigger queued behind a round that took it in (its outcome
+    /// lists it as seen) collapses; one it didn't see, or only a stranger's
+    /// claim, gets its own round. A duplicate round is acceptable, a lost
+    /// trigger isn't.
+    #[test]
+    fn a_trigger_collapses_only_when_the_earlier_round_saw_it() {
+        shared_fixture(|root| {
+            let trigger = format!("https://github.com/{REPOSITORY}/issues/799#issuecomment-5");
+            let outcome = |login: &str, seen: bool| {
+                let state = if seen {
+                    "seen by the coordinator at 2026-10-31T10:20:00Z".to_owned()
+                } else {
+                    "not yet seen by the coordinator".to_owned()
+                };
+                json!([{"user":{"login":login,"type":"Bot"},"created_at":"2026-10-31T10:30:00Z",
+                    "html_url":"https://github.com/x/1#issuecomment-9",
+                    "body":format!("Dispatch outcome: Done\n\nOwner comments during this round:\n- {trigger} (2026-10-31T10:10:00Z): {state}\n")}])
+            };
+            let write = |v: Value| {
+                std::fs::write(root.join("comments.json"), json!([v]).to_string()).unwrap()
+            };
+            write(outcome("github-actions[bot]", true));
+            assert!(trigger_consumed(root, &[799], &trigger, "2026-10-31T10:10:00Z").is_some());
+            write(outcome("github-actions[bot]", false));
+            assert!(trigger_consumed(root, &[799], &trigger, "2026-10-31T10:10:00Z").is_none());
+            // A section inside the worker contract (in <details>) doesn't count.
+            write(
+                json!([{"user":{"login":"github-actions[bot]","type":"Bot"},"created_at":"2026-10-31T10:30:00Z",
+                "html_url":"https://github.com/x/1#issuecomment-7",
+                "body":format!("Dispatch outcome: Done\n\n<details>\n\n```text\nOwner comments during this round:\n- {trigger} (x): seen by the coordinator at now\n```\n</details>\n")}]),
+            );
+            assert!(trigger_consumed(root, &[799], &trigger, "2026-10-31T10:10:00Z").is_none());
+            // A matching line outside the server's section doesn't count.
+            write(
+                json!([{"user":{"login":"github-actions[bot]","type":"Bot"},"created_at":"2026-10-31T10:30:00Z",
+                "html_url":"https://github.com/x/1#issuecomment-8",
+                "body":format!("Dispatch outcome: Done\n\n- {trigger} (x): seen by the coordinator at now\n")}]),
+            );
+            assert!(trigger_consumed(root, &[799], &trigger, "2026-10-31T10:10:00Z").is_none());
+            write(outcome("mallory", true));
+            assert!(trigger_consumed(root, &[799], &trigger, "2026-10-31T10:10:00Z").is_none());
+            // An outcome from before the trigger is another round's.
+            write(outcome("github-actions[bot]", true));
+            assert!(trigger_consumed(root, &[799], &trigger, "2026-10-31T11:00:00Z").is_none());
+        });
+    }
+    /// #1241 review: a comment posted in the round's tail, after the last
+    /// regular read, is still read before the outcome and listed as not
+    /// seen, so its own round runs instead of it being lost.
+    #[test]
+    fn a_comment_in_the_rounds_tail_is_listed_as_unseen() {
+        shared_fixture(|root| {
+            super::super::round_inbox::start(
+                root,
+                vec![799],
+                None,
+                "2026-10-31T10:00:00Z",
+                Vec::new(),
+                Vec::new(),
+            );
+            let late = format!("https://github.com/{REPOSITORY}/issues/799#issuecomment-70");
+            std::fs::write(
+                root.join("comments.json"),
+                json!([{"id":70,"user":{"login":"tjfontaine","type":"User"},
+                    "created_at":"2026-10-31T10:50:00Z","updated_at":"2026-10-31T10:50:00Z",
+                    "html_url":late,"body":"/agent one more thing"}])
+                .to_string(),
+            )
+            .unwrap();
+            server(root)
+                .outcome(ContractStatus::Done, "finished")
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(
+                posted.contains(&format!(
+                    "- {late} (2026-10-31T10:50:00Z): not yet seen by the coordinator"
+                )),
+                "{posted}"
+            );
+        });
+    }
+    /// #1252 review: GitHub keeps one pending job per concurrency group, so
+    /// with T1 running and T2 waiting, T3 cancels T2's job. The rule: a
+    /// round's input is everything since the last Done outcome (plus what
+    /// outcomes left unseen), whatever T2 was: a comment, a label or a
+    /// review, and even after a first round that crashed.
+    #[test]
+    fn a_cancelled_waiting_trigger_reaches_the_next_round() {
+        shared_fixture(|root| {
+            let url =
+                |id: u64| format!("https://github.com/{REPOSITORY}/issues/799#issuecomment-{id}");
+            let owner = |id: u64, at: &str, body: &str| {
+                json!({"id":id,"user":{"login":"tjfontaine","type":"User"},"created_at":at,"updated_at":at,
+                    "html_url":url(id),"body":body})
+            };
+            let outcome = |status: &str, at: &str, section: &str| {
+                json!({"user":{"login":"github-actions[bot]","type":"Bot"},"created_at":at,"html_url":url(900),
+                    "body":format!("Dispatch outcome: {status}\n\n{section}")})
+            };
+            let label = super::super::round_inbox::label_item(
+                799,
+                &json!({"event":"labeled","id":61,"label":{"name":"dispatch:opus"},
+                    "actor":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-31T10:30:00Z"}),
+            )
+            .unwrap();
+            let review = super::super::round_inbox::review_item(json!({"id":62,
+                "user":{"login":"tjfontaine","type":"User"},"submitted_at":"2026-10-31T10:31:00Z",
+                "html_url":format!("https://github.com/{REPOSITORY}/pull/800#pullrequestreview-62"),
+                "body":"please also rename it"}));
+            // Each case: what's on the thread, and what T3's round must deliver.
+            // (name, thread comments, extra reviews and labels, delivered)
+            type Case<'a> = (&'a str, Vec<Value>, Vec<Value>, Vec<&'a str>);
+            let cases: Vec<Case> = vec![
+                (
+                    // T1 Done saw a note, left T2 unseen; T3 gets T2 (owed, older).
+                    "comment T2",
+                    vec![
+                        owner(1, "2026-10-31T10:00:00Z", "/agent T1"),
+                        owner(4, "2026-10-31T10:20:00Z", "a note T1 saw"),
+                        owner(2, "2026-10-31T10:30:00Z", "/agent T2"),
+                        outcome(
+                            "Done",
+                            "2026-10-31T11:00:00Z",
+                            &format!(
+                                "Round trigger: {}\nOwner comments during this round:\n- {} (x): seen by the coordinator at y\n- {} (x): not yet seen by the coordinator\n",
+                                url(1),
+                                url(4),
+                                url(2)
+                            ),
+                        ),
+                        owner(3, "2026-10-31T11:05:00Z", "/agent T3"),
+                    ],
+                    vec![],
+                    vec!["/agent T2"],
+                ),
+                (
+                    // T2 a label and a review after T1's Done: both reach T3.
+                    "label and review T2",
+                    vec![
+                        owner(1, "2026-10-31T10:00:00Z", "/agent T1"),
+                        outcome(
+                            "Done",
+                            "2026-10-31T10:20:00Z",
+                            &format!(
+                                "Round trigger: {}\nOwner comments during this round:\n",
+                                url(1)
+                            ),
+                        ),
+                        owner(3, "2026-10-31T10:40:00Z", "/agent T3"),
+                    ],
+                    vec![label.clone(), review.clone()],
+                    vec![
+                        "The owner applied the `dispatch:opus` label to #799.",
+                        "please also rename it",
+                    ],
+                ),
+                (
+                    // T1 crashed (Failed, no Done ever): T3 replays T1 and T2.
+                    "first-round crash",
+                    vec![
+                        owner(1, "2026-10-31T10:00:00Z", "/agent T1"),
+                        owner(2, "2026-10-31T10:10:00Z", "/agent T2"),
+                        outcome(
+                            "Failed",
+                            "2026-10-31T10:20:00Z",
+                            &format!(
+                                "Round trigger: {}\nOwner comments during this round:\n- {} (x): not yet seen by the coordinator\n",
+                                url(1),
+                                url(2)
+                            ),
+                        ),
+                        owner(3, "2026-10-31T10:40:00Z", "/agent T3"),
+                    ],
+                    vec![],
+                    vec!["/agent T1", "/agent T2"],
+                ),
+            ];
+            let cases = cases.into_iter().chain([
+                (
+                    // T1 crashed without any outcome: T3 replays T1 and T2.
+                    "crash without an outcome",
+                    vec![
+                        owner(1, "2026-10-31T10:00:00Z", "/agent T1"),
+                        owner(2, "2026-10-31T10:10:00Z", "/agent T2"),
+                        owner(3, "2026-10-31T10:40:00Z", "/agent T3"),
+                    ],
+                    vec![],
+                    vec!["/agent T1", "/agent T2"],
+                ),
+                (
+                    // A Done outcome behind a warning prefix is still Done.
+                    "Done after a repair warning",
+                    vec![
+                        owner(1, "2026-10-31T10:00:00Z", "/agent T1"),
+                        json!({"user":{"login":"github-actions[bot]","type":"Bot"},"created_at":"2026-10-31T10:20:00Z","html_url":url(901),
+                            "body":format!("**PR body needs manual repair.** x\n\nDispatch outcome: Done\n\nRound trigger: {}\nOwner comments during this round:\n", url(1))}),
+                        owner(2, "2026-10-31T10:30:00Z", "/agent T2"),
+                        owner(3, "2026-10-31T10:40:00Z", "/agent T3"),
+                    ],
+                    vec![],
+                    vec!["/agent T2"],
+                ),
+            ]);
+            for (name, thread, extra, want) in cases {
+                std::fs::write(
+                    root.join("comments.json"),
+                    json!([thread.clone()]).to_string(),
+                )
+                .unwrap();
+                let (since, handled, owed) = mailbox_opening(root, &[799], "2026-10-31T10:40:00Z");
+                super::super::round_inbox::start(
+                    root,
+                    vec![799],
+                    Some(url(3)),
+                    &since,
+                    handled,
+                    owed,
+                );
+                let mut items = thread;
+                items.extend(extra);
+                super::super::round_inbox::receive(items);
+                let delivered: Vec<String> = super::super::round_inbox::take("now")
+                    .iter()
+                    .map(|c| c["body"].as_str().unwrap().to_owned())
+                    .collect();
+                assert_eq!(delivered, want, "{name}");
+            }
+        });
+    }
+    /// #1252 review: an outcome on the failed-worker path carries the server
+    /// section too, so the next round's mailbox can open from it.
+    #[test]
+    fn every_outcome_names_its_trigger() {
+        shared_fixture(|root| {
+            let mut server = server(root);
+            server.trigger = json!({"id":5,"html_url":format!("https://github.com/{REPOSITORY}/issues/799#issuecomment-5")});
+            server.used.workers = 1;
+            server.outcome(ContractStatus::Done, "claimed").unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(posted.starts_with("Dispatch outcome: Failed"), "{posted}");
+            assert!(
+                posted.contains("Round trigger: https://github.com/"),
+                "{posted}"
+            );
+        });
+    }
+    /// #1252 review: "seen" isn't "acted on". A round that fails lists what
+    /// its coordinator received as unseen, so a later round takes it up.
+    #[test]
+    fn a_failed_round_lists_received_comments_as_unseen() {
+        shared_fixture(|root| {
+            super::super::round_inbox::start(
+                root,
+                vec![799],
+                None,
+                "2026-10-31T10:00:00Z",
+                Vec::new(),
+                Vec::new(),
+            );
+            super::super::round_inbox::receive(vec![
+                json!({"id":5,"user":{"login":"tjfontaine","type":"User"},
+                "created_at":"2026-10-31T10:05:00Z","updated_at":"2026-10-31T10:05:00Z",
+                "html_url":format!("https://github.com/{REPOSITORY}/issues/799#issuecomment-5"),"body":"/agent also this"}),
+            ]);
+            assert_eq!(
+                super::super::round_inbox::take("2026-10-31T10:06:00Z").len(),
+                1
+            );
+            server(root)
+                .outcome(ContractStatus::Failed, "worker timed out")
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(
+                posted.contains("issuecomment-5 (2026-10-31T10:05:00Z): not yet seen"),
+                "{posted}"
             );
         });
     }

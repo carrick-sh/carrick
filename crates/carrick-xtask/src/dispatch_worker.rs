@@ -12,6 +12,8 @@ mod agent_loop;
 mod live_log;
 #[path = "dispatch_reactor.rs"]
 mod reactor;
+#[path = "dispatch_round_inbox.rs"]
+mod round_inbox;
 
 const LOOP_USER: &str = "carrick-dispatch-loop";
 const AGENT_USER: &str = "carrick-dispatch-agent";
@@ -708,6 +710,11 @@ fn wait_account_serving(
     let mut serving_error = None;
     loop {
         live_log::pump();
+        round_inbox::pump();
+        // The owner's `/agent stop` ends whatever is running (#1241).
+        if round_inbox::stop_requested().is_some() {
+            stopped = true;
+        }
         if !stopped {
             match serve() {
                 Ok(stop) => stopped = stop,
@@ -899,9 +906,19 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
             Publication refuses any HEAD that does not descend from {tip}. The PR body is not yours to change.\n"
         ),
     };
+    // The owner can steer a running round (#1241): new comments land here.
+    let inbox = round_inbox::worker_path()
+        .map(|path| {
+            format!(
+                "Comments the owner posts on this issue or PR while you work are appended to {}\n\
+                as they arrive; it is empty until one does.\n",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
     format!(
         "Work issue {REPOSITORY}#{} on branch {}. Read AGENTS.md in full.\n\
-        {history}\
+        {history}{inbox}\
         Implement and verify this brief. Commit your work with a Why/What/Verified body and\n\
         Co-Authored-By: {}\nDo not push, open a PR, or post comments; the workflow publishes those.\n\
         Never use --no-verify, git stash or git add -A. Keep conformance-probes/target out of commits.\n\
@@ -999,6 +1016,7 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         dispatch.worker.backend, dispatch.worker.model
     );
     let label_err = format!("{label} stderr");
+    round_inbox::set_worker_file(round_inbox::worker_path().as_deref());
     isolated
         .stdout(live_log::create(&label, &logs.join("agent.out"))?)
         .stderr(live_log::create(&label_err, &logs.join("agent.err"))?);
@@ -1014,6 +1032,7 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
     );
     live_log::unfollow(&label);
     live_log::unfollow(&label_err);
+    round_inbox::set_worker_file(None);
     let _harvest = dispatch.harvest_deadline.map(CommandWindow::until);
     retire_agent()?;
     let code = outcome?;
@@ -2529,6 +2548,16 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         DispatchAction::Guard { event, admit, .. } => (event, admit),
     };
     let (event, dispatch) = guard_admission(&root, &event_path, admit, cleanup_agent_user)?;
+    // `/agent stop` acts only on a running round, whose mailbox reads it
+    // (#1241); it never starts or queues a round of its own.
+    if event["comment"]["body"]
+        .as_str()
+        .is_some_and(|b| b.trim() == round_inbox::STOP)
+    {
+        return Err(ScalerError::Guard(
+            "`/agent stop` stops a running round through its mailbox; it never starts one",
+        ));
+    }
     if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
         use std::io::Write;
         writeln!(
@@ -3248,7 +3277,11 @@ impl Applied {
                     } else {
                         format!(
                             " It leaves out the run's workflow changes ({}), which dispatch can't publish: the owner publishes them from `{HARVEST_PATCH}`",
-                            self.workflow_left_out.join(", ")
+                            self.workflow_left_out
+                                .iter()
+                                .map(|p| p.escape_debug().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         )
                     };
                     format!("- Pushed WIP at `{tip}`.{left}\n")
@@ -4180,7 +4213,14 @@ fn publish_with(
     };
     let work = crate::agent_runner::state()?.join("work");
     match preserve_harvest(&work, &base, token) {
-        Ok(Some(note)) => Err(ScalerError::Usage(format!("{error}; {note}"))),
+        // The workflow refusal keeps its type, so a checkpoint can push the
+        // rest of the work (#1241).
+        Ok(Some(note)) => Err(match error {
+            ScalerError::WorkflowRefused(paths, _) => {
+                ScalerError::WorkflowRefused(paths.clone(), format!("; {note}"))
+            }
+            _ => ScalerError::Usage(format!("{error}; {note}")),
+        }),
         Ok(None) => result,
         Err(saving) => Err(ScalerError::Usage(format!(
             "{error}; harvested commits could not be kept: {saving}"
@@ -4422,10 +4462,9 @@ fn publish_commits(
         };
         let own = workflow_files(&base, "HEAD")?;
         if !own.is_empty() {
-            return Err(ScalerError::Usage(format!(
-                "Refused workflow changes: the run's own commits change {}; dispatch publishing credentials cannot publish .github/workflows/*, so the owner must publish or drop them",
-                own.join(", ")
-            )));
+            // Worker-chosen path names: shown escaped, never raw.
+            let shown = own.iter().map(|p| p.escape_debug().to_string()).collect();
+            return Err(ScalerError::WorkflowRefused(shown, String::new()));
         }
         // GitHub refuses an App push when the branch's workflow files differ
         // from the default branch, even if none of the pushed commits touch
