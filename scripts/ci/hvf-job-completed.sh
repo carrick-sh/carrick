@@ -3,12 +3,16 @@
 # self-hosted macOS HVF runner (#1225).
 #
 # Runs after each job finishes (whether steps passed, failed, or were
-# cancelled) to stop any per-job `sccache` daemon and prune
-# `$GITHUB_WORKSPACE/target` so build trees never accumulate across runs.
-# All path and override variables are guarded strictly against unset, empty,
+# cancelled) to prune `$GITHUB_WORKSPACE/target` and clear `$RUNNER_TEMP`
+# contents immediately (rather than waiting for the next job's runner startup
+# cleanup) so build trees and per-job temporary artifacts never linger across
+# runs. All directory variables are guarded strictly against unset, empty,
 # whitespace-only, non-canonical, root/top-level, overlapping, or symlinked
 # values before touching the filesystem.
 set -eu
+
+PATH=/usr/bin:/bin
+export PATH
 
 NL='
 '
@@ -17,6 +21,10 @@ fail_cleanup() {
     echo "hvf-job-completed: $*" >&2
     exit 1
 }
+
+if [ "$#" -ne 0 ]; then
+    fail_cleanup "unexpected arguments"
+fi
 
 is_nonempty() {
     case "$1" in
@@ -97,42 +105,6 @@ esac
 require_positive_int_if_set GITHUB_RUN_ID "${GITHUB_RUN_ID+x}" "${GITHUB_RUN_ID-}"
 require_positive_int_if_set GITHUB_RUN_ATTEMPT "${GITHUB_RUN_ATTEMPT+x}" "${GITHUB_RUN_ATTEMPT-}"
 
-if [ "${SCCACHE_SERVER_UDS+x}" = x ]; then
-    if ! is_clean_abs_path "$SCCACHE_SERVER_UDS"; then
-        fail_cleanup "SCCACHE_SERVER_UDS is empty or not a clean absolute path"
-    fi
-fi
-
-if [ "${CARRICK_SCCACHE_BIN+x}" = x ]; then
-    if ! is_nonempty "$CARRICK_SCCACHE_BIN"; then
-        fail_cleanup "CARRICK_SCCACHE_BIN is set but empty"
-    fi
-    case "$CARRICK_SCCACHE_BIN" in
-        */*)
-            if ! is_clean_abs_path "$CARRICK_SCCACHE_BIN"; then
-                fail_cleanup "CARRICK_SCCACHE_BIN path must be a clean absolute path: $CARRICK_SCCACHE_BIN"
-            fi
-            case "$CARRICK_SCCACHE_BIN/" in
-                "$GITHUB_WORKSPACE/"* | "$RUNNER_TEMP/"*)
-                    fail_cleanup "CARRICK_SCCACHE_BIN must not reside inside GITHUB_WORKSPACE or RUNNER_TEMP"
-                    ;;
-            esac
-            ;;
-    esac
-    sccache_bin=$CARRICK_SCCACHE_BIN
-else
-    sccache_bin=sccache
-fi
-
-if command -v "$sccache_bin" >/dev/null 2>&1; then
-    if [ "${SCCACHE_SERVER_UDS+x}" = x ] && [ -S "$SCCACHE_SERVER_UDS" ]; then
-        SCCACHE_SERVER_UDS="$SCCACHE_SERVER_UDS" "$sccache_bin" --stop-server >/dev/null 2>&1 || true
-    fi
-    if [ -S "$RUNNER_TEMP/sccache.sock" ]; then
-        SCCACHE_SERVER_UDS="$RUNNER_TEMP/sccache.sock" "$sccache_bin" --stop-server >/dev/null 2>&1 || true
-    fi
-fi
-
 target_dir="$GITHUB_WORKSPACE/target"
 case "$target_dir" in
     "$GITHUB_WORKSPACE"/target) ;;
@@ -149,11 +121,18 @@ if [ -e "$target_dir" ]; then
     fi
 fi
 
-avail_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { print $4 }')
-case "$avail_kib" in
-    '' | *[!0-9]*)
-        fail_cleanup "failed to read available KiB from df -Pk for $GITHUB_WORKSPACE"
-        ;;
-esac
-avail_gib=$(awk -v k="$avail_kib" 'BEGIN { printf "%d\n", int(k / 1048576) }')
-echo "hvf-job-completed: pruned $target_dir (${avail_gib} GiB free on $GITHUB_WORKSPACE)"
+if [ -L "$RUNNER_TEMP" ] || [ ! -d "$RUNNER_TEMP" ]; then
+    fail_cleanup "RUNNER_TEMP ceased to be a non-symlink directory: $RUNNER_TEMP"
+fi
+find "$RUNNER_TEMP" -type d -exec chmod u+w {} +
+find "$RUNNER_TEMP" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+if [ -L "$RUNNER_TEMP" ] || [ ! -d "$RUNNER_TEMP" ]; then
+    fail_cleanup "RUNNER_TEMP missing after cleanup: $RUNNER_TEMP"
+fi
+for leftover in "$RUNNER_TEMP"/* "$RUNNER_TEMP"/.[!.]* "$RUNNER_TEMP"/..?*; do
+    if [ -e "$leftover" ] || [ -L "$leftover" ]; then
+        fail_cleanup "failed to remove temporary entry in RUNNER_TEMP: $leftover"
+    fi
+done
+
+echo "hvf-job-completed: pruned $target_dir and cleared $RUNNER_TEMP"

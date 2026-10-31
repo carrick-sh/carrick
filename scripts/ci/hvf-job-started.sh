@@ -2,24 +2,33 @@
 # Job-start hook (`ACTIONS_RUNNER_HOOK_JOB_STARTED`) for the persistent
 # self-hosted macOS HVF runner (#1225).
 #
-# 1. Policy authorization: Rust (`carrick-xtask ci-scaler admit-job`) owns
-#    workflow/event/ref/actor policy. A failed hook alone still allows
-#    conditional (`always()`, `failure()`, `!cancelled()`) workflow steps to
-#    execute, so any authorization or context-guard failure kills the
-#    session-isolated (`setsid`) runner process group (`kill -KILL 0`).
+# 1. Policy authorization: Rust (`/usr/local/bin/carrick-xtask ci-scaler
+#    admit-job`) owns workflow/event/ref/actor policy against
+#    `/etc/carrick-ci/policy`. Both paths are hardcoded in production (never
+#    read from the runner's `.env` or job environment) and verified to be
+#    root-owned regular files without group/other write permission before
+#    execution.
+#    A nonzero hook exit alone still allows conditional (`always()`,
+#    `failure()`, `!cancelled()`) workflow steps to execute, so any
+#    binary/policy ownership failure, missing authorization variable, or policy
+#    rejection runs `kill -KILL 0`. Unlike one-shot `setsid` JIT launches, the
+#    persistent `launchd` service provides no separate per-job session, so
+#    `kill -KILL 0` terminates the runner's process group including
+#    `Runner.Listener` before any step can run; slice 2 pairs this with
+#    `KeepAlive` in the launchd plist and restricts the runner group's
+#    "Selected workflows" to `kernel-runtime.yml@refs/heads/main`.
 # 2. Strict empty-variable and path guards: unset, empty, whitespace-only,
 #    relative, root, top-level, traversal, overlapping, or symlinked
-#    workspace/temp/override paths fail closed before touching the filesystem.
-# 3. Leftover `target/` reclamation + up-front disk admission: any stale
-#    `$GITHUB_WORKSPACE/target` from an interrupted run is removed safely, then
-#    free space on `$GITHUB_WORKSPACE` is checked against
-#    `CARRICK_HVF_MIN_FREE_GIB` (default 40 GiB, matching
-#    `remote_accept::MIN_FREE_DISK_KIB`) so low-disk runs fail clearly at
-#    admission rather than mid-build.
-# 4. Per-job `sccache` socket isolation: when `GITHUB_ENV` is set and
-#    `SCCACHE_SERVER_UDS` is unset, exports `SCCACHE_SERVER_UDS` under
-#    `$RUNNER_TEMP` so concurrent runners on the host never share TCP 4226.
+#    `GITHUB_WORKSPACE` / `RUNNER_TEMP` paths fail closed before touching the
+#    filesystem.
+# 3. Leftover `target/` reclamation: any stale `$GITHUB_WORKSPACE/target` from
+#    an interrupted prior run is removed safely without following symlinks.
+#    Up-front disk free-space admission lives in the workflow, and post-job
+#    `target/` and `$RUNNER_TEMP` cleanup lives in `hvf-job-completed.sh`.
 set -eu
+
+PATH=/usr/bin:/bin
+export PATH
 
 NL='
 '
@@ -82,19 +91,105 @@ require_safe_dir() {
     fi
 }
 
-if [ "${CARRICK_XTASK+x}" = x ]; then
-    is_clean_abs_path "$CARRICK_XTASK" || reject_job "CARRICK_XTASK is empty or not a clean absolute path"
-    xtask=$CARRICK_XTASK
-else
-    xtask=/usr/local/bin/carrick-xtask
-fi
+xtask=/usr/local/bin/carrick-xtask
+policy_file=/etc/carrick-ci/policy
+expected_owner_uid=0
+test_mode=0
 
-if [ "${CARRICK_CI_POLICY_FILE+x}" = x ]; then
-    is_clean_abs_path "$CARRICK_CI_POLICY_FILE" || reject_job "CARRICK_CI_POLICY_FILE is empty or not a clean absolute path"
-    policy_file=$CARRICK_CI_POLICY_FILE
-else
-    policy_file=/etc/carrick-ci/policy
-fi
+# GitHub's runner invokes ACTIONS_RUNNER_HOOK_JOB_STARTED with zero arguments;
+# only the test harness passes CLI path/owner overrides.
+while [ "$#" -gt 0 ]; do
+    test_mode=1
+    case "$1" in
+        --test-xtask)
+            [ "$#" -ge 2 ] || reject_job "--test-xtask requires a path argument"
+            xtask=$2
+            shift 2
+            ;;
+        --test-policy-file)
+            [ "$#" -ge 2 ] || reject_job "--test-policy-file requires a path argument"
+            policy_file=$2
+            shift 2
+            ;;
+        --test-owner-uid)
+            [ "$#" -ge 2 ] || reject_job "--test-owner-uid requires a uid argument"
+            expected_owner_uid=$2
+            shift 2
+            ;;
+        *)
+            reject_job "unexpected argument: $1"
+            ;;
+    esac
+done
+
+case "$expected_owner_uid" in
+    '' | *[!0-9]*)
+        reject_job "expected owner uid must be a non-negative integer: $expected_owner_uid"
+        ;;
+esac
+
+uname_s=$(uname -s)
+
+require_owner_only_file() {
+    label=$1
+    file_path=$2
+    need_exec=$3
+    if ! is_clean_abs_path "$file_path"; then
+        reject_job "$label is empty or not a clean absolute path: $file_path"
+    fi
+    if [ -L "$file_path" ]; then
+        reject_job "$label must not be a symbolic link: $file_path"
+    fi
+    if [ ! -f "$file_path" ]; then
+        reject_job "$label is missing or not a regular file: $file_path"
+    fi
+    if [ "$need_exec" = 1 ] && [ ! -x "$file_path" ]; then
+        reject_job "$label is not executable: $file_path"
+    fi
+    if [ "$uname_s" = Darwin ]; then
+        owner_mode=$(stat -f '%u:%Lp' "$file_path") || reject_job "cannot stat $label: $file_path"
+    else
+        owner_mode=$(stat -c '%u:%a' "$file_path") || reject_job "cannot stat $label: $file_path"
+    fi
+    file_uid=${owner_mode%%:*}
+    file_mode=${owner_mode#*:}
+    case "$file_uid" in
+        '' | *[!0-9]*) reject_job "unexpected owner uid from stat for $label: $owner_mode" ;;
+    esac
+    case "$file_mode" in
+        '' | *[!0-7]*) reject_job "unexpected mode from stat for $label: $owner_mode" ;;
+    esac
+    if [ "$file_uid" -ne "$expected_owner_uid" ]; then
+        reject_job "$label must be owned by uid $expected_owner_uid (got uid $file_uid): $file_path"
+    fi
+    if [ "$(( 0$file_mode & 022 ))" -ne 0 ]; then
+        reject_job "$label must not be group- or other-writable (mode $file_mode): $file_path"
+    fi
+}
+
+require_not_in_job_dir() {
+    label=$1
+    file_path=$2
+    if [ "${GITHUB_WORKSPACE+x}" = x ] && is_clean_abs_path "$GITHUB_WORKSPACE"; then
+        case "$file_path/" in
+            "$GITHUB_WORKSPACE/"*)
+                reject_job "$label must not reside inside GITHUB_WORKSPACE: $file_path"
+                ;;
+        esac
+    fi
+    if [ "${RUNNER_TEMP+x}" = x ] && is_clean_abs_path "$RUNNER_TEMP"; then
+        case "$file_path/" in
+            "$RUNNER_TEMP/"*)
+                reject_job "$label must not reside inside RUNNER_TEMP: $file_path"
+                ;;
+        esac
+    fi
+}
+
+require_owner_only_file "xtask binary" "$xtask" 1
+require_owner_only_file "policy file" "$policy_file" 0
+require_not_in_job_dir "xtask binary" "$xtask"
+require_not_in_job_dir "policy file" "$policy_file"
 
 require_auth_var GITHUB_REPOSITORY "${GITHUB_REPOSITORY+x}" "${GITHUB_REPOSITORY-}"
 require_auth_var GITHUB_EVENT_NAME "${GITHUB_EVENT_NAME+x}" "${GITHUB_EVENT_NAME-}"
@@ -109,12 +204,14 @@ if [ "$GITHUB_EVENT_NAME" = "pull_request_review" ]; then
     require_auth_var GITHUB_EVENT_PATH "${GITHUB_EVENT_PATH+x}" "${GITHUB_EVENT_PATH-}"
 fi
 
-if [ ! -f "$xtask" ] || [ ! -x "$xtask" ]; then
-    reject_job "xtask binary is missing or not executable: $xtask"
-fi
-
-if ! "$xtask" ci-scaler admit-job --policy-file "$policy_file"; then
-    reject_job "job-start policy rejected workflow, event, ref, or actor"
+if [ "$test_mode" = 1 ]; then
+    if ! "$xtask" ci-scaler admit-job --policy-file "$policy_file" --test-policy-owner-uid "$expected_owner_uid"; then
+        reject_job "job-start policy rejected workflow, event, ref, or actor"
+    fi
+else
+    if ! "$xtask" ci-scaler admit-job --policy-file "$policy_file"; then
+        reject_job "job-start policy rejected workflow, event, ref, or actor"
+    fi
 fi
 
 require_safe_dir GITHUB_WORKSPACE "${GITHUB_WORKSPACE+x}" "${GITHUB_WORKSPACE-}"
@@ -135,56 +232,17 @@ case "$GITHUB_WORKSPACE/" in
 esac
 case "$xtask/" in
     "$GITHUB_WORKSPACE/"* | "$RUNNER_TEMP/"*)
-        fail_admission "CARRICK_XTASK must not reside inside GITHUB_WORKSPACE or RUNNER_TEMP"
+        fail_admission "xtask binary must not reside inside GITHUB_WORKSPACE or RUNNER_TEMP"
         ;;
 esac
 case "$policy_file/" in
     "$GITHUB_WORKSPACE/"* | "$RUNNER_TEMP/"*)
-        fail_admission "CARRICK_CI_POLICY_FILE must not reside inside GITHUB_WORKSPACE or RUNNER_TEMP"
+        fail_admission "policy file must not reside inside GITHUB_WORKSPACE or RUNNER_TEMP"
         ;;
 esac
 
-if [ "${CARRICK_HVF_MIN_FREE_GIB+x}" = x ]; then
-    if ! is_nonempty "$CARRICK_HVF_MIN_FREE_GIB"; then
-        fail_admission "CARRICK_HVF_MIN_FREE_GIB is set but empty"
-    fi
-    min_free_gib=$CARRICK_HVF_MIN_FREE_GIB
-else
-    # Matches remote_accept::MIN_FREE_DISK_KIB (40 GiB) above hvf-kernel's
-    # measured ~31.34 GiB peak target/ footprint (#348, #1225).
-    min_free_gib=40
-fi
-case "$min_free_gib" in
-    '' | *[!0-9]*)
-        fail_admission "CARRICK_HVF_MIN_FREE_GIB must be a positive integer GiB value: $min_free_gib"
-        ;;
-esac
-if [ "$min_free_gib" -lt 1 ]; then
-    fail_admission "CARRICK_HVF_MIN_FREE_GIB must be at least 1 GiB: $min_free_gib"
-fi
-
-if [ "${SCCACHE_SERVER_UDS+x}" = x ]; then
-    if ! is_clean_abs_path "$SCCACHE_SERVER_UDS"; then
-        fail_admission "SCCACHE_SERVER_UDS is empty or not a clean absolute path"
-    fi
-fi
-
-if [ "${GITHUB_ENV+x}" = x ]; then
-    if ! is_clean_abs_path "$GITHUB_ENV"; then
-        fail_admission "GITHUB_ENV is empty or not a clean absolute path"
-    fi
-    if [ -L "$GITHUB_ENV" ] || [ -d "$GITHUB_ENV" ]; then
-        fail_admission "GITHUB_ENV must not be a symlink or directory: $GITHUB_ENV"
-    fi
-    env_parent=${GITHUB_ENV%/*}
-    : "${env_parent:=/}"
-    if [ ! -d "$env_parent" ]; then
-        fail_admission "GITHUB_ENV parent directory does not exist: $env_parent"
-    fi
-fi
-
-# Reclaim any stale build tree from an interrupted prior run before checking
-# disk headroom, refusing symlink swaps on `$GITHUB_WORKSPACE/target`.
+# Reclaim any stale build tree from an interrupted prior run, refusing symlink
+# swaps on `$GITHUB_WORKSPACE/target`.
 target_dir="$GITHUB_WORKSPACE/target"
 case "$target_dir" in
     "$GITHUB_WORKSPACE"/target) ;;
@@ -201,20 +259,4 @@ if [ -e "$target_dir" ]; then
     fi
 fi
 
-avail_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { print $4 }')
-case "$avail_kib" in
-    '' | *[!0-9]*)
-        fail_admission "failed to read available KiB from df -Pk for $GITHUB_WORKSPACE"
-        ;;
-esac
-avail_gib=$(awk -v k="$avail_kib" 'BEGIN { printf "%d\n", int(k / 1048576) }')
-if ! awk -v k="$avail_kib" -v min_gib="$min_free_gib" 'BEGIN { exit !(k >= min_gib * 1048576) }'; then
-    echo "::error title=HVF disk admission failed::free disk space on $GITHUB_WORKSPACE is ${avail_gib} GiB (${avail_kib} KiB), below the ${min_free_gib} GiB minimum"
-    fail_admission "free disk space on $GITHUB_WORKSPACE is ${avail_gib} GiB (${avail_kib} KiB), below the ${min_free_gib} GiB minimum"
-fi
-
-if [ "${GITHUB_ENV+x}" = x ] && [ "${SCCACHE_SERVER_UDS+x}" != x ]; then
-    printf 'SCCACHE_SERVER_UDS=%s/sccache.sock\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-fi
-
-echo "hvf-job-started: disk admission passed (${avail_gib} GiB free >= ${min_free_gib} GiB minimum on $GITHUB_WORKSPACE)"
+echo "hvf-job-started: admitted job for $GITHUB_REPOSITORY ($GITHUB_EVENT_NAME on $GITHUB_REF)"

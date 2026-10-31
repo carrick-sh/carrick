@@ -1009,6 +1009,9 @@ pub enum ScalerAction {
         policy_file: PathBuf,
         #[arg(long, default_value = "/run/carrick-ci")]
         state_dir: PathBuf,
+        /// Test-harness-only expected owner UID for `policy_file` (`0` in production).
+        #[arg(long, hide = true, default_value_t = 0)]
+        test_policy_owner_uid: u32,
     },
     /// Stale-runner boundary, serialized against job admission.
     Quiesce {
@@ -1082,11 +1085,12 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             policy_file,
             state_dir,
             controller,
+            test_policy_owner_uid,
         } => {
             let get = |name| {
                 std::env::var(name)
                     .ok()
-                    .filter(|v| !v.trim().is_empty())
+                    .filter(|v| !v.trim().is_empty() && !v.contains(['\n', '\r']))
                     .ok_or(ScalerError::Guard("missing GitHub job context"))
             };
             let number = |name| {
@@ -1119,7 +1123,13 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 run_attempt: u32::try_from(number("GITHUB_RUN_ATTEMPT")?)
                     .map_err(|_| ScalerError::Guard("malformed GitHub run context"))?,
             };
-            admit_job_context(&context, &policy_file, &state_dir, controller, 0)?;
+            admit_job_context(
+                &context,
+                &policy_file,
+                &state_dir,
+                controller,
+                test_policy_owner_uid,
+            )?;
             println!("admitted workflow, event and ref");
             Ok(())
         }
