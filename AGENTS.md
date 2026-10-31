@@ -633,7 +633,8 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
 
 - **Land through the merge queue** (`main-merge-queue`: rebase, all-green,
   `ci-ok` required). Cancel PR runs that won't land before enqueueing;
-  hosted macOS capacity is scarce.
+  hosted macOS capacity is scarce. The one exception is the admin merge of
+  a collapsed ARM-only stack, below.
 - **Dependent work is a native GitHub stack** (`gh stack`, #468), not a
   hand-built landing branch and not a wait-then-rebase chain. One branch and
   PR per independently reviewable layer, each under the size cap, with its
@@ -650,8 +651,10 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
   with their issues. When the collapsed head is rebased on the current main
   tip and `ci-ok` is green on that exact head, admin-merge it with
   `gh pr merge <top> --admin --rebase`. That skips the merge-group-only
-  jobs (`macos-build`, `macos-clippy`, `macos-authority`, the KVM gate), so
-  confirm the PR's own CI covered those surfaces first.
+  jobs (`macos-build`, `macos-clippy`, `macos-authority`) and the KVM gate,
+  which PRs never run. So admin-merge only stacks that touch no x86, KVM,
+  HAL or CPL0 code; enqueue those stacks instead, or attach a `kvm-tests`
+  run on the exact head.
   Workflow: [`.agents/skills/carrick-stacked-prs`](.agents/skills/carrick-stacked-prs/SKILL.md).
 - **Lanes:** hosted Linux/macOS jobs in `ci.yml`. Heavy pull requests run the
   full macOS suite; same-repo PRs run it on the self-hosted `carrick-macos-ci`
@@ -674,7 +677,8 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
   `carrick-gate` volume, CPU admission is still #376. Worktree admission keys on the
   checkout root's device+inode: never copy or cross-volume move an admitted
   checkout; remove and re-add it.
-- **KVM evidence comes from the merge queue.** The `kvm-tests` lane produces
+- **KVM evidence comes from the merge queue** (PRs never run `kvm-tests`,
+  so an admin merge has none). The `kvm-tests` lane produces
   a receipt and `kvm-gate` fails on NEW failures against the merge-group base.
   Do not run `just test-kvm` on the shared willow worker VMs; a targeted KVM
   test to debug a specific defect runs under `just lease gate`.
