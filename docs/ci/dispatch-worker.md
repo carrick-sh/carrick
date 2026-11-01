@@ -699,6 +699,27 @@ bot. None posts outcome-shaped comments today, dispatch cannot publish
 workflow files (#1241 part 1), and every link must lead back to the
 owner's own trigger.
 
+A round has a worker tier (#1275), decided once by the server from facts
+it can show:
+1. an owner `Worker tier: strong` or `Worker tier: standard` line in the
+   trigger or the issue body;
+2. a label: `route:mechanical` or `dispatch:argon-high` mean standard;
+   `shared-kernel`, `fork`, `mm`, `signals`, `route:design`,
+   `dispatch:opus` or `dispatch:sol-high` mean strong;
+3. a strong-path crate the issue names (`carrick-kernel`, `carrick-core`,
+   `carrick-mem`, `carrick-el1*`, `carrick-thread`, `carrick-softcpu*`,
+   `carrick-softmmu`, `carrick-vmm-*`, `carrick-x86*` and similar);
+4. otherwise standard.
+
+On a strong round, `invoke_worker` admits only any Codex model, any Claude
+Opus model, or Claude Sonnet at high effort. Dispatch sets no reasoning
+effort, so a Codex worker runs at the launcher's default. The coordinator
+reads the tier as the `worker_tier` state item. A strong round that runs no
+worker because its capacity report offered no strong-tier model ends
+Blocked with "no strong-tier worker had capacity", rather than on a weaker
+model. Every outcome's server section records `Worker tier:` and
+`Workers this round:`.
+
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
 proposals and the comment tool refuse the marker.

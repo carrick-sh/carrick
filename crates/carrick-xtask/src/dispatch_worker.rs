@@ -14,6 +14,8 @@ mod live_log;
 mod reactor;
 #[path = "dispatch_round_inbox.rs"]
 mod round_inbox;
+#[path = "dispatch_worker_tier.rs"]
+mod worker_tier;
 
 const LOOP_USER: &str = "carrick-dispatch-loop";
 const AGENT_USER: &str = "carrick-dispatch-agent";
@@ -392,6 +394,10 @@ pub(crate) struct AdmittedDispatch {
     /// Set only for a round the server chained from a Continuing outcome.
     #[serde(default)]
     pub chain: Option<ChainFacts>,
+    /// The admitted issue's label names: an input to the worker tier
+    /// (#1275), read from this snapshot, never re-queried after admission.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 /// Rounds per owner trigger: the owner's round and three chained ones
 /// (owner decision on #1241, #231).
@@ -440,6 +446,12 @@ fn persist_admission(
         },
         event_digest: event_digest(path)?,
         chain: chain.map(|link| link.facts.clone()),
+        labels: event["issue"]["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|label| label["name"].as_str().map(str::to_owned))
+            .collect(),
     };
     crate::agent_runner::secret_file(
         &state.join("admission.json"),
