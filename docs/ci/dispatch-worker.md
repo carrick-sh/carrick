@@ -890,8 +890,7 @@ The agent template builds `/opt/carrick-agent/codex-sdk` once from
 with `--require-hashes`. The SDK is root-owned and read-only to the agent.
 
 The driver sets `AGY_DIRECTOR_CODEX_VENV` to that path, so no job installs
-packages at run time. It sets `AGY_DIRECTOR_ROUTES=default` because the loop
-names the backend explicitly.
+packages at run time.
 
 The SDK's hash-locked wheels carry the complete codex package: `codex`,
 `codex-code-mode-host`, `rg` and `bwrap`. The driver no longer fetches or

@@ -1387,7 +1387,6 @@ fn agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses() {
     }
     let driver = include_str!("../src/dispatch_worker.rs");
     assert!(driver.contains(".env(\"AGY_DIRECTOR_CODEX_VENV\", CODEX_SDK_VENV)"));
-    assert!(driver.contains(".env(\"AGY_DIRECTOR_ROUTES\", \"default\")"));
     // #1240: every launch can fall back to the pinned roster seed.
     assert!(driver.contains("\"AGY_MODELS_SEED\""));
     let coordinator = include_str!("../src/dispatch_loop.rs");
