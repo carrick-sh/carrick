@@ -1068,11 +1068,8 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .env("AGY_BIN", state.join("bin/agy"))
         // The template's read-only, hash-locked SDK (#773) carries the whole
         // codex package (codex, codex-code-mode-host, rg, bwrap); a lone
-        // codex binary override cannot run tools. The loop names the
-        // backend, so the launcher's own route default must not report the
-        // dispatch as overriding an owner pause.
+        // codex binary override cannot run tools.
         .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
-        .env("AGY_DIRECTOR_ROUTES", "default")
         .env(
             "AGY_MODELS_SEED",
             state
