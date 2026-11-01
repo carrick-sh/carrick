@@ -3,17 +3,32 @@ use carrick_guest_arch::{ReturnKind, UserFlags, UserReturn, UserVa};
 use carrick_personality_linux::signal::{SignalBackend, SignalFrameParams};
 
 use carrick_el1::isa::ArchError;
+#[cfg(not(test))]
 use carrick_el1::isa::x86::X86Backend;
+#[cfg(not(test))]
 use carrick_el1::isa::x86::context::native::NativeFrame;
+#[cfg(test)]
+pub use carrick_x86::cpl0_entry::NativeFrame;
 
 use carrick_syscall_abi::{
     LinuxSiginfo as Siginfo, X8664Rtsigframe as RtSigframe, X8664Ucontext as Ucontext,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
+/// ISA mechanics only: the shared signal owner decides whether to restart.
+pub fn restart_from_return_word(frame: &mut NativeFrame, original_return: u64) -> bool {
+    let Some(pc) = frame.rcx.checked_sub(2) else {
+        return false;
+    };
+    frame.rax = original_return;
+    frame.rcx = pc;
+    true
+}
+
 /// The Linux signal-frame codec over the neutral x86 backend's types.
 pub struct LinuxX86Backend;
 
+#[cfg(not(test))]
 impl carrick_guest_arch::ArchTypes for LinuxX86Backend {
     type Error = <X86Backend as carrick_guest_arch::ArchTypes>::Error;
     type NativeFrame = <X86Backend as carrick_guest_arch::ArchTypes>::NativeFrame;
@@ -26,6 +41,23 @@ impl carrick_guest_arch::ArchTypes for LinuxX86Backend {
     type UserTransfer = <X86Backend as carrick_guest_arch::ArchTypes>::UserTransfer;
     type HardwareInterrupt = <X86Backend as carrick_guest_arch::ArchTypes>::HardwareInterrupt;
     type InterruptMask = <X86Backend as carrick_guest_arch::ArchTypes>::InterruptMask;
+}
+
+// Only register/frame publication is driven in host tests; physical MM and
+// interrupt capabilities are deliberately absent from this test adapter.
+#[cfg(test)]
+impl carrick_guest_arch::ArchTypes for LinuxX86Backend {
+    type Error = ArchError;
+    type NativeFrame = NativeFrame;
+    type SavedContext = carrick_sched_core::ParkedContextWords;
+    type Context = carrick_sched_core::ParkedContextWords;
+    type Root = carrick_guest_arch::RootGpa;
+    type MmOwner = carrick_el1_abi::CurrentTask;
+    type DrainTicket = ();
+    type DrainReceipt = ();
+    type UserTransfer = ();
+    type HardwareInterrupt = ();
+    type InterruptMask = ();
 }
 
 impl LinuxX86Backend {

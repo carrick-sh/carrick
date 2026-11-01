@@ -26,6 +26,16 @@ pub trait SignalMachine<C> {
     ) -> Option<bool> {
         None
     }
+    /// Restore the original architectural return word and rewind one syscall
+    /// instruction. Eligibility and SA_RESTART remain shared policy above this
+    /// ISA-only operation.
+    fn restart_from_return_word(
+        &self,
+        _frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+        _original_return: u64,
+    ) -> bool {
+        false
+    }
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute;
 }
 
@@ -57,12 +67,17 @@ where
     // Every completed checkpoint consumes this exact member's interrupted wait,
     // including a handler without SA_RESTART. It cannot leak into a later SVC.
     let mut interrupted_child_wait = process.take_interrupted_child_wait();
+    let forwarded_restart = slot.take_forwarded_restart();
     let mut rewind_interrupted_wait =
         |_process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
          frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
          machine: &mut A| {
             if let Some(original) = interrupted_child_wait.take() {
                 Some(machine.restart(frame, original.as_ref()))
+            } else if let Some(restart) = forwarded_restart {
+                restart
+                    .eligible
+                    .then(|| machine.restart_from_return_word(frame, restart.original_return))
             } else {
                 machine.restart_forwarded(frame)
             }
@@ -374,5 +389,301 @@ mod altstack_tests {
         let saved_pstate = built.rt.ucontext.uc_mcontext.pstate;
         assert_eq!(saved_sp, 0x40_0000);
         assert_eq!(saved_pstate, 0x6000_0000);
+    }
+}
+
+#[cfg(test)]
+mod resumed_forward_tests {
+    use super::*;
+    use crate::native_process_runtime::host_test_support::{
+        NativeSignalFixture, take_signal_copies,
+    };
+    use carrick_core_abi::{
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
+    };
+    use carrick_personality_linux::abi::thread::ForwardedSyscallRestart;
+    use carrick_sched_core::ParkedContextWords;
+    use zerocopy::FromBytes;
+
+    struct X86Machine(crate::x86_signal::LinuxX86Backend);
+    impl SignalMachine<ParkedContextWords> for X86Machine {
+        type Backend = crate::x86_signal::LinuxX86Backend;
+        fn backend(&mut self) -> &mut Self::Backend {
+            &mut self.0
+        }
+        fn user_sp(&self, frame: &crate::x86_signal::NativeFrame) -> UserVa {
+            UserVa::new(frame.rsp)
+        }
+        fn restart(&self, _: &mut crate::x86_signal::NativeFrame, _: &ParkedContextWords) -> bool {
+            false
+        }
+        fn restart_from_return_word(
+            &self,
+            frame: &mut crate::x86_signal::NativeFrame,
+            word: u64,
+        ) -> bool {
+            crate::x86_signal::restart_from_return_word(frame, word)
+        }
+        fn group_exit_custody(&self, _: &CurrentTask) -> CompletionRoute {
+            CompletionRoute::Suspended
+        }
+    }
+
+    fn fixture(id: u64) -> (NativeSignalFixture, ExecutionBinding) {
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(id),
+            generation: SnapshotGeneration::from_raw(1),
+            mm: EntryMmKey::from_raw(1),
+            thread_generation: EntryThreadGeneration::from_raw(1),
+        };
+        let fixture = NativeSignalFixture::new(
+            binding,
+            binding.task,
+            BirthSerial::of_task(carrick_sched_core::process::TaskSerial::from_raw_u64(5).unwrap()),
+        );
+        // The generic fixture expects SIGINT to have a handler. These controls
+        // start without one and install it explicitly only when needed.
+        fixture.ignore_signal(2);
+        (fixture, binding)
+    }
+    fn enqueue(
+        fixture: &NativeSignalFixture,
+        binding: ExecutionBinding,
+        queue: &carrick_el1_abi::SharedSignalIngressQueue,
+        signal: Signal,
+    ) {
+        queue
+            .admit(carrick_el1_abi::ExternalSignalRecord::new(
+                carrick_core_abi::EntryEventIdentity::from_binding(binding),
+                binding,
+                fixture.record(),
+                queue.issue_event_generation().unwrap(),
+                signal,
+                carrick_el1_abi::ExternalSignalSource::Terminal,
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn x86_resumed_forward_delivers_once_and_uses_shared_restart_decision() {
+        for (index, restart, eligible) in [(0, true, true), (1, false, true), (2, true, false)] {
+            let (fixture, binding) = fixture(179_000 + index);
+            fixture.install_sigint_handler(restart);
+            let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+            enqueue(&fixture, binding, &queue, Signal::from_number(2).unwrap());
+            assert!(
+                fixture
+                    .control_slot()
+                    .arm_forwarded_restart(ForwardedSyscallRestart {
+                        original_return: 0,
+                        eligible
+                    })
+            );
+            let mut frame = crate::x86_signal::NativeFrame {
+                rcx: 0x400002,
+                r11: 0x202,
+                rsp: 0x400000,
+                rax: carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+                rdi: 17,
+                rsi: 0x500000,
+                rdx: 1,
+                ..Default::default()
+            };
+            let _ = take_signal_copies();
+            let mut machine = X86Machine(crate::x86_signal::LinuxX86Backend);
+            let fpstate = [0; carrick_sched_core::X86_XSAVE_BYTES];
+            assert_eq!(
+                fixture.drain_and_deliver_with(&queue, &mut frame, &fpstate, &mut machine),
+                (1, None)
+            );
+            let copies = take_signal_copies();
+            let frames: Vec<_> = copies
+                .iter()
+                .filter(|(_, bytes)| {
+                    bytes.len() == core::mem::size_of::<carrick_syscall_abi::X8664Rtsigframe>()
+                })
+                .collect();
+            assert_eq!(frames.len(), 1);
+            let saved =
+                carrick_syscall_abi::X8664Rtsigframe::read_from_bytes(&frames[0].1).unwrap();
+            let pc = saved.uc.uc_mcontext.rip;
+            let value = saved.uc.uc_mcontext.rax;
+            let fd = saved.uc.uc_mcontext.rdi;
+            assert_eq!(
+                pc,
+                if restart && eligible {
+                    0x400000
+                } else {
+                    0x400002
+                }
+            );
+            assert_eq!(
+                value,
+                if restart && eligible {
+                    0
+                } else {
+                    carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+                }
+            );
+            assert_eq!(fd, 17);
+            assert_eq!(frame.rcx, 0x7000);
+            assert!(!fixture.control_slot().forwarded_restart_armed());
+            assert_eq!(
+                fixture.drain_and_deliver_with(&queue, &mut frame, &fpstate, &mut machine),
+                (0, None)
+            );
+            assert!(take_signal_copies().is_empty());
+            assert_eq!(frame.rcx, 0x7000);
+        }
+    }
+
+    #[test]
+    fn x86_empty_ignored_and_blocked_checkpoints_consume_restart_once() {
+        for (index, disposition) in ["empty", "ignored", "blocked"].into_iter().enumerate() {
+            let (fixture, binding) = fixture(179_020 + index as u64);
+            let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+            match disposition {
+                "ignored" => fixture.ignore_signal(2),
+                "blocked" => {
+                    fixture.install_sigint_handler(true);
+                    fixture.set_blocked_mask(BlockedMask(Signal::from_number(2).unwrap().bit()));
+                }
+                _ => (),
+            }
+            if disposition != "empty" {
+                enqueue(&fixture, binding, &queue, Signal::from_number(2).unwrap());
+            }
+            assert!(
+                fixture
+                    .control_slot()
+                    .arm_forwarded_restart(ForwardedSyscallRestart {
+                        original_return: 0,
+                        eligible: true,
+                    })
+            );
+            let mut frame = crate::x86_signal::NativeFrame {
+                rcx: 0x400002,
+                r11: 0x202,
+                rsp: 0x400000,
+                rax: carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+                ..Default::default()
+            };
+            let _ = take_signal_copies();
+            let mut machine = X86Machine(crate::x86_signal::LinuxX86Backend);
+            let fpstate = [0; carrick_sched_core::X86_XSAVE_BYTES];
+            let (_, route) =
+                fixture.drain_and_deliver_with(&queue, &mut frame, &fpstate, &mut machine);
+            assert_eq!(route, None);
+            assert_eq!((frame.rcx, frame.rax), (0x400000, 0));
+            assert!(!fixture.control_slot().forwarded_restart_armed());
+            assert!(take_signal_copies().is_empty());
+            // A later checkpoint must not rewind an unrelated instruction.
+            frame.rcx = 0x500002;
+            let (_, route) =
+                fixture.drain_and_deliver_with(&queue, &mut frame, &fpstate, &mut machine);
+            assert_eq!(route, None);
+            assert_eq!(frame.rcx, 0x500002);
+            assert!(take_signal_copies().is_empty());
+            if disposition == "blocked" {
+                fixture.set_blocked_mask(BlockedMask(0));
+                let (_, route) =
+                    fixture.drain_and_deliver_with(&queue, &mut frame, &fpstate, &mut machine);
+                assert_eq!(route, None);
+                assert_eq!(frame.rcx, 0x7000);
+                let copies = take_signal_copies();
+                let (_, bytes) = copies
+                    .iter()
+                    .find(|(_, bytes)| {
+                        bytes.len() == core::mem::size_of::<carrick_syscall_abi::X8664Rtsigframe>()
+                    })
+                    .unwrap();
+                let saved = carrick_syscall_abi::X8664Rtsigframe::read_from_bytes(bytes).unwrap();
+                let pc = saved.uc.uc_mcontext.rip;
+                assert_eq!(
+                    pc, 0x500002,
+                    "unblocking cannot reuse a settled restart witness"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn x86_default_fatal_checkpoint_consumes_restart_without_a_handler() {
+        let (fixture, binding) = fixture(179_030);
+        let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+        enqueue(&fixture, binding, &queue, Signal::from_number(15).unwrap());
+        assert!(
+            fixture
+                .control_slot()
+                .arm_forwarded_restart(ForwardedSyscallRestart {
+                    original_return: 0,
+                    eligible: true,
+                })
+        );
+        let mut frame = crate::x86_signal::NativeFrame {
+            rcx: 0x400002,
+            r11: 0x202,
+            rsp: 0x400000,
+            rax: carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+            ..Default::default()
+        };
+        let _ = take_signal_copies();
+        let mut machine = X86Machine(crate::x86_signal::LinuxX86Backend);
+        let fpstate = [0; carrick_sched_core::X86_XSAVE_BYTES];
+        let (drained, route) =
+            fixture.drain_and_deliver_with(&queue, &mut frame, &fpstate, &mut machine);
+        assert_eq!(drained, 1);
+        assert_eq!(route, Some(CompletionRoute::Suspended));
+        assert!(!fixture.control_slot().forwarded_restart_armed());
+        assert!(take_signal_copies().is_empty());
+    }
+
+    #[test]
+    fn arm_resumed_forward_delivers_once_and_uses_shared_restart_decision() {
+        for (index, restart, eligible) in [(0, true, true), (1, false, true), (2, true, false)] {
+            let (fixture, binding) = fixture(179_010 + index);
+            fixture.install_sigint_handler(restart);
+            let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+            enqueue(&fixture, binding, &queue, Signal::from_number(2).unwrap());
+            let mut frame = carrick_el1_abi::TrapFrame {
+                elr: 0x400004,
+                esr: if eligible { 0xfffe } else { 0xfffd },
+                far: 17,
+                spsr: 0x600003c0,
+                ..Default::default()
+            };
+            frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+            frame.x[8] = 63;
+            let _ = take_signal_copies();
+            assert_eq!(fixture.drain_and_deliver(&queue, &mut frame), (1, None));
+            let copies = take_signal_copies();
+            assert_eq!(copies.len(), 1);
+            let saved =
+                carrick_personality_linux::signal::arm::SignalFrame::read_from_bytes(&copies[0].1)
+                    .unwrap();
+            let pc = saved.rt.ucontext.uc_mcontext.pc;
+            let value = saved.rt.ucontext.uc_mcontext.regs[0];
+            assert_eq!(
+                pc,
+                if restart && eligible {
+                    0x400000
+                } else {
+                    0x400004
+                }
+            );
+            assert_eq!(
+                value,
+                if restart && eligible {
+                    17
+                } else {
+                    carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+                }
+            );
+            assert_eq!(frame.elr, 0x7000);
+            assert!(!fixture.control_slot().forwarded_restart_armed());
+            assert_eq!(fixture.drain_and_deliver(&queue, &mut frame), (0, None));
+            assert!(take_signal_copies().is_empty());
+        }
     }
 }

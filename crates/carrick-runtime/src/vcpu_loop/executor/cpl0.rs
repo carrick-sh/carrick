@@ -196,6 +196,30 @@ mod resume_effect_tests {
     }
 
     #[test]
+    fn native_eintr_transfers_restart_to_delivery_and_progress_does_not() {
+        let control = carrick_personality_linux::abi::thread::ThreadControlSlot::new();
+        super::super::super::arm_native_forwarded_restart(&control, 3, 0, Some(true)).unwrap();
+        assert!(!control.forwarded_restart_armed());
+        super::super::super::arm_native_forwarded_restart(
+            &control,
+            carrick_abi::LINUX_EINTR.guest_retval(),
+            0,
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(
+            control.take_forwarded_restart(),
+            Some(
+                carrick_personality_linux::abi::thread::ForwardedSyscallRestart {
+                    original_return: 0,
+                    eligible: true,
+                },
+            )
+        );
+        assert!(!control.forwarded_restart_armed());
+    }
+
+    #[test]
     fn restart_effect_stays_available_for_kvm_resume() {
         let effects = ContinuationResumeEffects {
             restart: Some(RestartDecision::Restart),
@@ -1021,6 +1045,23 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                 .ok_or_else(|| TrapError::Hypervisor("KVM continuation vanished".into()))?
                 .ready_event()
                 .map_err(|error| TrapError::Hypervisor(format!("KVM wake event: {error:?}")))?;
+            let native_resume = context.thread().control_slot().native_signal_owner()
+                && matches!(
+                    event,
+                    carrick_kernel::kernel::continuation::ContinuationEvent::Signal
+                );
+            let (native_restart, forwarded_masks) = if native_resume {
+                let pending = submission
+                    .execution_lease_mut()?
+                    .blocked_continuation()
+                    .ok_or_else(|| TrapError::Hypervisor("KVM continuation vanished".into()))?;
+                (
+                    Some(pending.native_restart_eligible()),
+                    Some(pending.signal_masks()),
+                )
+            } else {
+                (None, None)
+            };
             let mut result =
                 resume_continuation(submission.execution_lease_mut()?, event, &context)
                     .map_err(|error| TrapError::Hypervisor(format!("KVM resume: {error:?}")))?;
@@ -1032,7 +1073,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     return Ok(ExecutorExit::Syscall);
                 }
             };
-            if restart == Some(carrick_kernel::kernel::continuation::RestartDecision::Restart)
+            if !native_resume
+                && restart == Some(carrick_kernel::kernel::continuation::RestartDecision::Restart)
                 && matches!(
                     result.completion,
                     carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(
@@ -1094,17 +1136,9 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     }
                 })?;
             drop(dispatcher);
-            match outcome {
-                DispatchOutcome::Returned { value } => {
-                    self.physical
-                        .complete_forward(task, retained.frame, value)?;
-                    return Ok(ExecutorExit::Syscall);
-                }
-                DispatchOutcome::Errno { errno } => {
-                    self.physical
-                        .complete_forward(task, retained.frame, errno.guest_retval())?;
-                    return Ok(ExecutorExit::Syscall);
-                }
+            let value = match outcome {
+                DispatchOutcome::Returned { value } => value,
+                DispatchOutcome::Errno { errno } => errno.guest_retval(),
                 other => {
                     let mut slot = binding
                         .retained
@@ -1115,7 +1149,25 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
                     drop(slot);
                     return Self::block_forward(&binding, submission, request, other, None);
                 }
+            };
+            if value == carrick_abi::LINUX_EINTR.guest_retval()
+                && let Some(masks) = forwarded_masks
+            {
+                super::super::arm_native_forwarded_wait_mask(
+                    context.thread().control_slot(),
+                    masks,
+                );
             }
+            super::super::arm_native_forwarded_restart(
+                context.thread().control_slot(),
+                value,
+                retained.frame.original_return(),
+                native_restart,
+            )
+            .map_err(|error| TrapError::Hypervisor(error.to_owned()))?;
+            self.physical
+                .complete_forward(task, retained.frame, value)?;
+            return Ok(ExecutorExit::Syscall);
         }
         let lane_exited = self
             .loaded_exits

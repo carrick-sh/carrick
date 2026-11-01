@@ -42,6 +42,9 @@ vm_free = [
   "carrick-signal-linux::fork_reset::tests::*",
   "carrick-signal-linux::tests::single_mask_*",
   "carrick-x86::engine::tests::native_fault_entry_has_no_venue_without_register_changes",
+  "carrick-el1-linux::signal_delivery::resumed_forward_tests::{x86_resumed_forward_delivers_once_and_uses_shared_restart_decision,arm_resumed_forward_delivers_once_and_uses_shared_restart_decision,x86_empty_ignored_and_blocked_checkpoints_consume_restart_once,x86_default_fatal_checkpoint_consumes_restart_without_a_handler}",
+  "carrick-personality-linux::abi::thread::layout_manifest::forwarded_restart_is_consumed_once_and_cleared_at_rebirth",
+  "carrick-runtime::vcpu_loop::executor::cpl0::resume_effect_tests::native_eintr_transfers_restart_to_delivery_and_progress_does_not",
 ]
 
 embed = [
@@ -50,6 +53,7 @@ embed = [
 ]
 
 [bindings.unresolved]
+cpl0_continuation_signal_return = "The VM-free frame bindings exercise shared native delivery on both ISAs. A two-live-thread production continuation-resume witness and its KVM/HVF runs remain required; neither the publication-helper test nor frame decoding proves that end-to-end path. The historical carrier ReservedSignal refusal is unchanged; native bindings wake with plain Signal and preserve native selection ownership."
 embed_structural = "Signed EL0 frame and PSTATE semantic bindings pass. EL1 ownership, malformed sigreturn and the remaining scenarios listed in the witness ledger remain unresolved."
 docker = "No Docker in preparation; native arm64 differential remains required at cutover."
 

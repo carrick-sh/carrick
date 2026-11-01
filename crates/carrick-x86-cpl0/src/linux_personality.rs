@@ -355,6 +355,10 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
         }
     }
 
+    fn restart_from_return_word(&self, frame: &mut NativeFrame, original_return: u64) -> bool {
+        carrick_el1_linux::x86_signal::restart_from_return_word(frame, original_return)
+    }
+
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute {
         complete_run_failure(
             task,

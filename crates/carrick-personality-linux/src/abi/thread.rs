@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 20;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 21;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -499,6 +499,22 @@ impl ClearChildTidState {
     }
 }
 
+/// Restart witness for one interrupted host-served syscall. The stopped
+/// execution owner publishes it; the shared native delivery owner consumes it
+/// once, including when another live thread has already consumed the signal.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub struct ForwardedSyscallRestart {
+    /// Original architectural return word (ARM arg0, x86 syscall number).
+    pub original_return: u64,
+    pub eligible: bool,
+}
+
 /// Per-thread control state served at EL1. Single writer per field: the
 /// owning thread writes `blocked` (`store_blocked_then_read_pending`) and the
 /// altstack/robust record; other threads and the host only read (senders read
@@ -563,6 +579,9 @@ pub struct ThreadControlSlot {
     affinity_guest_alias: AtomicU64,
     /// Exact native service custody survives execution-slot reuse.
     pub service: carrick_core_abi::service::ServiceCell,
+    forwarded_restart_word: AtomicU64,
+    /// 0 = absent, 1 = interrupted/nonrestartable, 2 = restart eligible.
+    forwarded_restart: AtomicU64,
 }
 
 /// Quiescent initialization was attempted on a live execution authority.
@@ -705,6 +724,8 @@ impl ThreadControlSlot {
             native_pending_writer: AtomicU32::new(0),
             in_zone_standard_pending: InZoneStandardPending::new(),
             service: carrick_core_abi::service::ServiceCell::new(),
+            forwarded_restart_word: AtomicU64::new(0),
+            forwarded_restart: AtomicU64::new(0),
         }
     }
 
@@ -852,6 +873,8 @@ impl ThreadControlSlot {
         self.in_zone_standard_pending.reset();
         self.forwarded_saved_mask.store(0, Ordering::Relaxed);
         self.forwarded_mask_armed.store(0, Ordering::Relaxed);
+        self.forwarded_restart.store(0, Ordering::Relaxed);
+        self.forwarded_restart_word.store(0, Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
         let seq = self.alt_seq.load(Ordering::Relaxed);
         self.alt_seq
@@ -1010,6 +1033,40 @@ impl ThreadControlSlot {
     pub fn take_forwarded_wait_mask(&self) -> Option<BlockedMask> {
         (self.forwarded_mask_armed.swap(0, Ordering::AcqRel) != 0)
             .then(|| BlockedMask(self.forwarded_saved_mask.load(Ordering::Acquire)))
+    }
+
+    /// Publish only while this exact thread is stopped, after completing an
+    /// interrupted continuation and before allowing its native return checkpoint.
+    /// The previous checkpoint must have consumed its witness before another
+    /// syscall can begin. False therefore names a broken completion invariant,
+    /// not contention between signal senders.
+    pub fn arm_forwarded_restart(&self, restart: ForwardedSyscallRestart) -> bool {
+        if self.forwarded_restart.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        self.forwarded_restart_word
+            .store(restart.original_return, Ordering::Relaxed);
+        self.forwarded_restart
+            .store(if restart.eligible { 2 } else { 1 }, Ordering::Release);
+        true
+    }
+
+    pub fn forwarded_restart_armed(&self) -> bool {
+        self.forwarded_restart.load(Ordering::Acquire) != 0
+    }
+
+    /// Only this thread's shared native signal-delivery checkpoint consumes it.
+    pub fn take_forwarded_restart(&self) -> Option<ForwardedSyscallRestart> {
+        let state = self.forwarded_restart.load(Ordering::Acquire);
+        if state == 0 {
+            return None;
+        }
+        let original_return = self.forwarded_restart_word.load(Ordering::Relaxed);
+        self.forwarded_restart.store(0, Ordering::Release);
+        Some(ForwardedSyscallRestart {
+            original_return,
+            eligible: state == 2,
+        })
     }
 
     /// Seqlock write. Only the owning thread may call this; concurrent
@@ -1569,7 +1626,7 @@ impl LifecycleHatches {
             | (if self.sigmask { SERVING_SIGMASK } else { 0 })
     }
 }
-const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 384);
+const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 448);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
 
 /// Linux keeps the last thread's exit with the terminal runtime owner.
@@ -3201,7 +3258,7 @@ mod layout_manifest {
                 size_of::<ThreadControlSlot>(),
                 align_of::<ThreadControlSlot>()
             ),
-            (384, 64)
+            (448, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
@@ -3239,6 +3296,8 @@ mod layout_manifest {
                      affinity_host_alias: _,
                      affinity_guest_alias: _,
                      service: _,
+                     forwarded_restart_word: _,
+                     forwarded_restart: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, fault_address, AtomicU64, 8, 8, 8);
@@ -3330,6 +3389,36 @@ mod layout_manifest {
             128,
             64
         );
+        field!(
+            ThreadControlSlot,
+            forwarded_restart_word,
+            AtomicU64,
+            384,
+            8,
+            8
+        );
+        field!(ThreadControlSlot, forwarded_restart, AtomicU64, 392, 8, 8);
+    }
+
+    #[test]
+    fn forwarded_restart_is_consumed_once_and_cleared_at_rebirth() {
+        let control = ThreadControlSlot::new();
+        let first = ForwardedSyscallRestart {
+            original_return: 63,
+            eligible: true,
+        };
+        let next = ForwardedSyscallRestart {
+            original_return: 7,
+            eligible: false,
+        };
+        assert!(control.arm_forwarded_restart(first));
+        assert!(!control.arm_forwarded_restart(next));
+        assert_eq!(control.take_forwarded_restart(), Some(first));
+        assert_eq!(control.take_forwarded_restart(), None);
+        assert!(control.arm_forwarded_restart(next));
+        control.reset_for_host_birth(BlockedMask(0)).unwrap();
+        assert!(!control.forwarded_restart_armed());
+        assert_eq!(control.take_forwarded_restart(), None);
     }
 
     #[test]
