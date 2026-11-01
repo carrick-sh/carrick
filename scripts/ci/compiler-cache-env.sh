@@ -48,10 +48,22 @@ if [[ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]]; then
     : "${RUNNER_NAME:?self-hosted runner has no RUNNER_NAME}" "${HOME:?}"
     dir="${CARRICK_SCCACHE_LOCAL_ROOT:-$HOME/.cache/carrick-sccache}/$RUNNER_NAME"
     mkdir -p "$dir"
+    # One server socket per job (#1264). A persistent runner keeps
+    # $RUNNER_TEMP between jobs, so a socket left by a server that a
+    # cancelled job's cleanup killed must never be the next job's path:
+    # sccache refuses to bind an existing one ("File exists").
+    : "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}" "${GITHUB_JOB:?}"
+    job_hash=$(printf '%s' "$GITHUB_JOB" | cksum | cut -d' ' -f1)
+    socket="$RUNNER_TEMP/sccache-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$job_hash.sock"
+    # sun_path holds 104 bytes on macOS, including the terminator.
+    if (( ${#socket} > 100 )); then
+        echo "compiler-cache-env: socket path too long for a UNIX socket: $socket" >&2
+        exit 1
+    fi
     {
         echo "SCCACHE_DIR=$dir"
         echo "SCCACHE_CACHE_SIZE=15G"
-        echo "SCCACHE_SERVER_UDS=$RUNNER_TEMP/sccache.sock"
+        echo "SCCACHE_SERVER_UDS=$socket"
     } >> "$GITHUB_ENV"
     echo "backend=local" >> "$GITHUB_OUTPUT"
     echo "compiler cache: family=$family backend=local ($dir, runner is ${RUNNER_ENVIRONMENT:-unknown})"

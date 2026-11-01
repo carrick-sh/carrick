@@ -575,33 +575,69 @@ fn compiler_cache_env_selects_r2_only_for_credentialed_hosted_runners() {
     assert_eq!(env, format!("SCCACHE_DIR={}\n", dir.display()));
 
     // Self-hosted runners hash different absolute paths: never R2. They keep
-    // a persistent per-runner cache and a per-job server socket (#938).
+    // a persistent per-runner cache and a per-job server socket (#938). The
+    // socket is named for the run, attempt and job (#1264): a persistent
+    // runner keeps $RUNNER_TEMP, so a socket a killed server left behind must
+    // never be the next job's path.
     let local = tempfile::tempdir().unwrap();
     let root = local.path().display().to_string();
-    let (code, env, out, temp_cache) = run(
+    let self_hosted = |job: &'static str| {
+        run(
+            &["darwin-hosted", "read-only"],
+            &[
+                creds[0],
+                creds[1],
+                ("RUNNER_ENVIRONMENT", "self-hosted"),
+                ("RUNNER_NAME", "carrick-m4-ci-2"),
+                ("HOME", "/nonexistent"),
+                ("CARRICK_SCCACHE_LOCAL_ROOT", &root),
+                ("GITHUB_RUN_ID", "41263666997"),
+                ("GITHUB_RUN_ATTEMPT", "2"),
+                ("GITHUB_JOB", job),
+            ],
+        )
+    };
+    let (code, env, out, temp_cache) = self_hosted("macos-build");
+    assert_eq!(code, Some(0));
+    assert_eq!(out, "backend=local\n");
+    let dir = local.path().join("carrick-m4-ci-2");
+    assert!(dir.is_dir());
+    let socket = |env: &str| {
+        env.lines()
+            .find_map(|l| l.strip_prefix("SCCACHE_SERVER_UDS="))
+            .unwrap()
+            .to_owned()
+    };
+    let build_socket = socket(&env);
+    assert_eq!(
+        env,
+        format!(
+            "SCCACHE_DIR={}\nSCCACHE_CACHE_SIZE=15G\nSCCACHE_SERVER_UDS={build_socket}\n",
+            dir.display(),
+        )
+    );
+    let prefix = temp_cache
+        .with_file_name("sccache-41263666997-2-")
+        .display()
+        .to_string();
+    assert!(
+        build_socket.starts_with(&prefix) && build_socket.ends_with(".sock"),
+        "{build_socket}"
+    );
+    let (_, unit_env, _, _) = self_hosted("macos-unit-a");
+    assert_ne!(socket(&unit_env), build_socket, "each job its own socket");
+    // Without the job identity a per-job socket can't be named; refuse.
+    let (code, env, _, _) = run(
         &["darwin-hosted", "read-only"],
         &[
-            creds[0],
-            creds[1],
             ("RUNNER_ENVIRONMENT", "self-hosted"),
             ("RUNNER_NAME", "carrick-m4-ci-2"),
             ("HOME", "/nonexistent"),
             ("CARRICK_SCCACHE_LOCAL_ROOT", &root),
         ],
     );
-    assert_eq!(code, Some(0));
-    assert_eq!(out, "backend=local\n");
-    let dir = local.path().join("carrick-m4-ci-2");
-    assert!(dir.is_dir());
-    let socket = temp_cache.with_file_name("sccache.sock");
-    assert_eq!(
-        env,
-        format!(
-            "SCCACHE_DIR={}\nSCCACHE_CACHE_SIZE=15G\nSCCACHE_SERVER_UDS={}\n",
-            dir.display(),
-            socket.display()
-        )
-    );
+    assert_ne!(code, Some(0));
+    assert!(env.is_empty());
 
     // Without a runner name the directory would be shared; refuse instead.
     let (code, env, out, _) = run(
@@ -881,4 +917,44 @@ fn compiler_cache_start_falls_back_only_on_transient_reader_faults() {
     let (code, env, _, _) = run("ok", "READ_ONLY", &stub_dir.path().join("absent"));
     assert_ne!(code, Some(0));
     assert!(env.is_empty());
+}
+
+/// #1264: a self-hosted runner keeps `$RUNNER_TEMP` and its daemonized
+/// sccache server between jobs, so every job that configures the compiler
+/// cache ends by stopping its own server (`just ci-cache-finish`), even when
+/// an earlier step failed or the job was cancelled.
+#[test]
+fn every_compiler_cache_job_stops_its_server_at_job_end() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
+    let mut jobs = 0;
+    for (job, body) in workflow["jobs"].as_hash().unwrap() {
+        let Some(steps) = body["steps"].as_vec() else {
+            continue;
+        };
+        let configures = steps.iter().any(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("scripts/ci/compiler-cache-env.sh "))
+        });
+        if !configures {
+            continue;
+        }
+        jobs += 1;
+        assert!(
+            steps.iter().any(|s| {
+                s["run"].as_str() == Some("just ci-cache-finish")
+                    && s["if"].as_str().is_some_and(|c| c.contains("always()"))
+            }),
+            "{job:?}: no `if: always()` step running `just ci-cache-finish`"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|s| s["run"].as_str() == Some("just build-cache")),
+            "{job:?}: job end must stop the server, not only print statistics"
+        );
+    }
+    assert!(jobs > 0, "no compiler-cache jobs found");
 }
