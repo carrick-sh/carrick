@@ -837,6 +837,7 @@ fn hlt_deadline_wait_uses_clock_domain_after_guest_tsc_write() {
             _hz: u64,
             _node: &carrick_softcpu_x86::ApicNode,
             _bound: Duration,
+            _ready: &dyn Fn() -> bool,
         ) -> bool {
             *self.0.lock().unwrap() = deadline;
             false
@@ -1053,7 +1054,8 @@ fn deadline_passed_before_enrolment_returns_without_parking() {
         Some(10_000),
         1_000_000_000,
         &lapic.node(),
-        Duration::from_secs(1)
+        Duration::from_secs(1),
+        &|| false,
     ));
     assert!(!clock.wait_for_enrolments(1, Duration::ZERO));
 }
@@ -1061,4 +1063,128 @@ fn deadline_passed_before_enrolment_returns_without_parking() {
 #[test]
 fn wide_apic_sse_page_crossing_is_gp() {
     assert_wide_apic_gp_at(&[0x0f, 0x10, 0x06], LAPIC_DEFAULT_PHYS_BASE + 0xff8);
+}
+
+#[test]
+fn icr_non_fixed_modes_never_latch_vectors() {
+    for clustered in [false, true] {
+        for mode in [0x200, 0x300, 0x400, 0x500, 0x600, 0x700] {
+            let mut apic = LocalApic::new(0);
+            if clustered {
+                apic.attach_cluster(Arc::new(ApicCluster::new()));
+            }
+            let mut d = 0;
+            apic.write_reg32(LAPIC_SVR_OFFSET, 0x1ff, 0, &mut d);
+            apic.write_reg32(
+                LAPIC_ICR_LOW_OFFSET,
+                mode | LAPIC_ICR_SHORTHAND_SELF | 0x9a,
+                0,
+                &mut d,
+            );
+            assert!(!apic.irr_bit(0x9a), "mode {mode:#x}, clustered={clustered}");
+            apic.write_reg32(
+                LAPIC_ICR_LOW_OFFSET,
+                mode | LAPIC_ICR_SHORTHAND_SELF | 2,
+                0,
+                &mut d,
+            );
+            assert_eq!(apic.read_reg32(LAPIC_ESR_OFFSET, 0), 0);
+        }
+    }
+}
+
+#[test]
+fn icr_broadcast_reaches_flat_cluster_and_standalone_destinations() {
+    for clustered in [true, false] {
+        for logical in [true, false] {
+            for dfr in [0x0fff_ffff, 0xffff_ffff] {
+                let cluster = Arc::new(ApicCluster::new());
+                let mut apics = [LocalApic::new(0), LocalApic::new(1)];
+                let mut d = 0;
+                for (id, apic) in apics.iter_mut().enumerate() {
+                    if clustered {
+                        apic.attach_cluster(cluster.clone());
+                    }
+                    apic.write_reg32(LAPIC_SVR_OFFSET, 0x1ff, 0, &mut d);
+                    apic.write_reg32(LAPIC_DFR_OFFSET, dfr, 0, &mut d);
+                    apic.write_reg32(LAPIC_LDR_OFFSET, ((id as u32 + 1) * 0x11) << 24, 0, &mut d);
+                }
+                apics[0].write_reg32(LAPIC_ICR_HIGH_OFFSET, 0xff00_0000, 0, &mut d);
+                apics[0].write_reg32(
+                    LAPIC_ICR_LOW_OFFSET,
+                    0x51 | if logical {
+                        LAPIC_ICR_DEST_MODE_LOGICAL
+                    } else {
+                        0
+                    },
+                    0,
+                    &mut d,
+                );
+                assert!(
+                    apics[0].irr_bit(0x51),
+                    "clustered={clustered}, logical={logical}, dfr={dfr:#x}"
+                );
+                assert_eq!(apics[1].irr_bit(0x51), clustered);
+            }
+        }
+    }
+}
+
+#[test]
+fn hlt_blocked_interrupts_park_without_host_exit_spin() {
+    for case in ["illegal", "tpr", "ppr", "if"] {
+        let clock = Arc::new(ManualTscClock::new(0));
+        let worker_clock = clock.clone();
+        let (node_tx, node_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut machine, _, _) = setup_apic_machine(0, &[0xf4]);
+            machine.set_clock(worker_clock);
+            machine.set_hlt_wait_timeout(Some(Duration::from_secs(5)));
+            let ctx = machine.context_mut();
+            ctx.lapic_mmio_write(LAPIC_SVR_OFFSET, &0x1ffu32.to_le_bytes());
+            ctx.rflags |= 1 << 9;
+            if case == "if" {
+                ctx.rflags &= !(1 << 9);
+            }
+            if case == "tpr" {
+                ctx.lapic_mmio_write(LAPIC_TPR_OFFSET, &0xf0u32.to_le_bytes());
+            }
+            if case == "ppr" {
+                ctx.lapic_mut().inject_interrupt(0xe1);
+                assert_eq!(ctx.lapic_mut().accept_interrupt(true), Some(0xe1));
+            }
+            machine.inject_interrupt(if case == "illegal" { 2 } else { 0x51 });
+            node_tx.send(machine.apic_node()).unwrap();
+            // A blocked request must park on every HLT, rather than exhaust this budget.
+            for exits in 1..=3 {
+                assert!(matches!(
+                    machine.run(1).unwrap(),
+                    SoftMachineExit::Hlt { .. }
+                ));
+                exit_tx.send(exits).unwrap();
+            }
+        });
+        let node = node_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let parked = clock.wait_for_enrolments(1, Duration::from_secs(5));
+        assert!(parked, "{case}: exhausted HLT exit budget before parking");
+        for expected in 1..=3 {
+            assert!(
+                matches!(
+                    exit_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "{case}: host exits while parked must be zero"
+            );
+            node.notify_clock_advance();
+            assert_eq!(
+                exit_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                expected
+            );
+            if expected < 3 {
+                assert!(clock.wait_for_enrolments(expected + 1, Duration::from_secs(5)));
+            }
+        }
+        worker.join().unwrap();
+    }
 }

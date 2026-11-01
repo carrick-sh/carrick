@@ -158,15 +158,16 @@ pub trait TscClock: Send + Sync + fmt::Debug {
     /// Returns the current unscaled TSC tick counter at nominal frequency `tsc_hz`.
     fn now_tsc(&self, tsc_hz: u64) -> u64;
 
-    /// Waits until either `kick` is signaled, `deadline_tsc` is reached, or `max_wait` elapses.
+    /// Waits until `ready` reports a deliverable interrupt, the deadline, or `max_wait`.
     ///
-    /// Returns `true` if a kick or deadline was reached before `max_wait` expired.
+    /// Notifications enroll under the node lock; stale kicks and masked IRR do not bypass parking.
     fn wait_until(
         &self,
         deadline_tsc: Option<u64>,
         tsc_hz: u64,
         kick: &ApicNode,
         max_wait: Duration,
+        ready: &dyn Fn() -> bool,
     ) -> bool;
 
     /// Optional hook allowing deterministic clocks to register an [`ApicNode`] so manual clock
@@ -214,8 +215,9 @@ impl TscClock for MonotonicTscClock {
         tsc_hz: u64,
         kick: &ApicNode,
         max_wait: Duration,
+        ready: &dyn Fn() -> bool,
     ) -> bool {
-        if kick.is_kicked() || kick.has_pending_irr() {
+        if ready() {
             return true;
         }
         let now = self.now_tsc(tsc_hz);
@@ -237,14 +239,10 @@ impl TscClock for MonotonicTscClock {
             max_wait
         };
         if wait_duration.is_zero() {
-            return kick.is_kicked()
-                || kick.has_pending_irr()
-                || deadline_tsc.is_some_and(|d| self.now_tsc(tsc_hz) >= d);
+            return ready() || deadline_tsc.is_some_and(|d| self.now_tsc(tsc_hz) >= d);
         }
-        kick.wait_for_kick_or_timeout(wait_duration);
-        kick.is_kicked()
-            || kick.has_pending_irr()
-            || deadline_tsc.is_some_and(|d| self.now_tsc(tsc_hz) >= d)
+        kick.wait_for_event(wait_duration, ready);
+        ready() || deadline_tsc.is_some_and(|d| self.now_tsc(tsc_hz) >= d)
     }
 }
 
@@ -363,8 +361,9 @@ impl TscClock for ManualTscClock {
         _tsc_hz: u64,
         kick: &ApicNode,
         max_wait: Duration,
+        ready: &dyn Fn() -> bool,
     ) -> bool {
-        if kick.is_kicked() || kick.has_pending_irr() {
+        if ready() {
             return true;
         }
         let now = self.now();
@@ -378,13 +377,11 @@ impl TscClock for ManualTscClock {
             }
         }
         if max_wait.is_zero() {
-            return kick.is_kicked()
-                || kick.has_pending_irr()
-                || deadline_tsc.is_some_and(|d| self.now() >= d);
+            return ready() || deadline_tsc.is_some_and(|d| self.now() >= d);
         }
         kick.wait_for_event_enrolled(
             max_wait,
-            || deadline_tsc.is_some_and(|d| self.now() >= d),
+            || ready() || deadline_tsc.is_some_and(|d| self.now() >= d),
             || {
                 if let Ok(mut count) = self.enrolments.lock() {
                     *count = count.saturating_add(1);
@@ -392,7 +389,7 @@ impl TscClock for ManualTscClock {
                 }
             },
         );
-        kick.is_kicked() || kick.has_pending_irr() || deadline_tsc.is_some_and(|d| self.now() >= d)
+        ready() || deadline_tsc.is_some_and(|d| self.now() >= d)
     }
 
     fn register_node(&self, node: Weak<ApicNode>) {
@@ -488,7 +485,7 @@ impl ApicNode {
         true
     }
 
-    /// Sets the kick flag and wakes any thread blocked in `wait_for_kick_or_timeout`.
+    /// Sets the kick flag and notifies the enrolled interrupt waiter.
     pub fn kick(&self) {
         self.kick_flag.store(true, Ordering::Release);
         if let Ok(mut epoch) = self.wait_lock.lock() {
@@ -497,7 +494,7 @@ impl ApicNode {
         }
     }
 
-    /// Wakes any thread blocked in `wait_for_kick_or_timeout` when a manual clock advances.
+    /// Notifies the enrolled interrupt waiter when a manual clock advances.
     pub fn notify_clock_advance(&self) {
         if let Ok(mut epoch) = self.wait_lock.lock() {
             *epoch = epoch.wrapping_add(1);
@@ -538,12 +535,7 @@ impl ApicNode {
         None
     }
 
-    /// Waits on the node's condvar until kicked, an `IRR` bit is set, or `timeout` elapses.
-    pub fn wait_for_kick_or_timeout(&self, timeout: Duration) -> bool {
-        self.wait_for_event(timeout, || false)
-    }
-
-    fn wait_for_event(&self, timeout: Duration, ready: impl Fn() -> bool) -> bool {
+    pub(crate) fn wait_for_event(&self, timeout: Duration, ready: impl Fn() -> bool) -> bool {
         self.wait_for_event_enrolled(timeout, ready, || {})
     }
 
@@ -553,7 +545,7 @@ impl ApicNode {
         ready: impl Fn() -> bool,
         enrolled: impl FnOnce(),
     ) -> bool {
-        let pending = || self.is_kicked() || self.has_pending_irr() || ready();
+        let pending = ready;
         if pending() || timeout.is_zero() {
             return pending();
         }
@@ -572,6 +564,9 @@ impl ApicNode {
     }
 
     fn matches_logical(&self, dest_mask: u8) -> bool {
+        if dest_mask == 0xff {
+            return true;
+        }
         if dest_mask == 0 {
             return false;
         }
@@ -585,6 +580,15 @@ impl ApicNode {
             _ => false,
         }
     }
+}
+
+// Only fixed and lowest-priority messages populate IRR. Other delivery modes
+// require distinct architectural state transitions; they are currently unimplemented.
+fn icr_latches_vector(icr_low: u32) -> bool {
+    matches!(
+        icr_low & LAPIC_ICR_DELIVERY_MODE_MASK,
+        LAPIC_ICR_DELIVERY_FIXED | LAPIC_ICR_DELIVERY_LOWEST_PRIORITY
+    ) && ((icr_low & LAPIC_ICR_TRIGGER_LEVEL) == 0 || (icr_low & LAPIC_ICR_LEVEL_ASSERT) != 0)
 }
 
 /// Shared interconnect routing xAPIC `ICR` IPIs between multiple soft vCPUs.
@@ -639,13 +643,7 @@ impl ApicCluster {
     pub fn dispatch_icr(&self, sender: &ApicNode, icr_low: u32, icr_high: u32) -> usize {
         let vector = (icr_low & 0xff) as u8;
         let delivery_mode = icr_low & LAPIC_ICR_DELIVERY_MODE_MASK;
-        if delivery_mode != LAPIC_ICR_DELIVERY_FIXED
-            && delivery_mode != LAPIC_ICR_DELIVERY_LOWEST_PRIORITY
-        {
-            return 0;
-        }
-        // De-assert level-triggered INIT (`level == 0`, `trigger == 1`) is a no-op.
-        if (icr_low & LAPIC_ICR_TRIGGER_LEVEL) != 0 && (icr_low & LAPIC_ICR_LEVEL_ASSERT) == 0 {
+        if !icr_latches_vector(icr_low) {
             return 0;
         }
         let shorthand = icr_low & LAPIC_ICR_SHORTHAND_MASK;
@@ -672,7 +670,7 @@ impl ApicCluster {
                     if logical {
                         sender.matches_logical(dest)
                     } else {
-                        dest == sender_id
+                        dest == 0xff || dest == sender_id
                     }
                 }
                 _ => false,
@@ -1305,12 +1303,12 @@ impl LocalApic {
                             if logical {
                                 self.node.matches_logical(dest)
                             } else {
-                                dest == self.apic_id()
+                                dest == 0xff || dest == self.apic_id()
                             }
                         }
                         _ => false,
                     };
-                    if self_targeted {
+                    if self_targeted && icr_latches_vector(self.icr_low) {
                         self.node.inject_interrupt(vector);
                     }
                 }

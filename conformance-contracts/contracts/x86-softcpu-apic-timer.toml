@@ -8,7 +8,7 @@ semantic_authority = [
 ]
 fixture = "carrick-softcpu-x86::softcpu_apic_timer"
 scale_points = [1, 1000, 1000000000]
-rationale = "A periodic timer coalesces missed expirations into one pending vector and computes the next deadline arithmetically, independent of elapsed periods. HLT retains its parked state until an interrupt; waits share the clock used by RDTSC and account for guest TSC writes. The two live CPU fixture sends one ping and one pong through guest MMIO, observes ISR before and after EOI, and resumes both CPUs after HLT."
+rationale = "A periodic timer coalesces missed expirations into one pending vector and computes the next deadline arithmetically, independent of elapsed periods. HLT retains its parked state until an interrupt; waits share the clock used by RDTSC and account for guest TSC writes. The two live CPU fixture sends one ping and one pong through guest MMIO, observes ISR before and after EOI, and resumes both CPUs after HLT. For illegal vectors and IRR blocked by IF, TPR or PPR, the HLT witness permits zero host exits while parked across three successive wait enrollments; only a fresh notification releases each wait."
 
 [[structural_budgets]]
 kind = "upper-bound"
@@ -20,6 +20,9 @@ rationale = "One poll coalesces any number of missed periodic deadlines into a s
 [bindings]
 vm_free = [
   "carrick-softcpu-x86::softcpu_apic_timer::tsc_deadline_and_initial_count_timers_with_injectable_clock_and_bounded_hlt",
+  "carrick-softcpu-x86::softcpu_apic_timer::icr_non_fixed_modes_never_latch_vectors",
+  "carrick-softcpu-x86::softcpu_apic_timer::icr_broadcast_reaches_flat_cluster_and_standalone_destinations",
+  "carrick-softcpu-x86::softcpu_apic_timer::hlt_blocked_interrupts_park_without_host_exit_spin",
   "carrick-softcpu-x86::softcpu_apic_timer::local_apic_registers_tpr_cr8_ppr_eoi_esr_and_apic_base_relocation",
   "carrick-softcpu-x86::softcpu_apic_timer::interrupt_priority_sti_shadow_and_nested_preemption_with_eoi",
   "carrick-softcpu-x86::softcpu_apic_timer::icr_ipi_modes_self_broadcast_physical_and_logical_across_apic_cluster",
