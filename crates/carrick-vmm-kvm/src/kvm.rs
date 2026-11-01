@@ -1094,8 +1094,9 @@ impl KvmVm {
     pub fn cpuid_view(&self) -> carrick_x86::GuestCpuidView {
         let tsc = match self.tsc_khz.load(Ordering::Acquire) {
             0 => self.cpuid_view.tsc_ratio(),
-            khz => carrick_x86::TscCrystalRatio::from_khz(khz)
-                .or_else(|| self.cpuid_view.tsc_ratio()),
+            khz => {
+                carrick_x86::TscCrystalRatio::from_khz(khz).or_else(|| self.cpuid_view.tsc_ratio())
+            }
         };
         self.cpuid_view.with_tsc(tsc)
     }

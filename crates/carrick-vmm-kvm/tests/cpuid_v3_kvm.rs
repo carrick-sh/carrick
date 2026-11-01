@@ -157,7 +157,8 @@ fn assert_observed_leaves_are_strictly_v3(
     for &((leaf, subleaf), got) in observed {
         let want = expected_view.cpuid(leaf, subleaf);
         assert_eq!(
-            got, want,
+            got,
+            want,
             "guest CPUID({leaf:#x}, {subleaf:#x}) diverged from GuestCpuidView \
              (apic_id={}): got={got:?} want={want:?}",
             expected_view.apic_id()
@@ -173,9 +174,17 @@ fn assert_observed_leaves_are_strictly_v3(
     };
 
     let l1 = find(1, 0);
-    assert_eq!(l1.ecx & !CPUID_1_ECX_X86_64_V3, 0, "non-v3 1.ECX bits leaked");
+    assert_eq!(
+        l1.ecx & !CPUID_1_ECX_X86_64_V3,
+        0,
+        "non-v3 1.ECX bits leaked"
+    );
     assert_eq!(l1.ecx & CPUID_1_ECX_HYPERVISOR, 0, "hypervisor bit leaked");
-    assert_eq!(l1.edx & !CPUID_1_EDX_X86_64_V3, 0, "non-v3 1.EDX bits leaked");
+    assert_eq!(
+        l1.edx & !CPUID_1_EDX_X86_64_V3,
+        0,
+        "non-v3 1.EDX bits leaked"
+    );
 
     let l7_0 = find(7, 0);
     assert_eq!(l7_0, CpuidRegs::new(0, CPUID_7_0_EBX_PINNED, 0, 0));
@@ -229,12 +238,7 @@ fn kvm_cpl0_guest_sees_pinned_x86_64_v3_cpuid_and_no_non_v3_features() {
         for &(leaf, subleaf) in PROBED_LEAVES {
             let lo = carrier.observe(slot).expect("observe ebx:eax").result as u64;
             let hi = carrier.observe(slot).expect("observe edx:ecx").result as u64;
-            let regs = CpuidRegs::new(
-                lo as u32,
-                (lo >> 32) as u32,
-                hi as u32,
-                (hi >> 32) as u32,
-            );
+            let regs = CpuidRegs::new(lo as u32, (lo >> 32) as u32, hi as u32, (hi >> 32) as u32);
             observed.push(((leaf, subleaf), regs));
         }
         assert_observed_leaves_are_strictly_v3(&observed, expected_view);
@@ -366,7 +370,10 @@ fn kvm_run_elf_guest_sees_pinned_x86_64_v3_cpuid_and_executes_v3_isa() {
     std::fs::write(tmp.path(), &elf).expect("write temp ELF");
 
     let bin = env!("CARGO_BIN_EXE_carrick-vmm-kvm");
-    let out = Command::new(bin)
+    // A guest fault must fail this witness rather than leave the KVM lane
+    // waiting indefinitely for the subprocess to flush its observations.
+    let out = Command::new("timeout")
+        .args(["--signal=KILL", "10s", bin])
         .arg("run-elf")
         .arg(tmp.path())
         .output()
@@ -399,6 +406,12 @@ fn kvm_run_elf_guest_sees_pinned_x86_64_v3_cpuid_and_executes_v3_isa() {
 
     let isa_witness = u32::from_le_bytes(out.stdout[tail + 8..tail + 12].try_into().unwrap());
     let movbe_witness = u32::from_le_bytes(out.stdout[tail + 12..tail + 16].try_into().unwrap());
-    assert_eq!(isa_witness, EXPECTED_V3_ISA_WITNESS, "run-elf v3 ISA witness");
-    assert_eq!(movbe_witness, EXPECTED_MOVBE_WITNESS, "run-elf MOVBE witness");
+    assert_eq!(
+        isa_witness, EXPECTED_V3_ISA_WITNESS,
+        "run-elf v3 ISA witness"
+    );
+    assert_eq!(
+        movbe_witness, EXPECTED_MOVBE_WITNESS,
+        "run-elf MOVBE witness"
+    );
 }
