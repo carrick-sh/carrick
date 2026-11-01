@@ -16,7 +16,8 @@ use carrick_mem::memory::AddressSpace;
 use kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    CpuId, KVM_CAP_EXIT_ON_EMULATION_FAILURE, KVM_MAX_CPUID_ENTRIES, kvm_enable_cap,
+    CpuId, KVM_CAP_EXIT_ON_EMULATION_FAILURE, KVM_MAX_CPUID_ENTRIES, kvm_cpuid_entry2,
+    kvm_enable_cap,
 };
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, kvm_userspace_memory_region};
 #[cfg(target_arch = "x86_64")]
@@ -529,11 +530,14 @@ pub struct KvmVm {
     /// re-align the counter via the `TIMER_CNT` fallback (vcpu init zeroes
     /// the VM-wide CNTVOFF). Set once at `create_empty`; immutable after.
     counter_locked: bool,
-    /// The host-supported x86 CPUID table installed onto each freshly-created
-    /// vCPU. Without this, KVM exposes an empty/default CPUID model and modern
-    /// glibc rejects Debian amd64 userland before `main`.
+    /// Pinned `x86-64-v3` guest CPUID view qualified against `KVM_GET_SUPPORTED_CPUID`
+    /// at VM creation (#667). Installed per vCPU with its unique `apic_id` and TSC rate.
     #[cfg(target_arch = "x86_64")]
-    cpuid: Arc<CpuId>,
+    cpuid_view: carrick_x86::GuestCpuidView,
+    /// Calibrated KVM virtual TSC rate in kHz (`KVM_GET_TSC_KHZ`), shared across
+    /// VM handles so `x86_tsc_hz()` matches `CPUID.15H` and guest `RDTSC`.
+    #[cfg(target_arch = "x86_64")]
+    tsc_khz: Arc<AtomicU32>,
 }
 
 /// A `Send`-safe handle to the SHARED VM state a `clone(CLONE_THREAD)` sibling
@@ -552,9 +556,12 @@ pub(crate) struct SharedVmHandle {
     vcpu_pool: Arc<Mutex<Vec<ParkedVcpu>>>,
     /// Whether the VM-wide counter offset is pinned (see [`KvmVm::counter_locked`]).
     counter_locked: bool,
-    /// Shared x86 CPUID table for sibling vCPUs on the same VM.
+    /// Shared pinned `x86-64-v3` CPUID view for sibling vCPUs on the same VM.
     #[cfg(target_arch = "x86_64")]
-    cpuid: Arc<CpuId>,
+    cpuid_view: carrick_x86::GuestCpuidView,
+    /// Shared calibrated KVM virtual TSC rate in kHz (`KVM_GET_TSC_KHZ`).
+    #[cfg(target_arch = "x86_64")]
+    tsc_khz: Arc<AtomicU32>,
 }
 /// The swappable live-vCPU identity, shared (via `Arc`) between the engine's
 /// `vcpu: KvmVcpu` field and — on the x86 M:N reclaim path — its `vm: KvmVmm`
@@ -874,8 +881,10 @@ impl KvmVcpu {
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod x86_tests {
     use super::*;
+    use carrick_x86::{CPUID_FLAG_SIGNIFICANT_INDEX, CpuidRegs, PINNED_CPUID_ENTRY_COUNT};
     use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 
     fn cpuid_entry(
@@ -883,32 +892,75 @@ mod x86_tests {
         function: u32,
         index: u32,
     ) -> Option<kvm_bindings::kvm_cpuid_entry2> {
-        cpuid
-            .as_slice()
-            .iter()
-            .copied()
-            .find(|entry| entry.function == function && entry.index == index)
+        cpuid.as_slice().iter().copied().find(|entry| {
+            entry.function == function
+                && ((entry.flags & CPUID_FLAG_SIGNIFICANT_INDEX) == 0 || entry.index == index)
+        })
     }
 
     #[test]
-    fn x86_vcpu_exposes_glibc_x86_64_v2_cpuid_bits() {
+    fn x86_vcpu_exposes_pinned_x86_64_v3_cpuid_and_no_non_v3_features() {
         let mut vm = KvmVm::create_empty().expect("create kvm vm");
-        let vcpu = vm.add_vcpu().expect("create kvm vcpu");
-        let cpuid = vcpu
-            .fd()
-            .get_cpuid2(KVM_MAX_CPUID_ENTRIES)
-            .expect("get vcpu cpuid");
+        let vcpu0 = vm.add_vcpu().expect("create kvm vcpu 0");
+        let vcpu1 = vm.add_vcpu().expect("create kvm vcpu 1");
 
-        let leaf1 = cpuid_entry(&cpuid, 1, 0).expect("CPUID leaf 1");
-        assert_ne!(leaf1.ecx & (1 << 0), 0, "SSE3");
-        assert_ne!(leaf1.ecx & (1 << 9), 0, "SSSE3");
-        assert_ne!(leaf1.ecx & (1 << 13), 0, "CMPXCHG16B");
-        assert_ne!(leaf1.ecx & (1 << 19), 0, "SSE4.1");
-        assert_ne!(leaf1.ecx & (1 << 20), 0, "SSE4.2");
-        assert_ne!(leaf1.ecx & (1 << 23), 0, "POPCNT");
+        for (slot, vcpu) in [(0_u8, &vcpu0), (1_u8, &vcpu1)] {
+            let expected = vm.cpuid_view().with_apic_id(slot);
+            let cpuid = vcpu
+                .fd()
+                .get_cpuid2(KVM_MAX_CPUID_ENTRIES)
+                .expect("get vcpu cpuid");
+            assert_eq!(cpuid.as_slice().len(), PINNED_CPUID_ENTRY_COUNT);
+            assert!(
+                !cpuid
+                    .as_slice()
+                    .iter()
+                    .any(|e| (0x4000_0000..0x8000_0000).contains(&e.function)),
+                "hypervisor CPUID range must not be installed"
+            );
 
-        let ext1 = cpuid_entry(&cpuid, 0x8000_0001, 0).expect("CPUID leaf 0x80000001");
-        assert_ne!(ext1.ecx & 1, 0, "LAHF/SAHF");
+            // Fresh vCPU has XCR0=0x7 installed and CR4.OSXSAVE=0 prior to set_sregs.
+            for entry in cpuid.as_slice() {
+                let got = CpuidRegs::new(entry.eax, entry.ebx, entry.ecx, entry.edx);
+                assert_eq!(
+                    got,
+                    expected.cpuid_for_state(entry.function, entry.index, false, true),
+                    "pre-OSXSAVE CPUID mismatch on slot {slot} leaf ({:#x}, {:#x})",
+                    entry.function,
+                    entry.index,
+                );
+            }
+
+            let mut sregs = vcpu.fd().get_sregs().expect("get_sregs");
+            sregs.cr4 |= 1 << 18; // CR4.OSXSAVE
+            vcpu.fd().set_sregs(&sregs).expect("set_sregs(CR4.OSXSAVE)");
+
+            let active_cpuid = vcpu
+                .fd()
+                .get_cpuid2(KVM_MAX_CPUID_ENTRIES)
+                .expect("get active vcpu cpuid");
+            for entry in active_cpuid.as_slice() {
+                let got = CpuidRegs::new(entry.eax, entry.ebx, entry.ecx, entry.edx);
+                assert_eq!(
+                    got,
+                    expected.cpuid(entry.function, entry.index),
+                    "active CPUID mismatch on slot {slot} leaf ({:#x}, {:#x})",
+                    entry.function,
+                    entry.index,
+                );
+            }
+            // Independent psABI feature oracle, separate from GuestCpuidView's
+            // production masks so a mistaken expansion cannot bless itself.
+            let leaf1 = cpuid_entry(&active_cpuid, 1, 0).expect("leaf 1 installed");
+            assert_eq!(leaf1.ecx, 0x3cd8_3201);
+            assert_eq!(leaf1.edx, 0x0789_a37d);
+            let leaf7 = cpuid_entry(&active_cpuid, 7, 0).expect("leaf 7 installed");
+            assert_eq!(leaf7.ebx, 0x0010_01a8);
+            assert_eq!((leaf7.eax, leaf7.ecx, leaf7.edx), (0, 0, 0));
+            assert!(cpuid_entry(&active_cpuid, 7, 1).is_none());
+            assert!(cpuid_entry(&active_cpuid, 0x0d, 1).is_none());
+            assert!(cpuid_entry(&active_cpuid, 0x4000_0000, 0).is_none());
+        }
     }
 }
 
@@ -1045,39 +1097,25 @@ impl Drop for KvmVcpu {
 }
 
 impl KvmVm {
+    /// Pinned `x86-64-v3` guest CPUID view installed onto this VM's vCPUs.
+    #[cfg(target_arch = "x86_64")]
+    pub fn cpuid_view(&self) -> carrick_x86::GuestCpuidView {
+        let tsc = match self.tsc_khz.load(Ordering::Acquire) {
+            0 => self.cpuid_view.tsc_ratio(),
+            khz => {
+                carrick_x86::TscCrystalRatio::from_khz(khz).or_else(|| self.cpuid_view.tsc_ratio())
+            }
+        };
+        self.cpuid_view.with_tsc(tsc)
+    }
+
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn x86_tsc_hz(&self) -> Option<u64> {
-        fn cpuid_entry(
-            cpuid: &kvm_bindings::CpuId,
-            function: u32,
-            index: u32,
-        ) -> Option<kvm_bindings::kvm_cpuid_entry2> {
-            cpuid
-                .as_slice()
-                .iter()
-                .copied()
-                .find(|entry| entry.function == function && entry.index == index)
+        let khz = self.tsc_khz.load(Ordering::Acquire);
+        if khz != 0 {
+            return u64::from(khz).checked_mul(1_000);
         }
-
-        if let Some(leaf) = cpuid_entry(&self.cpuid, 0x15, 0) {
-            let denom = u64::from(leaf.eax);
-            let numer = u64::from(leaf.ebx);
-            let crystal_hz = u64::from(leaf.ecx);
-            if denom != 0
-                && numer != 0
-                && crystal_hz != 0
-                && let Some(product) = crystal_hz.checked_mul(numer)
-            {
-                return Some(product / denom);
-            }
-        }
-        if let Some(leaf) = cpuid_entry(&self.cpuid, 0x16, 0) {
-            let base_mhz = u64::from(leaf.eax);
-            if base_mhz != 0 {
-                return base_mhz.checked_mul(1_000_000);
-            }
-        }
-        None
+        self.cpuid_view.tsc_ratio().map(|r| r.tsc_hz().get())
     }
 
     /// Open `/dev/kvm` and `KVM_CREATE_VM` with no address space — the child
@@ -1085,7 +1123,7 @@ impl KvmVm {
     /// `GuestRam` windows, so there is no `AddressSpace` to thread through.
     /// (`HvVm::create` ignores its `&AddressSpace` argument; this is the same
     /// bring-up without the unused parameter.)
-    pub(crate) fn create_empty() -> Result<Self, OsError> {
+    pub fn create_empty() -> Result<Self, OsError> {
         reset_kvm_stats_for_new_vm();
         let kvm = Kvm::new().map_err(|e| os_err("open /dev/kvm", e))?;
         // Probe KVM_CAP_SYNC_REGS once: it lets the syscall doorbell read the
@@ -1096,10 +1134,25 @@ impl KvmVm {
         #[cfg(target_arch = "x86_64")]
         let _ = SYNC_REGS_OK.get_or_init(|| kvm.check_extension(Cap::SyncRegs));
         #[cfg(target_arch = "x86_64")]
-        let cpuid = Arc::new(
-            kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
-                .map_err(|e| os_err("KVM_GET_SUPPORTED_CPUID", e))?,
-        );
+        let cpuid_view = {
+            let supported = kvm
+                .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+                .map_err(|e| os_err("KVM_GET_SUPPORTED_CPUID", e))?;
+            let entries: Vec<carrick_x86::CpuidLeafEntry> = supported
+                .as_slice()
+                .iter()
+                .map(|e| carrick_x86::CpuidLeafEntry {
+                    function: e.function,
+                    index: e.index,
+                    flags: e.flags,
+                    regs: carrick_x86::CpuidRegs::new(e.eax, e.ebx, e.ecx, e.edx),
+                })
+                .collect();
+            carrick_x86::GuestCpuidView::qualify_supported(&entries).map_err(|e| OsError {
+                context: format!("kvm: qualify x86-64-v3 guest CPUID: {e}"),
+                errno: libc::ENOTSUP,
+            })?
+        };
         let vm = kvm.create_vm().map_err(|e| os_err("KVM_CREATE_VM", e))?;
         // EPOCH INVARIANT: the shared dispatcher (clock_nanosleep TIMER_ABSTIME,
         // absolute FUTEX_WAIT_BITSET deadlines, timer/timerfd ABSTIME) compares
@@ -1152,7 +1205,9 @@ impl KvmVm {
             vcpu_pool: Arc::new(Mutex::new(Vec::new())),
             counter_locked,
             #[cfg(target_arch = "x86_64")]
-            cpuid,
+            cpuid_view,
+            #[cfg(target_arch = "x86_64")]
+            tsc_khz: Arc::new(AtomicU32::new(0)),
         })
     }
 
@@ -1170,7 +1225,9 @@ impl KvmVm {
             vcpu_pool: Arc::clone(&self.vcpu_pool),
             counter_locked: self.counter_locked,
             #[cfg(target_arch = "x86_64")]
-            cpuid: Arc::clone(&self.cpuid),
+            cpuid_view: self.cpuid_view,
+            #[cfg(target_arch = "x86_64")]
+            tsc_khz: Arc::clone(&self.tsc_khz),
         }
     }
 
@@ -1193,7 +1250,9 @@ impl KvmVm {
             vcpu_pool: handle.vcpu_pool,
             counter_locked: handle.counter_locked,
             #[cfg(target_arch = "x86_64")]
-            cpuid: handle.cpuid,
+            cpuid_view: handle.cpuid_view,
+            #[cfg(target_arch = "x86_64")]
+            tsc_khz: handle.tsc_khz,
         }
     }
 
@@ -1283,31 +1342,24 @@ impl KvmVm {
                     .create_vcpu(vcpu_id)
                     .map_err(|e| os_err("KVM_CREATE_VCPU", e))?;
                 #[cfg(target_arch = "x86_64")]
-                self.install_x86_cpuid(&new_fd)?;
+                self.install_x86_cpuid(&new_fd, vcpu_id)?;
                 new_fd
             }
         };
         #[cfg(target_arch = "x86_64")]
         {
-            // Enable AVX state on EVERY x86 vCPU: XCR0 = x87(0)|SSE(1)|AVX(2) so
-            // the guest's XGETBV reports AVX available (CR4.OSXSAVE is set in the
-            // boot regs). Only KVM does this — it is the only backend that carries
-            // the full XSAVE (incl YMM) across fork/clone/execve and signals (see
-            // X86Vcpu::get_xsave); without that an AVX-using guest (Go's runtime
-            // uses AVX memmove once it sees AVX) would lose YMM upper halves at a
-            // fork/signal boundary. SSE(1) MUST be set alongside AVX(2) or XSETBV
-            // faults. Best-effort: a host without AVX leaves the guest Base-only.
+            // Enable pinned x86-64-v3 AVX state on EVERY x86 vCPU:
+            // XCR0 = x87(0) | SSE(1) | AVX(2) = 0x7 so guest XGETBV(0) matches
+            // CPUID.(0Dh, 0) and AVX/AVX2 instructions execute without #UD.
+            // Fail closed if KVM refuses XCR0=0x7 so CPUID and XCR0 never diverge.
             let mut xcrs = kvm_bindings::kvm_xcrs {
                 nr_xcrs: 1,
                 ..Default::default()
             };
             xcrs.xcrs[0].xcr = 0;
-            xcrs.xcrs[0].value = 0x7;
-            if let Err(e) = fd.set_xcrs(&xcrs) {
-                eprintln!(
-                    "carrick-kvm: KVM_SET_XCRS(XCR0=0x7) failed: {e} — guest stays SSE/Base-only"
-                );
-            }
+            xcrs.xcrs[0].value = u64::from(carrick_x86::XCR0_X86_64_V3_MASK);
+            fd.set_xcrs(&xcrs)
+                .map_err(|e| os_err("KVM_SET_XCRS(XCR0=0x7)", e))?;
         }
         // aarch64: KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT + counter align.
         // x86_64: no ARM-specific init; the x86 bring-up path (guest_setup_x86.rs)
@@ -1452,8 +1504,39 @@ impl KvmVm {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn install_x86_cpuid(&self, fd: &VcpuFd) -> Result<(), OsError> {
-        fd.set_cpuid2(&self.cpuid)
+    fn install_x86_cpuid(&self, fd: &VcpuFd, vcpu_id: u64) -> Result<(), OsError> {
+        let apic_id = u8::try_from(vcpu_id).map_err(|_| OsError {
+            context: format!("kvm: vcpu id {vcpu_id} exceeds xAPIC 8-bit APIC ID range"),
+            errno: libc::EINVAL,
+        })?;
+        let tsc = match fd.get_tsc_khz() {
+            Ok(khz) if khz != 0 => {
+                self.tsc_khz.store(khz, Ordering::Release);
+                carrick_x86::TscCrystalRatio::from_khz(khz)
+            }
+            _ => {
+                let cached = self.tsc_khz.load(Ordering::Acquire);
+                if cached != 0 {
+                    carrick_x86::TscCrystalRatio::from_khz(cached)
+                } else {
+                    self.cpuid_view.tsc_ratio()
+                }
+            }
+        };
+        let view = self.cpuid_view.with_apic_id(apic_id).with_tsc(tsc);
+        let kvm_entries = view.to_leaf_entries().map(|entry| kvm_cpuid_entry2 {
+            function: entry.function,
+            index: entry.index,
+            flags: entry.flags,
+            eax: entry.regs.eax,
+            ebx: entry.regs.ebx,
+            ecx: entry.regs.ecx,
+            edx: entry.regs.edx,
+            padding: [0; 3],
+        });
+        let cpuid = CpuId::from_entries(&kvm_entries)
+            .map_err(|e| os_err("CpuId::from_entries(x86-64-v3)", e))?;
+        fd.set_cpuid2(&cpuid)
             .map_err(|e| os_err("KVM_SET_CPUID2", e))
     }
 }

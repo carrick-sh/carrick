@@ -20,11 +20,18 @@ pub mod bringup;
 pub mod bringup_fns;
 pub mod cpl0_entry;
 pub mod cpl0_scheduler;
+pub mod cpuid;
 pub mod engine;
 pub mod fault;
 pub mod interrupts;
 pub mod vdso;
 pub mod vmm;
+
+pub use cpuid::{
+    CPUID_FLAG_SIGNIFICANT_INDEX, CpuidLeafEntry, CpuidQualificationError, CpuidRegisterName,
+    CpuidRegs, DEFAULT_GUEST_MAX_PHY_ADDR, DEFAULT_TSC_HZ, GuestCpuidView, MIN_GUEST_MAX_PHY_ADDR,
+    PINNED_CPUID_ENTRY_COUNT, TscCrystalRatio, XCR0_X86_64_V3_MASK,
+};
 
 pub use bringup::{MsrInitBlob, fp_stub_bytes, msr_init_blob, run_fp_stub};
 pub use bringup_fns::{
