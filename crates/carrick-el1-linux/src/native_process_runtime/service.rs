@@ -657,6 +657,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
             )));
         }
+        let mut record = record;
+        carrick_personality_linux::native_host_file::stamp_write_file_size_limit(
+            &mut record,
+            || self.caller_file_size_soft_limit(),
+        )?;
         self.service_phase = NativeServicePhase::Capability;
         let capability = self
             .runtime
@@ -681,6 +686,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }),
             false,
         )
+    }
+    /// The caller's own `RLIMIT_FSIZE` soft limit, which the ring owns.
+    pub(super) fn caller_file_size_soft_limit(&self) -> Result<u64, NativeProcessError> {
+        let graph = self.runtime.graph.lock();
+        let task = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?;
+        task.rlimits
+            .get(carrick_abi::LINUX_RLIMIT_FSIZE as usize)
+            .map(|limit| limit.rlim_cur)
+            .ok_or(NativeProcessError::Stale)
     }
     /// Whether the calling thread's ring credentials are still exactly the
     /// identity a native process is admitted with.

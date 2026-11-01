@@ -11,7 +11,7 @@ use carrick_guest_mem::CurrentMmMemory;
 use super::LinuxSpliceFlags;
 use super::pipe::{PipeDrain, PipeWriteOperation, take_pipe_bytes, wait_for_pipe_readable};
 use super::*;
-use crate::dispatch::fd_table::{HostFdRef, HostWriteKind, is_anon_overlay_path};
+use crate::dispatch::fd_table::{HostFdRef, HostWriteKind};
 use crate::dispatch::{
     FdWaitCompletion, HostPipeWriteTarget, WaitFdAuthority, WaitFds, write_host_pipe_owned,
 };
@@ -704,7 +704,7 @@ impl<'a> FsView<'a> {
             // regular file (off_out at the fd's current position) work, matching
             // real Linux (splice pipe->file).
             let outcome: DispatchOutcome;
-            let writeback: Option<(String, usize, usize)>;
+            let writeback: Option<super::rw::FileWriteback>;
             {
                 let Some(mut open) =
                     crate::kernel::FileDescription::write_for_io(&open_file.description)
@@ -938,47 +938,26 @@ impl<'a> FsView<'a> {
                         )
                         .unwrap_or(DispatchOutcome::Errno { errno: LINUX_EINTR });
                     }
-                    OpenDescription::File {
-                        path,
-                        contents,
-                        offset,
-                        writable,
-                        metadata,
-                        ..
-                    } => {
-                        if !*writable {
-                            return DispatchOutcome::errno(LINUX_EBADF);
-                        }
-                        let write_offset = *offset;
-                        let written = match write_into_file_contents(contents, offset, bytes) {
-                            Ok(n) => n,
+                    // The transfer path does not apply RLIMIT_FSIZE to an
+                    // in-memory file (unchanged).
+                    file @ OpenDescription::File { .. } => {
+                        match super::rw::write_file_description(
+                            &open_file.description,
+                            file,
+                            bytes,
+                            |_, len| Ok(len),
+                        ) {
+                            Ok((written, range)) => {
+                                outcome = written;
+                                writeback = range;
+                            }
                             Err(errno) => return DispatchOutcome::errno(errno),
-                        };
-                        let cur_len = match contents.len() {
-                            Ok(l) => l,
-                            Err(errno) if written == 0 => return DispatchOutcome::errno(errno),
-                            Err(_) => *offset as u64,
-                        };
-                        metadata.size = usize::try_from(cur_len).unwrap_or(metadata.size);
-                        outcome = DispatchOutcome::returned_len_or_errno(written);
-                        writeback = (!is_anon_overlay_path(path)).then(|| {
-                            (
-                                path.clone(),
-                                write_offset,
-                                usize::try_from(cur_len).unwrap_or(0),
-                            )
-                        });
+                        }
                     }
                     _ => return DispatchOutcome::errno(LINUX_EBADF),
                 }
             }
-            if let Some((path, offset, final_size)) = writeback {
-                let _ = self
-                    .fs
-                    .rootfs_vfs
-                    .overlay
-                    .write_file_range(&path, offset, bytes, final_size);
-            }
+            self.apply_file_writeback(writeback);
             return outcome;
         }
         self.write_stdio_sink(fd, bytes)

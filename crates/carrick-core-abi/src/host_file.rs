@@ -18,6 +18,8 @@
 #[repr(u16)]
 pub enum HostFileOp {
     /// `write`/`writev` of the staged input bytes to a host-backed descriptor.
+    /// `args[0]` is the writer's own `RLIMIT_FSIZE` soft limit (`u64::MAX`
+    /// is unlimited), stamped by the ring that owns the writer's limits.
     Write = 1,
     /// `fstat` of a host-backed descriptor; the output is a Linux `struct stat`.
     Fstat = 2,
@@ -286,6 +288,17 @@ impl<'a> HostFileRequestView<'a> {
         self.header
     }
 
+    /// Replace the header's scalar arguments: the ring's own stamp of a
+    /// value only it knows (for example a `Write`'s file-size limit) on a
+    /// record it staged.
+    pub fn set_args(&mut self, args: [u64; 4]) {
+        for (index, arg) in args.iter().enumerate() {
+            let offset = ARGS + index * 8;
+            self.bytes[offset..offset + 8].copy_from_slice(&arg.to_le_bytes());
+        }
+        self.header.args = args;
+    }
+
     pub fn input(&self) -> &[u8] {
         &self.bytes[HOST_FILE_HEADER_BYTES..HOST_FILE_HEADER_BYTES + self.input_len]
     }
@@ -354,6 +367,19 @@ mod tests {
             flags: 0,
             args: [1, 2, 3, 4],
         }
+    }
+
+    #[test]
+    fn set_args_restamps_only_the_scalar_arguments() {
+        let mut bytes = vec![0u8; record_len(5, 0).unwrap()];
+        encode(&mut bytes, header(HostFileOp::Write), b"hello", 0).unwrap();
+        let mut view = HostFileRequestView::parse(&mut bytes).unwrap();
+        view.set_args([u64::MAX, 2, 3, 4]);
+        let view = HostFileRequestView::parse(&mut bytes).unwrap();
+        let mut expected = header(HostFileOp::Write);
+        expected.args[0] = u64::MAX;
+        assert_eq!(view.header(), expected);
+        assert_eq!(view.input(), b"hello");
     }
 
     #[test]

@@ -88,7 +88,7 @@ impl NativeOpenSink {
         &mut self,
         fs: &super::FsView<'_>,
         file: crate::dispatch::fd_table::OpenFile,
-    ) -> Result<i32, carrick_abi::LinuxErrno> {
+    ) -> Result<fd::Fd, carrick_abi::LinuxErrno> {
         let open_flags = LinuxOpenFlags::from_bits_retain(self.flags);
         // A mount-served open meets O_DIRECTORY only after the host task's
         // install, which then withdraws its fd. A ring descriptor, visible to
@@ -131,7 +131,7 @@ impl NativeOpenSink {
             status,
             open_flags.contains(LinuxOpenFlags::CLOEXEC),
         ) {
-            Ok(number) => Ok(number.0),
+            Ok(number) => Ok(number),
             Err(InstallHostDescriptionError::TooManyFiles) => Err(carrick_abi::LINUX_EMFILE),
             Err(InstallHostDescriptionError::FileTableFull) => Err(carrick_abi::LINUX_ENFILE),
             Err(InstallHostDescriptionError::NoMemory) => Err(carrick_abi::LINUX_ENOMEM),
@@ -295,17 +295,16 @@ impl SyscallDispatcher {
                 Ok(None) => Served::errno(carrick_abi::LINUX_EBADF),
                 Err(_) => Served::Refused,
             },
-            HostFileOp::Write => {
-                let fs = self.fs_view();
-                // A file-size limit or a watcher needs the writer's task.
-                let Some(admitted) = fs.admit_carrier_write() else {
-                    return Served::Refused;
-                };
-                match fs.write_description_from_carrier(admitted, description, input) {
-                    Ok(outcome) => served_outcome(outcome, Vec::new()),
-                    Err(_) => Served::Refused,
-                }
-            }
+            // `args[0]`: the writer's own RLIMIT_FSIZE soft limit, as its
+            // ring stamped it (unstamped, it reads as a finite 0).
+            HostFileOp::Write => match self.fs_view().write_description_from_carrier(
+                header.args[0],
+                description,
+                input,
+            ) {
+                Ok(super::fs::CarrierWritten::Done(outcome)) => served_outcome(outcome, Vec::new()),
+                Ok(super::fs::CarrierWritten::NeedsTask) | Err(_) => Served::Refused,
+            },
             HostFileOp::MapPrivate => self.native_map_source(description),
             HostFileOp::Openat | HostFileOp::Faccessat | HostFileOp::Newfstatat => Served::Refused,
         }
@@ -1110,12 +1109,21 @@ mod tests {
             )
             .0
         }
+        /// A write from a native caller whose ring stamped an unlimited
+        /// `RLIMIT_FSIZE`.
         fn venue_write(&self, fd: i64, bytes: &[u8]) -> i64 {
-            self.result(
-                None,
-                record(self.table, HostFileOp::Write, fd as i32, [0; 4], bytes, 0),
+            self.result(None, self.stamped_write(fd, UNLIMITED, bytes))
+                .0
+        }
+        fn stamped_write(&self, fd: i64, file_size_limit: u64, bytes: &[u8]) -> Vec<u8> {
+            record(
+                self.table,
+                HostFileOp::Write,
+                fd as i32,
+                [file_size_limit, 0, 0, 0],
+                bytes,
+                0,
             )
-            .0
         }
         /// The whole file, read back through a fresh read-only venue open.
         fn venue_contents(&self, authority: &NativeFsAuthority, path: &[u8]) -> Vec<u8> {
@@ -1161,6 +1169,8 @@ mod tests {
             other => panic!("unexpected outcome {other:?}"),
         }
     }
+
+    const UNLIMITED: u64 = carrick_abi::LINUX_RLIM_INFINITY;
 
     const CREATE: u64 =
         carrick_abi::LINUX_O_WRONLY | carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_TRUNC;
@@ -1354,8 +1364,111 @@ mod tests {
         assert_eq!(
             fixture.serve(Some(&authority), &mut create),
             Err(NativeHostFileRefusal),
-            "a create would owe IN_CREATE and later events"
+            "a create in the watched directory would owe IN_CREATE"
         );
+        let mut truncate = record(
+            fixture.table,
+            HostFileOp::Openat,
+            FDCWD,
+            [
+                carrick_abi::LINUX_O_WRONLY | carrick_abi::LINUX_O_TRUNC,
+                0,
+                0,
+                0,
+            ],
+            b"/etc/ld.so.cache",
+            0,
+        );
+        assert_eq!(
+            fixture.serve(Some(&authority), &mut truncate),
+            Err(NativeHostFileRefusal),
+            "a truncate of a watched file would owe IN_MODIFY"
+        );
+        // A path no watch covers is created and written as without one.
+        let fd = fixture.venue_open(&authority, b"/tmp/unwatched", CREATE, 0o644);
+        assert!(fd >= 0, "uncovered create: {fd}");
+        assert_eq!(fixture.venue_write(fd, b"ok"), 2);
+        assert_eq!(fixture.venue_contents(&authority, b"/tmp/unwatched"), b"ok");
+    }
+
+    /// The writer's own `RLIMIT_FSIZE` comes from its ring's stamp, never
+    /// the serving dispatcher's (unlimited here): a finite or unstamped
+    /// limit refuses a regular-file write before any byte lands; an
+    /// unlimited one is served. Limits never apply to stdio or a device.
+    #[test]
+    fn native_regular_file_writes_need_the_writers_unlimited_file_size() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = writable_fixture(upper);
+            let authority = authority_of(&fixture.dispatcher);
+            let fd = fixture.venue_open(&authority, b"/tmp/limited", CREATE, 0o644);
+            for limit in [4096, 0] {
+                let mut write = fixture.stamped_write(fd, limit, b"bytes");
+                assert_eq!(
+                    fixture.serve(None, &mut write),
+                    Err(NativeHostFileRefusal),
+                    "{upper:?}: limit {limit}"
+                );
+            }
+            assert!(
+                fixture
+                    .venue_contents(&authority, b"/tmp/limited")
+                    .is_empty(),
+                "{upper:?}: no byte landed"
+            );
+            assert_eq!(fixture.venue_write(fd, b"bytes"), 5, "{upper:?}");
+            assert_eq!(
+                fixture.venue_contents(&authority, b"/tmp/limited"),
+                b"bytes"
+            );
+
+            let null = fixture.venue_open(&authority, b"/dev/null", CREATE, 0);
+            let (written, _) = fixture.result(None, fixture.stamped_write(null, 0, b"x"));
+            assert_eq!(written, 1, "{upper:?}: a device has no file-size limit");
+            let (written, _) = fixture.result(None, fixture.stamped_write(1, 0, b"out"));
+            assert_eq!(written, 3, "{upper:?}: nor has stdout");
+        }
+    }
+
+    /// `writev(2)` through an `O_APPEND` descriptor of an in-memory upper
+    /// file (musl stdio's `>>`) lands at the end, through the same write
+    /// core as `write(2)`.
+    #[test]
+    fn root_append_writev_lands_at_the_end_of_an_in_memory_file() {
+        let mut fixture = writable_fixture(Upper::Memory);
+        const BASE: u64 = 0x4_0000;
+        let writev = |dispatcher: &mut SyscallDispatcher, fd: i64, bytes: &[u8]| {
+            let mut memory = vec![0u8; 0x1000];
+            memory[..8].copy_from_slice(&(BASE + 0x100).to_le_bytes());
+            memory[8..16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+            memory[0x100..0x100 + bytes.len()].copy_from_slice(bytes);
+            let mut memory = super::super::outcome::LinearMemory::new(BASE, memory);
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let reporter = crate::compat::CompatReporter::default();
+            dispatcher
+                .dispatch(
+                    &context,
+                    crate::dispatch::SyscallRequest::new(
+                        66,
+                        crate::compat::SyscallArgs([fd as u64, BASE, 1, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap()
+        };
+        let fd = root_openat(&mut fixture.dispatcher, b"/tmp/log\0", CREATE);
+        assert_eq!(
+            writev(&mut fixture.dispatcher, fd, b"abc"),
+            DispatchOutcome::Returned { value: 3 }
+        );
+        let append = carrick_abi::LINUX_O_WRONLY | carrick_abi::LINUX_O_APPEND;
+        let fd = root_openat(&mut fixture.dispatcher, b"/tmp/log\0", append);
+        assert_eq!(
+            writev(&mut fixture.dispatcher, fd, b"de"),
+            DispatchOutcome::Returned { value: 2 }
+        );
+        let authority = authority_of(&fixture.dispatcher);
+        assert_eq!(fixture.venue_contents(&authority, b"/tmp/log"), b"abcde");
     }
 
     /// `cmd < /dev/null`: a venue-opened synthetic device reads through the

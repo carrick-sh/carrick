@@ -49,6 +49,33 @@ pub(in crate::dispatch) enum OpenSink<'s> {
     Native(&'s mut crate::dispatch::native_files::NativeOpenSink),
 }
 
+/// The descriptor an open installed, in the table of the caller it was
+/// installed for. A ring number is never a host fd table slot, so only a
+/// `Host` number may reach the host-table code that follows an install.
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub(in crate::dispatch) enum InstalledFd {
+    /// A slot of the calling host task's fd table.
+    Host(i32),
+    /// A descriptor of a native caller's ring table.
+    Ring(carrick_el1_abi::ipc::fd::Fd),
+}
+
+impl InstalledFd {
+    /// The open's guest return value.
+    pub(in crate::dispatch) fn outcome(self) -> DispatchOutcome {
+        match self {
+            Self::Host(fd) => DispatchOutcome::returned_i32(fd),
+            Self::Ring(fd) => DispatchOutcome::returned_i32(fd.0),
+        }
+    }
+}
+
 impl OpenSink<'_> {
     /// The calling host task's context; `None` for a native caller.
     pub(in crate::dispatch) fn context(&self) -> Option<&crate::kernel::KernelContext> {
@@ -88,25 +115,12 @@ impl<'a> FsView<'a> {
         &self,
         sink: &mut OpenSink<'_>,
         open_file: crate::dispatch::fd_table::OpenFile,
-    ) -> Result<i32, LinuxErrno> {
+    ) -> Result<InstalledFd, LinuxErrno> {
         match sink {
-            OpenSink::Task { reservation, .. } => {
-                self.install_admitted_open_file(reservation, open_file)
-            }
-            OpenSink::Native(native) => native.install(self, open_file),
-        }
-    }
-
-    /// Record the guest path a host fd's description was opened by. A
-    /// native descriptor has no host fd slot to record against.
-    pub(in crate::dispatch) fn record_opened_path(
-        &self,
-        sink: &OpenSink<'_>,
-        fd: i32,
-        path: String,
-    ) {
-        if let OpenSink::Task { .. } = sink {
-            self.record_fd_open_path(fd, path);
+            OpenSink::Task { reservation, .. } => self
+                .install_admitted_open_file(reservation, open_file)
+                .map(InstalledFd::Host),
+            OpenSink::Native(native) => native.install(self, open_file).map(InstalledFd::Ring),
         }
     }
 
@@ -206,19 +220,15 @@ impl<'a> FsView<'a> {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 });
             }
-            // inotify, fanotify and dnotify events name the opener's task
-            // and follow its descriptor through write and close, which a
-            // native descriptor never reaches here. While any watch exists
-            // a write, create or truncate open is refused before its side
-            // effect. A read-only open is served as the venue always served
-            // it, without its events: no IN_OPEN, FAN_OPEN or
-            // IN_CLOSE_NOWRITE for the open and close, and no IN_ACCESS or
-            // FAN_ACCESS for its reads (a known gap).
+            // Watcher events (inotify, fanotify, dnotify) are not emitted
+            // for native callers; see the follow-up. A read-only native open
+            // is served without them, as the venue always served it. A
+            // write, create or truncate open of a watched path is refused
+            // once the path is resolved, before its side effect (below);
+            // an O_TMPFILE path is not resolved first, so it is refused
+            // while any watch exists.
             OpenSink::Native(native)
-                if (writable_request
-                    || open_flags.intersects(
-                        LinuxOpenFlags::CREAT | LinuxOpenFlags::TRUNC | LinuxOpenFlags::TMPFILE,
-                    ))
+                if open_flags.contains(LinuxOpenFlags::TMPFILE)
                     && (!self.fs.inotify_registry.is_empty()
                         || !self.fs.fanotify_registry.is_empty()
                         || !self.fs.dnotify_registry.lock().is_empty()) =>
@@ -280,11 +290,10 @@ impl<'a> FsView<'a> {
                         status,
                         linux_fd_flags_from_open_flags(flags),
                     );
-                let fd = match self.install_opened(sink, open_file) {
-                    Ok(fd) => fd,
-                    Err(e) => return Ok(DispatchOutcome::errno(e)),
-                };
-                return Ok(DispatchOutcome::returned_i32(fd));
+                return Ok(match self.install_opened(sink, open_file) {
+                    Ok(installed) => installed.outcome(),
+                    Err(e) => DispatchOutcome::errno(e),
+                });
             }
             let description = OpenDescription::File {
                 path: "/__carrick_o_tmpfile".to_string(),
@@ -306,11 +315,10 @@ impl<'a> FsView<'a> {
                     status,
                     linux_fd_flags_from_open_flags(flags),
                 );
-            let fd = match self.install_opened(sink, open_file) {
-                Ok(fd) => fd,
-                Err(e) => return Ok(DispatchOutcome::errno(e)),
-            };
-            return Ok(DispatchOutcome::returned_i32(fd));
+            return Ok(match self.install_opened(sink, open_file) {
+                Ok(installed) => installed.outcome(),
+                Err(e) => DispatchOutcome::errno(e),
+            });
         }
 
         if false {
@@ -336,6 +344,14 @@ impl<'a> FsView<'a> {
             LookupTarget::Resolved(path) => path,
             LookupTarget::Stat(_) => lookup.resolved_path,
         };
+        // A native caller's create, truncate or write of a watched path
+        // would owe events it does not raise (see the admission above).
+        if let OpenSink::Native(native) = sink
+            && (writable_request || want_create || want_trunc)
+            && self.watches_cover(&path)
+        {
+            return Ok(native.refuse());
+        }
 
         // VFS-mount routing. DevVfs serves /dev/*, ProcVfs serves
         // /proc/*, SysVfs serves /sys/*. The dispatcher converts each
@@ -404,11 +420,12 @@ impl<'a> FsView<'a> {
         }
         let vfs_outcome = self.try_vfs_open(sink, &path, access, flags, vfs_create_mode);
         match vfs_outcome {
-            VfsOpenAttempt::Installed(fd) => {
-                // A native caller's sink checked O_DIRECTORY before it
-                // installed (see `NativeOpenSink::install`), and nothing
-                // below applies to it: a native open raises no watcher
-                // events (see its admission in `open_with_sink`).
+            // A native caller's sink checked O_DIRECTORY before it installed
+            // (see `NativeOpenSink::install`), and nothing below applies to
+            // it: a native open raises no watcher events (see its admission
+            // in `open_with_sink`).
+            VfsOpenAttempt::Installed(ring @ InstalledFd::Ring(_)) => return Ok(ring.outcome()),
+            VfsOpenAttempt::Installed(InstalledFd::Host(fd)) => {
                 let Some(context) = sink.context() else {
                     return Ok(DispatchOutcome::returned_i32(fd));
                 };
@@ -630,10 +647,11 @@ impl<'a> FsView<'a> {
                         linux_fd_flags_from_open_flags(flags),
                     );
                     let fd = match self.install_opened(sink, open_file) {
-                        Ok(fd) => fd,
+                        Ok(InstalledFd::Host(fd)) => fd,
+                        Ok(ring) => return Ok(ring.outcome()),
                         Err(e) => return Ok(DispatchOutcome::errno(e)),
                     };
-                    self.record_opened_path(sink, fd, path.clone());
+                    self.record_fd_open_path(fd, path.clone());
                     return Ok(DispatchOutcome::returned_i32(fd));
                 }
                 // The non-blocking open failed — most commonly O_WRONLY with no
@@ -898,8 +916,11 @@ impl<'a> FsView<'a> {
         if inotify_created {
             open_file.description.common().set_created(true);
         }
+        // A native descriptor has no host slot to record a path against,
+        // and raises no watcher events (see its admission above).
         let fd = match self.install_opened(sink, open_file) {
-            Ok(fd) => fd,
+            Ok(InstalledFd::Host(fd)) => fd,
+            Ok(ring) => return Ok(ring.outcome()),
             Err(e) => return Ok(DispatchOutcome::errno(e)),
         };
         // Always record the path for the inotify AND fanotify read/write/close
@@ -919,10 +940,8 @@ impl<'a> FsView<'a> {
             || !self.fs.inotify_registry.is_empty()
             || !self.fs.fanotify_registry.is_empty()
         {
-            self.record_opened_path(sink, fd, record_path.clone());
+            self.record_fd_open_path(fd, record_path.clone());
         }
-        // Everything below notifies watchers, which a native caller's open
-        // does not (see its admission above).
         let Some(context) = sink.context() else {
             return Ok(DispatchOutcome::returned_i32(fd));
         };
@@ -1890,7 +1909,7 @@ impl<'a> FsView<'a> {
                         linux_fd_flags_from_open_flags(flags),
                     );
                 match self.install_opened(sink, open_file) {
-                    Ok(new_fd) => VfsOpenAttempt::Installed(new_fd),
+                    Ok(installed) => VfsOpenAttempt::Installed(installed),
                     Err(e) => VfsOpenAttempt::Errno(e),
                 }
             }
@@ -1906,10 +1925,11 @@ impl<'a> FsView<'a> {
                         linux_fd_flags_from_open_flags(flags),
                     );
                 match self.install_opened(sink, open_file) {
-                    Ok(new_fd) => {
-                        self.record_opened_path(sink, new_fd, kind.as_str().to_string());
-                        VfsOpenAttempt::Installed(new_fd)
+                    Ok(InstalledFd::Host(new_fd)) => {
+                        self.record_fd_open_path(new_fd, kind.as_str().to_string());
+                        VfsOpenAttempt::Installed(InstalledFd::Host(new_fd))
                     }
+                    Ok(ring) => VfsOpenAttempt::Installed(ring),
                     Err(e) => VfsOpenAttempt::Errno(e),
                 }
             }
@@ -1928,10 +1948,11 @@ impl<'a> FsView<'a> {
                         linux_fd_flags_from_open_flags(flags),
                     );
                 match self.install_opened(sink, open_file) {
-                    Ok(new_fd) => {
-                        self.record_opened_path(sink, new_fd, "/dev/tty0".to_string());
-                        VfsOpenAttempt::Installed(new_fd)
+                    Ok(InstalledFd::Host(new_fd)) => {
+                        self.record_fd_open_path(new_fd, "/dev/tty0".to_string());
+                        VfsOpenAttempt::Installed(InstalledFd::Host(new_fd))
                     }
+                    Ok(ring) => VfsOpenAttempt::Installed(ring),
                     Err(e) => VfsOpenAttempt::Errno(e),
                 }
             }
@@ -1953,7 +1974,7 @@ impl<'a> FsView<'a> {
                         linux_fd_flags_from_open_flags(flags),
                     );
                 match self.install_opened(sink, open_file) {
-                    Ok(new_fd) => VfsOpenAttempt::Installed(new_fd),
+                    Ok(installed) => VfsOpenAttempt::Installed(installed),
                     Err(e) => VfsOpenAttempt::Errno(e),
                 }
             }
@@ -2009,10 +2030,11 @@ impl<'a> FsView<'a> {
                     );
                 }
                 match self.install_opened(sink, open_file) {
-                    Ok(new_fd) => {
-                        self.record_opened_path(sink, new_fd, path.to_string());
-                        VfsOpenAttempt::Installed(new_fd)
+                    Ok(InstalledFd::Host(new_fd)) => {
+                        self.record_fd_open_path(new_fd, path.to_string());
+                        VfsOpenAttempt::Installed(InstalledFd::Host(new_fd))
                     }
+                    Ok(ring) => VfsOpenAttempt::Installed(ring),
                     Err(e) => VfsOpenAttempt::Errno(e),
                 }
             }
@@ -2079,7 +2101,7 @@ impl<'a> FsView<'a> {
                         linux_fd_flags_from_open_flags(flags),
                     );
                 match self.install_opened(sink, open_file) {
-                    Ok(new_fd) => VfsOpenAttempt::Installed(new_fd),
+                    Ok(installed) => VfsOpenAttempt::Installed(installed),
                     Err(e) => VfsOpenAttempt::Errno(e),
                 }
             }
@@ -2111,10 +2133,11 @@ impl<'a> FsView<'a> {
                         linux_fd_flags_from_open_flags(flags),
                     );
                 match self.install_opened(sink, open_file) {
-                    Ok(new_fd) => {
-                        self.record_opened_path(sink, new_fd, path);
-                        VfsOpenAttempt::Installed(new_fd)
+                    Ok(InstalledFd::Host(new_fd)) => {
+                        self.record_fd_open_path(new_fd, path);
+                        VfsOpenAttempt::Installed(InstalledFd::Host(new_fd))
                     }
+                    Ok(ring) => VfsOpenAttempt::Installed(ring),
                     Err(e) => VfsOpenAttempt::Errno(e),
                 }
             }

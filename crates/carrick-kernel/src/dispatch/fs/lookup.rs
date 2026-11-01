@@ -598,7 +598,14 @@ impl<'a> FsView<'a> {
                                 linux_fd_flags_from_open_flags(flags),
                             );
                             let fd = match self.install_opened(sink, open_file) {
-                                Ok(fd) => fd,
+                                Ok(super::open::InstalledFd::Host(fd)) => fd,
+                                Ok(ring) => {
+                                    return Ok(PathLookup {
+                                        resolved_path: path,
+                                        fast_path: FastPathKind::None,
+                                        target: LookupTarget::OpenOutcome(ring.outcome()),
+                                    });
+                                }
                                 Err(errno) => {
                                     return Ok(PathLookup {
                                         resolved_path: path,
@@ -609,7 +616,7 @@ impl<'a> FsView<'a> {
                                     });
                                 }
                             };
-                            self.record_opened_path(sink, fd, path.clone());
+                            self.record_fd_open_path(fd, path.clone());
                             return Ok(PathLookup {
                                 resolved_path: path,
                                 fast_path: FastPathKind::None,
