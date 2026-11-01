@@ -52,6 +52,8 @@ set -euo pipefail
 . scripts/lib/test-signed-selection.sh
 # shellcheck disable=SC1091
 . scripts/lib/test-signed-identity.sh
+# shellcheck disable=SC1091
+. scripts/lib/test-signed-run.sh
 
 # Bootstrap once into the Rust lease supervisor, which owns the lock through
 # build, signing, tests and EXIT cleanup. Descendants get only its validation
@@ -83,14 +85,26 @@ else
     run_id="embed-signed-$$"
 fi
 test_signed_validate_run_id "$run_id"
-# Default per-binary wall-clock deadline (seconds): 600s (10m) sits comfortably
-# above the slowest legitimate signed test binary (`kernel_abort` at ~210s in
-# CI, `el1_kick_served_loop` at ~105s in el1-embed). Exact `0` disables the
-# deadline for bisection or harness tests.
+# Per-binary wall-clock budget (seconds), a backstop over that binary's
+# per-test runs: once it is spent, each test not yet run is an itemized
+# not-run failure (#1114). 600s (10m) sat comfortably above the slowest
+# legitimate signed test binary (`kernel_abort` at ~210s in CI,
+# `el1_kick_served_loop` at ~105s in el1-embed). Exact `0` disables it for
+# bisection or harness tests.
 binary_deadline_secs="${CARRICK_TEST_SIGNED_DEADLINE_SECS:-600}"
 case "$binary_deadline_secs" in
     ''|*[!0-9]*)
         echo "test-signed: invalid CARRICK_TEST_SIGNED_DEADLINE_SECS: $binary_deadline_secs (expected non-negative integer seconds)" >&2
+        exit 2
+        ;;
+esac
+# Per-test wall-clock deadline (seconds): each selected test runs in its own
+# process (#1114) and is killed, diagnosed and reaped at this bound. Exact
+# `0` leaves only the per-binary budget.
+test_deadline_secs="${CARRICK_TEST_SIGNED_TEST_DEADLINE_SECS:-300}"
+case "$test_deadline_secs" in
+    ''|*[!0-9]*)
+        echo "test-signed: invalid CARRICK_TEST_SIGNED_TEST_DEADLINE_SECS: $test_deadline_secs (expected non-negative integer seconds)" >&2
         exit 2
         ;;
 esac
@@ -551,83 +565,19 @@ record_executable() {
         >>"$receipt_tmp"
 }
 
-# 4. Run each selected signed executable serially (one VM per process).
-#    Each executable receives a distinct CARRICK_RUN_ID suffix, a structural
-#    per-binary wall-clock deadline (`CARRICK_TEST_SIGNED_DEADLINE_SECS`,
-#    default 600s, `0` disables), and is reaped before the next executable
-#    starts so neither a test omitting `common::Watchdog::start` nor an
-#    orphaned watchdog `kill.sh` can block or kill subsequent executables.
+# 4. Run each selected signed executable's tests serially, one process (and
+#    one VM) per test, through `test_signed_run_executable_tests`
+#    (scripts/lib/test-signed-run.sh, #1114): each test has its own
+#    CARRICK_RUN_ID suffix, deadline, diagnostics and scoped reap, and one
+#    receipt row, so one hung or aborting test can't hide the tests after
+#    it. The per-binary deadline is the budget over all of them.
+#    `CARRICK_TEST_SIGNED_PER_TEST=0` runs each binary whole instead.
 failed=0
 exe_index=0
 for exe in "${run_exes[@]}"; do
     exe_index=$((exe_index + 1))
-    exe_run_id="$run_id-b$exe_index"
-    active_exe_run_id="$exe_run_id"
     record_executable "$exe"
-    executable_id="$last_executable_id"
-    echo "test-signed: running $exe $*"
-    deadline_marker="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-deadline-fired.XXXXXX")"
-    deadline_diag_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-deadline-diag.XXXXXX")"
-    scratch+=("$deadline_marker" "$deadline_diag_log")
-    env RUST_TEST_THREADS=1 CARRICK_RUN_ID="$exe_run_id" "$exe" "$@" &
-    active_exe_pid=$!
-    if [ "$binary_deadline_secs" -gt 0 ]; then
-        (
-            set +e
-            sleep "$binary_deadline_secs" >/dev/null 2>&1 &
-            sleep_pid=$!
-            trap 'kill -9 "$sleep_pid" 2>/dev/null || true; exit 0' TERM INT
-            wait "$sleep_pid" 2>/dev/null || exit 0
-            if kill -0 "$active_exe_pid" 2>/dev/null; then
-                printf '1\n' >"$deadline_marker"
-                capture_deadline_diagnostics "$exe" "$active_exe_pid" "$exe_run_id" >"$deadline_diag_log" 2>&1
-                for id in "$exe_run_id" "$exe_run_id-cli"; do
-                    reap_run_id "$id" >>"$deadline_diag_log" 2>&1 || true
-                done
-                kill -9 "$active_exe_pid" 2>/dev/null || true
-            fi
-        ) >/dev/null 2>&1 &
-        active_watchdog_pid=$!
-    fi
-    exe_rc=0
-    wait "$active_exe_pid" || exe_rc=$?
-    active_exe_pid=""
-    if [ -n "$active_watchdog_pid" ]; then
-        if [ -s "$deadline_marker" ]; then
-            wait "$active_watchdog_pid" 2>/dev/null || true
-        else
-            stop_watchdog "$active_watchdog_pid"
-        fi
-        active_watchdog_pid=""
-    fi
-    if [ -s "$deadline_marker" ]; then
-        cat "$deadline_diag_log" >&2
-        echo "test-signed: DEADLINE $exe (${binary_deadline_secs}s, CARRICK_RUN_ID=$exe_run_id)" >&2
-        echo "test-signed: FAIL $exe" >&2
-        failed=1
-    elif [ "$exe_rc" -eq 0 ]; then
-        while IFS="$(printf '\t')" read -r selected_exe test_name; do
-            [ "$selected_exe" = "$exe" ] || continue
-            jq -nc \
-                --arg schema "carrick.signed-embed-test.v1" \
-                --arg executable_id "$executable_id" \
-                --arg test_name "$test_name" \
-                --argjson requested_filter "$requested_filter_json" \
-                '{schema:$schema,record_type:"execution",executable_id:$executable_id,test_name:$test_name,requested_test_filter:$requested_filter,terminal_status:"passed"}' \
-                >>"$receipt_tmp"
-        done <"$selected"
-    else
-        echo "test-signed: FAIL $exe" >&2
-        failed=1
-    fi
-    rm -f "$deadline_marker" "$deadline_diag_log"
-    for id in "$exe_run_id" "$exe_run_id-cli"; do
-        if ! reap_run_id "$id"; then
-            echo "test-signed: scoped cleanup failed for $id" >&2
-            failed=1
-        fi
-    done
-    active_exe_run_id=""
+    test_signed_run_executable_tests "$exe" "$last_executable_id" "$exe_index" "$@"
 done
 
 # 5. Negative control. The executable carrying the negative test is copied
