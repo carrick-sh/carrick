@@ -315,6 +315,11 @@ pub enum Claim {
     FirstEntryHost { incarnation: u64 },
 }
 
+/// The first execution generation of a freshly published execution; equal to
+/// `carrick_core_abi::SnapshotGeneration::INITIAL` (asserted in
+/// `carrick-core`, which sees both crates).
+pub const FIRST_EXECUTION_GENERATION: u64 = 1;
+
 const STATE_FREE: u64 = 0;
 const STATE_PARKED: u64 = 1;
 const STATE_QUEUED: u64 = 2;
@@ -938,6 +943,21 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     /// left it on no queue. ISA-neutral: x86 CPL0 births use these tables.
     pub fn needs_host_first_entry(&self) -> bool {
         self.is_unadopted_birth() && !self.has_native_execution_owner()
+    }
+
+    /// The ring's first entry of a native-owned birth: issue its first
+    /// execution generation. Called only by the switch-in that has just taken
+    /// this record's `OnCpu` custody, before the slot publishes it as
+    /// current, so the identity EL1 loads is already issued. This is the
+    /// ring counterpart of a host birth's adoption; the host adopter cannot
+    /// issue for a native birth (it has no host thread). Before #1100 a
+    /// native birth ran at generation 0 and its first native-service
+    /// publication was refused `Stale`.
+    fn issue_ring_first_entry(&self) {
+        if self.is_unadopted_birth() && self.has_native_execution_owner() {
+            self.generation
+                .store(FIRST_EXECUTION_GENERATION, Ordering::Release);
+        }
     }
 
     pub fn needs_host(&self) -> bool {
@@ -3733,6 +3753,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if owner != slot || !rec.cas(Claim::Queued { slot, seq }, Claim::OnCpu { slot, seq }) {
             return None;
         }
+        rec.issue_ring_first_entry();
         let s = self.slot(slot);
         s.terminal[0].store(0, Ordering::Release);
         s.current.store(record.raw(), Ordering::Release);
@@ -4582,6 +4603,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             ) {
                 return None;
             }
+            rec.issue_ring_first_entry();
             let t = self.slot(thief);
             t.terminal[0].store(0, Ordering::Release);
             t.current.store(record.raw(), Ordering::Release);

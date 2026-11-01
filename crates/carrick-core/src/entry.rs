@@ -476,6 +476,13 @@ pub fn terminal_matches<C: EntryContext>(
 /// ```
 const _: () = ();
 
+// The ring's first-entry issuer and native fork publication name the same
+// first execution generation.
+const _: () = assert!(
+    carrick_sched_core::FIRST_EXECUTION_GENERATION
+        == carrick_core_abi::SnapshotGeneration::INITIAL.raw()
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1188,7 +1188,9 @@ fn serve_clone<'a>(
         serial: identity.thread_serial,
         mm,
         file_table: state.file_table.load(Ordering::Acquire),
-        // The host binds the child's execution generation at adoption.
+        // Unissued until first entry: a host birth's adopter binds it; a
+        // native-owned birth's is issued by the ring's first switch-in
+        // (`ZoneRecord::needs_host_first_entry`, #1100).
         generation: 0,
         affinity_source: child_slot.affinity_source(),
         affinity,
