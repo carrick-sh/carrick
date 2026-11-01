@@ -135,3 +135,202 @@ fn arm_signal_routes_match_preapproved_native_owner() {
         );
     }
 }
+
+#[test]
+fn x86_sysv_ipc_routes_to_ring_and_zeroes_abi_padding_bytes() {
+    use carrick_core::personality::UserCopy;
+    use carrick_guest_arch::{GuestIsa, UserVa};
+    use carrick_personality_linux::dispatch::route_x86;
+    use carrick_personality_linux::identity::TaskCredentials;
+    use carrick_personality_linux::ipc::namespace::IpcNamespace;
+    use carrick_personality_linux::ipc::{
+        IPC_CREAT, IPC_INFO, IPC_PRIVATE, IPC_STAT, IpcCall, IpcNative, IpcOutcome, LinuxMsginfo,
+        LinuxMsqidDs, LinuxSembuf, LinuxSemidDs, LinuxSemidDsX86_64, LinuxSeminfo, MsgrcvResult,
+        ProcessIpcVenue, invoke,
+    };
+
+    struct RouteVenue {
+        ns: IpcNamespace,
+        creds: TaskCredentials,
+    }
+    impl RouteVenue {
+        fn new() -> Self {
+            Self {
+                ns: IpcNamespace::new(),
+                creds: TaskCredentials::ROOT,
+            }
+        }
+    }
+    impl ProcessIpcVenue for RouteVenue {
+        fn msgget(&mut self, key: i32, msgflg: i32) -> Result<i32, i64> {
+            self.ns
+                .msgget(&self.creds, key, msgflg)
+                .map_err(|e| e.guest_retval())
+        }
+        fn msgctl(
+            &mut self,
+            msqid: i32,
+            cmd: i32,
+            buf: Option<&mut LinuxMsqidDs>,
+        ) -> Result<i64, i64> {
+            let out = buf.expect("IPC_STAT passes out record");
+            self.ns
+                .msgctl_stat(&self.creds, msqid, cmd, out)
+                .map_err(|e| e.guest_retval())
+        }
+        fn msgctl_info(&mut self, _cmd: i32, buf: &mut LinuxMsginfo) -> Result<i64, i64> {
+            self.ns.msgctl_info(buf).map_err(|e| e.guest_retval())
+        }
+        fn msgsnd(&mut self, _: i32, _: i64, _: &[u8], _: i32) -> Result<IpcOutcome, i64> {
+            unreachable!()
+        }
+        fn msgrcv(&mut self, _: i32, _: UserVa, _: i64, _: i32, _: usize) -> MsgrcvResult {
+            unreachable!()
+        }
+        fn msgrcv_restore(&mut self, _: i32, _: usize, _: i64, _: Vec<u8>) -> Result<(), i64> {
+            unreachable!()
+        }
+        fn semget(&mut self, key: i32, nsems: i32, semflg: i32) -> Result<i32, i64> {
+            self.ns
+                .semget(&self.creds, key, nsems, semflg)
+                .map_err(|e| e.guest_retval())
+        }
+        fn sem_nsems(&mut self, semid: i32) -> Result<usize, i64> {
+            self.ns
+                .sem_set(semid)
+                .map(|s| s.sems.len())
+                .map_err(|e| e.guest_retval())
+        }
+        fn semctl_rmid(&mut self, _: i32) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semctl_stat(
+            &mut self,
+            semid: i32,
+            _semnum: i32,
+            cmd: i32,
+            ds: &mut LinuxSemidDs,
+        ) -> Result<i64, i64> {
+            self.ns
+                .semctl_stat(&self.creds, semid, cmd, ds)
+                .map_err(|e| e.guest_retval())
+        }
+        fn semctl_set(&mut self, _: i32, _: &LinuxSemidDs) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semctl_info(&mut self, _: i32, _: &mut LinuxSeminfo) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semctl_getval(&mut self, _: i32, _: i32) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semctl_setval(&mut self, _: i32, _: i32, _: u64) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semctl_getpid(&mut self, _: i32, _: i32) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semctl_getncnt(&mut self, _: i32, _: i32) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semctl_getzcnt(&mut self, _: i32, _: i32) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semctl_getall(&mut self, _: i32, _: &mut [u16]) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semctl_setall(&mut self, _: i32, _: &[u16]) -> Result<i64, i64> {
+            unreachable!()
+        }
+        fn semop(
+            &mut self,
+            _: i32,
+            _: &[LinuxSembuf],
+            _: Option<core::time::Duration>,
+        ) -> Result<IpcOutcome, i64> {
+            unreachable!()
+        }
+    }
+
+    struct X86IpcEnv<'v> {
+        args: [u64; 6],
+        buf: Vec<u8>,
+        base: u64,
+        venue: &'v mut RouteVenue,
+    }
+    impl UserCopy for X86IpcEnv<'_> {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+            let off = (src.raw() - self.base) as usize;
+            dst.copy_from_slice(&self.buf[off..off + dst.len()]);
+            true
+        }
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+            let off = (dst.raw() - self.base) as usize;
+            self.buf[off..off + src.len()].copy_from_slice(src);
+            true
+        }
+    }
+    impl<'a> IpcNative<'a> for X86IpcEnv<'_> {
+        fn arguments(&self) -> [u64; 6] {
+            self.args
+        }
+        fn process_ipc(&mut self) -> Option<&mut dyn ProcessIpcVenue> {
+            Some(self.venue)
+        }
+        fn guest_isa(&self) -> GuestIsa {
+            GuestIsa::X86_64
+        }
+    }
+
+    let msgctl_dec = decode_x86_64(71, [0; 6], 0x7000);
+    let semctl_dec = decode_x86_64(66, [0; 6], 0x7000);
+    assert_eq!(
+        route_x86(msgctl_dec.canonical.raw(), u64::MAX),
+        Family::Ipc(IpcCall::MsgCtl)
+    );
+    assert_eq!(
+        route_x86(semctl_dec.canonical.raw(), u64::MAX),
+        Family::Ipc(IpcCall::SemCtl)
+    );
+
+    let mut venue = RouteVenue::new();
+    let msqid = venue.msgget(IPC_PRIVATE, IPC_CREAT | 0o600).unwrap();
+    let semid = venue.semget(IPC_PRIVATE, 2, IPC_CREAT | 0o600).unwrap();
+    let base = 0x9000u64;
+
+    let mut env = X86IpcEnv {
+        args: [msqid as u64, IPC_STAT as u64, base, 0, 0, 0],
+        buf: vec![0xFE; core::mem::size_of::<LinuxMsqidDs>()],
+        base,
+        venue: &mut venue,
+    };
+    assert!(matches!(
+        invoke(IpcCall::MsgCtl, &mut env),
+        IpcOutcome::Returned(r) if r.raw() == 0
+    ));
+    assert_eq!(&env.buf[28..32], &[0, 0, 0, 0]);
+
+    let mut info_env = X86IpcEnv {
+        args: [0, IPC_INFO as u64, base, 0, 0, 0],
+        buf: vec![0xFE; core::mem::size_of::<LinuxMsginfo>()],
+        base,
+        venue: &mut venue,
+    };
+    assert!(matches!(
+        invoke(IpcCall::MsgCtl, &mut info_env),
+        IpcOutcome::Returned(r) if r.raw() >= 0
+    ));
+    assert_eq!(&info_env.buf[30..32], &[0, 0]);
+
+    let mut sem_env = X86IpcEnv {
+        args: [semid as u64, 0, IPC_STAT as u64, base, 0, 0],
+        buf: vec![0xFE; core::mem::size_of::<LinuxSemidDsX86_64>()],
+        base,
+        venue: &mut venue,
+    };
+    assert!(matches!(
+        invoke(IpcCall::SemCtl, &mut sem_env),
+        IpcOutcome::Returned(r) if r.raw() == 0
+    ));
+    assert_eq!(&sem_env.buf[28..32], &[0, 0, 0, 0]);
+}

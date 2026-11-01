@@ -12,14 +12,23 @@ use carrick_guest_arch::UserVa;
 pub use carrick_syscall_abi::ipc::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_NOWAIT,
     IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, LinuxIpcPerm, LinuxMsginfo, LinuxMsqidDs,
-    LinuxSembuf, LinuxSemidDs, LinuxSemidDsAarch64, LinuxSemidDsX86_64, LinuxSeminfo, MSG_EXCEPT,
-    MSG_INFO, MSG_NOERROR, MSG_STAT, MSGMAX, MSGMNB, MSGMNI, SEM_INFO, SEM_STAT, SEM_UNDO, SEMMNI,
-    SEMMNS, SEMMSL, SEMOPM, SEMVMX, SETALL, SETVAL,
+    LinuxSembuf, LinuxSemidDs, LinuxSemidDsAarch64, LinuxSemidDsX86_64, LinuxSeminfo, LinuxShmidDs,
+    MSG_EXCEPT, MSG_INFO, MSG_NOERROR, MSG_STAT, MSGMAX, MSGMNB, MSGMNI, SEM_INFO, SEM_STAT,
+    SEM_UNDO, SEMMNI, SEMMNS, SEMMSL, SEMOPM, SEMVMX, SETALL, SETVAL,
 };
 use carrick_syscall_abi::{LINUX_E2BIG, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LinuxErrno};
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct LinuxTimespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
@@ -118,26 +127,11 @@ fn ret_errno(errno: LinuxErrno) -> IpcOutcome {
     ret(errno.guest_retval())
 }
 
-fn copy_val_in<'a, T: Copy>(native: &mut dyn IpcNative<'a>, ptr: UserVa) -> Option<T> {
-    let mut val = core::mem::MaybeUninit::<T>::uninit();
-    let slice = unsafe {
-        core::slice::from_raw_parts_mut(val.as_mut_ptr() as *mut u8, core::mem::size_of::<T>())
-    };
-    if !native.copy_in(slice, ptr) {
-        None
-    } else {
-        Some(unsafe { val.assume_init() })
-    }
-}
-
-fn copy_val_out<'a, T: Copy>(native: &mut dyn IpcNative<'a>, ptr: UserVa, val: &T) -> bool {
-    let slice = unsafe {
-        core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>())
-    };
-    native.copy_out(ptr, slice)
-}
-
-fn invoke_msg<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>) -> IpcOutcome {
+fn invoke_msg<'a>(
+    call: IpcCall,
+    args: &[u64; 6],
+    mut native: &mut dyn IpcNative<'a>,
+) -> IpcOutcome {
     match call {
         IpcCall::MsgGet => {
             let Some(venue) = native.process_ipc() else {
@@ -166,7 +160,7 @@ fn invoke_msg<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                     };
                     match res {
                         Ok(val) => {
-                            if !copy_val_out(native, buf_ptr, &info) {
+                            if !(&mut native).write_val(buf_ptr, &info) {
                                 return ret_errno(LINUX_EFAULT);
                             }
                             ret(val)
@@ -187,7 +181,7 @@ fn invoke_msg<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                     };
                     match res {
                         Ok(val) => {
-                            if !copy_val_out(native, buf_ptr, &ds) {
+                            if !(&mut native).write_val(buf_ptr, &ds) {
                                 return ret_errno(LINUX_EFAULT);
                             }
                             ret(val)
@@ -199,7 +193,7 @@ fn invoke_msg<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                     if buf_ptr.raw() == 0 {
                         return ret_errno(LINUX_EFAULT);
                     }
-                    let Some(mut ds) = copy_val_in::<LinuxMsqidDs>(native, buf_ptr) else {
+                    let Some(mut ds) = (&mut native).read_val::<LinuxMsqidDs>(buf_ptr) else {
                         return ret_errno(LINUX_EFAULT);
                     };
                     let Some(venue) = native.process_ipc() else {
@@ -234,7 +228,7 @@ fn invoke_msg<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                 return ret_errno(LINUX_EINVAL);
             }
             let msgsz = msgsz_raw as usize;
-            let Some(mtype) = copy_val_in::<i64>(native, msgp) else {
+            let Some(mtype) = (&mut native).read_val::<i64>(msgp) else {
                 return ret_errno(LINUX_EFAULT);
             };
             if mtype <= 0 {
@@ -275,7 +269,7 @@ fn invoke_msg<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
             match res {
                 Ok((outcome, Some((original_idx, mtype, data)))) => {
                     let text_va = UserVa::new(msgp.raw().wrapping_add(8));
-                    let copy_ok = copy_val_out(native, msgp, &mtype)
+                    let copy_ok = (&mut native).write_val(msgp, &mtype)
                         && (data.is_empty() || native.copy_out(text_va, &data));
                     if !copy_ok {
                         // Restore message to original position in queue so it is not lost!
@@ -294,7 +288,11 @@ fn invoke_msg<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
     }
 }
 
-fn invoke_sem<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>) -> IpcOutcome {
+fn invoke_sem<'a>(
+    call: IpcCall,
+    args: &[u64; 6],
+    mut native: &mut dyn IpcNative<'a>,
+) -> IpcOutcome {
     match call {
         IpcCall::SemGet => {
             let Some(venue) = native.process_ipc() else {
@@ -325,7 +323,7 @@ fn invoke_sem<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                     };
                     match res {
                         Ok(val) => {
-                            if !copy_val_out(native, arg_ptr, &info) {
+                            if !(&mut native).write_val(arg_ptr, &info) {
                                 return ret_errno(LINUX_EFAULT);
                             }
                             ret(val)
@@ -349,10 +347,10 @@ fn invoke_sem<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                         Ok(val) => {
                             let ok = match native.guest_isa() {
                                 carrick_guest_arch::GuestIsa::X86_64 => {
-                                    copy_val_out(native, arg_ptr, &ds)
+                                    (&mut native).write_val(arg_ptr, &ds)
                                 }
                                 carrick_guest_arch::GuestIsa::Aarch64 => {
-                                    copy_val_out(native, arg_ptr, &ds.to_aarch64())
+                                    (&mut native).write_val(arg_ptr, &ds.to_aarch64())
                                 }
                             };
                             if !ok {
@@ -370,14 +368,14 @@ fn invoke_sem<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                     }
                     let ds = match native.guest_isa() {
                         carrick_guest_arch::GuestIsa::X86_64 => {
-                            let Some(ds) = copy_val_in::<LinuxSemidDsX86_64>(native, arg_ptr)
+                            let Some(ds) = (&mut native).read_val::<LinuxSemidDsX86_64>(arg_ptr)
                             else {
                                 return ret_errno(LINUX_EFAULT);
                             };
                             ds
                         }
                         carrick_guest_arch::GuestIsa::Aarch64 => {
-                            let Some(ds) = copy_val_in::<LinuxSemidDsAarch64>(native, arg_ptr)
+                            let Some(ds) = (&mut native).read_val::<LinuxSemidDsAarch64>(arg_ptr)
                             else {
                                 return ret_errno(LINUX_EFAULT);
                             };
@@ -469,13 +467,9 @@ fn invoke_sem<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                     };
                     match res {
                         Ok(val) => {
-                            let slice = unsafe {
-                                core::slice::from_raw_parts(
-                                    vals.as_ptr() as *const u8,
-                                    vals.len() * core::mem::size_of::<u16>(),
-                                )
-                            };
-                            if !native.copy_out(arg_ptr, slice) {
+                            if !native
+                                .copy_out(arg_ptr, zerocopy::IntoBytes::as_bytes(vals.as_slice()))
+                            {
                                 return ret_errno(LINUX_EFAULT);
                             }
                             ret(val)
@@ -502,12 +496,17 @@ fn invoke_sem<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
                     if !native.copy_in(&mut bytes, arg_ptr) {
                         return ret_errno(LINUX_EFAULT);
                     }
-                    let vals: &[u16] =
-                        unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const u16, nsems) };
+                    let vals: Vec<u16> = bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(u16::from_ne_bytes)
+                        .collect();
                     let Some(venue) = native.process_ipc() else {
                         return ret_errno(LINUX_ENOSYS);
                     };
-                    match venue.semctl_setall(semid, vals) {
+                    match venue.semctl_setall(semid, &vals) {
                         Ok(val) => ret(val),
                         Err(e) => ret(e),
                     }
@@ -533,13 +532,14 @@ fn invoke_sem<'a>(call: IpcCall, args: &[u64; 6], native: &mut dyn IpcNative<'a>
             if !native.copy_in(&mut bytes, sops_ptr) {
                 return ret_errno(LINUX_EFAULT);
             }
-            let sops: &[LinuxSembuf] =
-                unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const LinuxSembuf, nsops) };
+            let Ok(sops) = <[LinuxSembuf] as zerocopy::FromBytes>::ref_from_bytes(&bytes) else {
+                return ret_errno(LINUX_EINVAL);
+            };
 
             let timeout = if call == IpcCall::SemTimedOp {
                 let to_ptr = UserVa::new(args[3]);
                 if to_ptr.raw() != 0 {
-                    let Some(ts) = copy_val_in::<LinuxTimespec>(native, to_ptr) else {
+                    let Some(ts) = (&mut native).read_val::<LinuxTimespec>(to_ptr) else {
                         return ret_errno(LINUX_EFAULT);
                     };
                     if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
@@ -573,6 +573,389 @@ pub fn invoke<'a>(call: IpcCall, native: &mut dyn IpcNative<'a>) -> IpcOutcome {
         }
         IpcCall::SemGet | IpcCall::SemCtl | IpcCall::SemOp | IpcCall::SemTimedOp => {
             invoke_sem(call, &args, native)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::TaskCredentials;
+    use crate::ipc::namespace::IpcNamespace;
+    use carrick_guest_arch::GuestIsa;
+
+    const GUEST_BUF_VA: u64 = 0x1000_0000;
+
+    #[inline(never)]
+    fn poison_stack(depth: usize) -> u8 {
+        let mut scratch = [0xa5_u8; 1024];
+        core::hint::black_box(&mut scratch);
+        if depth > 0 {
+            scratch[0] ^= poison_stack(depth - 1);
+        }
+        core::hint::black_box(scratch[scratch.len() - 1])
+    }
+
+    #[inline(never)]
+    fn invoke_with_poisoned_stack<'a>(call: IpcCall, native: &mut dyn IpcNative<'a>) -> IpcOutcome {
+        core::hint::black_box(poison_stack(4));
+        invoke(call, native)
+    }
+
+    struct TestVenue {
+        ns: IpcNamespace,
+        creds: TaskCredentials,
+    }
+
+    impl TestVenue {
+        fn new() -> Self {
+            Self {
+                ns: IpcNamespace::new(),
+                creds: TaskCredentials::ROOT,
+            }
+        }
+    }
+
+    impl ProcessIpcVenue for TestVenue {
+        fn msgget(&mut self, key: i32, msgflg: i32) -> Result<i32, i64> {
+            self.ns
+                .msgget(&self.creds, key, msgflg)
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn msgctl(
+            &mut self,
+            msqid: i32,
+            cmd: i32,
+            buf: Option<&mut LinuxMsqidDs>,
+        ) -> Result<i64, i64> {
+            core::hint::black_box(poison_stack(2));
+            match cmd {
+                IPC_STAT | MSG_STAT => {
+                    let out = buf.ok_or_else(|| LINUX_EFAULT.guest_retval())?;
+                    self.ns
+                        .msgctl_stat(&self.creds, msqid, cmd, out)
+                        .map_err(|e| e.guest_retval())
+                }
+                IPC_SET => {
+                    let ds = buf.ok_or_else(|| LINUX_EFAULT.guest_retval())?;
+                    self.ns
+                        .msgctl_set(&self.creds, msqid, ds)
+                        .map(|_| 0)
+                        .map_err(|e| e.guest_retval())
+                }
+                IPC_RMID => self
+                    .ns
+                    .msgctl_rmid(&self.creds, msqid)
+                    .map(|_| 0)
+                    .map_err(|e| e.guest_retval()),
+                _ => Err(LINUX_EINVAL.guest_retval()),
+            }
+        }
+
+        fn msgctl_info(&mut self, _cmd: i32, buf: &mut LinuxMsginfo) -> Result<i64, i64> {
+            core::hint::black_box(poison_stack(2));
+            self.ns.msgctl_info(buf).map_err(|e| e.guest_retval())
+        }
+
+        fn msgsnd(
+            &mut self,
+            _msqid: i32,
+            _mtype: i64,
+            _mtext: &[u8],
+            _msgflg: i32,
+        ) -> Result<IpcOutcome, i64> {
+            Err(LINUX_ENOSYS.guest_retval())
+        }
+
+        fn msgrcv(
+            &mut self,
+            _msqid: i32,
+            _msgp: UserVa,
+            _msgtyp: i64,
+            _msgflg: i32,
+            _msgsz: usize,
+        ) -> MsgrcvResult {
+            Err(LINUX_ENOSYS.guest_retval())
+        }
+
+        fn msgrcv_restore(
+            &mut self,
+            _msqid: i32,
+            _original_idx: usize,
+            _mtype: i64,
+            _data: Vec<u8>,
+        ) -> Result<(), i64> {
+            Err(LINUX_ENOSYS.guest_retval())
+        }
+
+        fn semget(&mut self, key: i32, nsems: i32, semflg: i32) -> Result<i32, i64> {
+            self.ns
+                .semget(&self.creds, key, nsems, semflg)
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn sem_nsems(&mut self, semid: i32) -> Result<usize, i64> {
+            self.ns
+                .sem_set(semid)
+                .map(|s| s.sems.len())
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn semctl_rmid(&mut self, semid: i32) -> Result<i64, i64> {
+            self.ns
+                .semctl_rmid(&self.creds, semid)
+                .map(|_| 0)
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn semctl_stat(
+            &mut self,
+            semid: i32,
+            _semnum: i32,
+            cmd: i32,
+            ds: &mut LinuxSemidDs,
+        ) -> Result<i64, i64> {
+            core::hint::black_box(poison_stack(2));
+            self.ns
+                .semctl_stat(&self.creds, semid, cmd, ds)
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn semctl_set(&mut self, semid: i32, ds: &LinuxSemidDs) -> Result<i64, i64> {
+            self.ns
+                .semctl_set(&self.creds, semid, ds)
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn semctl_info(&mut self, _cmd: i32, info: &mut LinuxSeminfo) -> Result<i64, i64> {
+            self.ns.semctl_info(info).map_err(|e| e.guest_retval())
+        }
+
+        fn semctl_getval(&mut self, semid: i32, semnum: i32) -> Result<i64, i64> {
+            self.ns
+                .semctl_getval(&self.creds, semid, semnum)
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn semctl_setval(&mut self, semid: i32, semnum: i32, val: u64) -> Result<i64, i64> {
+            self.ns
+                .semctl_setval(&self.creds, 1, semid, semnum, val)
+                .map(|_| 0)
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn semctl_getpid(&mut self, _semid: i32, _semnum: i32) -> Result<i64, i64> {
+            Err(LINUX_ENOSYS.guest_retval())
+        }
+
+        fn semctl_getncnt(&mut self, _semid: i32, _semnum: i32) -> Result<i64, i64> {
+            Err(LINUX_ENOSYS.guest_retval())
+        }
+
+        fn semctl_getzcnt(&mut self, _semid: i32, _semnum: i32) -> Result<i64, i64> {
+            Err(LINUX_ENOSYS.guest_retval())
+        }
+
+        fn semctl_getall(&mut self, semid: i32, out: &mut [u16]) -> Result<i64, i64> {
+            self.ns
+                .semctl_getall(&self.creds, semid, out)
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn semctl_setall(&mut self, semid: i32, vals: &[u16]) -> Result<i64, i64> {
+            self.ns
+                .semctl_setall(&self.creds, 1, semid, vals)
+                .map(|_| 0)
+                .map_err(|e| e.guest_retval())
+        }
+
+        fn semop(
+            &mut self,
+            _semid: i32,
+            _sops: &[LinuxSembuf],
+            _timeout: Option<Duration>,
+        ) -> Result<IpcOutcome, i64> {
+            Err(LINUX_ENOSYS.guest_retval())
+        }
+    }
+
+    struct TestNative<'v> {
+        args: [u64; 6],
+        isa: GuestIsa,
+        guest_mem: Vec<u8>,
+        base_va: u64,
+        venue: &'v mut TestVenue,
+    }
+
+    impl<'v> TestNative<'v> {
+        fn new(venue: &'v mut TestVenue, isa: GuestIsa, args: [u64; 6], mem_len: usize) -> Self {
+            Self {
+                args,
+                isa,
+                guest_mem: alloc::vec![0xff_u8; mem_len],
+                base_va: GUEST_BUF_VA,
+                venue,
+            }
+        }
+    }
+
+    impl UserCopy for TestNative<'_> {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+            let Some(off) = src.raw().checked_sub(self.base_va) else {
+                return false;
+            };
+            let off = off as usize;
+            let Some(end) = off.checked_add(dst.len()) else {
+                return false;
+            };
+            if end > self.guest_mem.len() {
+                return false;
+            }
+            dst.copy_from_slice(&self.guest_mem[off..end]);
+            true
+        }
+
+        fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+            let Some(off) = dst.raw().checked_sub(self.base_va) else {
+                return false;
+            };
+            let off = off as usize;
+            let Some(end) = off.checked_add(src.len()) else {
+                return false;
+            };
+            if end > self.guest_mem.len() {
+                return false;
+            }
+            self.guest_mem[off..end].copy_from_slice(src);
+            true
+        }
+    }
+
+    impl<'a> IpcNative<'a> for TestNative<'_> {
+        fn arguments(&self) -> [u64; 6] {
+            self.args
+        }
+
+        fn process_ipc(&mut self) -> Option<&mut dyn ProcessIpcVenue> {
+            Some(self.venue)
+        }
+
+        fn guest_isa(&self) -> GuestIsa {
+            self.isa
+        }
+    }
+
+    #[test]
+    fn msgctl_stat_zeroes_ipc_perm_padding_bytes() {
+        let mut venue = TestVenue::new();
+        let msqid = venue.msgget(0x1234, IPC_CREAT | 0o644).unwrap();
+
+        for (cmd, id_or_idx) in [(IPC_STAT, msqid), (MSG_STAT, 0)] {
+            let mut native = TestNative::new(
+                &mut venue,
+                GuestIsa::X86_64,
+                [id_or_idx as u64, cmd as u64, GUEST_BUF_VA, 0, 0, 0],
+                120,
+            );
+            let outcome = invoke_with_poisoned_stack(IpcCall::MsgCtl, &mut native);
+            assert!(matches!(outcome, IpcOutcome::Returned(r) if r.raw() >= 0));
+            // LinuxIpcPerm bytes 28..32 sit between __pad2 (26..28) and __glibc_reserved1 (32..40).
+            assert_eq!(
+                &native.guest_mem[28..32],
+                &[0, 0, 0, 0],
+                "msgctl(cmd={cmd}) leaked non-zero bytes in LinuxIpcPerm padding 28..32"
+            );
+            // High 16 bits of mode at 22..24 and __pad2 at 26..28 must also be zero.
+            assert_eq!(&native.guest_mem[22..24], &[0, 0]);
+            assert_eq!(&native.guest_mem[26..28], &[0, 0]);
+        }
+    }
+
+    #[test]
+    fn msgctl_info_zeroes_tail_padding_bytes() {
+        let mut venue = TestVenue::new();
+        let _msqid = venue.msgget(0x2345, IPC_CREAT | 0o600).unwrap();
+
+        for cmd in [IPC_INFO, MSG_INFO] {
+            let mut native = TestNative::new(
+                &mut venue,
+                GuestIsa::X86_64,
+                [0, cmd as u64, GUEST_BUF_VA, 0, 0, 0],
+                32,
+            );
+            let outcome = invoke_with_poisoned_stack(IpcCall::MsgCtl, &mut native);
+            assert!(matches!(outcome, IpcOutcome::Returned(r) if r.raw() >= 0));
+            // LinuxMsginfo fields end after msgseg: u16 at 28..30; 30..32 is tail padding.
+            assert_eq!(
+                &native.guest_mem[30..32],
+                &[0, 0],
+                "msgctl(cmd={cmd}) leaked non-zero bytes in LinuxMsginfo tail padding 30..32"
+            );
+        }
+    }
+
+    #[test]
+    fn semctl_stat_zeroes_ipc_perm_padding_bytes_for_x86_64_and_aarch64() {
+        let mut venue = TestVenue::new();
+        let semid = venue.semget(0x3456, 2, IPC_CREAT | 0o640).unwrap();
+
+        for (isa, expected_size) in [(GuestIsa::X86_64, 104usize), (GuestIsa::Aarch64, 88usize)] {
+            for (cmd, id_or_idx) in [(IPC_STAT, semid), (SEM_STAT, 0)] {
+                let mut native = TestNative::new(
+                    &mut venue,
+                    isa,
+                    [id_or_idx as u64, 0, cmd as u64, GUEST_BUF_VA, 0, 0],
+                    expected_size,
+                );
+                let outcome = invoke_with_poisoned_stack(IpcCall::SemCtl, &mut native);
+                assert!(matches!(outcome, IpcOutcome::Returned(r) if r.raw() >= 0));
+                assert_eq!(
+                    &native.guest_mem[28..32],
+                    &[0, 0, 0, 0],
+                    "semctl(isa={isa:?}, cmd={cmd}) leaked non-zero bytes in LinuxIpcPerm padding 28..32"
+                );
+                assert_eq!(&native.guest_mem[22..24], &[0, 0]);
+                assert_eq!(&native.guest_mem[26..28], &[0, 0]);
+            }
+        }
+    }
+
+    #[test]
+    fn semctl_setall_and_getall_round_trip_unaligned_guest_bytes() {
+        let mut venue = TestVenue::new();
+        let semid = venue.semget(0x4567, 3, IPC_CREAT | 0o666).unwrap();
+        let odd_va = GUEST_BUF_VA + 1;
+        let expected = [0x1234_u16, 0x5678, 0x0abc];
+
+        let mut native = TestNative::new(
+            &mut venue,
+            GuestIsa::X86_64,
+            [semid as u64, 0, SETALL as u64, odd_va, 0, 0],
+            16,
+        );
+        for (i, v) in expected.iter().enumerate() {
+            let bytes = v.to_ne_bytes();
+            native.guest_mem[1 + i * 2..1 + i * 2 + 2].copy_from_slice(&bytes);
+        }
+        let set_outcome = invoke(IpcCall::SemCtl, &mut native);
+        assert_eq!(set_outcome, IpcOutcome::Returned(SyscallResult::new(0)));
+
+        let out_va = GUEST_BUF_VA + 9;
+        let mut native_get = TestNative::new(
+            &mut venue,
+            GuestIsa::X86_64,
+            [semid as u64, 0, GETALL as u64, out_va, 0, 0],
+            16,
+        );
+        let get_outcome = invoke(IpcCall::SemCtl, &mut native_get);
+        assert_eq!(get_outcome, IpcOutcome::Returned(SyscallResult::new(0)));
+        for (i, v) in expected.iter().enumerate() {
+            let got = u16::from_ne_bytes([
+                native_get.guest_mem[9 + i * 2],
+                native_get.guest_mem[9 + i * 2 + 1],
+            ]);
+            assert_eq!(got, *v);
         }
     }
 }

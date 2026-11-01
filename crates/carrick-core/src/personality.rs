@@ -300,6 +300,155 @@ where
 pub trait UserCopy {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool;
     fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool;
+
+    /// Read a padding-free typed ABI record from guest memory.
+    ///
+    /// Records with explicit padding compile cleanly:
+    ///
+    /// ```
+    /// use carrick_core::personality::UserCopy;
+    /// use carrick_guest_arch::UserVa;
+    /// use zerocopy::{FromBytes, IntoBytes};
+    ///
+    /// #[repr(C)]
+    /// #[derive(FromBytes, IntoBytes)]
+    /// struct ExplicitPad {
+    ///     a: u16,
+    ///     __pad: u16,
+    ///     b: u32,
+    /// }
+    ///
+    /// fn load<C: UserCopy>(copy: &mut C, src: UserVa) -> Option<ExplicitPad> {
+    ///     copy.read_val(src)
+    /// }
+    /// ```
+    ///
+    /// Records with implicit compiler-inserted padding are rejected at compile time:
+    ///
+    /// ```compile_fail
+    /// use carrick_core::personality::UserCopy;
+    /// use carrick_guest_arch::UserVa;
+    /// use zerocopy::{FromBytes, IntoBytes};
+    ///
+    /// #[repr(C)]
+    /// #[derive(FromBytes, IntoBytes)]
+    /// struct ImplicitPad {
+    ///     a: u16,
+    ///     b: u32,
+    /// }
+    ///
+    /// fn load<C: UserCopy>(copy: &mut C, src: UserVa) -> Option<ImplicitPad> {
+    ///     copy.read_val(src)
+    /// }
+    /// ```
+    ///
+    /// Plain `Copy` structs without `FromBytes + IntoBytes` are also rejected:
+    ///
+    /// ```compile_fail
+    /// use carrick_core::personality::UserCopy;
+    /// use carrick_guest_arch::UserVa;
+    ///
+    /// #[repr(C)]
+    /// #[derive(Clone, Copy)]
+    /// struct UncheckedCopy {
+    ///     a: u16,
+    ///     b: u32,
+    /// }
+    ///
+    /// fn load<C: UserCopy>(copy: &mut C, src: UserVa) -> Option<UncheckedCopy> {
+    ///     copy.read_val(src)
+    /// }
+    /// ```
+    #[inline]
+    fn read_val<T: zerocopy::FromBytes + zerocopy::IntoBytes>(&mut self, src: UserVa) -> Option<T>
+    where
+        Self: Sized,
+    {
+        let mut val = T::new_zeroed();
+        self.copy_in(val.as_mut_bytes(), src).then_some(val)
+    }
+
+    /// Write a padding-free typed ABI record to guest memory.
+    ///
+    /// Records with explicit padding compile cleanly:
+    ///
+    /// ```
+    /// use carrick_core::personality::UserCopy;
+    /// use carrick_guest_arch::UserVa;
+    /// use zerocopy::{Immutable, IntoBytes};
+    ///
+    /// #[repr(C)]
+    /// #[derive(IntoBytes, Immutable)]
+    /// struct ExplicitPad {
+    ///     a: u16,
+    ///     __pad: u16,
+    ///     b: u32,
+    /// }
+    ///
+    /// fn publish<C: UserCopy>(copy: &mut C, dst: UserVa, val: &ExplicitPad) -> bool {
+    ///     copy.write_val(dst, val)
+    /// }
+    /// ```
+    ///
+    /// Records with implicit compiler-inserted padding are rejected at compile time:
+    ///
+    /// ```compile_fail
+    /// use carrick_core::personality::UserCopy;
+    /// use carrick_guest_arch::UserVa;
+    /// use zerocopy::{Immutable, IntoBytes};
+    ///
+    /// #[repr(C)]
+    /// #[derive(IntoBytes, Immutable)]
+    /// struct ImplicitPad {
+    ///     a: u16,
+    ///     b: u32,
+    /// }
+    ///
+    /// fn publish<C: UserCopy>(copy: &mut C, dst: UserVa, val: &ImplicitPad) -> bool {
+    ///     copy.write_val(dst, val)
+    /// }
+    /// ```
+    ///
+    /// Plain `Copy` structs without `IntoBytes + Immutable` are also rejected:
+    ///
+    /// ```compile_fail
+    /// use carrick_core::personality::UserCopy;
+    /// use carrick_guest_arch::UserVa;
+    ///
+    /// #[repr(C)]
+    /// #[derive(Clone, Copy)]
+    /// struct UncheckedCopy {
+    ///     a: u16,
+    ///     b: u32,
+    /// }
+    ///
+    /// fn publish<C: UserCopy>(copy: &mut C, dst: UserVa, val: &UncheckedCopy) -> bool {
+    ///     copy.write_val(dst, val)
+    /// }
+    /// ```
+    #[inline]
+    fn write_val<T: zerocopy::IntoBytes + zerocopy::Immutable>(
+        &mut self,
+        dst: UserVa,
+        val: &T,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        self.copy_out(dst, val.as_bytes())
+    }
+}
+
+impl<U: UserCopy + ?Sized> UserCopy for &mut U {
+    #[inline]
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+        (**self).copy_in(dst, src)
+    }
+
+    #[inline]
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+        (**self).copy_out(dst, src)
+    }
 }
 
 impl<'a, A: MmuArch + DefaultMmOwner> UserCopy for UserMemory<'a, A>

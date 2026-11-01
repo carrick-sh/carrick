@@ -81,124 +81,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use zerocopy::IntoBytes;
 
-/// Linux aarch64 `struct ipc64_perm` (UAPI, `include/uapi/asm-generic/ipcbuf.h`).
-/// 48 bytes; embedded in shmid_ds. `mode` is `__kernel_mode_t` which is
-/// `unsigned int` on 64-bit kernels (so 4 bytes, NOT 2 — the old `ipc_perm`
-/// form). `__unused1` is u64-aligned via a 4-byte pad following `pad2`.
-#[repr(C, packed)]
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-    ::core::default::Default,
-)]
-pub(super) struct LinuxIpcPerm {
-    pub key: i32,       // @0
-    pub uid: u32,       // @4
-    pub gid: u32,       // @8
-    pub cuid: u32,      // @12
-    pub cgid: u32,      // @16
-    pub mode: u32,      // @20
-    pub seq: u16,       // @24
-    pub __pad2: u16,    // @26
-    pub __pad3: u32,    // @28 — aligns __unused1 to 8
-    pub __unused1: u64, // @32
-    pub __unused2: u64, // @40 → end @48
-}
+use carrick_personality_linux::ipc::{
+    LinuxIpcPerm, LinuxMsginfo, LinuxMsqidDs, LinuxSemidDsAarch64 as LinuxSemidDs, LinuxSeminfo,
+    LinuxShmidDs,
+};
 
-/// Linux aarch64 `struct shmid_ds` (UAPI). 112 bytes. Verified against the
-/// kernel's `arch/arm64/include/uapi/asm/shmbuf.h` (which falls back to the
-/// generic asm-generic/shmbuf.h for 64-bit). LTP shmctl01 reads each field.
-#[repr(C, packed)]
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-    ::core::default::Default,
-)]
-pub(super) struct LinuxShmidDs {
-    pub shm_perm: LinuxIpcPerm, // 48
-    pub shm_segsz: u64,         // 8
-    pub shm_atime: u64,         // 8 — last attach time
-    pub shm_dtime: u64,         // 8 — last detach time
-    pub shm_ctime: u64,         // 8 — creation/last-IPC_SET time
-    pub shm_cpid: i32,          // 4 — pid of creator
-    pub shm_lpid: i32,          // 4 — pid of last shmop
-    pub shm_nattch: u64,        // 8 — current attaches
-    pub __unused4: u64,         // 8
-    pub __unused5: u64,         // 8
-}
-
-const _: () = assert!(core::mem::size_of::<LinuxShmidDs>() == 112);
 const _: () = assert!(core::mem::size_of::<LinuxIpcPerm>() == 48);
-
-/// Linux aarch64 `struct semid64_ds` (UAPI, `include/uapi/asm-generic/sembuf.h`
-/// — 64-bit time_t form). 88 bytes: ipc64_perm(48), sem_otime@48, sem_ctime@56,
-/// sem_nsems@64, then two reserved u64. (On a 64-bit-time_t arch the kernel's
-/// legacy otime/ctime-high split words read as zero, so the reserved tail is 0.)
-/// LTP semctl01 reads sem_perm.mode, the owner ids, sem_nsems and sem_otime/
-/// sem_ctime.
-#[repr(C, packed)]
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-    ::core::default::Default,
-)]
-pub(super) struct LinuxSemidDs {
-    pub sem_perm: LinuxIpcPerm, // 48
-    pub sem_otime: u64,         // 8 — last semop time
-    pub sem_ctime: u64,         // 8 — creation/last-IPC_SET time
-    pub sem_nsems: u64,         // 8 — number of semaphores in the set
-    pub __unused3: u64,         // 8
-    pub __unused4: u64,         // 8
-}
-
+const _: () = assert!(core::mem::size_of::<LinuxShmidDs>() == 112);
 const _: () = assert!(core::mem::size_of::<LinuxSemidDs>() == 88);
-
-/// Linux aarch64 `struct msqid64_ds` (UAPI). 120 bytes: ipc64_perm(48), three
-/// 64-bit timestamps, cbytes/qnum/qbytes, last sender/receiver pids, and two
-/// reserved u64 slots. Carrick owns SysV message queue state, so `IPC_STAT`
-/// serializes directly from this metadata instead of translating a host
-/// `msqid_ds`.
-#[repr(C, packed)]
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-    ::core::default::Default,
-)]
-pub(super) struct LinuxMsqidDs {
-    pub msg_perm: LinuxIpcPerm, // 48
-    pub msg_stime: u64,         // 8
-    pub msg_rtime: u64,         // 8
-    pub msg_ctime: u64,         // 8
-    pub msg_cbytes: u64,        // 8
-    pub msg_qnum: u64,          // 8
-    pub msg_qbytes: u64,        // 8
-    pub msg_lspid: i32,         // 4
-    pub msg_lrpid: i32,         // 4
-    pub __unused4: u64,         // 8
-    pub __unused5: u64,         // 8
-}
-
 const _: () = assert!(core::mem::size_of::<LinuxMsqidDs>() == LINUX_MSQID_DS_SIZE);
+const _: () = assert!(core::mem::size_of::<LinuxMsginfo>() == 32);
+const _: () = assert!(core::mem::size_of::<LinuxSeminfo>() == 40);
 
 /// Host directory for SysV shmem backing files. World-writable + sticky so
 /// any carrick guest process (including a forked child running as the same
@@ -1354,9 +1247,9 @@ impl MsgQueueFile {
                 mode: self.mode.raw(),
                 ..Default::default()
             },
-            msg_stime: self.stime,
-            msg_rtime: self.rtime,
-            msg_ctime: self.ctime,
+            msg_stime: self.stime as i64,
+            msg_rtime: self.rtime as i64,
+            msg_ctime: self.ctime as i64,
             msg_cbytes: self.cbytes,
             msg_qnum: self.qnum,
             msg_qbytes: self.qbytes,
@@ -2042,8 +1935,8 @@ pub(super) fn shmid_ds_bytes(
         shm_cpid: segment.cpid,
         shm_lpid: segment.lpid,
         shm_nattch: read_shm_nattch(segment),
-        __unused4: 0,
-        __unused5: 0,
+        __glibc_reserved4: 0,
+        __glibc_reserved5: 0,
     };
     // `LinuxShmidDs` is exactly 112 bytes (static-asserted above), so its
     // `as_bytes()` view is infallibly 112 bytes — copy it into the array.
@@ -3501,25 +3394,27 @@ fn write_msginfo<M: CurrentMmMemory>(
     if addr == 0 {
         return success;
     }
-    let mut out = [0u8; 36];
-    let put = |out: &mut [u8], idx: usize, value: i32| {
-        out[idx * 4..idx * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    let mut info = LinuxMsginfo {
+        msgpool: 0,
+        msgmap: 0,
+        msgmax: LINUX_MSGMAX as i32,
+        msgmnb: LINUX_MSGMNB as i32,
+        msgmni: LINUX_MSGMNI as i32,
+        msgssz: 8,
+        msgtql: LINUX_MSGMNI as i32,
+        msgseg: 0,
+        __pad: 0,
     };
-    put(&mut out, 2, LINUX_MSGMAX as i32);
-    put(&mut out, 3, LINUX_MSGMNB as i32);
-    put(&mut out, 4, LINUX_MSGMNI as i32);
-    put(&mut out, 5, 8);
-    put(&mut out, 6, LINUX_MSGMNI as i32);
     if cmd == LINUX_MSG_INFO {
-        put(&mut out, 0, metrics.queues as i32);
-        put(&mut out, 1, metrics.messages as i32);
-        put(&mut out, 6, metrics.bytes.min(i32::MAX as u64) as i32);
+        info.msgpool = metrics.queues as i32;
+        info.msgmap = metrics.messages as i32;
+        info.msgtql = metrics.bytes.min(i32::MAX as u64) as i32;
     }
     super::copyout::copyout_bytes(
         cx.kernel,
         cx.memory,
         carrick_guest_mem::GuestVa::new(addr),
-        &out,
+        info.as_bytes(),
         success,
     )
 }
@@ -4287,11 +4182,11 @@ impl<'a> IpcView<'a> {
                             seq: meta.scan_index.0 as u16,
                             ..Default::default()
                         },
-                        sem_otime: meta.otime.load(Ordering::Acquire),
-                        sem_ctime: meta.ctime,
+                        sem_otime: meta.otime.load(Ordering::Acquire) as i64,
+                        sem_ctime: meta.ctime as i64,
                         sem_nsems: meta.nsems as u64,
-                        __unused3: 0,
-                        __unused4: 0,
+                        __glibc_reserved3: 0,
+                        __glibc_reserved4: 0,
                     })
                 });
                 let out = match ds_res {
@@ -4574,27 +4469,23 @@ impl<'a> IpcView<'a> {
         });
 
         if arg != 0 {
-            let fields = [
-                LINUX_SEMMNI as u32,
-                LINUX_SEMMNI as u32,
-                1_024_000_000u32,
-                1_024_000_000u32,
-                LINUX_SEMMSL as u32,
-                LINUX_SEMOPM,
-                LINUX_SEMMNI as u32,
-                used_sets,
-                LINUX_SEMVMX,
-                used_sems,
-            ];
-            let mut bytes = Vec::with_capacity(fields.len() * 4);
-            for field in fields {
-                bytes.extend_from_slice(&field.to_le_bytes());
-            }
+            let info = LinuxSeminfo {
+                semmap: LINUX_SEMMNI as i32,
+                semmni: LINUX_SEMMNI as i32,
+                semmns: 1_024_000_000,
+                semmnu: 1_024_000_000,
+                semmsl: LINUX_SEMMSL as i32,
+                semopm: LINUX_SEMOPM as i32,
+                semume: LINUX_SEMMNI as i32,
+                semusz: used_sets as i32,
+                semvmx: LINUX_SEMVMX as i32,
+                semaem: used_sems as i32,
+            };
             return Ok(super::copyout::copyout_bytes(
                 cx.kernel,
                 cx.memory,
                 carrick_guest_mem::GuestVa::new(arg),
-                &bytes,
+                info.as_bytes(),
                 DispatchOutcome::Returned { value: max_index },
             ));
         }
@@ -4634,11 +4525,11 @@ impl<'a> IpcView<'a> {
                     seq: meta.scan_index.0 as u16,
                     ..Default::default()
                 },
-                sem_otime: meta.otime.load(Ordering::Acquire),
-                sem_ctime: meta.ctime,
+                sem_otime: meta.otime.load(Ordering::Acquire) as i64,
+                sem_ctime: meta.ctime as i64,
                 sem_nsems: meta.nsems as u64,
-                __unused3: 0,
-                __unused4: 0,
+                __glibc_reserved3: 0,
+                __glibc_reserved4: 0,
             };
             return Ok(super::copyout::copyout_bytes(
                 cx.kernel,
@@ -4763,6 +4654,112 @@ mod ipc_set_tests {
             assert_eq!(memory.read_bytes(0x2000, 128).unwrap(), vec![0xa5; 128]);
             assert_eq!(call(&mut memory, number, args), expected);
             assert_eq!(memory.read_bytes(0x2000, 128).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn sysv_stat_and_msginfo_exact_abi_footprint_and_zero_padding() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let dispatcher = SyscallDispatcher::new();
+        let container = Arc::new(crate::kernel::Container::new(
+            crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new(format!(
+                "sysv-pad-1152-{}",
+                std::process::id()
+            ))),
+        ));
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            711509,
+            crate::thread::ThreadId::synthetic_for_tests(711509),
+            "sysv-pad".to_owned(),
+        )
+        .unwrap()
+        .with_container(container);
+        let (_kernel, context) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        dispatcher.rebind_kernel(context.task_binding());
+        let mut memory = OwnerRefusingMemory::new(0x1000, 0x4000, 0xa5);
+        let _backing = insert_test_shm_segment(&dispatcher, 4243, 4096);
+        let call = |memory: &mut OwnerRefusingMemory, number: u64, args: [u64; 6]| {
+            dispatcher
+                .dispatch_normalized(
+                    &context,
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &CompatReporter::default(),
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let id = |outcome| match outcome {
+            DispatchOutcome::Returned { value } => value as u64,
+            other => panic!("create: {other:?}"),
+        };
+        let msg = id(call(&mut memory, nr::MSGGET.raw(), [0, 0o600, 0, 0, 0, 0]));
+        let sem = id(call(&mut memory, nr::SEMGET.raw(), [0, 2, 0o600, 0, 0, 0]));
+
+        for (label, number, args, abi_size, pad_range) in [
+            (
+                "shmctl(IPC_STAT)",
+                nr::SHMCTL.raw(),
+                [4243, LINUX_IPC_STAT, 0x2000, 0, 0, 0],
+                112usize,
+                Some(28usize..32usize),
+            ),
+            (
+                "msgctl(IPC_STAT)",
+                nr::MSGCTL.raw(),
+                [msg, LINUX_IPC_STAT, 0x2000, 0, 0, 0],
+                120usize,
+                Some(28usize..32usize),
+            ),
+            (
+                "msgctl(IPC_INFO)",
+                nr::MSGCTL.raw(),
+                [0, LINUX_IPC_INFO, 0x2000, 0, 0, 0],
+                32usize,
+                Some(30usize..32usize),
+            ),
+            (
+                "msgctl(MSG_INFO)",
+                nr::MSGCTL.raw(),
+                [0, LINUX_MSG_INFO, 0x2000, 0, 0, 0],
+                32usize,
+                Some(30usize..32usize),
+            ),
+            (
+                "semctl(IPC_STAT)",
+                nr::SEMCTL.raw(),
+                [sem, 0, LINUX_IPC_STAT, 0x2000, 0, 0],
+                88usize,
+                Some(28usize..32usize),
+            ),
+            (
+                "semctl(IPC_INFO)",
+                nr::SEMCTL.raw(),
+                [0, 0, LINUX_IPC_INFO, 0x2000, 0, 0],
+                40usize,
+                None,
+            ),
+        ] {
+            memory.seed(0x2000, &[0xa5; 128]);
+            let outcome = call(&mut memory, number, args);
+            assert!(
+                matches!(outcome, DispatchOutcome::Returned { .. }),
+                "{label}: {outcome:?}"
+            );
+            let bytes = memory.read_bytes(0x2000, 128).unwrap();
+            if let Some(pad) = pad_range {
+                assert_eq!(
+                    &bytes[pad.clone()],
+                    vec![0u8; pad.len()].as_slice(),
+                    "{label} must zero ABI padding bytes {pad:?}"
+                );
+            }
+            assert_eq!(
+                &bytes[abi_size..],
+                vec![0xa5u8; 128 - abi_size].as_slice(),
+                "{label} must write exact {abi_size}-byte ABI record without trailing overwrite"
+            );
         }
     }
 

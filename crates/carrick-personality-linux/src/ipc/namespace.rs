@@ -414,10 +414,10 @@ impl IpcNamespace {
             gid: queue.perm.gid.raw(),
             cuid: queue.perm.cuid.raw(),
             cgid: queue.perm.cgid.raw(),
-            mode: queue.perm.mode,
-            __pad1: 0,
+            mode: queue.perm.mode as u32,
             seq: queue.perm.seq,
             __pad2: 0,
+            __pad3: 0,
             __glibc_reserved1: 0,
             __glibc_reserved2: 0,
         };
@@ -462,7 +462,7 @@ impl IpcNamespace {
         let old_qbytes = queue.qbytes;
         queue.perm.uid = TaskUid::new(ds.msg_perm.uid);
         queue.perm.gid = TaskGid::new(ds.msg_perm.gid);
-        queue.perm.mode = ds.msg_perm.mode & 0o777;
+        queue.perm.mode = (ds.msg_perm.mode as u16) & 0o777;
         queue.qbytes = qbytes;
         queue.ctime = now;
         let channel = queue.wait_channel;
@@ -470,14 +470,17 @@ impl IpcNamespace {
     }
 
     pub fn msgctl_info(&self, out: &mut LinuxMsginfo) -> Result<i64, IpcError> {
-        out.msgpool = 1024;
-        out.msgmap = 1024;
-        out.msgmax = MSGMAX as i32;
-        out.msgmnb = MSGMNB as i32;
-        out.msgmni = MSGMNI as i32;
-        out.msgssz = 16;
-        out.msgtql = 1024;
-        out.msgseg = 0xffff;
+        *out = LinuxMsginfo {
+            msgpool: 1024,
+            msgmap: 1024,
+            msgmax: MSGMAX as i32,
+            msgmnb: MSGMNB as i32,
+            msgmni: MSGMNI as i32,
+            msgssz: 16,
+            msgtql: 1024,
+            msgseg: 0xffff,
+            __pad: 0,
+        };
 
         let max_idx = self
             .msg_slots
@@ -766,10 +769,10 @@ impl IpcNamespace {
             gid: set.perm.gid.raw(),
             cuid: set.perm.cuid.raw(),
             cgid: set.perm.cgid.raw(),
-            mode: set.perm.mode,
-            __pad1: 0,
+            mode: set.perm.mode as u32,
             seq: set.perm.seq,
             __pad2: 0,
+            __pad3: 0,
             __glibc_reserved1: 0,
             __glibc_reserved2: 0,
         };
@@ -800,7 +803,7 @@ impl IpcNamespace {
 
         set.perm.uid = TaskUid::new(ds.sem_perm.uid);
         set.perm.gid = TaskGid::new(ds.sem_perm.gid);
-        set.perm.mode = ds.sem_perm.mode & 0o777;
+        set.perm.mode = (ds.sem_perm.mode as u16) & 0o777;
         set.ctime = now;
         Ok(0)
     }
