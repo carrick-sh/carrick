@@ -36,7 +36,7 @@ vm_free = [
 ]
 
 [bindings.unresolved]
-embed_structural = "KVM vCPU CPUID and XGETBV execution bindings live in carrick-vmm-kvm::kvm::x86_tests and carrick-vmm-kvm/tests/cpuid_v3_kvm.rs (`test-kvm` lane); this ephemeral worker runner lacks /dev/kvm read/write access."
+embed_structural = "KVM vCPU CPUID and XGETBV execution fixtures live in carrick-vmm-kvm::kvm::x86_tests and carrick-vmm-kvm/tests/cpuid_v3_kvm.rs (`test-kvm` lane); these do not emit an embed structural observation."
 kvm = "Merge-queue `kvm-tests` / `kvm-gate` must execute `carrick-vmm-kvm --lib` and `--test cpuid_v3_kvm` on real `/dev/kvm` with `NEW=[]`."
 signed = "macOS HVF AArch64 lane does not execute x86 CPUID; soft-lane x86 CPUID consumption is tracked as the sibling slice under #578."
-docker = "Architectural x86-64-v3 CPUID isolation contract uses System V AMD64 psABI and Intel SDM authority; Docker passes host CPUID unfiltered and this runner has no Docker."
+docker = "Architectural x86-64-v3 CPUID isolation uses System V AMD64 psABI and Intel SDM authority; Docker passes host CPUID unfiltered and cannot supply the pinned-view oracle."
