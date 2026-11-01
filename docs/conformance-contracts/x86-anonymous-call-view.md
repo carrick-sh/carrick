@@ -3,8 +3,9 @@
 The shared reservation decoder, pending completion authentication and resident
 permission/retirement entry points consume `AnonymousCallView`. ARM projects its
 real `TrapFrame`; CPL0 retains a decoded `CanonicalCall`, CPU slot, return PC
-and independent result word. The latter projects one task at index zero while
-retaining its actual CPU slot for editor ownership. No ARM register frame is
+and independent result word. The latter carries an explicit task-slice index
+independently of the CPU slot. The x86 venue projects its single task at index
+zero while retaining its actual CPU slot for editor ownership. No ARM register frame is
 constructed by the x86 anonymous venue.
 
 The semantic authorities are mprotect(2) and munmap(2), under the existing
@@ -32,21 +33,26 @@ real CPU instruction execution and retained shootdown remain the KVM binding.
 
 Admitted main already serves delegated protect and retire operations in the
 shared engine. Thus the issue's original unconditional-x86-ENOSYS diagnosis
-cannot be claimed from the inspected snapshot alone. The direct venue hooks
-now use the same resident entry points as ARM. Under the exact-MM guard, those
-entry points bind a synchronous operation generation before entering the x86
-transaction; the delegated path retains its reservation sequence. Neither token
-replaces the existing invalidation or physical-return authority.
+cannot be claimed from the inspected snapshot alone. The non-delegated x86
+venue hooks refuse before editing and increment
+CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS. They cannot
+produce CommitOwed: x86 has no host consumer for that obligation.
+
+The x86 peer fixture and production X86AnonymousEditor share
+edit_x86_anonymous, including intent admission and descriptor execution.
+InitialWords::invalidate_range remains the production invalidation path.
+Migration to mm::retirement ServedTable/StagedInvalidation remains
+[#681 slice 5](https://github.com/carrick-sh/carrick/issues/681); this refactor
+does not satisfy that acceptance item. The ARM drain count is a fixture
+completion marker, not an invalidation witness.
 
 The native projected-task witness also checks that CPU slot 7 owns editor 8
-while looking up task slice index zero, and that both resident entry points
+while looking up task slice index one, and that both resident entry points
 bind an operation generation before editing. Applied to admitted-main entry
 point signatures, the native view is rejected with E0308 (`&TrapFrame`
 required). This is an API red witness, not a reproduced runtime ENOSYS.
 
-The KVM binding checks successful edits and errno answers, surviving outer
-pages, and exact-PC SIGSEGV with the expected x86 P/W/U bits for a forbidden
-write and a retired-page read. It requires zero host forwards, zero relevant
-refusals and zero `CARRICK_CPL0_ISA_UNSUPPORTED_FORWARDS`, read atomically from
-the symbol in the loaded production image. The resident x86 venue hooks remain
-compile/inspection covered: all production initial MMs use the delegated owner.
+The existing KVM binding is not runtime evidence for this refactor. No KVM,
+HVF, hardware TLB or runtime behavior was verified in this follow-up.
+Sparse munmap, PROT_NONE, partly mapped ranges and two-vCPU behavior remain
+deferred on #1095. This work references that issue without closing it.

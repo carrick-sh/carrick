@@ -981,7 +981,7 @@ impl Personality for LinuxPersonality {
                 Some(&GuestLifecycleVenue),
                 Some(&mut *process),
                 Some(source),
-                Some(&mut anonymous),
+                anonymous.as_mut().map(|venue| venue as &mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue),
                 cache_lookup,
             );
             if let Some(reason) = process.take_run_failure() {
