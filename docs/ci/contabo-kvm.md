@@ -99,6 +99,11 @@ workflow (dispatch requires both `actor` and `triggering_actor` to be
 `tjfontaine`); merge groups, pull requests and schedules are refused. The HVF
 lane runs on the same events on cloudmac. The optional HVF full-conformance
 closure runs only on owner dispatch when enabled, on a separate runner.
+For `dispatch-worker.yml` the hook also admits a chained round (#1241
+part 3): `workflow_dispatch` on `main` started and triggered by
+`github-actions[bot]`. The controller has already re-verified the chain
+outcome its guard named before minting that clone
+([dispatch docs](dispatch-worker.md#rounds-chain-1241-part-3)).
 `ci.yml` continues running its own PR, merge-group, push, schedule and
 dispatch lanes; only `ci-ok` is required for merging. Pre-merge hardware
 evidence belongs to the director; these post-landing runs are the backstop.

@@ -641,6 +641,64 @@ position, the outcome it continues, the pushed branch and head, and the
 brief as facts in its prompt; the brief is the previous coordinator's
 text, information rather than authority.
 
+**Starting the next round.** A separate `chain` job in
+`dispatch-worker.yml` runs after the worker job when the loop step reported
+a Continuing outcome (a pre-filter only). It is the only job in any
+workflow with `actions: write` (permissions `actions: write`,
+`contents: read`, nothing else), and its last step alone sees the job
+token: the job fetches public main with plain `git`, builds
+`carrick-xtask` without a credential, and runs no action, since an action
+receives the token by default. `only_the_chain_step_holds_actions_write`
+fails if any other workflow or job grants `actions: write` or the token
+reaches another step. `dispatch-worker chain --issue N` reads the issue
+and its open dispatch PRs, takes the latest dispatch outcome, and stops
+unless it is this run's own Continuing outcome. It then checks the chain
+rule below and sends one `workflow_dispatch` on `dispatch-worker.yml@main`
+whose only input is that outcome's comment id. A Continuing outcome the
+rule refuses fails the job, visibly.
+
+**Admitting a chained round.** A chained run is `workflow_dispatch` on
+`main` with workflow ref
+`carrick-sh/carrick/.github/workflows/dispatch-worker.yml@refs/heads/main`,
+and its actor and triggering actor are both `github-actions[bot]`
+(`chain_context`). The guard's pre-filter admits that shape; the guard, the
+clone admission and the controller then apply one function,
+`verify_chain`, which trusts no input but the comment id and re-reads
+everything from the API. The chained run is admitted only when all of
+these hold:
+- the comment is an unedited `github-actions[bot]` (type Bot) dispatch
+  outcome on the issue or an open dispatch PR of it, on an open issue,
+  whose server section reads Continuing with `k < 4` and names a
+  checkpoint on a dispatch branch of that issue;
+- it is the latest dispatch outcome on those threads, and no outcome
+  already names it in `Chained from:`;
+- after it there is no owner comment, no `/agent` command (including
+  `/agent stop`), no owner or changes-requested review and no dispatch
+  `labeled` event: the owner can always break a chain, and an owner
+  trigger starts its own chain;
+- its `Chained from:` links, each an authentic Continuing outcome one
+  round earlier on those threads, reach within three hops a round with no
+  `Chained from:` whose `Round trigger:` is the owner's `/agent` comment,
+  changes-requested review or dispatch label on those threads. Label
+  rounds name their `labeled` timeline event as their trigger for this.
+
+REST runs carry no inputs, so the guard records the verified outcome in a
+trusted-main step name, `Chain outcome <issue> <comment id>`; the
+controller reads it and runs `verify_chain` itself before any clone, and
+the job-start hook admits the chain shape. A chained run whose guard has
+no such marker is untrusted history: its artifacts and footer provenance
+are refused. The chained round's trigger is the outcome comment; the clone
+admission persists the chain facts (round, source outcome, branch, head,
+brief) for the loop. A chained round on a PR continues that PR; one whose
+outcome was on the issue starts a run branch and can select the
+checkpoint's branch. Adopted (non-dispatch) PRs do not chain.
+
+Residual trust: the chain is rooted in an authentic `github-actions[bot]`
+comment, and other workflows in this repository could also post as that
+bot. None posts outcome-shaped comments today, dispatch cannot publish
+workflow files (#1241 part 1), and every link must lead back to the
+owner's own trigger.
+
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
 proposals and the comment tool refuse the marker.

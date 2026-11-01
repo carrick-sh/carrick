@@ -505,7 +505,7 @@ fn bounded_text(text: &str) -> Result<(), ScalerError> {
         Ok(())
     }
 }
-fn run_from_body(body: &str) -> Option<&str> {
+pub(super) fn run_from_body(body: &str) -> Option<&str> {
     body.lines()
         .rev()
         .find(|line| line.starts_with("Dispatch run:"))?
@@ -967,6 +967,11 @@ fn authenticate_artifact_run(
         "repos/{REPOSITORY}/actions/runs/{id}/jobs?filter=latest&per_page=100"
     ))
     .ok_or_else(refused)?;
+    // A chained run's guard ran the chain rule on trusted main and named
+    // the outcome it admitted; without that marker its history is untrusted.
+    if chain_run(&run) && guard_markers(&jobs, "Chain outcome ").len() != 1 {
+        return Err(refused());
+    }
     let footer_issue = jobs["jobs"].as_array().and_then(|jobs| {
         let guard = jobs.iter().find(|job| {
             job["name"] == "guard" && job["status"] == "completed" && job["conclusion"] == "success"
@@ -1014,6 +1019,20 @@ fn authenticate_artifact_run(
         uploaded,
         footer_issue,
     })
+}
+/// The successful guard job's successful step names after `prefix`.
+fn guard_markers<'a>(jobs: &'a Value, prefix: &str) -> Vec<&'a str> {
+    jobs["jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|job| {
+            job["name"] == "guard" && job["status"] == "completed" && job["conclusion"] == "success"
+        })
+        .flat_map(|job| job["steps"].as_array().into_iter().flatten())
+        .filter(|step| step["conclusion"] == "success")
+        .filter_map(|step| step["name"].as_str()?.strip_prefix(prefix))
+        .collect()
 }
 /// `run` is an [`ArtifactRun`]'s run, whose actors were already trusted.
 fn artifact_scope(run: &Value, artifacts: &[Value], issue: u64) -> Result<Value, ScalerError> {
@@ -1377,7 +1396,7 @@ fn issue_artifact_runs(
             && s.bytes()
                 .all(|c| c.is_ascii_digit() || b"-:TZ.".contains(&c))
     }) {
-        for event in ["issues", "issue_comment"] {
+        for event in ["issues", "issue_comment", "workflow_dispatch"] {
             let data = api(
                 root,
                 &format!(
@@ -3179,7 +3198,7 @@ const MAILBOX_HEADER: &str = "Owner comments during this round:";
 /// A chained or Continuing outcome's place in its chain (#1241 part 3).
 const CHAIN_LINE: &str = "Chain: ";
 /// The Continuing outcome a chained round continued, with its hop.
-const CHAINED_FROM_LINE: &str = "Chained from: ";
+pub(super) const CHAINED_FROM_LINE: &str = "Chained from: ";
 /// The branch and head a Continuing round pushed for the next round.
 const CHECKPOINT_LINE: &str = "Checkpoint: ";
 /// The header of a Continuing outcome's quoted brief.
@@ -3209,16 +3228,93 @@ fn quoted(text: &str, limit: usize) -> String {
 /// The outcome's server-written line naming the round's own trigger.
 const TRIGGER_LINE: &str = "Round trigger: ";
 
+/// The chain facts of a dispatch outcome's server section (#1241 part 3),
+/// parsed strictly: each server line at most once, a hop consistent with
+/// the round, and the brief only as quoted lines under its header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ChainSection {
+    pub(super) status: String,
+    pub(super) trigger: Option<String>,
+    pub(super) round: u32,
+    pub(super) from: Option<String>,
+    pub(super) checkpoint: Option<(String, String)>,
+    pub(super) brief: String,
+}
+pub(super) fn chain_section(body: &str) -> Option<ChainSection> {
+    let server = server_part(body);
+    let status = outcome_status(body)?.to_owned();
+    let once = |prefix: &str| -> Result<Option<&str>, ()> {
+        let mut found = server.lines().filter_map(|l| l.strip_prefix(prefix));
+        let first = found.next();
+        if found.next().is_some() {
+            return Err(());
+        }
+        Ok(first)
+    };
+    let trigger = once(TRIGGER_LINE).ok()?.map(str::to_owned);
+    let round = match once(CHAIN_LINE).ok()? {
+        None => 1,
+        Some(line) => {
+            let k = line
+                .strip_prefix("round ")?
+                .strip_suffix(&format!(" of at most {CHAIN_ROUNDS}"))?;
+            if !k.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            k.parse::<u32>()
+                .ok()
+                .filter(|k| (1..=CHAIN_ROUNDS).contains(k))?
+        }
+    };
+    let from = match once(CHAINED_FROM_LINE).ok()? {
+        None if round == 1 => None,
+        Some(line) if round > 1 => {
+            let (url, hop) = line.rsplit_once(" (hop ")?;
+            if hop != format!("{}/{})", round - 1, CHAIN_ROUNDS - 1) || url.contains(' ') {
+                return None;
+            }
+            Some(url.to_owned())
+        }
+        _ => return None,
+    };
+    let checkpoint = match once(CHECKPOINT_LINE).ok()? {
+        None => None,
+        Some(line) => {
+            let (branch, head) = line.split_once(" at ")?;
+            if !valid_branch(branch) || !sha(head) {
+                return None;
+            }
+            Some((branch.to_owned(), head.to_owned()))
+        }
+    };
+    once(BRIEF_HEADER).ok()?;
+    let brief = server
+        .lines()
+        .skip_while(|l| *l != BRIEF_HEADER)
+        .skip(1)
+        .map_while(|l| l.strip_prefix("> ").or((l == ">").then_some("")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(ChainSection {
+        status,
+        trigger,
+        round,
+        from,
+        checkpoint,
+        brief,
+    })
+}
+
 /// The server-written part of a dispatch outcome: before `<details>`, which
 /// embeds the worker contract.
-fn server_part(body: &str) -> &str {
+pub(super) fn server_part(body: &str) -> &str {
     body.split("\n<details>").next().unwrap_or_default()
 }
 
 /// The status of a dispatch outcome comment (`Done`, `Blocked`, ...), from
 /// its `Dispatch outcome:` line in the server part; a warning such as "PR
 /// body needs manual repair" may come first.
-fn outcome_status(body: &str) -> Option<&str> {
+pub(super) fn outcome_status(body: &str) -> Option<&str> {
     server_part(body)
         .lines()
         .find_map(|l| l.strip_prefix("Dispatch outcome: "))
@@ -6866,7 +6962,8 @@ exec /usr/bin/git "$@"
                     .lines()
                     .filter(|e| e.contains("/workflows/dispatch-worker.yml/runs?"))
                     .count(),
-                2,
+                // One census: issue, comment and chained (#1241) runs.
+                3,
                 "unchanged branch repeated the history census"
             );
             std::fs::write(root.join("remote-tip"), "b".repeat(40)).unwrap();
@@ -8868,6 +8965,36 @@ exec /usr/bin/git "$@"
                 assert_eq!(reply["ok"], false, "{body}: {reply}");
             }
             assert!(!root.join("posted.md").exists());
+        });
+    }
+    /// The admission parser reads exactly what the outcome writer wrote
+    /// (#1241 part 3), and refuses a section with a duplicated server line.
+    #[test]
+    fn chain_sections_round_trip_from_the_outcome_writer() {
+        shared_fixture(|root| {
+            current_pr(root);
+            let head = "c".repeat(40);
+            pushed_checkpoint(&head);
+            let mut s = server(root);
+            s.trigger = json!({"html_url":format!("https://github.com/{REPOSITORY}/issues/799#issuecomment-5")});
+            s.chain = Some(chained(2));
+            let posted = finish_continue(&mut s, "next: a\n> nested");
+            let section = chain_section(&posted).unwrap();
+            assert_eq!(section.status, "Continuing");
+            assert_eq!(section.round, 2);
+            assert_eq!(section.from.as_deref(), Some(chained(2).from.as_str()));
+            assert_eq!(
+                section.checkpoint,
+                Some(("work/dispatch-799-42".to_owned(), head.clone()))
+            );
+            assert_eq!(section.brief, "next: a\n> nested");
+            assert!(
+                section
+                    .trigger
+                    .is_some_and(|t| t.ends_with("#issuecomment-5"))
+            );
+            let doubled = posted.replacen("Chain: ", "Chain: round 1 of at most 4\nChain: ", 1);
+            assert!(chain_section(&doubled).is_none(), "{doubled}");
         });
     }
     /// A chained round's coordinator receives the brief, its chain position

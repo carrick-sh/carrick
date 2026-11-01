@@ -7,6 +7,15 @@ on:
     types: [created]
   pull_request_review:
     types: [submitted]
+  # Round chaining (#1241 part 3): only the chain job below sends this. Its
+  # one input names the Continuing outcome; the guard and the controller
+  # re-read and verify everything else from the API.
+  workflow_dispatch:
+    inputs:
+      outcome:
+        description: Continuing dispatch outcome comment id
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -16,7 +25,9 @@ jobs:
     # Cheap pre-filter only (#1214). Comments and reviews need an OWNER, MEMBER or
     # COLLABORATOR association; applying a label already needs triage access. The
     # guard's live collaborator-permission check (write or higher) is authoritative.
-    if: github.event.sender.type == 'User' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && startsWith(github.event.comment.body, '/agent')) || (github.event_name == 'pull_request_review' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association) && github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))
+    # A chained round is a workflow_dispatch from the chain job, so its
+    # actors are the Actions bot; the guard's chain rule is authoritative.
+    if: (github.event.sender.type == 'User' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && startsWith(github.event.comment.body, '/agent')) || (github.event_name == 'pull_request_review' && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association) && github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'github-actions[bot]' && github.triggering_actor == 'github-actions[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -81,6 +92,10 @@ jobs:
       - name: Dispatch head ${{ steps.validate.outputs.head }}
         if: github.event_name == 'issue_comment' && github.event.issue.pull_request
         run: ':'
+      # A chained round names the outcome the guard verified (#1241 part 3).
+      - name: Chain outcome ${{ steps.validate.outputs.issue }} ${{ steps.validate.outputs.chain }}
+        if: github.event_name == 'workflow_dispatch'
+        run: ':'
 
   worker:
     needs: guard
@@ -92,6 +107,9 @@ jobs:
       group: dispatch-worker-${{ needs.guard.outputs.issue }}
       cancel-in-progress: false
     runs-on: [carrick-agent]
+    # A pre-filter for the chain job, which re-reads the outcome itself.
+    outputs:
+      chain: ${{ steps.loop.outputs.chain }}
     permissions:
       contents: write
       pull-requests: write
@@ -203,3 +221,37 @@ jobs:
       - name: Reflect the worker contract in the job verdict
         if: ${{ !cancelled() && steps.loop.outputs.worker_failed == 'true' }}
         run: exit 1
+
+  chain:
+    # Round chaining (#1241 part 3). The only job in any workflow with
+    # `actions: write`, held by its last step alone: no worker or model
+    # output runs here, checkout fetches public main without a credential,
+    # and no action (`uses:`) receives the token. `dispatch-worker chain`
+    # re-derives from the API that this run's outcome is the issue's latest
+    # dispatch outcome and an admissible Continuing one, then sends one
+    # `workflow_dispatch` whose only input is that outcome's comment id.
+    needs: [guard, worker]
+    if: ${{ !cancelled() && needs.worker.outputs.chain == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Fetch trusted main without a credential
+        run: |
+          set -euo pipefail
+          base=$(git ls-remote https://github.com/carrick-sh/carrick refs/heads/main | cut -f1)
+          [[ "$base" =~ ^[0-9a-f]{40}$ ]]
+          git init -q .
+          git fetch -q --depth 1 https://github.com/carrick-sh/carrick "$base"
+          git checkout -q --detach FETCH_HEAD
+      - name: Build the chain driver
+        run: |
+          cargo build --locked --release -p carrick-xtask
+          install -m 0700 target/release/carrick-xtask "$RUNNER_TEMP/carrick-chain-driver"
+      - name: Dispatch the next round from a Continuing outcome
+        env:
+          CHAIN_ISSUE: ${{ needs.guard.outputs.issue }}
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/carrick-chain-driver" dispatch-worker chain --issue "$CHAIN_ISSUE"'

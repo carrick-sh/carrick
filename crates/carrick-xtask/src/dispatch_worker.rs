@@ -43,6 +43,12 @@ pub enum DispatchAction {
         #[arg(long, conflicts_with = "admit")]
         retire: bool,
     },
+    /// Hosted chain job (#1241 part 3): when this run's outcome on the issue
+    /// is an admissible Continuing outcome, dispatch the next round.
+    Chain {
+        #[arg(long)]
+        issue: u64,
+    },
     /// Owner-local poll loop that answers PR conversation with `/agent` rounds (#1193).
     Reactor {
         #[command(subcommand)]
@@ -412,13 +418,20 @@ fn event_digest(path: &Path) -> Result<String, ScalerError> {
         Sha256::digest(regular_text(path)?.as_bytes())
     ))
 }
-fn persist_admission(dispatch: &Dispatch, event: &Value, path: &Path) -> Result<(), ScalerError> {
+fn persist_admission(
+    dispatch: &Dispatch,
+    event: &Value,
+    path: &Path,
+    chain: Option<&ChainLink>,
+) -> Result<(), ScalerError> {
     let state = crate::agent_runner::state()?;
     std::fs::create_dir_all(&state)?;
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
     let admission = AdmittedDispatch {
         dispatch: dispatch.clone(),
-        trigger: if event.get("review").is_some() {
+        trigger: if let Some(link) = chain {
+            link.outcome.clone()
+        } else if event.get("review").is_some() {
             event["review"].clone()
         } else if event.get("comment").is_some() {
             event["comment"].clone()
@@ -426,7 +439,7 @@ fn persist_admission(dispatch: &Dispatch, event: &Value, path: &Path) -> Result<
             event["label"].clone()
         },
         event_digest: event_digest(path)?,
-        chain: None,
+        chain: chain.map(|link| link.facts.clone()),
     };
     crate::agent_runner::secret_file(
         &state.join("admission.json"),
@@ -487,7 +500,7 @@ pub(crate) fn validate_event(
     triggering_actor: &str,
     trusted: &mut dyn FnMut(&str) -> bool,
 ) -> Result<Dispatch, ScalerError> {
-    validate_event_with_publication(event, triggering_actor, trusted, None, None)
+    validate_event_with_publication(event, triggering_actor, trusted, None, None, None)
 }
 fn validate_event_with_publication(
     event: &Value,
@@ -495,15 +508,38 @@ fn validate_event_with_publication(
     trusted: &mut dyn FnMut(&str) -> bool,
     publication: Option<&PublishedPr>,
     adoption: Option<&Adoption>,
+    chain: Option<&ChainLink>,
 ) -> Result<Dispatch, ScalerError> {
     let review = event.get("review").is_some();
     let comment = event.get("comment").is_some();
+    let chained = event.get("chain").is_some();
+    if chained != chain.is_some()
+        || chain.is_some_and(|link| {
+            review
+                || comment
+                || adoption.is_some()
+                || link.outcome["id"] != event["chain"]["id"]
+                || event["issue"]["number"].as_u64() != Some(link.issue)
+        })
+    {
+        return Err(ScalerError::Guard(
+            "a chained round needs its verified chain proof",
+        ));
+    }
     // Any issue author is fine (#1214): the trusted label, comment or review
-    // is the approval. The issue must still be an issue, not a PR.
+    // is the approval. The issue must still be an issue, not a PR. A chained
+    // round's actors are the Actions bot; its approval is the chain rule.
+    let actors = if chained {
+        event["sender"]["login"] == CHAIN_ACTOR
+            && event["sender"]["type"] == "Bot"
+            && triggering_actor == CHAIN_ACTOR
+    } else {
+        trusted_user(&event["sender"], trusted)
+            && !triggering_actor.is_empty()
+            && trusted(triggering_actor)
+    };
     if event["repository"]["full_name"] != REPOSITORY
-        || !trusted_user(&event["sender"], trusted)
-        || triggering_actor.is_empty()
-        || !trusted(triggering_actor)
+        || !actors
         || event["issue"].get("pull_request").is_some()
     {
         return Err(ScalerError::Guard(
@@ -514,7 +550,11 @@ fn validate_event_with_publication(
         .as_u64()
         .filter(|n| *n > 0)
         .ok_or(ScalerError::Guard("missing issue number"))?;
-    if review {
+    if chained {
+        if event["issue"]["state"] != "open" {
+            return Err(ScalerError::Guard("trigger requires an open issue"));
+        }
+    } else if review {
         if event["action"] != "submitted"
             || event["review"]["state"] != "changes_requested"
             || !trusted_user(&event["review"]["user"], trusted)
@@ -1923,17 +1963,18 @@ pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
         || !run["head_sha"]
             .as_str()
             .is_some_and(crate::ci_scaler::full_sha)
-        || ![&run["actor"], &run["triggering_actor"]]
-            .iter()
-            .all(|actor| {
-                actor["type"] == "User"
-                    && actor["login"]
-                        .as_str()
-                        .is_some_and(|l| permission_endpoint(l).is_some())
-            })
-        || !((matches!(run["event"].as_str(), Some("issues" | "issue_comment"))
-            && branch == "main")
-            || (run["event"] == "pull_request_review" && review_issue.is_some()))
+        || !(chain_run(run)
+            || ([&run["actor"], &run["triggering_actor"]]
+                .iter()
+                .all(|actor| {
+                    actor["type"] == "User"
+                        && actor["login"]
+                            .as_str()
+                            .is_some_and(|l| permission_endpoint(l).is_some())
+                })
+                && ((matches!(run["event"].as_str(), Some("issues" | "issue_comment"))
+                    && branch == "main")
+                    || (run["event"] == "pull_request_review" && review_issue.is_some()))))
     {
         return false;
     }
@@ -1966,15 +2007,362 @@ pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
 }
 
 /// [`dispatch_run_identity`] plus a live trust check on both the run's
-/// actor and its triggering actor.
+/// actor and its triggering actor. A chained run's actors are the Actions
+/// bot by construction ([`chain_run`]): only the chain job holds
+/// `actions: write`, and only after [`verify_chain`]. Admitting one still
+/// needs that rule: the controller re-verifies its outcome before any
+/// runner, and history callers require its guard's `Chain outcome` marker.
 pub(crate) fn dispatch_run_admitted(
     run: &Value,
     issue: Option<u64>,
     trusted: &mut dyn FnMut(&str) -> bool,
 ) -> bool {
     dispatch_run_identity(run, issue)
-        && trusted_user(&run["actor"], trusted)
-        && trusted_user(&run["triggering_actor"], trusted)
+        && (chain_run(run)
+            || (trusted_user(&run["actor"], trusted)
+                && trusted_user(&run["triggering_actor"], trusted)))
+}
+
+/// The account a chained run starts as: `workflow_dispatch` sent with a
+/// job's `GITHUB_TOKEN` runs as the Actions bot (#1241 part 3).
+pub(crate) const CHAIN_ACTOR: &str = "github-actions[bot]";
+
+/// The only run shape a chained round has: `workflow_dispatch` of this
+/// workflow on `main`, started and triggered by [`CHAIN_ACTOR`]. Shared by
+/// the guard (runner environment), the controller (REST run) and job start
+/// (hook context). It says nothing about the outcome the run names; that is
+/// [`verify_chain`]'s.
+pub(crate) fn chain_context(
+    event: &str,
+    git_ref: &str,
+    workflow_ref: &str,
+    actor: &str,
+    triggering_actor: &str,
+) -> bool {
+    event == "workflow_dispatch"
+        && git_ref == "refs/heads/main"
+        && workflow_ref
+            == format!(
+                "{REPOSITORY}/{}@refs/heads/main",
+                crate::ci_scaler::DISPATCH_WORKFLOW
+            )
+        && actor == CHAIN_ACTOR
+        && triggering_actor == CHAIN_ACTOR
+}
+/// [`chain_context`] for a REST workflow run.
+pub(crate) fn chain_run(run: &Value) -> bool {
+    let branch = run["head_branch"].as_str().unwrap_or_default();
+    fn login(actor: &Value) -> &str {
+        if actor["type"] == "Bot" {
+            actor["login"].as_str().unwrap_or_default()
+        } else {
+            ""
+        }
+    }
+    run["repository"]["full_name"] == REPOSITORY
+        && run["head_repository"]["full_name"] == REPOSITORY
+        && run["head_sha"]
+            .as_str()
+            .is_some_and(crate::ci_scaler::full_sha)
+        && chain_context(
+            run["event"].as_str().unwrap_or_default(),
+            &format!("refs/heads/{branch}"),
+            &format!(
+                "{REPOSITORY}/{}@refs/heads/{branch}",
+                run["path"].as_str().unwrap_or_default()
+            ),
+            login(&run["actor"]),
+            login(&run["triggering_actor"]),
+        )
+}
+
+/// Proof that a Continuing outcome may start the next round (#1241 part 3).
+/// Only [`verify_chain`] makes one, from live API reads alone.
+#[derive(Debug, Clone)]
+pub(crate) struct ChainLink {
+    /// The dispatch issue the chain belongs to.
+    pub(crate) issue: u64,
+    /// The issue or dispatch PR the outcome was posted on.
+    pub(crate) thread: u64,
+    /// The live outcome comment, the chained round's trigger.
+    pub(crate) outcome: Value,
+    pub(crate) facts: ChainFacts,
+}
+type Read<'a> = dyn FnMut(&str) -> Result<Value, ScalerError> + 'a;
+/// Every page of a list endpoint, read through `read`.
+fn read_pages(read: &mut Read<'_>, path: &str) -> Result<Vec<Value>, ScalerError> {
+    let mut items = Vec::new();
+    for page in 1..=20 {
+        let join = if path.contains('?') { '&' } else { '?' };
+        let data = read(&format!("{path}{join}per_page=100&page={page}"))?;
+        let entries = data
+            .as_array()
+            .ok_or(ScalerError::Guard("invalid list page"))?;
+        items.extend(entries.iter().cloned());
+        if entries.len() < 100 {
+            return Ok(items);
+        }
+    }
+    Err(ScalerError::Guard("list too long to verify"))
+}
+/// The threads a dispatch issue's rounds post on: the issue and its open
+/// dispatch PRs.
+fn chain_threads(read: &mut Read<'_>, issue: u64) -> Result<Vec<u64>, ScalerError> {
+    let mut threads = vec![issue];
+    for pr in read_pages(
+        read,
+        &format!("repos/{REPOSITORY}/pulls?state=open&base=main"),
+    )? {
+        if pr["head"]["ref"].as_str().and_then(dispatch_branch) == Some(issue)
+            && pr["head"]["repo"]["full_name"] == REPOSITORY
+            && let Some(number) = pr["number"].as_u64()
+        {
+            threads.push(number);
+        }
+    }
+    Ok(threads)
+}
+fn dispatch_outcome_author(user: &Value) -> bool {
+    dispatch_comment_author(user) || publish_app_author(user)
+}
+/// `https://github.com/{REPOSITORY}/{issues|pull}/{n}#{anchor}{id}`.
+fn anchored(url: &str, anchor: &str) -> Option<(u64, u64)> {
+    let rest = url.strip_prefix(&format!("https://github.com/{REPOSITORY}/"))?;
+    let rest = rest
+        .strip_prefix("issues/")
+        .or_else(|| rest.strip_prefix("pull/"))?;
+    let (number, id) = rest.split_once(&format!("#{anchor}"))?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (digits(number) && digits(id)).then(|| Some((number.parse().ok()?, id.parse().ok()?)))?
+}
+fn comment_thread(comment: &Value) -> Option<u64> {
+    comment["issue_url"]
+        .as_str()?
+        .strip_prefix(&format!(
+            "https://api.github.com/repos/{REPOSITORY}/issues/"
+        ))?
+        .parse()
+        .ok()
+}
+fn owner_user(user: &Value) -> bool {
+    user["login"] == crate::ci_scaler::DISPATCH_OWNER && user["type"] == "User"
+}
+/// The chain rule (#1241 part 3, director conditions on the design): the
+/// named comment is an authentic, unedited Continuing dispatch outcome below
+/// the chain limit, with a pushed checkpoint on a dispatch branch of its
+/// issue; it is the latest outcome on the issue and its open dispatch PRs;
+/// no owner comment, review or dispatch label, no `/agent` command and no
+/// changes-requested review came after it; no outcome already chained from
+/// it; and its `Chained from:` links, each an authentic Continuing outcome
+/// one round earlier, reach within three hops a round whose `Round trigger:`
+/// is the owner's `/agent` comment, changes-requested review or dispatch
+/// label on one of those threads. The guard, the controller and the chain
+/// job all decide through this one function; the dispatch input is the
+/// comment id only, and everything else is re-read here.
+pub(crate) fn verify_chain(id: u64, read: &mut Read<'_>) -> Result<ChainLink, ScalerError> {
+    let refused = |why: &'static str| ScalerError::Guard(why);
+    let outcome = read(&format!("repos/{REPOSITORY}/issues/comments/{id}"))?;
+    let body = outcome["body"].as_str().unwrap_or_default();
+    let section = agent_loop::chain_section(body).ok_or(refused("not a dispatch outcome"))?;
+    let url = outcome["html_url"].as_str().unwrap_or_default().to_owned();
+    let at = outcome["created_at"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    if outcome["id"].as_u64() != Some(id)
+        || !dispatch_comment_author(&outcome["user"])
+        || at.is_empty()
+        || outcome["updated_at"] != outcome["created_at"]
+        || anchored(&url, "issuecomment-").map(|(_, c)| c) != Some(id)
+    {
+        return Err(refused(
+            "chain outcome is not an authentic dispatch outcome",
+        ));
+    }
+    if section.status != "Continuing" {
+        return Err(refused("chain outcome is not Continuing"));
+    }
+    if section.round >= CHAIN_ROUNDS {
+        return Err(refused("chain is at its round limit"));
+    }
+    let (branch, head) = section
+        .checkpoint
+        .clone()
+        .ok_or(refused("Continuing outcome names no checkpoint"))?;
+    let thread = comment_thread(&outcome).ok_or(refused("chain outcome thread"))?;
+    let item = read(&format!("repos/{REPOSITORY}/issues/{thread}"))?;
+    let issue = if item.get("pull_request").is_some() {
+        let pr = read(&format!("repos/{REPOSITORY}/pulls/{thread}"))?;
+        pr["head"]["ref"]
+            .as_str()
+            .and_then(dispatch_branch)
+            .ok_or(refused("chains continue dispatch PRs only"))?
+    } else {
+        thread
+    };
+    let issue_item = if issue == thread {
+        item
+    } else {
+        read(&format!("repos/{REPOSITORY}/issues/{issue}"))?
+    };
+    if issue_item["state"] != "open" || issue_item.get("pull_request").is_some() {
+        return Err(refused("chain issue is not an open issue"));
+    }
+    if dispatch_branch(&branch) != Some(issue) {
+        return Err(refused(
+            "checkpoint is not on a dispatch branch of the issue",
+        ));
+    }
+    let threads = chain_threads(read, issue)?;
+    if !threads.contains(&thread) {
+        return Err(refused(
+            "chain outcome is not on the issue or its open dispatch PR",
+        ));
+    }
+    // Second-resolution timestamps: an item in the outcome's own second
+    // counts as after it, so a tie fails closed.
+    let named = |line: &str| {
+        line.strip_prefix(agent_loop::CHAINED_FROM_LINE)
+            .is_some_and(|rest| rest.starts_with(&format!("{url} (")))
+    };
+    for &t in &threads {
+        for comment in read_pages(read, &format!("repos/{REPOSITORY}/issues/{t}/comments"))? {
+            if comment["id"].as_u64() == Some(id) {
+                continue;
+            }
+            let text = comment["body"].as_str().unwrap_or_default();
+            let after = comment["created_at"]
+                .as_str()
+                .is_some_and(|c| c >= at.as_str());
+            if dispatch_outcome_author(&comment["user"])
+                && let Some(_) = agent_loop::outcome_status(text)
+            {
+                if agent_loop::server_part(text).lines().any(named) {
+                    return Err(refused("another round already chained from this outcome"));
+                }
+                if after {
+                    return Err(refused("chain outcome is not the latest dispatch outcome"));
+                }
+            }
+            if after && comment["user"]["type"] == "User" {
+                if text.trim() == round_inbox::STOP {
+                    return Err(refused(
+                        "`/agent stop` after the chain outcome ends the chain",
+                    ));
+                }
+                if owner_user(&comment["user"]) || text.starts_with("/agent") {
+                    return Err(refused(
+                        "an owner comment or trigger after the chain outcome ends the chain",
+                    ));
+                }
+            }
+        }
+        if t != issue {
+            for review in read_pages(read, &format!("repos/{REPOSITORY}/pulls/{t}/reviews"))? {
+                if review["submitted_at"]
+                    .as_str()
+                    .is_some_and(|s| s >= at.as_str())
+                    && review["user"]["type"] == "User"
+                    && (owner_user(&review["user"]) || review["state"] == "CHANGES_REQUESTED")
+                {
+                    return Err(refused(
+                        "an owner review after the chain outcome ends the chain",
+                    ));
+                }
+            }
+        }
+        for event in read_pages(read, &format!("repos/{REPOSITORY}/issues/{t}/timeline"))? {
+            if event["event"] == "labeled"
+                && event["label"]["name"].as_str().is_some_and(dispatch_label)
+                && event["created_at"]
+                    .as_str()
+                    .is_some_and(|c| c >= at.as_str())
+            {
+                return Err(refused(
+                    "a dispatch label after the chain outcome ends the chain",
+                ));
+            }
+        }
+    }
+    // Back to the owner's trigger, one authentic Continuing outcome per hop.
+    let mut link = section.clone();
+    for _ in 0..CHAIN_ROUNDS {
+        let Some(previous) = link.from.clone() else {
+            return chain_root(read, &link, &threads).map(|()| ChainLink {
+                issue,
+                thread,
+                outcome: outcome.clone(),
+                facts: ChainFacts {
+                    round: section.round + 1,
+                    from: url.clone(),
+                    branch: branch.clone(),
+                    head: head.clone(),
+                    brief: section.brief.clone(),
+                },
+            });
+        };
+        let (_, previous_id) =
+            anchored(&previous, "issuecomment-").ok_or(refused("invalid Chained from link"))?;
+        let comment = read(&format!("repos/{REPOSITORY}/issues/comments/{previous_id}"))?;
+        let earlier = comment["body"]
+            .as_str()
+            .and_then(agent_loop::chain_section)
+            .ok_or(refused("Chained from names no dispatch outcome"))?;
+        if comment["id"].as_u64() != Some(previous_id)
+            || comment["html_url"] != previous.as_str()
+            || !dispatch_comment_author(&comment["user"])
+            || !comment_thread(&comment).is_some_and(|n| threads.contains(&n))
+            || earlier.status != "Continuing"
+            || earlier.round + 1 != link.round
+        {
+            return Err(refused(
+                "Chained from link is not the previous Continuing round",
+            ));
+        }
+        link = earlier;
+    }
+    Err(refused("chain has no owner root within its hop limit"))
+}
+/// A first round's trigger: the owner's `/agent` comment, changes-requested
+/// review or dispatch label on one of the chain's threads.
+fn chain_root(
+    read: &mut Read<'_>,
+    root: &agent_loop::ChainSection,
+    threads: &[u64],
+) -> Result<(), ScalerError> {
+    let refused = || ScalerError::Guard("chain has no owner root");
+    let trigger = root.trigger.as_deref().ok_or_else(refused)?;
+    if root.round != 1 {
+        return Err(refused());
+    }
+    let rooted = if let Some((n, id)) = anchored(trigger, "issuecomment-") {
+        let c = read(&format!("repos/{REPOSITORY}/issues/comments/{id}"))?;
+        c["id"].as_u64() == Some(id)
+            && comment_thread(&c) == Some(n)
+            && owner_user(&c["user"])
+            && c["body"].as_str().is_some_and(|b| b.starts_with("/agent"))
+    } else if let Some((n, id)) = anchored(trigger, "pullrequestreview-") {
+        let r = read(&format!("repos/{REPOSITORY}/pulls/{n}/reviews/{id}"))?;
+        r["id"].as_u64() == Some(id) && owner_user(&r["user"]) && r["state"] == "CHANGES_REQUESTED"
+    } else if let Some((n, id)) = anchored(trigger, "event-") {
+        let e = read(&format!("repos/{REPOSITORY}/issues/events/{id}"))?;
+        e["id"].as_u64() == Some(id)
+            && e["event"] == "labeled"
+            && e["issue"]["number"].as_u64() == Some(n)
+            && owner_user(&e["actor"])
+            && e["label"]["name"].as_str().is_some_and(dispatch_label)
+    } else {
+        false
+    };
+    let n = anchored(trigger, "issuecomment-")
+        .or_else(|| anchored(trigger, "pullrequestreview-"))
+        .or_else(|| anchored(trigger, "event-"))
+        .map(|(n, _)| n);
+    if rooted && n.is_some_and(|n| threads.contains(&n)) {
+        Ok(())
+    } else {
+        Err(refused())
+    }
 }
 
 fn dispatch_comment_author(user: &Value) -> bool {
@@ -2385,8 +2773,8 @@ pub(crate) fn load_event(
     root: &Path,
     path: &Path,
     trusted: &mut dyn FnMut(&str) -> bool,
-) -> Result<(Value, Option<Adoption>), ScalerError> {
-    let (mut event, adoption) = resolve_event(root, path, trusted)?;
+) -> Result<(Value, Option<Adoption>, Option<ChainLink>), ScalerError> {
+    let (mut event, adoption, chain) = resolve_event(root, path, trusted)?;
     // Whatever path resolved the issue (the label payload, a live re-read for
     // an owned PR, or the adopted PR's closing issue), its title and body
     // enter Dispatch only through the last-writer checks.
@@ -2395,15 +2783,56 @@ pub(crate) fn load_event(
         |number| issue_brief_response(root, number),
         trusted,
     )?;
-    Ok((event, adoption))
+    Ok((event, adoption, chain))
+}
+/// The runner's own run shape ([`chain_context`]), from the environment
+/// GitHub sets for every step.
+fn runner_chain_context() -> bool {
+    let var = |key: &str| std::env::var(key).unwrap_or_default();
+    chain_context(
+        &var("GITHUB_EVENT_NAME"),
+        &var("GITHUB_REF"),
+        &var("GITHUB_WORKFLOW_REF"),
+        &var("GITHUB_ACTOR"),
+        &var("GITHUB_TRIGGERING_ACTOR"),
+    )
+}
+/// A `workflow_dispatch` payload: the chain job's dispatch, never a trigger
+/// of its own. Its one input names the Continuing outcome.
+fn dispatch_event(event: &Value) -> bool {
+    event.get("inputs").is_some() && event.get("workflow").is_some()
 }
 fn resolve_event(
     root: &Path,
     path: &Path,
     trusted: &mut dyn FnMut(&str) -> bool,
-) -> Result<(Value, Option<Adoption>), ScalerError> {
+) -> Result<(Value, Option<Adoption>, Option<ChainLink>), ScalerError> {
     let mut event: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    if !trusted_user(&event["sender"], trusted) {
+    let mut chain = None;
+    if dispatch_event(&event) {
+        // A chained round (#1241 part 3): admitted by the chain rule alone,
+        // re-read from the API; the input is only the outcome's id.
+        if !runner_chain_context() || event["ref"] != "refs/heads/main" {
+            return Err(ScalerError::Guard(
+                "a dispatch-worker workflow_dispatch must be the chain job's, on main",
+            ));
+        }
+        let id = event["inputs"]["outcome"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(ScalerError::Guard(
+                "chain input must be an outcome comment id",
+            ))?;
+        let link = verify_chain(id, &mut |endpoint| authenticated_api(root, endpoint))?;
+        event["issue"] = api(root, &format!("repos/{REPOSITORY}/issues/{}", link.thread))?;
+        if link.thread != link.issue {
+            event["pull_request"] =
+                api(root, &format!("repos/{REPOSITORY}/pulls/{}", link.thread))?;
+        }
+        event["chain"] = link.outcome.clone();
+        chain = Some(link);
+    } else if !trusted_user(&event["sender"], trusted) {
         return Err(ScalerError::Guard("untrusted event actor"));
     }
     if event.get("comment").is_some() {
@@ -2447,7 +2876,7 @@ fn resolve_event(
             )?;
             event["pull_request"] = live;
             event["issue"] = adoption.issue.clone();
-            return Ok((event, Some(adoption)));
+            return Ok((event, Some(adoption), chain));
         };
         let id = branch_run(issue, &branch)?;
         let live = api(root, &format!("repos/{REPOSITORY}/pulls/{number}"))?;
@@ -2460,7 +2889,7 @@ fn resolve_event(
         // private admission. validate_event receives that proof separately.
         event["issue"] = api(root, &format!("repos/{REPOSITORY}/issues/{issue}"))?;
     }
-    Ok((event, None))
+    Ok((event, None, chain))
 }
 
 /// Select a single open owned PR, authenticating the original branch run.
@@ -2520,6 +2949,129 @@ pub(crate) fn dispatch_branch(branch: &str) -> Option<u64> {
 /// Hosted guard (`admit == false`) and clone admission (`admit == true`):
 /// resolve the event, validate it, and on the clone re-check the target PR
 /// and persist the private admission the loop reads.
+/// The chain job: dispatch the next round when the latest dispatch outcome
+/// on the issue's threads is this run's own and [`verify_chain`] admits
+/// it. The one write is the dispatch, whose only input is the outcome id.
+fn chain(root: &Path, issue: u64) -> Result<(), ScalerError> {
+    let run = std::env::var("GITHUB_RUN_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or(ScalerError::Guard("missing run id"))?;
+    let chained = chain_next(
+        issue,
+        &run,
+        &mut |endpoint| authenticated_api(root, endpoint),
+        &mut |id| {
+            gh(
+                root,
+                &[
+                    "api",
+                    "-X",
+                    "POST",
+                    &format!("repos/{REPOSITORY}/actions/workflows/dispatch-worker.yml/dispatches"),
+                    "-f",
+                    "ref=main",
+                    "-f",
+                    &format!("inputs[outcome]={id}"),
+                ],
+            )
+            .map(drop)
+        },
+    )?;
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(path)?,
+            "{}",
+            chained.map_or_else(
+                || "No Continuing outcome from this run: nothing to chain.".to_owned(),
+                |url| format!("Chained the next round from {url}.")
+            )
+        )?;
+    }
+    Ok(())
+}
+/// [`chain`] over a transport: `Some(outcome url)` after exactly one
+/// dispatch, `None` (no call) when the latest outcome is not this run's
+/// Continuing one; a Continuing outcome the rule refuses is an error.
+pub(crate) fn chain_next(
+    issue: u64,
+    run: &str,
+    read: &mut Read<'_>,
+    dispatch: &mut dyn FnMut(u64) -> Result<(), ScalerError>,
+) -> Result<Option<String>, ScalerError> {
+    let mut latest: Option<Value> = None;
+    for thread in chain_threads(read, issue)? {
+        for comment in read_pages(
+            read,
+            &format!("repos/{REPOSITORY}/issues/{thread}/comments"),
+        )? {
+            let key = |c: &Value| {
+                (
+                    c["created_at"].as_str().map(str::to_owned),
+                    c["id"].as_u64(),
+                )
+            };
+            if dispatch_outcome_author(&comment["user"])
+                && comment["body"]
+                    .as_str()
+                    .and_then(agent_loop::outcome_status)
+                    .is_some()
+                && latest.as_ref().is_none_or(|l| key(&comment) > key(l))
+            {
+                latest = Some(comment);
+            }
+        }
+    }
+    let Some(latest) = latest else {
+        return Ok(None);
+    };
+    let body = latest["body"].as_str().unwrap_or_default();
+    if agent_loop::outcome_status(body) != Some("Continuing")
+        || agent_loop::run_from_body(body) != Some(run)
+    {
+        return Ok(None);
+    }
+    let id = latest["id"]
+        .as_u64()
+        .ok_or(ScalerError::Guard("outcome id"))?;
+    let link = verify_chain(id, read)?;
+    if link.issue != issue {
+        return Err(ScalerError::Guard("chain outcome belongs to another issue"));
+    }
+    dispatch(id)?;
+    Ok(Some(link.facts.from))
+}
+
+/// A label trigger with the `labeled` event's URL, read from the issue
+/// timeline, so its outcome names a `Round trigger:` a chain can be rooted
+/// in (#1241 part 3). Best effort: without it the round runs, unchainable.
+fn label_trigger(root: &Path, mut event: Value) -> Value {
+    if event.get("label").is_none()
+        || event.get("comment").is_some()
+        || event.get("review").is_some()
+    {
+        return event;
+    }
+    let issue = event["issue"]["number"].as_u64().unwrap_or_default();
+    let found = read_pages(
+        &mut |endpoint| authenticated_api(root, endpoint),
+        &format!("repos/{REPOSITORY}/issues/{issue}/timeline"),
+    )
+    .ok()
+    .and_then(|events| {
+        events.into_iter().rev().find(|e| {
+            e["event"] == "labeled"
+                && e["label"]["name"] == event["label"]["name"]
+                && e["actor"]["login"] == event["sender"]["login"]
+        })
+    });
+    if let Some(item) = found.and_then(|e| round_inbox::label_item(issue, &e)) {
+        event["label"]["html_url"] = item["html_url"].clone();
+    }
+    event
+}
+
 fn guard_admission(
     root: &Path,
     event_path: &Path,
@@ -2529,7 +3081,7 @@ fn guard_admission(
     // Both guard phases hold the job token (the endpoint answers 401
     // without one); the live permission read fails closed.
     let mut trusted = collaborators(|endpoint| authenticated_api(root, endpoint));
-    let (event, adoption) = load_event(root, event_path, &mut trusted)?;
+    let (event, adoption, chain) = load_event(root, event_path, &mut trusted)?;
     let publication = if adoption.is_none() && publish_app_author(&event["pull_request"]["user"]) {
         let branch = event["pull_request"]["head"]["ref"]
             .as_str()
@@ -2551,8 +3103,10 @@ fn guard_admission(
         &mut trusted,
         publication.as_ref(),
         adoption.as_ref(),
+        chain.as_ref(),
     )?;
-    dispatch.base = admitted_base(dispatch.review || event.get("comment").is_some())?;
+    dispatch.base =
+        admitted_base(dispatch.review || event.get("comment").is_some() || chain.is_some())?;
     if admit {
         retire_previous_agent()?;
     }
@@ -2564,7 +3118,12 @@ fn guard_admission(
         if dispatch.resume {
             require_target_pr(root, &dispatch)?;
         }
-        persist_admission(&dispatch, &event, event_path)?;
+        persist_admission(
+            &dispatch,
+            &label_trigger(root, event.clone()),
+            event_path,
+            chain.as_ref(),
+        )?;
     }
     Ok((event, dispatch))
 }
@@ -2588,6 +3147,7 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     }
     let root = root.canonicalize()?;
     let (event_path, admit) = match args.action {
+        DispatchAction::Chain { issue } => return chain(&root, issue),
         DispatchAction::Tool { .. } | DispatchAction::Reactor { .. } => {
             return Err(ScalerError::Guard("action already handled"));
         }
@@ -2612,13 +3172,17 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         use std::io::Write;
         writeln!(
             std::fs::OpenOptions::new().append(true).open(path)?,
-            "base={}\nhead={}\nissue={}\ncomment={}",
+            "base={}\nhead={}\nissue={}\ncomment={}\nchain={}",
             dispatch.base,
             event["pull_request"]["head"]["sha"]
                 .as_str()
                 .unwrap_or_default(),
             dispatch.issue,
-            comment_digest(&event["comment"])
+            comment_digest(&event["comment"]),
+            event["chain"]["id"]
+                .as_u64()
+                .map(|id| id.to_string())
+                .unwrap_or_default()
         )?;
     }
     Ok(())
@@ -4850,6 +5414,392 @@ fn publish_commits(
         }
     }
     Ok(None)
+}
+
+/// A three-round chain on issue 799 and its dispatch PR 800 (#1241 part 3),
+/// as live API reads: the owner's `/agent` (comment 10 on the issue), round
+/// 1's Continuing outcome (20, on the PR) and round 2's (30), which names 20.
+/// [`chain_case`] then breaks one rule at a time.
+#[cfg(test)]
+pub(crate) mod chain_fixture {
+    use super::*;
+    use std::collections::BTreeMap;
+    pub(crate) fn url(thread: u64, anchor: &str) -> String {
+        let kind = if thread == 800 { "pull" } else { "issues" };
+        format!("https://github.com/{REPOSITORY}/{kind}/{thread}#{anchor}")
+    }
+    pub(crate) fn outcome_body(
+        status: &str,
+        round: u32,
+        trigger: Option<&str>,
+        from: Option<&str>,
+        run: u64,
+    ) -> String {
+        let mut section = format!("Dispatch outcome: {status}\n\n");
+        if let Some(trigger) = trigger {
+            section.push_str(&format!("Round trigger: {trigger}\n"));
+        }
+        section.push_str(&format!("Chain: round {round} of at most 4\n"));
+        if let Some(from) = from {
+            section.push_str(&format!("Chained from: {from} (hop {}/3)\n", round - 1));
+        }
+        section.push_str(&format!(
+            "Checkpoint: work/dispatch-799-42 at {}\nOwner comments during this round:\n\nContinuation brief:\n> next step {round}\n\n<details><summary>x</summary>\n\nOutcome contract:\n```json\n{{}}\n```\n</details>\n\nLoop claims (unverified):\n> continue\n\n\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/{run}\n",
+            "c".repeat(40)
+        ));
+        section
+    }
+    pub(crate) fn comment(id: u64, thread: u64, login: &str, at: &str, body: &str) -> Value {
+        let kind = if login.ends_with("[bot]") {
+            "Bot"
+        } else {
+            "User"
+        };
+        json!({"id":id,"user":{"login":login,"type":kind},"created_at":at,"updated_at":at,
+            "issue_url":format!("https://api.github.com/repos/{REPOSITORY}/issues/{thread}"),
+            "html_url":url(thread, &format!("issuecomment-{id}")),"body":body})
+    }
+    fn page(path: &str) -> String {
+        let join = if path.contains('?') { '&' } else { '?' };
+        format!("repos/{REPOSITORY}/{path}{join}per_page=100&page=1")
+    }
+    pub(crate) fn pr() -> Value {
+        json!({"number":800,"state":"open","draft":true,"user":{"login":"github-actions[bot]","type":"Bot"},
+            "head":{"ref":"work/dispatch-799-42","sha":"c".repeat(40),"repo":{"full_name":REPOSITORY}},
+            "base":{"ref":"main","repo":{"full_name":REPOSITORY}},
+            "body":format!("Closes #799\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")})
+    }
+    /// The authentic chain, keyed by endpoint.
+    pub(crate) fn base() -> BTreeMap<String, Value> {
+        let trigger = comment(
+            10,
+            799,
+            "tjfontaine",
+            "2026-10-31T10:00:00Z",
+            "/agent do the slice",
+        );
+        let first = comment(
+            20,
+            800,
+            "github-actions[bot]",
+            "2026-10-31T11:00:00Z",
+            &outcome_body(
+                "Continuing",
+                1,
+                Some(&url(799, "issuecomment-10")),
+                None,
+                51,
+            ),
+        );
+        let second = comment(
+            30,
+            800,
+            "github-actions[bot]",
+            "2026-10-31T12:00:00Z",
+            &outcome_body(
+                "Continuing",
+                2,
+                Some(&url(800, "issuecomment-20")),
+                Some(&url(800, "issuecomment-20")),
+                52,
+            ),
+        );
+        let mut map = BTreeMap::new();
+        let mut put = |path: String, value: Value| {
+            map.insert(path, value);
+        };
+        put(
+            format!("repos/{REPOSITORY}/issues/comments/10"),
+            trigger.clone(),
+        );
+        put(
+            format!("repos/{REPOSITORY}/issues/comments/20"),
+            first.clone(),
+        );
+        put(
+            format!("repos/{REPOSITORY}/issues/comments/30"),
+            second.clone(),
+        );
+        put(
+            format!("repos/{REPOSITORY}/issues/800"),
+            json!({"number":800,"state":"open","pull_request":{"url":"pr"}}),
+        );
+        put(format!("repos/{REPOSITORY}/pulls/800"), pr());
+        put(
+            format!("repos/{REPOSITORY}/issues/799"),
+            json!({"number":799,"state":"open","title":"Fixture","body":"Do it","user":{"login":"tjfontaine","type":"User"}}),
+        );
+        put(page("pulls?state=open&base=main"), json!([pr()]));
+        put(page("issues/799/comments"), json!([trigger]));
+        put(page("issues/800/comments"), json!([first, second]));
+        put(page("pulls/800/reviews"), json!([]));
+        put(page("issues/799/timeline"), json!([]));
+        put(page("issues/800/timeline"), json!([]));
+        map
+    }
+    /// Each case breaks one rule; `None` is the authentic chain. The text
+    /// is part of the refusal the rule gives.
+    pub(crate) const CASES: &[(&str, Option<&str>)] = &[
+        ("authentic", None),
+        ("authentic label root", None),
+        ("authentic review root", None),
+        ("round limit", Some("round limit")),
+        ("not continuing", Some("not Continuing")),
+        ("forged author", Some("not an authentic dispatch outcome")),
+        ("edited outcome", Some("not an authentic dispatch outcome")),
+        ("stale outcome", Some("not the latest dispatch outcome")),
+        ("owner comment after", Some("owner comment")),
+        ("owner comment in the same second", Some("owner comment")),
+        ("owner review after", Some("owner review")),
+        ("dispatch label after", Some("dispatch label")),
+        ("agent stop after", Some("`/agent stop`")),
+        ("already chained", Some("already chained")),
+        (
+            "already chained in the same second",
+            Some("already chained"),
+        ),
+        ("skipped round", Some("not the previous Continuing round")),
+        ("collaborator root", Some("no owner root")),
+        ("root not a trigger", Some("no owner root")),
+        (
+            "previous round not continuing",
+            Some("not the previous Continuing round"),
+        ),
+        ("inconsistent hop", Some("not a dispatch outcome")),
+        ("closed issue", Some("not an open issue")),
+    ];
+    pub(crate) fn chain_case(case: &str) -> BTreeMap<String, Value> {
+        let mut map = base();
+        let key = |path: &str| page(path);
+        let comment_key = |id: u64| format!("repos/{REPOSITORY}/issues/comments/{id}");
+        let push = |map: &mut BTreeMap<String, Value>, path: &str, item: Value| {
+            let list = map.entry(key(path)).or_insert_with(|| json!([]));
+            list.as_array_mut().unwrap().push(item);
+        };
+        let set_body = |map: &mut BTreeMap<String, Value>, id: u64, body: String| {
+            map.get_mut(&comment_key(id)).unwrap()["body"] = body.clone().into();
+            for item in map
+                .get_mut(&key("issues/800/comments"))
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+            {
+                if item["id"] == id {
+                    item["body"] = body.clone().into();
+                }
+            }
+        };
+        let later = "2026-10-31T12:30:00Z";
+        match case {
+            "authentic" => {}
+            "authentic label root" | "root not a trigger" => {
+                let trigger = url(799, "event-61");
+                set_body(
+                    &mut map,
+                    20,
+                    outcome_body("Continuing", 1, Some(&trigger), None, 51),
+                );
+                let mut event = json!({"id":61,"event":"labeled","label":{"name":"dispatch:opus"},
+                    "actor":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-31T10:00:00Z",
+                    "issue":{"number":799}});
+                if case == "root not a trigger" {
+                    event["label"]["name"] = "bug".into();
+                }
+                map.insert(format!("repos/{REPOSITORY}/issues/events/61"), event);
+            }
+            "authentic review root" => {
+                let trigger = url(800, "pullrequestreview-62");
+                set_body(
+                    &mut map,
+                    20,
+                    outcome_body("Continuing", 1, Some(&trigger), None, 51),
+                );
+                map.insert(
+                    format!("repos/{REPOSITORY}/pulls/800/reviews/62"),
+                    json!({"id":62,"state":"CHANGES_REQUESTED","user":{"login":"tjfontaine","type":"User"},"submitted_at":"2026-10-31T10:00:00Z"}),
+                );
+            }
+            "round limit" => {
+                // A consistent four-round chain: 15 (round 1), 16, 20, 30.
+                let first = comment(
+                    15,
+                    800,
+                    "github-actions[bot]",
+                    "2026-10-31T10:30:00Z",
+                    &outcome_body(
+                        "Continuing",
+                        1,
+                        Some(&url(799, "issuecomment-10")),
+                        None,
+                        49,
+                    ),
+                );
+                let second = comment(
+                    16,
+                    800,
+                    "github-actions[bot]",
+                    "2026-10-31T10:45:00Z",
+                    &outcome_body(
+                        "Continuing",
+                        2,
+                        None,
+                        Some(&url(800, "issuecomment-15")),
+                        50,
+                    ),
+                );
+                for item in [first, second] {
+                    map.insert(comment_key(item["id"].as_u64().unwrap()), item.clone());
+                    push(&mut map, "issues/800/comments", item);
+                }
+                set_body(
+                    &mut map,
+                    20,
+                    outcome_body(
+                        "Continuing",
+                        3,
+                        None,
+                        Some(&url(800, "issuecomment-16")),
+                        51,
+                    ),
+                );
+                set_body(
+                    &mut map,
+                    30,
+                    outcome_body(
+                        "Continuing",
+                        4,
+                        None,
+                        Some(&url(800, "issuecomment-20")),
+                        52,
+                    ),
+                );
+            }
+            "skipped round" => set_body(
+                &mut map,
+                30,
+                outcome_body(
+                    "Continuing",
+                    3,
+                    None,
+                    Some(&url(800, "issuecomment-20")),
+                    52,
+                ),
+            ),
+            "already chained in the same second" => push(
+                &mut map,
+                "issues/800/comments",
+                comment(
+                    44,
+                    800,
+                    "github-actions[bot]",
+                    "2026-10-31T12:00:00Z",
+                    &outcome_body("Done", 3, None, Some(&url(800, "issuecomment-30")), 53),
+                ),
+            ),
+            "not continuing" => set_body(
+                &mut map,
+                30,
+                outcome_body("Blocked", 2, None, Some(&url(800, "issuecomment-20")), 52),
+            ),
+            "forged author" => {
+                map.get_mut(&comment_key(30)).unwrap()["user"] =
+                    json!({"login":"tjfontaine","type":"User"});
+            }
+            "edited outcome" => {
+                map.get_mut(&comment_key(30)).unwrap()["updated_at"] = later.into();
+            }
+            "stale outcome" => push(
+                &mut map,
+                "issues/799/comments",
+                comment(
+                    40,
+                    799,
+                    "github-actions[bot]",
+                    later,
+                    "Dispatch outcome: Done\n\nRound trigger: x\n",
+                ),
+            ),
+            "owner comment after" => push(
+                &mut map,
+                "issues/800/comments",
+                comment(41, 800, "tjfontaine", later, "looks good so far"),
+            ),
+            // Second-resolution timestamps: a tie counts as after (#1241).
+            "owner comment in the same second" => push(
+                &mut map,
+                "issues/800/comments",
+                comment(
+                    45,
+                    800,
+                    "tjfontaine",
+                    "2026-10-31T12:00:00Z",
+                    "wait, one more thing",
+                ),
+            ),
+            "agent stop after" => push(
+                &mut map,
+                "issues/799/comments",
+                comment(42, 799, "tjfontaine", later, "/agent stop"),
+            ),
+            "owner review after" => push(
+                &mut map,
+                "pulls/800/reviews",
+                json!({"id":63,"state":"COMMENTED","user":{"login":"tjfontaine","type":"User"},"submitted_at":later}),
+            ),
+            "dispatch label after" => push(
+                &mut map,
+                "issues/799/timeline",
+                json!({"id":64,"event":"labeled","label":{"name":"dispatch"},"actor":{"login":"tjfontaine","type":"User"},"created_at":later}),
+            ),
+            "already chained" => push(
+                &mut map,
+                "issues/800/comments",
+                comment(
+                    43,
+                    800,
+                    "github-actions[bot]",
+                    later,
+                    &outcome_body("Done", 3, None, Some(&url(800, "issuecomment-30")), 53),
+                ),
+            ),
+            "collaborator root" => {
+                map.get_mut(&comment_key(10)).unwrap()["user"] =
+                    json!({"login":"collaborator","type":"User"});
+            }
+            "previous round not continuing" => set_body(
+                &mut map,
+                20,
+                outcome_body("Done", 1, Some(&url(799, "issuecomment-10")), None, 51),
+            ),
+            "inconsistent hop" => {
+                let body = outcome_body(
+                    "Continuing",
+                    2,
+                    None,
+                    Some(&url(800, "issuecomment-20")),
+                    52,
+                )
+                .replace("(hop 1/3)", "(hop 2/3)");
+                set_body(&mut map, 30, body);
+            }
+            "closed issue" => {
+                map.get_mut(&format!("repos/{REPOSITORY}/issues/799"))
+                    .unwrap()["state"] = "closed".into();
+            }
+            other => panic!("unknown chain case {other}"),
+        }
+        map
+    }
+    /// A read transport over a case: a missing endpoint is the API's 404.
+    pub(crate) fn serve(
+        map: &BTreeMap<String, Value>,
+    ) -> impl FnMut(&str) -> Result<Value, ScalerError> + '_ {
+        |endpoint: &str| {
+            map.get(endpoint)
+                .cloned()
+                .ok_or(ScalerError::Guard("gh: Not Found (HTTP 404)"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8374,7 +9324,7 @@ cat "$file"
                 .unwrap();
                 std::fs::write(fixture.join("graphql.json"), references(refs).to_string()).unwrap();
                 std::fs::write(&event_path, event.to_string()).unwrap();
-                let (loaded, adoption) =
+                let (loaded, adoption, _) =
                     load_event(&fixture, &event_path, &mut owner_collaborator())?;
                 validate_event_with_publication(
                     &loaded,
@@ -8382,6 +9332,7 @@ cat "$file"
                     &mut owner_collaborator(),
                     None,
                     adoption.as_ref(),
+                    None,
                 )
             };
         if std::env::var_os("ADOPTION_ADMIT").is_some() {
@@ -8556,7 +9507,7 @@ cat "$file"
             .to_string();
         assert!(error.contains("actions/runs/42"), "{error}");
         // The proof binds to the PR it was made for.
-        let (loaded, adoption) = {
+        let (loaded, adoption, _) = {
             write("pulls/1150", &pr);
             std::fs::write(&event_path, event.to_string()).unwrap();
             load_event(&fixture, &event_path, &mut owner_collaborator()).unwrap()
@@ -8569,7 +9520,8 @@ cat "$file"
                 "tjfontaine",
                 &mut owner_collaborator(),
                 None,
-                adoption.as_ref()
+                adoption.as_ref(),
+                None,
             )
             .is_err()
         );
@@ -8583,7 +9535,8 @@ cat "$file"
                 "tjfontaine",
                 &mut owner_collaborator(),
                 None,
-                adoption.as_ref()
+                adoption.as_ref(),
+                None,
             )
             .is_err()
         );
@@ -8591,6 +9544,202 @@ cat "$file"
     /// The [`ISSUE_BRIEF_QUERY`] response for `issue`, unedited when
     /// `editor` is `None` and unrenamed unless [`issue_brief_renamed`] adds a
     /// `RENAMED_TITLE_EVENT`.
+    /// #1241 part 3 through the production guard (`guard_admission`, hosted
+    /// and clone phases) over the real `gh` transport: the chain rule admits
+    /// an authentic chain and refuses each broken rule, and the run shape
+    /// must be the chain job's dispatch.
+    #[test]
+    fn guard_admits_only_an_authentic_chain() {
+        const CHILD: &str = "CARRICK_TEST_CHAIN_GUARD";
+        let case = std::env::var("CHAIN_CASE").ok();
+        let Some(case) = case.filter(|_| std::env::var_os(CHILD).is_some()) else {
+            let mut wrong = Vec::new();
+            let mut runs = chain_fixture::CASES
+                .iter()
+                .map(|(case, refused)| (case.to_string(), *refused, Vec::<(&str, &str)>::new()))
+                .collect::<Vec<_>>();
+            for (name, env) in [
+                ("wrong actor", ("GITHUB_ACTOR", "tjfontaine")),
+                (
+                    "wrong triggering actor",
+                    ("GITHUB_TRIGGERING_ACTOR", "tjfontaine"),
+                ),
+                ("wrong ref", ("GITHUB_REF", "refs/heads/work/x")),
+                (
+                    "wrong workflow",
+                    (
+                        "GITHUB_WORKFLOW_REF",
+                        "carrick-sh/carrick/.github/workflows/ci.yml@refs/heads/main",
+                    ),
+                ),
+                ("wrong event", ("GITHUB_EVENT_NAME", "issue_comment")),
+            ] {
+                runs.push((name.to_owned(), Some("chain job's"), vec![env]));
+            }
+            for (case, refused, overrides) in runs {
+                let temp = tempfile::tempdir().unwrap();
+                let bin = temp.path().join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                crate::lock_file::tests::write_test_executable(
+                    bin.join("gh"),
+                    r#"#!/bin/sh
+test "$1" = api || exit 93
+if test "$2" = graphql; then cat "$CHAIN_FIXTURE/issue-graphql.json"; exit 0; fi
+file="$CHAIN_FIXTURE/$(printf '%s' "$2" | tr '/' '_')"
+test -f "$file" || { echo "gh: Not Found (HTTP 404) $2" >&2; exit 91; }
+cat "$file"
+"#,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        std::thread::current().name().unwrap(),
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("CHAIN_CASE", &case)
+                    .env("CHAIN_FIXTURE", temp.path())
+                    .env("GH_TOKEN", "fixture-token")
+                    .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                    .env("GITHUB_EVENT_NAME", "workflow_dispatch")
+                    .env("GITHUB_REF", "refs/heads/main")
+                    .env(
+                        "GITHUB_WORKFLOW_REF",
+                        "carrick-sh/carrick/.github/workflows/dispatch-worker.yml@refs/heads/main",
+                    )
+                    .env("GITHUB_ACTOR", CHAIN_ACTOR)
+                    .env("GITHUB_TRIGGERING_ACTOR", CHAIN_ACTOR)
+                    .env("CARRICK_DISPATCH_BASE", "f".repeat(40))
+                    .env("RUNNER_TEMP", temp.path())
+                    .env("GITHUB_RUN_ID", "77")
+                    .env("GITHUB_RUN_ATTEMPT", "1")
+                    .env_remove("CARRICK_DISPATCH_HEAD");
+                for (key, value) in overrides {
+                    command.env(key, value);
+                }
+                let output = command.output().unwrap();
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let verdict = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("CHAIN-VERDICT: "))
+                    .unwrap_or("no verdict")
+                    .to_owned();
+                let right = match refused {
+                    None => verdict == "admitted",
+                    Some(reason) => verdict.starts_with("refused") && verdict.contains(reason),
+                };
+                if !right || !output.status.success() {
+                    wrong.push(format!("{case}: {verdict}\n{text}"));
+                }
+            }
+            assert!(wrong.is_empty(), "{}", wrong.join("\n---\n"));
+            return;
+        };
+        let fixture = PathBuf::from(std::env::var_os("CHAIN_FIXTURE").unwrap());
+        // Run-shape cases keep the authentic chain and change the runner.
+        let fixture_case = if chain_fixture::CASES.iter().any(|(c, _)| *c == case) {
+            case.as_str()
+        } else {
+            "authentic"
+        };
+        let mut map = chain_fixture::chain_case(fixture_case);
+        map.insert(
+            format!("repos/{REPOSITORY}/actions/runs/42"),
+            json!({"id":42,"status":"completed","repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},
+                "path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","head_sha":"a".repeat(40),
+                "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}}),
+        );
+        map.insert(
+            format!("repos/{REPOSITORY}/collaborators/tjfontaine/permission"),
+            json!({"permission":"admin"}),
+        );
+        map.insert(
+            format!(
+                "repos/{REPOSITORY}/pulls?state=open&base=main&head=carrick-sh:work/dispatch-799-42"
+            ),
+            json!([chain_fixture::pr()]),
+        );
+        for (endpoint, value) in &map {
+            std::fs::write(fixture.join(endpoint.replace('/', "_")), value.to_string()).unwrap();
+        }
+        std::fs::write(
+            fixture.join("issue-graphql.json"),
+            issue_brief(&map[&format!("repos/{REPOSITORY}/issues/799")], None).to_string(),
+        )
+        .unwrap();
+        let event_path = fixture.join("event.json");
+        std::fs::write(
+            &event_path,
+            json!({"inputs":{"outcome":"30"},"workflow":".github/workflows/dispatch-worker.yml",
+                "ref":"refs/heads/main","repository":{"full_name":REPOSITORY},
+                "sender":{"login":CHAIN_ACTOR,"type":"Bot"}})
+            .to_string(),
+        )
+        .unwrap();
+        let root = fixture.canonicalize().unwrap();
+        let hosted = guard_admission(&root, &event_path, false, || Ok(()));
+        let verdict = match &hosted {
+            Ok((event, dispatch)) => {
+                // The clone repeats the rule and persists the chain facts
+                // the loop starts from.
+                let admitted = guard_admission(&root, &event_path, true, || Ok(())).unwrap();
+                assert_eq!(admitted.1.branch, "work/dispatch-799-42");
+                assert!(dispatch.resume && event["chain"]["id"] == 30);
+                let admission = read_admission(&event_path).unwrap();
+                let facts = admission.chain.unwrap();
+                assert_eq!(facts.round, 3);
+                assert_eq!(facts.from, chain_fixture::url(800, "issuecomment-30"));
+                assert_eq!(facts.head, "c".repeat(40));
+                assert_eq!(facts.brief, "next step 2");
+                assert_eq!(admission.trigger["id"], 30);
+                "admitted".to_owned()
+            }
+            Err(error) => format!("refused: {error}"),
+        };
+        println!("CHAIN-VERDICT: {verdict}");
+    }
+    /// #1241 part 3: the chain job sends exactly one dispatch, naming only
+    /// the outcome id, for this run's Continuing outcome, and none for
+    /// anything else; a Continuing outcome the rule refuses fails the job.
+    #[test]
+    fn chain_job_dispatches_once_for_its_own_continuing_outcome() {
+        let attempt = |case: &str, run: &str| {
+            let map = chain_fixture::chain_case(case);
+            let mut calls = Vec::new();
+            let result = chain_next(799, run, &mut chain_fixture::serve(&map), &mut |id| {
+                calls.push(id);
+                Ok(())
+            });
+            (result, calls)
+        };
+        let (result, calls) = attempt("authentic", "52");
+        assert_eq!(calls, vec![30]);
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some(chain_fixture::url(800, "issuecomment-30").as_str())
+        );
+        // Another run's outcome, a later Done, or nothing Continuing: no call.
+        for (case, run) in [
+            ("authentic", "51"),
+            ("stale outcome", "52"),
+            ("not continuing", "52"),
+        ] {
+            let (result, calls) = attempt(case, run);
+            assert!(matches!(result, Ok(None)), "{case}: {result:?}");
+            assert!(calls.is_empty(), "{case}: {calls:?}");
+        }
+        for case in ["owner comment after", "agent stop after", "round limit"] {
+            let (result, calls) = attempt(case, "52");
+            assert!(result.is_err(), "{case}: {result:?}");
+            assert!(calls.is_empty(), "{case}: {calls:?}");
+        }
+    }
     fn issue_brief(issue: &Value, editor: Option<&str>) -> Value {
         json!({"data":{"repository":{"issue":{
             "number":issue["number"],
@@ -8881,7 +10030,7 @@ cat "$file"
         ] {
             std::fs::write(&event_path, event.to_string()).unwrap();
             let load = || {
-                let (loaded, adoption) = load_event(
+                let (loaded, adoption, _) = load_event(
                     &fixture,
                     &event_path,
                     &mut fake_collaborators(BRIEF_PERMISSIONS),
@@ -8892,6 +10041,7 @@ cat "$file"
                     &mut fake_collaborators(BRIEF_PERMISSIONS),
                     None,
                     adoption.as_ref(),
+                    None,
                 )
             };
             // Unedited and unrenamed since filing: accepted, and both
