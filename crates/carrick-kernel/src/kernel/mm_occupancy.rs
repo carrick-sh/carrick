@@ -241,6 +241,45 @@ pub enum MmOccupancyError {
     CrashParticipationIdentityExhausted { thread: ThreadKey },
 }
 
+/// [`retire_exited_zone_space`] refused: the slot is not in the state a root
+/// exit crossing on an idle vCPU leaves. Each is a broken invariant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ExitedSpaceRefusal {
+    #[error("slot {slot:?} has a host owner of address space {running}")]
+    HostOwned { slot: ZoneSlotId, running: u64 },
+    #[error("slot {slot:?} runs address space {running}, not the exiting one")]
+    Foreign { slot: ZoneSlotId, running: u64 },
+    #[error("no zone tables to retire slot {slot:?}'s exiting space")]
+    NoZone { slot: ZoneSlotId },
+}
+
+/// The host, with `slot`'s vCPU out of the guest and switched to the
+/// maintenance root, after the in-ring owner crossed `space`'s root exit
+/// there. EL1 published that word with no host port and the crossing
+/// abandoned its stack, so EL1 never ran its own `release_space`. Under the
+/// slot's port lock (the lock every installer takes before publishing a
+/// word) the slot is proved to have no host owner, and only then is exactly
+/// `space` retired, so no installer can race the retirement.
+pub fn retire_exited_zone_space(
+    slot: ZoneSlotId,
+    space: AddressSpaceKey,
+) -> Result<(), ExitedSpaceRefusal> {
+    let execution = ExecutionSlot::zone(slot);
+    let state = PORTS[execution.index()].lock();
+    if let Some(port) = state.running.as_ref() {
+        return Err(ExitedSpaceRefusal::HostOwned {
+            slot,
+            running: port.mm.raw(),
+        });
+    }
+    let zone = crate::el1_zone::zone().ok_or(ExitedSpaceRefusal::NoZone { slot })?;
+    zone.retire_exited_space(slot, space)
+        .map_err(|foreign| ExitedSpaceRefusal::Foreign {
+            slot,
+            running: foreign.running,
+        })
+}
+
 /// A host-only execution slot, for a vCPU (or a native executor) without a
 /// mailbox lease; freed on drop.
 #[derive(Debug)]

@@ -22,6 +22,13 @@ macro_rules! binding_word {
 }
 binding_word!(EntryTaskKey, EntryMmKey, EntryThreadGeneration);
 
+impl EntryMmKey {
+    /// The occupancy key of this MM; `None` for the unissued word 0.
+    pub fn address_space(self) -> Option<carrick_sched_core::AddressSpaceKey> {
+        carrick_sched_core::AddressSpaceKey::from_raw(self.0)
+    }
+}
+
 /// Version of one published execution snapshot (the host's settlement
 /// generation). It moves on every settlement of the same thread and is never
 /// an incarnation: a thread's [`BirthSerial`] cannot be derived from it.

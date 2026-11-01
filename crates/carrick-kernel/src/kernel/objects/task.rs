@@ -549,7 +549,10 @@ impl DumpableMode {
 #[derive(Clone, Copy, Debug)]
 enum NativeRootExitCustody {
     Absent,
-    Pending(carrick_sched_core::process::TerminationStatus),
+    Pending {
+        owner: ThreadKey,
+        status: carrick_sched_core::process::TerminationStatus,
+    },
     Taken,
 }
 
@@ -1214,38 +1217,46 @@ impl Task {
         *self.waker.lock() = Some(waker);
     }
 
-    /// Record the root exit an idle vCPU received for this task. The first
-    /// publication wins: the in-ring owner crosses once per process, and a
-    /// second status would be a second terminal. Returns whether this call
-    /// published (false: one is already pending or taken).
+    /// Record the root exit an idle vCPU received for this task, owed to its
+    /// exact exiting thread `owner` (the in-ring owner whose record crossed).
+    /// The first publication wins: the in-ring owner crosses once per
+    /// process, and a second status would be a second terminal. Returns
+    /// whether this call published (false: one is already pending or taken).
     pub fn publish_native_root_exit(
         &self,
+        owner: ThreadKey,
         status: carrick_sched_core::process::TerminationStatus,
     ) -> bool {
         let mut custody = self.native_root_exit.lock();
         if !matches!(*custody, NativeRootExitCustody::Absent) {
             return false;
         }
-        *custody = NativeRootExitCustody::Pending(status);
+        *custody = NativeRootExitCustody::Pending { owner, status };
         true
     }
 
-    /// Whether an idle-vCPU root exit waits for a host member to take it.
-    pub fn native_root_exit_pending(&self) -> bool {
+    /// Whether an idle-vCPU root exit waits for exactly `thread` to take it.
+    /// Any other member of this task (and any task sharing its MM) sees none.
+    pub fn native_root_exit_pending_for(&self, thread: ThreadKey) -> bool {
         let custody = *self.native_root_exit.lock();
-        matches!(custody, NativeRootExitCustody::Pending(_))
+        matches!(custody, NativeRootExitCustody::Pending { owner, .. } if owner == thread)
     }
 
-    /// Take the pending idle-vCPU root exit; exactly one host member receives
-    /// it and owns the process terminal.
-    pub fn take_native_root_exit(&self) -> Option<carrick_sched_core::process::TerminationStatus> {
+    /// Take the pending idle-vCPU root exit when `thread` is its exact owner;
+    /// that one host member owns the process terminal.
+    pub fn take_native_root_exit_for(
+        &self,
+        thread: ThreadKey,
+    ) -> Option<carrick_sched_core::process::TerminationStatus> {
         let mut custody = self.native_root_exit.lock();
         match *custody {
-            NativeRootExitCustody::Pending(status) => {
+            NativeRootExitCustody::Pending { owner, status } if owner == thread => {
                 *custody = NativeRootExitCustody::Taken;
                 Some(status)
             }
-            NativeRootExitCustody::Absent | NativeRootExitCustody::Taken => None,
+            NativeRootExitCustody::Pending { .. }
+            | NativeRootExitCustody::Absent
+            | NativeRootExitCustody::Taken => None,
         }
     }
 

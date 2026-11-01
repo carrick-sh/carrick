@@ -650,44 +650,58 @@ pub(crate) enum GuestIdleExit {
     Unsupported,
 }
 
-/// A root exit received on an idle vCPU, whose slot no longer names the
-/// exiting address space. The crossing abandoned EL1's stack, so EL1 never
-/// left the space it had installed there; [`Self::retire_slot_space`] is the
-/// only constructor and retires it, so no executor can hand this terminal to
-/// a member (which then installs the same MM on this slot) while the slot
-/// still records that MM with no host owner.
+/// A root exit received on an idle vCPU, settled for handoff to its owner.
+///
+/// The crossing abandoned EL1's stack on the vCPU, so EL1 never ran its own
+/// `leave_space` (switch to the maintenance root, then release the slot's
+/// address space). [`Self::settle`] is the only constructor and does both,
+/// in that order, after proving the slot holds no switched record (#890).
+/// No executor can therefore hand this terminal to its owner (which then
+/// installs the same MM on this slot) while the slot still records that MM
+/// with no host owner, or while the vCPU's TTBR0 still names its tables.
 #[derive(Debug)]
 pub(crate) struct IdleRootExit {
     status: carrick_sched_core::process::TerminationStatus,
-    mm: carrick_core_abi::EntryMmKey,
+    binding: carrick_core_abi::ExecutionBinding,
+    _settled: SettledIdleSlot,
 }
 
 impl IdleRootExit {
     /// The host, with `slot`'s vCPU out of the guest after the crossing.
-    pub(crate) fn retire_slot_space(
-        zone: &carrick_el1_abi::ZoneTables,
+    /// `leave_root` switches the vCPU to the carrier's maintenance root; it
+    /// runs before the occupancy word is retired, so nothing can retire and
+    /// free the exiting tables while the vCPU still points at them.
+    pub(crate) fn settle(
         slot: carrick_el1_abi::SlotId,
         status: carrick_sched_core::process::TerminationStatus,
-        mm: carrick_core_abi::EntryMmKey,
+        binding: carrick_core_abi::ExecutionBinding,
+        leave_root: impl FnOnce() -> Result<(), TrapError>,
     ) -> Result<Self, TrapError> {
-        let space = carrick_sched_core::AddressSpaceKey::from_raw(mm.raw())
-            .ok_or_else(|| TrapError::Hypervisor("root exit names no address space".into()))?;
-        zone.retire_exited_space(slot, space).map_err(|foreign| {
+        let settled = SettledIdleSlot::admit(Some(slot)).map_err(|retained| {
             TrapError::Hypervisor(format!(
-                "root exit of mm {} on slot {slot:?} found address space {} installed",
-                mm.raw(),
-                foreign.running
+                "root exit left a switched record on its idle slot: {retained:?}"
             ))
         })?;
-        Ok(Self { status, mm })
+        let space = binding
+            .mm
+            .address_space()
+            .ok_or_else(|| TrapError::Hypervisor("root exit names no address space".into()))?;
+        leave_root()?;
+        carrick_kernel::kernel::retire_exited_zone_space(slot, space)
+            .map_err(|refusal| TrapError::Hypervisor(format!("root exit: {refusal}")))?;
+        Ok(Self {
+            status,
+            binding,
+            _settled: settled,
+        })
     }
 
     pub(crate) fn status(&self) -> carrick_sched_core::process::TerminationStatus {
         self.status
     }
 
-    pub(crate) fn mm(&self) -> carrick_core_abi::EntryMmKey {
-        self.mm
+    pub(crate) fn binding(&self) -> carrick_core_abi::ExecutionBinding {
+        self.binding
     }
 }
 
@@ -1670,9 +1684,14 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             }
             // A native-owned record ran at EL0 from the zone and its owner
             // ended the process here. The crossing never re-enters this guest
-            // stack; the slot holds no record for the next idle entry.
-            carrick_aarch64::Aarch64Exit::NativeRootExit { status, mm } => Ok(
-                GuestIdleExit::RootExit(IdleRootExit::retire_slot_space(zone, slot, status, mm)?),
+            // stack; `IdleRootExit::settle` proves the slot settled and does
+            // the root switch and space release EL1 no longer can.
+            carrick_aarch64::Aarch64Exit::NativeRootExit { status, binding } => Ok(
+                GuestIdleExit::RootExit(IdleRootExit::settle(slot, status, binding, || {
+                    carrick_vmm_hvf::hvf_aarch64_engine::retire_idle_root_exit_vcpu_root(
+                        lifecycle, vcpu,
+                    )
+                })?),
             ),
             other => {
                 let held = zone.slot(slot).current().map(|record| {

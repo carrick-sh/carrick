@@ -493,8 +493,22 @@ type NativeTerminalIdleEntry = Box<dyn FnOnce() -> Result<(), TrapError> + Send>
 /// An authenticated root exit status and its exiting MM.
 type IdleRootExit = (
     carrick_sched_core::process::TerminationStatus,
-    carrick_core_abi::EntryMmKey,
+    carrick_core_abi::ExecutionBinding,
 );
+
+/// The authenticated execution EL1 publishes for `context`'s thread
+/// (`publish_identity`: task key = tid, thread generation = serial).
+fn exit_binding(context: &KernelContext) -> carrick_core_abi::ExecutionBinding {
+    let key = context.thread().key();
+    carrick_core_abi::ExecutionBinding {
+        task: carrick_core_abi::EntryTaskKey::from_raw(
+            carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+        ),
+        generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+        mm: context.shared().mm().id().entry_key(),
+        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(key.serial.raw()),
+    }
+}
 
 #[derive(Clone, Default)]
 struct FakeFactory {
@@ -1015,7 +1029,7 @@ impl PersistentExecutor for FakeExecutor {
     }
 
     fn wait_in_guest(&mut self) -> Result<super::GuestIdleExit, TrapError> {
-        if let Some((status, mm)) = self
+        if let Some((status, binding)) = self
             .factory
             .idle_root_exit
             .as_ref()
@@ -1023,14 +1037,17 @@ impl PersistentExecutor for FakeExecutor {
         {
             // The production constructor: the crossing's slot gives up the
             // exiting space EL1 left installed on it.
-            let (Some(slot), Some(zone)) = (self.idle_slot, carrick_el1_abi::zone_tables()) else {
+            let Some(slot) = self.idle_slot else {
                 return Err(TrapError::Hypervisor(
                     "an idle root exit crosses on a zone slot".to_owned(),
                 ));
             };
-            return Ok(super::GuestIdleExit::RootExit(
-                super::IdleRootExit::retire_slot_space(zone, slot, status, mm)?,
-            ));
+            return Ok(super::GuestIdleExit::RootExit(super::IdleRootExit::settle(
+                slot,
+                status,
+                binding,
+                || Ok(()),
+            )?));
         }
         if let Some(entry) = self
             .factory
@@ -1932,6 +1949,27 @@ fn process_child(
         .expect("publish process child")
         .start_child()
         .expect("start process child")
+        .into_parts()
+        .0
+}
+
+/// A `CLONE_VM | CLONE_VFORK` child: another process sharing `parent`'s MM.
+fn vfork_child(kernel: &Arc<Kernel>, parent: &KernelContext, host_tid: i32) -> KernelContext {
+    kernel
+        .reserve_fork(
+            parent,
+            ClonePlan::from_flags(LinuxCloneFlags::VFORK | LinuxCloneFlags::VM)
+                .expect("vfork plan"),
+            "vfork-root-exit".to_owned(),
+            None,
+        )
+        .expect("reserve vfork child")
+        .prepare_reference(ThreadId::synthetic_for_tests(host_tid))
+        .expect("prepare vfork child")
+        .commit()
+        .expect("publish vfork child")
+        .start_child()
+        .expect("start vfork child")
         .into_parts()
         .0
 }
@@ -8856,15 +8894,19 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
 /// cross on an executor waiting in the guest scheduler, with no host task
 /// loaded there and the exiting address space still installed on its slot
 /// (the crossing abandons EL1's stack, so EL1 never leaves that space). That
-/// executor must hand the terminal to the exiting process's parked host
-/// member and keep serving; dying left the member parked and the run's
-/// result waiter unpublished forever (the
+/// executor must hand the terminal to the exiting thread's parked host
+/// thread and keep serving; dying left it parked and the run's result
+/// waiter unpublished forever (the
 /// `el1_thread_lifecycle_mask_storm_exactly_once` hang under #1044). The
-/// member then installs the same MM on that same slot to run the terminal:
+/// owner then installs the same MM on that same slot to run the terminal:
 /// a slot that still recorded the space with no host owner refused it
 /// (`SlotWordWithoutOwner`, a `kernel::terminal_settlement` fatal).
+///
+/// Two live processes share that MM: a vfork child before exec. The
+/// terminal is the exiting thread's process's alone; selecting by MM handed
+/// the child the parent's status (a second process terminal) and woke it.
 #[test]
-fn serial_host_idle_vcpu_root_exit_hands_its_slot_and_terminal_to_the_member() {
+fn serial_host_idle_vcpu_root_exit_hands_its_slot_and_terminal_to_the_exact_owner() {
     struct Region(Box<carrick_test_support::TestEl1Region>);
     impl Drop for Region {
         fn drop(&mut self) {
@@ -8878,13 +8920,25 @@ fn serial_host_idle_vcpu_root_exit_hands_its_slot_and_terminal_to_the_member() {
     let zone = carrick_el1_abi::zone_tables().unwrap();
     let (kernel, root) = bootstrap(19_795);
     root.thread().set_affinity(CpuAffinity::all(1));
+    let child = vfork_child(&kernel, &root, 19_798);
+    child.thread().set_affinity(CpuAffinity::all(1));
+    assert_eq!(
+        child.shared().mm().id(),
+        root.shared().mm().id(),
+        "the vfork child shares the exiting MM"
+    );
+    assert_ne!(child.task().key(), root.task().key());
     let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let kick = WorkerKick::new(Arc::new(ReceiptLog::default()));
     let idle = scheduler
         .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
         .unwrap();
-    let _authority = enqueue_root(&scheduler, &root, publish(&root, 1095));
-    // The member parks on the host: its zone record runs on in the guest.
+    // Both processes park on the host.
+    let _root_authority = enqueue_root(&scheduler, &root, publish(&root, 1095));
+    scheduler
+        .settle_blocked(scheduler.take(&idle).unwrap(), BlockedReason::HostWait)
+        .unwrap();
+    let _child_authority = enqueue_root(&scheduler, &child, publish(&child, 1098));
     scheduler
         .settle_blocked(scheduler.take(&idle).unwrap(), BlockedReason::HostWait)
         .unwrap();
@@ -8892,15 +8946,19 @@ fn serial_host_idle_vcpu_root_exit_hands_its_slot_and_terminal_to_the_member() {
     zone.drive(slot, 1);
     zone.publish_slot(slot, 0, Some(0), 0);
     let mm_id = root.shared().mm().id();
-    let space = carrick_sched_core::AddressSpaceKey::from_raw(mm_id.raw()).unwrap();
     // EL1 installed the exiting space on the idle vCPU, then crossed.
     zone.occupancy
-        .install(carrick_sched_core::ExecutionSlot::zone(slot), space)
+        .install(
+            carrick_sched_core::ExecutionSlot::zone(slot),
+            mm_id.address_space(),
+        )
         .unwrap();
     let status = carrick_sched_core::process::TerminationStatus::signaled(11, true);
-    let mm = carrick_core_abi::EntryMmKey::from_raw(mm_id.raw());
     let factory = FakeFactory {
-        idle_root_exit: Some(Arc::new(parking_lot::Mutex::new(Some((status, mm))))),
+        idle_root_exit: Some(Arc::new(parking_lot::Mutex::new(Some((
+            status,
+            exit_binding(&root),
+        ))))),
         ..FakeFactory::default()
     };
     let mut backend = factory.create(&idle).unwrap();
@@ -8909,16 +8967,24 @@ fn serial_host_idle_vcpu_root_exit_hands_its_slot_and_terminal_to_the_member() {
         let next = super::next_runnable(&scheduler, &mut backend, &idle, &kick);
         assert!(
             matches!(next, Ok(None)),
-            "the idle executor survives the crossing and keeps serving"
+            "the idle executor survives the crossing and keeps serving: {:?}",
+            next.as_ref().err().map(|_| "fatal")
         );
         assert!(
             matches!(
                 root.thread().execution_state(),
                 ThreadExecutionState::Runnable { .. }
             ),
-            "the parked member is woken to take its terminal"
+            "the exiting thread is woken to take its terminal"
         );
-        // The member's terminal quantum installs its MM on this same slot.
+        assert!(
+            matches!(
+                child.thread().execution_state(),
+                ThreadExecutionState::Blocked { .. }
+            ),
+            "the vfork child sharing the MM is not woken"
+        );
+        // The owner's terminal quantum installs its MM on this same slot.
         let registry: Arc<dyn carrick_hal::VcpuRegistry> =
             Arc::new(carrick_hal::GenericVcpuRegistry::new());
         let occupancy = carrick_kernel::kernel::MmOccupancy::install_registered_for_test(
@@ -8940,15 +9006,27 @@ fn serial_host_idle_vcpu_root_exit_hands_its_slot_and_terminal_to_the_member() {
             "the crossing's slot no longer names the exiting space"
         );
     });
+    let child_key = child.thread().key();
+    assert!(
+        !child.task().native_root_exit_pending_for(child_key),
+        "the vfork child's process owes no terminal"
+    );
+    assert_eq!(child.task().take_native_root_exit_for(child_key), None);
     assert_eq!(
-        root.task().take_native_root_exit(),
+        root.task().take_native_root_exit_for(child_key),
+        None,
+        "only the exact exiting thread takes the terminal"
+    );
+    let root_key = root.thread().key();
+    assert_eq!(
+        root.task().take_native_root_exit_for(root_key),
         Some(status),
-        "the member's task carries the authenticated status"
+        "the exiting thread's task carries the authenticated status"
     );
     assert_eq!(
-        root.task().take_native_root_exit(),
+        root.task().take_native_root_exit_for(root_key),
         None,
-        "exactly one member owns the process terminal"
+        "the process crosses its terminal once"
     );
 }
 
@@ -9040,15 +9118,49 @@ fn serial_host_root_exit_member_loads_without_its_retired_zone_residency() {
     zone.free_record(id);
     assert!(zone.live(record).is_none());
     assert!(member.exact_thread_is_live());
+    // A second thread of the same task, parked with its own live zone
+    // residency, is woken too (as a terminal drain would): it is not the
+    // owner, so its residency is never cleared and it never takes the exit.
+    let other = sibling(&kernel, &root, 19_799);
+    let other_authority = enqueue_root(&scheduler, &other, publish(&other, 29));
+    let other_running = scheduler
+        .take(
+            &scheduler
+                .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(other_running.thread_key(), other.thread().key());
+    scheduler
+        .settle_blocked(other_running, BlockedReason::HostWait)
+        .unwrap();
+    let other_binding = FakeBinding::new(29, [Step::Exit]);
+    other_binding.set_cpu_residency(super::residency::TaskCpuResidency::Zone {
+        base: test_guest_cpu_state(29),
+        record,
+        origin: super::residency::ZoneResumeOrigin::GuestRecord,
+    });
+    factory.install(&other, other_binding.clone());
     let status = carrick_sched_core::process::TerminationStatus::exited(3);
-    assert!(member.task().publish_native_root_exit(status));
+    assert_eq!(
+        kernel.publish_idle_root_exit(exit_binding(&member), status),
+        Ok(key)
+    );
+    let other_key = other.thread().key();
+    assert!(!member.task().native_root_exit_pending_for(other_key));
     scheduler.wake_control(key).unwrap();
+    scheduler.wake_control(other_key).unwrap();
     let pool = start_pool(scheduler, Arc::clone(&factory), 1);
     let entered = entered_rx.recv_timeout(Duration::from_secs(5));
     let _ = resume_tx.send(());
-    drop(authority);
+    drop((authority, other_authority));
     let report = pool.shutdown();
     assert!(entered.is_ok(), "the woken member reaches its load");
+    assert!(
+        other_binding.cpu_residency().is_some(),
+        "a thread that is not the owner keeps its zone residency"
+    );
+    assert_eq!(member.task().take_native_root_exit_for(other_key), None);
     let ran = factory.events.lock().iter().any(|event| {
         event.kind == BackendEventKind::Run && event.task.is_some_and(|(t, _)| t == key)
     });
@@ -9058,7 +9170,7 @@ fn serial_host_root_exit_member_loads_without_its_retired_zone_residency() {
     );
     report.expect("the member's terminal leaves a clean pool shutdown");
     assert!(
-        member.task().native_root_exit_pending(),
+        member.task().native_root_exit_pending_for(key),
         "the fake binding does not consume the status; production takes it at loop top"
     );
 }
