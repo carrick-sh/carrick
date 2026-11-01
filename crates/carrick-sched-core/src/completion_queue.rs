@@ -27,6 +27,18 @@ impl CompletionQueue {
             Err(value) => value == 2,
         }
     }
+    /// Finish this bounded, nonblocking publication under the caller's
+    /// short-section wait policy, without mistaking contention for capacity.
+    pub fn initialize_with_wait(&self, mut wait: impl FnMut(u32) -> bool) -> bool {
+        let mut attempt = 0_u32;
+        while !self.initialize() {
+            if !wait(attempt) {
+                return false;
+            }
+            attempt = attempt.saturating_add(1);
+        }
+        true
+    }
     /// Caller owns this entire chain; its tail link is zero. Links remain
     /// alive until pop transfers each member to the unique consumer.
     pub fn push(&self, head: u32, tail: u32, link: impl FnOnce(u32, u32)) {
@@ -128,5 +140,31 @@ mod tests {
         assert_eq!(pop(), Some(1));
         assert_eq!(pop(), Some(2));
         assert_eq!(pop(), None);
+    }
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::*;
+    #[test]
+    fn busy_initializer_finishes_through_the_supplied_wait_policy() {
+        // The first initializer has written its three cells and is paused
+        // immediately before its release publication.
+        let queue = CompletionQueue {
+            initialized: AtomicU32::new(1),
+            head: AtomicU32::new(STUB),
+            tail: AtomicU32::new(STUB),
+            stub_next: AtomicU32::new(0),
+        };
+        assert!(!queue.initialize_with_wait(|_| false));
+        let mut waits = 0;
+        assert!(queue.initialize_with_wait(|attempt| {
+            assert_eq!(attempt, 0);
+            waits += 1;
+            queue.initialized.store(2, Ordering::Release);
+            true
+        }));
+        assert_eq!(waits, 1);
+        assert!(queue.initialize());
     }
 }

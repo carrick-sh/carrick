@@ -151,6 +151,20 @@ impl<
         });
         super::native_run_failure::complete_native_run_failure(binding, reason)
     }
+    fn prepare_thread_birth(&mut self) -> ThreadBirthAdmission {
+        let admission = self
+            .process_venue()
+            .map_or(ThreadBirthAdmission::Unmanaged, |venue| {
+                venue.prepare_thread_birth()
+            });
+        match admission {
+            ThreadBirthAdmission::Owned(mut outcome) => {
+                self.run_ready_after_native_transfer(&mut outcome);
+                ThreadBirthAdmission::Owned(outcome)
+            }
+            admission => admission,
+        }
+    }
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         if let Some(venue) = self.process_venue() {
             venue.lifecycle_admission_settled()?;
@@ -402,6 +416,41 @@ impl<
             .map(|id| zone.record_ref(id))
             .map_err(|_| carrick_sched_core::Exhausted)
     }
+    fn retain_native_birth(&mut self, record: RecordRef, control: &ThreadControlSlot) -> bool {
+        if self
+            .process_venue()
+            .is_none_or(|venue| venue.bind_thread_birth(record, control).is_err())
+        {
+            return false;
+        }
+        self.zone.as_ref().is_some_and(|zone| {
+            zone.tables.record(record.id).incarnation() == record.incarnation
+                && zone.tables.mark_native_owned(record.id)
+        })
+    }
+    fn release_native_birth(&mut self, record: RecordRef, control: &ThreadControlSlot) -> bool {
+        let Some(zone) = &self.zone else {
+            return false;
+        };
+        let Some(key) = carrick_sched_core::object_wait::ObjectWaitKey::native_service(record)
+        else {
+            return false;
+        };
+        if zone.tables.record(record.id).incarnation() != record.incarnation
+            || control.zone_record() != Some(record)
+        {
+            return false;
+        }
+        // This exact record has never been enqueued or executed. No request
+        // or waiter can retain either binding yet.
+        control
+            .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+            .is_ok()
+            && zone
+                .tables
+                .unbind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .is_ok()
+    }
     fn free_record(&mut self, record: RecordRef) {
         if let Some(zone) = &self.zone
             && zone.tables.record(record.id).incarnation() == record.incarnation
@@ -417,9 +466,29 @@ impl<
         if rec.incarnation() != record.incarnation {
             return;
         }
+        let caller_address = self
+            .frame
+            .slot()
+            .and_then(|slot| {
+                let lane = zone.tables.slot(slot);
+                lane.current().or_else(|| lane.host_record())
+            })
+            .filter(|&caller| caller != record.id)
+            .and_then(|caller| {
+                // SAFETY: the running/host record on this slot is exclusively
+                // owned by the current trap frame during clone preparation.
+                unsafe { (*zone.tables.record(caller).ctx_mut()).address_context() }
+            })
+            .filter(|address| address.mm.raw().get() == rec.identity().mm);
         let record = rec;
         // SAFETY: this exact new record is unpublished and exclusively owned by this birth.
         let ctx = unsafe { record.ctx_mut() };
+        *ctx = match caller_address {
+            Some(address) => {
+                Aarch64ParkedContext::from_parts(carrick_sched_core::ThreadCtx::ZERO, address)
+            }
+            None => Aarch64ParkedContext::ZERO,
+        };
         let Some(frame) = self.frame.arm_frame() else {
             super::dispatch::invalid_completion(
                 super::dispatch::NativeInvariant::MissingNativeFrame,

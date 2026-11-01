@@ -561,6 +561,7 @@ pub struct ThreadControlSlot {
     // publishing this control to EL1. Never dereference the other venue's VA.
     affinity_host_alias: AtomicU64,
     affinity_guest_alias: AtomicU64,
+    release_waiter: carrick_core::lifecycle::MemberReleaseWaiter,
     /// Exact native service custody survives execution-slot reuse.
     pub service: carrick_core_abi::service::ServiceCell,
 }
@@ -673,6 +674,7 @@ impl ThreadControlSlot {
             affinity: carrick_core::affinity::AffinityAuthority::new(),
             affinity_host_alias: AtomicU64::new(0),
             affinity_guest_alias: AtomicU64::new(0),
+            release_waiter: carrick_core::lifecycle::MemberReleaseWaiter::new(),
             visible_tid: AtomicU32::new(0),
             fault_address: AtomicU64::new(0),
             fault_code: AtomicU32::new(0),
@@ -1135,6 +1137,10 @@ impl carrick_core::lifecycle::MemberControl for ThreadControlSlot {
     fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
         ThreadControlSlot::host_retirement(self)
     }
+
+    fn release_waiter(&self) -> Option<&carrick_core::lifecycle::MemberReleaseWaiter> {
+        Some(&self.release_waiter)
+    }
 }
 impl Default for ThreadControlSlot {
     fn default() -> Self {
@@ -1569,7 +1575,13 @@ impl LifecycleHatches {
             | (if self.sigmask { SERVING_SIGMASK } else { 0 })
     }
 }
-const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 384);
+// 448, not 384: the synchronous-fault fields (`fault_address`, `fault_code`,
+// `fault_signal`) and the member `release_waiter` took the last padding before
+// the 64-aligned `ServiceCell`, which therefore moved from 256 to 320 (#1100).
+// Loan sizes and `EL1_ABI_LAYOUT_HASH` derive from this layout.
+const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 448);
+const _: () = assert!(core::mem::align_of::<carrick_core_abi::service::ServiceCell>() == 64);
+const _: () = assert!(core::mem::offset_of!(ThreadControlSlot, service) == 320);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
 
 /// Linux keeps the last thread's exit with the terminal runtime owner.
@@ -2024,11 +2036,23 @@ impl ThreadLifecyclePage {
         index: usize,
         identity: EntryIdentity,
     ) -> Result<EntryRef, TransitionError> {
+        self.stock_with_control(index, identity, None)
+    }
+    /// Publish identity and its retained control address as one stock entry.
+    pub fn stock_with_control(
+        &self,
+        index: usize,
+        identity: EntryIdentity,
+        control: Option<carrick_guest_arch::KernelVa>,
+    ) -> Result<EntryRef, TransitionError> {
         let e = self.entry(index)?;
         let reference = self.reserve_stock(index)?;
         let next = reference.generation();
         e.tid.store(identity.tid, Ordering::Relaxed);
-        self.controls[index].store(0, Ordering::Relaxed);
+        self.controls[index].store(
+            control.map_or(0, |address| address.raw()),
+            Ordering::Relaxed,
+        );
         e.visible_tid.store(identity.visible_tid, Ordering::Relaxed);
         e.thread_serial
             .store(identity.thread_serial, Ordering::Relaxed);
@@ -3201,7 +3225,7 @@ mod layout_manifest {
                 size_of::<ThreadControlSlot>(),
                 align_of::<ThreadControlSlot>()
             ),
-            (384, 64)
+            (448, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
@@ -3238,6 +3262,7 @@ mod layout_manifest {
                      affinity: _,
                      affinity_host_alias: _,
                      affinity_guest_alias: _,
+                     release_waiter: _,
                      service: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
@@ -3324,9 +3349,17 @@ mod layout_manifest {
         );
         field!(
             ThreadControlSlot,
+            release_waiter,
+            carrick_core::lifecycle::MemberReleaseWaiter,
+            256,
+            16,
+            8
+        );
+        field!(
+            ThreadControlSlot,
             service,
             carrick_core_abi::service::ServiceCell,
-            256,
+            320,
             128,
             64
         );
