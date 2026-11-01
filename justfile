@@ -474,6 +474,17 @@ _test-loom-b *ARGS:
 test-kernel-semantics *ARGS:
     {{_admit}} {{_cargo}} test -p carrick-kernel-example --tests {{ARGS}}
 
+# carrick-el1-linux's native-process tests (template, IPC wake, poll) are
+# gated off macOS, which refuses their EL1 metadata window, and the macOS
+# unit shards were the only ones running this crate, so they never ran.
+# `kernel-runtime.yml`'s `el1-native-tests` runs them natively on Linux
+# aarch64 through `xtask accept --profile el1-native` and receipts the
+# result; `el1-native-gate` fails on NEW failures against the receipted
+# main ancestor (#1297).
+test-el1-native *ARGS:
+    {{_admit}} {{_cargo}} test -p carrick-el1-linux --lib {{ARGS}} -- --skip serial_host
+    RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-el1-linux --lib {{ARGS}} -- serial_host
+
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test-mm-owner *ARGS:
     {{_admit}} {{_cargo}} test --locked -p carrick-core -p carrick-core-abi --lib

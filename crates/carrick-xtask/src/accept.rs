@@ -63,6 +63,9 @@ pub enum AcceptProfile {
     LinuxPortable,
     /// The trusted KVM runner's lane: every kvm-lane test target, nothing else.
     Kvm,
+    /// The Linux aarch64 lane: `carrick-el1-linux`'s native-process tests,
+    /// which macOS can't run (#1297).
+    El1Native,
     Full,
 }
 
@@ -72,6 +75,7 @@ impl fmt::Display for AcceptProfile {
             Self::NoDocker => write!(f, "no-docker"),
             Self::LinuxPortable => write!(f, "linux-portable"),
             Self::Kvm => write!(f, "kvm"),
+            Self::El1Native => write!(f, "el1-native"),
             Self::Full => write!(f, "full"),
         }
     }
@@ -266,6 +270,14 @@ pub const KVM_STEPS: &[StepSpec] = &[StepSpec {
     log_name: "01-kvm-tests.log",
 }];
 
+pub const EL1_NATIVE_STEPS: &[StepSpec] = &[StepSpec {
+    name: "el1-native-tests",
+    program: "just",
+    args: &["test-el1-native"],
+    env: &[],
+    log_name: "01-el1-native-tests.log",
+}];
+
 // Keep the package/target selection identical for both ownership passes.
 macro_rules! linux_portable_test_args {
     ($($harness_arg:literal),+ $(,)?) => {
@@ -416,6 +428,7 @@ pub fn host_steps(profile: AcceptProfile) -> &'static [StepSpec] {
     match profile {
         AcceptProfile::LinuxPortable => LINUX_PORTABLE_STEPS,
         AcceptProfile::Kvm => KVM_STEPS,
+        AcceptProfile::El1Native => EL1_NATIVE_STEPS,
         AcceptProfile::NoDocker | AcceptProfile::Full => HOST_STEPS,
     }
 }
@@ -424,7 +437,10 @@ pub fn profile_phase(
     profile: AcceptProfile,
     phase: AcceptPhase,
 ) -> Result<AcceptPhase, AcceptError> {
-    if matches!(profile, AcceptProfile::LinuxPortable | AcceptProfile::Kvm) {
+    if matches!(
+        profile,
+        AcceptProfile::LinuxPortable | AcceptProfile::Kvm | AcceptProfile::El1Native
+    ) {
         if phase == AcceptPhase::Signed {
             return Err(AcceptError::UnsupportedPlatform(format!(
                 "{profile} supports the host phase only; use remote-accept --phase signed on the gate Mac"
@@ -2189,6 +2205,26 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1297: the el1-native profile runs only the native-process tests and
+    /// is host-only, like the kvm profile.
+    #[test]
+    fn el1_native_profile_runs_only_the_native_tests_on_the_host_phase() {
+        use clap::ValueEnum as _;
+        let profile = AcceptProfile::from_str("el1-native", false).unwrap();
+        assert_eq!(profile.to_string(), "el1-native");
+        let steps = host_steps(profile);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            (steps[0].program, steps[0].args),
+            ("just", &["test-el1-native"][..])
+        );
+        assert_eq!(
+            profile_phase(profile, AcceptPhase::Host).unwrap(),
+            AcceptPhase::Host
+        );
+        assert!(profile_phase(profile, AcceptPhase::Signed).is_err());
+    }
 
     #[test]
     fn acceptance_child_cannot_inherit_a_target_override() {

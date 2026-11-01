@@ -801,7 +801,14 @@ fn one_always_job_requires_both_trusted_hardware_lanes() {
         .iter()
         .map(|n| n.as_str().unwrap())
         .collect();
-    for job in ["hvf-kernel", "kvm-tests-willow", "hvf-gate", "kvm-gate"] {
+    for job in [
+        "hvf-kernel",
+        "kvm-tests-willow",
+        "hvf-gate",
+        "kvm-gate",
+        "el1-native-tests",
+        "el1-native-gate",
+    ] {
         assert!(needs.contains(&job), "{job}");
     }
     let script = trusted_hardware_decision(&docs[0]["jobs"])["run"]
@@ -811,6 +818,8 @@ fn one_always_job_requires_both_trusted_hardware_lanes() {
     assert!(script.contains("test \"$KVM\" = success"));
     assert!(script.contains("test \"$HVF_GATE\" = success"));
     assert!(script.contains("test \"$KVM_GATE\" = success"));
+    assert!(script.contains("test \"$EL1N\" = success"));
+    assert!(script.contains("test \"$EL1N_GATE\" = success"));
     // No step interpolates the merge-group base SHA into a shell script.
     for job in docs[0]["jobs"].as_hash().unwrap().values() {
         for step in job["steps"].as_vec().into_iter().flatten() {
@@ -861,7 +870,7 @@ fn hardware_lanes_never_wait_and_hosted_gates_grade_with_receipted_baseline_code
     };
     // A lane job waiting on a base receipt would hold the single runner the
     // base entry's job needs (queue deadlock).
-    for lane in ["hvf-kernel", "kvm-tests-willow"] {
+    for lane in ["hvf-kernel", "kvm-tests-willow", "el1-native-tests"] {
         assert!(
             runs(lane).iter().all(|r| !r.contains("ci-receipt gate")),
             "{lane} must only produce and upload its receipt"
@@ -870,6 +879,7 @@ fn hardware_lanes_never_wait_and_hosted_gates_grade_with_receipted_baseline_code
     for (gate, lane, name) in [
         ("hvf-gate", "hvf-kernel", "receipt-hvf-"),
         ("kvm-gate", "kvm-tests-willow", "receipt-kvm-"),
+        ("el1-native-gate", "el1-native-tests", "receipt-el1-native-"),
     ] {
         let job = &jobs[gate];
         assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));
@@ -1104,6 +1114,10 @@ fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
             .env("KVM", kvm)
             .env("HVF_GATE", hvf_gate)
             .env("KVM_GATE", kvm_gate)
+            // The el1-native lane and its gate follow the KVM pair here;
+            // their own red cases follow the table.
+            .env("EL1N", "success")
+            .env("EL1N_GATE", kvm_gate)
             .env("SUPERSEDED", if superseded { "true" } else { "false" })
             .env("KVM_BACKEND", "willow")
             .output()
@@ -1112,6 +1126,30 @@ fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
             output.status.success(),
             expected,
             "{event}: hvf={hvf} kvm={kvm} hvf-gate={hvf_gate} kvm-gate={kvm_gate} superseded={superseded}"
+        );
+    }
+    // A red el1-native lane, or a red el1-native gate on push, is red.
+    for (event, el1n, el1n_gate, gate) in [
+        ("push", "failure", "skipped", "success"),
+        ("workflow_dispatch", "failure", "skipped", "skipped"),
+        ("push", "success", "failure", "success"),
+    ] {
+        let output = std::process::Command::new("bash")
+            .args(["-e", "-c", script])
+            .env("EVENT", event)
+            .env("HVF", "success")
+            .env("KVM", "success")
+            .env("HVF_GATE", gate)
+            .env("KVM_GATE", gate)
+            .env("EL1N", el1n)
+            .env("EL1N_GATE", el1n_gate)
+            .env("SUPERSEDED", "false")
+            .env("KVM_BACKEND", "willow")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{event}: el1-native={el1n} el1-native-gate={el1n_gate}"
         );
     }
 }

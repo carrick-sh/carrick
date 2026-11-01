@@ -486,6 +486,61 @@ jobs:
           path: target/el1-gate/
           if-no-files-found: ignore
 
+  # carrick-el1-linux's native-process tests are `not(target_os = "macos")`
+  # (macOS refuses their EL1 metadata window), so no macOS shard runs them
+  # (#1297). This hosted Linux aarch64 lane receipts them per SHA; the
+  # `el1-native-gate` job compares against the receipted main ancestor.
+  el1-native-tests:
+    name: EL1 · native-process tests (Linux ARM64)
+    if: >-
+      ${{ !cancelled() &&
+          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      # Hosted and discarded with the job: no per-user cache server to share.
+      CARRICK_SCCACHE: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      # `xtask accept --profile el1-native` runs `just test-el1-native` and
+      # records every failing `<test-binary>::<test>` in the receipt.
+      - name: EL1 native-process receipt
+        run: |
+          set -euo pipefail
+          rm -rf target/ci-receipts target/el1-gate
+          mkdir -p target/ci-receipts
+          status=0
+          just accept --profile el1-native --receipt target/ci-receipts/receipt.json || status=$?
+          echo "xtask accept exited $status"
+          test -s target/ci-receipts/receipt.json
+
+      - name: Upload per-SHA receipt
+        if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: receipt-el1-native-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/ci-receipts/receipt.json
+          if-no-files-found: error
+
+      - name: Upload step logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: el1-native-logs-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/el1-gate/
+          if-no-files-found: ignore
+
   # The selector is built from trusted event.before, then the comparison is
   # built from the selected receipted ancestor in its own clean checkout.
   # Reuse the selector build when before itself supplies the baseline.
@@ -667,6 +722,93 @@ jobs:
           --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
           --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 0
 
+  el1-native-gate:
+    name: EL1 native · receipt gate vs receipted main ancestor
+    permissions:
+      contents: read
+      actions: read
+    needs: [el1-native-tests]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.el1-native-tests.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Reject an invalid push before checkout
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ || "$BEFORE_SHA" =~ ^0{40}$ ]]; then
+            echo "::error title=Invalid push history::Missing, zero or malformed event.before; refusing to execute repository code"
+            printf '## Invalid push history\n\nMissing, zero or malformed event.before; no comparison was made.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Check out the trusted pre-push commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.before }}
+          path: selector
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: gate-xtask-release
+          workspaces: selector -> target
+          cache-workspace-crates: "true"
+          save-if: false
+      - name: Build the trusted selector (owner seeding required at rollout)
+        working-directory: selector
+        run: |
+          cargo build --locked --release -p carrick-xtask
+          target/release/carrick-xtask ci-receipt --help > "$RUNNER_TEMP/receipt-help"
+          if ! grep -q select-baseline "$RUNNER_TEMP/receipt-help"; then
+            echo "::error title=Baseline selector unavailable::The trusted pre-push commit predates the selector. Seed current main with an owner dispatch; subsequent pushes can compare."
+            printf '## Baseline selector unavailable\n\nTrusted event.before predates select-baseline. Seed current main with an owner dispatch for subsequent pushes. No comparison was made.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Select the nearest trusted receipt baseline
+        id: baseline
+        working-directory: selector
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: >-
+          target/release/carrick-xtask ci-receipt select-baseline --lane el1-native
+          --before-sha "$BEFORE_SHA" --candidate-sha "$GITHUB_SHA"
+          --wait-minutes 90 --poll-seconds 60
+      - name: Check out the selected baseline cleanly
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.baseline.outputs.sha }}
+          path: baseline
+          clean: true
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        with:
+          shared-key: gate-xtask-release
+          workspaces: baseline -> target
+          cache-workspace-crates: "true"
+          save-if: false
+      - name: Build the selected baseline xtask with its own lockfile
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        working-directory: baseline
+        run: cargo build --locked --release -p carrick-xtask
+      - name: Download candidate receipt data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: receipt-el1-native-${{ github.sha }}-*
+          path: ${{ runner.temp }}/candidate
+      - name: Compare using the selected baseline's code
+        working-directory: ${{ steps.baseline.outputs.reuse == 'true' && 'selector' || 'baseline' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.baseline.outputs.sha }}
+        run: >-
+          target/release/carrick-xtask ci-receipt gate --lane el1-native
+          --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
+          --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 0
+
   gate-xtask-cache:
     name: Warm the receipt-gate xtask cache
     if: github.event_name == 'push'
@@ -689,7 +831,7 @@ jobs:
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
-    needs: [signed-fixtures, hvf-kernel, kvm-tests-willow, hvf-gate, kvm-gate]
+    needs: [signed-fixtures, hvf-kernel, kvm-tests-willow, hvf-gate, kvm-gate, el1-native-tests, el1-native-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -727,20 +869,25 @@ jobs:
           KVM: ${{ needs.kvm-tests-willow.result }}
           HVF_GATE: ${{ needs.hvf-gate.result }}
           KVM_GATE: ${{ needs.kvm-gate.result }}
+          EL1N: ${{ needs.el1-native-tests.result }}
+          EL1N_GATE: ${{ needs.el1-native-gate.result }}
           EVENT: ${{ github.event_name }}
         run: |
-          echo "hvf-kernel=$HVF kvm=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE superseded=$SUPERSEDED"
+          echo "hvf-kernel=$HVF kvm=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE el1-native=$EL1N el1-native-gate=$EL1N_GATE superseded=$SUPERSEDED"
           test "$KVM" = success
+          test "$EL1N" = success
           if [ "$SUPERSEDED" = true ]; then
             # The newer push's run carries the HVF lane and its gate.
             test "$EVENT" = push
             test "$HVF" = cancelled
             test "$HVF_GATE" = skipped
             test "$KVM_GATE" = success
+            test "$EL1N_GATE" = success
             exit 0
           fi
           test "$HVF" = success
           if [ "$EVENT" = push ]; then
             test "$HVF_GATE" = success
             test "$KVM_GATE" = success
+            test "$EL1N_GATE" = success
           fi
