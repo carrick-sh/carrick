@@ -421,6 +421,20 @@ where
             }
         }
         backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
+        // The root exit retired this process's zone records, including the
+        // in-ring owner's own. A member woken to take that terminal resumes
+        // no guest state, so its retired zone residency must not be restored:
+        // that load reports the record missing and settles the member exited,
+        // and the terminal would then have no owner.
+        if running
+            .thread()
+            .task()
+            .is_some_and(|task| task.native_root_exit_pending())
+        {
+            binding
+                .clear_terminal_cpu_residency()
+                .map_err(|error| error.to_string())?;
+        }
         if let Err(error) = backend.load(&task) {
             crate::probes::hvpatch_executor_load_failure(
                 thread.serial.raw(),
@@ -1688,6 +1702,10 @@ fn next_runnable<F: PersistentExecutor>(
                         .map_err(|error| NextError::Fatal(error.to_string()))?;
                     return Ok(None);
                 }
+                GuestIdleExit::RootExit { status, mm } => {
+                    deliver_idle_root_exit(scheduler, mm, status)?;
+                    return Ok(None);
+                }
                 GuestIdleExit::Unsupported => {}
             }
         }
@@ -1718,8 +1736,49 @@ fn next_runnable<F: PersistentExecutor>(
                 .map_err(|error| NextError::Fatal(error.to_string()))?;
             Ok(None)
         }
+        GuestIdleExit::RootExit { status, mm } => {
+            deliver_idle_root_exit(scheduler, mm, status)?;
+            Ok(None)
+        }
         GuestIdleExit::Unsupported => Ok(Some(scheduler.take(registration)?)),
     }
+}
+
+/// An idle executor received the in-ring owner's root exit: it has no task
+/// binding to enter the process terminal with. Retain the status on the exact
+/// process and control-wake its host members; the first one to reach its loop
+/// top owns the terminal (`ProductionHvpatchLoopJob::poll_with_engine`). This
+/// executor keeps serving. Treating the crossing as a dead worker instead left
+/// every member parked and the run's physical-retirement waiter with no
+/// publication, forever.
+fn deliver_idle_root_exit(
+    scheduler: &Arc<Scheduler>,
+    mm: carrick_core_abi::EntryMmKey,
+    status: carrick_sched_core::process::TerminationStatus,
+) -> Result<(), NextError> {
+    let members = scheduler.kernel().publish_idle_root_exit(mm, status);
+    let mut woken = 0usize;
+    for member in &members {
+        match scheduler.wake_control(*member) {
+            Ok(_) => woken += 1,
+            // A member that already left the graph needs no terminal wake.
+            Err(carrick_kernel::kernel::SchedulerError::UnknownThread) => {}
+            Err(error) => {
+                return Err(NextError::Fatal(format!(
+                    "wake host member {member:?} for an idle-vCPU root exit: {error}"
+                )));
+            }
+        }
+    }
+    // An authenticated crossing names a live process: no member to wake is a
+    // broken invariant, never contention.
+    if woken == 0 {
+        return Err(NextError::Fatal(format!(
+            "idle-vCPU root exit {status:?} for mm {} reached no live host member",
+            mm.raw()
+        )));
+    }
+    Ok(())
 }
 
 enum ZoneProbe {

@@ -8653,8 +8653,9 @@ impl HvfInner {
                     custody,
                     vm_generation,
                 )?;
-                if let crate::metadata_grant::MetadataTrapOutcome::RootExit(status) = outcome {
-                    return Ok(Aarch64Exit::NativeRootExit(status));
+                if let crate::metadata_grant::MetadataTrapOutcome::RootExit { status, mm } = outcome
+                {
+                    return Ok(Aarch64Exit::NativeRootExit { status, mm });
                 }
                 continue;
             }

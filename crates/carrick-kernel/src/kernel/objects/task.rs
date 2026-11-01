@@ -544,6 +544,15 @@ impl DumpableMode {
     }
 }
 
+/// Custody of a root exit received on an idle vCPU ([`Task::publish_native_root_exit`]).
+/// `Taken` is terminal: the process crosses its root exit once.
+#[derive(Clone, Copy, Debug)]
+enum NativeRootExitCustody {
+    Absent,
+    Pending(carrick_sched_core::process::TerminationStatus),
+    Taken,
+}
+
 #[derive(Debug)]
 pub struct Task {
     key: TaskKey,
@@ -582,6 +591,14 @@ pub struct Task {
     /// on lanes that have none). Held here rather than in a side table so it
     /// cannot outlive the task or be looked up for a retired one.
     waker: Mutex<Option<Arc<dyn TaskWaker>>>,
+    /// The in-ring process owner's authenticated root exit, when it crossed on
+    /// a vCPU with no host task loaded (an executor waiting in the guest
+    /// scheduler). That executor has no binding to enter the process terminal
+    /// with, so it publishes the status here and control-wakes the task's host
+    /// members; the first member to reach its loop top takes it and becomes
+    /// the terminal owner, exactly as a loaded member that received the
+    /// crossing on its own vCPU does.
+    native_root_exit: Mutex<NativeRootExitCustody>,
     /// Durable counterpart to the lane wake hint. A vCPU can be between a
     /// syscall boundary and guest re-entry when the host kick fires; retaining
     /// the generation lets that same boundary reconcile the authoritative
@@ -819,6 +836,7 @@ impl Task {
             threads: Mutex::new(BTreeMap::new()),
             cpu: TaskCpu::default(),
             waker: Mutex::new(None),
+            native_root_exit: Mutex::new(NativeRootExitCustody::Absent),
             wake_generation: AtomicU64::new(0),
             task_event_generation: AtomicU64::new(0),
             wake_listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1194,6 +1212,41 @@ impl Task {
     /// to kick.
     pub fn set_waker(&self, waker: Arc<dyn TaskWaker>) {
         *self.waker.lock() = Some(waker);
+    }
+
+    /// Record the root exit an idle vCPU received for this task. The first
+    /// publication wins: the in-ring owner crosses once per process, and a
+    /// second status would be a second terminal. Returns whether this call
+    /// published (false: one is already pending or taken).
+    pub fn publish_native_root_exit(
+        &self,
+        status: carrick_sched_core::process::TerminationStatus,
+    ) -> bool {
+        let mut custody = self.native_root_exit.lock();
+        if !matches!(*custody, NativeRootExitCustody::Absent) {
+            return false;
+        }
+        *custody = NativeRootExitCustody::Pending(status);
+        true
+    }
+
+    /// Whether an idle-vCPU root exit waits for a host member to take it.
+    pub fn native_root_exit_pending(&self) -> bool {
+        let custody = *self.native_root_exit.lock();
+        matches!(custody, NativeRootExitCustody::Pending(_))
+    }
+
+    /// Take the pending idle-vCPU root exit; exactly one host member receives
+    /// it and owns the process terminal.
+    pub fn take_native_root_exit(&self) -> Option<carrick_sched_core::process::TerminationStatus> {
+        let mut custody = self.native_root_exit.lock();
+        match *custody {
+            NativeRootExitCustody::Pending(status) => {
+                *custody = NativeRootExitCustody::Taken;
+                Some(status)
+            }
+            NativeRootExitCustody::Absent | NativeRootExitCustody::Taken => None,
+        }
     }
 
     /// Kick every vehicle this task may be parked on, so it reaches a point

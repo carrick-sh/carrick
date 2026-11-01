@@ -4357,6 +4357,43 @@ where
     /// Route a terminal outcome produced outside `service_outcome` — a fault
     /// signal that killed the process, or a forced-exit signal service — into
     /// the persistent terminal, the same way the trap watchdog does.
+    /// The in-ring process owner's authenticated root exit ends the run with
+    /// its status. It reaches this member either on its own vCPU (the trap)
+    /// or through [`carrick_kernel::kernel::Task::take_native_root_exit`]
+    /// when it crossed on an idle vCPU that had no host task loaded.
+    fn enter_native_root_exit(
+        &mut self,
+        engine: &mut E,
+        status: carrick_sched_core::process::TerminationStatus,
+    ) -> Result<executor::ExecutorExit, RuntimeError> {
+        // A native root may exit without ever forwarding a syscall.
+        self.state.service_kernel_context = Some(
+            self.kernel
+                .dispatcher
+                .capture_kernel_context(self.state.linux_tid)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!("capture native terminal context: {error}"))
+                })?,
+        );
+        let code = i32::try_from(status.code()).map_err(|_| {
+            RuntimeError::Configuration("native terminal status exceeds result domain".into())
+        })?;
+        let (exit_code, signal) = match status.kind() {
+            carrick_sched_core::process::TerminationKind::Exited => (code, None),
+            carrick_sched_core::process::TerminationKind::Signaled { .. } => {
+                (128 + code, Some(code))
+            }
+        };
+        let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
+            &self.kernel,
+            exit_code,
+            signal,
+            self.traps,
+            false,
+        )));
+        Ok(self.enter_terminal_with_outcome(engine, outcome))
+    }
+
     pub(super) fn enter_terminal_with_outcome(
         &mut self,
         engine: &mut E,
@@ -4467,6 +4504,22 @@ where
             }
             if let Some(context) = self.state.service_kernel_context.as_ref() {
                 self.kernel.wake_native_terminal_members(context)?;
+            }
+            // A root exit that crossed on an idle vCPU is owed to this
+            // process's host members (`deliver_idle_root_exit`); the first one
+            // here takes it before resuming any continuation or guest state.
+            if !self.phase.is_terminal_transition()
+                && let Some(status) = match self.state.service_kernel_context.as_ref() {
+                    Some(context) => context.task().take_native_root_exit(),
+                    None => self
+                        .state
+                        .kernel_thread
+                        .as_ref()
+                        .and_then(|thread| thread.task())
+                        .and_then(|task| task.take_native_root_exit()),
+                }
+            {
+                return Ok(self.enter_native_root_exit(engine, status)?);
             }
             if !self.phase.is_terminal_transition()
                 && !matches!(self.phase, HvpatchProductionPhase::ResumeOwnerPhysical(_))
@@ -5319,36 +5372,7 @@ where
         let frame = match next {
             Ok(Some(frame)) => frame,
             Err(TrapError::NativeRootExit { status }) => {
-                // A native root may exit without ever forwarding a syscall.
-                self.state.service_kernel_context = Some(
-                    self.kernel
-                        .dispatcher
-                        .capture_kernel_context(self.state.linux_tid)
-                        .map_err(|error| {
-                            RuntimeError::Configuration(format!(
-                                "capture native terminal context: {error}"
-                            ))
-                        })?,
-                );
-                let code = i32::try_from(status.code()).map_err(|_| {
-                    RuntimeError::Configuration(
-                        "native terminal status exceeds result domain".into(),
-                    )
-                })?;
-                let (exit_code, signal) = match status.kind() {
-                    carrick_sched_core::process::TerminationKind::Exited => (code, None),
-                    carrick_sched_core::process::TerminationKind::Signaled { .. } => {
-                        (128 + code, Some(code))
-                    }
-                };
-                let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
-                    &self.kernel,
-                    exit_code,
-                    signal,
-                    self.traps,
-                    false,
-                )));
-                return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                return Ok(self.enter_native_root_exit(engine, status)?);
             }
             Ok(None) => {
                 if let Some(slot) = engine.mailbox_slot() {
