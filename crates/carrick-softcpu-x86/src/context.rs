@@ -1996,6 +1996,10 @@ fn gw_jump_ctx(code: &mut Vec<u8>, offset: usize) {
     code.extend_from_slice(&(offset as i32).to_le_bytes());
 }
 
+/// RFLAGS bits a native guest body may change and the host flags register
+/// carries between gateway transitions: CF, PF, AF, ZF, SF, DF and OF.
+const GUEST_HOST_FLAGS: u64 = 0x0cd5;
+
 fn gw_save_guest(code: &mut Vec<u8>, from_probe: bool, from_lahf: bool) {
     for gpr in 0..14 {
         if gpr == reg::RSP || (from_probe && gpr < 2) {
@@ -2021,10 +2025,18 @@ fn gw_save_guest(code: &mut Vec<u8>, from_probe: bool, from_lahf: bool) {
     }
     code.extend_from_slice(&[0x9c, 0x58]); // pushfq; pop rax on the host stack
     gw_load(code, 1, offset_of!(SoftCpuContext, rflags));
-    code.extend_from_slice(&[
-        0x48, 0x81, 0xe1, 0x00, 0x03, 0x04, 0x00, 0x48, 0x25, 0xff, 0xfc, 0xfb, 0xff, 0x48, 0x09,
-        0xc8,
-    ]);
+    // Native guest bodies change only the status flags and DF
+    // (`GUEST_HOST_FLAGS`); `PUSHF`/`POPF`/`IRETQ`/`CLI`/`STI` are emulated on
+    // the context. Every system flag (TF, IF, IOPL, NT, RF, VM, AC, VIF, VIP,
+    // ID) stays context-owned: a CPL3 host `POPF` cannot load IOPL/VM/VIF/VIP,
+    // and Rosetta also drops NT, so taking them from host flags loses guest
+    // state (SDM Vol. 1 §3.4.3, Vol. 2B `POPF`).
+    // and rcx, !GUEST_HOST_FLAGS; and rax, GUEST_HOST_FLAGS; or rax, rcx
+    code.extend_from_slice(&[0x48, 0x81, 0xe1]);
+    code.extend_from_slice(&(!GUEST_HOST_FLAGS as u32).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x25]);
+    code.extend_from_slice(&(GUEST_HOST_FLAGS as u32).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x09, 0xc8]);
     gw_store(code, 0, offset_of!(SoftCpuContext, rflags));
     gw_save_guest_simd(code);
 }
@@ -2058,7 +2070,11 @@ fn gw_restore_host(code: &mut Vec<u8>) {
 fn gw_restore_guest(code: &mut Vec<u8>) {
     gw_fx(code, true, CTX_FXSAVE_OFF);
     gw_load(code, 0, offset_of!(SoftCpuContext, rflags));
-    code.extend_from_slice(&[0x48, 0x25, 0xff, 0xfe, 0xfb, 0xff, 0x50, 0x9d]);
+    // Load only the native-body flags into the host: and rax, GUEST_HOST_FLAGS;
+    // or rax, 0x202 (reserved bit 1, host IF); push rax; popfq.
+    code.extend_from_slice(&[0x48, 0x25]);
+    code.extend_from_slice(&(GUEST_HOST_FLAGS as u32).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x0d, 0x02, 0x02, 0x00, 0x00, 0x50, 0x9d]);
     for gpr in 0..14 {
         if gpr != reg::RSP {
             gw_load(code, gpr, gpr * 8);

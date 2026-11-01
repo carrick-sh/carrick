@@ -1502,3 +1502,32 @@ fn idt_pf_then_pf_escalates_to_double_fault_and_table_6_5_classes() {
         }
     );
 }
+
+#[test]
+fn native_block_transitions_keep_guest_system_rflags_context_owned() {
+    // A CPL3 host `POPF` can never load IOPL (and Rosetta also drops NT), so guest IOPL/NT must
+    // survive native-body gateway transitions from the context, not from host flags.
+    let mut rig = IdtTestRig::new();
+    rig.set_gate(0x81, IdtTestRig::stub_va(0x81), 0x08, 0, 0x0f, 0, true);
+    // add eax, 1 (native body); pushfq; pop rbx (emulated helpers); int 0x81.
+    rig.write_kernel_code(&[0x05, 0x01, 0x00, 0x00, 0x00, 0x9c, 0x5b, 0xcd, 0x81]);
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF | RFLAGS_NT | (3 << 12));
+    rig.machine.context_mut().gpr[reg::RAX] = 0xffff_ffff;
+    assert_eq!(rig.run_to_vec_port(), 0x81);
+    let ctx = rig.machine.context();
+    // `add` result flags (ZF, CF) come from the native body; IOPL/NT/IF from the context.
+    let pushed = ctx.gpr[reg::RBX];
+    assert_eq!(
+        pushed & (0x3000 | RFLAGS_NT | RFLAGS_IF),
+        0x3000 | RFLAGS_NT | RFLAGS_IF
+    );
+    assert_eq!(pushed & 0x41, 0x41);
+    let frame = rig.read_frame40(rig.stack_frame, 0xfc8);
+    assert_eq!(frame.rip, CODE_VA + 9);
+    assert_eq!(frame.rflags & (0x3000 | RFLAGS_NT), 0x3000 | RFLAGS_NT);
+    // Trap-gate entry clears live NT but keeps IOPL and IF.
+    assert_eq!(
+        ctx.rflags & (0x3000 | RFLAGS_NT | RFLAGS_IF),
+        0x3000 | RFLAGS_IF
+    );
+}
