@@ -659,70 +659,122 @@ pub fn lane_census(
     receipt: &AcceptReceipt,
     root: &Path,
 ) -> Result<BTreeMap<String, usize>, ReceiptError> {
-    let required: &[&str] = if receipt.profile == "kvm" {
-        &["kvm"]
+    let mut required = BTreeSet::new();
+    if receipt.profile == "kvm" {
+        required.insert("kvm");
     } else if receipt.profile == "el1-native" {
-        &["host"]
-    } else if receipt.phase == "signed" {
-        if receipt.profile == "full" {
-            &["signed-hvf", "signed-cli"]
-        } else {
-            &["signed-hvf"]
-        }
+        required.insert("host");
     } else {
-        &["host"]
-    };
-    let mut tests_by_binary: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for test in receipt.steps.iter().flat_map(|step| &step.started_tests) {
-        if let Some((bin, name)) = test.split_once("::") {
-            tests_by_binary.entry(bin).or_default().insert(name);
+        if receipt.phase != "signed" {
+            required.insert("host");
+        }
+        if receipt.phase != "host" {
+            required.insert("signed-hvf");
+            if receipt.profile == "full" {
+                required.insert("signed-cli");
+            }
         }
     }
-    let mut counts = BTreeMap::new();
+    // Supply source-only target metadata to the canonical lane resolver. Never
+    // run candidate Cargo/build scripts in the trusted receipt grader.
+    let mut packages = Vec::new();
+    let mut libs = BTreeSet::new();
     for dir in candidate_crate_dirs(root)? {
         let manifest = crate_manifest(&dir)?;
-        let declared = manifest
-            .get("package")
-            .and_then(|v| v.get("metadata"))
-            .and_then(|v| v.get("carrick"))
-            .and_then(|v| v.get("test-lanes"));
-        // Include implicit host ownership as defined by test-lanes resolve.
-        for lane in required {
-            let declared_here = *lane == "host"
-                || declared.and_then(toml::Value::as_table).is_some_and(|d| {
-                    d.values().any(|v| {
-                        v.as_str()
-                            .or_else(|| v.get("lane").and_then(toml::Value::as_str))
-                            == Some(*lane)
-                    })
-                });
-            if !declared_here {
-                continue;
-            }
-            counts.entry((*lane).to_string()).or_insert(0usize);
+        let Some(package) = manifest.get("package") else {
+            continue;
+        };
+        let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        if manifest.get("lib").is_some()
+            || regular_path(&dir, Path::new("src/lib.rs"), false)?
+            || regular_path(&dir, Path::new("src/main.rs"), false)?
+        {
+            libs.insert(
+                manifest
+                    .get("lib")
+                    .and_then(|v| v.get("name"))
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or(name)
+                    .replace('-', "_"),
+            );
         }
-        for (bin, tests) in &tests_by_binary {
-            if !crate_matches_bin(&dir, &manifest, bin)? {
-                continue;
+        if let Some(bins) = manifest.get("bin").and_then(toml::Value::as_array) {
+            for bin in bins {
+                if let Some(name) = bin.get("name").and_then(toml::Value::as_str) {
+                    libs.insert(name.replace('-', "_"));
+                }
             }
-            let lane = declared.and_then(|d| {
-                d.as_table()
-                    .and_then(|table| {
-                        table
-                            .iter()
-                            .find(|(key, _)| key.replace('-', "_") == *bin)
-                            .map(|(_, v)| v)
-                    })
-                    .or_else(|| d.get("*"))
-            });
-            let lane = lane
-                .and_then(|v| {
-                    v.as_str()
-                        .or_else(|| v.get("lane").and_then(toml::Value::as_str))
-                })
-                .unwrap_or(crate::test_lanes::DEFAULT_LANE);
-            if let Some(count) = counts.get_mut(lane) {
-                *count += tests.len();
+        }
+        let mut names = BTreeSet::new();
+        if package.get("autotests").and_then(toml::Value::as_bool) != Some(false)
+            && regular_path(&dir, Path::new("tests"), true)?
+        {
+            let tests = dir.join("tests");
+            for entry in std::fs::read_dir(&tests).map_err(|e| source_io(&tests, e))? {
+                let entry = entry.map_err(|e| source_io(&tests, e))?;
+                let path = entry.path();
+                if (path.extension().is_some_and(|e| e == "rs") || path.join("main.rs").is_file())
+                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                {
+                    names.insert(stem.to_owned());
+                }
+            }
+        }
+        if let Some(explicit) = manifest.get("test").and_then(toml::Value::as_array) {
+            for target in explicit {
+                if let Some(name) = target.get("name").and_then(toml::Value::as_str) {
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+        packages.push(serde_json::json!({
+            "name": name,
+            "metadata": package.get("metadata"),
+            "targets": names.into_iter().map(|name| serde_json::json!({"name": name, "kind": ["test"]})).collect::<Vec<_>>()
+        }));
+    }
+    let metadata = serde_json::json!({"packages": packages});
+    let (targets, errors) = crate::test_lanes::resolve(&metadata);
+    let declared = crate::test_lanes::declared_lanes(&metadata);
+    if !errors.is_empty() {
+        return Err(ReceiptError::Mismatch(errors.join("; ")));
+    }
+    let mut counts: BTreeMap<String, usize> = required
+        .into_iter()
+        .filter(|lane| {
+            declared.contains(*lane)
+                || targets.iter().any(|target| target.lane == *lane)
+                || (*lane == crate::test_lanes::DEFAULT_LANE && !libs.is_empty())
+        })
+        .map(|lane| (lane.into(), 0))
+        .collect();
+    let mut counted = BTreeSet::new();
+    for step in &receipt.steps {
+        for test in &step.started_tests {
+            let Some((bin, _)) = test.split_once("::") else {
+                continue;
+            };
+            let owners: Vec<_> = targets
+                .iter()
+                .filter(|t| t.target.replace('-', "_") == bin)
+                .collect();
+            let lanes: BTreeSet<&str> = owners.iter().map(|t| t.lane.as_str()).collect();
+            // A bare integration binary shared by several packages cannot
+            // establish which lane ran. Do not count it in multiple lanes.
+            let lane = if lanes.len() == 1 && !libs.contains(bin) {
+                lanes.first().copied()
+            } else if owners.is_empty() && libs.contains(bin) {
+                Some(crate::test_lanes::DEFAULT_LANE)
+            } else {
+                None
+            };
+            if let Some(lane) = lane
+                && counted.insert((lane.to_owned(), test.clone()))
+                && let Some(count) = counts.get_mut(lane)
+            {
+                *count += 1;
             }
         }
     }
@@ -878,10 +930,7 @@ pub fn diff_with_retired(
         // These suites are outside no-docker's declared scope, rather than
         // required steps whose execution was skipped.
         let excluded = candidate.profile == "no-docker"
-            && matches!(
-                skipped.as_str(),
-                "conformance-probes-retained" | "ltp" | "inotify09-el1" | "inotify09-el0"
-            );
+            && crate::accept::NO_DOCKER_EXCLUSIONS.contains(&skipped.as_str());
         let foreign_compiler = candidate.profile == "linux-portable"
             && skipped.starts_with("host-authority live compiler profiles ");
         if !excluded && !foreign_compiler {

@@ -157,6 +157,40 @@ pub struct TestTarget {
     pub macos_default: bool,
 }
 
+fn lane_declaration(value: &Value) -> Option<(String, Option<String>)> {
+    match value {
+        Value::String(lane) => Some((lane.clone(), None)),
+        Value::Object(table) => table.get("lane").and_then(Value::as_str).map(|lane| {
+            (
+                lane.to_owned(),
+                table
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )
+        }),
+        _ => None,
+    }
+}
+
+/// Declared lanes remain required even if no integration target was discovered.
+/// Use the same declaration parser as target resolution.
+pub fn declared_lanes(metadata: &Value) -> BTreeSet<String> {
+    metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|package| {
+            package
+                .pointer("/metadata/carrick/test-lanes")
+                .and_then(Value::as_object)
+        })
+        .flat_map(|declarations| declarations.values())
+        .filter_map(lane_declaration)
+        .map(|(lane, _)| lane)
+        .collect()
+}
+
 /// Resolve every test target in the workspace and every declaration error.
 pub fn resolve(metadata: &Value) -> (Vec<TestTarget>, Vec<String>) {
     let mut targets = Vec::new();
@@ -208,19 +242,7 @@ pub fn resolve(metadata: &Value) -> (Vec<TestTarget>, Vec<String>) {
         let mut declarations: BTreeMap<&str, (String, Option<String>)> = BTreeMap::new();
         if let Some(declared) = declared {
             for (key, value) in declared {
-                let parsed = match value {
-                    Value::String(lane) => Some((lane.clone(), None)),
-                    Value::Object(table) => table.get("lane").and_then(Value::as_str).map(|lane| {
-                        (
-                            lane.to_owned(),
-                            table
-                                .get("reason")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                        )
-                    }),
-                    _ => None,
-                };
+                let parsed = lane_declaration(value);
                 let Some((lane, reason)) = parsed else {
                     errors.push(format!(
                         "{name}: test-lanes.{key} must be a lane string or {{ lane, reason }}"
