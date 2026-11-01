@@ -1469,6 +1469,13 @@ pub struct ZoneCounters {
     pub el1_cow_invalidations: AtomicU64,
 }
 
+/// [`ZoneTables::retire_exited_space`] found a different address space
+/// installed on the slot than the one whose root exit crossed there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForeignInstalledSpace {
+    pub running: u64,
+}
+
 /// The zone: every table, as one `repr(C)` object in the shared EL1 region.
 /// All-zero bytes are a valid empty zone.
 #[repr(C, align(64))]
@@ -3517,6 +3524,28 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             .el1_space_switches
             .fetch_add(1, Ordering::Relaxed);
         Some(grant)
+    }
+
+    /// The host, with `slot`'s vCPU out of the guest after the in-ring owner
+    /// crossed `space`'s root exit there. That crossing abandons EL1's stack
+    /// on the vCPU, so EL1 never runs its own [`Self::release_space`]: the
+    /// word it published names `space` with no installer behind it, and the
+    /// next host install on the slot (the process's terminal owner loading)
+    /// would be refused. Exact: only `space` is retired; an empty word means
+    /// EL1 already left; any other space is a broken invariant.
+    pub fn retire_exited_space(
+        &self,
+        slot: SlotId,
+        space: AddressSpaceKey,
+    ) -> Result<(), ForeignInstalledSpace> {
+        let here = ExecutionSlot::zone(slot);
+        if self.occupancy.vacate(here, space) {
+            return Ok(());
+        }
+        match self.occupancy.running_raw(here) {
+            0 => Ok(()),
+            running => Err(ForeignInstalledSpace { running }),
+        }
     }
 
     /// EL1 on `slot`, after switching the vCPU to the maintenance root:

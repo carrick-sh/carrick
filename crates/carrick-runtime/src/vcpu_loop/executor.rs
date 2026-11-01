@@ -1702,8 +1702,8 @@ fn next_runnable<F: PersistentExecutor>(
                         .map_err(|error| NextError::Fatal(error.to_string()))?;
                     return Ok(None);
                 }
-                GuestIdleExit::RootExit { status, mm } => {
-                    deliver_idle_root_exit(scheduler, mm, status)?;
+                GuestIdleExit::RootExit(exit) => {
+                    deliver_idle_root_exit(scheduler, &exit)?;
                     return Ok(None);
                 }
                 GuestIdleExit::Unsupported => {}
@@ -1736,8 +1736,8 @@ fn next_runnable<F: PersistentExecutor>(
                 .map_err(|error| NextError::Fatal(error.to_string()))?;
             Ok(None)
         }
-        GuestIdleExit::RootExit { status, mm } => {
-            deliver_idle_root_exit(scheduler, mm, status)?;
+        GuestIdleExit::RootExit(exit) => {
+            deliver_idle_root_exit(scheduler, &exit)?;
             Ok(None)
         }
         GuestIdleExit::Unsupported => Ok(Some(scheduler.take(registration)?)),
@@ -1753,9 +1753,9 @@ fn next_runnable<F: PersistentExecutor>(
 /// publication, forever.
 fn deliver_idle_root_exit(
     scheduler: &Arc<Scheduler>,
-    mm: carrick_core_abi::EntryMmKey,
-    status: carrick_sched_core::process::TerminationStatus,
+    exit: &backend::IdleRootExit,
 ) -> Result<(), NextError> {
+    let (status, mm) = (exit.status(), exit.mm());
     let members = scheduler.kernel().publish_idle_root_exit(mm, status);
     let mut woken = 0usize;
     for member in &members {
