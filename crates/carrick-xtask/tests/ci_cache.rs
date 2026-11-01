@@ -437,7 +437,7 @@ fn hosted_jobs_read_the_r2_compiler_cache_and_only_the_warmer_writes() {
         Some("carrick-sccache")
     );
     assert!(env["SCCACHE_BUCKET"].is_badvalue(), "selected per job");
-    let mut readers = 0;
+    let mut readers = std::collections::BTreeSet::new();
     for (job, body) in workflow["jobs"].as_hash().unwrap() {
         let job = job.as_str().unwrap();
         let Some(steps) = body["steps"].as_vec() else {
@@ -467,7 +467,7 @@ fn hosted_jobs_read_the_r2_compiler_cache_and_only_the_warmer_writes() {
             {
                 continue;
             }
-            readers += 1;
+            readers.insert(job.to_owned());
             let configure = &steps[index - 1];
             assert_eq!(configure["id"].as_str(), Some("compiler-cache"), "{job}");
             assert_eq!(
@@ -512,7 +512,8 @@ fn hosted_jobs_read_the_r2_compiler_cache_and_only_the_warmer_writes() {
         }
     }
     assert_eq!(
-        readers, 21,
+        readers,
+        cache_consumers(workflow),
         "every compiler cache consumer selects a backend"
     );
 }
@@ -675,6 +676,27 @@ fn compiler_cache_env_selects_r2_only_for_credentialed_hosted_runners() {
     }
 }
 
+/// Jobs that configure the compiler cache (`compiler-cache-env.sh`): the
+/// population every cache-shape check below must cover, derived from the
+/// workflow so a new compiling job is checked by name, never by a count.
+fn cache_consumers(workflow: &yaml_rust2::Yaml) -> std::collections::BTreeSet<String> {
+    workflow["jobs"]
+        .as_hash()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| {
+            body["steps"].as_vec().is_some_and(|steps| {
+                steps.iter().any(|s| {
+                    s["run"]
+                        .as_str()
+                        .is_some_and(|r| r.starts_with("scripts/ci/compiler-cache-env.sh "))
+                })
+            })
+        })
+        .map(|(job, _)| job.as_str().unwrap().to_owned())
+        .collect()
+}
+
 /// Every string in `value` that names an R2 secret.
 fn r2_secret_references(value: &yaml_rust2::Yaml, found: &mut Vec<String>) {
     match value {
@@ -719,7 +741,7 @@ fn r2_reader_credentials_reach_only_hosted_compiling_jobs() {
             "${{{{ needs.changes.outputs.macos_runner == '\"macos-15\"' && secrets.{secret} || '' }}}}"
         )
     };
-    let mut readers = 0;
+    let mut readers = std::collections::BTreeSet::new();
     for (job, body) in workflow["jobs"].as_hash().unwrap() {
         let job = job.as_str().unwrap();
         let compiles = body["steps"].as_vec().unwrap().iter().any(|step| {
@@ -737,7 +759,7 @@ fn r2_reader_credentials_reach_only_hosted_compiling_jobs() {
             assert!(refs.is_empty(), "{job} never compiles but sees {refs:?}");
             continue;
         }
-        readers += 1;
+        readers.insert(job.to_owned());
         assert_eq!(refs.len(), 2, "{job}: only the job-level pair: {refs:?}");
         let runner = body["runs-on"].as_str().unwrap();
         let (id, secret) = if runner.contains("macos_runner") {
@@ -766,7 +788,13 @@ fn r2_reader_credentials_reach_only_hosted_compiling_jobs() {
             "{job}"
         );
     }
-    assert_eq!(readers, 20, "every hosted compiler cache reader");
+    // cache-warm is the writer, checked above; every other consumer reads.
+    let mut hosted_readers = cache_consumers(workflow);
+    hosted_readers.remove("cache-warm");
+    assert_eq!(
+        readers, hosted_readers,
+        "every hosted compiler cache reader"
+    );
     for job in ["linked-issue", "commit-trailers", "actionlint", "ci-ok"] {
         assert!(workflow["jobs"][job]["env"]["AWS_ACCESS_KEY_ID"].is_badvalue());
     }
@@ -787,7 +815,7 @@ fn r2_jobs_start_the_compiler_cache_after_install_and_selection() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
-    let mut started = 0;
+    let mut started = std::collections::BTreeSet::new();
     for (job, body) in workflow["jobs"].as_hash().unwrap() {
         let Some(steps) = body["steps"].as_vec() else {
             continue;
@@ -827,10 +855,11 @@ fn r2_jobs_start_the_compiler_cache_after_install_and_selection() {
                 "{job:?}: only the skipped GitHub cache restore may precede the start"
             );
         }
-        started += 1;
+        started.insert(job.as_str().unwrap().to_owned());
     }
     assert_eq!(
-        started, 21,
+        started,
+        cache_consumers(workflow),
         "every compiler cache consumer starts its server"
     );
 }

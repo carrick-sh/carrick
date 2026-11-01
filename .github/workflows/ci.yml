@@ -870,6 +870,60 @@ jobs:
         if: ${{ always() }}
         run: just ci-cache-finish
 
+  # x86_64-only host tests (#1269). Every other host-lane job is arm64, where
+  # a `#![cfg(target_arch = "x86_64")]` crate or test target compiles to zero
+  # tests. `test-lanes check` requires each such root to be selected here.
+  x86-host-tests:
+    needs: [changes]
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # R2 reader for the compiler cache (#858).
+      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        id: compiler-cache
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/compiler-cache-env.sh linux-x64 read-only
+      - name: Restore shared compiler cache (read-only)
+        if: steps.compiler-cache.outputs.backend == 'gha'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: ${{ github.job }}-debug-v2
+          cache-workspace-crates: "true"
+          cache-targets: false
+          save-if: false
+      - name: Install per-user compiler cache
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
+      - name: Start compiler cache
+        if: steps.compiler-cache.outputs.backend == 'r2'
+        run: scripts/ci/compiler-cache-start.sh
+      - name: Software x86 CPU and MMU tests on x86_64
+        run: cargo test --locked -p carrick-softcpu-x86 -p carrick-softmmu
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just ci-cache-finish
+
   linux-doc:
     needs: [changes, xtask-build]
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
@@ -1796,6 +1850,7 @@ jobs:
       - lint-domains
       - portable
       - loom
+      - x86-host-tests
       - linux-doc
       - macos-clippy
       - macos-authority
