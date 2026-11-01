@@ -23,7 +23,7 @@ use core::sync::atomic::Ordering;
 /// live words. The caller retains exact-MM exclusion and validates the root.
 /// Invalidation uses the supplied words' existing invalidate_range hook;
 /// migration of InitialWords to ServedTable/StagedInvalidation is #681 slice 5
-/// (https://github.com/carrick-sh/carrick/issues/681), still outstanding.
+/// (<https://github.com/carrick-sh/carrick/issues/681>), still outstanding.
 pub fn edit_x86_anonymous(
     words: &impl carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords,
     root: carrick_guest_arch::RootGpa,
