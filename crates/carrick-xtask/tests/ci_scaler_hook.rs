@@ -203,9 +203,11 @@ fn cloudmac_launch_isolates_the_runner_session_before_it_can_receive_a_job() {
 fn serial_host_reserved_standing_job_cannot_bypass_controller_rendezvous() {
     let bin = tempfile::tempdir().unwrap();
     let fake = bin.path().join("admit");
-    std::fs::write(&fake,"#!/bin/sh\ncase \" $* \" in\n  *' --controller '*) touch rendezvous-requested; exit 1 ;;\n  *) touch reserved-bypass; exit 0 ;;\nesac\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(
+        &fake,
+        "#!/bin/sh\ncase \" $* \" in\n  *' --controller '*) touch rendezvous-requested; exit 1 ;;\n  *) touch reserved-bypass; exit 0 ;;\nesac\n",
+        0o755,
+    );
     let hook = carrick_xtask::ci_scaler::standing_hook_script()
         .unwrap()
         .replace(
@@ -246,7 +248,7 @@ fn agent_auth_provisions_all_worker_credentials_and_only_agy_for_loop() {
         let fake_bin = temp.path().join("bin");
         std::fs::create_dir_all(&fake_bin).unwrap();
         let fake_gh = fake_bin.join("gh");
-        std::fs::write(
+        write_executable(
             &fake_gh,
             r###"#!/bin/sh
 case " $* " in
@@ -255,9 +257,8 @@ case " $* " in
   *) echo "fake gh: unexpected call: $*" >&2; exit 1 ;;
 esac
 "###,
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            0o755,
+        );
         let path = format!(
             "{}:{}",
             fake_bin.display(),
@@ -330,7 +331,6 @@ esac
 
 #[test]
 fn bootstrap_without_a_controller_token_stops_before_downloads() {
-    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -351,8 +351,7 @@ fn bootstrap_without_a_controller_token_stops_before_downloads() {
         ),
     ] {
         let path = bin.join(name);
-        std::fs::write(&path, source).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&path, source, 0o700);
     }
     let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
         .args(["agent-runner", "bootstrap"])
@@ -388,11 +387,48 @@ fn shell_quote_arg(arg: &str) -> String {
 }
 
 fn copy_owner_only_xtask(dest_dir: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let bin = dest_dir.join("carrick-xtask");
-    std::fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &bin).unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    copy_executable(
+        std::path::Path::new(env!("CARGO_BIN_EXE_carrick-xtask")),
+        &bin,
+        0o755,
+    );
     bin
+}
+
+/// Write an executable the test will exec, from a child shell. Sibling
+/// tests in this binary run on parallel threads and fork; a fork that
+/// inherits this process's writable descriptor for a fresh executable
+/// makes the next exec of it fail with `ETXTBSY` (#1294's lint-gates). A
+/// child's descriptor table is its own, so no sibling can inherit it.
+fn write_executable(path: &std::path::Path, contents: &str, mode: u32) {
+    use std::io::Write as _;
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod \"$2\" \"$1\"", "sh"])
+        .arg(path)
+        .arg(format!("{mode:o}"))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(contents.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success(), "{}", path.display());
+}
+
+/// [`write_executable`] for a copy of an existing file.
+fn copy_executable(source: &std::path::Path, dest: &std::path::Path, mode: u32) {
+    let status = Command::new("/bin/sh")
+        .args(["-c", "cp -- \"$1\" \"$2\" && chmod \"$3\" \"$2\"", "sh"])
+        .arg(source)
+        .arg(dest)
+        .arg(format!("{mode:o}"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "{}", dest.display());
 }
 
 fn hvf_auth_env(
@@ -503,12 +539,11 @@ fn serial_host_hvf_job_started_refuses_env_overrides_and_writable_or_non_root_xt
 
     let marker = temp.path().join("spy-xtask-executed");
     let spy_xtask = bin.join("spy-xtask");
-    std::fs::write(
+    write_executable(
         &spy_xtask,
-        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&spy_xtask, std::fs::Permissions::from_mode(0o755)).unwrap();
+        &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        0o755,
+    );
 
     let policy = etc.join("policy");
     std::fs::write(&policy, "standing\n").unwrap();
@@ -623,8 +658,7 @@ fn serial_host_hvf_job_started_refuses_env_overrides_and_writable_or_non_root_xt
     assert!(!marker.exists(), "symlinked xtask executed");
 
     let ws_xtask = workspace.join("ws-xtask");
-    std::fs::copy(&spy_xtask, &ws_xtask).unwrap();
-    std::fs::set_permissions(&ws_xtask, std::fs::Permissions::from_mode(0o755)).unwrap();
+    copy_executable(&spy_xtask, &ws_xtask, 0o755);
     let (_, status) = run_isolated_hook_session(
         &script,
         &[
