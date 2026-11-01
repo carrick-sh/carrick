@@ -4183,8 +4183,8 @@ enum EntryRead {
 ///
 /// `seq` is both the writer lock and the publication sequence
 /// ([`ExclusiveSeq`]): every field is private, the only mutators live on
-/// [`NameEntryWriter`] (which exists only while `seq` is held odd), and the
-/// only reader is [`InotifyNameCacheEntry::read`], which validates `seq`
+/// the private `NameEntryWriter` (which exists only while `seq` is held
+/// odd), and the only reader is the private `read`, which validates `seq`
 /// around its atomic word loads. Host writers and lock-free guest readers
 /// therefore never share a non-atomic byte, and an invalidate-then-refill
 /// between a reader's ticket and its validation always advances `seq`.
