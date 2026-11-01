@@ -710,6 +710,29 @@ impl NativeSignalFixture {
         Option<carrick_personality_linux::dispatch::CompletionRoute>,
     ) {
         use zerocopy::IntoBytes;
+        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+        self.drain_and_deliver_with(
+            queue,
+            frame,
+            fp.as_bytes(),
+            &mut HostArmSignalMachine {
+                backend: HostArmBackend,
+            },
+        )
+    }
+
+    /// Enter the real registered native process and shared signal owner with
+    /// either ISA's frame codec; only physical memory copies are instrumented.
+    pub fn drain_and_deliver_with<A: crate::signal_delivery::SignalMachine<ParkedContextWords>>(
+        &self,
+        queue: &carrick_el1_abi::SharedSignalIngressQueue,
+        frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+        fpstate: &[u8],
+        machine: &mut A,
+    ) -> (
+        usize,
+        Option<carrick_personality_linux::dispatch::CompletionRoute>,
+    ) {
         let mut service = self.service();
         let drained = self
             .registry
@@ -743,7 +766,10 @@ impl NativeSignalFixture {
             .has_deliverable(self.record, blocked);
         assert_eq!(
             entry.signal_checkpoint_needed(),
-            drained != 0 || deliverable || self.control.forwarded_wait_mask_armed(),
+            drained != 0
+                || deliverable
+                || self.control.forwarded_wait_mask_armed()
+                || self.control.forwarded_restart_armed(),
             "native checkpoint must match admitted signal work"
         );
         let signum = self.handler_signum.load(Ordering::Acquire);
@@ -759,17 +785,13 @@ impl NativeSignalFixture {
                 carrick_signal_core::policy::Disposition::Handler(_)
             ));
         }
-        let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
-        let mut machine = HostArmSignalMachine {
-            backend: HostArmBackend,
-        };
         let route = crate::signal_delivery::deliver_signal_on_syscall_return(
             self.task,
             self.control,
             &mut entry,
             frame,
-            fp.as_bytes(),
-            &mut machine,
+            fpstate,
+            machine,
         );
         (drained, route)
     }

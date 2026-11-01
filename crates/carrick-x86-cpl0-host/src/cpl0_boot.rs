@@ -1141,6 +1141,12 @@ pub struct ProductionForwardFrame {
     frame: NativeFrame,
 }
 
+impl ProductionForwardFrame {
+    pub fn original_return(&self) -> u64 {
+        self.frame.rax
+    }
+}
+
 /// Bytes still reachable from a stopped task's CPL0 RSP. The physical stack
 /// may be reused after the task releases its executor; its call chain belongs
 /// to the task until it is reloaded on the same physical slot.

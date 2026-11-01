@@ -557,6 +557,7 @@ dependencies = [
  "carrick-signal-core",
  "carrick-syscall-abi",
  "carrick-test-support",
+ "carrick-x86",
  "libc",
  "wait-timeout",
  "zerocopy",

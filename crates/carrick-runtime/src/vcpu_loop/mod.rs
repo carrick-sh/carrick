@@ -1162,6 +1162,29 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     pub(super) _engine: std::marker::PhantomData<fn() -> E>,
 }
 
+/// Transfer restart eligibility from the operation owner to native delivery.
+/// A return with progress must not leak a witness into a later syscall.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn arm_native_forwarded_restart(
+    control: &carrick_personality_linux::abi::thread::ThreadControlSlot,
+    value: i64,
+    original_return: u64,
+    eligible: Option<bool>,
+) -> Result<(), &'static str> {
+    if value == carrick_abi::LINUX_EINTR.guest_retval()
+        && let Some(eligible) = eligible
+        && !control.arm_forwarded_restart(
+            carrick_personality_linux::abi::thread::ForwardedSyscallRestart {
+                original_return,
+                eligible,
+            },
+        )
+    {
+        return Err("native syscall return still owns an earlier restart witness");
+    }
+    Ok(())
+}
+
 /// The host wait's mask was temporary, but native delivery owns the handler
 /// and sigreturn. Carry the saved persistent mask into that one checkpoint.
 fn arm_native_forwarded_wait_mask(

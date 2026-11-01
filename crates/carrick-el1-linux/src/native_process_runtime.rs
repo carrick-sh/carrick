@@ -2048,6 +2048,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 if control.native_signal_owner()
                     && control.zone_record() == Some(record)
                     && !control.forwarded_wait_mask_armed()
+                    && !control.forwarded_restart_armed()
                 {
                     let pending = super::native_process_signals::pending_summary_word();
                     let blocked = control.blocked().0;
@@ -2078,6 +2079,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .interrupted_child_waits
                 .contains_key(&record)
             || member.control.forwarded_wait_mask_armed()
+            || member.control.forwarded_restart_armed()
         {
             return true;
         }
@@ -3944,7 +3946,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     /// Test pending native work before the ISA saves FP/SIMD for delivery.
     /// A suspended mask needs its restoration even if no signal is pending.
     pub fn signal_checkpoint_needed(&self) -> bool {
-        if self.control.forwarded_wait_mask_armed() {
+        if self.control.forwarded_wait_mask_armed() || self.control.forwarded_restart_armed() {
             return true;
         }
         let graph = self.runtime.graph.lock();
