@@ -3911,19 +3911,15 @@ fn completed_poll_output_preparation_busy_yields_then_delivers_the_answer() {
 
 #[cfg(test)]
 fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, production_frame: bool) {
-    #[repr(C, align(4096))]
-    struct PollPages([crate::file_table::PollFd; 1024]);
-    // Aligned host input lets the real TrapFrame path read its pollfd array;
-    // physical output still goes through this fixture's native service.
-    let pages = production_frame.then(|| unsafe {
-        let ptr =
-            std::alloc::alloc_zeroed(std::alloc::Layout::new::<PollPages>()).cast::<PollPages>();
-        assert!(!ptr.is_null());
-        Box::from_raw(ptr)
+    // Page-aligned guest user input lets the real TrapFrame path read its
+    // pollfd array; physical output still goes through this fixture's native
+    // service.
+    let pages = production_frame.then(|| {
+        carrick_test_support::GuestUserBuffer::zeroed(
+            1024 * core::mem::size_of::<crate::file_table::PollFd>(),
+        )
     });
-    let address = pages
-        .as_ref()
-        .map_or(0x10000, |pages| pages.0.as_ptr() as u64);
+    let address = pages.as_ref().map_or(0x10000, |pages| pages.arg());
     let expected_result = if production_frame { 1024 } else { 37 };
     let fixture = native_exec_fixture();
     let source = BornInZoneSource {
@@ -4008,6 +4004,7 @@ fn retained_poll_output_owner_wait(cancel: bool, during_enrollment: bool, produc
             frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
             frame.x[0] = address;
             frame.x[1] = 1024;
+            carrick_test_support::assert_guest_args(&frame.x[..6]);
             let counters = carrick_el1_abi::Counters::default();
             let route = crate::dispatch::dispatch_syscall_with_native(
                 &mut frame,

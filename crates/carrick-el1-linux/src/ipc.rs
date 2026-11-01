@@ -1959,6 +1959,7 @@ mod tests {
             slot: u64::from(SLOT.raw()),
             ..TrapFrame::default()
         };
+        carrick_test_support::assert_guest_args(&[buf]);
         frame.x[0] = fd as u64;
         frame.x[1] = buf;
         frame.x[2] = len;
@@ -3769,9 +3770,9 @@ mod tests {
         };
         let mut cpu = FakeCpu::default();
         // The dispatcher copies through EL1's validated user copy, which in a
-        // host test reads process memory directly.
-        let mut byte = [b'x'];
-        let mut frame = syscall(SYS_WRITE, wfd, byte.as_mut_ptr() as u64, 1, A_SVC);
+        // host test reads process memory directly at a guest user VA.
+        let byte = carrick_test_support::GuestUserBuffer::from_bytes(b"x");
+        let mut frame = syscall(SYS_WRITE, wfd, byte.arg(), 1, A_SVC);
         let action = crate::dispatch::dispatch_syscall_with_ipc(
             &mut frame,
             w.counters,
@@ -3864,8 +3865,8 @@ mod tests {
         let (r2, _, _) = w.pipe(a, BLOCK);
         w.fork_table(a, 202);
         // A's buffer is real memory: the dispatcher's validated copy writes it.
-        let mut value = [0u8; 8];
-        let buf = value.as_mut_ptr() as u64;
+        let value = carrick_test_support::GuestUserBuffer::zeroed(8);
+        let buf = value.arg();
         w.mem.map(MM, buf, 8);
         w.mem.write(OTHER_MM, 0x10000, &7u64.to_ne_bytes());
         let b_write = syscall(SYS_WRITE, e, 0x10000, 8, B_SVC);
@@ -3888,7 +3889,7 @@ mod tests {
             (carrick_el1_abi::Action::ServedWithWork, 8),
             "the owned read completes and leaves with its result"
         );
-        assert_eq!(u64::from_ne_bytes(value), 7);
+        assert_eq!(value.read::<u64>(0), 7);
         assert!(!w.zone.record(current).has_object_operation());
         assert_eq!(task.linux.served_word(), 1);
     }
@@ -3906,21 +3907,21 @@ mod tests {
         let (r, wfd, _) = w.pipe(t, BLOCK);
         let tasks = slot_tasks_with_host_work(&w);
         let task = &tasks[SLOT.raw() as usize];
-        let mut out = *b"ab";
-        let mut f = syscall(SYS_WRITE, wfd, out.as_mut_ptr() as u64, 2, A_SVC);
+        let out = carrick_test_support::GuestUserBuffer::from_bytes(b"ab");
+        let mut f = syscall(SYS_WRITE, wfd, out.arg(), 2, A_SVC);
         assert_eq!(
             (dispatch(&w, &mut f, &tasks), f.x[0]),
             (carrick_el1_abi::Action::ServedWithWork, 2),
             "a write with room completes in EL1"
         );
-        let mut buf = [0u8; 2];
-        let mut f = syscall(SYS_READ, r, buf.as_mut_ptr() as u64, 2, A_SVC);
+        let buf = carrick_test_support::GuestUserBuffer::zeroed(2);
+        let mut f = syscall(SYS_READ, r, buf.arg(), 2, A_SVC);
         assert_eq!(
             (dispatch(&w, &mut f, &tasks), f.x[0]),
             (carrick_el1_abi::Action::ServedWithWork, 2),
             "a read with data completes in EL1"
         );
-        assert_eq!(&buf, b"ab");
+        assert_eq!(buf.as_bytes(), b"ab");
         assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), r as u64);
         assert!(
             task.linux.has_pending_host_work(),
@@ -3953,8 +3954,8 @@ mod tests {
         w.queue(202, OTHER_MM, &b, B_SVC);
         let tasks = slot_tasks_with_host_work(&w);
         let task = &tasks[SLOT.raw() as usize];
-        let mut buf = [0u8; 1];
-        let mut f = syscall(SYS_READ, r, buf.as_mut_ptr() as u64, 1, A_SVC);
+        let buf = carrick_test_support::GuestUserBuffer::zeroed(1);
+        let mut f = syscall(SYS_READ, r, buf.arg(), 1, A_SVC);
         assert_eq!(
             dispatch(&w, &mut f, &tasks),
             carrick_el1_abi::Action::Idle,
@@ -3986,8 +3987,8 @@ mod tests {
         let a = w.table(w.a_tid);
         let (r, wfd, _) = w.pipe(a, BLOCK);
         w.fork_table(a, 202);
-        let mut buf = [0u8; 1];
-        let a_buf = buf.as_mut_ptr() as u64;
+        let buf = carrick_test_support::GuestUserBuffer::zeroed(1);
+        let a_buf = buf.arg();
         w.mem.map(MM, a_buf, 1);
         w.mem.write(OTHER_MM, 0x10000, b"z");
         let b_write = syscall(SYS_WRITE, wfd, 0x10000, 1, B_SVC);
@@ -4103,6 +4104,7 @@ mod tests {
 
     use crate::file_table::{LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, PollFd};
     use carrick_personality_linux::dispatch::CompletionRoute;
+    use carrick_test_support::GuestUserBuffer;
 
     /// Host-test frame with the production x86 CPL0 poll contract: native
     /// `poll` (7) or `ppoll` (271) decoded to canonical `ppoll`, the x86
@@ -4217,6 +4219,10 @@ mod tests {
         ipc: Option<&IpcVenue<'_>>,
         tables: &Delegated,
     ) -> CompletionRoute {
+        let args: [u64; 6] = core::array::from_fn(|index| {
+            carrick_personality_linux::dispatch::SyscallFrame::argument(frame, index).unwrap_or(0)
+        });
+        carrick_test_support::assert_guest_args(&args);
         crate::dispatch::dispatch_syscall_with_native::<
             _,
             FakeCpu,
@@ -4243,7 +4249,7 @@ mod tests {
     }
 
     /// A ppoll set: one ready eventfd first, then negative (ignored) entries.
-    fn eventfd_set(event: i32, nfds: usize) -> Vec<PollFd> {
+    fn eventfd_set(event: i32, nfds: usize) -> GuestUserBuffer {
         let mut fds = std::vec![
             PollFd {
                 fd: -1,
@@ -4255,7 +4261,16 @@ mod tests {
         if let Some(first) = fds.first_mut() {
             first.fd = event;
         }
-        fds
+        GuestUserBuffer::from_values(&fds)
+    }
+
+    /// A zero `struct timespec` in guest user memory.
+    fn zero_timespec() -> GuestUserBuffer {
+        GuestUserBuffer::from_values(&ZERO_TIMESPEC)
+    }
+
+    fn revents(fds: &GuestUserBuffer, index: usize) -> i16 {
+        fds.get::<PollFd>(index).revents
     }
 
     const ZERO_TIMESPEC: [i64; 2] = [0, 0];
@@ -4277,8 +4292,8 @@ mod tests {
                 carrick_syscall_abi::nr::PPOLL.raw(),
                 carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw(),
             ] {
-                let call = |fds: &mut [PollFd], nfds: usize, timespec: u64| {
-                    let args = [fds.as_mut_ptr() as u64, nfds as u64, timespec, 0, 0];
+                let call = |fds: &GuestUserBuffer, nfds: usize, timespec: u64| {
+                    let args = [fds.arg(), nfds as u64, timespec, 0, 0];
                     if native == carrick_syscall_abi::nr::PPOLL.raw() {
                         let mut frame = TrapFrame::default();
                         frame.x[..5].copy_from_slice(&args);
@@ -4292,40 +4307,36 @@ mod tests {
                         (route, frame.frame.x[0] as i64)
                     }
                 };
-                let timespec = ZERO_TIMESPEC.as_ptr() as u64;
-                let mut fds = eventfd_set(event, limit + 1);
+                let zero = zero_timespec();
+                let timespec = zero.arg();
+                let fds = eventfd_set(event, limit + 1);
                 assert_eq!(
-                    call(&mut fds, limit + 1, timespec),
+                    call(&fds, limit + 1, timespec),
                     (CompletionRoute::Served, -22),
                     "limit {limit}, native {native}: nfds = limit + 1"
                 );
-                assert_eq!(fds[0].revents, 0x7777, "EINVAL publishes no revents");
+                assert_eq!(revents(&fds, 0), 0x7777, "EINVAL publishes no revents");
                 assert_eq!(
-                    call(&mut fds, limit + 1, UNMAPPED),
+                    call(&fds, limit + 1, UNMAPPED),
                     (CompletionRoute::Served, -14),
                     "the timespec is read before nfds is compared"
                 );
                 assert_eq!(
-                    call(&mut fds, limit, timespec),
+                    call(&fds, limit, timespec),
                     (CompletionRoute::Served, 1),
                     "limit {limit}, native {native}: nfds = limit"
                 );
-                assert_eq!(fds[0].revents, LINUX_POLLIN);
-                assert!(fds[1..limit].iter().all(|fd| fd.revents == 0));
-                assert_eq!(fds[limit].revents, 0x7777, "past nfds stays untouched");
+                assert_eq!(revents(&fds, 0), LINUX_POLLIN);
+                assert!((1..limit).all(|index| revents(&fds, index) == 0));
+                assert_eq!(revents(&fds, limit), 0x7777, "past nfds stays untouched");
             }
         }
         // ppoll's sigsetsize is checked before nfds: EINVAL either way, but a
         // valid size with an unreadable mask is EFAULT, not nfds' EINVAL.
-        let mut fds = eventfd_set(event, 1);
+        let fds = eventfd_set(event, 1);
+        let zero = zero_timespec();
         let mut frame = TrapFrame::default();
-        frame.x[..5].copy_from_slice(&[
-            fds.as_mut_ptr() as u64,
-            2049,
-            ZERO_TIMESPEC.as_ptr() as u64,
-            UNMAPPED,
-            8,
-        ]);
+        frame.x[..5].copy_from_slice(&[fds.arg(), 2049, zero.arg(), UNMAPPED, 8]);
         frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
         assert_eq!(
             dispatch_poll(&w, &mut frame, Some(&venue), &tables),
@@ -4346,10 +4357,10 @@ mod tests {
         let venue = w.venue();
         let tables = delegated();
         // x86 CPL0's delegated namespace, at its 1024 cap.
-        let mut fds = eventfd_set(9, 1024);
+        let fds = eventfd_set(9, 1024);
         let mut frame = X86PollFrame::new(
             carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
-            [fds.as_mut_ptr() as u64, 1024, 0, 0, 0],
+            [fds.arg(), 1024, 0, 0, 0],
         );
         let route = {
             let _refuse = RefuseAllocations::from(1024 * core::mem::size_of::<PollFd>());
@@ -4360,7 +4371,7 @@ mod tests {
             (CompletionRoute::Served, -12)
         );
         assert!(frame.queries.is_empty(), "nothing crosses");
-        assert_eq!(fds[0].revents, 0x7777, "ENOMEM publishes no revents");
+        assert_eq!(revents(&fds, 0), 0x7777, "ENOMEM publishes no revents");
         // The pollfd array fits but the host-entry array for the readiness
         // crossing does not: still ENOMEM, nothing crosses, no revents.
         let entry_bytes = 1024 * core::mem::size_of::<carrick_el1_abi::HostReadinessEntry>();
@@ -4378,17 +4389,16 @@ mod tests {
             0,
         )
         .unwrap();
-        let mut fds = std::vec![
-            PollFd {
+        let fds = GuestUserBuffer::from_values(
+            &[PollFd {
                 fd: 4,
                 events: LINUX_POLLOUT,
                 revents: 0x7777,
-            };
-            1024
-        ];
+            }; 1024],
+        );
         let mut frame = X86PollFrame::new(
             carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
-            [fds.as_mut_ptr() as u64, 1024, 0, 0, 0],
+            [fds.arg(), 1024, 0, 0, 0],
         );
         let route = {
             let _refuse = RefuseAllocations::from(entry_bytes);
@@ -4399,24 +4409,22 @@ mod tests {
             (CompletionRoute::Served, -12)
         );
         assert!(frame.queries.is_empty(), "nothing crosses");
-        assert!(fds.iter().all(|fd| fd.revents == 0x7777), "no revents");
+        assert!(
+            (0..1024).all(|index| revents(&fds, index) == 0x7777),
+            "no revents"
+        );
         unsafe {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
         }
         // A ring table whose soft limit admits the set.
-        let mut fds = eventfd_set(event, 2048);
+        let fds = eventfd_set(event, 2048);
+        let zero = zero_timespec();
         for native in [
             carrick_syscall_abi::nr::PPOLL.raw(),
             carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw(),
         ] {
-            let args = [
-                fds.as_mut_ptr() as u64,
-                2048,
-                ZERO_TIMESPEC.as_ptr() as u64,
-                0,
-                0,
-            ];
+            let args = [fds.arg(), 2048, zero.arg(), 0, 0];
             let result = {
                 let _refuse = RefuseAllocations::from(2048 * core::mem::size_of::<PollFd>());
                 if native == carrick_syscall_abi::nr::PPOLL.raw() {
@@ -4432,7 +4440,7 @@ mod tests {
                 }
             };
             assert_eq!(result, (CompletionRoute::Served, -12), "native {native}");
-            assert_eq!(fds[0].revents, 0x7777, "ENOMEM publishes no revents");
+            assert_eq!(revents(&fds, 0), 0x7777, "ENOMEM publishes no revents");
         }
     }
 
@@ -4468,27 +4476,26 @@ mod tests {
         };
         let poll = carrick_syscall_abi::syscall_x86_64::X86_POLL.raw();
         let ppoll = carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw();
-        let set = |fds: &mut [PollFd], timeout: u64| {
-            [fds.as_mut_ptr() as u64, fds.len() as u64, timeout, 0, 0]
+        let set = |fds: &GuestUserBuffer, timeout: u64| {
+            let nfds = fds.len() / core::mem::size_of::<PollFd>();
+            [fds.arg(), nfds as u64, timeout, 0, 0]
         };
         // In-ring ready set: an absent descriptor is POLLNVAL and never crosses.
-        let mut fds = [PollFd {
+        let absent = PollFd {
             fd: 9,
             events: LINUX_POLLIN,
             revents: 0,
-        }];
-        assert_eq!(call(poll, set(&mut fds, 1000), None), (1, Vec::new()));
-        assert_eq!(fds[0].revents, LINUX_POLLNVAL);
-        let mut fds = [PollFd {
-            fd: 9,
-            events: LINUX_POLLIN,
-            revents: 0,
-        }];
-        let zero = ZERO_TIMESPEC.as_ptr() as u64;
-        assert_eq!(call(ppoll, set(&mut fds, zero), None), (1, Vec::new()));
-        assert_eq!(fds[0].revents, LINUX_POLLNVAL);
+        };
+        let fds = GuestUserBuffer::from_value(absent);
+        assert_eq!(call(poll, set(&fds, 1000), None), (1, Vec::new()));
+        assert_eq!(revents(&fds, 0), LINUX_POLLNVAL);
+        let fds = GuestUserBuffer::from_value(absent);
+        let zero_timespec = zero_timespec();
+        let zero = zero_timespec.arg();
+        assert_eq!(call(ppoll, set(&fds, zero), None), (1, Vec::new()));
+        assert_eq!(revents(&fds, 0), LINUX_POLLNVAL);
         // A host-bound entry crosses once with the caller's timeout.
-        let mut fds = [
+        let fds = GuestUserBuffer::from_values(&[
             PollFd {
                 fd: 4,
                 events: LINUX_POLLOUT,
@@ -4499,12 +4506,9 @@ mod tests {
                 events: LINUX_POLLIN,
                 revents: 0x7777,
             },
-        ];
-        assert_eq!(
-            call(poll, set(&mut fds, 1000), None),
-            (1, std::vec![(1, 1000)])
-        );
-        assert_eq!((fds[0].revents, fds[1].revents), (LINUX_POLLOUT, 0));
+        ]);
+        assert_eq!(call(poll, set(&fds, 1000), None), (1, std::vec![(1, 1000)]));
+        assert_eq!((revents(&fds, 0), revents(&fds, 1)), (LINUX_POLLOUT, 0));
         // Zero-timeout empty set: the carrier answers it with a zero wait.
         assert_eq!(
             call(ppoll, [0, 0, zero, 0, 0], None),
@@ -4528,12 +4532,11 @@ mod tests {
         w.host().set_limit(a, 2048).unwrap();
         let venue = w.venue();
         let mut fds = eventfd_set(event, 1100);
-        fds[0].events = LINUX_POLLIN | LINUX_POLLOUT;
-        assert_eq!(
-            call(ppoll, set(&mut fds, zero), Some(&venue)),
-            (1, Vec::new())
-        );
-        assert_eq!(fds[0].revents, LINUX_POLLIN | LINUX_POLLOUT);
+        let mut first = fds.get::<PollFd>(0);
+        first.events = LINUX_POLLIN | LINUX_POLLOUT;
+        fds.set(0, first);
+        assert_eq!(call(ppoll, set(&fds, zero), Some(&venue)), (1, Vec::new()));
+        assert_eq!(revents(&fds, 0), LINUX_POLLIN | LINUX_POLLOUT);
         // The carrier crossing samples host-bound entries with one host poll,
         // bounded at 1024 independently of the guest's soft limit. A larger
         // host-bound set stays unrouted before any effect: no crossing and
@@ -4554,27 +4557,30 @@ mod tests {
             .unwrap();
         assert_eq!(host, Fd(4), "the ring table and fd map name one descriptor");
         let host_set = |count: usize| {
-            std::vec![
+            GuestUserBuffer::from_values(&std::vec![
                 PollFd {
                     fd: 4,
                     events: LINUX_POLLOUT,
                     revents: 0x7777,
                 };
                 count
-            ]
+            ])
         };
-        let mut fds = host_set(1024);
+        let fds = host_set(1024);
         assert_eq!(
-            call(ppoll, set(&mut fds, zero), Some(&venue)),
+            call(ppoll, set(&fds, zero), Some(&venue)),
             (1024, std::vec![(1024, 0)]),
             "at the crossing bound the set crosses once"
         );
-        assert!(fds.iter().all(|fd| fd.revents == LINUX_POLLOUT));
-        let mut fds = host_set(1025);
-        let mut frame = X86PollFrame::new(ppoll, set(&mut fds, zero));
+        assert!((0..1024).all(|index| revents(&fds, index) == LINUX_POLLOUT));
+        let fds = host_set(1025);
+        let mut frame = X86PollFrame::new(ppoll, set(&fds, zero));
         let route = dispatch_poll(&w, &mut frame, Some(&venue), &tables);
         assert!(frame.queries.is_empty(), "no host readiness crossing");
-        assert!(fds.iter().all(|fd| fd.revents == 0x7777), "no revents");
+        assert!(
+            (0..1025).all(|index| revents(&fds, index) == 0x7777),
+            "no revents"
+        );
         assert_eq!(
             (route, frame.frame.x[0] as i64),
             (CompletionRoute::Served, -38),

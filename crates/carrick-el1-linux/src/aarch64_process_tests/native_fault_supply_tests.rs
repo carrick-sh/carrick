@@ -3330,7 +3330,6 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
     use crate::mm_portal::{GuestVa, MmError, SelectionVenues, TransferIntent, TransferStep};
     use carrick_el1::fault::{NoopCowResolver, NoopPreparedResolver};
     use carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal;
-    use core::sync::atomic::AtomicI32;
 
     let fixture = Box::leak(Box::new(Fixture::with_page(
         0x10000,
@@ -3400,9 +3399,9 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
         fixture.zone,
     );
 
-    let tid_words = [AtomicI32::new(11), AtomicI32::new(22)];
-    let parent_tid_host_addr = tid_words[0].as_ptr() as u64;
-    let child_tid_host_addr = tid_words[1].as_ptr() as u64;
+    let tid_words = carrick_test_support::GuestUserBuffer::from_values(&[11i32, 22]);
+    let parent_tid_va = tid_words.arg_at(0);
+    let child_tid_va = tid_words.arg_at(4);
     let non_resident_tid_va = VA + 4096;
     let child_stack = VA + 0x1000;
     // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
@@ -3414,9 +3413,9 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
     };
     clone_frame.x[0] = clone_flags;
     clone_frame.x[1] = child_stack;
-    clone_frame.x[2] = parent_tid_host_addr;
+    clone_frame.x[2] = parent_tid_va;
     clone_frame.x[3] = 0;
-    clone_frame.x[4] = child_tid_host_addr;
+    clone_frame.x[4] = child_tid_va;
     clone_frame.x[8] = 220; // SYS_clone
 
     // 1. Before the 2 MiB stack block page `VA + 4096` is resident in Stage-1,
@@ -3663,8 +3662,8 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
         child_visible_tid > 0,
         "clone must not fail with EFAULT (-14): got {child_visible_tid}"
     );
-    assert_eq!(tid_words[0].load(Ordering::Acquire), child_visible_tid);
-    assert_eq!(tid_words[1].load(Ordering::Acquire), child_visible_tid);
+    assert_eq!(tid_words.get::<i32>(0), child_visible_tid);
+    assert_eq!(tid_words.get::<i32>(1), child_visible_tid);
 }
 
 /// #898: interleave reservation admission and first touch, as the signed

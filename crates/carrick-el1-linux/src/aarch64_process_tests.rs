@@ -2161,15 +2161,18 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
             panic!("WNOHANG must return without parking")
         };
         assert_eq!(result.raw(), 0, "a live native child is not waitable");
-        let mut child_info = carrick_syscall_abi::LinuxSiginfo::kill(17, 1, 1, 1);
+        let child_info_user = carrick_test_support::GuestUserBuffer::from_value(
+            carrick_syscall_abi::LinuxSiginfo::kill(17, 1, 1, 1),
+        );
         let LifecycleOutcome::Returned { result, .. } = parent_entry.waitid(
             ProcessWaitId::pid(child_pid),
-            UserVa::new(&raw mut child_info as u64),
+            child_info_user.va(),
             LinuxWaitOptions::WEXITED | LinuxWaitOptions::WNOHANG,
         ) else {
             panic!("waitid WNOHANG must return without parking")
         };
         assert_eq!(result.raw(), 0);
+        let child_info = child_info_user.get::<carrick_syscall_abi::LinuxSiginfo>(0);
         let si_signo = child_info.si_signo;
         assert_eq!(si_signo, 0, "waitid WNOHANG clears the empty result");
     }
@@ -2270,8 +2273,8 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
     }
 
     // Now parent calls wait4 to consume the zombie
-    let mut status_storage = 0i32;
-    let status_va = UserVa::new(&raw mut status_storage as u64);
+    let status_storage = carrick_test_support::GuestUserBuffer::from_value(0i32);
+    let status_va = status_storage.va();
 
     let parent_binding = runtime.task_binding(parent_key).unwrap();
     activate(source, &fixture.task, &parent_binding);
@@ -2280,16 +2283,19 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
         .enter(source, &fixture.task, parked, &mut service)
         .unwrap();
 
-    let mut child_info = carrick_syscall_abi::LinuxSiginfo::empty();
+    let child_info_user = carrick_test_support::GuestUserBuffer::from_value(
+        carrick_syscall_abi::LinuxSiginfo::empty(),
+    );
     let waitid_outcome = parent_entry.waitid(
         ProcessWaitId::pid(child_pid),
-        UserVa::new(&raw mut child_info as u64),
+        child_info_user.va(),
         LinuxWaitOptions::WEXITED | LinuxWaitOptions::WNOWAIT,
     );
     assert!(matches!(
         waitid_outcome,
         LifecycleOutcome::Returned { result, .. } if result.raw() == 0
     ));
+    let child_info = child_info_user.get::<carrick_syscall_abi::LinuxSiginfo>(0);
     let si_signo = child_info.si_signo;
     let si_code = child_info.si_code;
     assert_eq!(si_signo, 17);
@@ -2325,12 +2331,13 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
         Wait4TerminalCase::CoreSignal => 11 | 0x80,
         Wait4TerminalCase::PipeSignal => 13,
     };
-    assert_eq!(status_storage, expected_status);
+    let status = status_storage.get::<i32>(0);
+    assert_eq!(status, expected_status);
     if matches!(terminal, Wait4TerminalCase::CoreSignal) {
-        assert_ne!(status_storage & 0x7f, 0, "WIFSIGNALED");
-        assert_ne!(status_storage & 0x7f, 0x7f, "WIFSIGNALED");
-        assert_eq!(status_storage & 0x7f, 11, "WTERMSIG");
-        assert_eq!(status_storage & 0x80, 0x80, "core flag");
+        assert_ne!(status & 0x7f, 0, "WIFSIGNALED");
+        assert_ne!(status & 0x7f, 0x7f, "WIFSIGNALED");
+        assert_eq!(status & 0x7f, 11, "WTERMSIG");
+        assert_eq!(status & 0x80, 0x80, "core flag");
     }
 
     // Second wait on the consumed child must fail with ECHILD (error code -10)
@@ -2523,8 +2530,8 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         .unwrap_or(parent_binding.record.id);
 
     // Waiter yields slot to child.
-    let mut status_storage = 0i32;
-    let status_va = UserVa::new(&raw mut status_storage as u64);
+    let status_storage = carrick_test_support::GuestUserBuffer::from_value(0i32);
+    let status_va = status_storage.va();
     {
         let mut parent_entry = runtime
             .enter_registered(
@@ -2733,7 +2740,7 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         assert_eq!(fixture.task.visible_pid(), Some(41));
     }
     assert_eq!(
-        status_storage,
+        status_storage.get::<i32>(0),
         LinuxWaitStatus::from_wait_encoding(9 << 8).raw()
     );
 
@@ -3644,6 +3651,7 @@ fn arm_root_setup_enters_production_process_venue() {
     ] {
         frame.x[..6].copy_from_slice(&args);
         frame.x[8] = nr;
+        carrick_test_support::assert_guest_args(&frame.x[..6]);
         let route =
             super::dispatch::dispatch_arm_syscall_with_native_process(
                 &mut frame,
@@ -3715,27 +3723,17 @@ fn arm_signal_setup_then_plain_fork_returns_one_child() {
     let counters = carrick_el1_abi::Counters::new();
     let cache = carrick_el1_abi::InotifyNameCache::new();
     let mut frame = carrick_el1_abi::TrapFrame::default();
-    let mask = Box::new(u64::MAX);
-    let old_mask = Box::new(core::cell::UnsafeCell::new(0xdead_beef_u64));
+    let mask = carrick_test_support::GuestUserBuffer::from_value(u64::MAX);
+    let old_mask = carrick_test_support::GuestUserBuffer::from_value(0xdead_beef_u64);
     for (nr, args, expected) in [
-        (
-            135,
-            [
-                0,
-                &*mask as *const u64 as u64,
-                old_mask.get() as u64,
-                8,
-                0,
-                0,
-            ],
-            0,
-        ),
+        (135, [0, mask.arg(), old_mask.arg(), 8, 0, 0], 0),
         // musl's _Fork sets only x0/x1. Linux ignores x2..x5 without their
         // matching CLONE_* flags; the preceding sigprocmask leaves them live.
         (220, [17, 0, 0xdead_beef, 8, 0x1234, 0x5678], 42),
     ] {
         frame.x[..6].copy_from_slice(&args);
         frame.x[8] = nr;
+        carrick_test_support::assert_guest_args(&frame.x[..6]);
         let route =
             super::dispatch::dispatch_arm_syscall_with_native_process(
                 &mut frame,
@@ -3769,9 +3767,7 @@ fn arm_signal_setup_then_plain_fork_returns_one_child() {
         );
         assert_eq!(frame.x[0] as i64, expected, "syscall {nr}");
     }
-    // SAFETY: the owned cell outlives the production UserCopy call and no
-    // concurrent actor can write it in this single-threaded fixture.
-    assert_eq!(unsafe { *old_mask.get() }, 0);
+    assert_eq!(old_mask.get::<u64>(0), 0);
     assert_eq!(service.crossing.loans_requested.load(Ordering::Acquire), 1);
 }
 
@@ -4505,6 +4501,7 @@ fn arm_call_with_cpu<X: ForkStockCrossing>(
     frame: &mut carrick_el1_abi::TrapFrame,
     cpu: &mut crate::sched::FakeCpu,
 ) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {
+    carrick_test_support::assert_guest_args(&frame.x[..6]);
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
     super::dispatch::dispatch_arm_syscall_with_native_process(
@@ -4543,13 +4540,13 @@ fn arm_signal_setup_then_timed_futex_keeps_its_deadline() {
     arm_call(fixture, fixture.control, &mut service, &mut setup).unwrap();
     assert_eq!(setup.x[0], 0);
 
-    let word = core::sync::atomic::AtomicU32::new(0);
-    let timeout = [0_u64, 1_000_000];
+    let word = carrick_test_support::GuestUserBuffer::from_value(0u32);
+    let timeout = carrick_test_support::GuestUserBuffer::from_values(&[0_u64, 1_000_000]);
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[8] = 98;
-    frame.x[0] = word.as_ptr() as u64;
+    frame.x[0] = word.arg();
     frame.x[1] = 128;
-    frame.x[3] = timeout.as_ptr() as u64;
+    frame.x[3] = timeout.arg();
     let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
     assert_eq!(
         route,
@@ -4932,8 +4929,8 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
 
     // Untraced SignalOwner delivers SIGSEGV/SEGV_ACCERR in-ring and builds the
     // user signal frame.
-    let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
-    let sp = UserVa::new(stack.0.as_mut_ptr() as u64 + stack.0.len() as u64);
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let sp = stack.va_at(stack.len());
     let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     let mut machine = ArmWaitSignalMachine {
         user_sp: sp,
@@ -4988,9 +4985,9 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
         frame.elr, 0x40_0100,
         "installed handler must run instead of default termination"
     );
-    let offset = frame.x[1] as usize - stack.0.as_ptr() as usize;
+    let offset = (frame.x[1] - stack.va().raw()) as usize;
     let signal = carrick_personality_linux::signal::arm::SignalFrame::ref_from_bytes(
-        &stack.0[offset
+        &stack.as_bytes()[offset
             ..offset + core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()],
     )
     .unwrap();
@@ -5107,8 +5104,8 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
         zone: fixture.zone,
         slot: fixture.slot,
     };
-    let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
-    let sp = UserVa::new(stack.0.as_mut_ptr() as u64 + stack.0.len() as u64);
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let sp = stack.va_at(stack.len());
     let mut frame = carrick_el1_abi::TrapFrame {
         slot: u64::from(fixture.slot.raw()),
         esr: 0x9200_004f,
@@ -5260,9 +5257,9 @@ fn arm_native_signal_calls_route_to_shared_owner() {
 fn arm_native_sigsuspend_dispatches_to_owned_continuation() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let mut service = fixture.process_service();
-    let mask = 0u64;
+    let mask = carrick_test_support::GuestUserBuffer::from_value(0u64);
     let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.x[0] = &raw const mask as u64;
+    frame.x[0] = mask.arg();
     frame.x[1] = 8;
     frame.x[8] = 133;
 
@@ -8585,11 +8582,8 @@ impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
 
 // VM-free binding for kernel.el1.signal-delivery-owner: the scheduler must
 // preserve the original wait4 context across a fresh signal-delivery entry.
-// No guest instructions or hardware user-memory translation execute here.
-#[cfg(test)]
-#[repr(C, align(16))]
-struct ArmWaitSignalStack([u8; 16384]);
-
+// No guest instructions or hardware user-memory translation execute here;
+// the signal frame lands on a guest user stack.
 #[test]
 fn arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_checkpoint() {
     arm_parked_wait4_signal_wake_case(true, false, true);
@@ -8622,9 +8616,9 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
     let words = fixture.tables.live(&fixture.maintenance);
     let child_task = CurrentTask::new();
     let sibling_task = CurrentTask::new();
-    let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
-    let stack_base = stack.0.as_mut_ptr() as u64;
-    let user_sp = UserVa::new(stack_base + stack.0.len() as u64);
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let stack_base = stack.va().raw();
+    let user_sp = stack.va_at(stack.len());
     assert_eq!(user_sp.raw() & 15, 0);
     let initial = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     // Match arm_child_wait_wake's supported ownership setup. Fixture::enter
@@ -8985,7 +8979,7 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
     );
     let offset = usize::try_from(frame.x[1].checked_sub(stack_base).unwrap()).unwrap();
     let decoded = carrick_personality_linux::signal::arm::decode(
-        &stack.0[offset..],
+        &stack.as_bytes()[offset..],
         UserVa::new(frame.x[1]),
         true,
     )
@@ -9627,67 +9621,6 @@ fn serial_host_native_fork_unpublished_parent_ipc_table_succeeds_without_einval(
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
-struct LowVaBuffer {
-    ptr: *mut u8,
-    map_len: usize,
-    len: usize,
-}
-
-#[cfg(all(test, not(target_os = "macos")))]
-impl LowVaBuffer {
-    fn zeroed(len: usize) -> Self {
-        static NEXT_HINT: AtomicU64 = AtomicU64::new(0x2000_0000);
-        let map_len = len.max(1).next_multiple_of(4096);
-        let stride = map_len.next_multiple_of(0x1_0000) as u64;
-        let hint = NEXT_HINT.fetch_add(stride, Ordering::Relaxed);
-        let ptr = unsafe {
-            libc::mmap(
-                hint as *mut libc::c_void,
-                map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(ptr, libc::MAP_FAILED, "low-VA test mmap failed");
-        let ptr = ptr.cast::<u8>();
-        assert!(
-            carrick_guest_arch::lower_half_range(ptr as u64, map_len as u64),
-            "test buffer VA {ptr:p} must stay in 48-bit lower half"
-        );
-        Self { ptr, map_len, len }
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let mut buf = Self::zeroed(bytes.len());
-        buf.as_mut_slice().copy_from_slice(bytes);
-        buf
-    }
-
-    fn va(&self) -> u64 {
-        self.ptr as u64
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-}
-
-#[cfg(all(test, not(target_os = "macos")))]
-impl Drop for LowVaBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = libc::munmap(self.ptr.cast::<libc::c_void>(), self.map_len);
-        }
-    }
-}
-
-#[cfg(all(test, not(target_os = "macos")))]
 fn activate_target(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,
@@ -9902,6 +9835,7 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         frame.x[0] = args[0];
         frame.x[1] = args[1];
         frame.x[2] = args[2];
+        carrick_test_support::assert_guest_args(&args);
         let route = super::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
@@ -10102,9 +10036,9 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     // Child 1 closes its writer fd 4; child 0's dup2 alias (fd 1) is still open,
     // so nonblocking read on fd 3 MUST return EAGAIN (-11), never premature EOF!
     assert_eq!(run_in_child(1, sys_close, [4, 0, 0]).1, 0);
-    let read_buf = LowVaBuffer::zeroed(8);
+    let read_buf = carrick_test_support::GuestUserBuffer::zeroed(8);
     assert_eq!(
-        run_in_child(1, sys_read, [3, read_buf.va(), 8]).1,
+        run_in_child(1, sys_read, [3, read_buf.arg(), 8]).1,
         -11,
         "reader must see EAGAIN (-11) while child 0 still holds dup2 writer alias fd 1"
     );
@@ -10133,8 +10067,8 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         .settled();
     assert_eq!(owner.retained_host_resources(), 0);
     assert_eq!(host_file.physical_fd_errno(), Some(9));
-    let payload = LowVaBuffer::from_bytes(b"ok");
-    assert_eq!(run_in_child(0, sys_write, [1, payload.va(), 2]).1, 2);
+    let payload = carrick_test_support::GuestUserBuffer::from_bytes(b"ok");
+    assert_eq!(run_in_child(0, sys_write, [1, payload.arg(), 2]).1, 2);
     assert_eq!(run_in_child(0, sys_close, [1, 0, 0]).1, 0);
 
     // Switch back to child 1: read drains "ok" (2 bytes), then returns EOF (0).
@@ -10142,10 +10076,10 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         .zone
         .requeue_preempted(fixture.slot, child_bindings[0].record.id);
     activate_target(source, &task, &child_bindings[1]);
-    assert_eq!(run_in_child(1, sys_read, [3, read_buf.va(), 8]).1, 2);
-    assert_eq!(&read_buf.as_slice()[..2], b"ok");
+    assert_eq!(run_in_child(1, sys_read, [3, read_buf.arg(), 8]).1, 2);
+    assert_eq!(&read_buf.as_bytes()[..2], b"ok");
     assert_eq!(
-        run_in_child(1, sys_read, [3, read_buf.va(), 8]).1,
+        run_in_child(1, sys_read, [3, read_buf.arg(), 8]).1,
         0,
         "reader must observe EOF (0) once last writer across both children closed"
     );
@@ -10320,6 +10254,7 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
         frame.x[0] = args[0];
         frame.x[1] = args[1];
         frame.x[2] = args[2];
+        carrick_test_support::assert_guest_args(&args);
         let route = super::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &counters,
@@ -10379,16 +10314,16 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     let pattern_bytes: Vec<u8> = (0..(15 * PIPE_BUF + 2096))
         .map(|i| (i % 251) as u8)
         .collect();
-    let pattern = LowVaBuffer::from_bytes(&pattern_bytes);
+    let pattern = carrick_test_support::GuestUserBuffer::from_bytes(&pattern_bytes);
     assert_eq!(
-        run_in_child(0, sys_write, [4, pattern.va(), pattern_bytes.len() as u64]).1,
+        run_in_child(0, sys_write, [4, pattern.arg(), pattern_bytes.len() as u64]).1,
         pattern_bytes.len() as i64
     );
 
     // 1. PIPE_BUF (4096) write with < PIPE_BUF space refuses atomically with EAGAIN (-11), 0 written.
-    let atomic_chunk = LowVaBuffer::from_bytes(&vec![0xA5u8; PIPE_BUF]);
+    let atomic_chunk = carrick_test_support::GuestUserBuffer::from_bytes(&vec![0xA5u8; PIPE_BUF]);
     assert_eq!(
-        run_in_child(0, sys_write, [4, atomic_chunk.va(), PIPE_BUF as u64]).1,
+        run_in_child(0, sys_write, [4, atomic_chunk.arg(), PIPE_BUF as u64]).1,
         -11,
         "O_NONBLOCK write <= PIPE_BUF (4096) without room must fail atomically with EAGAIN (-11)"
     );
@@ -10399,12 +10334,12 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
         .requeue_preempted(fixture.slot, child_bindings[0].record.id);
     activate_target(source, &task, &child_bindings[1]);
     let mut drained = Vec::new();
-    let page_buf = LowVaBuffer::zeroed(PIPE_BUF);
+    let page_buf = carrick_test_support::GuestUserBuffer::zeroed(PIPE_BUF);
     assert_eq!(
-        run_in_child(1, sys_read, [3, page_buf.va(), PIPE_BUF as u64]).1,
+        run_in_child(1, sys_read, [3, page_buf.arg(), PIPE_BUF as u64]).1,
         PIPE_BUF as i64
     );
-    drained.extend_from_slice(page_buf.as_slice());
+    drained.extend_from_slice(page_buf.as_bytes());
 
     // 2. Write > PIPE_BUF (8192 bytes) with 1 page free performs partial write of 4096 bytes.
     fixture
@@ -10412,19 +10347,19 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
         .requeue_preempted(fixture.slot, child_bindings[1].record.id);
     activate_target(source, &task, &child_bindings[0]);
     let large_write_bytes: Vec<u8> = (0..(2 * PIPE_BUF)).map(|i| ((i + 7) % 251) as u8).collect();
-    let large_write = LowVaBuffer::from_bytes(&large_write_bytes);
+    let large_write = carrick_test_support::GuestUserBuffer::from_bytes(&large_write_bytes);
     assert_eq!(
         run_in_child(
             0,
             sys_write,
-            [4, large_write.va(), large_write_bytes.len() as u64]
+            [4, large_write.arg(), large_write_bytes.len() as u64]
         )
         .1,
         PIPE_BUF as i64,
         "O_NONBLOCK write > PIPE_BUF must transfer available partial bytes (4096)"
     );
     assert_eq!(
-        run_in_child(0, sys_write, [4, atomic_chunk.va(), PIPE_BUF as u64]).1,
+        run_in_child(0, sys_write, [4, atomic_chunk.arg(), PIPE_BUF as u64]).1,
         -11
     );
 
@@ -10433,10 +10368,10 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
         .zone
         .requeue_preempted(fixture.slot, child_bindings[0].record.id);
     activate_target(source, &task, &child_bindings[1]);
-    let rest = LowVaBuffer::zeroed(65536);
-    let n = run_in_child(1, sys_read, [3, rest.va(), 65536]).1;
+    let rest = carrick_test_support::GuestUserBuffer::zeroed(65536);
+    let n = run_in_child(1, sys_read, [3, rest.arg(), 65536]).1;
     assert_eq!(n, (14 * PIPE_BUF + 2096 + PIPE_BUF) as i64);
-    drained.extend_from_slice(&rest.as_slice()[..n as usize]);
+    drained.extend_from_slice(&rest.as_bytes()[..n as usize]);
     let mut expected = pattern_bytes;
     expected.extend_from_slice(&large_write_bytes[..PIPE_BUF]);
     assert_eq!(
@@ -10454,8 +10389,8 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
         .requeue_preempted(fixture.slot, child_bindings[1].record.id);
     activate_target(source, &task, &child_bindings[0]);
     let sigpipe = Signal::from_number(13).unwrap();
-    let byte = LowVaBuffer::from_bytes(b"z");
-    let (route, ret) = run_in_child(0, sys_write, [4, byte.va(), 1]);
+    let byte = carrick_test_support::GuestUserBuffer::from_bytes(b"z");
+    let (route, ret) = run_in_child(0, sys_write, [4, byte.arg(), 1]);
     assert!(
         matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
         "native child write on broken pipe must complete in ring, got {route:?}"
@@ -10504,7 +10439,7 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
             )
             .unwrap();
     }
-    let (route2, ret2) = run_in_child(0, sys_write, [4, byte.va(), 1]);
+    let (route2, ret2) = run_in_child(0, sys_write, [4, byte.arg(), 1]);
     assert!(matches!(
         route2,
         CompletionRoute::Served | CompletionRoute::WithWork
@@ -10738,10 +10673,10 @@ fn tgkill_during_futex_enrollment_returns_eintr() {
         }),
         ..Default::default()
     };
-    let word = core::sync::atomic::AtomicU32::new(0);
+    let word = carrick_test_support::GuestUserBuffer::from_value(0u32);
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[8] = crate::sched::SYS_FUTEX as u64;
-    frame.x[0] = word.as_ptr() as u64;
+    frame.x[0] = word.arg();
     frame.x[1] = crate::sched::FUTEX_WAIT_PRIVATE;
     let counters = carrick_el1_abi::Counters::new();
     let result = (crate::sched::Sched {
@@ -10891,9 +10826,9 @@ fn arm_classified_maperr_and_bus_use_signal_owner() {
         fixture
             .control
             .publish_synchronous_fault(signal, code, address);
-        let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
+        let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
         let mut machine = ArmWaitSignalMachine {
-            user_sp: UserVa::new(stack.0.as_mut_ptr() as u64 + stack.0.len() as u64),
+            user_sp: stack.va_at(stack.len()),
             backend: ArmWaitSignalBackend,
         };
         let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
@@ -10932,9 +10867,9 @@ fn arm_classified_maperr_and_bus_use_signal_owner() {
         );
         assert_eq!(frame.elr, 0x40_0100);
         assert!(fixture.control.synchronous_fault().is_none());
-        let offset = frame.x[1] as usize - stack.0.as_ptr() as usize;
+        let offset = (frame.x[1] - stack.va().raw()) as usize;
         let built = carrick_personality_linux::signal::arm::SignalFrame::ref_from_bytes(
-            &stack.0[offset
+            &stack.as_bytes()[offset
                 ..offset
                     + core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()],
         )

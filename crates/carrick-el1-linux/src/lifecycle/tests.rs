@@ -33,6 +33,7 @@ use carrick_el1_abi::{
 };
 use carrick_personality_linux::dispatch::CompletionRoute;
 use carrick_sched_core::ExecutionSlot;
+use carrick_test_support::{GuestUserValue, assert_guest_args};
 use std::boxed::Box;
 use std::sync::Barrier;
 use std::vec::Vec;
@@ -194,6 +195,7 @@ impl World {
     /// Issue syscall `nr` from the running thread through the production
     /// dispatcher. `frame` carries the running thread across switches.
     fn call(&mut self, frame: &mut TrapFrame, nr: usize, args: &[u64]) -> Action {
+        assert_guest_args(args);
         frame.x[..args.len()].copy_from_slice(args);
         frame.x[8] = nr as u64;
         frame.slot = SLOT_IDX as u64;
@@ -220,6 +222,7 @@ impl World {
     }
 
     fn call_native(&mut self, frame: &mut TrapFrame, nr: usize, args: &[u64]) -> Action {
+        assert_guest_args(args);
         frame.x[..args.len()].copy_from_slice(args);
         frame.x[8] = nr as u64;
         frame.slot = SLOT_IDX as u64;
@@ -275,10 +278,6 @@ impl World {
     fn forwarded(&self, nr: usize) -> u64 {
         self.counters.forwarded[nr].load(Ordering::Relaxed)
     }
-}
-
-fn addr<T>(value: &T) -> u64 {
-    value as *const T as u64
 }
 
 #[test]
@@ -339,7 +338,7 @@ impl crate::file::UserCopy for FaultingUser {
         if self.deny_out.contains(&dst_va) {
             return false;
         }
-        // SAFETY: tests pass live host buffers.
+        // SAFETY: tests pass live guest user buffers, mapped in this process.
         unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst_va as *mut u8, src.len()) };
         true
     }
@@ -348,7 +347,7 @@ impl crate::file::UserCopy for FaultingUser {
         if self.deny_in.contains(&src_va) {
             return false;
         }
-        // SAFETY: tests pass live host buffers.
+        // SAFETY: tests pass live guest user buffers, mapped in this process.
         unsafe { core::ptr::copy_nonoverlapping(src_va as *const u8, dst.as_mut_ptr(), dst.len()) };
         true
     }
@@ -490,21 +489,21 @@ fn clone_serves_libc_and_go_thread_flag_sets_and_queues_the_child() {
         let mut w = World::new(LifecycleHatches::ON);
         let entry = w.venue.stock(2, CHILD_TID, CHILD_VISIBLE);
         w.venue.leader_slot().init_blocked(BlockedMask(0x1234));
-        let parent_word = Box::new(0xaaaa_u32);
-        let child_word = Box::new(0xbbbb_u32);
+        let parent_word = GuestUserValue::new(0xaaaa_u32);
+        let child_word = GuestUserValue::new(0xbbbb_u32);
         let (action, frame) = w.syscall(
             SYS_CLONE,
-            &clone_args(flags, addr(&*parent_word), addr(&*child_word)),
+            &clone_args(flags, parent_word.arg(), child_word.arg()),
         );
         assert_eq!(action, Action::Served, "flags {flags:#x}");
         assert_eq!(frame.x[0], u64::from(CHILD_VISIBLE));
         assert_eq!(w.served(SYS_CLONE), 1);
         assert_eq!(w.forwarded(SYS_CLONE), 0);
         let libc = flags & CLONE_PARENT_SETTID != 0;
-        assert_eq!(*parent_word, if libc { CHILD_VISIBLE } else { 0xaaaa });
+        assert_eq!(parent_word.get(), if libc { CHILD_VISIBLE } else { 0xaaaa });
         // No CLONE_CHILD_SETTID in any of these sets: the child word is
         // only the CLEARTID target.
-        assert_eq!(*child_word, 0xbbbb);
+        assert_eq!(child_word.get(), 0xbbbb);
 
         // Born, with the mask captured at the claim; one more live thread.
         let page = w.page();
@@ -512,7 +511,7 @@ fn clone_serves_libc_and_go_thread_flag_sets_and_queues_the_child() {
             page.state(2).unwrap(),
             (entry.generation(), EntryState::Born)
         );
-        let clear = if libc { addr(&*child_word) } else { 0 };
+        let clear = if libc { child_word.arg() } else { 0 };
         assert_eq!(
             page.born_record(entry),
             Some(BornRecord {
@@ -576,12 +575,12 @@ fn clone_forwards_every_other_flag_set_without_effects() {
     for flags in cases {
         let mut w = World::new(LifecycleHatches::ON);
         let entry = w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
-        let word = Box::new(0xaaaa_u32);
-        let args = clone_args(flags, addr(&*word), addr(&*word));
+        let word = GuestUserValue::new(0xaaaa_u32);
+        let args = clone_args(flags, word.arg(), word.arg());
         let (action, frame) = w.syscall(SYS_CLONE, &args);
         assert_eq!(action, Action::Forward, "flags {flags:#x}");
         assert_eq!(&frame.x[..5], &args, "forwarding cannot consume arguments");
-        assert_eq!(*word, 0xaaaa);
+        assert_eq!(word.get(), 0xaaaa);
         assert_eq!(
             w.page().state(0).unwrap(),
             (entry.generation(), EntryState::Reserved)
@@ -607,16 +606,14 @@ fn clone_forwards_every_other_flag_set_without_effects() {
 fn clone_closed_gate_returns_eagain_and_threads_hatch_forwards() {
     let run = |w: &mut World, expected: Action| {
         let entry = w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
-        let word = Box::new(0xaaaa_u32);
-        let (action, frame) = w.syscall(
-            SYS_CLONE,
-            &clone_args(GLIBC_FLAGS, addr(&*word), addr(&*word)),
-        );
+        let word = GuestUserValue::new(0xaaaa_u32);
+        let (action, frame) =
+            w.syscall(SYS_CLONE, &clone_args(GLIBC_FLAGS, word.arg(), word.arg()));
         assert_eq!(action, expected);
         if expected == Action::Served {
             assert_eq!(frame.x[0] as i64, -11);
         }
-        assert_eq!(*word, 0xaaaa);
+        assert_eq!(word.get(), 0xaaaa);
         assert_eq!(
             w.page().state(0).unwrap(),
             (entry.generation(), EntryState::Reserved)
@@ -654,11 +651,11 @@ fn clone_on_exhausted_zone_records_returns_the_entry_and_forwards() {
     while let Ok(record) = w.zone.alloc_record(ThreadIdentity::default()) {
         taken.push(record);
     }
-    let word = Box::new(0xaaaa_u32);
-    let args = clone_args(GLIBC_FLAGS, addr(&*word), addr(&*word));
+    let word = GuestUserValue::new(0xaaaa_u32);
+    let args = clone_args(GLIBC_FLAGS, word.arg(), word.arg());
     let (action, _) = w.syscall(SYS_CLONE, &args);
     assert_eq!(action, Action::Forward);
-    assert_eq!(*word, 0xaaaa, "no tid output before the child exists");
+    assert_eq!(word.get(), 0xaaaa, "no tid output before the child exists");
     assert_eq!(
         w.page().state(0).unwrap(),
         (entry.generation(), EntryState::Reserved)
@@ -681,14 +678,14 @@ fn clone_tid_copy_faults_restore_the_preimages_and_forward() {
     // An unreadable output word: nothing is claimed or written.
     let mut w = World::new(LifecycleHatches::ON);
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
-    let parent_word = Box::new(0xaaaa_u32);
-    let child_word = Box::new(0xbbbb_u32);
-    let args = clone_args(flags, addr(&*parent_word), addr(&*child_word));
+    let parent_word = GuestUserValue::new(0xaaaa_u32);
+    let child_word = GuestUserValue::new(0xbbbb_u32);
+    let args = clone_args(flags, parent_word.arg(), child_word.arg());
     let mut frame = TrapFrame::default();
     frame.x[..5].copy_from_slice(&args);
     frame.x[8] = SYS_CLONE as u64;
     let mut user = FaultingUser {
-        deny_in: std::vec![addr(&*child_word)],
+        deny_in: std::vec![child_word.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(serve_directly(&mut w, &mut frame, &mut user), None);
@@ -703,12 +700,12 @@ fn clone_tid_copy_faults_restore_the_preimages_and_forward() {
     frame.x[..5].copy_from_slice(&args);
     frame.x[8] = SYS_CLONE as u64;
     let mut user = FaultingUser {
-        deny_out: std::vec![addr(&*child_word)],
+        deny_out: std::vec![child_word.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(serve_directly(&mut w, &mut frame, &mut user), None);
-    assert_eq!(*parent_word, 0xaaaa);
-    assert_eq!(*child_word, 0xbbbb);
+    assert_eq!(parent_word.get(), 0xaaaa);
+    assert_eq!(child_word.get(), 0xbbbb);
     assert_eq!(&frame.x[..5], &args);
     assert_eq!(
         w.page().state(0).unwrap(),
@@ -778,15 +775,12 @@ fn sigprocmask_unblocking_a_pending_signal_serves_with_work() {
         .carrier_pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
     assert_ne!(seen.0 & SIGUSR1_BIT, 0);
-    let set = Box::new(SIGUSR1_BIT);
-    let old = Box::new(0_u64);
-    let (action, frame) = w.syscall(
-        SYS_RT_SIGPROCMASK,
-        &[SIG_UNBLOCK, addr(&*set), addr(&*old), 8],
-    );
+    let set = GuestUserValue::new(SIGUSR1_BIT);
+    let old = GuestUserValue::new(0_u64);
+    let (action, frame) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_UNBLOCK, set.arg(), old.arg(), 8]);
     assert_eq!(action, Action::ServedWithWork);
     assert_eq!(frame.x[0], 0);
-    assert_eq!(*old, SIGUSR1_BIT | 1);
+    assert_eq!(old.get(), SIGUSR1_BIT | 1);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(1));
     assert_eq!(w.task().linux.served_word(), 1);
     assert_eq!(w.served(SYS_RT_SIGPROCMASK), 1);
@@ -804,15 +798,12 @@ fn sigprocmask_unblocking_a_process_pending_signal_serves_with_work() {
         .pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
     assert_ne!(seen.0 & SIGUSR1_BIT, 0);
-    let set = Box::new(SIGUSR1_BIT);
-    let old = Box::new(0_u64);
-    let (action, frame) = w.syscall(
-        SYS_RT_SIGPROCMASK,
-        &[SIG_UNBLOCK, addr(&*set), addr(&*old), 8],
-    );
+    let set = GuestUserValue::new(SIGUSR1_BIT);
+    let old = GuestUserValue::new(0_u64);
+    let (action, frame) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_UNBLOCK, set.arg(), old.arg(), 8]);
     assert_eq!(action, Action::ServedWithWork);
     assert_eq!(frame.x[0], 0);
-    assert_eq!(*old, SIGUSR1_BIT | 1);
+    assert_eq!(old.get(), SIGUSR1_BIT | 1);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(1));
     assert_eq!(w.task().linux.served_word(), 1);
     assert_eq!(w.served(SYS_RT_SIGPROCMASK), 1);
@@ -821,25 +812,22 @@ fn sigprocmask_unblocking_a_process_pending_signal_serves_with_work() {
 #[test]
 fn sigprocmask_serves_block_setmask_and_query() {
     let mut w = World::new(LifecycleHatches::ON);
-    let set = Box::new(SIGUSR1_BIT);
-    let old = Box::new(u64::MAX);
-    let (action, _) = w.syscall(
-        SYS_RT_SIGPROCMASK,
-        &[SIG_BLOCK, addr(&*set), addr(&*old), 8],
-    );
+    let set = GuestUserValue::new(SIGUSR1_BIT);
+    let old = GuestUserValue::new(u64::MAX);
+    let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_BLOCK, set.arg(), old.arg(), 8]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*old, 0);
+    assert_eq!(old.get(), 0);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(SIGUSR1_BIT));
     // SIGKILL and SIGSTOP never enter a mask.
-    let all = Box::new(u64::MAX);
-    let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_SETMASK, addr(&*all), 0, 8]);
+    let all = GuestUserValue::new(u64::MAX);
+    let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_SETMASK, all.arg(), 0, 8]);
     assert_eq!(action, Action::Served);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(!UNBLOCKABLE));
     // A query ignores `how`, as the host lane does.
-    let (action, frame) = w.syscall(SYS_RT_SIGPROCMASK, &[99, 0, addr(&*old), 8]);
+    let (action, frame) = w.syscall(SYS_RT_SIGPROCMASK, &[99, 0, old.arg(), 8]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0], 0);
-    assert_eq!(*old, !UNBLOCKABLE);
+    assert_eq!(old.get(), !UNBLOCKABLE);
     // Blocking a pending signal re-targets it: the host must look.
     let mut w = World::new(LifecycleHatches::ON);
     let _ = w
@@ -847,7 +835,7 @@ fn sigprocmask_serves_block_setmask_and_query() {
         .leader_slot()
         .carrier_pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), w.venue.leader_slot());
-    let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_BLOCK, addr(&*set), 0, 8]);
+    let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_BLOCK, set.arg(), 0, 8]);
     assert_eq!(action, Action::ServedWithWork);
 }
 
@@ -856,14 +844,14 @@ fn sigprocmask_serves_block_setmask_and_query() {
 #[test]
 fn sigprocmask_oldset_fault_keeps_new_mask() {
     let mut w = World::new(LifecycleHatches::ON);
-    let set = Box::new(SIGUSR1_BIT);
-    let old = Box::new(0x55_u64);
+    let set = GuestUserValue::new(SIGUSR1_BIT);
+    let old = GuestUserValue::new(0x55_u64);
     let mut frame = TrapFrame::default();
-    frame.x[..4].copy_from_slice(&[SIG_BLOCK, addr(&*set), addr(&*old), 8]);
+    frame.x[..4].copy_from_slice(&[SIG_BLOCK, set.arg(), old.arg(), 8]);
     frame.x[8] = SYS_RT_SIGPROCMASK as u64;
     frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
-        deny_out: std::vec![addr(&*old)],
+        deny_out: std::vec![old.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(
@@ -871,7 +859,7 @@ fn sigprocmask_oldset_fault_keeps_new_mask() {
         Some(Action::Served)
     );
     assert_eq!(frame.x[0] as i64, -14);
-    assert_eq!(*old, 0x55);
+    assert_eq!(old.get(), 0x55);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(SIGUSR1_BIT));
 }
 
@@ -886,14 +874,14 @@ fn sigprocmask_oldset_fault_preserves_pending_signal_work() {
         .carrier_pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
     assert_ne!(seen.0 & SIGUSR1_BIT, 0);
-    let set = Box::new(SIGUSR1_BIT);
-    let old = Box::new(0x55_u64);
+    let set = GuestUserValue::new(SIGUSR1_BIT);
+    let old = GuestUserValue::new(0x55_u64);
     let mut frame = TrapFrame::default();
-    frame.x[..4].copy_from_slice(&[SIG_UNBLOCK, addr(&*set), addr(&*old), 8]);
+    frame.x[..4].copy_from_slice(&[SIG_UNBLOCK, set.arg(), old.arg(), 8]);
     frame.x[8] = SYS_RT_SIGPROCMASK as u64;
     frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
-        deny_out: std::vec![addr(&*old)],
+        deny_out: std::vec![old.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(
@@ -906,40 +894,36 @@ fn sigprocmask_oldset_fault_preserves_pending_signal_work() {
 
 #[test]
 fn sigprocmask_serves_errors_aliases_and_refuses_closed_services() {
-    let mut set = Box::new(SIGUSR1_BIT);
-    let old = Box::new(0x55_u64);
+    let mut set = GuestUserValue::new(SIGUSR1_BIT);
+    let old = GuestUserValue::new(0x55_u64);
     let cases: [(LifecycleHatches, [u64; 4], bool); 5] = [
         (
             LifecycleHatches::ON,
-            [SIG_BLOCK, addr(&*set), addr(&*old), 16],
+            [SIG_BLOCK, set.arg(), old.arg(), 16],
             false,
         ),
         (
             LifecycleHatches::ON,
-            [SIG_BLOCK, addr(&*set), addr(&*set), 8],
+            [SIG_BLOCK, set.arg(), set.arg(), 8],
             false,
         ),
-        (
-            LifecycleHatches::ON,
-            [7, addr(&*set), addr(&*old), 8],
-            false,
-        ),
+        (LifecycleHatches::ON, [7, set.arg(), old.arg(), 8], false),
         (
             LifecycleHatches {
                 threads: true,
                 sigmask: false,
             },
-            [SIG_BLOCK, addr(&*set), addr(&*old), 8],
+            [SIG_BLOCK, set.arg(), old.arg(), 8],
             false,
         ),
         (
             LifecycleHatches::ON,
-            [SIG_BLOCK, addr(&*set), addr(&*old), 8],
+            [SIG_BLOCK, set.arg(), old.arg(), 8],
             true,
         ),
     ];
     for (hatches, args, close) in cases {
-        *set = SIGUSR1_BIT;
+        set.set(SIGUSR1_BIT);
         let mut w = World::new(hatches);
         if close {
             w.page().close();
@@ -963,9 +947,9 @@ fn sigprocmask_serves_errors_aliases_and_refuses_closed_services() {
                 0
             })
         );
-        assert_eq!(*old, 0x55);
+        assert_eq!(old.get(), 0x55);
         assert_eq!(
-            *set,
+            set.get(),
             if args[1] == args[2] && action == Action::Served {
                 0
             } else {
@@ -976,11 +960,11 @@ fn sigprocmask_serves_errors_aliases_and_refuses_closed_services() {
     // A set EL1 cannot read: the host answers (EFAULT or the fault-in).
     let mut w = World::new(LifecycleHatches::ON);
     let mut frame = TrapFrame::default();
-    frame.x[..4].copy_from_slice(&[SIG_BLOCK, addr(&*set), addr(&*old), 8]);
+    frame.x[..4].copy_from_slice(&[SIG_BLOCK, set.arg(), old.arg(), 8]);
     frame.x[8] = SYS_RT_SIGPROCMASK as u64;
     frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
-        deny_in: std::vec![addr(&*set)],
+        deny_in: std::vec![set.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(
@@ -988,7 +972,7 @@ fn sigprocmask_serves_errors_aliases_and_refuses_closed_services() {
         Some(Action::Served)
     );
     assert_eq!(frame.x[0] as i64, -14);
-    assert_eq!(*old, 0x55);
+    assert_eq!(old.get(), 0x55);
 }
 
 /// The Dekker pair through the served call: a sender posting a signal and a
@@ -1031,12 +1015,12 @@ fn run_sigprocmask_dekker_storm(process: bool) {
             }
             saw_blocked
         });
-        let set = SIGUSR1_BIT;
+        let set = GuestUserValue::new(SIGUSR1_BIT);
         let mut frame = TrapFrame::default();
         let mut works = Vec::with_capacity(ROUNDS);
         for _ in 0..ROUNDS {
             start.wait();
-            frame.x[..4].copy_from_slice(&[SIG_UNBLOCK, addr(&set), 0, 8]);
+            frame.x[..4].copy_from_slice(&[SIG_UNBLOCK, set.arg(), 0, 8]);
             let thread = LifecycleThread {
                 page: &venue.page,
                 slot: venue.leader_slot(),
@@ -1079,14 +1063,14 @@ fn stack_t(sp: u64, flags: u32, size: u64) -> [u8; 24] {
 #[test]
 fn sigaltstack_serves_off_the_alternate_stack() {
     let mut w = World::new(LifecycleHatches::ON);
-    let old = Box::new([0xffu8; 24]);
+    let old = GuestUserValue::new([0xffu8; 24]);
     // Query: none installed.
-    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, old.arg()]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*old, stack_t(0, SS_DISABLE, 0));
+    assert_eq!(old.get(), stack_t(0, SS_DISABLE, 0));
     // Install.
-    let new = Box::new(stack_t(0x10_0000, 0, 0x4000));
-    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*new), 0]);
+    let new = GuestUserValue::new(stack_t(0x10_0000, 0, 0x4000));
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[new.arg(), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(
         w.venue.leader_slot().read_altstack(),
@@ -1097,16 +1081,16 @@ fn sigaltstack_serves_off_the_alternate_stack() {
         }
     );
     // Query from the thread's own stack.
-    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, old.arg()]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*old, stack_t(0x10_0000, 0, 0x4000));
+    assert_eq!(old.get(), stack_t(0x10_0000, 0, 0x4000));
     // Running on it (a handler): the retained slot reports SS_ONSTACK and
     // refuses replacement with EPERM.
     w.cpu.regs.sp_el0 = 0x10_2000;
-    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, old.arg()]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*old, stack_t(0x10_0000, 1, 0x4000));
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*new), 0]);
+    assert_eq!(old.get(), stack_t(0x10_0000, 1, 0x4000));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[new.arg(), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, -1);
     for change in [
@@ -1115,14 +1099,14 @@ fn sigaltstack_serves_off_the_alternate_stack() {
         stack_t(0x20_0000, 0, 1024),
         stack_t(0, SS_DISABLE, 0),
     ] {
-        let change = Box::new(change);
-        let bad_old = Box::new([0x55; 24]);
+        let change = GuestUserValue::new(change);
+        let bad_old = GuestUserValue::new([0x55u8; 24]);
         let mut frame = TrapFrame::default();
-        frame.x[..2].copy_from_slice(&[addr(&*change), addr(&*bad_old)]);
+        frame.x[..2].copy_from_slice(&[change.arg(), bad_old.arg()]);
         frame.x[8] = SYS_SIGALTSTACK as u64;
         frame.slot = SLOT_IDX as u64;
         let mut user = FaultingUser {
-            deny_out: std::vec![addr(&*bad_old)],
+            deny_out: std::vec![bad_old.arg()],
             ..FaultingUser::default()
         };
         assert_eq!(
@@ -1133,18 +1117,18 @@ fn sigaltstack_serves_off_the_alternate_stack() {
             frame.x[0] as i64, -1,
             "active stack change precedes flags, size and output fault"
         );
-        assert_eq!(*bad_old, [0x55; 24]);
+        assert_eq!(bad_old.get(), [0x55u8; 24]);
     }
     // On the active alternate stack, an unreadable ss pointer faults with
     // EFAULT (-14) before the on-stack EPERM (-1) check.
     w.cpu.regs.sp_el0 = 0x10_2000;
-    let bad_in = Box::new(stack_t(0x20_0000, 0, 0x4000));
+    let bad_in = GuestUserValue::new(stack_t(0x20_0000, 0, 0x4000));
     let mut frame = TrapFrame::default();
-    frame.x[..2].copy_from_slice(&[addr(&*bad_in), 0]);
+    frame.x[..2].copy_from_slice(&[bad_in.arg(), 0]);
     frame.x[8] = SYS_SIGALTSTACK as u64;
     frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
-        deny_in: std::vec![addr(&*bad_in)],
+        deny_in: std::vec![bad_in.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(
@@ -1162,19 +1146,19 @@ fn sigaltstack_serves_off_the_alternate_stack() {
         (stack_t(0x20_0000, 4, 0x4000), -22),
         (stack_t(0x20_0000, 4, 1024), -22),
     ] {
-        let bad = Box::new(bad);
-        let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*bad), 0]);
+        let bad = GuestUserValue::new(bad);
+        let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[bad.arg(), 0]);
         assert_eq!(action, Action::Served);
         assert_eq!(frame.x[0] as i64, errno);
     }
-    let invalid = Box::new(stack_t(0x20_0000, 4, 1024));
-    let bad_old = Box::new([0x55; 24]);
+    let invalid = GuestUserValue::new(stack_t(0x20_0000, 4, 1024));
+    let bad_old = GuestUserValue::new([0x55u8; 24]);
     let mut frame = TrapFrame::default();
-    frame.x[..2].copy_from_slice(&[addr(&*invalid), addr(&*bad_old)]);
+    frame.x[..2].copy_from_slice(&[invalid.arg(), bad_old.arg()]);
     frame.x[8] = SYS_SIGALTSTACK as u64;
     frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
-        deny_out: std::vec![addr(&*bad_old)],
+        deny_out: std::vec![bad_old.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(
@@ -1182,11 +1166,10 @@ fn sigaltstack_serves_off_the_alternate_stack() {
         Some(Action::Served)
     );
     assert_eq!(frame.x[0] as i64, -22);
-    assert_eq!(*bad_old, [0x55; 24]);
-    for (ss, old_ss, deny_in, deny_out) in [
-        (addr(&*new), 0, true, false),
-        (0, addr(&*bad_old), false, true),
-    ] {
+    assert_eq!(bad_old.get(), [0x55u8; 24]);
+    for (ss, old_ss, deny_in, deny_out) in
+        [(new.arg(), 0, true, false), (0, bad_old.arg(), false, true)]
+    {
         let mut frame = TrapFrame::default();
         frame.x[..2].copy_from_slice(&[ss, old_ss]);
         frame.x[8] = SYS_SIGALTSTACK as u64;
@@ -1205,32 +1188,32 @@ fn sigaltstack_serves_off_the_alternate_stack() {
         );
         assert_eq!(frame.x[0] as i64, -14);
     }
-    let alias = Box::new(stack_t(0x30_0000, 0, 0x4000));
-    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*alias), addr(&*alias)]);
+    let alias = GuestUserValue::new(stack_t(0x30_0000, 0, 0x4000));
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[alias.arg(), alias.arg()]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*alias, stack_t(0x10_0000, 0, 0x4000));
+    assert_eq!(alias.get(), stack_t(0x10_0000, 0, 0x4000));
     assert_eq!(w.venue.leader_slot().read_altstack().sp, 0x30_0000);
     // Disable, returning the old one.
-    let off = Box::new(stack_t(0, SS_DISABLE, 1024));
-    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*off), addr(&*old)]);
+    let off = GuestUserValue::new(stack_t(0, SS_DISABLE, 1024));
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[off.arg(), old.arg()]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*old, stack_t(0x30_0000, 0, 0x4000));
+    assert_eq!(old.get(), stack_t(0x30_0000, 0, 0x4000));
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
-    let autodisarm = Box::new(stack_t(
+    let autodisarm = GuestUserValue::new(stack_t(
         0x40_0000,
         carrick_syscall_abi::LINUX_SS_AUTODISARM as u32,
         0x4000,
     ));
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*autodisarm), 0]);
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[autodisarm.arg(), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0], 0);
     assert_eq!(
         w.venue.leader_slot().read_altstack().flags,
         carrick_syscall_abi::LINUX_SS_AUTODISARM as u32
     );
-    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, old.arg()]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*old, *autodisarm);
+    assert_eq!(old.get(), autodisarm.get());
     assert_eq!(w.served(SYS_SIGALTSTACK), 12);
 }
 
@@ -1241,8 +1224,8 @@ fn sigaltstack_serves_off_the_alternate_stack() {
 #[test]
 fn sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm() {
     let mut w = World::new(LifecycleHatches::ON);
-    let first = Box::new(stack_t(0x10_0000, 0, 0x4000));
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*first), 0]);
+    let first = GuestUserValue::new(stack_t(0x10_0000, 0, 0x4000));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[first.arg(), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, 0);
     assert_eq!(
@@ -1256,14 +1239,14 @@ fn sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm() {
 
     // Valid replacement with faulting old_ss: returns EFAULT (-14) and keeps
     // the second stack committed.
-    let second = Box::new(stack_t(0x20_0000, 0, 0x4000));
-    let bad_old = Box::new([0x55u8; 24]);
+    let second = GuestUserValue::new(stack_t(0x20_0000, 0, 0x4000));
+    let bad_old = GuestUserValue::new([0x55u8; 24]);
     let mut frame = TrapFrame::default();
-    frame.x[..2].copy_from_slice(&[addr(&*second), addr(&*bad_old)]);
+    frame.x[..2].copy_from_slice(&[second.arg(), bad_old.arg()]);
     frame.x[8] = SYS_SIGALTSTACK as u64;
     frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
-        deny_out: std::vec![addr(&*bad_old)],
+        deny_out: std::vec![bad_old.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(
@@ -1271,7 +1254,7 @@ fn sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm() {
         Some(Action::Served)
     );
     assert_eq!(frame.x[0] as i64, -14);
-    assert_eq!(*bad_old, [0x55u8; 24]);
+    assert_eq!(bad_old.get(), [0x55u8; 24]);
     assert_eq!(
         w.venue.leader_slot().read_altstack(),
         AltStack {
@@ -1283,11 +1266,11 @@ fn sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm() {
 
     // Aliased ss == old_ss: writes captured previous stack to old_ss and
     // commits the replacement.
-    let alias = Box::new(stack_t(0x30_0000, 0, 0x4000));
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*alias), addr(&*alias)]);
+    let alias = GuestUserValue::new(stack_t(0x30_0000, 0, 0x4000));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[alias.arg(), alias.arg()]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, 0);
-    assert_eq!(*alias, stack_t(0x20_0000, 0, 0x4000));
+    assert_eq!(alias.get(), stack_t(0x20_0000, 0, 0x4000));
     assert_eq!(
         w.venue.leader_slot().read_altstack(),
         AltStack {
@@ -1301,13 +1284,13 @@ fn sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm() {
     // (-14) before the on-stack EPERM (-1) check, and leaves the active stack
     // untouched.
     w.cpu.regs.sp_el0 = 0x30_2000;
-    let bad_in = Box::new(stack_t(0x40_0000, 0, 0x4000));
+    let bad_in = GuestUserValue::new(stack_t(0x40_0000, 0, 0x4000));
     let mut frame = TrapFrame::default();
-    frame.x[..2].copy_from_slice(&[addr(&*bad_in), 0]);
+    frame.x[..2].copy_from_slice(&[bad_in.arg(), 0]);
     frame.x[8] = SYS_SIGALTSTACK as u64;
     frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
-        deny_in: std::vec![addr(&*bad_in)],
+        deny_in: std::vec![bad_in.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(
@@ -1327,13 +1310,13 @@ fn sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm() {
     // Off-stack SS_DISABLE with faulting old_ss: returns EFAULT (-14) and
     // commits the disabled stack state.
     w.cpu.regs.sp_el0 = 0x2222_0000;
-    let disable = Box::new(stack_t(0, SS_DISABLE, 0));
+    let disable = GuestUserValue::new(stack_t(0, SS_DISABLE, 0));
     let mut frame = TrapFrame::default();
-    frame.x[..2].copy_from_slice(&[addr(&*disable), addr(&*bad_old)]);
+    frame.x[..2].copy_from_slice(&[disable.arg(), bad_old.arg()]);
     frame.x[8] = SYS_SIGALTSTACK as u64;
     frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
-        deny_out: std::vec![addr(&*bad_old)],
+        deny_out: std::vec![bad_old.arg()],
         ..FaultingUser::default()
     };
     assert_eq!(
@@ -1341,7 +1324,7 @@ fn sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm() {
         Some(Action::Served)
     );
     assert_eq!(frame.x[0] as i64, -14);
-    assert_eq!(*bad_old, [0x55u8; 24]);
+    assert_eq!(bad_old.get(), [0x55u8; 24]);
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
 }
 
@@ -1351,8 +1334,8 @@ fn sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm() {
 fn arm_sigaltstack_minimum_is_5120() {
     let mut w = World::new(LifecycleHatches::ON);
     for (size, expected) in [(5119, -12), (5120, 0)] {
-        let stack = Box::new(stack_t(0x10_0000, 0, size));
-        let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*stack), 0]);
+        let stack = GuestUserValue::new(stack_t(0x10_0000, 0, size));
+        let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[stack.arg(), 0]);
         assert_eq!(action, Action::Served);
         assert_eq!(frame.x[0] as i64, expected, "size={size}");
     }
@@ -1364,27 +1347,27 @@ fn arm_sigaltstack_minimum_is_5120() {
 #[test]
 fn arm_sigaltstack_accepts_reported_and_disable_autodisarm_flags() {
     let mut w = World::new(LifecycleHatches::ON);
-    let onstack = Box::new(stack_t(0x10_0000, 1, 5120));
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*onstack), 0]);
+    let onstack = GuestUserValue::new(stack_t(0x10_0000, 1, 5120));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[onstack.arg(), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, 0);
     assert_eq!(w.venue.leader_slot().read_altstack().flags, 0);
-    let disabled = Box::new(stack_t(
+    let disabled = GuestUserValue::new(stack_t(
         0,
         SS_DISABLE | carrick_syscall_abi::LINUX_SS_AUTODISARM as u32,
         0,
     ));
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*disabled), 0]);
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[disabled.arg(), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, 0);
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
-    let invalid = Box::new(stack_t(0, SS_DISABLE | 0x8, 0));
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*invalid), 0]);
+    let invalid = GuestUserValue::new(stack_t(0, SS_DISABLE | 0x8, 0));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[invalid.arg(), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, -22);
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
-    let contradictory = Box::new(stack_t(0, SS_DISABLE | SS_ONSTACK, 0));
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*contradictory), 0]);
+    let contradictory = GuestUserValue::new(stack_t(0, SS_DISABLE | SS_ONSTACK, 0));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[contradictory.arg(), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, -22);
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
@@ -1395,21 +1378,21 @@ fn arm_sigaltstack_accepts_reported_and_disable_autodisarm_flags() {
 #[test]
 fn arm_sigaltstack_onstack_boundaries_use_open_base_closed_top() {
     let mut w = World::new(LifecycleHatches::ON);
-    let stack = Box::new(stack_t(0x10_0000, 0, 5120));
-    let old = Box::new([0u8; 24]);
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*stack), 0]);
+    let stack = GuestUserValue::new(stack_t(0x10_0000, 0, 5120));
+    let old = GuestUserValue::new([0u8; 24]);
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[stack.arg(), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, 0);
     w.cpu.regs.sp_el0 = 0x10_0000;
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[0, old.arg()]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, 0);
-    assert_eq!(*old, stack_t(0x10_0000, 0, 5120));
+    assert_eq!(old.get(), stack_t(0x10_0000, 0, 5120));
     w.cpu.regs.sp_el0 = 0x10_0000 + 5120;
-    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[0, old.arg()]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, 0);
-    assert_eq!(*old, stack_t(0x10_0000, 1, 5120));
+    assert_eq!(old.get(), stack_t(0x10_0000, 1, 5120));
 }
 
 #[test]
@@ -1443,8 +1426,8 @@ fn set_robust_list_stores_the_head_or_returns_einval() {
 fn host_only_setup_sigprocmask_declines_to_host() {
     let mut w = World::new(LifecycleHatches::ON);
     w.page().decline_to_host();
-    let set = Box::new(SIGUSR1_BIT);
-    let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_BLOCK, addr(&*set), 0, 8]);
+    let set = GuestUserValue::new(SIGUSR1_BIT);
+    let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_BLOCK, set.arg(), 0, 8]);
     assert_eq!(
         action,
         Action::Forward,
@@ -1471,11 +1454,11 @@ fn host_only_setup_robust_list_declines_to_host() {
 /// The leader clones a glibc thread whose tid word is `word`, then joins
 /// it (futex wait on the word): the child is switched in. Returns the
 /// running (child's) frame.
-fn clone_then_join(w: &mut World, word: &u32) -> TrapFrame {
+fn clone_then_join(w: &mut World, word: &GuestUserValue<u32>) -> TrapFrame {
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
-    let (action, _) = w.syscall(SYS_CLONE, &clone_args(GLIBC_FLAGS, addr(word), addr(word)));
+    let (action, _) = w.syscall(SYS_CLONE, &clone_args(GLIBC_FLAGS, word.arg(), word.arg()));
     assert_eq!(action, Action::Served);
-    assert_eq!(*word, CHILD_VISIBLE);
+    assert_eq!(word.get(), CHILD_VISIBLE);
     let mut frame = TrapFrame {
         elr: 0x5000,
         ..TrapFrame::default()
@@ -1483,7 +1466,7 @@ fn clone_then_join(w: &mut World, word: &u32) -> TrapFrame {
     let action = w.call(
         &mut frame,
         SYS_FUTEX,
-        &[addr(word), 128, u64::from(CHILD_VISIBLE), 0],
+        &[word.arg(), 128, u64::from(CHILD_VISIBLE), 0],
     );
     assert_eq!(action, Action::Served);
     assert_eq!(
@@ -1500,11 +1483,11 @@ fn clone_then_join(w: &mut World, word: &u32) -> TrapFrame {
 #[test]
 fn exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it() {
     let mut w = World::new(LifecycleHatches::ON);
-    let word = Box::new(0_u32);
+    let word = GuestUserValue::new(0_u32);
     let mut frame = clone_then_join(&mut w, &word);
     let action = w.call(&mut frame, SYS_EXIT, &[0]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*word, 0, "CLEARTID cleared");
+    assert_eq!(word.get(), 0, "CLEARTID cleared");
     let page = w.page();
     assert_eq!(page.state(0).unwrap().1, EntryState::ExitedInZone);
     assert_eq!(page.live(), 1);
@@ -1523,8 +1506,8 @@ fn exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it() {
 fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
     let mut hosted = World::new(LifecycleHatches::ON);
     let mut peer = World::new(LifecycleHatches::ON);
-    let hosted_word = Box::new(0_u32);
-    let peer_word = Box::new(0_u32);
+    let hosted_word = GuestUserValue::new(0_u32);
+    let peer_word = GuestUserValue::new(0_u32);
     let mut hosted_frame = clone_then_join(&mut hosted, &hosted_word);
     let mut peer_frame = clone_then_join(&mut peer, &peer_word);
     let entry = hosted.venue.child_slot(0).entry().unwrap();
@@ -1561,7 +1544,8 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
     );
     assert_eq!(hosted.page().live(), 2);
     assert_eq!(
-        *hosted_word, CHILD_VISIBLE,
+        hosted_word.get(),
+        CHILD_VISIBLE,
         "host retirement still owns CLEARTID"
     );
     assert_eq!(hosted.zone.slot(SLOT).current(), Some(record));
@@ -1573,7 +1557,7 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
     );
     assert_eq!(peer.call(&mut peer_frame, SYS_EXIT, &[0]), Action::Served);
     assert_eq!(peer.page().live(), 1);
-    assert_eq!(*peer_word, 0);
+    assert_eq!(peer_word.get(), 0);
 }
 
 #[test]
@@ -1602,7 +1586,7 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
     ];
     for (label, setup) in cases {
         let mut w = World::new(LifecycleHatches::ON);
-        let word = Box::new(0_u32);
+        let word = GuestUserValue::new(0_u32);
         let mut frame = clone_then_join(&mut w, &word);
         setup(&w);
         let live = w.page().live();
@@ -1626,7 +1610,7 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
             "{label}: exactly one decline reason"
         );
         assert_eq!(frame.x[0], 3, "{label}: the host exits with the status");
-        assert_eq!(*word, CHILD_VISIBLE, "{label}: CLEARTID untouched");
+        assert_eq!(word.get(), CHILD_VISIBLE, "{label}: CLEARTID untouched");
         assert_eq!(w.page().state(0).unwrap().1, EntryState::Born, "{label}");
         assert_eq!(w.page().live(), live, "{label}");
         assert_eq!(
@@ -1641,10 +1625,10 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
     let (action, _) = w.syscall(SYS_EXIT, &[0]);
     assert_eq!(action, Action::Forward);
     let entry = w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
-    let word = Box::new(9_u32);
+    let word = GuestUserValue::new(9_u32);
     w.venue
         .child_slot(0)
-        .reset_for_birth(BlockedMask(0), addr(&*word), entry)
+        .reset_for_birth(BlockedMask(0), word.arg(), entry)
         .unwrap();
     w.page().thread_born().unwrap();
     w.task().set(
@@ -1654,7 +1638,7 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
     );
     let (action, _) = w.syscall(SYS_EXIT, &[0]);
     assert_eq!(action, Action::Forward);
-    assert_eq!(*word, 9);
+    assert_eq!(word.get(), 9);
     assert_eq!(w.page().live(), 2);
 }
 
@@ -2356,7 +2340,7 @@ fn set_tid_address_cpl0_records_word_and_returns_the_exact_tid() {
 #[test]
 fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
     let mut w = World::new(LifecycleHatches::ON);
-    let word = Box::new(CHILD_VISIBLE);
+    let word = GuestUserValue::new(CHILD_VISIBLE);
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
     let (action, _) = w.syscall(SYS_CLONE, &clone_args(GO_FLAGS, 0, 0));
     assert_eq!(action, Action::Served);
@@ -2368,7 +2352,7 @@ fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
         w.call(
             &mut frame,
             SYS_FUTEX,
-            &[addr(&*word), 128, u64::from(CHILD_VISIBLE), 0]
+            &[word.arg(), 128, u64::from(CHILD_VISIBLE), 0]
         ),
         Action::Served
     );
@@ -2379,7 +2363,7 @@ fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
     assert_eq!(w.venue.child_slot(0).clear_child_tid(), 0);
     let mut owner = IdentityOwner(crate::common_entry::execution_binding(w.task()));
     frame.slot = SLOT_IDX as u64;
-    frame.x[0] = addr(&*word);
+    frame.x[0] = word.arg();
     frame.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw();
     let names = InotifyNameCache::new();
     let route = crate::dispatch::dispatch_syscall_with_native::<
@@ -2419,9 +2403,9 @@ fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
         Some(carrick_el1_abi::ServedBoundary::Completed)
     );
     assert_eq!(w.task().linux.take_served_boundary(), None);
-    assert_eq!(w.venue.child_slot(0).clear_child_tid(), addr(&*word));
+    assert_eq!(w.venue.child_slot(0).clear_child_tid(), word.arg());
     assert_eq!(w.call(&mut frame, SYS_EXIT, &[0]), Action::Served);
-    assert_eq!(*word, 0);
+    assert_eq!(word.get(), 0);
     assert_eq!(w.task().execution.task.load(Ordering::Relaxed), PARENT_TID);
     assert_eq!(frame.x[0], 0);
     assert_eq!(w.zone.slot(SLOT).queued(), 0);
