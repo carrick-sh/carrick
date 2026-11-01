@@ -1,3 +1,15 @@
+# #1090 shared-file scope (classification acknowledgement, not runtime acceptance).
+# Thread control gains constant-size restart custody, cleared at rebirth.
+# forwarded_restart_is_consumed_once_and_cleared_at_rebirth is the new
+# lifecycle binding; its focused crate gate is recorded separately.
+# Checkpoint predicates also recognize an armed restart witness. The new
+# x86_empty_ignored_and_blocked_checkpoints_consume_restart_once and default-
+# fatal signal-return controls passed through the real registered native owner.
+# Existing semantic bindings and work budgets below are retained. These scope
+# notes do not replace their contract-specific acceptance. Live continuation
+# and reservation-transfer evidence remains unresolved under
+# kernel.el1.signal-delivery-owner; see
+# docs/conformance-contracts/continuation-signal-return.md.
 # #1044: owned-yield replies are typed separately from memory preparation.
 # The retained IPC/CarrierWork seam bindings below cover that API change;
 # existing fork, lifecycle, file and inotify acceptance remains unchanged.
