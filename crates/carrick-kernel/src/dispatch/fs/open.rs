@@ -208,12 +208,20 @@ impl<'a> FsView<'a> {
             }
             // inotify, fanotify and dnotify events name the opener's task
             // and follow its descriptor through write and close, which a
-            // native descriptor never reaches here: refuse rather than
-            // drop events.
+            // native descriptor never reaches here. While any watch exists
+            // a write, create or truncate open is refused before its side
+            // effect. A read-only open is served as the venue always served
+            // it, without its events: no IN_OPEN, FAN_OPEN or
+            // IN_CLOSE_NOWRITE for the open and close, and no IN_ACCESS or
+            // FAN_ACCESS for its reads (a known gap).
             OpenSink::Native(native)
-                if !self.fs.inotify_registry.is_empty()
-                    || !self.fs.fanotify_registry.is_empty()
-                    || !self.fs.dnotify_registry.lock().is_empty() =>
+                if (writable_request
+                    || open_flags.intersects(
+                        LinuxOpenFlags::CREAT | LinuxOpenFlags::TRUNC | LinuxOpenFlags::TMPFILE,
+                    ))
+                    && (!self.fs.inotify_registry.is_empty()
+                        || !self.fs.fanotify_registry.is_empty()
+                        || !self.fs.dnotify_registry.lock().is_empty()) =>
             {
                 return Ok(native.refuse());
             }
@@ -399,8 +407,8 @@ impl<'a> FsView<'a> {
             VfsOpenAttempt::Installed(fd) => {
                 // A native caller's sink checked O_DIRECTORY before it
                 // installed (see `NativeOpenSink::install`), and nothing
-                // below applies to it: its inotify and fanotify registries
-                // were empty at admission.
+                // below applies to it: a native open raises no watcher
+                // events (see its admission in `open_with_sink`).
                 let Some(context) = sink.context() else {
                     return Ok(DispatchOutcome::returned_i32(fd));
                 };
@@ -913,8 +921,8 @@ impl<'a> FsView<'a> {
         {
             self.record_opened_path(sink, fd, record_path.clone());
         }
-        // Everything below notifies watchers, whose registries were empty
-        // when a native caller's open was admitted.
+        // Everything below notifies watchers, which a native caller's open
+        // does not (see its admission above).
         let Some(context) = sink.context() else {
             return Ok(DispatchOutcome::returned_i32(fd));
         };
