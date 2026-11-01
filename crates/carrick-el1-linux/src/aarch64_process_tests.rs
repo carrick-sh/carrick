@@ -7,6 +7,8 @@ mod native_child_handoff_tests;
 mod native_fault_supply_tests;
 #[cfg(all(test, not(target_os = "macos")))]
 mod native_ipc_wake_tests;
+#[cfg(all(test, not(target_os = "macos")))]
+mod native_poll_tests;
 #[cfg(test)]
 mod native_retirement_tests;
 

@@ -634,6 +634,7 @@ fn clone_closed_gate_returns_eagain_and_threads_hatch_forwards() {
     let mut w = World::new(LifecycleHatches {
         threads: false,
         sigmask: true,
+        waitsets: true,
     });
     run(&mut w, Action::Forward);
 }
@@ -928,6 +929,7 @@ fn sigprocmask_serves_errors_aliases_and_refuses_closed_services() {
             LifecycleHatches {
                 threads: true,
                 sigmask: false,
+                waitsets: true,
             },
             [SIG_BLOCK, addr(&*set), addr(&*old), 8],
             false,
@@ -1431,6 +1433,7 @@ fn set_robust_list_stores_the_head_or_returns_einval() {
     let mut w = World::new(LifecycleHatches {
         threads: true,
         sigmask: false,
+        waitsets: true,
     });
     let (action, _) = w.syscall(SYS_SET_ROBUST_LIST, &[0x9000, 24]);
     assert_eq!(action, Action::Forward);
@@ -2297,6 +2300,220 @@ impl crate::dispatch::GuestDispatchFrame for Cpl0IdentityFrame {
     }
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
         None
+    }
+}
+
+/// Host-test frame with the production CPL0 poll contract: native `poll`
+/// (7) or `ppoll` (271) and the carrier readiness crossing, which records
+/// each query and reports every queried entry writable.
+struct Cpl0PollFrame {
+    frame: TrapFrame,
+    native: u64,
+    queries: Vec<(usize, i32)>,
+}
+impl carrick_personality_linux::dispatch::SyscallFrame for Cpl0PollFrame {
+    fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+        carrick_syscall_abi::nr::PPOLL
+    }
+    fn argument(&self, index: usize) -> Option<u64> {
+        carrick_personality_linux::dispatch::SyscallFrame::argument(&self.frame, index)
+    }
+    fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+        carrick_personality_linux::dispatch::SyscallFrame::result(&self.frame)
+    }
+    fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
+        carrick_personality_linux::dispatch::SyscallFrame::set_result(&mut self.frame, result);
+    }
+    fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
+        carrick_personality_linux::dispatch::SyscallFrame::slot(&self.frame)
+    }
+    fn user_sp(&self) -> Option<UserVa> {
+        carrick_personality_linux::dispatch::SyscallFrame::user_sp(&self.frame)
+    }
+}
+impl crate::dispatch::GuestDispatchFrame for Cpl0PollFrame {
+    fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+        carrick_guest_arch::NativeOrdinal::new(self.native)
+    }
+    fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+        carrick_personality_linux::crossing::HostCrossingSet::X86
+    }
+    fn may_serve_poll(&self) -> bool {
+        true
+    }
+    fn poll_timeout_kind(&self) -> carrick_personality_linux::poll::PollTimeoutKind {
+        if self.native == 7 {
+            carrick_personality_linux::poll::PollTimeoutKind::Milliseconds
+        } else {
+            carrick_personality_linux::poll::PollTimeoutKind::Timespec
+        }
+    }
+    fn query_host_readiness(
+        &mut self,
+        entries: &mut [carrick_el1_abi::HostReadinessEntry],
+        timeout_ms: i32,
+        _: carrick_personality_linux::poll::PollSignalMask,
+    ) -> Option<i64> {
+        self.queries.push((entries.len(), timeout_ms));
+        for entry in entries.iter_mut() {
+            entry.revents = entry.events & carrick_syscall_abi::LINUX_POLLOUT;
+        }
+        Some(entries.len() as i64)
+    }
+    fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
+        None
+    }
+    fn arm_frame_ref(&self) -> Option<&TrapFrame> {
+        None
+    }
+    fn arm_scheduler(&self) -> bool {
+        false
+    }
+    fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+        None
+    }
+}
+
+/// x86 CPL0's delegated poll keeps the behaviour it had before the shared
+/// body: a delegated set with no host-bound entry returns its ready count at
+/// once, even with a timeout and nothing ready (no ring wait on that lane
+/// yet); host-bound sets and empty sets take the carrier crossing with the
+/// caller's timeout; the cap stays 1024 and a bad array is EFAULT.
+#[test]
+fn x86_cpl0_delegated_poll_keeps_its_existing_completions() {
+    use carrick_el1_abi::{
+        DELEGATED_STATE_GUEST, DelegatedFile, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot,
+        MAX_ZONE_OPEN_FILES,
+    };
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    const POLLIN: i16 = 1;
+    const POLLOUT: i16 = 4;
+    const POLLNVAL: i16 = 0x20;
+    let w = World::new(LifecycleHatches::ON);
+    let file_table = w.task().linux.file_table.load(Ordering::Acquire).max(1);
+    let fd_map: Box<[FdMapSlot]> = (0..FD_MAP_CAPACITY).map(|_| FdMapSlot::new()).collect();
+    let open_table: Box<[DelegatedOpenFile]> = (0..MAX_ZONE_OPEN_FILES)
+        .map(|_| DelegatedOpenFile::new())
+        .collect();
+    let object_table: Box<[DelegatedFile]> = (0..64).map(|_| DelegatedFile::new()).collect();
+    // fd 3: an in-zone delegated description (no host binding).
+    open_table[0]
+        .state
+        .store(DELEGATED_STATE_GUEST, Ordering::Release);
+    fd_map[0].set(file_table, 3, 1, 1);
+    // fd 4: a host-bound description.
+    let mut pipe = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    crate::file_table::admit_host_fd(
+        &fd_map,
+        &open_table,
+        &object_table,
+        file_table,
+        4,
+        pipe[1],
+        0,
+    )
+    .unwrap();
+    let names = InotifyNameCache::new();
+    let call = |native: u64, args: [u64; 5]| {
+        let mut owner = IdentityOwner(crate::common_entry::execution_binding(w.task()));
+        let mut frame = Cpl0PollFrame {
+            frame: TrapFrame {
+                slot: SLOT_IDX as u64,
+                ..Default::default()
+            },
+            native,
+            queries: Vec::new(),
+        };
+        frame.frame.x[..5].copy_from_slice(&args);
+        let route = crate::dispatch::dispatch_syscall_with_native::<
+            _,
+            FakeCpu,
+            HardwareUserWord,
+            _,
+            carrick_sched_core::Aarch64ParkedContext,
+        >(
+            &mut frame,
+            &w.counters,
+            &w.tasks,
+            &fd_map,
+            &object_table,
+            &open_table,
+            &[],
+            &names,
+            None,
+            None,
+            Some(&*w.venue),
+            Some(&mut owner),
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(route, CompletionRoute::Served);
+        (frame.frame.x[0] as i64, frame.queries)
+    };
+    let zone_only = |fds: &mut [PollFd], timeout: i32| {
+        [
+            fds.as_mut_ptr() as u64,
+            fds.len() as u64,
+            timeout as u32 as u64,
+            0,
+            0,
+        ]
+    };
+    // Pure delegated in-zone set, nothing ready, finite and infinite timeouts.
+    for timeout in [1000, -1] {
+        let mut fds = [PollFd {
+            fd: 3,
+            events: POLLIN,
+            revents: 0x7777,
+        }];
+        assert_eq!(
+            call(7, zone_only(&mut fds, timeout)),
+            (0, Vec::new()),
+            "timeout {timeout}"
+        );
+        assert_eq!(fds[0].revents, 0, "revents are written");
+    }
+    // An absent descriptor is POLLNVAL and never crosses.
+    let mut fds = [PollFd {
+        fd: 9,
+        events: POLLIN,
+        revents: 0,
+    }];
+    assert_eq!(call(7, zone_only(&mut fds, 1000)), (1, Vec::new()));
+    assert_eq!(fds[0].revents, POLLNVAL);
+    // A host-bound entry crosses once with the caller's timeout.
+    let mut fds = [
+        PollFd {
+            fd: 4,
+            events: POLLOUT,
+            revents: 0,
+        },
+        PollFd {
+            fd: 3,
+            events: POLLIN,
+            revents: 0x7777,
+        },
+    ];
+    assert_eq!(call(7, zone_only(&mut fds, 1000)), (1, vec![(1, 1000)]));
+    assert_eq!((fds[0].revents, fds[1].revents), (POLLOUT, 0));
+    // An empty set carries its timer through the same crossing.
+    assert_eq!(call(7, [0, 0, 250, 0, 0]), (0, vec![(0, 250)]));
+    // ppoll with a NULL timespec waits without a deadline.
+    assert_eq!(call(271, [0, 0, 0, 0, 0]), (0, vec![(0, -1)]));
+    // The delegated cap is 1024 descriptors; a bad array is EFAULT.
+    assert_eq!(call(7, [0x1000, 1025, 0, 0, 0]).0, -22);
+    assert_eq!(call(7, [0xffff_ffff_ffff_f000, 1, 0, 0, 0]).0, -14);
+    unsafe {
+        libc::close(pipe[0]);
+        libc::close(pipe[1]);
     }
 }
 

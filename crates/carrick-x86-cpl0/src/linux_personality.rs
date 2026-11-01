@@ -10,7 +10,7 @@ use carrick_el1_abi::{
     HostObjectReleaseCrossing, HostObjectWriteCrossing, HostReadinessCrossing, fd_map_lookup,
 };
 use carrick_el1_linux::dispatch::GuestDispatchFrame;
-use carrick_el1_linux::dispatch::{PollSignalMask, PollTimeoutKind, dispatch_syscall_with_native};
+use carrick_el1_linux::dispatch::dispatch_syscall_with_native;
 use carrick_el1_linux::lifecycle::LifecycleVenue;
 use carrick_el1_linux::thread_setup::GuestLifecycleVenue;
 use carrick_guest_arch::{LayoutBackend, NativeReturnWord, SlotId, UserVa};
@@ -18,6 +18,7 @@ use carrick_personality_linux::crossing::{HostCrossingSet, evaluate_host_crossin
 use carrick_personality_linux::dispatch::{CompletionRoute, SyscallFrame};
 use carrick_personality_linux::entry::{CanonicalCall, decode_x86_snapshot};
 use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+use carrick_personality_linux::poll::{PollSignalMask, PollTimeoutKind};
 use carrick_syscall_abi::{CanonicalNr, LINUX_EBADF};
 use carrick_x86_carrier::entry::{
     PageFaultStack, cross_owner_grant, fatal_boot, fatal_error, forward_to_host, halt, notify_work,

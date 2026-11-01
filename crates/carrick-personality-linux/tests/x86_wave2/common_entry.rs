@@ -450,6 +450,7 @@ fn closed_gate_or_hatch_refuses_without_effect() {
     let w2 = World::new(LifecycleHatches {
         threads: true,
         sigmask: false,
+        waitsets: true,
     });
     assert_eq!(w2.robust(1, 0xb000, 24).0, Action::Served);
     for w in [&w, &w2] {

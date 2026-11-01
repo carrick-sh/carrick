@@ -113,6 +113,21 @@ pub mod events {
     pub const WRITE_SIDE: u32 = OUT | WRNORM | WRBAND;
 }
 
+/// What [`IpcRegion::zone_level`] observed.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum ZoneLevel {
+    /// Linux poll/epoll event bits.
+    Level(u32),
+    /// The level depends on host-backed state.
+    HostHalf,
+}
+
 /// Which side of which object an item watches.
 #[repr(u32)]
 #[derive(
@@ -900,6 +915,34 @@ impl<'a> IpcRegion<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The current Linux readiness level of the in-zone object `backing`
+    /// names, as poll/epoll event bits: the one level owner for both. A
+    /// pipe end or eventfd reports its member level. A zone epoll reports
+    /// `IN | RDNORM` while its zone half has a reportable item.
+    /// [`ZoneLevel::HostHalf`] for a host-backed description or an epoll
+    /// whose interest list has host items: the zone cannot answer alone.
+    pub fn zone_level<W: LockWait>(
+        &self,
+        backing: IpcBacking,
+        wait: &W,
+    ) -> Result<ZoneLevel, IpcError> {
+        if let IpcBacking::Epoll { object } = backing {
+            return Ok(match self.epoll_zone_only_ready_count(object, 1, wait)? {
+                Some(count) if count.records() != 0 => {
+                    ZoneLevel::Level(events::IN | events::RDNORM)
+                }
+                Some(_) => ZoneLevel::Level(0),
+                None => ZoneLevel::HostHalf,
+            });
+        }
+        let Some((object, kind)) = EpollMember::of_backing(backing) else {
+            return Ok(ZoneLevel::HostHalf);
+        };
+        Ok(ZoneLevel::Level(
+            self.lock(object, wait)?.member_level(kind)?,
+        ))
     }
 
     /// Whether the zone half has a reportable item now, without consuming

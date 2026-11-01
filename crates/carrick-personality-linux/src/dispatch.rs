@@ -620,6 +620,9 @@ fn serve_family<'a, C: EntryContext + 'a>(
         forward_reason: if family == Family::Unported
             || (matches!(family, Family::Sched(_)) && completion == FamilyCompletion::Forward)
             || (matches!(family, Family::Ipc(_)) && completion == FamilyCompletion::Forward)
+            // A poll set the ring refuses keeps the unported route it had
+            // before the family served any set.
+            || (family == Family::Poll && completion == FamilyCompletion::Forward)
         {
             ForwardReason::Unported
         } else {
@@ -1132,7 +1135,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
             FamilyRun {
                 completion: FamilyCompletion::Forward,
                 returned: None,
-                forward_reason: if family == Family::Unported {
+                forward_reason: if matches!(family, Family::Unported | Family::Poll) {
                     ForwardReason::Unported
                 } else {
                     ForwardReason::FamilyFallback

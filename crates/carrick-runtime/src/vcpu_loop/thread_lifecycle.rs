@@ -262,6 +262,7 @@ mod tests {
             carrick_el1_abi::ThreadLifecyclePage::with_hatches(carrick_el1_abi::LifecycleHatches {
                 threads: false,
                 sigmask: false,
+                waitsets: true,
             });
         let maps = std::cell::Cell::new(0);
         let result = publish_for_page(&page, || {

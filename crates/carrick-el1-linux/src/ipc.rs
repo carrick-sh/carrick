@@ -312,6 +312,64 @@ pub fn native_descriptor(
     }
 }
 
+/// `task`'s ring-owned table (a native process's complete namespace).
+fn owned_table(venue: &IpcVenue<'_>, task: &CurrentTask) -> Option<TableId> {
+    venue.tables.owned_table_of(task).map(TableId::from_raw)
+}
+
+/// The soft descriptor limit (`RLIMIT_NOFILE`) of `task`'s ring-owned
+/// table. `None` when it has none or the table is contended.
+pub fn native_poll_limit(venue: &IpcVenue<'_>, task: &CurrentTask) -> Option<u64> {
+    let table = owned_table(venue, task)?;
+    venue
+        .region
+        .fd(EL1_WAIT)
+        .limit(table)
+        .ok()
+        .map(|limit| limit as u64)
+}
+
+/// What `fd` names for `poll` in `task`'s ring-owned table, with the
+/// in-zone level from the one level owner epoll also reads.
+pub fn native_poll_target(
+    venue: &IpcVenue<'_>,
+    task: &CurrentTask,
+    fd: i32,
+) -> carrick_personality_linux::poll::PollTarget {
+    use carrick_el1_abi::ipc::epoll::ZoneLevel;
+    use carrick_personality_linux::poll::PollTarget;
+    let Some(table) = owned_table(venue, task) else {
+        return PollTarget::Busy;
+    };
+    let description = match venue.region.fd(EL1_WAIT).get(table, Fd(fd)) {
+        Ok(description) => description,
+        Err(FdError::BadFd) => return PollTarget::Absent,
+        Err(_) => return PollTarget::Busy,
+    };
+    let Some(backing) = IpcBacking::decode(description.backing) else {
+        return PollTarget::Busy;
+    };
+    let object = match backing {
+        IpcBacking::Host(_) => return PollTarget::HostBacked,
+        IpcBacking::Pipe { object, .. }
+        | IpcBacking::EventFd { object }
+        | IpcBacking::Epoll { object } => object,
+    };
+    let wait = ObjectLockWait {
+        region: &venue.region,
+        object,
+    };
+    match venue.region.zone_level(backing, &wait) {
+        // Linux poll bits are the low epoll bits; no level carries more.
+        Ok(ZoneLevel::Level(level)) => PollTarget::InZone(level as u16),
+        Ok(ZoneLevel::HostHalf) => PollTarget::HostBacked,
+        // A description closed and its object freed after the snapshot, or a
+        // host holder past the bounded wait: not now. Any other refusal also
+        // keeps the call's route, before any effect.
+        Err(_) => PollTarget::Busy,
+    }
+}
+
 /// An object lock's wait, by holder: unbounded while EL1 on another vCPU
 /// holds it, bounded ([`EL1_GUEST_LOCK_SPINS`]) while a host thread does.
 struct ObjectLockWait<'r, 'a> {

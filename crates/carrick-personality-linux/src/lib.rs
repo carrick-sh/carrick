@@ -15,6 +15,7 @@ pub mod signal;
 pub mod pending_file;
 
 pub mod native_host_file;
+pub mod poll;
 
 pub mod pending_anonymous;
 

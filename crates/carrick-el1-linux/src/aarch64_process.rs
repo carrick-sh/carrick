@@ -2036,6 +2036,11 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             ThreadLifecyclePage::initialize_at(
                 loan.lifecycle.page.raw() as *mut ThreadLifecyclePage
             );
+            // The ring waitset hatch follows the process, not the template.
+            if let Some((parent, _)) = self.task.lifecycle_refs() {
+                (*(loan.lifecycle.page.raw() as *const ThreadLifecyclePage))
+                    .inherit_waitsets(parent);
+            }
             let controls = loan.lifecycle.controls.raw() as *mut ThreadControlSlot;
             for index in 0..=carrick_el1_abi::THREAD_POOL_ENTRIES {
                 // The accepted loan already carries the owner's retained aliases.

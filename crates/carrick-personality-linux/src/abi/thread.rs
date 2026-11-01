@@ -1526,11 +1526,15 @@ const _: () = assert!(core::mem::size_of::<HostBornMember>() == 32);
 /// Environment names of the EL1 lifecycle opt-out hatches.
 pub const EL1_THREADS_HATCH_ENV: &str = "CARRICK_EL1_THREADS";
 pub const EL1_SIGMASK_HATCH_ENV: &str = "CARRICK_EL1_SIGMASK";
+pub const EL1_WAITSETS_HATCH_ENV: &str = "CARRICK_EL1_WAITSETS";
 
 /// Which EL1 lifecycle services a page allows. Both are on by default;
 /// `CARRICK_EL1_THREADS=0` stops EL1 serving clone and exit,
 /// `CARRICK_EL1_SIGMASK=0` stops it serving `rt_sigprocmask`,
-/// `sigaltstack` and `set_robust_list`. The host reads each variable once
+/// `sigaltstack` and `set_robust_list`, and `CARRICK_EL1_WAITSETS=0` keeps a
+/// native process's `ppoll` on its unported route. A native fork child
+/// inherits its parent's waitset bit ([`ThreadLifecyclePage::inherit_waitsets`]).
+/// The host reads each variable once
 /// ([`Self::from_lookup`]) and builds every page with the result, so EL1 and
 /// the host decide from the same bits.
 #[derive(
@@ -1543,15 +1547,18 @@ pub const EL1_SIGMASK_HATCH_ENV: &str = "CARRICK_EL1_SIGMASK";
 pub struct LifecycleHatches {
     pub threads: bool,
     pub sigmask: bool,
+    pub waitsets: bool,
 }
 
 const SERVING_THREADS: u32 = 1;
 const SERVING_SIGMASK: u32 = 2;
+const SERVING_WAITSETS: u32 = 4;
 
 impl LifecycleHatches {
     pub const ON: Self = Self {
         threads: true,
         sigmask: true,
+        waitsets: true,
     };
 
     /// Consult `lookup` once per hatch variable; exactly `0`
@@ -1561,12 +1568,14 @@ impl LifecycleHatches {
         Self {
             threads: on(EL1_THREADS_HATCH_ENV),
             sigmask: on(EL1_SIGMASK_HATCH_ENV),
+            waitsets: on(EL1_WAITSETS_HATCH_ENV),
         }
     }
 
     const fn bits(self) -> u32 {
         (if self.threads { SERVING_THREADS } else { 0 })
             | (if self.sigmask { SERVING_SIGMASK } else { 0 })
+            | (if self.waitsets { SERVING_WAITSETS } else { 0 })
     }
 }
 const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 384);
@@ -1925,6 +1934,22 @@ impl ThreadLifecyclePage {
     /// (`CARRICK_EL1_SIGMASK`).
     pub fn serves_sigmask(&self) -> bool {
         self.serving.load(Ordering::Relaxed) & SERVING_SIGMASK != 0
+    }
+
+    /// Whether the ring serves a native process's poll sets
+    /// (`CARRICK_EL1_WAITSETS`).
+    pub fn serves_waitsets(&self) -> bool {
+        self.serving.load(Ordering::Relaxed) & SERVING_WAITSETS != 0
+    }
+
+    /// Give a page being built for a native fork child its parent's waitset
+    /// bit, before the child is published.
+    pub fn inherit_waitsets(&self, parent: &Self) {
+        if parent.serves_waitsets() {
+            self.serving.fetch_or(SERVING_WAITSETS, Ordering::Relaxed);
+        } else {
+            self.serving.fetch_and(!SERVING_WAITSETS, Ordering::Relaxed);
+        }
     }
 
     pub fn pending(&self) -> &PendingSummary {
@@ -3031,10 +3056,18 @@ mod tests {
             h,
             LifecycleHatches {
                 threads: true,
-                sigmask: false
+                sigmask: false,
+                waitsets: true,
             }
         );
-        assert_eq!(seen, [EL1_THREADS_HATCH_ENV, EL1_SIGMASK_HATCH_ENV]);
+        assert_eq!(
+            seen,
+            [
+                EL1_THREADS_HATCH_ENV,
+                EL1_SIGMASK_HATCH_ENV,
+                EL1_WAITSETS_HATCH_ENV
+            ]
+        );
         let h = LifecycleHatches::from_lookup(|name: &str| {
             (name == EL1_THREADS_HATCH_ENV).then_some("1")
         });
@@ -3042,10 +3075,18 @@ mod tests {
         let p = ThreadLifecyclePage::with_hatches(LifecycleHatches {
             threads: false,
             sigmask: true,
+            waitsets: false,
         });
         assert!(!p.serves_threads());
         assert!(p.serves_sigmask());
+        assert!(!p.serves_waitsets());
         assert!(ThreadLifecyclePage::new().serves_threads());
+        let child = ThreadLifecyclePage::new();
+        assert!(child.serves_waitsets());
+        child.inherit_waitsets(&p);
+        assert!(!child.serves_waitsets() && child.serves_threads());
+        child.inherit_waitsets(&ThreadLifecyclePage::new());
+        assert!(child.serves_waitsets());
     }
 
     #[test]
@@ -3061,7 +3102,8 @@ mod tests {
             LifecycleHatches::from_lookup(|_| Some("0")),
             LifecycleHatches {
                 threads: false,
-                sigmask: false
+                sigmask: false,
+                waitsets: false,
             }
         );
     }

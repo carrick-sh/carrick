@@ -8,8 +8,8 @@
 //! existing zone tables and IPC venue, ignores negative descriptors, and reports
 //! `POLLNVAL` for absent nonnegative descriptors. Unconditional `ERR`, `HUP`, and
 //! `NVAL` are reported independently of requested events. Duplicate descriptors
-//! receive independent results. A blocking wait releases execution capacity
-//! through an owned continuation on the zone scheduler.
+//! receive independent results. This is the delegated namespace of the
+//! shared poll body (`carrick_personality_linux::poll`).
 
 extern crate alloc;
 
@@ -23,7 +23,7 @@ use carrick_el1_abi::{
     DelegatedFile, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, HostObjectBinding,
     HostReadinessEntry, fd_map_lookup, lock_fd_map,
 };
-use carrick_sched_core::{SlotId, ZoneTables};
+use carrick_personality_linux::poll::PollFd;
 pub use carrick_syscall_abi::{
     LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_POLLPRI,
     LINUX_POLLRDBAND, LINUX_POLLRDNORM, LINUX_POLLWRBAND, LINUX_POLLWRNORM,
@@ -446,15 +446,6 @@ pub fn dup_host_binding(
     })
 }
 
-/// Bounded Linux `struct pollfd`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PollFd {
-    pub fd: i32,
-    pub events: i16,
-    pub revents: i16,
-}
-
 fn claim_open_record<'a>(
     open_table: &'a [DelegatedOpenFile],
     object_table: &'a [DelegatedFile],
@@ -798,84 +789,10 @@ pub fn resolve_poll_with_host_readiness(
     ready_count
 }
 
-/// Owned continuation for a blocking poll.
-#[derive(Debug)]
-pub struct PollContinuation {
-    pub file_table: u64,
-    pub pollfds: Vec<PollFd>,
-    pub timeout_ms: i32,
-    pub user_va: u64,
-    pub slot: Option<SlotId>,
-}
-
-impl PollContinuation {
-    pub fn new(
-        file_table: u64,
-        pollfds: Vec<PollFd>,
-        timeout_ms: i32,
-        user_va: u64,
-        slot: Option<SlotId>,
-    ) -> Self {
-        Self {
-            file_table,
-            pollfds,
-            timeout_ms,
-            user_va,
-            slot,
-        }
-    }
-
-    /// Releases execution capacity on the zone scheduler by clearing the slot's current task.
-    pub fn release_capacity<C: carrick_el1_abi::EntryContext>(&mut self, zone: &ZoneTables<C>) {
-        if let Some(slot) = self.slot {
-            zone.clear_current(slot);
-        }
-    }
-
-    /// Re-evaluates poll against current table state.
-    pub fn poll(
-        &mut self,
-        fd_map: &[FdMapSlot],
-        open_table: &[DelegatedOpenFile],
-        object_table: &[DelegatedFile],
-        ipc: Option<&crate::ipc::IpcVenue<'_>>,
-    ) -> Option<i32> {
-        let ready = resolve_poll(
-            fd_map,
-            open_table,
-            object_table,
-            ipc,
-            self.file_table,
-            &mut self.pollfds,
-        );
-        if ready > 0 { Some(ready) } else { None }
-    }
-
-    /// Complete the wait unconditionally, returning (ready_count, pollfds).
-    pub fn complete(
-        mut self,
-        fd_map: &[FdMapSlot],
-        open_table: &[DelegatedOpenFile],
-        object_table: &[DelegatedFile],
-        ipc: Option<&crate::ipc::IpcVenue<'_>>,
-    ) -> (i32, Vec<PollFd>) {
-        let ready = resolve_poll(
-            fd_map,
-            open_table,
-            object_table,
-            ipc,
-            self.file_table,
-            &mut self.pollfds,
-        );
-        (ready, self.pollfds)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use carrick_el1_abi::MAX_ZONE_OPEN_FILES;
-    use carrick_sched_core::ThreadIdentity;
 
     fn resolve_with_native_batch(
         fd_map: &[FdMapSlot],
@@ -1683,107 +1600,6 @@ mod tests {
             .expect("host descriptor remains in the batch");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].poll_index, 1);
-    }
-
-    #[test]
-    fn test_blocking_poll_releases_capacity_and_completes() {
-        const LOADED_MM: u64 = 0x5000;
-        let (fd_map, open_table, object_table) = setup_tables();
-        let file_table = 10;
-        let slot = SlotId::new(0);
-
-        // Allocate a zeroed ZoneTables
-        let layout = std::alloc::Layout::new::<ZoneTables>();
-        let zone: Box<ZoneTables> = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
-        };
-
-        let identity = ThreadIdentity {
-            tid: 41,
-            serial: 101,
-            mm: LOADED_MM,
-            file_table,
-            generation: 1,
-            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
-            affinity: 0,
-            lifecycle_page: 0,
-            control_slot: 0,
-        };
-        // A host-owned waiter runs only on a slot whose executor has its
-        // task (and address space) loaded: an idle executor cannot take it.
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, LOADED_MM, None, 0);
-        assert!(zone.occupancy.replace(
-            carrick_sched_core::ExecutionSlot::zone(slot),
-            0,
-            LOADED_MM
-        ));
-        let guard = zone
-            .lock(
-                ZoneTables::bucket_of(0, 0x1000),
-                &carrick_sched_core::BoundedSpin(100),
-            )
-            .unwrap();
-        let record = zone.alloc_record(identity).unwrap();
-        let seq = zone.next_seq(record);
-        zone.enqueue(&guard, record, seq, 0, 0x1000, u32::MAX, 0)
-            .unwrap();
-        zone.publish_park(record, seq);
-        drop(guard);
-
-        let guard = zone
-            .lock(
-                ZoneTables::bucket_of(0, 0x1000),
-                &carrick_sched_core::BoundedSpin(100),
-            )
-            .unwrap();
-        let mut woken = [const { carrick_sched_core::WakeRecord::Empty }; 1];
-        let n = zone
-            .wake(
-                &guard,
-                0,
-                0x1000,
-                u32::MAX,
-                1,
-                carrick_sched_core::Waker::El1 { slot },
-                &mut woken,
-            )
-            .unwrap();
-        assert_eq!(n, 1);
-        drop(guard);
-
-        assert_eq!(zone.switch_in(slot), Some(record));
-        // Verify executor slot has current task before release
-        assert_eq!(zone.slot(slot).current(), Some(record));
-
-        let pfds = vec![PollFd {
-            fd: 0,
-            events: LINUX_POLLIN,
-            revents: 0,
-        }];
-        let mut continuation = PollContinuation::new(file_table, pfds, 1000, 0x1000, Some(slot));
-
-        // Release execution capacity: this MUST clear current and free the executor!
-        continuation.release_capacity(&zone);
-        assert_eq!(
-            zone.slot(slot).current(),
-            None,
-            "release_capacity must vacate current slot, freeing the executor"
-        );
-
-        // Now complete the wait
-        admit_stdio(
-            &fd_map,
-            &open_table,
-            &object_table,
-            file_table,
-            [true, true, true],
-        );
-        let (ready, out_pfds) = continuation.complete(&fd_map, &open_table, &object_table, None);
-        assert_eq!(out_pfds.len(), 1);
-        assert!(ready >= 0);
     }
 
     #[test]

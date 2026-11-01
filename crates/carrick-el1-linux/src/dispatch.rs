@@ -26,32 +26,7 @@ use carrick_personality_linux::pending_anonymous::{DelegatedStep, PermissionStep
 use carrick_personality_linux::pending_file::PendingFileVenue;
 use core::sync::atomic::Ordering;
 
-/// ARM frame access is retained for scheduler/IPC park leaves that have not
-/// yet acquired an ISA-neutral saved-context contract.
-#[derive(::core::clone::Clone, ::core::marker::Copy)]
-pub enum PollTimeoutKind {
-    Milliseconds,
-    Timespec,
-}
-
-#[derive(::core::clone::Clone, ::core::marker::Copy)]
-pub enum PollSignalMask {
-    Inherit,
-    Replace(carrick_signal_core::SignalSet),
-}
-
-fn ppoll_timeout_ms(
-    seconds: i64,
-    nanoseconds: i64,
-) -> Result<i32, carrick_syscall_abi::LinuxErrno> {
-    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
-        return Err(carrick_syscall_abi::LINUX_EINVAL);
-    }
-    let milliseconds = seconds
-        .saturating_mul(1_000)
-        .saturating_add((nanoseconds + 999_999) / 1_000_000);
-    Ok(milliseconds.min(i64::from(i32::MAX)) as i32)
-}
+use carrick_personality_linux::poll::{PollSignalMask, PollTimeoutKind};
 
 pub trait GuestDispatchFrame: SyscallFrame {
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal;
@@ -67,8 +42,15 @@ pub trait GuestDispatchFrame: SyscallFrame {
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => arm_policy(),
         }
     }
-    /// Whether this native call has the poll argument contract.
+    /// Whether this native call has the poll argument contract and its
+    /// venue serves every poll set (the delegated map and its carrier
+    /// readiness crossing).
     fn may_serve_poll(&self) -> bool {
+        false
+    }
+    /// Whether this native call is `ppoll`, which the ring serves only for
+    /// a ring-owned descriptor namespace.
+    fn may_serve_ring_poll(&self) -> bool {
         false
     }
     fn poll_timeout_kind(&self) -> PollTimeoutKind {
@@ -125,31 +107,15 @@ pub trait GuestDispatchFrame: SyscallFrame {
     }
 }
 
-#[cfg(test)]
-mod poll_timeout_tests {
-    #[test]
-    fn ppoll_timeout_rounds_up_and_rejects_invalid_nanoseconds() {
-        assert_eq!(super::ppoll_timeout_ms(0, 1), Ok(1));
-        assert_eq!(super::ppoll_timeout_ms(0, 999_999), Ok(1));
-        assert_eq!(super::ppoll_timeout_ms(0, 1_000_001), Ok(2));
-        assert_eq!(
-            super::ppoll_timeout_ms(0, 1_000_000_000),
-            Err(carrick_syscall_abi::LINUX_EINVAL)
-        );
-        assert_eq!(
-            super::ppoll_timeout_ms(-1, 0),
-            Err(carrick_syscall_abi::LINUX_EINVAL)
-        );
-        assert_eq!(super::ppoll_timeout_ms(i64::MAX, 999_999_999), Ok(i32::MAX));
-    }
-}
-
 impl GuestDispatchFrame for TrapFrame {
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
         carrick_guest_arch::NativeOrdinal::new(self.x[8])
     }
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::Aarch64
+    }
+    fn may_serve_ring_poll(&self) -> bool {
+        self.x[8] == carrick_syscall_abi::nr::PPOLL.raw()
     }
     fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
         Some(self)
@@ -2007,7 +1973,7 @@ impl<
         self.process.as_deref_mut()?.resume_owned_continuation()
     }
     fn may_serve_poll(&self) -> bool {
-        self.frame.may_serve_poll()
+        self.frame.may_serve_poll() || (self.frame.may_serve_ring_poll() && self.ring_poll())
     }
     fn native_descriptor_owner(&self) -> bool {
         self.ipc
@@ -2129,192 +2095,10 @@ impl<
         self.ipc_transfer()
     }
     fn poll(&mut self) -> FamilyCompletion {
-        let Some(task) = self.task() else {
+        if self.task().is_none() {
             return FamilyCompletion::Forward;
-        };
-        let fds_ptr = self.frame.argument(0).unwrap_or(0);
-        let nfds = self.frame.argument(1).unwrap_or(0) as usize;
-        let timeout_kind = self.frame.poll_timeout_kind();
-        let timeout_ms = if matches!(timeout_kind, PollTimeoutKind::Milliseconds) {
-            self.frame.argument(2).unwrap_or(0) as i32
-        } else {
-            let tmo_ptr = self.frame.argument(2).unwrap_or(0);
-            if tmo_ptr == 0 {
-                -1
-            } else {
-                let mut ts = [0u8; 16];
-                let mut user = file::ValidatedCopy {
-                    task,
-                    validator: &file::HardwareValidator,
-                };
-                if !user.copy_in(&mut ts, tmo_ptr) {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    );
-                }
-                let mut seconds = [0u8; 8];
-                let mut nanoseconds = [0u8; 8];
-                seconds.copy_from_slice(&ts[..8]);
-                nanoseconds.copy_from_slice(&ts[8..]);
-                match ppoll_timeout_ms(i64::from_le_bytes(seconds), i64::from_le_bytes(nanoseconds))
-                {
-                    Ok(milliseconds) => milliseconds,
-                    Err(errno) => return FamilyCompletion::Complete(errno.guest_retval()),
-                }
-            }
-        };
-        let sig_mask = if matches!(timeout_kind, PollTimeoutKind::Milliseconds) {
-            PollSignalMask::Inherit
-        } else {
-            let mask_ptr = self.frame.argument(3).unwrap_or(0);
-            if mask_ptr == 0 {
-                PollSignalMask::Inherit
-            } else {
-                let mut bits = [0u8; 8];
-                if self.frame.argument(4).unwrap_or(0) != bits.len() as u64 {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
-                    );
-                }
-                let mut user = file::ValidatedCopy {
-                    task,
-                    validator: &file::HardwareValidator,
-                };
-                if !user.copy_in(&mut bits, mask_ptr) {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    );
-                }
-                PollSignalMask::Replace(
-                    carrick_signal_core::SignalSet::from_bits(u64::from_le_bytes(bits))
-                        .without(carrick_signal_core::policy::Signal::KILL)
-                        .without(carrick_signal_core::policy::Signal::STOP),
-                )
-            }
-        };
-        if nfds == 0 {
-            let mut empty = [];
-            return FamilyCompletion::Complete(
-                self.frame
-                    .query_host_readiness(&mut empty, timeout_ms, sig_mask)
-                    .unwrap_or(0),
-            );
         }
-        if nfds > 1024 {
-            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
-        }
-        let mut pollfds = alloc::vec![super::file_table::PollFd::default(); nfds];
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                pollfds.as_mut_ptr() as *mut u8,
-                nfds * core::mem::size_of::<super::file_table::PollFd>(),
-            )
-        };
-        let copied = {
-            let mut user = file::ValidatedCopy {
-                task,
-                validator: &file::HardwareValidator,
-            };
-            user.copy_in(bytes, fds_ptr)
-        };
-        if !copied {
-            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
-        }
-        let file_table = task
-            .linux
-            .file_table
-            .load(core::sync::atomic::Ordering::Acquire)
-            .max(1);
-        let host_entries = super::file_table::host_readiness_entries(
-            self.fd_map,
-            self.open_table,
-            file_table,
-            &pollfds,
-        );
-        if let Some(mut entries) = host_entries {
-            let already_ready = super::file_table::resolve_poll_with_host_readiness(
-                self.fd_map,
-                self.open_table,
-                self.object_table,
-                self.ipc,
-                file_table,
-                &mut pollfds,
-                Some(&entries),
-            );
-            let host_timeout = if already_ready > 0 { 0 } else { timeout_ms };
-            if let Some(result) =
-                self.frame
-                    .query_host_readiness(&mut entries, host_timeout, sig_mask)
-            {
-                if result < 0 {
-                    return FamilyCompletion::Complete(result);
-                }
-                let ready = super::file_table::resolve_poll_with_host_readiness(
-                    self.fd_map,
-                    self.open_table,
-                    self.object_table,
-                    self.ipc,
-                    file_table,
-                    &mut pollfds,
-                    Some(&entries),
-                );
-                let out_bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        pollfds.as_ptr() as *const u8,
-                        nfds * core::mem::size_of::<super::file_table::PollFd>(),
-                    )
-                };
-                let Some(task) = self.task() else {
-                    return FamilyCompletion::Forward;
-                };
-                let mut user = file::ValidatedCopy {
-                    task,
-                    validator: &file::HardwareValidator,
-                };
-                if !user.copy_out(fds_ptr, out_bytes) {
-                    return FamilyCompletion::Complete(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
-                    );
-                }
-                return FamilyCompletion::Complete(ready as i64);
-            }
-        }
-        let Some(task) = self.task() else {
-            return FamilyCompletion::Forward;
-        };
-        let mut user = file::ValidatedCopy {
-            task,
-            validator: &file::HardwareValidator,
-        };
-        let ready = super::file_table::resolve_poll(
-            self.fd_map,
-            self.open_table,
-            self.object_table,
-            self.ipc,
-            file_table,
-            &mut pollfds,
-        );
-        let out_bytes = unsafe {
-            core::slice::from_raw_parts(
-                pollfds.as_ptr() as *const u8,
-                nfds * core::mem::size_of::<super::file_table::PollFd>(),
-            )
-        };
-        if !user.copy_out(fds_ptr, out_bytes) {
-            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
-        }
-        if ready > 0 || timeout_ms == 0 {
-            FamilyCompletion::Complete(ready as i64)
-        } else {
-            let slot = self.frame.slot();
-            let mut continuation = super::file_table::PollContinuation::new(
-                file_table, pollfds, timeout_ms, fds_ptr, slot,
-            );
-            if let (Some(zone), Some(_)) = (self.zone.as_ref(), slot) {
-                continuation.release_capacity(zone.tables);
-            }
-            FamilyCompletion::Complete(ready as i64)
-        }
+        carrick_personality_linux::poll::serve(self)
     }
     fn descriptor(&mut self) -> FamilyCompletion {
         if self.native_descriptor_owner() {
@@ -3302,6 +3086,177 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
     }
     fn task(&self) -> Option<&CurrentTask> {
         self.current_tasks.get(self.frame.task_index())
+    }
+}
+
+impl<
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame,
+    Context: DispatchContext,
+> El1PendingFamilies<'_, F, C, U, G, Context>
+{
+    /// The caller's poll sets resolve in its ring-owned namespace: a native
+    /// process whose lifecycle page serves waitsets (`CARRICK_EL1_WAITSETS`).
+    /// A root keeps its delegated route until one readiness owner serves it.
+    fn ring_poll(&self) -> bool {
+        PendingFamilies::native_descriptor_owner(self)
+            && self
+                .task()
+                .and_then(CurrentTask::lifecycle_refs)
+                .is_some_and(|(page, _)| page.serves_waitsets())
+    }
+}
+
+/// One `poll`/`ppoll` venue for both ISAs. A ring namespace resolves entries
+/// in the caller's IPC table; the delegated namespace (x86 CPL0 today) keeps
+/// the existing fd map and carrier readiness crossing.
+impl<
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame,
+    Context: DispatchContext,
+> carrick_personality_linux::poll::PollVenue for El1PendingFamilies<'_, F, C, U, G, Context>
+{
+    fn namespace(&self) -> carrick_personality_linux::poll::PollNamespace {
+        if self.ring_poll() {
+            carrick_personality_linux::poll::PollNamespace::Ring
+        } else {
+            carrick_personality_linux::poll::PollNamespace::Delegated
+        }
+    }
+    fn argument(&self, index: usize) -> u64 {
+        self.frame.argument(index).unwrap_or(0)
+    }
+    fn timeout_kind(&self) -> PollTimeoutKind {
+        self.frame.poll_timeout_kind()
+    }
+    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+        self.task().is_some_and(|task| {
+            file::ValidatedCopy {
+                task,
+                validator: &file::HardwareValidator,
+            }
+            .copy_in(dst, src)
+        })
+    }
+    fn copy_out(&mut self, dst: u64, src: &[u8]) -> bool {
+        self.task().is_some_and(|task| {
+            file::ValidatedCopy {
+                task,
+                validator: &file::HardwareValidator,
+            }
+            .copy_out(dst, src)
+        })
+    }
+    fn copy_refused(&self) -> FamilyCompletion {
+        if self.ring_poll() {
+            // A page the owner could supply is not EFAULT: the ring has no
+            // poll fault-supply retry yet, so the call keeps its route.
+            FamilyCompletion::Forward
+        } else {
+            FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval())
+        }
+    }
+    fn descriptor_limit(&mut self) -> Option<u64> {
+        if !self.ring_poll() {
+            return Some(super::file_table::GUEST_FD_LIMIT as u64);
+        }
+        ipc::native_poll_limit(self.ipc?, self.task()?)
+    }
+    fn resolve(&mut self, fd: i32) -> carrick_personality_linux::poll::PollTarget {
+        match (self.ipc, self.task()) {
+            (Some(venue), Some(task)) => ipc::native_poll_target(venue, task, fd),
+            _ => carrick_personality_linux::poll::PollTarget::Busy,
+        }
+    }
+    fn serve_delegated(
+        &mut self,
+        request: &carrick_personality_linux::poll::PollRequest,
+        pollfds: &mut [carrick_personality_linux::poll::PollFd],
+    ) -> FamilyCompletion {
+        use zerocopy::IntoBytes;
+        if pollfds.is_empty() {
+            return FamilyCompletion::Complete(
+                self.frame
+                    .query_host_readiness(&mut [], request.timeout_ms, request.sig_mask)
+                    .unwrap_or(0),
+            );
+        }
+        let Some(task) = self.task() else {
+            return FamilyCompletion::Forward;
+        };
+        let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+        let host_entries = super::file_table::host_readiness_entries(
+            self.fd_map,
+            self.open_table,
+            file_table,
+            pollfds,
+        );
+        if let Some(mut entries) = host_entries {
+            let already_ready = super::file_table::resolve_poll_with_host_readiness(
+                self.fd_map,
+                self.open_table,
+                self.object_table,
+                self.ipc,
+                file_table,
+                pollfds,
+                Some(&entries),
+            );
+            let host_timeout = if already_ready > 0 {
+                0
+            } else {
+                request.timeout_ms
+            };
+            if let Some(result) =
+                self.frame
+                    .query_host_readiness(&mut entries, host_timeout, request.sig_mask)
+            {
+                if result < 0 {
+                    return FamilyCompletion::Complete(result);
+                }
+                let ready = super::file_table::resolve_poll_with_host_readiness(
+                    self.fd_map,
+                    self.open_table,
+                    self.object_table,
+                    self.ipc,
+                    file_table,
+                    pollfds,
+                    Some(&entries),
+                );
+                if !carrick_personality_linux::poll::PollVenue::copy_out(
+                    self,
+                    request.fds,
+                    pollfds.as_bytes(),
+                ) {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                    );
+                }
+                return FamilyCompletion::Complete(ready as i64);
+            }
+        }
+        let ready = super::file_table::resolve_poll(
+            self.fd_map,
+            self.open_table,
+            self.object_table,
+            self.ipc,
+            file_table,
+            pollfds,
+        );
+        if !carrick_personality_linux::poll::PollVenue::copy_out(
+            self,
+            request.fds,
+            pollfds.as_bytes(),
+        ) {
+            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
+        }
+        // A delegated set with no host-bound entry and nothing ready returns
+        // at once even with a timeout: the existing x86 CPL0 behaviour, kept
+        // until that lane's in-zone wait lands (#894 slice 2).
+        FamilyCompletion::Complete(ready as i64)
     }
 }
 

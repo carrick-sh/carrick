@@ -5,7 +5,7 @@ guest_surfaces = ["syscall:poll", "syscall:ppoll", "syscall:select", "syscall:ps
 semantic_authority = ["man 2 poll", "man 2 select", "man 7 epoll"]
 fixture = "VM-free scoped two-owner seam; see M2-M5 witness ledger"
 scale_points = [1, 8, 64]
-rationale = "Zone wait enrollment must create zero host readiness proxies at each scale; count only scoped proxy handles, never global fd deltas. Existing epoll record tests prove LT/ET/ONESHOT and detach, not mixed completion incarnation or mask transactions."
+rationale = "Slice 1 of #894 (no ring wait): a native process's all-zone ppoll set that completes immediately is served in ring by one shared Linux body; a set that would block or names a host-backed fd keeps its unported route before any effect. Zone wait enrollment must create zero host readiness proxies at each scale; count only scoped proxy handles, never global fd deltas. Existing epoll record tests prove LT/ET/ONESHOT and detach, not mixed completion incarnation or mask transactions."
 structural_budgets = []
 
 [bindings]
@@ -14,6 +14,9 @@ vm_free = [
   "carrick-el1-abi::ipc::epoll::tests::{edge_triggered_reports_each_arrival_once,oneshot_disarms_until_modified,harvest_honours_maxevents_order_and_requeues_level_items_after_the_scan}",
   "carrick-kernel::dispatch::net::epoll_zone::tests::red_until_step3_m3_zone_pipe_waits_create_host_proxies",
   "carrick-kernel::dispatch::net::netlink_readiness_tests::{poll_and_epoll_negative_and_absent_fd_semantics,epoll_ctl_rejects_two_description_cycle_with_eloop,epoll_readiness_tracks_stored_target_identity_after_fd_close_and_reuse}",
+  "carrick-personality-linux::poll::tests::{revents_keeps_requested_bits_and_unconditional_error_hangup_invalid,ring_scan_reports_levels_ignores_negative_and_counts_invalid,ring_would_block_host_backed_and_busy_refuse_before_any_effect,invalid_arguments_are_linux_einval_in_linux_order,a_huge_set_below_the_limit_is_enomem_without_allocating_or_copying}",
+  "carrick-el1-linux::aarch64_process_tests::native_poll_tests::{serial_host_native_child_ppoll_empty_pipe_zero_timeout_is_served_in_ring,serial_host_native_child_ppoll_rust_std_stdio_shape_and_closed_fd,serial_host_native_child_ppoll_reports_written_byte_and_writable_end,serial_host_native_child_ppoll_hangup_and_error_after_the_peer_closes,serial_host_native_child_ppoll_that_would_block_keeps_its_route_before_any_effect,serial_host_native_child_ppoll_mixed_host_set_is_refused_whole,serial_host_native_child_ppoll_invalid_arguments_are_einval}",
+  "carrick-el1-linux::lifecycle::tests::x86_cpl0_delegated_poll_keeps_its_existing_completions",
 ]
 
 [bindings.unresolved]
