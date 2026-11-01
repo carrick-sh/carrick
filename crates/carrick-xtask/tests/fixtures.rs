@@ -85,8 +85,7 @@ fn restore_command(f: &Fixture, lock: &Path) -> Command {
         .env("CARRICK_HOST_LEASE_PATH", lock)
         .env_remove("CARRICK_HOST_LEASE_FD")
         .env_remove("CARRICK_HOST_LEASE_MODE")
-        .env_remove("CARRICK_HOST_LEASE_SOCKET")
-        .env_remove("CARRICK_HOST_LEASE_SCOPE_FD");
+        .env_remove("CARRICK_HOST_LEASE_SOCKET");
     command
 }
 
@@ -625,7 +624,6 @@ fn acceptance_rejects_untracked_host_test_even_with_valid_fixtures() {
         .env_remove("CARRICK_HOST_LEASE_FD")
         .env_remove("CARRICK_HOST_LEASE_MODE")
         .env_remove("CARRICK_HOST_LEASE_SOCKET")
-        .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -1304,8 +1302,7 @@ fi
             )
             .env_remove("CARRICK_HOST_LEASE_FD")
             .env_remove("CARRICK_HOST_LEASE_MODE")
-            .env_remove("CARRICK_HOST_LEASE_SOCKET")
-            .env_remove("CARRICK_HOST_LEASE_SCOPE_FD");
+            .env_remove("CARRICK_HOST_LEASE_SOCKET");
         command
     }
 
@@ -3185,7 +3182,6 @@ fn restore_never_waits_on_the_ambient_host_lease() {
         ])
         .env("CARRICK_HOST_LEASE_PATH", held.path())
         .env_remove("CARRICK_HOST_LEASE_SOCKET")
-        .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);

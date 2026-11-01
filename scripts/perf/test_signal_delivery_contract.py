@@ -3,6 +3,7 @@ import argparse
 import copy
 import json
 from pathlib import Path
+from contextlib import nullcontext
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -167,8 +168,7 @@ class ReceiptTests(unittest.TestCase):
 
 
 class LeaseTests(unittest.TestCase):
-    @patch.dict("os.environ", {"CARRICK_HOST_LEASE_SOCKET": "/mock/socket",
-                              "CARRICK_HOST_LEASE_SCOPE_FD": "9"})
+    @patch.dict("os.environ", {"CARRICK_HOST_LEASE_SOCKET": "/mock/socket"})
     def test_actual_gate_protocol_and_negative_controls(self):
         from types import SimpleNamespace
         identity = {"dev": 1, "ino": 2, "mode": "gate", "scope": {"dev": 3, "ino": 4}}
@@ -177,23 +177,38 @@ class LeaseTests(unittest.TestCase):
                                    ({"scope": None}, False),
                                    ({"scope": {"dev": 3, "ino": 99}}, False)]:
             reply = dict(identity, **mutation)
-            with self.subTest(reply=reply), patch("signal_delivery_contract.socket.socket") as sock, patch("signal_delivery_contract.Path.stat", return_value=SimpleNamespace(st_dev=1, st_ino=2)), patch("signal_delivery_contract.os.fstat", return_value=SimpleNamespace(st_dev=3, st_ino=4, st_mode=driver.stat.S_IFIFO)), patch("signal_delivery_contract.fcntl.fcntl", return_value=driver.os.O_WRONLY):
-                sock.return_value.__enter__.return_value.recv.side_effect = [json.dumps(reply).encode(), b""]
+            with self.subTest(reply=reply), patch("signal_delivery_contract.socket.socket") as sock, patch("signal_delivery_contract.Path.stat", return_value=SimpleNamespace(st_dev=1, st_ino=2)), patch("signal_delivery_contract.os.fstat", return_value=SimpleNamespace(st_dev=3, st_ino=4, st_mode=driver.stat.S_IFIFO)), patch("signal_delivery_contract.fcntl.fcntl", return_value=driver.os.O_WRONLY), patch("signal_delivery_contract.os.close"), patch("signal_delivery_contract.os.set_inheritable"):
+                sock.return_value.__enter__.return_value.recvmsg.side_effect = [(b"\xc1" + json.dumps(reply).encode(), [(driver.socket.SOL_SOCKET, driver.socket.SCM_RIGHTS, driver.array.array("i", [9]).tobytes())], 0, None), (b"", [], 0, None)]
                 if accepted:
                     self.assertEqual(driver.gate_identity(), reply)
                 else:
                     with self.assertRaises(driver.Rejected):
                         driver.gate_identity()
 
+    @patch.dict("os.environ", {"CARRICK_HOST_LEASE_SOCKET": "/mock/socket"})
+    def test_protocol_mismatch_closes_received_writer(self):
+        with patch("signal_delivery_contract.socket.socket") as sock, patch("signal_delivery_contract.os.close") as close:
+            client = sock.return_value.__enter__.return_value
+            client.recvmsg.return_value = (b"{", [(driver.socket.SOL_SOCKET, driver.socket.SCM_RIGHTS,
+                                                  driver.array.array("i", [9]).tobytes())], 0, None)
+            with self.assertRaisesRegex(driver.Rejected, "lease protocol mismatch"):
+                driver.gate_identity()
+            close.assert_called_once_with(9)
+            client.sendall.assert_called_once_with(b"\xc1\0\0\0\0\0")
+
+
 
 class DriverTests(unittest.TestCase):
     def setUp(self):
+        lease = patch("signal_delivery_contract.gate_scope", side_effect=lambda: nullcontext(({}, 9)))
+        lease.start()
+        self.addCleanup(lease.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.driver = driver.Driver(argparse.Namespace(binary="/unused", xtask="/unused", signed_receipt="/unused-receipt",
                                    image=IMAGE, output=str(Path(self.temp.name) / "evidence")))
 
-    @patch.dict("os.environ", {"CARRICK_RUN_ID": "signal-unit", "CARRICK_HOST_LEASE_SCOPE_FD": "9"})
+    @patch.dict("os.environ", {"CARRICK_RUN_ID": "signal-unit"})
     def test_command_nonzero_keeps_logs_without_external_execution(self):
         with patch("signal_delivery_contract.subprocess.Popen") as spawn:
             spawn.return_value.wait.return_value = 7
@@ -208,7 +223,7 @@ class DriverTests(unittest.TestCase):
         self.assertTrue((self.driver.output / "0001.stderr").exists())
         self.assertEqual(spawn.call_args.kwargs["pass_fds"], (9,))
 
-    @patch.dict("os.environ", {"CARRICK_RUN_ID": "signal-unit", "CARRICK_HOST_LEASE_SCOPE_FD": "9"})
+    @patch.dict("os.environ", {"CARRICK_RUN_ID": "signal-unit"})
     def test_sample_child_environment_does_not_replace_campaign(self):
         child = "signal-unit-pair-000-carrick"
         with patch("signal_delivery_contract.subprocess.Popen") as spawn:
@@ -220,7 +235,7 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(record["run_id"], child)
         self.assertEqual(record["command_role"], "sample")
 
-    @patch.dict("os.environ", {"CARRICK_RUN_ID": "signal-unit", "CARRICK_HOST_LEASE_SCOPE_FD": "9"})
+    @patch.dict("os.environ", {"CARRICK_RUN_ID": "signal-unit"})
     def test_timeout_records_exit_and_kills_only_child_group(self):
         with patch("signal_delivery_contract.subprocess.Popen") as spawn, patch("signal_delivery_contract.os.killpg") as kill:
             spawn.return_value.pid = 1234

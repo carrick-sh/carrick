@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Paired release wake-latency acceptance; never builds, signs, or acquires a lease."""
 import argparse
+import array
+from contextlib import contextmanager
 import hashlib
 import fcntl
 import json
@@ -148,34 +150,54 @@ def child_run_id(campaign, label, lane):
     return child
 
 
-def gate_identity():
-    """Read the existing host-lease holder's bounded validation protocol."""
+@contextmanager
+def gate_scope():
+    """Join the enclosing gate through its versioned scope-writer handoff."""
     endpoint = os.environ.get("CARRICK_HOST_LEASE_SOCKET")
     require(endpoint, "an enclosing actual gate lease is required")
-    with socket.socket(socket.AF_UNIX) as client:
-        client.settimeout(5)
-        client.connect(endpoint)
-        data = b""
-        deadline = time.monotonic() + 5
-        while True:
-            client.settimeout(max(0.001, deadline - time.monotonic()))
-            chunk = client.recv(4096 - len(data))
-            if not chunk:
-                break
-            data += chunk
-            require(len(data) < 4096 and time.monotonic() < deadline, "invalid lease reply")
-    identity = json.loads(data)
-    require(identity["mode"] == "gate", "shared/Docker lease is not an enclosing gate")
-    lock = Path(os.environ.get("CARRICK_HOST_LEASE_PATH", "/tmp/carrick-host-lease.lock")).stat()
-    require((identity["dev"], identity["ino"]) == (lock.st_dev, lock.st_ino), "wrong lease lock")
-    scope = identity.get("scope")
-    require(scope is not None, "supervised gate scope required")
-    fd = int(os.environ["CARRICK_HOST_LEASE_SCOPE_FD"])
-    st = os.fstat(fd)
-    require(stat.S_ISFIFO(st.st_mode) and fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY,
-            "lease scope must be the supervised writer")
-    require((st.st_dev, st.st_ino) == (scope["dev"], scope["ino"]), "wrong lease scope")
-    return identity
+    writers = []
+    try:
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(5)
+            client.connect(endpoint)
+            client.sendall(b"\xc1\0\0\0\0\0")
+            data = b""
+            deadline = time.monotonic() + 5
+            while True:
+                client.settimeout(max(0.001, deadline - time.monotonic()))
+                chunk, ancillary, flags, _ = client.recvmsg(4097 - len(data), socket.CMSG_SPACE(4))
+                for level, kind, payload in ancillary:
+                    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                        descriptors = array.array("i")
+                        descriptors.frombytes(payload)
+                        writers.extend(descriptors)
+                require(not flags & socket.MSG_CTRUNC and len(writers) <= 1, "invalid lease scope descriptors")
+                data += chunk
+                require(data[:1] == b"\xc1", "lease protocol mismatch")
+                if not chunk:
+                    break
+                require(len(data) < 4097 and time.monotonic() < deadline, "invalid lease reply")
+        identity = json.loads(data[1:])
+        require(identity["mode"] == "gate", "shared/Docker lease is not an enclosing gate")
+        lock = Path(os.environ.get("CARRICK_HOST_LEASE_PATH", "/tmp/carrick-host-lease.lock")).stat()
+        require((identity["dev"], identity["ino"]) == (lock.st_dev, lock.st_ino), "wrong lease lock")
+        scope = identity.get("scope")
+        require(scope is not None and len(writers) == 1, "supervised gate scope required")
+        fd = writers[0]
+        os.set_inheritable(fd, False)
+        st = os.fstat(fd)
+        require(stat.S_ISFIFO(st.st_mode) and fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY,
+                "lease scope must be the supervised writer")
+        require((st.st_dev, st.st_ino) == (scope["dev"], scope["ino"]), "wrong lease scope")
+        yield identity, fd
+    finally:
+        for fd in writers:
+            os.close(fd)
+
+
+def gate_identity():
+    with gate_scope() as (identity, _):
+        return identity
 
 
 class Driver:
@@ -203,11 +225,10 @@ class Driver:
         env.pop("CARRICK_RUN_ID", None)
         if run_id is not None:
             env["CARRICK_RUN_ID"] = run_id
-        scope = int(os.environ["CARRICK_HOST_LEASE_SCOPE_FD"])
         record = {"command": [str(a) for a in argv], "timeout_seconds": timeout,
                   "run_id": run_id, "command_role": "sample" if run_id else "system"}
         # Files, rather than pipes, preserve full output even on timeout/cancellation.
-        with stem.with_suffix(".stdout").open("wb") as out, stem.with_suffix(".stderr").open("wb") as err:
+        with gate_scope() as (_, scope), stem.with_suffix(".stdout").open("wb") as out, stem.with_suffix(".stderr").open("wb") as err:
             proc = subprocess.Popen(argv, cwd=self.root, env=env, stdin=subprocess.DEVNULL,
                                     stdout=out, stderr=err, start_new_session=True, pass_fds=(scope,))
             try:

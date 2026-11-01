@@ -595,26 +595,6 @@ fn nested_cli_reuses_exclusive_gate_without_deadlock_or_downgrade() {
 }
 
 #[test]
-fn nested_admission_requires_the_supervisor_scope_writer() {
-    let lock = tempfile::NamedTempFile::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-        .args(["host-lease", "--mode", "gate", "--", "/bin/sh", "-c"])
-        .arg("unset CARRICK_HOST_LEASE_SCOPE_FD; exec \"$1\" host-lease --mode carrick -- /bin/echo SHOULD_NOT_RUN")
-        .arg("scope-fixture")
-        .arg(env!("CARGO_BIN_EXE_carrick-xtask"))
-        .env_remove("CARRICK_HOST_LEASE_SOCKET")
-        .env_remove("CARRICK_HOST_LEASE_FD")
-        .env("CARRICK_HOST_LEASE_PATH", lock.path())
-        .output().unwrap();
-    assert!(
-        !output.status.success(),
-        "nested admission succeeded without a live scope writer"
-    );
-    assert!(output.stdout.is_empty(), "unscoped nested command ran");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid inherited host lease"));
-}
-
-#[test]
 fn cancellation_preserves_another_checkout_with_identical_command() {
     struct Fixture {
         runner: std::process::Child,

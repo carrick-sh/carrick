@@ -18,6 +18,9 @@ pub const DEFAULT_LOCK_PATH: &str = "/tmp/carrick-host-lease.lock";
 /// A contended machine may be running a full acceptance gate. Failure, never skip.
 pub const HOST_LEASE_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
 const INHERITED_SOCKET: &str = "CARRICK_HOST_LEASE_SOCKET";
+// High nibble identifies Carrick leases; low nibble is the wire version.
+const LEASE_PROTOCOL: u8 = 0xc1;
+const REQUEST_LIMIT: Duration = Duration::from_millis(100);
 const VALIDATION_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,10 +214,10 @@ fn lease_request(
             "lease server identity mismatch",
         ));
     }
-    let mut request = [0; 5];
+    let mut request = [LEASE_PROTOCOL, 0, 0, 0, 0, 0];
     if let Some(uid) = delegate {
-        request[0] = 1;
-        request[1..].copy_from_slice(&uid.to_le_bytes());
+        request[1] = 1;
+        request[2..].copy_from_slice(&uid.to_le_bytes());
     }
     stream.write_all(&request)?;
     read_validation_identity(stream)
@@ -227,7 +230,6 @@ fn serve_lease_request(
     identity: &[u8],
     scope: Option<&OwnedFd>,
 ) -> io::Result<()> {
-    use std::io::Read;
     let uid = carrick_portable::peer_credentials(stream.as_raw_fd())?.uid;
     if uid != owner && !allowed.contains(&uid) {
         return Err(io::Error::new(
@@ -235,10 +237,17 @@ fn serve_lease_request(
             "lease client uid not admitted",
         ));
     }
-    stream.set_read_timeout(Some(VALIDATION_LIMIT))?;
     stream.set_write_timeout(Some(VALIDATION_LIMIT))?;
     let mut request = [0; 5];
-    stream.read_exact(&mut request)?;
+    let deadline = Instant::now() + REQUEST_LIMIT;
+    let mut header = [0];
+    read_lease_request(stream, &mut header, deadline)?;
+    if header[0] != LEASE_PROTOCOL {
+        // An explicit rejection also gives newer clients a recognizable error.
+        stream.write_all(&[0])?;
+        return Err(protocol_mismatch());
+    }
+    read_lease_request(stream, &mut request, deadline)?;
     match request[0] {
         0 if request[1..] == [0; 4] => {}
         1 if uid == owner => {
@@ -254,6 +263,40 @@ fn serve_lease_request(
         }
     }
     send_scope_reply(stream, identity, scope)
+}
+
+fn protocol_mismatch() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "lease protocol mismatch; restart the outer lease runner",
+    )
+}
+
+fn read_lease_request(
+    mut stream: &UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    use std::io::Read;
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "lease request expired"))?;
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete lease request",
+                ));
+            }
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 impl ScopeIdentity {
@@ -382,10 +425,16 @@ fn read_validation_identity_until(
             {
                 continue;
             }
+            Err(error) if length == 0 && error.kind() == io::ErrorKind::ConnectionReset => {
+                return Err(protocol_mismatch());
+            }
             Err(error) => return Err(error),
         };
+        if length == 0 && (count == 0 || bytes[0] != LEASE_PROTOCOL) {
+            return Err(protocol_mismatch());
+        }
         if count == 0 {
-            return Ok((serde_json::from_slice(&bytes[..length])?, scopes.pop()));
+            return Ok((serde_json::from_slice(&bytes[1..length])?, scopes.pop()));
         }
         length += count;
         if length == bytes.len() {
@@ -601,12 +650,13 @@ impl HostLease {
         let listener = UnixListener::bind(&socket)?;
         let metadata = fd.metadata()?;
         let (dev, ino) = (metadata.dev(), metadata.ino());
-        let identity = serde_json::to_vec(&LeaseIdentity {
+        let mut identity = vec![LEASE_PROTOCOL];
+        identity.extend(serde_json::to_vec(&LeaseIdentity {
             dev,
             ino,
             mode,
             scope: scope.as_ref().map(ScopeIdentity::writer).transpose()?,
-        })?;
+        })?);
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
         let active = Arc::new(Mutex::new(None::<UnixStream>));
@@ -681,7 +731,6 @@ impl HostLease {
         command
             .env_remove("CARRICK_HOST_LEASE_FD")
             .env_remove("CARRICK_HOST_LEASE_MODE")
-            .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
             .env(INHERITED_SOCKET, &self.socket)
             .env("CARRICK_HOST_LEASE_PATH", &self.path);
         if let Some(scope) = &self._scope {
@@ -901,6 +950,118 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
+    fn closed_admission_refuses_later_nested_request() {
+        let lock = NamedTempFile::new().unwrap();
+        let mut holder = HostLease::acquire_path(lock.path(), HostLeaseMode::Gate).unwrap();
+        assert!(HostLease::inherit(lock.path(), HostLeaseMode::Carrick, &holder.socket).is_ok());
+        holder.close_admission();
+        assert!(HostLease::inherit(lock.path(), HostLeaseMode::Carrick, &holder.socket).is_err());
+        assert!(HostLease::try_exclusive(lock.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn client_scope_writer_prevents_cleanup() {
+        let lock = NamedTempFile::new().unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut holder = HostLease::acquire_path_with_wait(
+            lock.path(),
+            HostLeaseMode::Gate,
+            Duration::ZERO,
+            Some(writer.into()),
+            |_| Ok(false),
+        )
+        .unwrap();
+        let client =
+            HostLease::inherit(lock.path(), HostLeaseMode::Carrick, &holder.socket).unwrap();
+        holder.close_admission();
+        let mut lifetime = std::fs::File::from(OwnedFd::from(reader));
+        let result = crate::lease_supervisor::complete_lifetime_cleanup(
+            &mut lifetime,
+            Instant::now() + Duration::from_millis(20),
+        );
+        assert!(matches!(
+            result,
+            Err(HostLeaseError::Cleanup {
+                operation: "workload lifetime EOF",
+                source,
+            }) if source.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(HostLease::try_exclusive(lock.path()).unwrap().is_none());
+        drop(client);
+        crate::lease_supervisor::complete_lifetime_cleanup(
+            &mut lifetime,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn silent_connection_does_not_delay_nested_request() {
+        let lock = NamedTempFile::new().unwrap();
+        let holder = HostLease::acquire_path(lock.path(), HostLeaseMode::Gate).unwrap();
+        let _silent = UnixStream::connect(&holder.socket).unwrap();
+        let start = Instant::now();
+        let nested = HostLease::inherit(lock.path(), HostLeaseMode::Carrick, &holder.socket);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "silent connection blocked admission"
+        );
+        assert!(nested.is_ok());
+    }
+
+    #[test]
+    fn server_rejects_unversioned_request() {
+        let lock = NamedTempFile::new().unwrap();
+        let holder = HostLease::acquire_path(lock.path(), HostLeaseMode::Gate).unwrap();
+        let mut client = UnixStream::connect(&holder.socket).unwrap();
+        client.write_all(&[0; 5]).unwrap();
+        let start = Instant::now();
+        let error = read_validation_identity(client).err().unwrap();
+        assert!(
+            error.to_string().contains("lease protocol mismatch"),
+            "{error}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn client_reports_old_server_protocol_mismatch() {
+        use std::io::Read;
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("old.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(VALIDATION_LIMIT)).unwrap();
+            let mut old_request = [0; 5];
+            stream.read_exact(&mut old_request).unwrap();
+            // The old protocol rejects the new magic as an invalid operation,
+            // leaving one unread byte when closing the socket.
+        });
+        let start = Instant::now();
+        let error = lease_request(&socket, None).err().unwrap();
+        server.join().unwrap();
+        assert!(
+            error.to_string().contains("lease protocol mismatch"),
+            "{error}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn validation_reports_protocol_mismatch_immediately() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server.write_all(b"{").unwrap(); // Old unversioned JSON peer stays open.
+        let start = Instant::now();
+        let error = read_validation_identity(client).err().unwrap();
+        assert!(
+            error.to_string().contains("lease protocol mismatch"),
+            "{error}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     fn validation_reads_identity_after_peer_closed() {
         // Run the Linux syscall model in its own process. No process-global
         // injection or serialization affects the ordinary parallel test suite.
@@ -931,6 +1092,7 @@ mod tests {
             mode: HostLeaseMode::Gate,
             scope: None,
         };
+        server.write_all(&[LEASE_PROTOCOL]).unwrap();
         server
             .write_all(&serde_json::to_vec(&reply).unwrap())
             .unwrap();
@@ -1015,6 +1177,7 @@ mod tests {
     #[test]
     fn validation_requires_eof_within_one_deadline() {
         let (client, mut server) = UnixStream::pair().unwrap();
+        server.write_all(&[LEASE_PROTOCOL]).unwrap();
         server
             .write_all(br#"{"dev":1,"ino":2,"mode":"gate","scope":null}"#)
             .unwrap();
@@ -1031,6 +1194,7 @@ mod tests {
     fn validation_rejects_incomplete_and_oversized_closed_replies() {
         for reply in [b"{".to_vec(), vec![b' '; 4097]] {
             let (client, mut server) = UnixStream::pair().unwrap();
+            server.write_all(&[LEASE_PROTOCOL]).unwrap();
             server.write_all(&reply).unwrap();
             drop(server);
             let error = read_validation_identity(client).err().unwrap();
@@ -1241,8 +1405,8 @@ mod tests {
         let owner = uid.checked_add(1).unwrap();
         for admitted in [false, true] {
             let (mut client, server) = UnixStream::pair().unwrap();
-            let mut request = [1; 5];
-            request[1..].copy_from_slice(&owner.to_le_bytes());
+            let mut request = [LEASE_PROTOCOL, 1, 0, 0, 0, 0];
+            request[2..].copy_from_slice(&owner.to_le_bytes());
             client.write_all(&request).unwrap();
             let mut allowed = std::collections::BTreeSet::new();
             if admitted {
