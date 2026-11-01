@@ -949,6 +949,14 @@ mod x86_tests {
                     entry.index,
                 );
             }
+            // Independent psABI feature oracle, separate from GuestCpuidView's
+            // production masks so a mistaken expansion cannot bless itself.
+            let leaf1 = cpuid_entry(&active_cpuid, 1, 0).expect("leaf 1 installed");
+            assert_eq!(leaf1.ecx, 0x3cd8_3201);
+            assert_eq!(leaf1.edx, 0x0789_a37d);
+            let leaf7 = cpuid_entry(&active_cpuid, 7, 0).expect("leaf 7 installed");
+            assert_eq!(leaf7.ebx, 0x0010_01a8);
+            assert_eq!((leaf7.eax, leaf7.ecx, leaf7.edx), (0, 0, 0));
             assert!(cpuid_entry(&active_cpuid, 7, 1).is_none());
             assert!(cpuid_entry(&active_cpuid, 0x0d, 1).is_none());
             assert!(cpuid_entry(&active_cpuid, 0x4000_0000, 0).is_none());
