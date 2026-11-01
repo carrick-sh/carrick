@@ -35,3 +35,15 @@ KVM guest execution proofs live in `carrick_vmm_kvm::kvm::x86_tests` and
 `XGETBV(0)` + `AVX2`/`BMI1`/`BMI2`/`LZCNT`/`POPCNT` and `carrick-vmm-kvm run-elf`
 including `MOVBE`) and are gated on real `/dev/kvm` in the merge-queue `kvm-tests`
 lane (`NEW=[]`).
+
+The table test and both KVM fixtures assert architectural feature bit values
+independently of the production masks. Comparing observations only with
+`GuestCpuidView` would allow a mistakenly expanded mask to bless itself in both
+the installed table and its expected answer. The live fixtures additionally
+check the pinned processor signature.
+
+The raw-host negative control is a passing test that expects rejection; it is
+not itself a red execution of the pinned-table test. Record a failing run and
+its implementation variant separately from the subsequent green run. A
+compile-only KVM fixture result is also not a live verdict: acceptance still
+requires the merge queue's `kvm-tests` and `kvm-gate` receipt with `NEW=[]`.
