@@ -9,9 +9,8 @@ pub trait AnonymousCallView {
     fn arguments(&self) -> [u64; 6];
     fn return_address(&self) -> UserVa;
     fn slot(&self) -> Option<SlotId>;
-    fn task_index(&self) -> usize {
-        self.slot().map_or(usize::MAX, SlotId::index)
-    }
+    /// Index in the task slice supplied to the resident entry point, not a CPU.
+    fn task_index(&self) -> usize;
     fn result(&self) -> NativeReturnWord;
     fn set_result(&mut self, result: NativeReturnWord);
 }
@@ -20,6 +19,7 @@ pub trait AnonymousCallView {
 pub struct AnonymousCall {
     call: CanonicalCall,
     slot: SlotId,
+    task_index: usize,
     return_address: UserVa,
     result: NativeReturnWord,
 }
@@ -27,10 +27,16 @@ impl AnonymousCall {
     pub fn slot(&self) -> SlotId {
         self.slot
     }
-    pub fn new(call: CanonicalCall, slot: SlotId, return_address: UserVa) -> Self {
+    pub fn new(
+        call: CanonicalCall,
+        task_index: usize,
+        slot: SlotId,
+        return_address: UserVa,
+    ) -> Self {
         Self {
             result: NativeReturnWord(call.args[0]),
             call,
+            task_index,
             slot,
             return_address,
         }
@@ -50,7 +56,7 @@ impl AnonymousCallView for AnonymousCall {
         Some(self.slot)
     }
     fn task_index(&self) -> usize {
-        0
+        self.task_index
     }
     fn result(&self) -> NativeReturnWord {
         self.result
@@ -74,6 +80,9 @@ impl AnonymousCallView for carrick_el1_abi::TrapFrame {
     }
     fn slot(&self) -> Option<SlotId> {
         usize::try_from(self.slot).ok().and_then(SlotId::from_index)
+    }
+    fn task_index(&self) -> usize {
+        self.slot().map_or(usize::MAX, SlotId::index)
     }
     fn result(&self) -> NativeReturnWord {
         NativeReturnWord(self.x[0])

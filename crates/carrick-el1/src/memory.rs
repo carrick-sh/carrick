@@ -19,6 +19,35 @@ use carrick_sched_core::spaces::notification::SpaceAccess;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
+/// Execute the x86 anonymous editor's descriptor transaction on authenticated
+/// live words. The caller retains exact-MM exclusion and validates the root.
+/// Invalidation uses the supplied words' existing invalidate_range hook;
+/// migration of InitialWords to ServedTable/StagedInvalidation is #681 slice 5
+/// (https://github.com/carrick-sh/carrick/issues/681), still outstanding.
+pub fn edit_x86_anonymous(
+    words: &impl carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords,
+    root: carrick_guest_arch::RootGpa,
+    mm: NonZeroU64,
+    generation: &AnonymousEditGeneration,
+    range: carrick_guest_arch::UserRange,
+    operation: carrick_guest_arch::EditOperation,
+) -> Result<
+    carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome,
+    carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+> {
+    use carrick_guest_arch::{EditIntent, EditOwner};
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+    use carrick_mmu_core::x86::descriptor_txn::{
+        DescriptorTxn, InlineJournal, execute_descriptor_txn,
+    };
+    // SAFETY: caller holds the exact-MM editor and supplies its bound generation.
+    let owner = unsafe { EditOwner::issue(root, mm, generation.nonzero()) };
+    let intent =
+        EditIntent::checked(owner, range, operation, &[]).ok_or(DescriptorRefusal::BadRange)?;
+    let txn = DescriptorTxn::from_intent(&intent)?;
+    Ok(execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome)
+}
+
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
@@ -1446,11 +1475,13 @@ mod tests {
     fn native_memory_call_uses_projected_task_and_actual_editor_slot() {
         use carrick_guest_arch::UserVa;
         use carrick_sched_core::SlotId;
-        let (frame, tasks, spaces, ttbr0) = fixture(PROT_READ);
+        let (frame, [task], spaces, ttbr0) = fixture(PROT_READ);
+        let tasks = [CurrentTask::new(), task];
         let args = [frame.x[0], frame.x[1], frame.x[2], 0, 0, 0];
         let decoded = carrick_personality_linux::entry::decode_x86_64(10, args, 0x8000);
         let call = AnonymousCall::new(
             decoded,
+            1,
             SlotId::from_index(7).unwrap(),
             UserVa::new(0x40004),
         );
@@ -1473,6 +1504,7 @@ mod tests {
         let decoded = carrick_personality_linux::entry::decode_x86_64(11, args, 0x8000);
         let call = AnonymousCall::new(
             decoded,
+            1,
             SlotId::from_index(7).unwrap(),
             UserVa::new(0x40004),
         );
@@ -2062,6 +2094,7 @@ mod tests {
                         };
                         let mut native = AnonymousCall::new(
                             decoded,
+                            0,
                             SlotId::from_index(7).unwrap(),
                             UserVa::new(0x40004),
                         );

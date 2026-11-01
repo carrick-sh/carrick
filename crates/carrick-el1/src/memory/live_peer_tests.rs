@@ -133,6 +133,7 @@ impl LiveTables {
                 )
             }
             .unwrap();
+            // Fixture completion marker only: this does not witness ARM TLB invalidation.
             self.drains.fetch_add(1, Ordering::Release);
         }
     }
@@ -157,6 +158,7 @@ impl LiveTables {
                 )
             }
             .unwrap();
+            // Fixture completion marker only: this does not witness ARM TLB invalidation.
             self.drains.fetch_add(1, Ordering::Release);
         }
     }
@@ -167,32 +169,18 @@ impl LiveTables {
         len: u64,
         operation: carrick_guest_arch::EditOperation,
     ) {
-        use carrick_guest_arch::{
-            EditIntent, EditOwner, FrameGpa, GuestLen, RootGpa, UserRange, UserVa,
-        };
-        use carrick_mmu_core::x86::descriptor_txn::{
-            DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn,
-        };
+        use carrick_guest_arch::{FrameGpa, GuestLen, RootGpa, UserRange, UserVa};
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
         let root = RootGpa::page_aligned(FrameGpa::new(LIVE_ROOT)).unwrap();
-        // SAFETY: issued by the real reservation operation under the shared
-        // exact-MM editor; root and MM are this fixture's admitted identities.
-        let owner = unsafe {
-            EditOwner::issue(
+        assert!(matches!(
+            edit_x86_anonymous(
+                self,
                 root,
                 NonZeroU64::new(17).unwrap(),
-                NonZeroU64::new(sequence.raw()).unwrap(),
-            )
-        };
-        let intent = EditIntent::checked(
-            owner,
-            UserRange::checked(UserVa::new(address), GuestLen::new(len)).unwrap(),
-            operation,
-            &[],
-        )
-        .unwrap();
-        let txn = DescriptorTxn::from_intent(&intent).unwrap();
-        assert!(matches!(
-            execute_descriptor_txn(self, &txn, root, &mut InlineJournal::new()).outcome,
+                &AnonymousEditGeneration::reservation(sequence).unwrap(),
+                UserRange::checked(UserVa::new(address), GuestLen::new(len)).unwrap(),
+                operation,
+            ).unwrap(),
             DescriptorOutcome::Applied { .. }
         ));
     }

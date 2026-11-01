@@ -11,7 +11,6 @@ use carrick_personality_linux::entry::{CanonicalCall, SyscallResult};
 use carrick_personality_linux::pending_anonymous::{
     DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
 };
-use carrick_sched_core::SlotId;
 use carrick_x86_carrier::entry::InitialWords;
 pub use carrick_x86_carrier::table_span::{
     admit_context, admit_tables, live_context, live_words, retire_context, working_tables,
@@ -28,13 +27,9 @@ impl<'a> X86AnonymousVenue<'a> {
         task: &'a CurrentTask,
         slot: u32,
         return_pc: u64,
-    ) -> Self {
-        let frame = AnonymousCall::new(
-            *call,
-            SlotId::from_index(slot as usize).unwrap_or_else(|| fatal_reservation()),
-            UserVa::new(return_pc),
-        );
-        Self { frame, task }
+    ) -> Option<Self> {
+        let frame = crate::anonymous_call(*call, slot, UserVa::new(return_pc))?;
+        Some(Self { frame, task })
     }
     fn editor(&self) -> Option<(&'static X86Cpl0Zone, X86AnonymousEditor)> {
         let mm = carrick_el1_abi::ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))?;
@@ -89,38 +84,10 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         None
     }
     fn permission(&mut self) -> PermissionStep {
-        let Some((zone, mut editor)) = self.editor() else {
-            return PermissionStep::Forward;
-        };
-        match carrick_el1::memory::try_serve_mprotect(
-            &self.frame,
-            core::slice::from_ref(self.task),
-            carrick_core::wait::space_access(zone, self.frame.slot(), initial_release),
-            &mut editor,
-        ) {
-            carrick_el1::memory::MprotectDisposition::Forward => PermissionStep::Forward,
-            carrick_el1::memory::MprotectDisposition::Return(result) => {
-                PermissionStep::Return(SyscallResult::new(result))
-            }
-            carrick_el1::memory::MprotectDisposition::ReturnWithWork => PermissionStep::CommitOwed,
-        }
+        crate::refuse_anonymous_permission(&crate::CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS)
     }
     fn retirement(&mut self) -> RetirementStep {
-        let Some((zone, mut editor)) = self.editor() else {
-            return RetirementStep::Forward;
-        };
-        match carrick_el1::memory::try_serve_munmap(
-            &self.frame,
-            core::slice::from_ref(self.task),
-            carrick_core::wait::space_access(zone, self.frame.slot(), initial_release),
-            &mut editor,
-        ) {
-            carrick_el1::memory::MunmapDisposition::Forward => RetirementStep::Forward,
-            carrick_el1::memory::MunmapDisposition::Return(result) => {
-                RetirementStep::Return(SyscallResult::new(result))
-            }
-            carrick_el1::memory::MunmapDisposition::Retired => RetirementStep::Retired,
-        }
+        crate::refuse_anonymous_retirement(&crate::CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS)
     }
     fn install_result(&mut self, result: SyscallResult) {
         self.frame
@@ -139,11 +106,8 @@ impl X86AnonymousEditor {
         range: UserRange,
         operation: carrick_guest_arch::EditOperation,
     ) -> Result<(), carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
-        use carrick_guest_arch::{EditIntent, EditOwner};
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
-        use carrick_mmu_core::x86::descriptor_txn::{
-            DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn,
-        };
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
         let context = self.words.context.ok_or(DescriptorRefusal::StaleRoot)?;
         if context.root != register {
             return Err(DescriptorRefusal::StaleRoot);
@@ -151,18 +115,18 @@ impl X86AnonymousEditor {
         // SAFETY: the shared anonymous entry holds the exact MM editor through
         // settlement and binds this operation generation before editing.
         // InitialWords retains its authenticated context.
-        let sequence = self
+        let generation = self
             .sequence
             .as_ref()
-            .map(|generation| generation.nonzero())
             .ok_or(DescriptorRefusal::BadEncoding)?;
-        let owner = unsafe { EditOwner::issue(context.root, context.mm.raw(), sequence) };
-        let intent =
-            EditIntent::checked(owner, range, operation, &[]).ok_or(DescriptorRefusal::BadRange)?;
-        let txn = DescriptorTxn::from_intent(&intent)?;
-        match execute_descriptor_txn(&self.words, &txn, context.root, &mut InlineJournal::new())
-            .outcome
-        {
+        match carrick_el1::memory::edit_x86_anonymous(
+            &self.words,
+            context.root,
+            context.mm.raw(),
+            generation,
+            range,
+            operation,
+        )? {
             DescriptorOutcome::Applied { .. } => Ok(()),
             DescriptorOutcome::Refused(reason) | DescriptorOutcome::RolledBack(reason) => {
                 Err(reason)
