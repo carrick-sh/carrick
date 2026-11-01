@@ -560,6 +560,130 @@ pub fn linux_lib_errors(
     errors
 }
 
+/// The CI job that runs x86_64-only host tests (#1269): every other host-lane
+/// job is arm64, where an x86_64-gated target compiles to zero tests.
+pub const X86_HOST_JOB: &str = "x86-host-tests";
+
+/// Host-lane roots that exist only on x86_64 Linux and similar hosts: a
+/// crate-level `#![cfg(...)]` naming `target_arch = "x86_64"` and no
+/// `target_os` (an OS-gated root, such as bhyve's or NVMM's, has its own
+/// lane). Returns `(package, target, root)` for library roots and for test
+/// targets in the `host` lane.
+pub fn x86_only_roots(metadata: &Value, targets: &[TestTarget]) -> Vec<(String, String, PathBuf)> {
+    let mut roots = Vec::new();
+    for package in metadata
+        .get("packages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = package.get("name").and_then(Value::as_str).unwrap_or("");
+        for target in package
+            .get("targets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let kinds = target.get("kind").and_then(Value::as_array);
+            let has = |kind: &str| kinds.is_some_and(|kinds| kinds.iter().any(|k| k == kind));
+            let target_name = target.get("name").and_then(Value::as_str).unwrap_or("");
+            let host_test = has("test")
+                && targets
+                    .iter()
+                    .any(|t| t.package == name && t.target == target_name && t.lane == "host");
+            if !(has("lib") || host_test) {
+                continue;
+            }
+            let Some(src) = target.get("src_path").and_then(Value::as_str) else {
+                continue;
+            };
+            let src = PathBuf::from(src);
+            if root_is_x86_64_only(&src) {
+                roots.push((name.to_owned(), target_name.to_owned(), src));
+            }
+        }
+    }
+    roots.sort();
+    roots
+}
+
+fn root_is_x86_64_only(src: &Path) -> bool {
+    std::fs::read_to_string(src).is_ok_and(|text| {
+        text.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("#![cfg(")
+                && line.contains("target_arch = \"x86_64\"")
+                && !line.contains("target_os")
+        })
+    })
+}
+
+/// The `cargo test` command lines of [`X86_HOST_JOB`] in `workflow` (the
+/// text of `.github/workflows/ci.yml`), or an error when the job is missing
+/// or does not run on an x86_64 hosted runner.
+fn x86_job_commands(workflow: &str) -> Result<Vec<String>, String> {
+    let docs = yaml_rust2::YamlLoader::load_from_str(workflow)
+        .map_err(|e| format!("ci.yml does not parse: {e}"))?;
+    let job = &docs.first().ok_or_else(|| "ci.yml is empty".to_owned())?["jobs"][X86_HOST_JOB];
+    if job.is_badvalue() {
+        return Err(format!("ci.yml has no `{X86_HOST_JOB}` job"));
+    }
+    if job["runs-on"].as_str() != Some("ubuntu-latest") {
+        return Err(format!(
+            "ci.yml `{X86_HOST_JOB}` must run on ubuntu-latest (x86_64)"
+        ));
+    }
+    Ok(job["steps"]
+        .as_vec()
+        .into_iter()
+        .flatten()
+        .filter_map(|step| step["run"].as_str())
+        .flat_map(str::lines)
+        .filter(|line| line.contains("cargo test"))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Every x86_64-only host-lane root that [`X86_HOST_JOB`] doesn't select
+/// with `-p <package>`: arm64 `just test` compiles it to zero tests, so no
+/// gate would run it (#1269).
+pub fn x86_root_errors(workflow: &str, roots: &[(String, String, PathBuf)]) -> Vec<String> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let commands = match x86_job_commands(workflow) {
+        Ok(commands) => commands,
+        Err(error) => {
+            return roots
+                .iter()
+                .map(|(package, target, src)| {
+                    format!(
+                        "{package}::{target}: root {} is x86_64-only, but {error}; arm64 host-lane jobs compile it to zero tests",
+                        src.display()
+                    )
+                })
+                .collect();
+        }
+    };
+    roots
+        .iter()
+        .filter(|(package, _, _)| {
+            !commands.iter().any(|line| {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                tokens
+                    .windows(2)
+                    .any(|w| w[0] == "-p" && w[1] == package.as_str())
+            })
+        })
+        .map(|(package, target, src)| {
+            format!(
+                "{package}::{target}: root {} is x86_64-only, but ci.yml `{X86_HOST_JOB}` runs no `cargo test -p {package}`; arm64 host-lane jobs compile it to zero tests",
+                src.display()
+            )
+        })
+        .collect()
+}
+
 /// Contract bindings (`[bindings]` in `conformance-contracts/contracts/*.toml`)
 /// whose path names an integration test target (`<crate>::<target>::...`).
 /// Returns `(contract file, binding, target)` triples and parse errors.
@@ -719,6 +843,14 @@ pub fn run(
                 &linux_libs,
                 crate::accept::LINUX_PORTABLE_STEPS,
             ));
+            let x86_roots = x86_only_roots(&metadata, &targets);
+            let workflow_path = root.join(".github/workflows/ci.yml");
+            let workflow =
+                std::fs::read_to_string(&workflow_path).map_err(|source| TestLanesError::Io {
+                    path: workflow_path,
+                    source,
+                })?;
+            errors.extend(x86_root_errors(&workflow, &x86_roots));
             let (bound, binding_errors) = contract_test_bindings(root, &targets);
             errors.extend(binding_errors);
             for (contract, binding, target) in &bound {
@@ -742,11 +874,12 @@ pub fn run(
                 .collect();
             writeln!(
                 writer,
-                "test-lanes: {} test targets, all gated ({}); {} contract bindings name gated test targets; {} Linux-only libs in a Linux gate",
+                "test-lanes: {} test targets, all gated ({}); {} contract bindings name gated test targets; {} Linux-only libs in a Linux gate; {} x86_64-only roots in `{X86_HOST_JOB}`",
                 targets.len(),
                 summary.join(" "),
                 bound.len(),
-                linux_libs.len()
+                linux_libs.len(),
+                x86_roots.len()
             )
             .map_err(io)?;
             for target in targets.iter().filter(|target| target.lane == "manual") {
@@ -875,6 +1008,51 @@ mod tests {
         ));
     }
 
+    /// #1269: an x86_64-only host-lane root must be selected by the x86
+    /// job; arm64 host jobs compile it to zero tests. The red case is the
+    /// assignment main had: no such job.
+    #[test]
+    fn x86_only_roots_need_the_x86_host_job() {
+        let roots = vec![(
+            "carrick-softcpu-x86".to_owned(),
+            "softcpu_level0".to_owned(),
+            PathBuf::from("crates/carrick-softcpu-x86/tests/softcpu_level0.rs"),
+        )];
+        let job = |runs_on: &str, run: &str| {
+            format!(
+                "jobs:\n  x86-host-tests:\n    runs-on: {runs_on}\n    steps:\n      - run: {run}\n"
+            )
+        };
+        let none = "jobs:\n  macos-unit-a:\n    runs-on: macos-15\n";
+        assert!(x86_root_errors(none, &roots)[0].contains("no `x86-host-tests` job"));
+        let arm = job("ubuntu-24.04-arm", "cargo test -p carrick-softcpu-x86");
+        assert!(x86_root_errors(&arm, &roots)[0].contains("ubuntu-latest"));
+        let other = job("ubuntu-latest", "cargo test -p carrick-softmmu");
+        assert!(
+            x86_root_errors(&other, &roots)[0].contains("no `cargo test -p carrick-softcpu-x86`")
+        );
+        let gated = job(
+            "ubuntu-latest",
+            "cargo test --locked -p carrick-softcpu-x86 -p carrick-softmmu",
+        );
+        assert!(x86_root_errors(&gated, &roots).is_empty());
+        // The real roots: only softcpu-x86, never an OS-gated bhyve/NVMM root.
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        assert!(root_is_x86_64_only(&write(
+            "a.rs",
+            "#![cfg(target_arch = \"x86_64\")]\n"
+        )));
+        assert!(!root_is_x86_64_only(&write(
+            "b.rs",
+            "#![cfg(all(target_os = \"freebsd\", target_arch = \"x86_64\"))]\n"
+        )));
+        assert!(!root_is_x86_64_only(&write("c.rs", "//! portable\n")));
+    }
     #[test]
     fn linux_only_libs_need_a_linux_gate() {
         let temp_dir = tempfile::tempdir().unwrap();
