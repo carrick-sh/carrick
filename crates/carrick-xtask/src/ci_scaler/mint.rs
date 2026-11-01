@@ -746,10 +746,14 @@ mod tests {
         reads: RefCell<u32>,
         revoked: RefCell<Vec<String>>,
         admission: RefCell<Option<Admission>>,
+        /// The run's trigger: `owner` (an owner event), `chain` (a chained
+        /// round's workflow_dispatch) or `bot-elsewhere` (bot-started, off main).
+        trigger: &'static str,
     }
     impl Api {
         fn new() -> Self {
             Self {
+                trigger: "owner",
                 job_status: "in_progress",
                 permission: "admin",
                 configured: true,
@@ -771,12 +775,28 @@ mod tests {
         }
         fn run(&self, run: RunId, attempt: u32) -> Result<Value, ScalerError> {
             assert_free(&self.admission, "a GitHub run read");
+            let (event, branch, actor) = match self.trigger {
+                "chain" => (
+                    "workflow_dispatch",
+                    "main",
+                    json!({"login":"github-actions[bot]","type":"Bot"}),
+                ),
+                "bot-elsewhere" => (
+                    "workflow_dispatch",
+                    "work/dispatch-799-41",
+                    json!({"login":"github-actions[bot]","type":"Bot"}),
+                ),
+                _ => (
+                    "issues",
+                    "main",
+                    json!({"login":DISPATCH_OWNER,"type":"User"}),
+                ),
+            };
             Ok(
-                json!({"id":run.0,"run_attempt":attempt,"head_sha":SHA,"head_branch":"main",
-                "event":"issues","path":DISPATCH_WORKFLOW,
+                json!({"id":run.0,"run_attempt":attempt,"head_sha":SHA,"head_branch":branch,
+                "event":event,"path":DISPATCH_WORKFLOW,
                 "repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},
-                "actor":{"login":DISPATCH_OWNER,"type":"User"},
-                "triggering_actor":{"login":DISPATCH_OWNER,"type":"User"}}),
+                "actor":actor,"triggering_actor":actor}),
             )
         }
         fn permission(&self, endpoint: &str) -> Result<Value, ScalerError> {
@@ -969,6 +989,30 @@ mod tests {
         let mut other = row();
         other.runner = Some(RunnerId(901));
         let (served, _, _) = serve(&api, other, request("board", 41));
+        assert_eq!(served, MintServed::Refused(MintRefusal::IdentityMismatch));
+        assert!(api.mints.borrow().is_empty());
+    }
+
+    /// #1262: a chained round's run starts as the Actions bot, so it has no
+    /// collaborator to re-check; its authority is the controller's approval
+    /// of the assignment, which ran the chain rule (`admits_chain`). It
+    /// mints only once approved, and a bot-started run of any other shape
+    /// is refused.
+    #[test]
+    fn a_chained_run_mints_only_once_its_assignment_is_approved() {
+        let mut api = Api::new();
+        api.trigger = "chain";
+        api.permission = "none";
+        let (served, _, _) = serve(&api, row(), request("publish", 41));
+        assert_eq!(served, MintServed::Minted(MintScope::Publish));
+        let mut unapproved = row();
+        unapproved.approved = false;
+        let (served, exchange, _) = serve(&api, unapproved, request("publish", 41));
+        assert_eq!(served, MintServed::Refused(MintRefusal::NotAssigned));
+        assert!(!exchange.responses[0].contains(SECRET));
+        let mut api = Api::new();
+        api.trigger = "bot-elsewhere";
+        let (served, _, _) = serve(&api, row(), request("publish", 41));
         assert_eq!(served, MintServed::Refused(MintRefusal::IdentityMismatch));
         assert!(api.mints.borrow().is_empty());
     }

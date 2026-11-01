@@ -2244,17 +2244,17 @@ pub(crate) fn verify_chain(id: u64, read: &mut Read<'_>) -> Result<ChainLink, Sc
                     return Err(refused("chain outcome is not the latest dispatch outcome"));
                 }
             }
-            if after && comment["user"]["type"] == "User" {
+            // Only the owner breaks a chain (#1262): any other account's
+            // comment, `/agent` included, is not the owner's direction.
+            if after && owner_user(&comment["user"]) {
                 if text.trim() == round_inbox::STOP {
                     return Err(refused(
                         "`/agent stop` after the chain outcome ends the chain",
                     ));
                 }
-                if owner_user(&comment["user"]) || text.starts_with("/agent") {
-                    return Err(refused(
-                        "an owner comment or trigger after the chain outcome ends the chain",
-                    ));
-                }
+                return Err(refused(
+                    "an owner comment or trigger after the chain outcome ends the chain",
+                ));
             }
         }
         if t != issue {
@@ -2262,8 +2262,7 @@ pub(crate) fn verify_chain(id: u64, read: &mut Read<'_>) -> Result<ChainLink, Sc
                 if review["submitted_at"]
                     .as_str()
                     .is_some_and(|s| s >= at.as_str())
-                    && review["user"]["type"] == "User"
-                    && (owner_user(&review["user"]) || review["state"] == "CHANGES_REQUESTED")
+                    && owner_user(&review["user"])
                 {
                     return Err(refused(
                         "an owner review after the chain outcome ends the chain",
@@ -2308,12 +2307,20 @@ pub(crate) fn verify_chain(id: u64, read: &mut Read<'_>) -> Result<ChainLink, Sc
             .as_str()
             .and_then(agent_loop::chain_section)
             .ok_or(refused("Chained from names no dispatch outcome"))?;
+        // The same authenticity the head outcome needs (#1262): unedited,
+        // and checkpointed on a dispatch branch of this issue.
         if comment["id"].as_u64() != Some(previous_id)
             || comment["html_url"] != previous.as_str()
             || !dispatch_comment_author(&comment["user"])
+            || comment["created_at"].as_str().is_none()
+            || comment["updated_at"] != comment["created_at"]
             || !comment_thread(&comment).is_some_and(|n| threads.contains(&n))
             || earlier.status != "Continuing"
             || earlier.round + 1 != link.round
+            || earlier
+                .checkpoint
+                .as_ref()
+                .is_none_or(|(branch, _)| dispatch_branch(branch) != Some(issue))
         {
             return Err(refused(
                 "Chained from link is not the previous Continuing round",
@@ -2422,6 +2429,10 @@ pub(crate) fn owned_pr(
         && pr["base"]["ref"] == "main"
         && pr["draft"] == true
         && run["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
+        // A chained run never owns a branch (#1262): it continues the
+        // checkpoint branch of the owner-rooted round it chains from, so
+        // ownership keeps that run's live collaborator re-check.
+        && !chain_run(run)
         && dispatch_run_admitted(run, Some(issue), trusted)
         && pr["body"].as_str().is_some_and(|body| {
             body.lines().any(|line| line == format!("Closes #{issue}"))
@@ -2802,6 +2813,22 @@ fn runner_chain_context() -> bool {
 fn dispatch_event(event: &Value) -> bool {
     event.get("inputs").is_some() && event.get("workflow").is_some()
 }
+/// The one open PR whose head is `branch` in this repository, if any.
+fn checkpoint_pr(root: &Path, branch: &str) -> Result<Option<Value>, ScalerError> {
+    let prs = api(
+        root,
+        &format!("repos/{REPOSITORY}/pulls?state=open&base=main&head=carrick-sh:{branch}"),
+    )?;
+    Ok(match prs.as_array().map(Vec::as_slice) {
+        Some([pr]) if pr["head"]["ref"] == branch => {
+            let number = pr["number"]
+                .as_u64()
+                .ok_or(ScalerError::Guard("missing PR number"))?;
+            Some(api(root, &format!("repos/{REPOSITORY}/pulls/{number}"))?)
+        }
+        _ => None,
+    })
+}
 fn resolve_event(
     root: &Path,
     path: &Path,
@@ -2829,6 +2856,12 @@ fn resolve_event(
         if link.thread != link.issue {
             event["pull_request"] =
                 api(root, &format!("repos/{REPOSITORY}/pulls/{}", link.thread))?;
+        } else if let Some(pr) = checkpoint_pr(root, &link.facts.branch)? {
+            // Continue the checkpoint's open PR, owned by the owner-rooted
+            // run that made it, rather than start a branch this chained run
+            // would own (#1262).
+            event["issue"] = api(root, &format!("repos/{REPOSITORY}/issues/{}", pr["number"]))?;
+            event["pull_request"] = pr;
         }
         event["chain"] = link.outcome.clone();
         chain = Some(link);
@@ -5553,6 +5586,18 @@ pub(crate) mod chain_fixture {
         ("owner review after", Some("owner review")),
         ("dispatch label after", Some("dispatch label")),
         ("agent stop after", Some("`/agent stop`")),
+        // Only the owner breaks a chain (#1262).
+        ("stranger agent after", None),
+        ("stranger changes-requested review after", None),
+        // Every hop is held to the head outcome's checks (#1262).
+        (
+            "edited earlier hop",
+            Some("not the previous Continuing round"),
+        ),
+        (
+            "earlier hop checkpoint elsewhere",
+            Some("not the previous Continuing round"),
+        ),
         ("already chained", Some("already chained")),
         (
             "already chained in the same second",
@@ -5741,6 +5786,27 @@ pub(crate) mod chain_fixture {
                 "issues/799/comments",
                 comment(42, 799, "tjfontaine", later, "/agent stop"),
             ),
+            "stranger agent after" => push(
+                &mut map,
+                "issues/799/comments",
+                comment(46, 799, "someone", later, "/agent stop this"),
+            ),
+            "stranger changes-requested review after" => push(
+                &mut map,
+                "pulls/800/reviews",
+                json!({"id":65,"state":"CHANGES_REQUESTED","user":{"login":"someone","type":"User"},"submitted_at":later}),
+            ),
+            "edited earlier hop" => {
+                map.get_mut(&comment_key(20)).unwrap()["updated_at"] = later.into();
+            }
+            "earlier hop checkpoint elsewhere" => {
+                let first = map.get_mut(&comment_key(20)).unwrap();
+                let body = first["body"].as_str().unwrap().replace(
+                    "Checkpoint: work/dispatch-799-42",
+                    "Checkpoint: work/dispatch-900-42",
+                );
+                first["body"] = body.into();
+            }
             "owner review after" => push(
                 &mut map,
                 "pulls/800/reviews",

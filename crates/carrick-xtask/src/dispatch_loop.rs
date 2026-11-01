@@ -4484,6 +4484,43 @@ fi
             }
         });
     }
+    /// #1262: a chained run never owns a branch. The same draft PR is owned
+    /// through the owner-triggered run that made it; a chain-shaped run named
+    /// by the branch (no collaborator to re-check) owns nothing.
+    #[test]
+    fn a_chain_shaped_run_never_owns_a_dispatch_branch() {
+        shared_fixture(|root| {
+            let pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            let mut run: Value =
+                serde_json::from_str(&regular_text(&root.join("run.json")).unwrap()).unwrap();
+            let branch = "work/dispatch-799-42";
+            assert!(owned_pr(
+                &pr,
+                &run,
+                799,
+                branch,
+                None,
+                &mut owner_collaborator()
+            ));
+            run["event"] = "workflow_dispatch".into();
+            run["head_branch"] = "main".into();
+            run["actor"] = json!({"login":"github-actions[bot]","type":"Bot"});
+            run["triggering_actor"] = run["actor"].clone();
+            assert!(
+                crate::dispatch_worker::chain_run(&run),
+                "fixture is chain-shaped"
+            );
+            assert!(!owned_pr(
+                &pr,
+                &run,
+                799,
+                branch,
+                None,
+                &mut owner_collaborator()
+            ));
+        });
+    }
     #[test]
     fn guard_publication_ignores_the_artifact_handoff_even_with_a_token() {
         shared_fixture(|root| {
