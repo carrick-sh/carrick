@@ -53,6 +53,22 @@ pub const HVF_CLOSURE_LABELS: [&str; 4] = ["self-hosted", "macOS", "ARM64", "car
 /// re-served beyond this many reservations; a re-run is a new attempt.
 pub const MAX_SERVES_PER_JOB: usize = 3;
 pub const HOSTED_CI_WORKFLOW: &str = ".github/workflows/ci.yml";
+/// Job-admission capabilities this binary's `admit-job` implements, printed
+/// one per line by `ci-scaler capabilities`. A standing clone's job-start
+/// hook runs the *template's* xtask, so before minting a runner the
+/// controller refuses a template that lacks any of these (#1366): a
+/// template that predates `merge-group-v1` refuses ci.yml merge-group jobs
+/// at job start and kills the runner. Add an entry whenever admission
+/// gains behaviour the controller relies on; template 300 must then be
+/// rebuilt before the new controller serves jobs.
+pub const ADMIT_JOB_CAPABILITIES: [&str; 2] = ["admit-job-controller", "merge-group-v1"];
+/// `ci-scaler capabilities` output.
+pub fn capabilities_text() -> String {
+    ADMIT_JOB_CAPABILITIES
+        .iter()
+        .map(|capability| format!("{capability}\n"))
+        .collect()
+}
 pub const KERNEL_RUNTIME_WORKFLOW: &str = ".github/workflows/kernel-runtime.yml";
 pub const PILOT_WORKFLOW: &str = ".github/workflows/willow-pilot.yml";
 const PILOT_BRANCH: &str = "work/willow-pilot";
@@ -1198,6 +1214,9 @@ pub enum ScalerAction {
     },
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
+    /// Print the job-admission capabilities this binary implements, one per
+    /// line; the controller refuses a template lacking any of them (#1366).
+    Capabilities,
     /// Runner job-start hook: authorize before any workflow step executes.
     AdmitJob {
         /// Ask the credential-holding controller to re-vet the assigned run.
@@ -1290,6 +1309,10 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
         ScalerAction::SweepCloneVolumes { state_dir } => live::sweep_clone_volumes(&state_dir),
         ScalerAction::CheckTemplateRetirement { template } => template_retirement::check(template),
         ScalerAction::VerifyKvm => verify_kvm(),
+        ScalerAction::Capabilities => {
+            print!("{}", capabilities_text());
+            Ok(())
+        }
         ScalerAction::AdmitJob {
             policy_file,
             state_dir,

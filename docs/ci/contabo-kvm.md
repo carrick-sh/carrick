@@ -1,23 +1,38 @@
 # Contabo self-hosted KVM lane
 
-The trusted post-landing KVM lane runs on a throwaway JIT clone on the dedicated
-Contabo host (issue #287). The design,
+The KVM lane runs on a throwaway JIT clone on the dedicated Contabo host
+(issue #287): after landing for main pushes, and before landing for merge
+groups in the KVM closure (#1366). The design,
 admission and teardown are the Willow standing controller's, unchanged
 ([willow-pilot.md](willow-pilot.md)). Only the clone placement differs, and
 it comes from the typed site table in `crates/carrick-xtask/src/ci_scaler/site.rs`.
 A clone that GitHub assigns a job from a run other than the one it was minted
 for admits it only after the controller re-vets that run
 ([willow-pilot.md](willow-pilot.md#actual-assignments-are-re-vetted-333));
-the controller binary in `/root/carrick-ci/bin` carries this, so deploying it
-needs a controller restart, not a template rebuild.
+the controller binary in `/root/carrick-ci/bin` carries that re-vet.
+
+The job-start hook, though, authorizes with the **template's own**
+`/usr/local/bin/carrick-xtask`, so a change to job admission needs a template
+300 rebuild as well as a controller restart. The admission that merge groups
+need (#1366) is one such change. Before minting a runner, the controller runs
+`carrick-xtask ci-scaler capabilities` on the template binary and refuses a
+template that lacks any entry of `ADMIT_JOB_CAPABILITIES`
+(`ci_scaler.rs`), naming "rebuild template 300". It checks every standing
+clone, whatever job it was minted for, because GitHub can hand any clone with
+the `willow-kvm` labels a merge-group job. Rebuild the template from the same
+commit as the controller, then restart the controller.
 
 The same standing service also serves issue-label agent clones from the
 active agent template (9000/9001); see [dispatch-worker.md](dispatch-worker.md) for the four-clone budget,
 runner-independent credentials and VM-local leases. The KVM placement
 and its two-clone budget below are separate from the agent budget.
 
-This is trusted-ref CI infrastructure for an experimental project, not an
-adversarial isolation boundary.
+This is CI infrastructure for an experimental project, not an adversarial
+isolation boundary. Since #1366 it is no longer trusted-ref only: **code that
+any collaborator with write access enqueues in the merge queue runs on these
+clones**, before it lands. Clones are disposable and a merge-group job checks
+out without persisted credentials, but treat everything the clone can reach
+(the NAT, the Contabo host's exposed services) as reachable by queued code.
 
 ## Site
 
@@ -85,10 +100,23 @@ DNS to the public resolver and NAT to the internet still work.
 
 ## Runner lane
 
-The `kvm-tests-willow` job and its `willow-kvm` runner labels are served from
-Contabo; there is no separate workflow arm. Only one standing controller may
-serve those labels, so Willow's stays stopped. The lane runs when
-`CARRICK_SELF_HOSTED_KVM=true`.
+The `kvm-tests-willow` job (`kernel-runtime.yml`) and the `kvm-tests` job
+(`ci.yml`), with their shared `willow-kvm` runner labels, are served from
+Contabo. Both jobs check out and then run one composite action,
+`.github/actions/kvm-lane-receipt`, so merge-group candidates and main-push
+baselines come from the same steps; only cache publication differs
+(main saves, merge groups restore). Only one standing controller may serve
+those labels, so Willow's stays stopped.
+
+Two repository variables switch the jobs:
+
+- `CARRICK_SELF_HOSTED_KVM=true` runs the main-push lane.
+- `CARRICK_MERGE_GROUP_KVM` is the merge-group lane's break-glass. It is
+  on unless set to exactly `false` (any case). When it is off, `kvm-tests`
+  and `kvm-gate` are skipped and `ci-ok` requires them skipped, so the queue
+  keeps moving without KVM evidence and `ci-results` warns. Use it when
+  Contabo or the controller is down, or for a fix-forward that must land
+  while the lane is broken.
 
 ## Events and receipts
 
@@ -96,7 +124,13 @@ serve those labels, so Willow's stays stopped. The lane runs when
 owner `workflow_dispatch` on `main`, when this backend is selected. The
 standing controller and job-start hook admit exactly those events for this
 workflow (dispatch requires both `actor` and `triggering_actor` to be
-`tjfontaine`); merge groups, pull requests and schedules are refused. The HVF
+`tjfontaine`). For `ci.yml` they admit only `merge_group` runs on
+`gh-readonly-queue/main/pr-*` (#1366), and only through a controller-vetted
+run binding: the persistent standing hook refuses merge groups. Pull requests
+and schedules are refused for both workflows. `ci.yml`'s `kvm-gate` grades a
+merge-group receipt against the nearest receipted first-parent main ancestor,
+whose receipt comes from the main-push lane; a merge-group receipt never
+becomes a baseline. The HVF
 lane runs on the same events on cloudmac. The optional HVF full-conformance
 closure runs only on owner dispatch when enabled, on a separate runner.
 For `dispatch-worker.yml` the hook also admits a chained round (#1241
@@ -105,8 +139,10 @@ part 3): `workflow_dispatch` on `main` started and triggered by
 outcome its guard named before minting that clone
 ([dispatch docs](dispatch-worker.md#rounds-chain-1241-part-3)).
 `ci.yml` continues running its own PR, merge-group, push, schedule and
-dispatch lanes; only `ci-ok` is required for merging. Pre-merge hardware
-evidence belongs to the director; these post-landing runs are the backstop.
+dispatch lanes; only `ci-ok` is required for merging, and for a merge group
+in the KVM closure it requires `kvm-tests` and `kvm-gate`. The main-push runs
+publish the baselines and remain the backstop for anything landed with the
+break-glass on or by an admin merge.
 
 The standing KVM controller, like cloudmac, serves only the newest queued
 main push before owner dispatches. Each poll durably records and logs older

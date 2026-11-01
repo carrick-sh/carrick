@@ -1512,10 +1512,21 @@ ci-results:
         echo "superseded by a newer run on the same head (#1283)"
         exit 0
     fi
-    jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" '
+    # CARRICK_MERGE_GROUP_KVM=false is the owner's break-glass for the
+    # merge-group KVM lane (#1366): both KVM jobs must then be skipped.
+    # Workflow expressions compare strings case-insensitively, so this does.
+    mg_kvm=$(printf '%s' "${CI_MERGE_GROUP_KVM:-}" | tr '[:upper:]' '[:lower:]')
+    if [[ "${CI_EVENT}" == merge_group && "${mg_kvm}" == false ]]; then
+        msg="merge-group KVM lane is off (CARRICK_MERGE_GROUP_KVM=false): this entry lands without KVM evidence"
+        echo "::warning title=KVM break-glass::${msg}"
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            echo "${msg}" >> "${GITHUB_STEP_SUMMARY}"
+        fi
+    fi
+    jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" --arg mgkvm "${mg_kvm}" '
       has("lint-clippy") and has("lint-gates") and has("xtask-tests-build") and has("loom") and
       has("el1-native-tests") and has("el1-native-gate") and
-      (if $event == "merge_group" and (.changes.outputs.kvm // "true") != "false"
+      (if $event == "merge_group" and $mgkvm != "false" and (.changes.outputs.kvm // "true") != "false"
        then .["kvm-tests"].result == "success" and .["kvm-gate"].result == "success"
        else (.["kvm-tests"].result // "skipped") == "skipped" and (.["kvm-gate"].result // "skipped") == "skipped" end) and
       (del(.["kvm-tests"], .["kvm-gate"]) |

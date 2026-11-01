@@ -913,6 +913,55 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
         None,
         &not_required.to_string()
     ));
+    // Break-glass (#1366): CARRICK_MERGE_GROUP_KVM=false (any case, as
+    // workflow expressions compare) is the only value that turns it off. Off, an in-closure group needs both
+    // KVM jobs skipped; a job that ran anyway (or failed) is red.
+    let mut in_closure: serde_json::Value = serde_json::from_str(&mg_needs).unwrap();
+    in_closure["changes"]["outputs"]["kvm"] = serde_json::json!("true");
+    let mut glass_skipped = in_closure.clone();
+    for job in ["kvm-tests", "kvm-gate"] {
+        glass_skipped[job]["result"] = serde_json::json!("skipped");
+    }
+    let off = [("CI_MERGE_GROUP_KVM", "false")];
+    let (passed, out) =
+        run_ci_results_with_env("merge_group", None, &glass_skipped.to_string(), &off);
+    assert!(passed, "break-glass off: both skipped passes");
+    assert!(out.contains("CARRICK_MERGE_GROUP_KVM=false"), "{out}");
+    assert!(
+        run_ci_results_with_env(
+            "merge_group",
+            None,
+            &glass_skipped.to_string(),
+            &[("CI_MERGE_GROUP_KVM", "FALSE")]
+        )
+        .0
+    );
+    for verdict in ["success", "failure"] {
+        let mut ran = glass_skipped.clone();
+        ran["kvm-tests"]["result"] = serde_json::json!(verdict);
+        assert!(
+            !run_ci_results_with_env("merge_group", None, &ran.to_string(), &off).0,
+            "break-glass off: kvm-tests {verdict} is red"
+        );
+    }
+    // On (unset, "true", or any other spelling): skipped jobs are red and
+    // both must succeed.
+    for on in [None, Some("true"), Some("0"), Some("off")] {
+        let env: Vec<(&str, &str)> = on.map(|v| ("CI_MERGE_GROUP_KVM", v)).into_iter().collect();
+        assert!(
+            !run_ci_results_with_env("merge_group", None, &glass_skipped.to_string(), &env).0,
+            "lane on ({on:?}): skipped KVM jobs are red"
+        );
+        assert!(
+            run_ci_results_with_env("merge_group", None, &in_closure.to_string(), &env).0,
+            "lane on ({on:?}): both KVM jobs green passes"
+        );
+    }
+    // The break-glass never applies outside merge groups' KVM jobs.
+    assert!(
+        !run_ci_results_with_env("merge_group", None, &not_required.to_string(), &off).0,
+        "break-glass does not excuse a failed kvm-gate"
+    );
     for job in [
         "lint-clippy",
         "lint-gates",

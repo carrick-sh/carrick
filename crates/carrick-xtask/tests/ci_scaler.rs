@@ -761,8 +761,11 @@ fn kvm_willow_lane_is_sole_kvm_backend_and_read_directly() {
         ok_env["KVM"].as_str(),
         Some("${{ needs.kvm-tests-willow.result }}")
     );
-    // The Willow backend publishes the one artifact name the gate downloads.
-    let names: Vec<_> = jobs["kvm-tests-willow"]["steps"]
+    // The Willow backend publishes the one artifact name the gate downloads,
+    // from the composite action both KVM jobs share.
+    let lane = include_str!("../../../.github/actions/kvm-lane-receipt/action.yml");
+    let lane = yaml_rust2::YamlLoader::load_from_str(lane).unwrap();
+    let names: Vec<_> = lane[0]["runs"]["steps"]
         .as_vec()
         .unwrap()
         .iter()
@@ -770,8 +773,72 @@ fn kvm_willow_lane_is_sole_kvm_backend_and_read_directly() {
         .collect();
     assert!(
         names.contains(&"receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}"),
-        "kvm-tests-willow: {names:?}"
+        "kvm-lane-receipt: {names:?}"
     );
+}
+
+/// #1366: merge-group candidates (ci.yml `kvm-tests`) are graded against
+/// main-push baselines (kernel-runtime.yml `kvm-tests-willow`), so both must
+/// run one step definition: checkout, then the shared composite action, on
+/// the same labels. Only the cache-publication input differs.
+#[test]
+fn both_kvm_jobs_run_the_one_shared_lane_definition() {
+    let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
+    let hosted = include_str!("../../../.github/workflows/ci.yml");
+    let kernel = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
+    let hosted = yaml_rust2::YamlLoader::load_from_str(hosted).unwrap();
+    let steps = |doc: &yaml_rust2::Yaml, job: &str| -> Vec<(String, Option<String>)> {
+        doc["jobs"][job]["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["uses"].as_str().unwrap().to_owned(),
+                    s["with"]["save-cache"].as_str().map(str::to_owned),
+                )
+            })
+            .collect()
+    };
+    let main = steps(&kernel[0], "kvm-tests-willow");
+    let queue = steps(&hosted[0], "kvm-tests");
+    let shared = "./.github/actions/kvm-lane-receipt";
+    assert_eq!(main.len(), 2, "{main:?}");
+    assert_eq!(queue.len(), 2, "{queue:?}");
+    assert_eq!(main[0].0, queue[0].0, "same pinned checkout");
+    assert!(main[0].0.starts_with("actions/checkout@11bd71901bbe"));
+    assert_eq!(
+        (main[1].0.as_str(), main[1].1.as_deref()),
+        (shared, Some("true"))
+    );
+    assert_eq!(
+        (queue[1].0.as_str(), queue[1].1.as_deref()),
+        (shared, Some("false"))
+    );
+    let labels = |doc: &yaml_rust2::Yaml, job: &str| -> Vec<String> {
+        doc["jobs"][job]["runs-on"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(labels(&kernel[0], "kvm-tests-willow"), LABELS);
+    assert_eq!(labels(&hosted[0], "kvm-tests"), LABELS);
+    // Pre-landing code runs here: every third-party action is SHA-pinned
+    // except upload-artifact, which no workflow in this repository pins.
+    let lane = include_str!("../../../.github/actions/kvm-lane-receipt/action.yml");
+    let lane = yaml_rust2::YamlLoader::load_from_str(lane).unwrap();
+    for step in lane[0]["runs"]["steps"].as_vec().unwrap() {
+        if let Some(action) = step["uses"].as_str() {
+            let (_, version) = action.split_once('@').unwrap();
+            assert!(
+                action.starts_with("actions/upload-artifact@")
+                    || (version.len() == 40 && version.bytes().all(|b| b.is_ascii_hexdigit())),
+                "{action} must be pinned to a commit"
+            );
+        }
+    }
 }
 
 #[test]

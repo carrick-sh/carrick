@@ -16,6 +16,42 @@ fn only_trusted_warmer_publishes_bounded_shared_compiler_caches() {
             let Some(action) = step["uses"].as_str() else {
                 continue;
             };
+            // A local composite action's steps are this job's steps too: a
+            // rust-cache inside one must not publish from ci.yml (#1366).
+            if let Some(local) = action.strip_prefix("./") {
+                let text = std::fs::read_to_string(root.join(local).join("action.yml")).unwrap();
+                let composite = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
+                for inner in composite["runs"]["steps"].as_vec().unwrap() {
+                    if inner["uses"]
+                        .as_str()
+                        .is_some_and(|a| a.starts_with("Swatinem/rust-cache@"))
+                    {
+                        assert_eq!(
+                            inner["with"]["save-if"].as_str(),
+                            Some("${{ inputs.save-cache }}"),
+                            "{local}"
+                        );
+                        assert!(
+                            inner["with"]["shared-key"]
+                                .as_str()
+                                .unwrap()
+                                .ends_with("-v2")
+                        );
+                        assert_eq!(
+                            step["with"]["save-cache"].as_str(),
+                            Some("false"),
+                            "{job:?} must call {local} restore-only"
+                        );
+                    }
+                    assert!(
+                        !inner["uses"]
+                            .as_str()
+                            .is_some_and(|a| a.starts_with("actions/cache")),
+                        "{local}: compiler caches stay in the hosted jobs"
+                    );
+                }
+                continue;
+            }
             assert!(
                 !action.starts_with("actions/cache@"),
                 "cache readers must use restore-only actions"

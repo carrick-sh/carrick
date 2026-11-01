@@ -1,0 +1,89 @@
+name: KVM-lane receipt
+description: >-
+  The one definition of the self-hosted KVM lane (#1366). Runs every kvm-lane
+  test target (`just accept --profile kvm`, which runs `just test-kvm` with
+  CARRICK_REQUIRE_KVM=1) on a real /dev/kvm and uploads the per-SHA receipt
+  and step logs. kernel-runtime.yml's `kvm-tests-willow` (main-push
+  baselines) and ci.yml's `kvm-tests` (merge-group candidates) both run it,
+  so a candidate is always graded against a baseline produced by the same
+  steps. The caller checks out the repository first.
+inputs:
+  save-cache:
+    description: >-
+      Whether this run may publish the Rust cache. Only kernel-runtime.yml
+      (main pushes and owner dispatches) passes 'true'; ci.yml merge groups
+      run pre-landing code and pass 'false' (restore only).
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Verify KVM host
+      shell: bash
+      run: |
+        test "$(uname -s)" = Linux
+        test "$(uname -m)" = x86_64
+        test -c /dev/kvm
+        test -r /dev/kvm
+        test -w /dev/kvm
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      with:
+        toolchain: stable
+
+    # One key for both callers: merge groups restore what main pushes saved.
+    - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+      with:
+        shared-key: kvm-lane-v2
+        save-if: ${{ inputs.save-cache }}
+
+    - name: Install just
+      uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      with:
+        tool: just
+
+    - name: Install per-user compiler cache
+      shell: bash
+      run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+
+    - name: Install x86 image and fixture targets
+      shell: bash
+      run: rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
+
+    # `xtask accept --profile kvm` runs `just test-kvm` and records every
+    # failing `<test-binary>::<test>` in the receipt (one format with the
+    # signed lane).
+    - name: KVM-lane receipt (CARRICK_REQUIRE_KVM=1)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Persistent workspaces: a stale receipt must not stand in for this run.
+        rm -rf target/ci-receipts target/el1-gate
+        mkdir -p target/ci-receipts
+        status=0
+        just accept --profile kvm --receipt target/ci-receipts/receipt.json || status=$?
+        echo "xtask accept exited $status"
+        test -s target/ci-receipts/receipt.json
+
+    # Lane jobs only produce and upload receipts; they never wait for a
+    # base receipt, so a queued entry can never hold the runner its base
+    # entry needs. The hosted `kvm-gate` jobs compare.
+    - name: Upload per-SHA receipt
+      if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        # The attempt keeps a re-run from colliding with an earlier upload;
+        # the gate picks the newest attempt.
+        name: receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}
+        path: target/ci-receipts/receipt.json
+        if-no-files-found: error
+
+    # `xtask accept --profile kvm` writes per-step logs (e.g.
+    # `01-kvm-tests.log`) under `target/el1-gate/<short-sha>/`.
+    - name: Upload step logs
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: kvm-logs-${{ github.sha }}-${{ github.run_attempt }}
+        path: target/el1-gate/
+        if-no-files-found: ignore

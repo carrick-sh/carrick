@@ -90,6 +90,27 @@ const GUEST_MINT_CLEAR: &str = r#"cd /run/carrick-ci || exit 1
 [ -f token-request ] && [ ! -L token-request ] || exit 5
 exec 9<token-request && timeout 10 /usr/bin/flock -w 3 9 || exit 6
 if [ -z "$1" ] || grep -qF -- "\"$1\"" token-request; then : > token-request; fi"#;
+/// Verdict on a template's `ci-scaler capabilities` probe: every entry of
+/// this controller's [`ADMIT_JOB_CAPABILITIES`] must be listed. A template
+/// older than the probe exits non-zero (unknown subcommand).
+fn template_capabilities_verdict(probe: &GuestOutput) -> Result<(), ScalerError> {
+    if probe.exit != GuestExit(0) {
+        return Err(ScalerError::Guard(
+            "template xtask predates `ci-scaler capabilities`, so its job-start hook refuses merge-group jobs; rebuild template 300",
+        ));
+    }
+    let listed: std::collections::BTreeSet<&str> = probe.stdout.lines().map(str::trim).collect();
+    if ADMIT_JOB_CAPABILITIES
+        .iter()
+        .all(|capability| listed.contains(capability))
+    {
+        Ok(())
+    } else {
+        Err(ScalerError::Guard(
+            "template xtask lacks an admit-job capability this controller serves (ADMIT_JOB_CAPABILITIES); rebuild template 300",
+        ))
+    }
+}
 fn script_install_command(path: &str, source: &str) -> String {
     format!(
         "umask 077; printf '%s' {} > {} && chmod 755 {}",
@@ -1290,6 +1311,14 @@ fn boot_and_register(
                 "template xtask lacks admit-job --controller; rebuild template 300",
             ));
         }
+        // GitHub hands a standing clone any job with its labels, including a
+        // ci.yml merge-group job, whatever job it was minted for; the hook
+        // then authorizes with the template's xtask. Refuse a template whose
+        // admission predates what this controller serves (#1366).
+        template_capabilities_verdict(&pve.agent_output(
+            row,
+            &["/usr/local/bin/carrick-xtask", "ci-scaler", "capabilities"],
+        )?)?;
     }
     if matches!(admission, Admission::Agent) {
         // Agent policy parsing and assignment authorization shipped with this
@@ -3722,5 +3751,34 @@ mod tests {
             recover_registration(&row, &[json!({"id":99,"name":"someone-else"})]).unwrap(),
             None
         );
+    }
+
+    /// #1366: a stale template 300 passes the `--controller` help check but
+    /// its hook refuses ci.yml merge-group jobs. The controller must refuse
+    /// it before minting a runner, naming the rebuild.
+    #[test]
+    fn stale_template_admission_is_refused_before_minting_with_a_rebuild_reason() {
+        let probe = |exit, stdout: &str| GuestOutput {
+            exit: GuestExit(exit),
+            stdout: stdout.to_owned(),
+        };
+        // A pre-#1366 xtask: `ci-scaler capabilities` is an unrecognized
+        // subcommand (exit 1, usage on stderr), yet `admit-job --help`
+        // still lists `--controller`, so the older check alone admits it.
+        let old = template_capabilities_verdict(&probe(1, "")).unwrap_err();
+        assert!(
+            matches!(old, ScalerError::Guard(reason) if reason.contains("rebuild template 300")
+                && reason.contains("merge-group")),
+            "{old}"
+        );
+        // A template that knows the probe but not this controller's
+        // merge-group admission.
+        let partial = template_capabilities_verdict(&probe(0, "admit-job-controller\n"));
+        assert!(
+            matches!(partial, Err(ScalerError::Guard(reason)) if reason.contains("rebuild template 300"))
+        );
+        // A template built from this commit lists what it implements.
+        template_capabilities_verdict(&probe(0, &capabilities_text())).unwrap();
+        assert!(capabilities_text().lines().any(|c| c == "merge-group-v1"));
     }
 }

@@ -423,68 +423,12 @@ jobs:
     runs-on: [self-hosted, Linux, X64, willow-kvm]
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify KVM host
-        run: |
-          test "$(uname -s)" = Linux
-          test "$(uname -m)" = x86_64
-          test -c /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # One definition shared by both KVM jobs (#1366):
+      # .github/actions/kvm-lane-receipt.
+      - uses: ./.github/actions/kvm-lane-receipt
         with:
-          tool: just
-
-      - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
-
-      - name: Install x86 image and fixture targets
-        run: rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
-
-      # `xtask accept --profile kvm` runs `just test-kvm` and records every
-      # failing `<test-binary>::<test>` in the receipt (one format with the
-      # signed lane).
-      - name: KVM-lane receipt (CARRICK_REQUIRE_KVM=1)
-        run: |
-          set -euo pipefail
-          # Persistent workspaces: a stale receipt must not stand in for this run.
-          rm -rf target/ci-receipts target/el1-gate
-          mkdir -p target/ci-receipts
-          status=0
-          just accept --profile kvm --receipt target/ci-receipts/receipt.json || status=$?
-          echo "xtask accept exited $status"
-          test -s target/ci-receipts/receipt.json
-
-      # Lane jobs only produce and upload receipts; they never wait for a
-      # base receipt, so a queued entry can never hold the runner its base
-      # entry needs. The hosted `*-gate` jobs compare.
-      - name: Upload per-SHA receipt
-        if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          # The attempt keeps a re-run from colliding with an earlier upload;
-          # the gate picks the newest attempt.
-          name: receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}
-          path: target/ci-receipts/receipt.json
-          if-no-files-found: error
-
-      # `xtask accept --profile kvm` writes per-step logs (e.g.
-      # `01-kvm-tests.log`) under `target/el1-gate/<short-sha>/`.
-      - name: Upload step logs
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: kvm-logs-${{ github.sha }}-${{ github.run_attempt }}
-          path: target/el1-gate/
-          if-no-files-found: ignore
+          save-cache: 'true'
 
   # carrick-el1-linux's native-process tests are `not(target_os = "macos")`
   # (macOS refuses their EL1 metadata window), so no macOS shard runs them

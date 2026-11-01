@@ -730,9 +730,14 @@ SendMessage.
   failures, a missing receipt or a skipped required job make `ci-ok` red,
   and an outside-closure merge group needs both jobs skipped. Pull requests
   never run KVM, so an admin merge lands with no KVM evidence.
-  `kernel-runtime.yml` still publishes the main-push baselines. Merge groups
-  are served only once the standing controller and clone job-start hooks
-  run the queue-aware admission in `ci_scaler`. Do not run `just test-kvm`
+  `kernel-runtime.yml` still publishes the main-push baselines; both jobs run
+  one composite action (`.github/actions/kvm-lane-receipt`). Break-glass:
+  repo variable `CARRICK_MERGE_GROUP_KVM=false` skips the lane and `ci-ok`
+  then requires it skipped. Queued code runs on the Contabo clones. The
+  job-start hook runs the template's xtask, so an admission change needs a
+  template 300 rebuild; the controller refuses a template missing an
+  `ADMIT_JOB_CAPABILITIES` entry ([Contabo setup](docs/ci/contabo-kvm.md)).
+  Do not run `just test-kvm`
   on the shared worker VMs; a targeted KVM test to debug a specific defect
   runs under `just lease gate`.
 - **Personality split:** the shared kernel is personality-neutral. Linux is
