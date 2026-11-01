@@ -659,7 +659,10 @@ fn guard_skips_reviews_outside_dispatch_changes_requests() {
     let condition = docs[0]["jobs"]["guard"]["if"].as_str().unwrap();
     // #1214: no hard-coded login; an association pre-filter on comments and
     // reviews, with the guard's live permission check authoritative.
-    assert!(!condition.contains("tjfontaine") && !condition.contains("github.actor"));
+    assert!(!condition.contains("tjfontaine"));
+    // The only actor test is the chained round's (#1241 part 3).
+    assert_eq!(condition.matches("github.actor").count(), 1, "{condition}");
+    assert!(condition.contains("github.actor == 'github-actions[bot]'"));
     for association in [
         "github.event.comment.author_association",
         "github.event.review.author_association",
@@ -862,7 +865,104 @@ fn guard_skips_labels_that_cannot_be_admitted() {
     assert_eq!(
         docs[0]["jobs"]["guard"]["if"].as_str(),
         Some(
-            "github.event.sender.type == 'User' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), github.event.comment.author_association) && startsWith(github.event.comment.body, '/agent')) || (github.event_name == 'pull_request_review' && contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), github.event.review.author_association) && github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))"
+            "(github.event.sender.type == 'User' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), github.event.comment.author_association) && startsWith(github.event.comment.body, '/agent')) || (github.event_name == 'pull_request_review' && contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'), github.event.review.author_association) && github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'github-actions[bot]' && github.triggering_actor == 'github-actions[bot]')"
         )
+    );
+}
+
+/// Director condition 1 on #1241 part 3: `actions: write` exists only in
+/// `dispatch-worker.yml`'s `chain` job, where no worker or model output runs,
+/// and the job token reaches only that job's one dispatch step: no other
+/// step names it and no action (`uses:`), which receives the token by
+/// default, runs there.
+#[test]
+fn only_the_chain_step_holds_actions_write() {
+    let workflows =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let grants_actions_write = |permissions: &yaml_rust2::Yaml| {
+        permissions.as_str() == Some("write-all")
+            || permissions["actions"].as_str() == Some("write")
+    };
+    let token = |text: &str| text.contains("github.token") || text.contains("secrets.GITHUB_TOKEN");
+    let mut chain_jobs = 0;
+    let mut checked = 0;
+    for entry in std::fs::read_dir(workflows).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let docs = YamlLoader::load_from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let workflow = &docs[0];
+        checked += 1;
+        assert!(
+            !workflow["permissions"].is_badvalue(),
+            "{name} has no top-level permissions (the repository default could grant actions: write)"
+        );
+        assert!(
+            !grants_actions_write(&workflow["permissions"]),
+            "{name} grants actions: write to every job"
+        );
+        for (job_name, job) in workflow["jobs"].as_hash().unwrap() {
+            let job_name = job_name.as_str().unwrap();
+            if !grants_actions_write(&job["permissions"]) {
+                continue;
+            }
+            assert_eq!(
+                (name.as_str(), job_name),
+                ("dispatch-worker.yml", "chain"),
+                "only dispatch-worker.yml's chain job may hold actions: write"
+            );
+            chain_jobs += 1;
+            let permissions = job["permissions"].as_hash().unwrap();
+            assert_eq!(permissions.len(), 2, "chain job permissions grew");
+            assert_eq!(job["permissions"]["contents"].as_str(), Some("read"));
+            assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));
+            assert!(job["env"].is_badvalue() && job["container"].is_badvalue());
+            assert!(!token(&format!("{:?}", job["if"])));
+            let steps = job["steps"].as_vec().unwrap();
+            let holders: Vec<_> = steps.iter().filter(|s| token(&format!("{s:?}"))).collect();
+            assert_eq!(
+                holders.len(),
+                1,
+                "the job token must reach exactly one step"
+            );
+            assert!(
+                std::ptr::eq(holders[0], steps.last().unwrap()),
+                "the token belongs to the final dispatch step"
+            );
+            assert!(
+                holders[0]["run"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("dispatch-worker chain --issue")),
+                "the token step is the chain dispatch"
+            );
+            for step in steps {
+                assert!(
+                    step["uses"].is_badvalue(),
+                    "an action runs beside actions: write: {step:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(chain_jobs, 1, "the chain job is missing");
+    assert!(checked > 1);
+    // The chain job runs only after the worker, never as part of it.
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let chain = &docs[0]["jobs"]["chain"];
+    let needs: Vec<_> = chain["needs"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert_eq!(needs, ["guard", "worker"]);
+    assert_eq!(
+        docs[0]["on"]["workflow_dispatch"]["inputs"]
+            .as_hash()
+            .unwrap()
+            .len(),
+        1,
+        "the dispatch carries the outcome id only"
     );
 }

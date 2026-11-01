@@ -586,6 +586,55 @@ impl Github {
         Ok(issue["state"] == "open")
     }
 
+    /// A chained round (#1241 part 3): REST runs carry no inputs, so the
+    /// trusted-main guard names the outcome it admitted in a step; the
+    /// controller re-verifies that outcome with the same chain rule.
+    fn admits_chain(
+        run: &Value,
+        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+    ) -> Result<bool, ScalerError> {
+        if !crate::dispatch_worker::chain_run(run) {
+            return Ok(false);
+        }
+        let id = run["id"]
+            .as_u64()
+            .ok_or(ScalerError::Guard("missing run id"))?;
+        let attempt = run["run_attempt"]
+            .as_u64()
+            .ok_or(ScalerError::Guard("missing run attempt"))?;
+        let data = request(
+            "GET",
+            &format!("repos/{REPOSITORY}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100"),
+            None,
+            true,
+        )?;
+        let jobs = pages(&data, "jobs")?;
+        if !guard_ready(&Admission::Agent, &jobs) {
+            return Ok(false);
+        }
+        let markers: Vec<_> = jobs
+            .iter()
+            .filter(|j| j["name"] == "guard")
+            .flat_map(|j| j["steps"].as_array().into_iter().flatten())
+            .filter(|s| s["conclusion"] == "success")
+            .filter_map(|s| s["name"].as_str()?.strip_prefix("Chain outcome "))
+            .collect();
+        let [marker] = markers.as_slice() else {
+            return Ok(false);
+        };
+        let parts: Vec<_> = marker.split_whitespace().collect();
+        let [issue, outcome] = parts.as_slice() else {
+            return Ok(false);
+        };
+        let (Ok(issue), Ok(outcome)) = (issue.parse::<u64>(), outcome.parse::<u64>()) else {
+            return Ok(false);
+        };
+        let link = crate::dispatch_worker::verify_chain(outcome, &mut |endpoint| {
+            request("GET", endpoint, None, false)
+        })?;
+        Ok(link.issue == issue)
+    }
+
     /// Both queued demand and the final pre-clone/reassignment vet use this
     /// API-backed admission. A successful PR-supplied guard is insufficient.
     fn admits_run(
@@ -611,6 +660,9 @@ impl Github {
             }
             if matches!(admission, Admission::Agent) && run["event"] == "issue_comment" {
                 return Self::admits_comment(run, request, publication);
+            }
+            if matches!(admission, Admission::Agent) && run["event"] == "workflow_dispatch" {
+                return Self::admits_chain(run, request);
             }
             if !matches!(admission, Admission::Agent) || run["event"] != "pull_request_review" {
                 return Ok(true);
@@ -955,6 +1007,139 @@ mod tests {
             unsafe_cases.is_empty(),
             "controller unsafe cases: {unsafe_cases:?}"
         );
+    }
+    fn chained_run() -> Value {
+        json!({"id":99,"run_attempt":1,"event":"workflow_dispatch","head_branch":"main",
+            "head_sha":"a".repeat(40),"path":DISPATCH_WORKFLOW,
+            "repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},
+            "actor":{"login":"github-actions[bot]","type":"Bot"},
+            "triggering_actor":{"login":"github-actions[bot]","type":"Bot"}})
+    }
+    /// #1241 part 3: the controller admits a chained run only through the
+    /// same chain rule as the guard (`verify_chain`), reading the outcome the
+    /// trusted guard step names, and job start admits only the chain shape.
+    #[test]
+    fn chained_runs_are_admitted_only_by_the_chain_rule() {
+        use crate::dispatch_worker::chain_fixture;
+        let mut cases: Vec<(String, bool, Value, String)> = chain_fixture::CASES
+            .iter()
+            .map(|(case, refused)| {
+                (
+                    case.to_string(),
+                    refused.is_none(),
+                    chained_run(),
+                    "Chain outcome 799 30".to_owned(),
+                )
+            })
+            .collect();
+        for (case, pointer, value) in [
+            (
+                "wrong actor",
+                "/actor",
+                json!({"login":"tjfontaine","type":"User"}),
+            ),
+            (
+                "bot of another app",
+                "/actor",
+                json!({"login":"carrick-workers[bot]","type":"Bot"}),
+            ),
+            (
+                "wrong triggering actor",
+                "/triggering_actor",
+                json!({"login":"tjfontaine","type":"User"}),
+            ),
+            ("wrong ref", "/head_branch", json!("work/dispatch-799-42")),
+            ("wrong workflow", "/path", json!(".github/workflows/ci.yml")),
+            ("wrong event", "/event", json!("repository_dispatch")),
+        ] {
+            let mut run = chained_run();
+            *run.pointer_mut(pointer).unwrap() = value;
+            cases.push((case.into(), false, run, "Chain outcome 799 30".into()));
+        }
+        cases.push((
+            "no marker".into(),
+            false,
+            chained_run(),
+            "Dispatch issue 799".into(),
+        ));
+        cases.push((
+            "marker for another issue".into(),
+            false,
+            chained_run(),
+            "Chain outcome 798 30".into(),
+        ));
+        let mut wrong = Vec::new();
+        for (case, allowed, run, marker) in cases {
+            let fixture_case = if chain_fixture::CASES.iter().any(|(c, _)| *c == case) {
+                case.as_str()
+            } else {
+                "authentic"
+            };
+            let map = chain_fixture::chain_case(fixture_case);
+            let mut serve = chain_fixture::serve(&map);
+            let jobs = json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success",
+                "steps":[{"name":marker,"conclusion":"success"}]}]}]);
+            let admitted = Github::admits_run(
+                &Admission::Agent,
+                &run,
+                &mut |method, endpoint, _, _| {
+                    assert_eq!(method, "GET");
+                    if endpoint.contains("/actions/runs/99/attempts/1/jobs") {
+                        return Ok(jobs.clone());
+                    }
+                    if endpoint.contains("/collaborators/") {
+                        return permission(endpoint);
+                    }
+                    serve(endpoint)
+                },
+                &mut |_, _, _, _| None,
+            )
+            .unwrap();
+            if admitted != allowed {
+                wrong.push(case);
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "controller chain verdicts wrong: {wrong:?}"
+        );
+        // Job start: only the chain shape, bound to the vetted run.
+        let context = |actor: &str, git_ref: &str, workflow: &str| JobContext {
+            repository: REPOSITORY.into(),
+            actor: actor.into(),
+            triggering_actor: "github-actions[bot]".into(),
+            event: "workflow_dispatch".into(),
+            workflow_ref: format!("{REPOSITORY}/{workflow}@{git_ref}"),
+            git_ref: git_ref.into(),
+            sha: "a".repeat(40),
+            run_id: 99,
+            run_attempt: 1,
+        };
+        let agent = Admission::Agent;
+        assert!(
+            agent
+                .authorize(&context(
+                    "github-actions[bot]",
+                    "refs/heads/main",
+                    DISPATCH_WORKFLOW
+                ))
+                .is_ok()
+        );
+        for refused in [
+            context("tjfontaine", "refs/heads/main", DISPATCH_WORKFLOW),
+            context(
+                "github-actions[bot]",
+                "refs/heads/work/x",
+                DISPATCH_WORKFLOW,
+            ),
+            context(
+                "github-actions[bot]",
+                "refs/heads/main",
+                ".github/workflows/ci.yml",
+            ),
+        ] {
+            assert!(agent.authorize(&refused).is_err(), "{refused:?}");
+        }
     }
     #[test]
     fn agent_comment_controller_admits_only_an_adoptable_director_pr() {

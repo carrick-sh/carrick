@@ -618,6 +618,15 @@ impl Admission {
                 Self::Agent => {
                     ((matches!(context.event.as_str(), "issues" | "issue_comment")
                         && branch == "main")
+                        // A chained round (#1241 part 3); its outcome was
+                        // verified before this runner existed.
+                        || crate::dispatch_worker::chain_context(
+                            &context.event,
+                            &context.git_ref,
+                            &context.workflow_ref,
+                            &context.actor,
+                            &context.triggering_actor,
+                        )
                         || (context.event == "pull_request_review"
                             && context
                                 .git_ref
