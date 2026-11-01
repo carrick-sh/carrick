@@ -945,19 +945,21 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.is_unadopted_birth() && !self.has_native_execution_owner()
     }
 
-    /// The ring's first entry of a native-owned birth: issue its first
-    /// execution generation. Called only by the switch-in that has just taken
-    /// this record's `OnCpu` custody, before the slot publishes it as
-    /// current, so the identity EL1 loads is already issued. This is the
-    /// ring counterpart of a host birth's adoption; the host adopter cannot
-    /// issue for a native birth (it has no host thread). Before #1100 a
-    /// native birth ran at generation 0 and its first native-service
-    /// publication was refused `Stale`.
-    fn issue_ring_first_entry(&self) {
-        if self.is_unadopted_birth() && self.has_native_execution_owner() {
-            self.generation
-                .store(FIRST_EXECUTION_GENERATION, Ordering::Release);
+    /// Issue a native-owned birth's first execution generation. The only
+    /// caller is the native process runtime's first admission of the born
+    /// thread, which re-keys the thread's member `Born` -> `Issued` in the
+    /// same transaction (#1100). Refused unless the record is an unadopted
+    /// native birth held `OnCpu` on `slot` (the admitting vCPU).
+    pub fn issue_native_first_execution(&self, slot: SlotId) -> bool {
+        if !self.is_unadopted_birth()
+            || !self.has_native_execution_owner()
+            || !matches!(self.claim(), Claim::OnCpu { slot: owner, .. } if owner == slot)
+        {
+            return false;
         }
+        self.generation
+            .store(FIRST_EXECUTION_GENERATION, Ordering::Release);
+        true
     }
 
     pub fn needs_host(&self) -> bool {
@@ -3753,7 +3755,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if owner != slot || !rec.cas(Claim::Queued { slot, seq }, Claim::OnCpu { slot, seq }) {
             return None;
         }
-        rec.issue_ring_first_entry();
         let s = self.slot(slot);
         s.terminal[0].store(0, Ordering::Release);
         s.current.store(record.raw(), Ordering::Release);
@@ -4603,7 +4604,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             ) {
                 return None;
             }
-            rec.issue_ring_first_entry();
             let t = self.slot(thief);
             t.terminal[0].store(0, Ordering::Release);
             t.current.store(record.raw(), Ordering::Release);

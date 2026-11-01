@@ -4409,6 +4409,112 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
 }
 
+/// #1100 (a'): a native-owned thread birth's first `with_process_entry`
+/// admission is its single execution issuer. In one transaction it issues
+/// the record's first generation, re-keys the registry and graph member
+/// `Born` -> `Issued`, and publishes the loaded execution. Two live threads:
+/// the born thread (tid 42) and its leader (tid 41) each re-admit under their
+/// own distinct executions afterwards.
+/// Red before the fix: the born thread stayed at generation 0, so its first
+/// native-service publication was refused `Stale`; issuing only the record
+/// (the earlier sched-core issuer) left the member under `Born` and the next
+/// admission `Stale`.
+#[test]
+fn arm_native_birth_first_admission_issues_and_rekeys_its_execution() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) =
+        imported_thread_with_identity(fixture, |identity| identity.generation = 0);
+    let mut service = fixture.process_service();
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    // The leader registers the process and its Born member (tid 42).
+    fixture
+        .enter(fixture.control, ttbr0, &mut service, |process| {
+            assert!(process.has_thread(42))
+        })
+        .unwrap();
+    let leader = (
+        fixture.task.execution.task.load(Ordering::Acquire),
+        fixture.task.execution.generation.load(Ordering::Acquire),
+        fixture.task.mm.thread_generation.load(Ordering::Acquire),
+    );
+    // EL1 switches the born thread in: it is the ring's own native birth.
+    fixture.task.set(
+        El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(0),
+        5,
+    );
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    fixture
+        .task
+        .publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    assert!(fixture.zone.mark_native_owned(record.id));
+    // First admission: the single issuer.
+    fixture
+        .enter(control, ttbr0, &mut service, |process| {
+            assert_eq!(
+                process.binding().generation,
+                carrick_core_abi::SnapshotGeneration::INITIAL,
+                "the born thread's first admission must issue its execution"
+            );
+        })
+        .expect("the first admission of a native birth issues, never Stale");
+    assert_eq!(
+        fixture.zone.record(record.id).identity().generation,
+        carrick_core_abi::SnapshotGeneration::INITIAL.raw()
+    );
+    assert!(!fixture.zone.record(record.id).is_unadopted_birth());
+    assert_eq!(
+        fixture.task.execution.generation.load(Ordering::Acquire),
+        carrick_core_abi::SnapshotGeneration::INITIAL
+    );
+    // The member was re-keyed: the issued execution re-admits.
+    fixture
+        .enter(control, ttbr0, &mut service, |process| {
+            assert_eq!(
+                process.binding().generation,
+                carrick_core_abi::SnapshotGeneration::INITIAL
+            );
+            assert!(process.has_thread(41) && process.has_thread(42));
+        })
+        .expect("the re-keyed member must admit under its issued execution");
+    // The other live thread keeps its own, distinct execution.
+    fixture.zone.clear_current(fixture.slot);
+    fixture
+        .task
+        .execution
+        .task
+        .store(leader.0, Ordering::Release);
+    fixture
+        .task
+        .execution
+        .generation
+        .store(leader.1, Ordering::Release);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(leader.2, Ordering::Release);
+    fixture.task.publish_lifecycle(
+        fixture.page as *const _ as u64,
+        fixture.control as *const _ as u64,
+    );
+    assert_ne!(leader.1, carrick_core_abi::SnapshotGeneration::INITIAL);
+    fixture
+        .enter(fixture.control, ttbr0, &mut service, |process| {
+            assert_eq!(process.binding().generation, leader.1);
+            assert!(process.has_thread(41) && process.has_thread(42));
+        })
+        .expect("the leader re-admits under its own execution");
+}
+
 #[test]
 fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
