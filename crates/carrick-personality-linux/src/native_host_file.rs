@@ -5,8 +5,10 @@
 //! served in ring and never leave it. A call whose descriptor names a
 //! host-backed open description, or that resolves a host path, genuinely
 //! crosses: the ring stages a typed [`carrick_core_abi::host_file`] record
-//! and the carrier serves it with the caller's authority. This module is the
-//! single routing decision and the single staging step for both ISAs;
+//! and the carrier serves it with the caller's authority.
+//! Pipe creation uses the same venue to provision the shared in-zone object
+//! and publish its two endpoints in the caller's table; later I/O stays in ring.
+//! This module is the single routing decision and staging step for both ISAs;
 //! transports only carry the record.
 extern crate alloc;
 
@@ -102,6 +104,10 @@ pub enum HostFileCall {
     Fstat {
         fd: i32,
         statbuf: u64,
+    },
+    Pipe2 {
+        pipefd: u64,
+        flags: u64,
     },
     Openat {
         dirfd: i32,
@@ -211,6 +217,10 @@ impl HostFileCall {
             c if c == nr::FSTAT => Self::Fstat {
                 fd,
                 statbuf: args[1],
+            },
+            c if c == nr::PIPE2 => Self::Pipe2 {
+                pipefd: args[0],
+                flags: args[1],
             },
             c if c == nr::OPENAT => Self::Openat {
                 dirfd: fd,
@@ -630,6 +640,22 @@ fn stage_call(
                 len: LINUX_STAT_BYTES,
             },
         )?,
+        HostFileCall::Pipe2 { pipefd, flags } => {
+            if carrick_syscall_abi::LinuxPipe2Flags::from_bits(flags).is_none() {
+                return Some(errno(carrick_syscall_abi::LINUX_EINVAL));
+            }
+            staging.request(
+                HostFileOp::Pipe2,
+                0,
+                0,
+                [flags, 0, 0, 0],
+                &[],
+                Some(HostFileOutput {
+                    address: pipefd,
+                    len: 8,
+                }),
+            )
+        }
         HostFileCall::Openat {
             dirfd,
             path,

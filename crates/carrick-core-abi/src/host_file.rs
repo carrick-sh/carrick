@@ -46,6 +46,9 @@ pub enum HostFileOp {
     /// ring then maps it with its own reservation owner. Input is the list of
     /// sources the caller's owner retired, which the carrier releases first.
     MapPrivate = 11,
+    /// Create an in-zone pipe in the caller's ring table (`args[0]` flags).
+    /// Output is two little-endian i32 descriptor numbers, reader then writer.
+    Pipe2 = 12,
 }
 
 /// The byte-source identity a [`HostFileOp::MapPrivate`] reply carries: the
@@ -119,6 +122,7 @@ impl HostFileOp {
             9 => Self::Lseek,
             10 => Self::Getdents64,
             11 => Self::MapPrivate,
+            12 => Self::Pipe2,
             _ => return None,
         })
     }

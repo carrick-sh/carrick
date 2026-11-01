@@ -1,7 +1,7 @@
 schema_version = 1
 id = "kernel.native.host-file-venue"
 title = "Native processes cross to the host only for host files, through the dispatcher's own path"
-guest_surfaces = ["syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev"]
+guest_surfaces = ["syscall:pipe2", "syscall:read", "syscall:pread64", "syscall:lseek", "syscall:getdents64", "syscall:fstat", "syscall:newfstatat", "syscall:statx", "syscall:openat", "syscall:faccessat", "syscall:write", "syscall:writev"]
 semantic_authority = ["man 2 read", "man 2 pread", "man 2 lseek", "man 2 getdents64", "man 2 fstat", "man 2 statx", "man 2 openat", "man 2 pipe", "owner decision on #231, #894 and #937"]
 fixture = "unit:native_reads_equal_the_dispatchers_own_syscalls"
 scale_points = [1]
@@ -14,6 +14,10 @@ record the dispatcher reports. Calls on host-backed descriptions cross once
 to the carrier, which runs the dispatcher's own description cores (read,
 pread64, lseek, getdents64, stat) against the caller's pinned description, so
 a native process sees exactly what the dispatcher's own syscalls return.
+Pipe creation is staged once to the carrier's existing pipe factory and
+publishes two existing in-zone OFDs atomically into the caller's ring table.
+It allocates zero host fd slots and retains zero host-resource tokens. Subsequent
+I/O and close remain in ring; the carrier retains no endpoint after publication.
 Paths resolve with the caller's own credentials and filesystem context, never
 the serving task's. The VM-free witnesses compare venue results with the
 dispatcher's syscalls byte for byte and prove the in-zone routing.
@@ -23,6 +27,9 @@ dispatcher's syscalls byte for byte and prove the in-zone routing.
 vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_child_handoff_tests::{arm_native_fork_child_stdout_retains_capability_after_root_exit_publication,arm_native_fork_tree_releases_capability_after_last_exit}",
   "carrick-kernel::dispatch::native_files::tests::native_reads_equal_the_dispatchers_own_syscalls",
+  "carrick-personality-linux::native_host_file::tests::native_pipe2_is_admitted_before_carrier_service",
+  "carrick-kernel::dispatch::native_files::tests::native_child_pipe_pair_owns_only_its_table_and_round_trips_in_zone",
+  "carrick-kernel::dispatch::native_files::tests::native_pipe_pair_limit_and_invalid_flags_publish_nothing",
   "carrick-el1-linux::dispatch::tests::native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout",
   "carrick-kernel::dispatch::mem::native_successor::tests::successor_image_rows_cover_every_user_leaf_and_make_elf_pages_lazy",
   "carrick-kernel::dispatch::native_files::tests::in_zone_pipe_stat_matches_the_dispatchers_pipe_record",

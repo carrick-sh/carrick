@@ -229,6 +229,22 @@ pub const LINUX_POLLWRNORM: i16 = 0x0100;
 pub const LINUX_POLLWRBAND: i16 = 0x0200;
 pub const LINUX_POLLRDHUP: i16 = 0x2000;
 pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
+pub const LINUX_O_NONBLOCK: u64 = 0o4000;
+
+bitflags! {
+    /// `pipe2(2)` creation flags.
+    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+    pub struct LinuxPipe2Flags: u64 {
+        const CLOEXEC = LINUX_O_CLOEXEC;
+        const NONBLOCK = LINUX_O_NONBLOCK;
+        const DIRECT = 0o200000;
+    }
+
+}
+
+impl LinuxPipe2Flags {
+    pub const SUPPORTED_MASK: u64 = LINUX_O_CLOEXEC | LINUX_O_NONBLOCK | 0o200000;
+}
 
 /// Linux poll interest/result bits after decoding the wire `i16` field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

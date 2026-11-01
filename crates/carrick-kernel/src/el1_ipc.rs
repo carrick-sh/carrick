@@ -366,6 +366,50 @@ impl HostDescription {
         std::sync::Arc::clone(&self.flags)
     }
 
+    /// Publish both existing endpoint OFDs in one table transaction. Capacity
+    /// is supplied outside the transaction and a refusal publishes neither end.
+    pub(crate) fn install_pair(
+        &self,
+        second: &Self,
+        table: fd::TableId,
+        cloexec: bool,
+    ) -> Result<[fd::Fd; 2], InstallHostDescriptionError> {
+        if !std::sync::Arc::ptr_eq(&self.flags.owner, &second.flags.owner)
+            || std::sync::Arc::ptr_eq(&self.flags, &second.flags)
+        {
+            return Err(InstallHostDescriptionError::Unavailable);
+        }
+        let first_state = self.flags.state.lock();
+        let second_state = second.flags.state.lock();
+        let (HostDescriptionState::Live(first), HostDescriptionState::Live(second)) =
+            (&*first_state, &*second_state)
+        else {
+            return Err(InstallHostDescriptionError::Unavailable);
+        };
+        loop {
+            let result = self
+                .flags
+                .owner
+                .region()
+                .fd(HostLockWait)
+                .transaction(table)
+                .and_then(|mut tx| tx.install_pair(fd::Fd(0), [first, second], cloexec));
+            match result {
+                Ok(pair) => return Ok(pair),
+                Err(fd::Error::NeedsBacking { descriptors }) => {
+                    self.flags
+                        .owner
+                        .ensure_capacity(table, descriptors)
+                        .map_err(|_| InstallHostDescriptionError::NoMemory)?;
+                }
+                Err(fd::Error::TooManyFiles) => {
+                    return Err(InstallHostDescriptionError::TooManyFiles);
+                }
+                Err(_) => return Err(InstallHostDescriptionError::Unavailable),
+            }
+        }
+    }
+
     /// Install the exact admitted description into a shared table. Caller
     /// supplies already-provisioned capacity and serializes slot admission.
     pub fn install(

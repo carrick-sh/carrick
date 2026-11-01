@@ -200,7 +200,12 @@ impl SyscallDispatcher {
             index: header.table[1],
             generation: header.table[2],
         });
-        let served = if header.op.resolves_path() {
+        let served = if header.op == HostFileOp::Pipe2 {
+            if !view.input().is_empty() || view.output_capacity() != 8 {
+                return Err(NativeHostFileRefusal);
+            }
+            self.serve_native_pipe(owner, table, header.args[0])
+        } else if header.op.resolves_path() {
             let authority = authority.ok_or(NativeHostFileRefusal)?;
             // Carrick's VFS names paths as UTF-8; any other byte string is
             // not served rather than altered.
@@ -306,7 +311,33 @@ impl SyscallDispatcher {
                 Ok(super::fs::CarrierWritten::NeedsTask) | Err(_) => Served::Refused,
             },
             HostFileOp::MapPrivate => self.native_map_source(description),
-            HostFileOp::Openat | HostFileOp::Faccessat | HostFileOp::Newfstatat => Served::Refused,
+            HostFileOp::Openat
+            | HostFileOp::Faccessat
+            | HostFileOp::Newfstatat
+            | HostFileOp::Pipe2 => Served::Refused,
+        }
+    }
+
+    fn serve_native_pipe(&self, owner: &Arc<HostIpc>, table: fd::TableId, flags: u64) -> Served {
+        let (pipe, _pair) = match self.fs_view().create_pipe_pair(Arc::clone(owner), flags) {
+            Ok(pair) => pair,
+            Err(errno) => return Served::errno(errno),
+        };
+        match pipe.install_native_pair(table, flags & carrick_abi::LINUX_O_CLOEXEC != 0) {
+            Ok([reader, writer]) => {
+                let mut output = Vec::with_capacity(8);
+                output.extend_from_slice(&reader.0.to_le_bytes());
+                output.extend_from_slice(&writer.0.to_le_bytes());
+                Served::Reply(0, output)
+            }
+            Err(InstallHostDescriptionError::TooManyFiles) => {
+                Served::errno(carrick_abi::LINUX_EMFILE)
+            }
+            Err(InstallHostDescriptionError::FileTableFull) => {
+                Served::errno(carrick_abi::LINUX_ENFILE)
+            }
+            Err(InstallHostDescriptionError::NoMemory) => Served::errno(carrick_abi::LINUX_ENOMEM),
+            Err(InstallHostDescriptionError::Unavailable) => Served::Refused,
         }
     }
 
@@ -675,6 +706,161 @@ mod tests {
             self.serve(authority, &mut bytes).unwrap();
             let reply = host_file::reply(&bytes).unwrap();
             (reply.result, reply.output.to_vec())
+        }
+    }
+
+    #[test]
+    fn native_child_pipe_pair_owns_only_its_table_and_round_trips_in_zone() {
+        use crate::el1_zone::HostLockWait;
+        use carrick_el1_abi::ipc::{IpcBacking, pipe::End};
+        for flags in [
+            0,
+            carrick_abi::LINUX_O_NONBLOCK,
+            carrick_abi::LINUX_O_CLOEXEC,
+            carrick_abi::LINUX_O_NONBLOCK | carrick_abi::LINUX_O_CLOEXEC,
+        ] {
+            let fixture = fixture();
+            let parent =
+                crate::el1_ipc::HostTable::create(Arc::clone(&fixture.owner), 64, 1).unwrap();
+            let child = parent.fork().unwrap();
+            let raw = child.id().to_raw();
+            let table = [raw.authority, raw.index, raw.generation];
+            let before = fixture.owner.retained_host_resources();
+            use carrick_personality_linux::native_host_file::{
+                HostFileCall, HostFileStage, HostFileUser, NativeNamespace, complete, stage,
+            };
+            struct Output;
+            impl HostFileUser for Output {
+                fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+                    false
+                }
+                fn writable(&mut self, address: u64, len: usize) -> usize {
+                    if address == 0x10000 && len == 8 {
+                        len
+                    } else {
+                        0
+                    }
+                }
+            }
+            let call = HostFileCall::decode(
+                carrick_personality_linux::crossing::nr::PIPE2,
+                &[0x10000, flags, 0, 0, 0, 0],
+            )
+            .unwrap();
+            let mut namespace = NativeNamespace {
+                table,
+                resolve: &mut |_| panic!("pipe creation resolves no input descriptor"),
+                releases: &mut |_| 0,
+            };
+            let Some(HostFileStage::Request {
+                mut record, output, ..
+            }) = stage(call, &mut namespace, &mut Output)
+            else {
+                panic!("native pipe2 must stage creation");
+            };
+            fixture.serve(None, &mut record).unwrap();
+            let mut bytes = Vec::new();
+            let result = complete(&record, output, &mut |address, output| {
+                assert_eq!(address, 0x10000);
+                bytes.extend_from_slice(output);
+                true
+            });
+            assert_eq!(result.raw(), 0);
+            assert_eq!(bytes, [0i32.to_le_bytes(), 1i32.to_le_bytes()].concat());
+            assert_eq!(
+                fixture.owner.retained_host_resources(),
+                before,
+                "no host resource token for an in-zone pipe"
+            );
+            let region = fixture.owner.region();
+            let fds = region.fd(HostLockWait);
+            assert_eq!(fds.getfd(parent.id(), fd::Fd(0)), Err(fd::Error::BadFd));
+            assert!(
+                fixture.dispatcher.open_file(4).is_none(),
+                "root host table is untouched"
+            );
+            let mut object = None;
+            for (number, access, end) in [
+                (0, fd::AccessMode::ReadOnly, End::Reader),
+                (1, fd::AccessMode::WriteOnly, End::Writer),
+            ] {
+                assert_eq!(
+                    fds.getfd(child.id(), fd::Fd(number)),
+                    Ok(flags & carrick_abi::LINUX_O_CLOEXEC != 0)
+                );
+                let (seen_access, status) = fds.getfl(child.id(), fd::Fd(number)).unwrap();
+                assert_eq!(seen_access, access);
+                assert_eq!(status.nonblock, flags & carrick_abi::LINUX_O_NONBLOCK != 0);
+                let (pin, description) = fds.pin(child.id(), fd::Fd(number)).unwrap();
+                let Some(IpcBacking::Pipe {
+                    object: seen,
+                    end: seen_end,
+                }) = IpcBacking::decode(description.backing)
+                else {
+                    panic!("pipe must stay in zone");
+                };
+                assert_eq!(seen_end, end);
+                if let Some(object) = object {
+                    assert_eq!(seen, object);
+                } else {
+                    object = Some(seen);
+                }
+                assert!(fds.unpin(pin).unwrap().is_none());
+            }
+            let object = object.unwrap();
+            fixture.owner.ensure_pipe_storage(object).unwrap();
+            {
+                let mut guard = region.lock(object, &HostLockWait).unwrap();
+                let mut pipe = guard.pipe().unwrap();
+                assert_eq!(pipe.try_write(b"a").result, Ok(1));
+                let mut bytes = [0; 1];
+                assert_eq!(pipe.try_read(&mut bytes).result, Ok(1));
+                assert_eq!(&bytes, b"a");
+            }
+            let writer = fds.close(child.id(), fd::Fd(1)).unwrap().unwrap();
+            fixture.owner.release(writer.backing).unwrap();
+            {
+                let mut guard = region.lock(object, &HostLockWait).unwrap();
+                assert_eq!(
+                    guard.pipe().unwrap().try_read(&mut [0; 1]).result,
+                    Ok(0),
+                    "no carrier pin keeps the writer alive"
+                );
+            }
+            let reader = fds.close(child.id(), fd::Fd(0)).unwrap().unwrap();
+            fixture.owner.release(reader.backing).unwrap();
+            assert!(
+                region.lock(object, &HostLockWait).is_err(),
+                "final close retires the object"
+            );
+        }
+    }
+
+    #[test]
+    fn native_pipe_pair_limit_and_invalid_flags_publish_nothing() {
+        use crate::el1_zone::HostLockWait;
+        let fixture = fixture();
+        let table = crate::el1_ipc::HostTable::create(Arc::clone(&fixture.owner), 1, 1).unwrap();
+        let raw = table.id().to_raw();
+        let words = [raw.authority, raw.index, raw.generation];
+        for (flags, errno) in [
+            (0, carrick_abi::LINUX_EMFILE),
+            (1, carrick_abi::LINUX_EINVAL),
+        ] {
+            let (result, bytes) = fixture.result(
+                None,
+                record(words, HostFileOp::Pipe2, 0, [flags, 0, 0, 0], &[], 8),
+            );
+            assert_eq!(result, errno.guest_retval());
+            assert!(bytes.is_empty());
+            assert_eq!(
+                fixture
+                    .owner
+                    .region()
+                    .fd(HostLockWait)
+                    .getfd(table.id(), fd::Fd(0)),
+                Err(fd::Error::BadFd)
+            );
         }
     }
 
