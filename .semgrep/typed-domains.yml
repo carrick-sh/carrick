@@ -343,3 +343,31 @@ rules:
       authenticated by `ExtentTable` into an `AuthenticatedGpa` before calling
       `LinearPlacement::host`.
 
+  # Forbid raw slice::from_raw_parts* byte views over typed pointers in personality crates (#1152).
+  # Zero existing sites remain in carrick-personality-* after migrating ipc.rs to
+  # UserCopy::{read_val, write_val} and zerocopy, so the allowance ceiling is 0.
+  - id: carrick-personality-no-raw-slice-byte-cast
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "crates/carrick-personality-*/**/*.rs"
+    patterns:
+      - pattern-either:
+          - pattern: core::slice::from_raw_parts($ARG, $LEN)
+          - pattern: std::slice::from_raw_parts($ARG, $LEN)
+          - pattern: slice::from_raw_parts($ARG, $LEN)
+          - pattern: from_raw_parts($ARG, $LEN)
+          - pattern: core::slice::from_raw_parts_mut($ARG, $LEN)
+          - pattern: std::slice::from_raw_parts_mut($ARG, $LEN)
+          - pattern: slice::from_raw_parts_mut($ARG, $LEN)
+          - pattern: from_raw_parts_mut($ARG, $LEN)
+      - metavariable-regex:
+          metavariable: $ARG
+          regex: '(?s).*(\bas\s*\*\s*(?:const|mut)\s+u8\b|\.cast\s*(?:::\s*<\s*u8\s*>)?\s*\(\s*\)).*'
+    message: |
+      Do not view typed records as raw byte slices via `slice::from_raw_parts*`
+      in `carrick-personality-*`: implicit struct padding causes UB and leaks
+      uninitialized kernel stack bytes to the guest. Derive `zerocopy::{FromBytes,
+      IntoBytes, Immutable, KnownLayout}` with explicit pad fields and use
+      `UserCopy::{read_val, write_val}` or `zerocopy::IntoBytes::as_bytes`.

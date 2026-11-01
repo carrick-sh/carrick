@@ -40,26 +40,78 @@ pub const SEMOPM: usize = 500;
 pub const SEMVMX: u16 = 32767;
 pub const SEMAEM: i32 = 32767;
 
-/// Linux IPC permissions structure (struct ipc64_perm).
+/// Linux IPC permissions structure (`struct ipc64_perm`, 48 bytes).
+///
+/// `mode` is `__kernel_mode_t` (`u32` on 64-bit Linux UAPI). Explicit `__pad3`
+/// aligns `__glibc_reserved1` to offset 32 with zero implicit padding.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Debug,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct LinuxIpcPerm {
     pub key: i32,
     pub uid: u32,
     pub gid: u32,
     pub cuid: u32,
     pub cgid: u32,
-    pub mode: u16,
-    pub __pad1: u16,
+    pub mode: u32,
     pub seq: u16,
     pub __pad2: u16,
+    pub __pad3: u32,
     pub __glibc_reserved1: u64,
     pub __glibc_reserved2: u64,
 }
 
-/// Linux System V message queue description (struct msqid64_ds).
+/// Linux System V shared memory segment description (`struct shmid64_ds`, 112 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Debug,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+pub struct LinuxShmidDs {
+    pub shm_perm: LinuxIpcPerm,
+    pub shm_segsz: u64,
+    pub shm_atime: u64,
+    pub shm_dtime: u64,
+    pub shm_ctime: u64,
+    pub shm_cpid: i32,
+    pub shm_lpid: i32,
+    pub shm_nattch: u64,
+    pub __glibc_reserved4: u64,
+    pub __glibc_reserved5: u64,
+}
+
+/// Linux System V message queue description (`struct msqid64_ds`, 120 bytes).
+#[repr(C)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Debug,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct LinuxMsqidDs {
     pub msg_perm: LinuxIpcPerm,
     pub msg_stime: i64,
@@ -74,9 +126,20 @@ pub struct LinuxMsqidDs {
     pub __glibc_reserved5: u64,
 }
 
-/// Linux System V semaphore set description for x86_64 (struct semid64_ds, 104 bytes).
+/// Linux System V semaphore set description for x86_64 (`struct semid64_ds`, 104 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    PartialEq,
+    Eq,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct LinuxSemidDsX86_64 {
     pub sem_perm: LinuxIpcPerm,
     pub sem_otime: i64,
@@ -88,9 +151,20 @@ pub struct LinuxSemidDsX86_64 {
     pub __glibc_reserved4: u64,
 }
 
-/// Linux System V semaphore set description for AArch64 / asm-generic (struct semid64_ds, 88 bytes).
+/// Linux System V semaphore set description for AArch64 / asm-generic (`struct semid64_ds`, 88 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    PartialEq,
+    Eq,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct LinuxSemidDsAarch64 {
     pub sem_perm: LinuxIpcPerm,
     pub sem_otime: i64,
@@ -132,18 +206,39 @@ impl LinuxSemidDsAarch64 {
     }
 }
 
-/// Linux System V semaphore operation (struct sembuf).
+/// Linux System V semaphore operation (`struct sembuf`, 6 bytes).
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+    zerocopy::Unaligned,
+)]
 pub struct LinuxSembuf {
     pub sem_num: u16,
     pub sem_op: i16,
     pub sem_flg: i16,
 }
 
-/// Linux System V msginfo (struct msginfo).
+/// Linux System V msginfo (`struct msginfo`, 32 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Debug,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct LinuxMsginfo {
     pub msgpool: i32,
     pub msgmap: i32,
@@ -153,11 +248,23 @@ pub struct LinuxMsginfo {
     pub msgssz: i32,
     pub msgtql: i32,
     pub msgseg: u16,
+    pub __pad: u16,
 }
 
-/// Linux System V seminfo (struct seminfo).
+/// Linux System V seminfo (`struct seminfo`, 40 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Debug,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct LinuxSeminfo {
     pub semmap: i32,
     pub semmni: i32,
@@ -171,16 +278,35 @@ pub struct LinuxSeminfo {
     pub semaem: i32,
 }
 
+const _: () = assert!(core::mem::size_of::<LinuxIpcPerm>() == 48);
+const _: () = assert!(core::mem::size_of::<LinuxShmidDs>() == 112);
+const _: () = assert!(core::mem::size_of::<LinuxMsqidDs>() == 120);
+const _: () = assert!(core::mem::size_of::<LinuxMsginfo>() == 32);
+const _: () = assert!(core::mem::size_of::<LinuxSemidDsX86_64>() == 104);
+const _: () = assert!(core::mem::size_of::<LinuxSemidDsAarch64>() == 88);
+const _: () = assert!(core::mem::size_of::<LinuxSeminfo>() == 40);
+const _: () = assert!(core::mem::size_of::<LinuxSembuf>() == 6);
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_ipc_struct_sizes() {
+        assert_eq!(core::mem::size_of::<LinuxIpcPerm>(), 48);
+        assert_eq!(core::mem::offset_of!(LinuxIpcPerm, mode), 20);
+        assert_eq!(core::mem::offset_of!(LinuxIpcPerm, seq), 24);
+        assert_eq!(core::mem::offset_of!(LinuxIpcPerm, __pad2), 26);
+        assert_eq!(core::mem::offset_of!(LinuxIpcPerm, __pad3), 28);
+        assert_eq!(core::mem::offset_of!(LinuxIpcPerm, __glibc_reserved1), 32);
+        assert_eq!(core::mem::size_of::<LinuxShmidDs>(), 112);
+        assert_eq!(core::mem::size_of::<LinuxMsqidDs>(), 120);
+        assert_eq!(core::mem::size_of::<LinuxMsginfo>(), 32);
+        assert_eq!(core::mem::offset_of!(LinuxMsginfo, msgseg), 28);
+        assert_eq!(core::mem::offset_of!(LinuxMsginfo, __pad), 30);
         assert_eq!(core::mem::size_of::<LinuxSemidDsX86_64>(), 104);
         assert_eq!(core::mem::size_of::<LinuxSemidDsAarch64>(), 88);
-        assert_eq!(core::mem::size_of::<LinuxIpcPerm>(), 48);
-        assert_eq!(core::mem::size_of::<LinuxMsqidDs>(), 120);
+        assert_eq!(core::mem::size_of::<LinuxSeminfo>(), 40);
         assert_eq!(core::mem::size_of::<LinuxSembuf>(), 6);
     }
 }

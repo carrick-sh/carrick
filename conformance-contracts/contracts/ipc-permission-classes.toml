@@ -14,6 +14,10 @@ rationale = "The EL1 IPC namespace and kernel dispatcher consume one shared perm
 # S5 changes post-permission output admission in sysv.rs. Rerun the existing
 # dispatcher shm_permission controls below; the new s5_sysv witnesses
 # prove owner-memory refusal, not additional permission classes.
+# #1152 unifies LinuxIpcPerm, LinuxMsqidDs, LinuxSemidDs*, LinuxShmidDs,
+# LinuxMsginfo, and LinuxSeminfo in carrick-syscall-abi with explicit zeroed
+# padding fields; IPC permission selection is unchanged and retains the
+# existing vm_free permission-class controls below.
 [bindings]
 # S3 migrates credential output writes without changing IPC permission selection.
 # The existing shm_permission_* bindings exercise owner/group/capability rules;
