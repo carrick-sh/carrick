@@ -468,7 +468,7 @@ fn cumulative_merge_group_diff_runs_everything_when_ahead_entry_touched_code() {
 }
 
 #[test]
-fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() {
+fn draft_pr_runs_cheap_linux_checks_and_its_ci_ok_cannot_land() {
     let repo = TempRepo::new(&[(
         "crates/carrick-kernel/src/lib.rs",
         "pub fn draft_change() {}\n",
@@ -506,10 +506,12 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
       "cross-check-macos": { "result": "skipped" },
       "kernel-linux-native": { "result": "skipped" }
     }"#;
-    assert!(
-        run_ci_results("pull_request", Some("true"), draft_needs),
-        "draft PR with passing lint and skipped expensive jobs must pass ci-results"
-    );
+    // #1321: a draft run's ci-ok is never a landing signal. When everything
+    // it ran passed it still fails, and says why, so auto-merge can't take a
+    // green ci-ok that skipped the macOS unit shards.
+    let (ok, out) = run_ci_results_with_env("pull_request", Some("true"), draft_needs, &[]);
+    assert!(!ok, "a draft PR's ci-results must not pass: {out}");
+    assert!(out.contains("draft run: the jobs that ran passed"), "{out}");
     assert!(
         !run_ci_results("pull_request", Some("false"), draft_needs),
         "non-draft PR with skipped expensive jobs must fail ci-results"
@@ -519,9 +521,11 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
         r#""lint-clippy": { "result": "success" }"#,
         r#""lint-clippy": { "result": "failure" }"#,
     );
+    let (ok, out) = run_ci_results_with_env("pull_request", Some("true"), &draft_failed_lint, &[]);
+    assert!(!ok, "draft PR with failing lint must fail ci-results");
     assert!(
-        !run_ci_results("pull_request", Some("true"), &draft_failed_lint),
-        "draft PR with failing lint must fail ci-results"
+        !out.contains("draft run:"),
+        "a real failure fails on the failure, not the draft notice: {out}"
     );
 
     let draft_failed_lint_domains = draft_needs.replace(

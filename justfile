@@ -1559,3 +1559,15 @@ ci-results:
             echo "${msg}" >> "${GITHUB_STEP_SUMMARY}"
         fi
     fi
+    # A draft run skips the macOS unit shards and the heavy jobs, so its
+    # green would let auto-merge land a PR they never ran on (#1321: #1315
+    # landed a failing carrick-embed test this way). Everything it did run
+    # passed; say so, and stay red until a ready-for-review run covers it.
+    if [[ "${CI_EVENT}" == pull_request && "${CI_DRAFT:-false}" == true && "${is_lower}" != true && "${CI_LOWER_LAYER:-false}" != true ]]; then
+        msg="draft run: the jobs that ran passed, but the macOS unit shards and heavy jobs were skipped, so this ci-ok can't land the PR. Mark it ready for review to run the full suite."
+        echo "${msg}"
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            echo "${msg}" >> "${GITHUB_STEP_SUMMARY}"
+        fi
+        exit 1
+    fi
