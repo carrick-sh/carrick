@@ -3713,11 +3713,19 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         hand_over_to(&actor, LOOP_USER)?;
         super::live_log::set_token(&server.token);
         command
-            .stdout(super::live_log::create("loop", &state.join("loop.out"))?)
+            .stdout(super::live_log::create(
+                "loop stdout",
+                &state.join("loop.out"),
+            )?)
             .stderr(super::live_log::create(
-                "loop stderr",
+                "loop launcher",
                 &state.join("loop.err"),
             )?);
+        // The coordinator's transcript is the file its launcher writes in the
+        // loop account's own tree; its stdout above stays empty (#1292).
+        let events = actor.join("runtime/dispatch-loop");
+        super::live_log::follow("loop", &events.join("loop.log"), uid);
+        super::live_log::follow("loop stderr", &events.join("loop.err"), uid);
         let remaining = server.deadline.saturating_duration_since(Instant::now());
         let code = wait_account_serving(&mut command, remaining, LOOP_USER, || {
             match listener.accept() {
@@ -3736,6 +3744,8 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         });
         super::live_log::unfollow("loop");
         super::live_log::unfollow("loop stderr");
+        super::live_log::unfollow("loop stdout");
+        super::live_log::unfollow("loop launcher");
         drop(commands);
         let _final_commands = CommandWindow::until(final_deadline);
         post_loop_capture(
