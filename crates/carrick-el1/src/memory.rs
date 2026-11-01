@@ -955,7 +955,13 @@ pub fn serve_delegated_anonymous<
         ReservationDisposition::Unavailable(reservations::Refusal::PreparedConflict) => {
             return DelegatedAnonymous::PreparedConflict;
         }
-        ReservationDisposition::Unavailable(_) => return forward(Leave::RootUnavailable),
+        ReservationDisposition::Unavailable(refusal) => {
+            return forward(match refusal {
+                reservations::Refusal::Busy => Leave::RootUnavailableBusy,
+                reservations::Refusal::MetadataRequired => Leave::RootUnavailableMetadataRequired,
+                _ => Leave::RootUnavailableStale,
+            });
+        }
         ReservationDisposition::Work(pending) => pending,
     };
     let request = pending.request();

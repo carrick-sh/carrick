@@ -449,6 +449,29 @@ pub struct ExitRecord {
     pub object_operation: bool,
 }
 
+/// Whether a committed birth was made runnable.
+///
+/// Born membership is already published when the record is queued, so a
+/// refusal cannot be rolled back as a clone failure: the birth owner fails
+/// closed. Before #1100 the outcome was `()`, and a refused record was
+/// silently left on no run queue.
+#[must_use = "a refused birth enqueue leaves a published thread unrunnable"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BornEnqueue {
+    Queued,
+    Refused,
+}
+
+impl From<carrick_sched_core::Requeue> for BornEnqueue {
+    fn from(requeue: carrick_sched_core::Requeue) -> Self {
+        if requeue.is_queued() {
+            Self::Queued
+        } else {
+            Self::Refused
+        }
+    }
+}
+
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
@@ -507,7 +530,9 @@ pub trait LifecycleNative<'a>: UserCopy {
     /// ISA-only context availability, checked before any output or pool claim.
     fn can_prepare_child(&self, stack: UserVa, tls: Option<UserVa>) -> bool;
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext);
-    fn enqueue_born(&mut self, record: RecordRef);
+    /// Make a committed birth runnable. A refusal is returned, never
+    /// dropped: the caller fails closed (#1100).
+    fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue;
     fn exit_record(&self) -> Option<ExitRecord>;
     fn wake_child_tid(&mut self, mm: EntryMmKey, address: UserVa) -> bool;
     fn release_current(
@@ -549,7 +574,9 @@ pub trait LifecycleNative<'a>: UserCopy {
 
     fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
         birth.record()?;
-        self.enqueue_born(birth.record);
+        if self.enqueue_born(birth.record) == BornEnqueue::Refused {
+            self.fail_lifecycle(NativeRunFailureReason::BornEnqueueRefused);
+        }
         Ok(())
     }
     fn thread_exited(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}

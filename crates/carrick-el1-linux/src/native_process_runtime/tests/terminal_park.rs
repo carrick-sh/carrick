@@ -19,9 +19,12 @@ pub fn run() -> Result<LinuxWaitStatus, NativeTerminalFailure> {
     assert!(sibling.service_ticket.is_none());
     let live_members = fixture.page.live();
     assert_eq!(live_members, 2);
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, fixture.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, fixture.record.id)
+            .is_queued()
+    );
     assert_eq!(
         fixture.zone.switch_in(fixture.slot),
         Some(fixture.record.id)
@@ -251,9 +254,12 @@ fn losing_entryless_exit_group_publishes_terminal_before_record_release() {
     let sibling = add_service_sibling(&fixture, None);
     assert_eq!(fixture.page.live(), 2);
     assert!(fixture.control.entry().is_none());
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, fixture.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, fixture.record.id)
+            .is_queued()
+    );
     assert_eq!(
         fixture.zone.switch_in(fixture.slot),
         Some(fixture.record.id)
@@ -344,9 +350,12 @@ fn losing_pool_exit_group_does_not_reserve_membership_twice() {
     let fixture = native_exec_fixture();
     let sibling = add_service_sibling(&fixture, None);
     assert_eq!(fixture.page.live(), 2);
-    fixture
-        .zone
-        .requeue_preempted(sibling.slot, sibling.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(sibling.slot, sibling.record.id)
+            .is_queued()
+    );
     assert_eq!(
         fixture.zone.switch_in(sibling.slot),
         Some(sibling.record.id)
@@ -424,9 +433,12 @@ fn losing_exit_group_keeps_host_reserved_membership_and_live_record() {
     let fixture = native_exec_fixture();
     let sibling = add_service_sibling(&fixture, None);
     assert_eq!(fixture.page.live(), 2);
-    fixture
-        .zone
-        .requeue_preempted(sibling.slot, sibling.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(sibling.slot, sibling.record.id)
+            .is_queued()
+    );
     assert_eq!(
         fixture.zone.switch_in(sibling.slot),
         Some(sibling.record.id)

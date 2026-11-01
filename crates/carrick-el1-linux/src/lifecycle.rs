@@ -269,8 +269,11 @@ impl<
         // The shared clone owner emits admission settlement only after this
         // enqueue. A terminal close wins against a prepublication claimant
         // under the graph guard; that caller instead rolls back live/claim
-        // custody before publishing the settlement wake.
-        self.enqueue_born(birth.record);
+        // custody before publishing the settlement wake. Born is published,
+        // so a refused enqueue is not a clone failure: fail closed (#1100).
+        if self.enqueue_born(birth.record) == BornEnqueue::Refused {
+            self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BornEnqueueRefused);
+        }
         Ok(())
     }
     fn thread_exited(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
@@ -503,20 +506,22 @@ impl<
         ctx.native.tpidrro_el0 =
             aarch64_child_vdso_identity(ctx.native.tpidrro_el0, context.visible_tid);
     }
-    fn enqueue_born(&mut self, record: RecordRef) {
+    fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue {
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
-            return;
+            return BornEnqueue::Refused;
         };
         let Some(slot) = self.frame.slot() else {
-            return;
+            return BornEnqueue::Refused;
         };
         let Some(zone) = &mut self.zone else {
-            return;
+            return BornEnqueue::Refused;
         };
-        if zone.tables.record(record.id).incarnation() == record.incarnation {
-            native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-                .enqueue_born(record.id);
+        if zone.tables.record(record.id).incarnation() != record.incarnation {
+            return BornEnqueue::Refused;
         }
+        native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+            .enqueue_born(record.id)
+            .into()
     }
     fn exit_record(&self) -> Option<ExitRecord> {
         let zone = self.zone.as_ref()?.tables;

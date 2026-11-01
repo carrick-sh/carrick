@@ -1597,21 +1597,34 @@ fn adopt_born_record(
     if live.identity().generation != 0 {
         return Ok(false);
     }
+    // One owner per birth (#1100): `needs_host_first_entry` never hands a
+    // native-owned birth to a host executor, so reaching here with one is a
+    // broken invariant. Releasing it would leave it on no queue forever.
+    if live.has_native_execution_owner() {
+        return Err(NextError::Fatal(format!(
+            "native-owned birth reached host first-entry adoption: record={record:?}"
+        )));
+    }
     let Some(key) = carrick_kernel::el1_zone::thread_key_of(record) else {
-        if !zone.release_first_entry_activation(custody) {
-            return Err(NextError::Fatal(
-                "first-entry activation could not release custody".into(),
-            ));
-        }
-        return Ok(false);
+        return Err(NextError::Fatal(format!(
+            "host-owned birth has no host thread key: record={record:?}"
+        )));
     };
     // SAFETY: the stopped executor owns this Host handback or claimed service head.
     let frame = unsafe { *live.ctx_mut() };
-    if scheduler
+    let adoption = scheduler
         .kernel()
         .adopt_born_thread_at_first_entry(key, &frame.native)
-        .map_err(NextError::Fatal)?
+        .map_err(NextError::Fatal)?;
+    // A host-owned birth with no host thread has no other owner unless its
+    // terminal retirement (which cancels the record) is taking it.
+    if adoption == carrick_kernel::kernel::FirstEntryAdoption::NoHostThread && !live.is_cancelled()
     {
+        return Err(NextError::Fatal(format!(
+            "host-owned birth has no host thread: record={record:?} key={key:?}"
+        )));
+    }
+    if adoption == carrick_kernel::kernel::FirstEntryAdoption::Adopted {
         #[cfg(any(test, feature = "test-support"))]
         {
             use carrick_kernel::el1_zone::first_entry_test_control::{Event, emit};

@@ -796,7 +796,12 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                         },
                     )
                     .unwrap();
-                fixture.zone.requeue_preempted(sibling_slot, sibling_record);
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(sibling_slot, sibling_record)
+                        .is_queued()
+                );
                 assert_eq!(fixture.zone.switch_in(sibling_slot), Some(sibling_record));
                 fixture.zone.record_ref(sibling_record)
             });
@@ -804,7 +809,12 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                 .zone
                 .current_or_new(fixture.slot, fixture.leader)
                 .unwrap();
-            fixture.zone.requeue_preempted(fixture.slot, record);
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, record)
+                    .is_queued()
+            );
             assert_eq!(fixture.zone.switch_in(fixture.slot), Some(record));
             let reference = fixture.zone.record_ref(record);
             fixture.control.bind_zone_record(reference);
@@ -1085,7 +1095,12 @@ fn arm_unregistered_cancel_without_lifecycle_retains_record_for_host() {
             },
         )
         .unwrap();
-    fixture.zone.requeue_preempted(fixture.slot, record);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, record)
+            .is_queued()
+    );
     assert_eq!(fixture.zone.switch_in(fixture.slot), Some(record));
     let reference = fixture.zone.record_ref(record);
     assert_eq!(
@@ -1129,7 +1144,12 @@ fn arm_unregistered_pool_cancel_reaps_entry_before_host_cleanup() {
     for closed in [false, true] {
         let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
         let leader = fixture.zone.slot(fixture.slot).host_record().unwrap();
-        fixture.zone.requeue_preempted(fixture.slot, leader);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, leader)
+                .is_queued()
+        );
         assert_eq!(fixture.zone.switch_in(fixture.slot), Some(leader));
         let slot = SlotId::new(1);
         fixture.zone.drive(slot, 1);
@@ -2171,9 +2191,12 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
     }
 
     // Parent yields slot to child
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent_binding.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
 
     // Now the child either exits normally or consumes a default core signal
     // through the same production return checkpoint used by native execution.
@@ -3503,9 +3526,12 @@ pub fn with_native_file_fork(
         .unwrap();
     let child = runtime.task_binding(child_key).unwrap();
     assert_ne!(parent.key, child.key);
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent.record.id)
+            .is_queued()
+    );
     activate(source, &child_task, &child);
     *crossing.stock.zone.lock().unwrap() = Some(fixture.zone);
     *crossing.stock.child.lock().unwrap() = Some((
@@ -3802,7 +3828,12 @@ fn arm_returned_process_call_is_not_a_zone_park() {
     let published = fixture
         .enter(fixture.control, ttbr0, &mut service, |_| {
             let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
-            fixture.zone.requeue_preempted(fixture.slot, record);
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, record)
+                    .is_queued()
+            );
             fixture.zone.record_ref(record)
         })
         .unwrap();
@@ -3916,7 +3947,7 @@ fn imported_thread_on_control_and_slot(
             },
         )
         .unwrap();
-    fixture.zone.requeue_preempted(slot, record);
+    assert!(fixture.zone.requeue_preempted(slot, record).is_queued());
     (control, reference)
 }
 
@@ -4178,7 +4209,12 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
         fixture.control,
     )
     .unwrap();
-    fixture.zone.requeue_preempted(fixture.slot, record);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, record)
+            .is_queued()
+    );
     assert_eq!(
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
         record
@@ -5321,9 +5357,12 @@ fn native_child_sigsuspend_wakes_from_parent_signal() {
     let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
     let child_binding = runtime.task_binding(child_key).unwrap();
 
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent_binding.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
     activate(source, &child_task, &child_binding);
     let mut child_service = Aarch64NativeProcessService::with_crossing(
         &child_task,
@@ -5373,9 +5412,12 @@ fn native_child_sigsuspend_wakes_from_parent_signal() {
             )
             .unwrap();
     }
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent_binding.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
     activate(source, &child_task, &child_binding);
     let mut child = runtime
         .enter(source, &child_task, child_binding.words, &mut child_service)
@@ -5641,7 +5683,12 @@ fn arm_registered_sibling_switch_in_without_pending_owner_work() {
         *fixture.zone.record(record).ctx_mut() =
             Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     }
-    fixture.zone.requeue_preempted(fixture.slot, record);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, record)
+            .is_queued()
+    );
     let mut cpu = ResumeCpu {
         inner: crate::sched::FakeCpu::default(),
         runtime: &runtime,
@@ -8219,7 +8266,12 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
             },
         )
         .unwrap();
-    fixture.zone.requeue_preempted(fixture.slot, record3);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, record3)
+            .is_queued()
+    );
 
     let service: &'static mut Aarch64NativeProcessService<'static, TestStockCrossing> =
         Box::leak(Box::new(fixture.process_service()));
@@ -8744,9 +8796,12 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
             )
             .unwrap();
     }
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_binding.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .is_queued()
+    );
 
     // Production scheduler -> resume_selected -> NativeProcessEntry::resume_checkpoint.
     // resume_selected drops its temporary entry before returning -EINTR.
@@ -9644,7 +9699,10 @@ fn activate_target(
             task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
             return switched;
         }
-        zone.requeue_preempted(source.slot, switched.record);
+        assert!(
+            zone.requeue_preempted(source.slot, switched.record)
+                .is_queued()
+        );
     }
     panic!("target record {:?} not runnable in slot", binding.record.id);
 }
@@ -9793,9 +9851,12 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     assert_eq!(owner.retained_host_resources(), 1);
 
     let parent_binding = runtime.task_binding(parent).unwrap();
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent_binding.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
 
     let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
@@ -10003,9 +10064,12 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     }
 
     // Switch to live child 1.
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &child_bindings[1]);
     assert_eq!(
         run_in_child(1, sys_fcntl, [4, LINUX_F_GETFL, 0]).1,
@@ -10037,9 +10101,12 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     );
 
     // Switch back to child 0: write 2 bytes via fd 1 and close the final writer description.
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[1].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &child_bindings[0]);
     let (route, result) = run_in_child(0, sys_close, [2, 0, 0]);
     assert_eq!(result, 0);
@@ -10065,9 +10132,12 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     assert_eq!(run_in_child(0, sys_close, [1, 0, 0]).1, 0);
 
     // Switch back to child 1: read drains "ok" (2 bytes), then returns EOF (0).
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &child_bindings[1]);
     assert_eq!(run_in_child(1, sys_read, [3, read_buf.arg(), 8]).1, 2);
     assert_eq!(&read_buf.as_bytes()[..2], b"ok");
@@ -10212,9 +10282,12 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     table.close(fd::Fd(4)).unwrap();
 
     let parent_binding = runtime.task_binding(parent).unwrap();
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent_binding.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
 
     let tables = crate::ipc::MapTables(map);
     let venue = crate::ipc::IpcVenue {
@@ -10289,9 +10362,12 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     );
     assert_eq!(task.linux.take_served_boundary(), None);
     assert!(!task.linux.has_pending_host_work());
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &child_bindings[1]);
     let (route, result) = run_in_child(1, sys_close, [4, 0, 0]);
     assert_eq!(result, 0);
@@ -10300,9 +10376,12 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     assert!(!task.linux.has_pending_host_work());
 
     // Switch to writer (child 0): fill 15 full pages + 2096 bytes (leaving 2000 < PIPE_BUF free).
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[1].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &child_bindings[0]);
     let pattern_bytes: Vec<u8> = (0..(15 * PIPE_BUF + 2096))
         .map(|i| (i % 251) as u8)
@@ -10322,9 +10401,12 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     );
 
     // Switch to reader (child 1): drain 1 full page (4096 bytes), freeing 1 page in the 16-page ring.
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &child_bindings[1]);
     let mut drained = Vec::new();
     let page_buf = carrick_test_support::GuestUserBuffer::zeroed(PIPE_BUF);
@@ -10335,9 +10417,12 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     drained.extend_from_slice(page_buf.as_bytes());
 
     // 2. Write > PIPE_BUF (8192 bytes) with 1 page free performs partial write of 4096 bytes.
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[1].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &child_bindings[0]);
     let large_write_bytes: Vec<u8> = (0..(2 * PIPE_BUF)).map(|i| ((i + 7) % 251) as u8).collect();
     let large_write = carrick_test_support::GuestUserBuffer::from_bytes(&large_write_bytes);
@@ -10357,9 +10442,12 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     );
 
     // Switch to reader (child 1): drain all remaining bytes and verify stream integrity, then close fd 3!
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &child_bindings[1]);
     let rest = carrick_test_support::GuestUserBuffer::zeroed(65536);
     let n = run_in_child(1, sys_read, [3, rest.arg(), 65536]).1;
@@ -10377,9 +10465,12 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
 
     // 3. Switch to writer (child 0): write after last reader closed returns EPIPE (-32) IN RING
     // and enqueues SIGPIPE (13, SI_KERNEL) unless SIG_IGN is installed.
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, child_bindings[1].record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .is_queued()
+    );
     activate_target(source, &task, &child_bindings[0]);
     let sigpipe = Signal::from_number(13).unwrap();
     let byte = carrick_test_support::GuestUserBuffer::from_bytes(b"z");
@@ -10507,7 +10598,12 @@ fn tgkill_during_futex_enrollment_returns_eintr() {
     let waiter = fixture
         .zone
         .record_ref(fixture.zone.slot(fixture.slot).host_record().unwrap());
-    fixture.zone.requeue_preempted(fixture.slot, waiter.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, waiter.id)
+            .is_queued()
+    );
     assert_eq!(
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
         waiter.id
@@ -10586,7 +10682,12 @@ fn tgkill_during_futex_enrollment_returns_eintr() {
             control,
         )
         .unwrap();
-    fixture.zone.requeue_preempted(sender_slot, sender_record);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(sender_slot, sender_record)
+            .is_queued()
+    );
     assert_eq!(
         fixture.zone.switch_in_full(sender_slot).unwrap().record,
         sender_record
@@ -10728,7 +10829,12 @@ fn native_process_venue_survives_host_only_and_closed_admission() {
             ),
             NativeEntryVenue::NativeProcess(record)
         );
-        fixture.zone.requeue_preempted(fixture.slot, record);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, record)
+                .is_queued()
+        );
         assert_eq!(
             fixture.zone.switch_in_full(fixture.slot).unwrap().record,
             record

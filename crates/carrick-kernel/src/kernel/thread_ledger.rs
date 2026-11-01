@@ -1321,12 +1321,12 @@ impl Kernel {
         self: &Arc<Self>,
         key: ThreadKey,
         frame: &carrick_el1_abi::ThreadCtx,
-    ) -> Result<bool, String> {
+    ) -> Result<FirstEntryAdoption, String> {
         let Some(thread) = self.exact_thread_for_scheduler(key) else {
-            return Ok(false);
+            return Ok(FirstEntryAdoption::NoHostThread);
         };
         if thread.execution_state().generation().is_some() {
-            return Ok(false);
+            return Ok(FirstEntryAdoption::NotAdopted);
         }
         let task = thread.task().ok_or("born thread lost task")?;
         let context = self
@@ -1340,7 +1340,7 @@ impl Kernel {
             return Err("born first entry changed identity".into());
         }
         let Some(reservation) = self.take_thread_birth_adoption(task.key(), key) else {
-            return Ok(false);
+            return Ok(FirstEntryAdoption::NotAdopted);
         };
         let factory = task
             .thread_adoption_factory()
@@ -1350,7 +1350,7 @@ impl Kernel {
             self.schedule_hooks(),
             super::schedule::Event::thread(&context, super::schedule::Point::FirstEntryFinished)
         );
-        Ok(true)
+        Ok(FirstEntryAdoption::Adopted)
     }
 
     /// Consume only the born thread's exact process-owned first-entry capacity.
@@ -1381,6 +1381,21 @@ impl Kernel {
             .map(|record| record.thread_pool.tids())
             .unwrap_or_default()
     }
+}
+
+/// What a host executor's first-entry adoption of an unadopted birth did.
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirstEntryAdoption {
+    /// The host thread now owns its first entry.
+    Adopted,
+    /// No host thread has this key. A host-owned birth always has one, so
+    /// the caller treats this as a broken invariant, never as "not now"
+    /// (#1100: a native fork child's birth reached here and was dropped).
+    NoHostThread,
+    /// The thread exists but its first entry was already issued or its
+    /// adoption capacity is not this caller's.
+    NotAdopted,
 }
 
 #[cfg(test)]
@@ -2630,7 +2645,7 @@ mod tests {
                     control_slot: 0,
                 })
                 .unwrap();
-            zone.requeue_preempted(slot, record);
+            assert!(zone.requeue_preempted(slot, record).is_queued());
             assert_eq!(zone.switch_in(slot), Some(record));
             let binding = carrick_el1_abi::ExecutionBinding {
                 task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid as u64),

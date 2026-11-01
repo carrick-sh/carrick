@@ -154,7 +154,7 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     zone.spaces.open(space);
     assert!(zone.install_space(slot, id.mm).is_some());
     let record = zone.alloc_record(id).unwrap();
-    zone.requeue_preempted(slot, record);
+    assert!(zone.requeue_preempted(slot, record).is_queued());
     assert_eq!(zone.switch_in(slot), Some(record));
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(id.tid),
@@ -213,7 +213,7 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         }
     );
     let record = zone.alloc_record(id).unwrap();
-    zone.requeue_preempted(slot, record);
+    assert!(zone.requeue_preempted(slot, record).is_queued());
     assert_eq!(zone.switch_in(slot), Some(record));
     let stale = admit_born_in_zone(binding, source).unwrap();
     let key = ObjectWaitKey::new(1, 13).unwrap();
@@ -242,7 +242,7 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     let token = admit_born_in_zone(binding, source).unwrap();
     let other = zone.alloc_record(id).unwrap();
     zone.clear_current(slot);
-    zone.requeue_preempted(slot, other);
+    assert!(zone.requeue_preempted(slot, other).is_queued());
     assert_eq!(zone.switch_in(slot), Some(other));
     assert_eq!(
         complete_born_in_zone(token, binding, source),
@@ -270,7 +270,7 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         })
         .unwrap();
     zone.clear_current(slot);
-    zone.requeue_preempted(slot, record);
+    assert!(zone.requeue_preempted(slot, record).is_queued());
     assert_eq!(zone.switch_in(slot), Some(record));
     assert!(admit_born_in_zone(binding, source).is_none());
     assert!(admit_born_in_zone(adopted, source).is_none());
@@ -382,7 +382,7 @@ fn running_compact_with_identity(
     zone.spaces.open(space);
     assert!(zone.install_space(slot, identity.mm).is_some());
     let record = zone.alloc_record(identity).unwrap();
-    zone.requeue_preempted(slot, record);
+    assert!(zone.requeue_preempted(slot, record).is_queued());
     assert_eq!(zone.switch_in(slot), Some(record));
     (
         slot,
@@ -555,7 +555,7 @@ fn compact_handoff_rejects_stale_record_incarnation_receipt() {
         control_slot: 0x2000,
     };
     let replacement = zone.alloc_record(identity).unwrap();
-    zone.requeue_preempted(slot, replacement);
+    assert!(zone.requeue_preempted(slot, replacement).is_queued());
     assert_eq!(zone.switch_in(slot), Some(replacement));
     let second = admit_born_in_zone(binding, source).unwrap();
     assert_ne!(captured_record, second.record());
@@ -811,7 +811,7 @@ fn terminal_attempt(mode: TerminalAttempt) {
     peer_identity.tid += 1;
     peer_identity.serial += 1;
     let peer = zone.alloc_record(peer_identity).unwrap();
-    zone.requeue_preempted(SlotId::new(2), peer);
+    assert!(zone.requeue_preempted(SlotId::new(2), peer).is_queued());
     let page = ThreadLifecyclePage::new();
     assert_eq!(page.thread_born(), Some(2));
     let entry = page.reserve_stock(0).unwrap();

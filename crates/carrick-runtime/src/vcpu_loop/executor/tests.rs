@@ -10341,7 +10341,7 @@ fn serial_host_missing_terminal_continuation_finishes_exit_owner() {
             },
         )
         .unwrap();
-    zone.requeue_preempted(slot, id);
+    assert!(zone.requeue_preempted(slot, id).is_queued());
     assert_eq!(zone.switch_in(slot), Some(id));
     let record = zone.record_ref(id);
     member.bind_zone_record(record);
@@ -10550,7 +10550,7 @@ fn claimed_abi_born_sibling_zone_reload(terminal: bool) {
             control_slot: 0,
         })
         .unwrap();
-    zone.requeue_preempted(slot, id);
+    assert!(zone.requeue_preempted(slot, id).is_queued());
     assert_eq!(zone.switch_in(slot), Some(id));
     let record = zone.record_ref(id);
     let control = sibling.thread().control_slot();
@@ -10636,4 +10636,44 @@ fn claimed_abi_born_sibling_zone_reload(terminal: bool) {
     assert_eq!(report.created(), report.destroyed());
     assert_eq!(binding.progress.load(Ordering::SeqCst), 0);
     assert_eq!(binding.reaped_settlements.load(Ordering::SeqCst), 1);
+}
+
+/// #1100 B: a host executor that cannot adopt a host-owned birth must not
+/// release it and walk away. Before the fix `adopt_born_record` released
+/// the record as `FirstEntryHost` and returned `Ok(false)`, leaving it on no
+/// queue and with no owner; a missing host thread is a broken invariant
+/// (the record is not cancelled, so no retirement owns it) and fails closed.
+#[test]
+fn host_birth_without_a_host_thread_fails_closed_not_dropped() {
+    let (kernel, _root) = bootstrap(19_900);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    // SAFETY: TestEl1Region owns aligned, zeroed ABI storage for this test.
+    let zone = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<carrick_el1_abi::ZoneTables>()
+    };
+    let id = zone
+        .alloc_host_runnable(carrick_el1_abi::ThreadIdentity {
+            tid: 19_977,
+            serial: 919_977,
+            mm: 1,
+            file_table: 1,
+            generation: 0,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: 1,
+            control_slot: 1,
+        })
+        .unwrap();
+    let record = zone.record_ref(id);
+    assert!(zone.record(id).needs_host_first_entry());
+    let custody = zone.claim_current_first_entry_activation(record).unwrap();
+    let outcome = super::adopt_born_record(&scheduler, zone, custody);
+    assert!(
+        matches!(outcome, Err(super::NextError::Fatal(ref why)) if why.contains("no host thread")),
+        "a host birth with no host thread must fail closed"
+    );
 }

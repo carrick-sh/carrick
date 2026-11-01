@@ -799,7 +799,7 @@ mod settled_idle_tests {
             })
             .unwrap();
         assert!(zone.mark_native_owned(record));
-        zone.requeue_preempted(slot, record);
+        assert!(zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(zone.switch_in_full(slot).map(|s| s.record), Some(record));
         assert_eq!(zone.slot(slot).current(), Some(record));
         assert_eq!(

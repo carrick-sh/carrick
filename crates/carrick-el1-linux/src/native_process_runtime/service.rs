@@ -1155,9 +1155,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if self.source.zone.record(self.record.id).claim() == carrick_sched_core::Claim::Free {
             // The root's first entry has a retained, unqueued host-loaded
             // record. Materialize it on this slot's queue with its token.
-            self.source
+            if !self
+                .source
                 .zone
-                .requeue_preempted(self.source.slot, self.record.id);
+                .requeue_preempted(self.source.slot, self.record.id)
+                .is_queued()
+            {
+                return Err(NativeProcessError::Quarantined);
+            }
             self.source.zone.clear_current(self.source.slot);
         } else if !matches!(
             self.source.zone.release_current(

@@ -7157,7 +7157,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             unrow(self.runtime);
             return Err(NativeProcessError::Quarantined);
         }
-        self.source.zone.requeue_preempted(self.source.slot, record);
+        // The child's only owner is this queue entry: a refusal would leave
+        // the published child on no run queue (#1100).
+        if !self
+            .source
+            .zone
+            .requeue_preempted(self.source.slot, record)
+            .is_queued()
+        {
+            unrow(self.runtime);
+            return Err(NativeProcessError::Quarantined);
+        }
         Ok(visible.get())
     }
 }
@@ -9613,7 +9623,7 @@ mod tests {
                 .or_else(|| zone.slot(slot).host_record())
                 .unwrap();
             drop(parent);
-            zone.requeue_preempted(slot, parent_record);
+            assert!(zone.requeue_preempted(slot, parent_record).is_queued());
             activate(&runtime, source, &task, child_key);
             let child_words = runtime.task_binding(child_key).unwrap().words;
             let mut child = runtime
@@ -10777,7 +10787,7 @@ mod tests {
             })
             .unwrap();
         thread_control.bind_zone_record(zone.record_ref(record));
-        zone.requeue_preempted(slot, record);
+        assert!(zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
         thread.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(42),
@@ -10855,7 +10865,7 @@ mod tests {
         drop(observer_claim);
         drop(process);
         let leader_record = runtime.task_binding(process_key).unwrap().record;
-        zone.requeue_preempted(slot, leader_record.id);
+        assert!(zone.requeue_preempted(slot, leader_record.id).is_queued());
         assert_eq!(zone.switch_in_full(slot).unwrap().record, leader_record.id);
         let mut leader_entry = runtime
             .enter_registered(
@@ -11100,7 +11110,7 @@ mod tests {
             })
             .unwrap();
         thread_control.bind_zone_record(zone.record_ref(record));
-        zone.requeue_preempted(slot, record);
+        assert!(zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
         thread.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(43),
@@ -14916,7 +14926,7 @@ mod tests {
             .expect("fork child succeeds") as i32;
         drop(entry);
 
-        zone.requeue_preempted(slot, parent_record.id);
+        assert!(zone.requeue_preempted(slot, parent_record.id).is_queued());
         let child_key = {
             let graph = runtime.graph.lock();
             graph

@@ -737,7 +737,11 @@ fn switched_self_affinity(exclude: bool) {
         let saved = unsafe { p.zone.record(sibling.id).ctx_mut() };
         *saved = p.words;
         cpu.save(&frame, saved);
-        p.zone.requeue_preempted(previous_slot, sibling.id);
+        assert!(
+            p.zone
+                .requeue_preempted(previous_slot, sibling.id)
+                .is_queued()
+        );
         p.zone.leave_guest(previous_slot, &HostLockWait);
         let mut handed_back = Vec::new();
         p.zone.drain_slot(previous_slot, &mut |record, discarded| {
@@ -913,7 +917,7 @@ fn production_venue_remote_set_prompts_a_record_without_host_residency() {
     with_pair(|p| {
         let slot = SlotId::new(1);
         let record = p.sibling.thread().control_slot().zone_record().unwrap().id;
-        p.zone.requeue_preempted(slot, record);
+        assert!(p.zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(p.zone.switch_in_full(slot).unwrap().record, record);
         let mut physical = NoPhysicalCrossings::default();
         let mut entry = enter_native(&p, 0, &mut physical);
