@@ -1,0 +1,271 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f51eb8a67..ee8a6a7bd 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -216,6 +216,7 @@ jobs:
+               just test-kernel-semantics --no-run
+               cargo test --locked --no-run -p carrick-host-linux
+               cargo test --locked --no-run -p carrick-softcpu-x86 --lib --tests
++              cargo test --locked --no-run -p carrick-x86-cpl0-host
+               just clippy
+               # Refresh compiler-cache LRU even when earlier Cargo outputs are
+               # fresh. Keep the default admission build and the exact all-feature
+@@ -232,6 +233,7 @@ jobs:
+               cargo check --locked -p carrick-kernel-example --tests
+               cargo build --locked -p carrick-kernel-example --tests
+               cargo test --locked --no-run -p carrick-kernel-example --tests
++              cargo test --locked --no-run -p carrick-el1-linux --lib
+               ;;
+           esac
+       - name: Compiler cache statistics after critical replay
+@@ -260,6 +262,7 @@ jobs:
+     outputs:
+       heavy: ${{ steps.filter.outputs.heavy }}
+       macos: ${{ steps.filter.outputs.macos }}
++      el1_native: ${{ steps.filter.outputs.el1_native }}
+       workflows: ${{ steps.filter.outputs.workflows }}
+       lower_layer: ${{ steps.filter.outputs.lower_layer }}
+       child_pr: ${{ steps.filter.outputs.child_pr }}
+@@ -897,9 +900,11 @@ jobs:
+         if: ${{ always() }}
+         run: just ci-cache-finish
+ 
+-  # x86_64-only host tests (#1269). Every other host-lane job is arm64, where
+-  # a `#![cfg(target_arch = "x86_64")]` crate or test target compiles to zero
+-  # tests. `test-lanes check` requires each such root to be selected here.
++  # x86_64-only host tests (#1269, #1303). Every other host-lane job is arm64,
++  # where a `#![cfg(target_arch = "x86_64")]` crate or test target compiles to
++  # zero tests. `test-lanes check` requires each such root to be selected here;
++  # `carrick-x86-cpl0-host`'s VM-free Linux x86_64 CPL0 coordinator tests also
++  # run here before landing (live `/dev/kvm` stays on post-landing Willow).
+   x86-host-tests:
+     needs: [changes]
+     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+@@ -948,8 +953,8 @@ jobs:
+       - name: Start this job's local compiler cache server
+         if: steps.compiler-cache.outputs.backend == 'local'
+         run: scripts/ci/compiler-cache-start-local.sh
+-      - name: Software x86 CPU and MMU tests on x86_64
+-        run: cargo test --locked -p carrick-softcpu-x86 -p carrick-softmmu
++      - name: Software x86 CPU, MMU, and CPL0 host coordinator tests on x86_64
++        run: cargo test --locked -p carrick-softcpu-x86 -p carrick-softmmu -p carrick-x86-cpl0-host
+       - name: Compiler cache statistics
+         if: ${{ always() }}
+         run: just ci-cache-finish
+@@ -1553,6 +1558,207 @@ jobs:
+         if: ${{ always() }}
+         run: just ci-cache-finish
+ 
++  # Native Linux aarch64 run of carrick-el1-linux's non-macOS process/template/
++  # IPC/poll tests (#1297, #1303). Gated on PRs touching carrick-el1-linux's
++  # workspace closure and on every merge_group; el1-native-gate compares the
++  # uploaded per-SHA receipt against the nearest receipted main ancestor so NEW
++  # failures are refused by ci-ok before landing.
++  el1-native-tests:
++    name: EL1 · native-process tests (Linux ARM64)
++    needs: changes
++    if: (github.event_name == 'pull_request' && github.event.pull_request.draft == false && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.el1_native == 'true') || github.event_name == 'merge_group'
++    runs-on: ubuntu-24.04-arm
++    timeout-minutes: 60
++    env:
++      # R2 reader for the compiler cache (#858).
++      AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_R2_ACCESS_KEY_ID }}
++      AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_SECRET_ACCESS_KEY }}
++    steps:
++      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
++        with:
++          persist-credentials: false
++      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
++        with:
++          tool: just
++      - name: Install repository Rust toolchain
++        run: just ci-toolchain
++      - name: Configure persisted compiler cache
++        id: compiler-cache
++        env:
++          RUNNER_ENVIRONMENT: ${{ runner.environment }}
++        run: scripts/ci/compiler-cache-env.sh linux-arm64 read-only
++      - name: Restore shared compiler cache (read-only)
++        if: steps.compiler-cache.outputs.backend == 'gha'
++        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
++        with:
++          path: ${{ env.SCCACHE_DIR }}
++          key: sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
++          restore-keys: |
++            sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
++            sccache-linux-arm64-
++      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
++        with:
++          shared-key: ${{ github.job }}-debug-v2
++          cache-workspace-crates: "true"
++          cache-targets: false
++          save-if: false
++      - name: Install per-user compiler cache
++        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
++        with:
++          tool: sccache@0.18.0
++      - name: Start compiler cache
++        if: steps.compiler-cache.outputs.backend == 'r2'
++        run: scripts/ci/compiler-cache-start.sh
++      - name: Start this job's local compiler cache server
++        if: steps.compiler-cache.outputs.backend == 'local'
++        run: scripts/ci/compiler-cache-start-local.sh
++      - name: Prebuild cached xtask admission helpers
++        run: just ci-prebuild-xtask
++      - name: EL1 native-process receipt
++        run: |
++          set -euo pipefail
++          export CARRICK_XTASK_BIN="$PWD/target/debug/carrick-xtask"
++          rm -rf target/ci-receipts target/el1-gate
++          mkdir -p target/ci-receipts
++          status=0
++          just accept --profile el1-native --receipt target/ci-receipts/receipt.json || status=$?
++          echo "xtask accept exited $status"
++          test -s target/ci-receipts/receipt.json
++      - name: Upload per-SHA receipt
++        if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
++        uses: actions/upload-artifact@v4
++        with:
++          name: receipt-el1-native-${{ github.sha }}-${{ github.run_attempt }}
++          path: target/ci-receipts/receipt.json
++          retention-days: 5
++          if-no-files-found: error
++      - name: Upload step logs
++        if: ${{ always() }}
++        uses: actions/upload-artifact@v4
++        with:
++          name: el1-native-logs-${{ github.sha }}-${{ github.run_attempt }}
++          path: target/el1-gate/
++          retention-days: 5
++          if-no-files-found: ignore
++      - name: Compiler cache statistics
++        if: ${{ always() }}
++        run: just ci-cache-finish
++
++  # Builds the selector from trusted refs/heads/main and the comparison from
++  # the selected receipted main ancestor, never executing candidate PR code.
++  el1-native-gate:
++    name: EL1 · native-process receipt gate vs receipted main ancestor
++    permissions:
++      contents: read
++      actions: read
++    needs: [changes, el1-native-tests]
++    if: ((github.event_name == 'pull_request' && github.event.pull_request.draft == false && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.el1_native == 'true') || github.event_name == 'merge_group') && needs.el1-native-tests.result == 'success'
++    runs-on: ubuntu-latest
++    timeout-minutes: 75
++    steps:
++      - name: Check out trusted main for baseline selection
++        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
++        with:
++          ref: refs/heads/main
++          path: selector
++          fetch-depth: 0
++          persist-credentials: false
++      - name: Resolve trusted main first-parent ancestor
++        id: ancestor
++        run: |
++          set -euo pipefail
++          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ || "$GITHUB_SHA" =~ ^0{40}$ ]]; then
++            echo "::error title=Invalid candidate commit::Missing, zero or malformed GITHUB_SHA"
++            printf '## Invalid candidate commit\n\nMissing, zero or malformed `GITHUB_SHA`; no comparison was made.\n' >> "$GITHUB_STEP_SUMMARY"
++            exit 1
++          fi
++          SELECTOR_SHA="$(git -C selector rev-parse --verify HEAD)"
++          git -C selector fetch --no-tags origin "$GITHUB_SHA" \
++            || git -C selector fetch --no-tags origin "+$GITHUB_REF:refs/carrick/candidate"
++          git -C selector cat-file -e "${GITHUB_SHA}^{commit}"
++          git -C selector rev-list --first-parent HEAD > "$RUNNER_TEMP/main-first-parent"
++          if ! git -C selector rev-list --first-parent "${GITHUB_SHA}^1" > "$RUNNER_TEMP/candidate-first-parent"; then
++            echo "::error title=Invalid candidate history::Candidate $GITHUB_SHA has no first parent"
++            printf '## Invalid candidate history\n\nCandidate `%s` has no first parent; no comparison was made.\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
++            exit 1
++          fi
++          BEFORE_SHA="$(awk 'NR==FNR { main[$1]=1; next } ($1 in main) { print $1; exit }' "$RUNNER_TEMP/main-first-parent" "$RUNNER_TEMP/candidate-first-parent")"
++          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
++            echo "::error title=No main ancestor::Candidate $GITHUB_SHA shares no first-parent ancestor with refs/heads/main"
++            printf '## No main ancestor\n\nCandidate `%s` shares no first-parent ancestor with `refs/heads/main`; no comparison was made.\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
++            exit 1
++          fi
++          {
++            echo "selector_sha=$SELECTOR_SHA"
++            echo "before_sha=$BEFORE_SHA"
++          } >> "$GITHUB_OUTPUT"
++      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
++        with:
++          shared-key: gate-xtask-release-v2
++          workspaces: selector -> target
++          cache-workspace-crates: "true"
++          cache-targets: false
++          save-if: false
++      - name: Build the trusted selector
++        working-directory: selector
++        run: |
++          rustup show active-toolchain
++          cargo build --locked --release -p carrick-xtask
++      - name: Select the nearest trusted receipt baseline
++        id: baseline
++        working-directory: selector
++        env:
++          GH_TOKEN: ${{ github.token }}
++          BEFORE_SHA: ${{ steps.ancestor.outputs.before_sha }}
++        run: >-
++          target/release/carrick-xtask ci-receipt select-baseline --lane el1-native
++          --before-sha "$BEFORE_SHA" --candidate-sha "$GITHUB_SHA"
++          --wait-minutes 60 --poll-seconds 30
++      - name: Check out the selected baseline cleanly
++        if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
++        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
++        with:
++          ref: ${{ steps.baseline.outputs.sha }}
++          path: baseline
++          clean: true
++          persist-credentials: false
++      - name: Fetch candidate commit objects into baseline repository
++        if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
++        run: |
++          set -euo pipefail
++          git -C baseline fetch --no-tags --depth=1 origin "$GITHUB_SHA" \
++            || git -C baseline fetch --no-tags --depth=1 origin "+$GITHUB_REF:refs/carrick/candidate"
++          git -C baseline cat-file -e "${GITHUB_SHA}^{commit}"
++      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
++        if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
++        with:
++          shared-key: gate-xtask-release-v2
++          workspaces: baseline -> target
++          cache-workspace-crates: "true"
++          cache-targets: false
++          save-if: false
++      - name: Build the selected baseline xtask with its own lockfile
++        if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
++        working-directory: baseline
++        run: |
++          rustup show active-toolchain
++          cargo build --locked --release -p carrick-xtask
++      - name: Download candidate receipt data
++        uses: actions/download-artifact@v4
++        with:
++          pattern: receipt-el1-native-${{ github.sha }}-*
++          path: ${{ runner.temp }}/candidate
++      - name: Compare using the selected baseline's code
++        working-directory: ${{ steps.baseline.outputs.sha == steps.ancestor.outputs.selector_sha && 'selector' || 'baseline' }}
++        env:
++          GH_TOKEN: ${{ github.token }}
++          BASE_SHA: ${{ steps.baseline.outputs.sha }}
++        run: >-
++          target/release/carrick-xtask ci-receipt gate --lane el1-native
++          --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
++          --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
++          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 0
++
+   cross-check-freebsd:
+     needs: [changes, xtask-build]
+     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
+@@ -1926,6 +2132,8 @@ jobs:
+       - macos-integration
+       - cross-check-linux
+       - kernel-linux-native
++      - el1-native-tests
++      - el1-native-gate
+       - cross-check-freebsd
+       - cross-check-netbsd
+       - cross-check-macos

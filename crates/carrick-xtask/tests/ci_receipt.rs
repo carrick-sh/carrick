@@ -11,6 +11,33 @@ use carrick_xtask::ci_receipt::{
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Dispatch cannot publish workflow files. Exercise the exact director handoff
+// until it has been applied; after landing, exercise the checked-in workflow.
+fn prelanding_workflow() -> String {
+    let ci = include_str!("../../../.github/workflows/ci.yml");
+    if ci.contains("  el1-native-gate:") {
+        return ci.to_owned();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let workflows = dir.path().join(".github/workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+    std::fs::write(workflows.join("ci.yml"), ci).unwrap();
+    let patch = dir.path().join("harvest.patch");
+    std::fs::write(&patch, include_str!("../../../harvest.patch")).unwrap();
+    let output = Command::new("git")
+        .current_dir(dir.path())
+        .arg("apply")
+        .arg(&patch)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read_to_string(workflows.join("ci.yml")).unwrap()
+}
+
 fn step(name: &str, passed: bool, failed: &[&str]) -> StepResult {
     StepResult {
         name: name.into(),
@@ -2032,8 +2059,8 @@ else:
     fn serial_host_pr_and_merge_group_el1_native_gate_refuses_new_failure_against_receipted_main() {
         use std::os::unix::fs::PermissionsExt;
 
-        let ci_yaml = include_str!("../../../.github/workflows/ci.yml");
-        let ci_docs = yaml_rust2::YamlLoader::load_from_str(ci_yaml).unwrap();
+        let ci_yaml = prelanding_workflow();
+        let ci_docs = yaml_rust2::YamlLoader::load_from_str(&ci_yaml).unwrap();
         let gate_steps = ci_docs[0]["jobs"]["el1-native-gate"]["steps"]
             .as_vec()
             .unwrap();
@@ -2441,8 +2468,8 @@ else:
                     "gate",
                     "--lane",
                     "el1-native",
-                    "--base-sha",
-                    &main_commits[1],
+                    "--main-ref",
+                    "HEAD",
                     "--candidate-dir",
                 ])
                 .arg(cand_dir.path())
@@ -2476,6 +2503,10 @@ else:
         ]);
         assert!(!regressed_gate.status.success());
         let regressed_stdout = String::from_utf8_lossy(&regressed_gate.stdout);
+        assert!(
+            regressed_stdout.contains(&format!("selected baseline ancestor {}", main_commits[1])),
+            "{regressed_stdout}"
+        );
         assert!(
             regressed_stdout.contains(
                 "test:el1-native-tests:carrick_el1_linux::new_failing_native_process_test"
@@ -2514,8 +2545,8 @@ fn el1_native_lane_names_match_the_workflow_upload_and_cli() {
 /// using trusted `main` / baseline code, feeding the verdict into `ci-ok`.
 #[test]
 fn ci_workflow_gates_el1_native_before_landing_with_trusted_baseline_code() {
-    let ci = include_str!("../../../.github/workflows/ci.yml");
-    let docs = yaml_rust2::YamlLoader::load_from_str(ci).unwrap();
+    let ci = prelanding_workflow();
+    let docs = yaml_rust2::YamlLoader::load_from_str(&ci).unwrap();
     let jobs = &docs[0]["jobs"];
 
     assert_eq!(
