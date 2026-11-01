@@ -22,13 +22,9 @@ if ! command -v "$sccache_bin" > /dev/null; then
     echo "compiler-cache-start-local: '$sccache_bin' is not installed; install it before this step" >&2
     exit 1
 fi
-if "$sccache_bin" --show-stats > /dev/null 2>&1; then
-    echo "compiler cache: local server already running on $SCCACHE_SERVER_UDS"
-    exit 0
-fi
-if [[ -e "$SCCACHE_SERVER_UDS" ]]; then
-    echo "compiler cache: removing a stale socket no server answers: $SCCACHE_SERVER_UDS"
-    rm -f -- "$SCCACHE_SERVER_UDS"
-fi
-SCCACHE_IDLE_TIMEOUT=0 "$sccache_bin" --start-server
-echo "compiler cache: local server started on $SCCACHE_SERVER_UDS"
+# Bootstrap without a rustc wrapper: this command establishes the server that
+# subsequent cached Cargo commands use. Do not let bootstrap start it implicitly.
+export CARRICK_SCCACHE=0
+export RUSTC_WRAPPER=
+export RUSTC_WORKSPACE_WRAPPER=
+exec just xtask compiler-cache-start

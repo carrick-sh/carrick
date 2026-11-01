@@ -49,7 +49,14 @@ Self-hosted runners (the `carrick-macos-ci` PR runners) keep a persistent
 job workspace (#938). Each runner builds in one fixed checkout path, so its own
 entries keep matching, which hosted R2 entries never would. Each job starts its
 own sccache server on a socket in `$RUNNER_TEMP`, so jobs on two runners that
-share one user don't share a server. Only same-repository pull requests run
+share one user don't share a server. The local startup command takes an OS file
+lock beside the job socket before checking readiness, removing a stale socket,
+or starting the server. Concurrent callers attach to the first caller's server;
+the lock file stays in place so waiters always lock the same inode. Readiness
+requires a UNIX-socket connection: sccache 0.18 can return successful empty
+statistics even when no server exists. The xtask
+bootstrap compiles without a compiler wrapper to avoid implicitly starting the
+server before acquiring this lock. Only same-repository pull requests run
 there; merge-queue and `main` jobs use hosted macOS.
 No linker, Rust flags, entitlement, DOF processing, or signing steps change:
 macOS still uses Apple ld64 and the existing post-link signing path.
