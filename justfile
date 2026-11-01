@@ -1515,6 +1515,10 @@ ci-results:
     jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" '
       has("lint-clippy") and has("lint-gates") and has("xtask-tests-build") and has("loom") and
       has("el1-native-tests") and has("el1-native-gate") and
+      (if $event == "merge_group" and (.changes.outputs.kvm // "true") != "false"
+       then .["kvm-tests"].result == "success" and .["kvm-gate"].result == "success"
+       else (.["kvm-tests"].result // "skipped") == "skipped" and (.["kvm-gate"].result // "skipped") == "skipped" end) and
+      (del(.["kvm-tests"], .["kvm-gate"]) |
       .changes.result == "success" and
       .["xtask-build"].result == "success" and
       (.["macos-authority"].result ==
@@ -1555,6 +1559,7 @@ ci-results:
          (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key as $k | $pr_only | index($k)))
            | if $event == "merge_group" then all(.[]; .result == "skipped") else all(.[]; .result == "success") end)
        else false end)
+      )
     ' <<< "${CI_NEEDS:?}"
     child_pr=$(jq -r '.changes.outputs.child_pr // empty' <<< "${CI_NEEDS}" 2>/dev/null || true)
     if [[ -z "${child_pr}" ]]; then

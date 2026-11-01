@@ -983,10 +983,13 @@ pub fn collect_changed_paths(
     base_ref: &str,
     head: &str,
 ) -> Result<Option<Vec<String>>, CiChangesError> {
-    if event != "pull_request" {
+    if event != "pull_request" && event != "merge_group" {
         return Ok(None);
     }
     let base = base.trim();
+    if base.is_empty() && event == "merge_group" {
+        return Ok(None);
+    }
     if base.is_empty() {
         return Err(CiChangesError::Git(
             "CI_BASE is required for pull_request".into(),
@@ -1057,6 +1060,8 @@ pub fn run<W: Write>(
         outputs.lower_layer = false;
     }
     let mut formatted = outputs.format_github_output();
+    let kvm = event == "merge_group" && kvm_required(repo_root, changed_paths.as_deref());
+    formatted.push_str(&format!("kvm={kvm}\n"));
     if let Some(pr_num) = child_pr {
         formatted.push_str(&format!("child_pr={pr_num}\n"));
     }
@@ -1127,4 +1132,140 @@ pub fn run<W: Write>(
         source,
     })?;
     Ok(outputs)
+}
+
+/// Conservative KVM cost filter. Derive workspace dependency closure from the
+/// same lane declarations used by `test-kvm`. Cargo resolves the Linux feature
+/// and target closure; unknown paths or unavailable metadata require hardware.
+pub fn kvm_required(root: &Path, paths: Option<&[String]>) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return true;
+    };
+    let root = root.as_path();
+    let Some(paths) = paths.filter(|paths| !paths.is_empty()) else {
+        return true;
+    };
+    let Ok(output) = Command::new("cargo")
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(root)
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return true;
+    };
+    let Some(packages) = metadata["packages"].as_array() else {
+        return true;
+    };
+    let (targets, errors) = crate::test_lanes::resolve(&metadata);
+    if !errors.is_empty() {
+        return true;
+    }
+    let mut selected: BTreeSet<String> = targets
+        .iter()
+        .filter(|target| target.lane == "kvm")
+        .map(|target| target.package.clone())
+        .collect();
+    // These packages have VM-free x86 tests or build the freestanding image;
+    // they are part of the hardware contract even without a kvm target.
+    selected.extend(packages.iter().filter_map(|package| {
+        let name = package["name"].as_str()?;
+        (name.starts_with("carrick-x86")
+            || name.starts_with("carrick-softcpu")
+            || name == "carrick-vmm-kvm")
+            .then(|| name.to_string())
+    }));
+    if selected.is_empty() {
+        return true;
+    }
+    // Let Cargo resolve target conditions and optional features, rather than
+    // treating the CLI's macOS/BSD optional dependencies as Linux dependencies.
+    let mut tree = Command::new("cargo");
+    tree.current_dir(root).args([
+        "tree",
+        "--locked",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--no-default-features",
+        "--features",
+        "carrick-cli/syscall-shim,carrick-cli/platform-linux",
+        "--edges",
+        "normal,build,dev",
+        "--prefix",
+        "none",
+        "--format",
+        "{p}",
+    ]);
+    for package in &selected {
+        tree.args(["-p", package]);
+    }
+    let Ok(tree) = tree.output() else {
+        return true;
+    };
+    if !tree.status.success() {
+        return true;
+    }
+    let Ok(tree) = String::from_utf8(tree.stdout) else {
+        return true;
+    };
+    let closure: BTreeSet<&str> = tree
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    if !selected.iter().all(|name| closure.contains(name.as_str())) {
+        return true;
+    }
+    let refs = ReferencedDocs::discover(root);
+    let Ok(refs) = refs else {
+        return true;
+    };
+    paths.iter().any(|path| {
+        if classify_path(path, &refs) == PathClass::Prose {
+            return false;
+        }
+        if !path.starts_with("crates/") {
+            return true;
+        }
+        // `crates/*/fixtures/*` are excluded workspaces that recipes build
+        // outside Cargo's member graph (`test-kvm` builds the bhyve
+        // hello-x86_64 fixture), so the enclosing member's closure says
+        // nothing about who consumes them: fail closed.
+        if Path::new(path)
+            .components()
+            .nth(2)
+            .is_some_and(|c| c.as_os_str() == "fixtures")
+        {
+            return true;
+        }
+        // The innermost member owns the path: a nested package directory
+        // (or a fixture workspace inside a member) must not be attributed to
+        // whichever enclosing member Cargo happens to list first.
+        let package = packages
+            .iter()
+            .filter_map(|package| {
+                let dir = package["manifest_path"]
+                    .as_str()
+                    .and_then(|manifest| Path::new(manifest).parent())
+                    .and_then(|dir| dir.strip_prefix(root).ok())?;
+                Path::new(path)
+                    .starts_with(dir)
+                    .then(|| (dir.components().count(), package))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, package)| package);
+        package
+            .and_then(|package| package["name"].as_str())
+            .is_none_or(|name| closure.contains(name) || name == "carrick-xtask")
+    })
 }

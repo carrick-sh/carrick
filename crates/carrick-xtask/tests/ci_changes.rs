@@ -110,11 +110,14 @@ impl TempRepo {
         let text = fs::read_to_string(&output_file).expect("read GITHUB_OUTPUT");
         let text_without_child_pr: String = text
             .lines()
-            .filter(|line| !line.starts_with("child_pr="))
+            .filter(|line| !line.starts_with("child_pr=") && !line.starts_with("kvm="))
             .map(|line| format!("{line}\n"))
             .collect();
         assert_eq!(text_without_child_pr, written_json.format_github_output());
-        text
+        text.lines()
+            .filter(|line| !line.starts_with("kvm="))
+            .map(|line| format!("{line}\n"))
+            .collect()
     }
 }
 
@@ -852,6 +855,11 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
     // Merge groups run macos-build, macos-clippy, macos-authority, and the el1-native receipt gate:
     // the macOS unit and integration suites ran on the PR and run again on push (#650, #1303).
     let mg_needs = full_needs
+        .replacen(
+            "{",
+            r#"{"kvm-tests": {"result":"success"}, "kvm-gate": {"result":"success"},"#,
+            1,
+        )
         .replace(
             r#""macos-authority": { "result": "skipped" }"#,
             r#""macos-authority": { "result": "success" }"#,
@@ -880,6 +888,31 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
         run_ci_results("merge_group", None, &mg_needs),
         "merge_group with macOS skew check and el1-native gate must pass ci-results"
     );
+    let mut not_required: serde_json::Value = serde_json::from_str(&mg_needs).unwrap();
+    not_required["changes"]["outputs"]["kvm"] = serde_json::json!("false");
+    for job in ["kvm-tests", "kvm-gate"] {
+        not_required[job]["result"] = serde_json::json!("skipped");
+    }
+    assert!(run_ci_results(
+        "merge_group",
+        None,
+        &not_required.to_string()
+    ));
+    for invalid in ["", "unknown"] {
+        not_required["changes"]["outputs"]["kvm"] = serde_json::json!(invalid);
+        assert!(!run_ci_results(
+            "merge_group",
+            None,
+            &not_required.to_string()
+        ));
+    }
+    not_required["changes"]["outputs"]["kvm"] = serde_json::json!("false");
+    not_required["kvm-gate"]["result"] = serde_json::json!("failure");
+    assert!(!run_ci_results(
+        "merge_group",
+        None,
+        &not_required.to_string()
+    ));
     for job in [
         "lint-clippy",
         "lint-gates",
@@ -888,6 +921,8 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
         "macos-authority",
         "el1-native-tests",
         "el1-native-gate",
+        "kvm-tests",
+        "kvm-gate",
     ] {
         let mut missing: serde_json::Value = serde_json::from_str(&mg_needs).unwrap();
         missing.as_object_mut().unwrap().remove(job);
@@ -896,10 +931,9 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
             "missing {job}"
         );
         for verdict in ["skipped", "failure", "cancelled"] {
-            let broken = mg_needs.replace(
-                &format!(r#""{job}": {{ "result": "success" }}"#),
-                &format!(r#""{job}": {{ "result": "{verdict}" }}"#),
-            );
+            let mut broken: serde_json::Value = serde_json::from_str(&mg_needs).unwrap();
+            broken[job]["result"] = serde_json::json!(verdict);
+            let broken = broken.to_string();
             assert!(
                 !run_ci_results("merge_group", None, &broken),
                 "{job}: {verdict}"
@@ -1404,4 +1438,59 @@ fn el1_native_closure_gates_pr_surfaces_and_refuses_new_failures_before_landing(
         !run_ci_results("merge_group", None, &mg_new_failure),
         "merge_group entry with NEW native-process failure (el1-native-gate=failure) must be refused by ci-ok"
     );
+}
+
+#[test]
+fn merge_group_kvm_wiring_requires_receipted_hardware() {
+    let root = workspace_root();
+    let workflow = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    assert!(workflow.contains("  kvm-tests:\n"));
+    assert!(workflow.contains("  kvm-gate:\n"));
+    assert!(workflow.contains("      - kvm-tests\n      - kvm-gate\n"));
+    assert!(workflow.contains("--base-sha \"$BASE_SHA\""));
+}
+
+#[test]
+fn kvm_change_closure_covers_real_x86_roots_and_dependencies() {
+    let root = workspace_root();
+    let paths = |path: &str| vec![path.to_string()];
+    for path in [
+        "crates/carrick-x86-cpl0/src/lib.rs",
+        "crates/carrick-hal/src/lib.rs",
+        "crates/carrick-softcpu-x86/src/lib.rs",
+        "crates/carrick-core/src/lib.rs",
+        ".github/workflows/ci.yml",
+        "Cargo.lock",
+        "crates/future-crate/src/lib.rs",
+        // `just test-kvm` builds this excluded fixture workspace and
+        // live_vcpu_x86 runs it; it is not a Cargo member of its own.
+        "crates/carrick-vmm-bhyve/fixtures/hello-x86_64/src/main.rs",
+    ] {
+        assert!(carrick_xtask::ci_changes::kvm_required(
+            &root,
+            Some(&paths(path))
+        ));
+    }
+    for path in [
+        "docs/unreferenced-prose.md",
+        "crates/carrick-vmm-hvf/src/lib.rs",
+    ] {
+        assert!(!carrick_xtask::ci_changes::kvm_required(
+            &root,
+            Some(&paths(path))
+        ));
+    }
+    // Cargo normally starts tests in the package directory; the production
+    // CLI uses a relative root. Exercise that spelling without mutating cwd.
+    let cwd = std::env::current_dir().unwrap();
+    let mut relative_root = PathBuf::from(".");
+    for _ in cwd.strip_prefix(&root).unwrap().components() {
+        relative_root.push("..");
+    }
+    assert!(!carrick_xtask::ci_changes::kvm_required(
+        &relative_root,
+        Some(&paths("crates/carrick-vmm-hvf/src/lib.rs"))
+    ));
+    assert!(carrick_xtask::ci_changes::kvm_required(&root, None));
+    assert!(carrick_xtask::ci_changes::kvm_required(&root, Some(&[])));
 }

@@ -2,7 +2,8 @@
 //!
 //! `kernel-runtime.yml` uploads each signed-HVF, KVM, and `el1-native` receipt
 //! on `main` as `receipt-<lane>-<sha>-<attempt>`, and `ci.yml` uploads
-//! pre-landing `el1-native` receipts for PRs and merge groups. Trusted `main`
+//! pre-landing `el1-native` receipts for PRs and merge groups and `kvm`
+//! receipts for merge groups in the KVM closure (#1366). Trusted `main`
 //! code selects the nearest receipted first-parent `main` ancestor, and that
 //! baseline's own xtask grades candidate receipt data and fails on NEW.
 //! Missing baselines and history/walk errors remain distinct from regressions.
