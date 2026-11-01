@@ -6131,11 +6131,6 @@ mod tests {
         stripped.drain(program..program + 2);
         assert_eq!(stripped, plain);
         assert!(!plain.iter().any(|a| a.starts_with("CARRICK_HOST_LEASE")));
-        assert!(
-            !handed
-                .iter()
-                .any(|a| a.starts_with("CARRICK_HOST_LEASE_SCOPE_FD"))
-        );
     }
 
     #[test]

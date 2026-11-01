@@ -41,7 +41,6 @@ pub fn launch(
         .env_remove("CARRICK_HOST_LEASE_SOCKET")
         .env_remove("CARRICK_HOST_LEASE_FD")
         .env_remove("CARRICK_HOST_LEASE_MODE");
-    command.env_remove("CARRICK_HOST_LEASE_SCOPE_FD");
     if check_load {
         command.arg("--check-load");
     }
@@ -143,18 +142,7 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
     workload.reaped = true;
     #[cfg(target_os = "linux")]
     complete_cleanup("reap descendants", || reap_descendants(&mut cleanup))?;
-    let mut bytes = [0; 256];
-    complete_cleanup("workload lifetime EOF", || {
-        loop {
-            cleanup.deadline.wait_fd(lifetime.as_raw_fd())?;
-            match lifetime.read(&mut bytes) {
-                Ok(0) => return Ok(()),
-                Ok(_) => continue,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    })?;
+    complete_lifetime_cleanup(&mut lifetime, cleanup.deadline.0)?;
     #[cfg(not(target_os = "linux"))]
     complete_cleanup("descendant reaping", || {
         workload.wait_for_reaping(&cleanup.deadline)
@@ -303,6 +291,24 @@ fn drain_child_signals(
             Err(error) => return Err(error),
         }
     }
+}
+
+pub(crate) fn complete_lifetime_cleanup(
+    lifetime: &mut std::fs::File,
+    deadline: Instant,
+) -> Result<(), HostLeaseError> {
+    let mut bytes = [0; 256];
+    complete_cleanup("workload lifetime EOF", || {
+        loop {
+            CleanupDeadline(deadline).wait_fd(lifetime.as_raw_fd())?;
+            match lifetime.read(&mut bytes) {
+                Ok(0) => return Ok(()),
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    })
 }
 
 fn complete_cleanup<T>(

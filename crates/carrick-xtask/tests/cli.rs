@@ -396,7 +396,6 @@ fn lease_socket_rejoins_gate_after_tool_runner_closes_descriptors() {
         .env("CARRICK_HOST_LEASE_PATH", lock.path())
         .env_remove("CARRICK_HOST_LEASE_SOCKET")
         .env_remove("CARRICK_HOST_LEASE_FD")
-        .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
