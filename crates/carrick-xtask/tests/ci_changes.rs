@@ -1066,3 +1066,134 @@ fn every_heavy_pr_job_skips_on_lower_stack_layers() {
         "heavy jobs without a lower_layer guard: {unguarded:?}"
     );
 }
+
+/// #1283: a Hosted CI run that workflow concurrency cancelled because a
+/// newer run started on the same head reports `ci-ok` as a pass, not a
+/// failure that blocks the merge queue. Newer means its latest attempt
+/// started later, not a higher run id (#1260: re-running an older run
+/// cancelled a higher-id one). Any other cancellation stays red.
+#[test]
+fn a_superseded_cancelled_run_passes_ci_ok_and_any_other_cancel_stays_red() {
+    let dir = tempfile::tempdir().unwrap();
+    // A `gh` that answers `gh api <endpoint> --jq <filter>` by applying the
+    // recipe's own filter: `actions/runs/<id>` reads this run's fixture,
+    // anything else the runs list.
+    let gh = dir.path().join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nfile=\"$FAKE_RUNS\"\ncase \"$2\" in */actions/runs/[0-9]*) file=\"$FAKE_SELF\";; esac\nwhile [ $# -gt 0 ]; do if [ \"$1\" = --jq ]; then shift; exec jq -r \"$1\" \"$file\"; fi; shift; done\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    // `at` is the minute after 03:00 at which a run's latest attempt began.
+    let run = |id: u64, conclusion: Option<&str>, at: u32| {
+        serde_json::json!({"id": id, "event": "pull_request", "conclusion": conclusion,
+            "run_started_at": format!("2026-11-01T03:{at:02}:00Z")})
+    };
+    // This run is id 100, its attempt began at 03:15.
+    let me = dir.path().join("self.json");
+    std::fs::write(&me, run(100, None, 15).to_string()).unwrap();
+    let runs = |name: &str, list: serde_json::Value| {
+        let path = dir.path().join(format!("runs-{name}.json"));
+        std::fs::write(
+            &path,
+            serde_json::json!({"workflow_runs": list}).to_string(),
+        )
+        .unwrap();
+        path
+    };
+    let cancelled = r#"{"changes":{"result":"success"},"loom":{"result":"cancelled"}}"#;
+    let finished = r#"{"changes":{"result":"success"},"loom":{"result":"success"}}"#;
+    let failed = r#"{"changes":{"result":"success"},"loom":{"result":"cancelled"},"portable":{"result":"failure"}}"#;
+    let superseded = |event: &str, needs: &str, fixture: &std::path::Path| {
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let out = Command::new("just")
+            .arg("--justfile")
+            .arg(workspace_root().join("justfile"))
+            .arg("--working-directory")
+            .arg(workspace_root())
+            .arg("ci-superseded")
+            .env("PATH", path)
+            .env("FAKE_RUNS", fixture)
+            .env("FAKE_SELF", &me)
+            .env("CI_NEEDS", needs)
+            .env("CI_RUN_ID", "100")
+            .env("CI_HEAD_SHA", "a".repeat(40))
+            .env("CI_REPOSITORY", "carrick-sh/carrick")
+            .env("CI_EVENT", event)
+            .env_remove("GITHUB_OUTPUT")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).contains("superseded=true")
+    };
+    let newer_running = runs(
+        "newer",
+        serde_json::json!([run(100, Some("cancelled"), 15), run(101, None, 20)]),
+    );
+    let none_newer = runs(
+        "none",
+        serde_json::json!([run(99, Some("success"), 10), run(100, None, 15)]),
+    );
+    let newer_cancelled = runs(
+        "cancelled",
+        serde_json::json!([run(101, Some("cancelled"), 20)]),
+    );
+    let newer_held = runs(
+        "held",
+        serde_json::json!([run(101, Some("action_required"), 20)]),
+    );
+    // #1260: the older run (id 99) was re-run; its attempt 2 began at 03:35,
+    // rejoined the concurrency group and cancelled this higher-id run.
+    let older_rerun = runs(
+        "rerun",
+        serde_json::json!([run(99, None, 35), run(100, Some("cancelled"), 15)]),
+    );
+    // A higher-id run whose latest attempt began before this one is older.
+    let higher_earlier = runs("earlier", serde_json::json!([run(101, Some("success"), 5)]));
+    // Cancelled, and a run started after this attempt: superseded.
+    assert!(superseded("pull_request", cancelled, &newer_running));
+    assert!(
+        superseded("pull_request", cancelled, &older_rerun),
+        "an older run's re-run supersedes"
+    );
+    // Cancelled with no later run (a manual cancel on the newest): not.
+    assert!(!superseded("pull_request", cancelled, &none_newer));
+    assert!(
+        !superseded("pull_request", cancelled, &higher_earlier),
+        "a higher id is not later"
+    );
+    // Not cancelled: never superseded, whatever runs exist.
+    assert!(!superseded("pull_request", finished, &newer_running));
+    // A failed job is never excused by a later run.
+    assert!(!superseded("pull_request", failed, &newer_running));
+    // The later run must be live or finished, not cancelled or held.
+    assert!(!superseded("pull_request", cancelled, &newer_cancelled));
+    assert!(!superseded("pull_request", cancelled, &newer_held));
+    // Only pull_request runs defer (merge groups and pushes never do).
+    assert!(!superseded("merge_group", cancelled, &newer_running));
+    // ci-results passes a superseded run and still fails the same needs
+    // when the run is not superseded.
+    let (passed, _) = run_ci_results_with_env(
+        "pull_request",
+        Some("false"),
+        cancelled,
+        &[("CI_SUPERSEDED", "true")],
+    );
+    assert!(passed, "a superseded run's ci-ok passes");
+    let (passed, _) = run_ci_results_with_env(
+        "pull_request",
+        Some("false"),
+        cancelled,
+        &[("CI_SUPERSEDED", "false")],
+    );
+    assert!(!passed, "a cancelled, unsuperseded run's ci-ok fails");
+}
