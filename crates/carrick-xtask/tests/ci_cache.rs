@@ -1104,7 +1104,10 @@ use std::process::{Command, Stdio};
 fn main() {
     let socket = std::env::var("SCCACHE_SERVER_UDS").unwrap();
     match std::env::args().nth(1).unwrap().as_str() {
-        "--show-stats" => (), // Like sccache 0.18, succeeds even without a server.
+        "--show-stats" => {
+            // Record use of CARRICK_SCCACHE_BIN on the already-live path.
+            std::fs::write(format!("{socket}.stats"), "configured binary").unwrap();
+        }
         "--start-server" => {
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .arg("serve").stdout(Stdio::piped()).spawn().unwrap();
@@ -1125,7 +1128,9 @@ fn main() {
             std::io::stdout().flush().unwrap();
             for conn in listener.incoming() {
                 let mut conn = conn.unwrap();
-                conn.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                // The readiness probe connects and immediately closes. Darwin can
+                // reject SO_RCVTIMEO on that disconnected peer with EINVAL. The
+                // process-wide watchdog above bounds every read, including stop.
                 let mut line = String::new();
                 std::io::BufReader::new(&mut conn).read_line(&mut line).unwrap();
                 if line == "stop\n" { break; }
@@ -1155,11 +1160,19 @@ fn main() {
             .spawn()
             .unwrap()
     };
+    // Begin with a real stale socket, as left by a cancelled CI step. Both
+    // concurrent callers must still succeed and share the one new daemon;
+    // its exclusive .starting directory rejects a second daemon invocation.
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
     let mut first = spawn();
     let mut second = spawn();
     assert!(first.wait().unwrap().success());
     assert!(second.wait().unwrap().success());
     assert!(socket.exists());
+    assert_eq!(
+        std::fs::read_to_string(format!("{}.stats", socket.display())).unwrap(),
+        "configured binary"
+    );
     std::os::unix::net::UnixStream::connect(&socket)
         .unwrap()
         .write_all(b"stop\n")

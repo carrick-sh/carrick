@@ -51,6 +51,9 @@ pub(crate) fn start() -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
+    // sccache 0.18 commands::run_server_process waits for ServerStartup::Ok;
+    // server::start_server sends it only after binding the listener. Keep this
+    // synchronous command under the lock so the next caller sees a bound socket.
     if !Command::new(bin)
         .env("SCCACHE_IDLE_TIMEOUT", "0")
         .arg("--start-server")
