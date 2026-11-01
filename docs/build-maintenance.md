@@ -54,9 +54,15 @@ lock beside the job socket before checking readiness, removing a stale socket,
 or starting the server. Concurrent callers attach to the first caller's server;
 the lock file stays in place so waiters always lock the same inode. Readiness
 requires a UNIX-socket connection: sccache 0.18 can return successful empty
-statistics even when no server exists. The xtask
-bootstrap compiles without a compiler wrapper to avoid implicitly starting the
-server before acquiring this lock. Only same-repository pull requests run
+statistics even when no server exists. The configured `CARRICK_SCCACHE_BIN`
+handles both startup and statistics. Startup holds the lock until
+`--start-server` returns: in sccache 0.18,
+[`run_server_process`](https://github.com/mozilla/sccache/blob/v0.18.0/src/commands.rs)
+reads the daemon's startup notification, and
+[`start_server`](https://github.com/mozilla/sccache/blob/v0.18.0/src/server.rs)
+sends `ServerStartup::Ok` only after binding its listener. No readiness polling
+is needed. The xtask bootstrap compiles without a compiler wrapper to avoid
+implicitly starting the server before acquiring this lock. Only same-repository pull requests run
 there; merge-queue and `main` jobs use hosted macOS.
 No linker, Rust flags, entitlement, DOF processing, or signing steps change:
 macOS still uses Apple ld64 and the existing post-link signing path.
