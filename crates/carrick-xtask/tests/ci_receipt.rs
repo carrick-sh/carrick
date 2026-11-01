@@ -2027,6 +2027,396 @@ else:
         assert_eq!(state[&h.commits[3]], 1);
         assert!(state.get(&h.commits[1]).is_none());
     }
+
+    #[test]
+    fn serial_host_pr_and_merge_group_el1_native_gate_refuses_new_failure_against_receipted_main() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ci_yaml = include_str!("../../../.github/workflows/ci.yml");
+        let ci_docs = yaml_rust2::YamlLoader::load_from_str(ci_yaml).unwrap();
+        let gate_steps = ci_docs[0]["jobs"]["el1-native-gate"]["steps"]
+            .as_vec()
+            .unwrap();
+        let ancestor_script = gate_steps
+            .iter()
+            .find(|s| s["id"].as_str() == Some("ancestor"))
+            .and_then(|s| s["run"].as_str())
+            .unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let origin = temp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "-b", "main"]);
+        let mut main_commits = Vec::new();
+        for n in 0..4 {
+            std::fs::write(origin.join("main.txt"), format!("main {n}\n")).unwrap();
+            git(&origin, &["add", "main.txt"]);
+            git(&origin, &["commit", "-q", "-m", &format!("main {n}")]);
+            main_commits.push(git(&origin, &["rev-parse", "HEAD"]));
+        }
+
+        // PR branched from main_commits[2] while refs/heads/main moved to main_commits[3].
+        git(
+            &origin,
+            &["checkout", "-q", "-b", "work/pr-42", &main_commits[2]],
+        );
+        std::fs::write(origin.join("pr.txt"), "pr head\n").unwrap();
+        git(&origin, &["add", "pr.txt"]);
+        git(&origin, &["commit", "-q", "-m", "pr commit"]);
+        let pr_head = git(&origin, &["rev-parse", "HEAD"]);
+        git(
+            &origin,
+            &["checkout", "-q", "-B", "pr-merge", &main_commits[2]],
+        );
+        git(
+            &origin,
+            &["merge", "--no-ff", "-q", "-m", "Merge pr into main", &pr_head],
+        );
+        let pr_merge_sha = git(&origin, &["rev-parse", "HEAD"]);
+        git(
+            &origin,
+            &["update-ref", "refs/pull/42/merge", &pr_merge_sha],
+        );
+
+        // Stacked PR targeting work/pr-42 (lower layer based on main_commits[2]).
+        git(
+            &origin,
+            &["checkout", "-q", "-b", "work/pr-43", &pr_head],
+        );
+        std::fs::write(origin.join("stack.txt"), "upper layer\n").unwrap();
+        git(&origin, &["add", "stack.txt"]);
+        git(&origin, &["commit", "-q", "-m", "stack upper"]);
+        let stack_head = git(&origin, &["rev-parse", "HEAD"]);
+        git(&origin, &["checkout", "-q", "-B", "stack-merge", &pr_head]);
+        git(
+            &origin,
+            &[
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "Merge stack upper into lower",
+                &stack_head,
+            ],
+        );
+        let stack_merge_sha = git(&origin, &["rev-parse", "HEAD"]);
+        git(
+            &origin,
+            &["update-ref", "refs/pull/43/merge", &stack_merge_sha],
+        );
+
+        // Merge-group rebase queue batch of 3 commits on top of main_commits[3].
+        git(
+            &origin,
+            &[
+                "checkout",
+                "-q",
+                "-b",
+                "gh-readonly-queue/main/pr-99",
+                &main_commits[3],
+            ],
+        );
+        let mut queue_commits = Vec::new();
+        for n in 0..3 {
+            std::fs::write(origin.join("queue.txt"), format!("queue {n}\n")).unwrap();
+            git(&origin, &["add", "queue.txt"]);
+            git(&origin, &["commit", "-q", "-m", &format!("queue {n}")]);
+            queue_commits.push(git(&origin, &["rev-parse", "HEAD"]));
+        }
+        let queue_head = queue_commits.last().unwrap().clone();
+
+        // Orphan commit sharing no ancestor with refs/heads/main (negative control).
+        git(&origin, &["checkout", "--orphan", "unrelated"]);
+        git(&origin, &["rm", "-rf", "-q", "."]);
+        std::fs::write(origin.join("unrelated.txt"), "unrelated\n").unwrap();
+        git(&origin, &["add", "unrelated.txt"]);
+        git(&origin, &["commit", "-q", "-m", "unrelated root"]);
+        let orphan_root = git(&origin, &["rev-parse", "HEAD"]);
+        std::fs::write(origin.join("unrelated.txt"), "unrelated child\n").unwrap();
+        git(&origin, &["add", "unrelated.txt"]);
+        git(&origin, &["commit", "-q", "-m", "unrelated child"]);
+        let orphan_child = git(&origin, &["rev-parse", "HEAD"]);
+
+        git(&origin, &["checkout", "-q", "main"]);
+
+        // Clone `selector` at refs/heads/main just as el1-native-gate does.
+        let job_root = temp.path().join("job");
+        std::fs::create_dir_all(&job_root).unwrap();
+        git(
+            &job_root,
+            &[
+                "clone",
+                "-q",
+                "--branch",
+                "main",
+                origin.to_str().unwrap(),
+                "selector",
+            ],
+        );
+
+        let run_ancestor_step = |candidate_sha: &str, candidate_ref: &str| {
+            let runner_temp = tempfile::tempdir().unwrap();
+            let out_file = runner_temp.path().join("github_output");
+            let sum_file = runner_temp.path().join("github_summary");
+            std::fs::write(&out_file, "").unwrap();
+            std::fs::write(&sum_file, "").unwrap();
+            let out = Command::new("bash")
+                .arg("-c")
+                .arg(ancestor_script)
+                .current_dir(&job_root)
+                .env("GITHUB_SHA", candidate_sha)
+                .env("GITHUB_REF", candidate_ref)
+                .env("RUNNER_TEMP", runner_temp.path())
+                .env("GITHUB_OUTPUT", &out_file)
+                .env("GITHUB_STEP_SUMMARY", &sum_file)
+                .output()
+                .unwrap();
+            (
+                out,
+                std::fs::read_to_string(out_file).unwrap(),
+                std::fs::read_to_string(sum_file).unwrap(),
+            )
+        };
+
+        // Negative controls fail closed before any receipt lookup.
+        for (bad_sha, bad_ref, expected_heading) in [
+            ("0".repeat(40), "refs/pull/1/merge", "## Invalid candidate commit"),
+            (orphan_root, "refs/heads/unrelated", "## Invalid candidate history"),
+            (orphan_child, "refs/heads/unrelated", "## No main ancestor"),
+        ] {
+            let (out, gh_out, summary) = run_ancestor_step(&bad_sha, bad_ref);
+            assert!(!out.status.success());
+            assert!(gh_out.is_empty(), "{gh_out}");
+            assert!(summary.contains(expected_heading), "{summary}");
+        }
+
+        // PR merge commit resolves BEFORE_SHA = main_commits[2] even after main moved to [3].
+        let (pr_out, pr_gh_out, _) = run_ancestor_step(&pr_merge_sha, "refs/pull/42/merge");
+        assert!(
+            pr_out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&pr_out.stderr)
+        );
+        assert!(
+            pr_gh_out.contains(&format!("selector_sha={}\n", main_commits[3])),
+            "{pr_gh_out}"
+        );
+        assert!(
+            pr_gh_out.contains(&format!("before_sha={}\n", main_commits[2])),
+            "{pr_gh_out}"
+        );
+
+        // Stacked PR merge commit walks past lower layer to main_commits[2].
+        let (stack_out, stack_gh_out, _) =
+            run_ancestor_step(&stack_merge_sha, "refs/pull/43/merge");
+        assert!(stack_out.status.success());
+        assert!(
+            stack_gh_out.contains(&format!("before_sha={}\n", main_commits[2])),
+            "{stack_gh_out}"
+        );
+
+        // Merge-group queue head resolves BEFORE_SHA = main_commits[3].
+        let (mg_out, mg_gh_out, _) =
+            run_ancestor_step(&queue_head, "refs/heads/gh-readonly-queue/main/pr-99");
+        assert!(mg_out.status.success());
+        assert!(
+            mg_gh_out.contains(&format!("before_sha={}\n", main_commits[3])),
+            "{mg_gh_out}"
+        );
+
+        // Mock `gh` serving both `gh api` (select-baseline + gate) and `gh run download` (gate).
+        // Only main_commits[1] has a trusted kernel-runtime.yml el1-native receipt; an untrusted
+        // PR run at main_commits[2] must be ignored.
+        let mut trusted = run("push", "main", ".github/workflows/kernel-runtime.yml");
+        trusted["id"] = 101.into();
+        trusted["head_sha"] = main_commits[1].clone().into();
+        trusted["status"] = "completed".into();
+        trusted["artifacts"] = serde_json::json!([
+            {"name": format!("receipt-el1-native-{}-1", main_commits[1]), "expired": false}
+        ]);
+        let mut untrusted_pr = run("pull_request", "work/pr", ".github/workflows/ci.yml");
+        untrusted_pr["id"] = 102.into();
+        untrusted_pr["head_sha"] = main_commits[2].clone().into();
+        untrusted_pr["status"] = "completed".into();
+        untrusted_pr["artifacts"] = serde_json::json!([
+            {"name": format!("receipt-el1-native-{}-1", main_commits[2]), "expired": false}
+        ]);
+
+        let mut base_receipt = receipt(vec![step(
+            "el1-native-tests",
+            false,
+            &["carrick_el1_linux::existing_gap"],
+        )]);
+        base_receipt.head = main_commits[1].clone();
+        base_receipt.phase = "host".into();
+        base_receipt.profile = "el1-native".into();
+        let base_receipt_path = temp.path().join("base-receipt.json");
+        std::fs::write(
+            &base_receipt_path,
+            serde_json::to_vec(&base_receipt).unwrap(),
+        )
+        .unwrap();
+
+        let api_fixture = temp.path().join("api.json");
+        std::fs::write(
+            &api_fixture,
+            serde_json::to_vec(&[trusted, untrusted_pr]).unwrap(),
+        )
+        .unwrap();
+
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
+args = sys.argv[1:]
+if args[:2] == ["run", "download"]:
+    dest = pathlib.Path(args[args.index("--dir") + 1])
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(os.environ["BASE_RECEIPT_FILE"], dest / "receipt.json")
+    raise SystemExit(0)
+rows = json.loads(pathlib.Path(os.environ["RECEIPT_API_FIXTURE"]).read_text())
+endpoint = args[-1]
+if "/runs?head_sha=" in endpoint:
+    sha = endpoint.split("head_sha=")[1].split("&")[0]
+    print(json.dumps({"workflow_runs": [r for r in rows if r["head_sha"] == sha]}))
+elif "/artifacts?" in endpoint:
+    rid = int(endpoint.split("/runs/")[1].split("/")[0])
+    row = next(r for r in rows if r["id"] == rid)
+    print(json.dumps({"artifacts": row["artifacts"]}))
+else:
+    raise SystemExit(f"unexpected gh invocation: {args}")
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+        // Select baseline for both PR merge commit and merge-group queue head.
+        for (before_sha, candidate_sha, expected_covered) in [
+            (&main_commits[2], &pr_merge_sha, vec![main_commits[2].clone()]),
+            (
+                &main_commits[3],
+                &queue_head,
+                vec![
+                    main_commits[2].clone(),
+                    main_commits[3].clone(),
+                    queue_commits[0].clone(),
+                    queue_commits[1].clone(),
+                ],
+            ),
+        ] {
+            let sel_out_file = temp.path().join("sel_out");
+            let sel_sum_file = temp.path().join("sel_sum");
+            std::fs::write(&sel_out_file, "").unwrap();
+            std::fs::write(&sel_sum_file, "").unwrap();
+            let sel = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                .current_dir(job_root.join("selector"))
+                .args([
+                    "ci-receipt",
+                    "select-baseline",
+                    "--lane",
+                    "el1-native",
+                    "--before-sha",
+                    before_sha,
+                    "--candidate-sha",
+                    candidate_sha,
+                    "--wait-minutes",
+                    "0",
+                    "--poll-seconds",
+                    "1",
+                ])
+                .env("PATH", &path_env)
+                .env("RECEIPT_API_FIXTURE", &api_fixture)
+                .env("GITHUB_OUTPUT", &sel_out_file)
+                .env("GITHUB_STEP_SUMMARY", &sel_sum_file)
+                .output()
+                .unwrap();
+            assert!(
+                sel.status.success(),
+                "{}",
+                String::from_utf8_lossy(&sel.stderr)
+            );
+            let sel_outputs = std::fs::read_to_string(&sel_out_file).unwrap();
+            assert!(
+                sel_outputs.contains(&format!("sha={}\n", main_commits[1])),
+                "{sel_outputs}"
+            );
+            let sel_summary = std::fs::read_to_string(&sel_sum_file).unwrap();
+            for covered in expected_covered {
+                assert!(sel_summary.contains(&covered), "{sel_summary}");
+            }
+        }
+
+        // Run `ci-receipt gate --lane el1-native`:
+        // 1) Candidate with only pre-existing failure passes.
+        // 2) Candidate adding a failing native-process test fails and names NEW.
+        let run_gate = |failed_tests: &[&str]| {
+            let cand_dir = tempfile::tempdir().unwrap();
+            let artifact_dir = cand_dir
+                .path()
+                .join(format!("receipt-el1-native-{queue_head}-1"));
+            std::fs::create_dir_all(&artifact_dir).unwrap();
+            let mut cand = receipt(vec![step("el1-native-tests", false, failed_tests)]);
+            cand.head = queue_head.clone();
+            cand.phase = "host".into();
+            cand.profile = "el1-native".into();
+            std::fs::write(
+                artifact_dir.join("receipt.json"),
+                serde_json::to_vec(&cand).unwrap(),
+            )
+            .unwrap();
+            let dl_dir = tempfile::tempdir().unwrap();
+            Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                .current_dir(job_root.join("selector"))
+                .args([
+                    "ci-receipt",
+                    "gate",
+                    "--lane",
+                    "el1-native",
+                    "--base-sha",
+                    &main_commits[1],
+                    "--candidate-dir",
+                ])
+                .arg(cand_dir.path())
+                .args([
+                    "--candidate-sha",
+                    &queue_head,
+                    "--run-attempt",
+                    "1",
+                    "--download-dir",
+                ])
+                .arg(dl_dir.path())
+                .args(["--wait-minutes", "0"])
+                .env("PATH", &path_env)
+                .env("RECEIPT_API_FIXTURE", &api_fixture)
+                .env("BASE_RECEIPT_FILE", &base_receipt_path)
+                .output()
+                .unwrap()
+        };
+
+        let clean_gate = run_gate(&["carrick_el1_linux::existing_gap"]);
+        assert!(
+            clean_gate.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&clean_gate.stdout),
+            String::from_utf8_lossy(&clean_gate.stderr)
+        );
+
+        let regressed_gate = run_gate(&[
+            "carrick_el1_linux::existing_gap",
+            "carrick_el1_linux::new_failing_native_process_test",
+        ]);
+        assert!(!regressed_gate.status.success());
+        let regressed_stdout = String::from_utf8_lossy(&regressed_gate.stdout);
+        assert!(
+            regressed_stdout
+                .contains("test:el1-native-tests:carrick_el1_linux::new_failing_native_process_test"),
+            "{regressed_stdout}"
+        );
+    }
 }
 
 /// #1297: the el1-native lane's gate looks for exactly the artifact name
@@ -2051,4 +2441,136 @@ fn el1_native_lane_names_match_the_workflow_upload_and_cli() {
         2,
         "select-baseline and gate"
     );
+}
+
+/// #1303: `ci.yml` runs `el1-native-tests` on `ubuntu-24.04-arm` and gates its
+/// uploaded receipt in `el1-native-gate` against the receipted `main` ancestor
+/// using trusted `main` / baseline code, feeding the verdict into `ci-ok`.
+#[test]
+fn ci_workflow_gates_el1_native_before_landing_with_trusted_baseline_code() {
+    let ci = include_str!("../../../.github/workflows/ci.yml");
+    let docs = yaml_rust2::YamlLoader::load_from_str(ci).unwrap();
+    let jobs = &docs[0]["jobs"];
+
+    assert_eq!(
+        jobs["changes"]["outputs"]["el1_native"].as_str(),
+        Some("${{ steps.filter.outputs.el1_native }}")
+    );
+
+    let lane = &jobs["el1-native-tests"];
+    assert_eq!(lane["runs-on"].as_str(), Some("ubuntu-24.04-arm"));
+    let lane_if = lane["if"].as_str().unwrap();
+    assert!(lane_if.contains("needs.changes.outputs.el1_native == 'true'"));
+    assert!(lane_if.contains("github.event_name == 'merge_group'"));
+    let lane_steps = lane["steps"].as_vec().unwrap();
+    assert!(
+        lane_steps
+            .iter()
+            .filter_map(|s| s["run"].as_str())
+            .all(|r| !r.contains("ci-receipt gate")),
+        "el1-native-tests must only produce and upload its receipt"
+    );
+    assert!(
+        lane_steps.iter().any(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.contains("just accept --profile el1-native --receipt"))
+        }),
+        "el1-native-tests must run `just accept --profile el1-native`"
+    );
+    assert!(
+        lane_steps.iter().any(|s| {
+            s["uses"].as_str() == Some("actions/upload-artifact@v4")
+                && s["with"]["name"].as_str()
+                    == Some("receipt-el1-native-${{ github.sha }}-${{ github.run_attempt }}")
+        }),
+        "el1-native-tests must upload per-SHA receipt artifact"
+    );
+
+    let gate = &jobs["el1-native-gate"];
+    assert_eq!(gate["runs-on"].as_str(), Some("ubuntu-latest"));
+    let gate_needs: Vec<_> = gate["needs"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n.as_str())
+        .collect();
+    assert_eq!(gate_needs, vec!["changes", "el1-native-tests"]);
+    assert!(
+        gate["if"]
+            .as_str()
+            .unwrap()
+            .contains("needs.el1-native-tests.result == 'success'")
+    );
+    assert!(gate["timeout-minutes"].as_i64().unwrap() >= 70);
+
+    let gate_steps = gate["steps"].as_vec().unwrap();
+    for checkout in gate_steps
+        .iter()
+        .filter(|s| s["uses"].as_str().is_some_and(|u| u.starts_with("actions/checkout@")))
+    {
+        let path = checkout["with"]["path"].as_str();
+        let git_ref = checkout["with"]["ref"].as_str();
+        assert!(
+            matches!(
+                (path, git_ref),
+                (Some("selector"), Some("refs/heads/main"))
+                    | (Some("baseline"), Some("${{ steps.baseline.outputs.sha }}"))
+            ),
+            "el1-native-gate must never check out candidate PR code: path={path:?} ref={git_ref:?}"
+        );
+        assert_eq!(checkout["with"]["persist-credentials"].as_bool(), Some(false));
+    }
+    for build_step in gate_steps
+        .iter()
+        .filter(|s| s["run"].as_str().is_some_and(|r| r.contains("cargo build")))
+    {
+        assert!(matches!(
+            build_step["working-directory"].as_str(),
+            Some("selector" | "baseline")
+        ));
+    }
+
+    let select = gate_steps
+        .iter()
+        .find(|s| s["id"].as_str() == Some("baseline"))
+        .unwrap();
+    assert_eq!(select["working-directory"].as_str(), Some("selector"));
+    assert!(
+        select["run"]
+            .as_str()
+            .unwrap()
+            .contains("ci-receipt select-baseline --lane el1-native")
+    );
+
+    let download = gate_steps
+        .iter()
+        .find(|s| s["uses"].as_str() == Some("actions/download-artifact@v4"))
+        .unwrap();
+    assert_eq!(
+        download["with"]["pattern"].as_str(),
+        Some("receipt-el1-native-${{ github.sha }}-*")
+    );
+
+    let compare = gate_steps
+        .iter()
+        .find(|s| s["run"].as_str().is_some_and(|r| r.contains("ci-receipt gate --lane el1-native")))
+        .unwrap();
+    assert_eq!(
+        compare["working-directory"].as_str(),
+        Some("${{ steps.baseline.outputs.sha == steps.ancestor.outputs.selector_sha && 'selector' || 'baseline' }}")
+    );
+    assert_eq!(
+        compare["env"]["BASE_SHA"].as_str(),
+        Some("${{ steps.baseline.outputs.sha }}")
+    );
+
+    let ci_ok_needs: Vec<_> = jobs["ci-ok"]["needs"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n.as_str())
+        .collect();
+    assert!(ci_ok_needs.contains(&"el1-native-tests"));
+    assert!(ci_ok_needs.contains(&"el1-native-gate"));
 }

@@ -479,10 +479,11 @@ test-kernel-semantics *ARGS:
 # carrick-el1-linux's native-process tests (template, IPC wake, poll) are
 # gated off macOS, which refuses their EL1 metadata window, and the macOS
 # unit shards were the only ones running this crate, so they never ran.
-# `kernel-runtime.yml`'s `el1-native-tests` runs them natively on Linux
-# aarch64 through `xtask accept --profile el1-native` and receipts the
+# `ci.yml` (for PRs in `carrick-el1-linux`'s closure and merge groups) and
+# `kernel-runtime.yml` (on `main` pushes and owner dispatch) run them natively
+# on Linux aarch64 through `xtask accept --profile el1-native` and receipt the
 # result; `el1-native-gate` fails on NEW failures against the receipted
-# main ancestor (#1297).
+# main ancestor (#1297, #1303).
 # Each test runs in its own process (`xtask test-isolated`): the native
 # fixtures leak `'static` structures for the life of their process, and one
 # process running the whole suite exhausted a 16 GiB runner (#1297).
@@ -1512,6 +1513,7 @@ ci-results:
     fi
     jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" '
       has("lint-clippy") and has("lint-gates") and has("xtask-tests-build") and has("loom") and
+      has("el1-native-tests") and has("el1-native-gate") and
       .changes.result == "success" and
       .["xtask-build"].result == "success" and
       (.["macos-authority"].result ==
@@ -1519,31 +1521,37 @@ ci-results:
       (length > 1) and
       (. as $root |
        (($root.changes.outputs.lower_layer // $lower) == "true") as $is_lower |
+       (["el1-native-tests", "el1-native-gate"]) as $el1_pair |
+       (with_entries(select(.key as $k | $el1_pair | index($k)))
+         | select(length == 2)
+         | if $event == "merge_group" then all(.[]; .result == "success")
+           elif $event == "pull_request" and ($root.changes.outputs.heavy // "true") == "true" and ($root.changes.outputs.el1_native // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
+           else all(.[]; .result == "skipped") end) and
        if $event == "pull_request" then
-         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key | startswith("macos-")))
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key | startswith("macos-")))
            | if ($root.changes.outputs.heavy // "true") == "true" and ($root.changes.outputs.macos // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
-         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key == "lint-clippy" or .key == "lint-gates" or .key == "xtask-tests-build"))
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key == "lint-clippy" or .key == "lint-gates" or .key == "xtask-tests-build"))
            | select(length == 3)
            | if ($root.changes.outputs.heavy // "true") == "true" then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
-         (del(.changes, .["xtask-build"], .["macos-authority"])["lint-domains"]
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"])["lint-domains"]
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
-         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint-clippy" and .key != "lint-gates" and .key != "xtask-tests-build" and .key != "lint-domains"))
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint-clippy" and .key != "lint-gates" and .key != "xtask-tests-build" and .key != "lint-domains"))
            | if ($root.changes.outputs.heavy // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and
          (.["commit-trailers"].result == "success") and
-         (del(.changes, .["xtask-build"], .["macos-authority"]).actionlint
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]).actionlint
            | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
              else .result == "skipped" end)
-       elif $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" and ($is_lower | not) then
+       elif $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" and ($root.changes.outputs.el1_native // "true") == "true" and ($is_lower | not) then
          # Merge groups run macOS build, clippy and the authority census;
          # the unit and integration suites ran on the PR and run nightly.
          ["macos-unit-a", "macos-unit-b", "macos-integration"] as $pr_only |
-         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key as $k | $pr_only | index($k) | not)) | all(.[]; .result == "success")) and
-         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key as $k | $pr_only | index($k)))
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key as $k | $pr_only | index($k) | not)) | all(.[]; .result == "success")) and
+         (del(.changes, .["xtask-build"], .["macos-authority"], .["el1-native-tests"], .["el1-native-gate"]) | with_entries(select(.key as $k | $pr_only | index($k)))
            | if $event == "merge_group" then all(.[]; .result == "skipped") else all(.[]; .result == "success") end)
        else false end)
     ' <<< "${CI_NEEDS:?}"

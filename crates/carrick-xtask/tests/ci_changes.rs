@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use carrick_xtask::ci_changes::{
-    CiChangesOutputs, PathClass, ReferencedDocs, child_lookup_allowed, classify_path,
-    evaluate_changes, scan_script_or_workflow,
+    CiChangesOutputs, El1NativeClosure, PathClass, ReferencedDocs, child_lookup_allowed,
+    classify_path, evaluate_changes, evaluate_changes_with_closure, path_affects_el1_native,
+    scan_script_or_workflow,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -193,11 +194,12 @@ fn referenced_docs_and_census_files_in_workspace_flip_to_heavy() {
             CiChangesOutputs {
                 heavy: true,
                 macos: true,
+                el1_native: true,
                 workflows: false,
                 hardware: true,
                 lower_layer: false,
             },
-            "PR touching `{referenced}` must set heavy=true, hardware=true"
+            "PR touching `{referenced}` must set heavy=true, el1_native=true, hardware=true"
         );
         let mg_out = evaluate_changes(
             "merge_group",
@@ -211,11 +213,12 @@ fn referenced_docs_and_census_files_in_workspace_flip_to_heavy() {
             CiChangesOutputs {
                 heavy: true,
                 macos: true,
+                el1_native: true,
                 workflows: true,
                 hardware: true,
                 lower_layer: false,
             },
-            "merge_group touching `{referenced}` must set heavy=true, macos=true, workflows=true, hardware=true"
+            "merge_group touching `{referenced}` must set heavy=true, macos=true, el1_native=true, workflows=true, hardware=true"
         );
     }
 
@@ -330,11 +333,12 @@ fn scripts_justfile_and_xtask_classify_as_full_heavy_macos_and_hardware() {
             CiChangesOutputs {
                 heavy: true,
                 macos: true,
+                el1_native: true,
                 workflows: false,
                 hardware: true,
                 lower_layer: false,
             },
-            "PR touching `{full_path}` must run heavy=true, hardware=true"
+            "PR touching `{full_path}` must run heavy=true, el1_native=true, hardware=true"
         );
         let mg_out = evaluate_changes(
             "merge_group",
@@ -348,11 +352,12 @@ fn scripts_justfile_and_xtask_classify_as_full_heavy_macos_and_hardware() {
             CiChangesOutputs {
                 heavy: true,
                 macos: true,
+                el1_native: true,
                 workflows: true,
                 hardware: true,
                 lower_layer: false,
             },
-            "merge_group touching `{full_path}` must run heavy=true, macos=true, workflows=true, hardware=true"
+            "merge_group touching `{full_path}` must run heavy=true, macos=true, el1_native=true, workflows=true, hardware=true"
         );
     }
 }
@@ -368,11 +373,11 @@ fn prose_only_pr_skips_heavy_macos_and_hardware_but_merge_group_runs_full() {
 
     assert_eq!(
         repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=false\nmacos=false\nworkflows=false\nhardware=false\nlower_layer=false\n"
+        "heavy=false\nmacos=false\nel1_native=false\nworkflows=false\nhardware=false\nlower_layer=false\n"
     );
     assert_eq!(
         repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 }
 
@@ -381,11 +386,11 @@ fn workflows_run_full_heavy_macos_hardware_plus_actionlint() {
     let ci_yml_repo = TempRepo::new(&[(".github/workflows/ci.yml", "name: CI\n")]);
     assert_eq!(
         ci_yml_repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
     assert_eq!(
         ci_yml_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 
     let kr_yml_repo = TempRepo::new(&[(
@@ -394,11 +399,11 @@ fn workflows_run_full_heavy_macos_hardware_plus_actionlint() {
     )]);
     assert_eq!(
         kr_yml_repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
     assert_eq!(
         kr_yml_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 }
 
@@ -407,17 +412,17 @@ fn unknown_or_rust_product_path_fails_safe_and_runs_everything() {
     let rust_repo = TempRepo::new(&[("crates/carrick-kernel/src/lib.rs", "pub fn f() {}\n")]);
     assert_eq!(
         rust_repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
     assert_eq!(
         rust_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 
     let unknown_repo = TempRepo::new(&[("Cargo.lock", "# lockfile\n")]);
     assert_eq!(
         unknown_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 }
 
@@ -460,10 +465,10 @@ fn cumulative_merge_group_diff_runs_everything_when_ahead_entry_touched_code() {
         base_sha: entry1_sha,
     };
 
-    // Merge group always runs everything: heavy, macos, workflows, and hardware are all true.
+    // Merge group always runs everything: heavy, macos, el1_native, workflows, and hardware are all true.
     assert_eq!(
         repo.run_ci_changes("merge_group", None, Some(&main_sha)),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 }
 
@@ -476,14 +481,14 @@ fn draft_pr_runs_cheap_linux_checks_and_its_ci_ok_cannot_land() {
 
     assert_eq!(
         repo.run_ci_changes("pull_request", Some("true"), None),
-        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
 
     let draft_needs = r#"{
       "xtask-build": { "result": "success" },
       "changes": {
         "result": "success",
-        "outputs": { "heavy": "true", "macos": "false", "workflows": "false", "hardware": "true", "lower_layer": "false" }
+        "outputs": { "heavy": "true", "macos": "false", "el1_native": "true", "workflows": "false", "hardware": "true", "lower_layer": "false" }
       },
       "actionlint": { "result": "skipped" },
       "linked-issue": { "result": "success" },
@@ -504,7 +509,9 @@ fn draft_pr_runs_cheap_linux_checks_and_its_ci_ok_cannot_land() {
       "cross-check-freebsd": { "result": "skipped" },
       "cross-check-netbsd": { "result": "skipped" },
       "cross-check-macos": { "result": "skipped" },
-      "kernel-linux-native": { "result": "skipped" }
+      "kernel-linux-native": { "result": "skipped" },
+      "el1-native-tests": { "result": "skipped" },
+      "el1-native-gate": { "result": "skipped" }
     }"#;
     // #1321: a draft run's ci-ok is never a landing signal. When everything
     // it ran passed it still fails, and says why, so auto-merge can't take a
@@ -572,6 +579,7 @@ fn stack_layer_detection_and_ci_results_gating() {
         CiChangesOutputs {
             heavy: true,
             macos: true,
+            el1_native: true,
             workflows: false,
             hardware: true,
             lower_layer: true,
@@ -583,6 +591,7 @@ fn stack_layer_detection_and_ci_results_gating() {
         CiChangesOutputs {
             heavy: true,
             macos: true,
+            el1_native: true,
             workflows: false,
             hardware: true,
             lower_layer: false,
@@ -595,6 +604,7 @@ fn stack_layer_detection_and_ci_results_gating() {
             CiChangesOutputs {
                 heavy: true,
                 macos: true,
+                el1_native: true,
                 workflows: true,
                 hardware: true,
                 lower_layer: false,
@@ -627,7 +637,7 @@ fn stack_layer_detection_and_ci_results_gating() {
     );
     assert_eq!(
         out_lower,
-        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=true\nchild_pr=610\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=false\nhardware=true\nlower_layer=true\nchild_pr=610\n"
     );
     let summary_text = fs::read_to_string(&summary_file).expect("step summary written");
     assert!(
@@ -651,14 +661,14 @@ fn stack_layer_detection_and_ci_results_gating() {
     );
     assert_eq!(
         out_top,
-        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
     assert!(
         !summary_file.exists(),
         "top layer should not write lower stack layer summary"
     );
 
-    // 2c. Lookup error fails closed to full suite (heavy=true, lower_layer=false) even on prose-only PR
+    // 2c. Lookup error fails closed to full suite (heavy=true, el1_native=true, lower_layer=false) even on prose-only PR
     let path_err = write_mock_gh(
         bin_dir.path(),
         "#!/usr/bin/env bash\necho 'HTTP 502 Bad Gateway' >&2\nexit 1\n",
@@ -675,7 +685,7 @@ fn stack_layer_detection_and_ci_results_gating() {
     );
     assert_eq!(
         out_err,
-        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
     let prose_repo = TempRepo::new(&[("docs/unreferenced-note.md", "prose only\n")]);
     let out_prose_err = prose_repo.run_ci_changes_with_env(
@@ -690,8 +700,8 @@ fn stack_layer_detection_and_ci_results_gating() {
     );
     assert_eq!(
         out_prose_err,
-        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n",
-        "child lookup error on prose PR must fail closed to heavy=true, hardware=true, lower_layer=false"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=false\nhardware=true\nlower_layer=false\n",
+        "child lookup error on prose PR must fail closed to heavy=true, el1_native=true, hardware=true, lower_layer=false"
     );
 
     // 2d. merge_group with a child PR still runs full suite
@@ -707,7 +717,7 @@ fn stack_layer_detection_and_ci_results_gating() {
     );
     assert_eq!(
         out_mg_with_child,
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nel1_native=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 
     // 3. ci-results check: lower layer passes with skipped heavy jobs and writes reason to summary;
@@ -719,6 +729,7 @@ fn stack_layer_detection_and_ci_results_gating() {
         "outputs": {
           "heavy": "true",
           "macos": "false",
+          "el1_native": "true",
           "workflows": "false",
           "hardware": "true",
           "lower_layer": "true",
@@ -744,7 +755,9 @@ fn stack_layer_detection_and_ci_results_gating() {
       "cross-check-linux": { "result": "skipped" },
       "cross-check-freebsd": { "result": "skipped" },
       "cross-check-netbsd": { "result": "skipped" },
-      "kernel-linux-native": { "result": "skipped" }
+      "kernel-linux-native": { "result": "skipped" },
+      "el1-native-tests": { "result": "skipped" },
+      "el1-native-gate": { "result": "skipped" }
     }"#;
     let ci_ok_summary = repo.dir.path().join("ci_ok_summary.md");
     let _ = fs::remove_file(&ci_ok_summary);
@@ -795,7 +808,7 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
       "xtask-build": { "result": "success" },
       "changes": {
         "result": "success",
-        "outputs": { "heavy": "true", "macos": "true", "workflows": "true", "hardware": "true", "lower_layer": "false" }
+        "outputs": { "heavy": "true", "macos": "true", "el1_native": "true", "workflows": "true", "hardware": "true", "lower_layer": "false" }
       },
       "actionlint": { "result": "success" },
       "linked-issue": { "result": "success" },
@@ -817,9 +830,11 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
       "cross-check-freebsd": { "result": "success" },
       "cross-check-netbsd": { "result": "success" },
       "cross-check-macos": { "result": "success" },
-      "kernel-linux-native": { "result": "success" }
+      "kernel-linux-native": { "result": "success" },
+      "el1-native-tests": { "result": "skipped" },
+      "el1-native-gate": { "result": "skipped" }
     }"#;
-    // Push to main (and schedule) runs the full macOS suite.
+    // Push to main (and schedule) runs the full macOS suite; el1-native runs in kernel-runtime.yml on main.
     assert!(
         run_ci_results("push", None, full_needs),
         "full push must pass ci-results"
@@ -834,12 +849,20 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
         "push with failing lint-domains must fail ci-results"
     );
 
-    // Merge groups run macos-build and macos-clippy only: the unit and
-    // integration suites ran on the PR and run again on push (#650).
+    // Merge groups run macos-build, macos-clippy, macos-authority, and the el1-native receipt gate:
+    // the macOS unit and integration suites ran on the PR and run again on push (#650, #1303).
     let mg_needs = full_needs
         .replace(
             r#""macos-authority": { "result": "skipped" }"#,
             r#""macos-authority": { "result": "success" }"#,
+        )
+        .replace(
+            r#""el1-native-tests": { "result": "skipped" }"#,
+            r#""el1-native-tests": { "result": "success" }"#,
+        )
+        .replace(
+            r#""el1-native-gate": { "result": "skipped" }"#,
+            r#""el1-native-gate": { "result": "success" }"#,
         )
         .replace(
             r#""macos-unit-a": { "result": "success" }"#,
@@ -855,7 +878,7 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
         );
     assert!(
         run_ci_results("merge_group", None, &mg_needs),
-        "merge_group with only the macOS skew check must pass ci-results"
+        "merge_group with macOS skew check and el1-native gate must pass ci-results"
     );
     for job in [
         "lint-clippy",
@@ -863,6 +886,8 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
         "xtask-tests-build",
         "loom",
         "macos-authority",
+        "el1-native-tests",
+        "el1-native-gate",
     ] {
         let mut missing: serde_json::Value = serde_json::from_str(&mg_needs).unwrap();
         missing.as_object_mut().unwrap().remove(job);
@@ -902,32 +927,16 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
         "merge_group without macos-build must fail ci-results"
     );
 
-    let skipped_heavy_mg_needs = full_needs.replace(
+    let skipped_heavy_mg_needs = mg_needs.replace(
         r#""portable": { "result": "success" }"#,
         r#""portable": { "result": "skipped" }"#,
     );
     assert!(
-        !run_ci_results(
-            "merge_group",
-            None,
-            &skipped_heavy_mg_needs
-                .replace(
-                    r#""macos-unit-a": { "result": "success" }"#,
-                    r#""macos-unit-a": { "result": "skipped" }"#
-                )
-                .replace(
-                    r#""macos-unit-b": { "result": "success" }"#,
-                    r#""macos-unit-b": { "result": "skipped" }"#
-                )
-                .replace(
-                    r#""macos-integration": { "result": "success" }"#,
-                    r#""macos-integration": { "result": "skipped" }"#
-                )
-        ),
+        !run_ci_results("merge_group", None, &skipped_heavy_mg_needs),
         "skipped heavy job on merge_group must fail ci-results"
     );
 
-    let docs_mg_needs = full_needs.replace(
+    let docs_mg_needs = mg_needs.replace(
         r#""heavy": "true", "macos": "true""#,
         r#""heavy": "false", "macos": "false""#,
     );
@@ -943,7 +952,7 @@ fn heavy_same_repo_pr_requires_the_full_macos_suite() {
       "xtask-build": { "result": "success" },
       "changes": {
         "result": "success",
-        "outputs": { "heavy": "true", "macos": "true", "workflows": "false", "hardware": "true", "lower_layer": "false" }
+        "outputs": { "heavy": "true", "macos": "true", "el1_native": "true", "workflows": "false", "hardware": "true", "lower_layer": "false" }
       },
       "actionlint": { "result": "skipped" },
       "linked-issue": { "result": "success" },
@@ -965,7 +974,9 @@ fn heavy_same_repo_pr_requires_the_full_macos_suite() {
       "cross-check-freebsd": { "result": "success" },
       "cross-check-netbsd": { "result": "success" },
       "cross-check-macos": { "result": "success" },
-      "kernel-linux-native": { "result": "success" }
+      "kernel-linux-native": { "result": "success" },
+      "el1-native-tests": { "result": "success" },
+      "el1-native-gate": { "result": "success" }
     }"#;
     assert!(
         run_ci_results("pull_request", Some("false"), pr_needs),
@@ -1201,3 +1212,199 @@ fn a_superseded_cancelled_run_passes_ci_ok_and_any_other_cancel_stays_red() {
     );
     assert!(!passed, "a cancelled, unsuperseded run's ci-ok fails");
 }
+
+#[test]
+fn el1_native_closure_gates_pr_surfaces_and_refuses_new_failures_before_landing() {
+    let root = workspace_root();
+    let refs = ReferencedDocs::discover(&root).expect("discover referenced docs");
+    let closure =
+        El1NativeClosure::discover(&root).expect("discover carrick-el1-linux workspace closure");
+
+    for in_closure in [
+        "carrick-el1-linux",
+        "carrick-el1",
+        "carrick-kernel",
+        "carrick-core",
+        "carrick-personality-linux",
+        "carrick-xtask",
+    ] {
+        assert!(
+            closure.closure_packages.contains(in_closure),
+            "expected `{in_closure}` in carrick-el1-linux closure"
+        );
+    }
+    for out_of_closure in [
+        "carrick-cli",
+        "carrick-vmm-bhyve",
+        "carrick-vmm-kvm",
+        "carrick-softcpu-x86",
+        "carrick-embed",
+        "carrick-x86-cpl0-host",
+    ] {
+        assert!(
+            !closure.closure_packages.contains(out_of_closure),
+            "`{out_of_closure}` is outside carrick-el1-linux's dependency closure"
+        );
+    }
+
+    for affecting_path in [
+        "crates/carrick-el1-linux/src/native_process_runtime.rs",
+        "crates/carrick-kernel/src/lib.rs",
+        "crates/carrick-xtask/src/ci_receipt.rs",
+        "justfile",
+        ".github/retired-tests.toml",
+        ".github/workflows/ci.yml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "docs/design/arm-ring-first-flip.md",
+    ] {
+        assert!(
+            path_affects_el1_native(affecting_path, &refs, Some(&closure)),
+            "`{affecting_path}` must trigger el1_native"
+        );
+        let pr_out = evaluate_changes_with_closure(
+            "pull_request",
+            false,
+            false,
+            Some(&[affecting_path.to_string()]),
+            &refs,
+            Some(&closure),
+        );
+        assert!(pr_out.heavy && pr_out.el1_native, "{affecting_path}");
+    }
+
+    for unrelated_heavy_path in [
+        "crates/carrick-cli/src/main.rs",
+        "crates/carrick-vmm-bhyve/src/lib.rs",
+        "crates/carrick-softcpu-x86/src/lib.rs",
+        "conformance-probes/src/main.rs",
+        "fuzz/Cargo.toml",
+    ] {
+        assert!(
+            !path_affects_el1_native(unrelated_heavy_path, &refs, Some(&closure)),
+            "`{unrelated_heavy_path}` is outside carrick-el1-linux closure"
+        );
+        let pr_out = evaluate_changes_with_closure(
+            "pull_request",
+            false,
+            false,
+            Some(&[unrelated_heavy_path.to_string()]),
+            &refs,
+            Some(&closure),
+        );
+        assert!(
+            pr_out.heavy && !pr_out.el1_native,
+            "PR touching only `{unrelated_heavy_path}` runs heavy jobs without el1-native"
+        );
+        let mg_out = evaluate_changes_with_closure(
+            "merge_group",
+            false,
+            false,
+            Some(&[unrelated_heavy_path.to_string()]),
+            &refs,
+            Some(&closure),
+        );
+        assert!(
+            mg_out.heavy && mg_out.el1_native,
+            "merge_group always runs el1-native regardless of path"
+        );
+    }
+
+    // PR with el1_native=false passes ci-ok when both el1-native jobs skip, and
+    // fails if only one skipped or if el1_native=true skipped them.
+    let non_el1_pr_needs = r#"{
+      "xtask-build": { "result": "success" },
+      "changes": {
+        "result": "success",
+        "outputs": { "heavy": "true", "macos": "true", "el1_native": "false", "workflows": "false", "hardware": "true", "lower_layer": "false" }
+      },
+      "actionlint": { "result": "skipped" },
+      "linked-issue": { "result": "success" },
+      "commit-trailers": { "result": "success" },
+      "lint-clippy": { "result": "success" },
+      "lint-gates": { "result": "success" },
+      "xtask-tests-build": { "result": "success" },
+      "lint-domains": { "result": "success" },
+      "portable": { "result": "success" },
+      "loom": { "result": "success" },
+      "linux-doc": { "result": "success" },
+      "macos-authority": { "result": "skipped" },
+      "macos-clippy": { "result": "success" },
+      "macos-build": { "result": "success" },
+      "macos-unit-a": { "result": "success" },
+      "macos-unit-b": { "result": "success" },
+      "macos-integration": { "result": "success" },
+      "cross-check-linux": { "result": "success" },
+      "cross-check-freebsd": { "result": "success" },
+      "cross-check-netbsd": { "result": "success" },
+      "cross-check-macos": { "result": "success" },
+      "kernel-linux-native": { "result": "success" },
+      "el1-native-tests": { "result": "skipped" },
+      "el1-native-gate": { "result": "skipped" }
+    }"#;
+    assert!(
+        run_ci_results("pull_request", Some("false"), non_el1_pr_needs),
+        "PR outside carrick-el1-linux closure with skipped el1-native jobs must pass ci-results"
+    );
+    let half_skipped = non_el1_pr_needs.replace(
+        r#""el1-native-tests": { "result": "skipped" }"#,
+        r#""el1-native-tests": { "result": "success" }"#,
+    );
+    assert!(
+        !run_ci_results("pull_request", Some("false"), &half_skipped),
+        "el1-native-tests without el1-native-gate must fail ci-results"
+    );
+    let el1_pr_skipped = non_el1_pr_needs.replace(
+        r#""el1_native": "false""#,
+        r#""el1_native": "true""#,
+    );
+    assert!(
+        !run_ci_results("pull_request", Some("false"), &el1_pr_skipped),
+        "PR with el1_native=true and skipped el1-native jobs must fail ci-results"
+    );
+
+    // Acceptance: a PR or merge_group entry whose el1-native-tests uploaded a
+    // receipt with a NEW native-process failure causes el1-native-gate to fail,
+    // and ci-ok refuses it in both PR checks and the merge queue.
+    let el1_pr_new_failure = non_el1_pr_needs
+        .replace(r#""el1_native": "false""#, r#""el1_native": "true""#)
+        .replace(
+            r#""el1-native-tests": { "result": "skipped" }"#,
+            r#""el1-native-tests": { "result": "success" }"#,
+        )
+        .replace(
+            r#""el1-native-gate": { "result": "skipped" }"#,
+            r#""el1-native-gate": { "result": "failure" }"#,
+        );
+    assert!(
+        !run_ci_results("pull_request", Some("false"), &el1_pr_new_failure),
+        "PR with NEW native-process failure (el1-native-gate=failure) must be refused by ci-ok"
+    );
+    let mg_new_failure = el1_pr_new_failure
+        .replace(r#""workflows": "false""#, r#""workflows": "true""#)
+        .replace(
+            r#""actionlint": { "result": "skipped" }"#,
+            r#""actionlint": { "result": "success" }"#,
+        )
+        .replace(
+            r#""macos-authority": { "result": "skipped" }"#,
+            r#""macos-authority": { "result": "success" }"#,
+        )
+        .replace(
+            r#""macos-unit-a": { "result": "success" }"#,
+            r#""macos-unit-a": { "result": "skipped" }"#,
+        )
+        .replace(
+            r#""macos-unit-b": { "result": "success" }"#,
+            r#""macos-unit-b": { "result": "skipped" }"#,
+        )
+        .replace(
+            r#""macos-integration": { "result": "success" }"#,
+            r#""macos-integration": { "result": "skipped" }"#,
+        );
+    assert!(
+        !run_ci_results("merge_group", None, &mg_new_failure),
+        "merge_group entry with NEW native-process failure (el1-native-gate=failure) must be refused by ci-ok"
+    );
+}
+

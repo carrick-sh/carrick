@@ -1,6 +1,6 @@
 use clap::Args;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ pub struct CiChangesArgs {
     #[arg(long, env = "GITHUB_STEP_SUMMARY")]
     pub step_summary: Option<PathBuf>,
 
-    /// Optional JSON file path to write the classification (`{heavy, macos, workflows, hardware}`)
+    /// Optional JSON file path to write the classification (`{heavy, macos, el1_native, workflows, hardware}`)
     /// so `kernel-runtime.yml` can upload `ci-class-<sha>.json` as positive fast-path evidence.
     #[arg(long, env = "CI_CLASS_JSON")]
     pub json_out: Option<PathBuf>,
@@ -53,6 +53,8 @@ pub struct CiChangesOutputs {
     pub heavy: bool,
     pub macos: bool,
     #[serde(default)]
+    pub el1_native: bool,
+    #[serde(default)]
     pub workflows: bool,
     pub hardware: bool,
     #[serde(default)]
@@ -62,8 +64,13 @@ pub struct CiChangesOutputs {
 impl CiChangesOutputs {
     pub fn format_github_output(&self) -> String {
         format!(
-            "heavy={}\nmacos={}\nworkflows={}\nhardware={}\nlower_layer={}\n",
-            self.heavy, self.macos, self.workflows, self.hardware, self.lower_layer
+            "heavy={}\nmacos={}\nel1_native={}\nworkflows={}\nhardware={}\nlower_layer={}\n",
+            self.heavy,
+            self.macos,
+            self.el1_native,
+            self.workflows,
+            self.hardware,
+            self.lower_layer
         )
     }
 }
@@ -579,6 +586,160 @@ pub fn classify_path(path: &str, referenced_docs: &ReferencedDocs) -> PathClass 
     PathClass::Full
 }
 
+pub const EL1_NATIVE_ROOT_PACKAGE: &str = "carrick-el1-linux";
+
+/// Workspace member directory map and transitive dependency closure of
+/// `carrick-el1-linux` (across normal, dev, and build dependencies).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct El1NativeClosure {
+    /// Repo-relative member directory (e.g. `"crates/carrick-cli"`) -> package name.
+    pub member_dirs: BTreeMap<String, String>,
+    /// Workspace packages reachable from `carrick-el1-linux`, plus `carrick-xtask`.
+    pub closure_packages: BTreeSet<String>,
+}
+
+impl El1NativeClosure {
+    /// Resolve `carrick-el1-linux`'s workspace dependency closure via offline
+    /// `cargo metadata`. Returns `None` if `Cargo.toml` is absent or metadata
+    /// fails, causing `path_affects_el1_native` to fail closed.
+    pub fn discover(repo_root: &Path) -> Option<Self> {
+        if !repo_root.join("Cargo.toml").is_file() {
+            return None;
+        }
+        let output = Command::new("cargo")
+            .current_dir(repo_root)
+            .args(["metadata", "--format-version", "1", "--no-deps", "--locked", "--offline"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        Self::from_cargo_metadata(repo_root, &metadata)
+    }
+
+    pub fn from_cargo_metadata(repo_root: &Path, metadata: &serde_json::Value) -> Option<Self> {
+        let canonical_root = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        let packages = metadata.get("packages")?.as_array()?;
+        let mut member_dirs = BTreeMap::new();
+        let mut pkg_names = BTreeSet::new();
+
+        for pkg in packages {
+            let name = pkg.get("name")?.as_str()?;
+            let manifest_path = Path::new(pkg.get("manifest_path")?.as_str()?);
+            let manifest_dir = manifest_path.parent()?;
+            let rel_dir = manifest_dir
+                .strip_prefix(&canonical_root)
+                .or_else(|_| manifest_dir.strip_prefix(repo_root))
+                .ok()?;
+            let rel_str = rel_dir
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => s.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            if rel_str.is_empty() {
+                return None;
+            }
+            member_dirs.insert(rel_str, name.to_owned());
+            pkg_names.insert(name.to_owned());
+        }
+
+        if !pkg_names.contains(EL1_NATIVE_ROOT_PACKAGE) {
+            return None;
+        }
+
+        let mut deps_by_pkg: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for pkg in packages {
+            let Some(name) = pkg.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let entry = deps_by_pkg.entry(name.to_owned()).or_default();
+            if let Some(deps) = pkg.get("dependencies").and_then(serde_json::Value::as_array) {
+                for dep in deps {
+                    if let Some(dep_name) = dep.get("name").and_then(serde_json::Value::as_str)
+                        && pkg_names.contains(dep_name)
+                    {
+                        entry.insert(dep_name.to_owned());
+                    }
+                }
+            }
+        }
+
+        let mut closure_packages = BTreeSet::new();
+        let mut stack = vec![EL1_NATIVE_ROOT_PACKAGE.to_owned()];
+        while let Some(pkg) = stack.pop() {
+            if !closure_packages.insert(pkg.clone()) {
+                continue;
+            }
+            if let Some(deps) = deps_by_pkg.get(&pkg) {
+                for dep in deps {
+                    if !closure_packages.contains(dep) {
+                        stack.push(dep.clone());
+                    }
+                }
+            }
+        }
+        // carrick-xtask drives `test-isolated`, `accept --profile el1-native`,
+        // `ci-changes`, and `ci-receipt`.
+        if pkg_names.contains("carrick-xtask") {
+            closure_packages.insert("carrick-xtask".to_owned());
+        }
+
+        Some(Self {
+            member_dirs,
+            closure_packages,
+        })
+    }
+}
+
+pub fn path_affects_el1_native(
+    path: &str,
+    referenced_docs: &ReferencedDocs,
+    closure: Option<&El1NativeClosure>,
+) -> bool {
+    if classify_path(path, referenced_docs) == PathClass::Prose {
+        return false;
+    }
+    let normalized = path.trim().trim_start_matches("./");
+    if normalized.is_empty() {
+        return true;
+    }
+    let Some(closure) = closure else {
+        return true;
+    };
+    // Standalone workspaces excluded from root `[workspace]` that are never
+    // compiled or executed by `carrick-el1-linux --lib`.
+    for excluded_ws in ["conformance-probes", "fuzz"] {
+        if normalized == excluded_ws
+            || normalized
+                .strip_prefix(excluded_ws)
+                .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return false;
+        }
+    }
+    if let Some((_, pkg_name)) = closure
+        .member_dirs
+        .iter()
+        .filter(|(dir, _)| {
+            normalized == dir.as_str()
+                || normalized
+                    .strip_prefix(dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|(dir, _)| dir.len())
+    {
+        return closure.closure_packages.contains(pkg_name);
+    }
+    // Root Cargo.{toml,lock}, rust-toolchain.toml, .cargo/**, justfile,
+    // scripts/**, .github/**, referenced docs, and unknown paths fail closed.
+    true
+}
+
 pub fn evaluate_changes(
     event_name: &str,
     pr_draft: bool,
@@ -586,12 +747,32 @@ pub fn evaluate_changes(
     changed_paths: Option<&[String]>,
     referenced_docs: &ReferencedDocs,
 ) -> CiChangesOutputs {
-    // Only pull_request events may use the docs-only fast path, draft skip, or lower-layer skip.
-    // Merge groups, schedule, workflow_dispatch, and push always run everything.
+    evaluate_changes_with_closure(
+        event_name,
+        pr_draft,
+        has_child_layer,
+        changed_paths,
+        referenced_docs,
+        None,
+    )
+}
+
+pub fn evaluate_changes_with_closure(
+    event_name: &str,
+    pr_draft: bool,
+    has_child_layer: bool,
+    changed_paths: Option<&[String]>,
+    referenced_docs: &ReferencedDocs,
+    el1_native_closure: Option<&El1NativeClosure>,
+) -> CiChangesOutputs {
+    // Only pull_request events may use the docs-only fast path, crate-closure
+    // skip, draft skip, or lower-layer skip. Merge groups, schedule,
+    // workflow_dispatch, and push always run everything.
     if event_name != "pull_request" {
         return CiChangesOutputs {
             heavy: true,
             macos: true,
+            el1_native: true,
             workflows: true,
             hardware: true,
             lower_layer: false,
@@ -602,6 +783,7 @@ pub fn evaluate_changes(
         return CiChangesOutputs {
             heavy: true,
             macos: true,
+            el1_native: true,
             workflows: true,
             hardware: true,
             lower_layer: false,
@@ -612,6 +794,7 @@ pub fn evaluate_changes(
         return CiChangesOutputs {
             heavy: true,
             macos: true,
+            el1_native: true,
             workflows: true,
             hardware: true,
             lower_layer: false,
@@ -619,6 +802,7 @@ pub fn evaluate_changes(
     }
 
     let mut heavy = false;
+    let mut el1_native = false;
     let mut workflows = false;
 
     for path in paths {
@@ -626,10 +810,14 @@ pub fn evaluate_changes(
             PathClass::Prose => {}
             PathClass::Workflow => {
                 heavy = true;
+                el1_native = true;
                 workflows = true;
             }
             PathClass::Full => {
                 heavy = true;
+                if path_affects_el1_native(path, referenced_docs, el1_native_closure) {
+                    el1_native = true;
+                }
             }
         }
     }
@@ -641,6 +829,7 @@ pub fn evaluate_changes(
     CiChangesOutputs {
         heavy,
         macos: heavy,
+        el1_native,
         workflows,
         hardware: heavy,
         lower_layer: has_child_layer,
@@ -811,6 +1000,11 @@ pub fn run<W: Write>(
         return Err(CiChangesError::Git("CI_EVENT must be set".into()));
     }
     let referenced_docs = ReferencedDocs::discover(repo_root)?;
+    let el1_native_closure = if event == "pull_request" {
+        El1NativeClosure::discover(repo_root)
+    } else {
+        None
+    };
     let pr_draft = args.draft.trim() == "true";
     let changed_paths =
         collect_changed_paths(repo_root, event, &args.base, &args.base_ref, &args.head)?;
@@ -835,17 +1029,19 @@ pub fn run<W: Write>(
         None
     };
     let has_child_layer = child_pr.is_some();
-    let mut outputs = evaluate_changes(
+    let mut outputs = evaluate_changes_with_closure(
         event,
         pr_draft,
         has_child_layer,
         changed_paths.as_deref(),
         &referenced_docs,
+        el1_native_closure.as_ref(),
     );
     if lookup_failed {
-        // Fail closed: a heavy PR also runs the macOS suite (#650).
+        // Fail closed: a heavy PR also runs the macOS and el1-native suites (#650, #1303).
         outputs.heavy = true;
         outputs.macos = true;
+        outputs.el1_native = true;
         outputs.hardware = true;
         outputs.lower_layer = false;
     }
@@ -907,8 +1103,13 @@ pub fn run<W: Write>(
     }
     writeln!(
         writer,
-        "Run hosted checks: heavy={} macos={} workflows={} hardware={} lower_layer={}",
-        outputs.heavy, outputs.macos, outputs.workflows, outputs.hardware, outputs.lower_layer
+        "Run hosted checks: heavy={} macos={} el1_native={} workflows={} hardware={} lower_layer={}",
+        outputs.heavy,
+        outputs.macos,
+        outputs.el1_native,
+        outputs.workflows,
+        outputs.hardware,
+        outputs.lower_layer
     )
     .map_err(|source| CiChangesError::Io {
         path: PathBuf::from("stdout"),
