@@ -19,7 +19,6 @@ const RFLAGS_IF: u64 = 1 << 9;
 const RFLAGS_NT: u64 = 1 << 14;
 const RFLAGS_RF: u64 = 1 << 16;
 const RFLAGS_VM: u64 = 1 << 17;
-const RFLAGS_AC: u64 = 1 << 18;
 
 /// Host-observable machine exit returned by [`SoftMachine::step`] and [`SoftMachine::run`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,7 +374,8 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     let entry_rip =
         u64::from(offset_low) | (u64::from(offset_mid) << 16) | (u64::from(offset_high) << 32);
     if !is_canonical_va(entry_rip) {
-        return Err(X86Exception::general_protection(fault_va, 0));
+        // SDM Vol. 2A `INT n`: a non-canonical gate RIP raises #GP(EXT).
+        return Err(X86Exception::general_protection(fault_va, ext));
     }
 
     if (target_cs_sel & 0xfffc) == 0 {
@@ -448,12 +448,17 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     cs_loaded.commit_accessed_write(ctx, mem, fault_va)?;
 
     ctx.cs = cs_loaded.seg;
-    if new_cpl < old_cpl || ist != 0 {
-        // SDM Vol. 3A §6.14.2: IA-32e stack switch (inter-privilege or IST != 0) loads NULL SS with RPL = new_cpl.
+    if new_cpl < old_cpl {
+        // SDM Vol. 3A §6.14.4 / Vol. 2A `INT n` INTER-PRIVILEGE-LEVEL-INTERRUPT: an IA-32e
+        // privilege change loads a NULL SS with RPL = new CPL. A same-CPL IST switch only
+        // replaces RSP; SS is left unchanged (INTRA-PRIVILEGE-LEVEL-INTERRUPT).
         ctx.ss = SoftSegment::null_stack(new_cpl);
     }
     ctx.gpr[reg::RSP] = new_rsp;
-    ctx.rflags &= !(RFLAGS_TF | RFLAGS_NT | RFLAGS_RF | RFLAGS_VM | RFLAGS_AC);
+    // SDM Vol. 3A §6.12.1.3 and Vol. 2A `INT n` Operation: gate delivery clears TF, NT, RF and
+    // VM (plus IF for an interrupt gate) after pushing RFLAGS. AC is cleared only by real-address
+    // mode delivery; a protected/IA-32e handler keeps the interrupted AC and must `CLAC` itself.
+    ctx.rflags &= !(RFLAGS_TF | RFLAGS_NT | RFLAGS_RF | RFLAGS_VM);
     if gate_type == 0x0e {
         ctx.rflags &= !RFLAGS_IF;
     }
