@@ -966,3 +966,25 @@ fn startup_agent_source_requires_both_rights() {
         ));
     }
 }
+
+#[test]
+fn agent_template_grants_kvm_only_to_the_worker_account() {
+    let source = include_str!("../../../../scripts/ci/build-template-debian.sh");
+    let agent = source
+        .split("if [[ $(cat profile) == agent ]]; then\n")
+        .nth(1)
+        .unwrap()
+        .split("\nfi")
+        .next()
+        .unwrap();
+    let grants: Vec<_> = source
+        .lines()
+        .filter(|line| line.contains("usermod -aG kvm"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(grants, ["/usr/sbin/usermod -aG kvm carrick-dispatch-agent"]);
+    assert!(agent.contains(grants[0]));
+    assert!(!agent.contains("usermod -aG runner carrick-dispatch-agent"));
+    assert!(!agent.contains("usermod -aG sudo carrick-dispatch-agent"));
+    assert!(!agent.contains("usermod -aG kvm carrick-dispatch-loop"));
+}

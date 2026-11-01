@@ -41,7 +41,7 @@ pub fn launch(
         .env_remove("CARRICK_HOST_LEASE_SOCKET")
         .env_remove("CARRICK_HOST_LEASE_FD")
         .env_remove("CARRICK_HOST_LEASE_MODE");
-    command.env_remove(crate::host_lease::SCOPE_FD);
+    command.env_remove("CARRICK_HOST_LEASE_SCOPE_FD");
     if check_load {
         command.arg("--check-load");
     }
@@ -72,19 +72,14 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
         return Err(HostLeaseError::ChildWait(io::Error::last_os_error()));
     }
     let (mut lifetime, writer) = scope_pipe().map_err(HostLeaseError::ChildWait)?;
-    let identity =
-        crate::host_lease::ScopeIdentity::writer(&writer).map_err(HostLeaseError::ChildWait)?;
-    let lease =
-        HostLease::acquire_supervised(args.mode, identity, |delay| events.wait_owner(delay))?;
+    let mut lease =
+        HostLease::acquire_supervised(args.mode, &writer, |delay| events.wait_owner(delay))?;
     if args.check_load {
         crate::host_load::check()?;
     }
     if events.owner_dead().map_err(HostLeaseError::ChildWait)? {
         return Ok(1);
     }
-
-    #[cfg(target_os = "macos")]
-    let mut lease = lease;
 
     // EOF grants release only after every inherited writer has closed. This
     // includes arbitrary Cargo/test forks and execs, without sharing flock.
@@ -103,7 +98,6 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
     command.env("CARRICK_LEASE_SUPERVISOR", std::process::id().to_string());
     #[cfg(target_os = "macos")]
     command.env("CARRICK_LEASE_GUARDIAN", guardian.child.id().to_string());
-    command.env(crate::host_lease::SCOPE_FD, writer.as_raw_fd().to_string());
     lease
         .configure_command(&mut command)
         .map_err(HostLeaseError::ChildWait)?;
@@ -137,6 +131,9 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
         cancelled: std::collections::BTreeMap::new(),
     };
     let supervision = supervise_worker(&mut events, workload.child.id() as libc::pid_t);
+    // No new scope may join cleanup, and the server's writer must not keep
+    // lifetime EOF open. Flock custody remains held until cleanup finishes.
+    lease.close_admission();
 
     // On owner death AND normal command exit, terminate remaining run-scoped
     // descendants. Retain exclusion across this whole operation and EOF.

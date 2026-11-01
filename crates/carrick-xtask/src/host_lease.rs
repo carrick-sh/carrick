@@ -9,8 +9,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -18,7 +18,6 @@ pub const DEFAULT_LOCK_PATH: &str = "/tmp/carrick-host-lease.lock";
 /// A contended machine may be running a full acceptance gate. Failure, never skip.
 pub const HOST_LEASE_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
 const INHERITED_SOCKET: &str = "CARRICK_HOST_LEASE_SOCKET";
-pub(crate) const SCOPE_FD: &str = "CARRICK_HOST_LEASE_SCOPE_FD";
 const VALIDATION_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +100,162 @@ pub(crate) struct ScopeIdentity {
     ino: u64,
 }
 
+// Send only a scope writer, never the flock description. The aligned control
+// storage holds one SCM_RIGHTS record; UnixStream supplies SIGPIPE protection.
+fn send_scope_reply(
+    mut stream: &UnixStream,
+    bytes: &[u8],
+    scope: Option<&OwnedFd>,
+) -> io::Result<()> {
+    let mut control = [0usize; 8];
+    let mut vector = libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
+    };
+    // SAFETY: all pointers below refer to live, aligned storage for this call.
+    let sent = unsafe {
+        let mut message: libc::msghdr = std::mem::zeroed();
+        message.msg_iov = &mut vector;
+        message.msg_iovlen = 1;
+        if let Some(scope) = scope {
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) as _;
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as _;
+            libc::CMSG_DATA(header)
+                .cast::<libc::c_int>()
+                .write_unaligned(scope.as_raw_fd());
+        }
+        loop {
+            let sent = libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL);
+            if sent >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break sent;
+            }
+        }
+    };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    stream.write_all(&bytes[sent as usize..])
+}
+
+fn receive_scope_reply(
+    stream: &UnixStream,
+    bytes: &mut [u8],
+    scopes: &mut Vec<OwnedFd>,
+) -> io::Result<usize> {
+    let mut control = [0usize; 8];
+    let mut vector = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    // SAFETY: the kernel writes bounded data and aligned ancillary records.
+    unsafe {
+        let mut message: libc::msghdr = std::mem::zeroed();
+        message.msg_iov = &mut vector;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = std::mem::size_of_val(&control) as _;
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = libc::MSG_DONTWAIT;
+        let count = libc::recvmsg(stream.as_raw_fd(), &mut message, flags);
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut header = libc::CMSG_FIRSTHDR(&message);
+        while !header.is_null() {
+            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                let length = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                for offset in 0..length / std::mem::size_of::<libc::c_int>() {
+                    let fd = libc::CMSG_DATA(header)
+                        .cast::<libc::c_int>()
+                        .add(offset)
+                        .read_unaligned();
+                    scopes.push(OwnedFd::from_raw_fd(fd));
+                }
+            }
+            header = libc::CMSG_NXTHDR(&message, header);
+        }
+        // Own every received fd before rejecting malformed/truncated input.
+        if message.msg_flags & libc::MSG_CTRUNC != 0 || scopes.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid lease scope descriptors",
+            ));
+        }
+        for scope in scopes.iter() {
+            if libc::fcntl(scope.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(count as usize)
+    }
+}
+
+fn lease_request(
+    socket: &Path,
+    delegate: Option<libc::uid_t>,
+) -> io::Result<(LeaseIdentity, Option<OwnedFd>)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut stream = UnixStream::connect(socket)?;
+    let metadata = std::fs::symlink_metadata(socket)?;
+    if !metadata.file_type().is_socket()
+        || carrick_portable::peer_credentials(stream.as_raw_fd())?.uid != metadata.uid()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lease server identity mismatch",
+        ));
+    }
+    let mut request = [0; 5];
+    if let Some(uid) = delegate {
+        request[0] = 1;
+        request[1..].copy_from_slice(&uid.to_le_bytes());
+    }
+    stream.write_all(&request)?;
+    read_validation_identity(stream)
+}
+
+fn serve_lease_request(
+    mut stream: &UnixStream,
+    owner: libc::uid_t,
+    allowed: &mut std::collections::BTreeSet<libc::uid_t>,
+    identity: &[u8],
+    scope: Option<&OwnedFd>,
+) -> io::Result<()> {
+    use std::io::Read;
+    let uid = carrick_portable::peer_credentials(stream.as_raw_fd())?.uid;
+    if uid != owner && !allowed.contains(&uid) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lease client uid not admitted",
+        ));
+    }
+    stream.set_read_timeout(Some(VALIDATION_LIMIT))?;
+    stream.set_write_timeout(Some(VALIDATION_LIMIT))?;
+    let mut request = [0; 5];
+    stream.read_exact(&mut request)?;
+    match request[0] {
+        0 if request[1..] == [0; 4] => {}
+        1 if uid == owner => {
+            allowed.insert(libc::uid_t::from_le_bytes(
+                request[1..].try_into().map_err(io::Error::other)?,
+            ));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "lease delegation requires its owner",
+            ));
+        }
+    }
+    send_scope_reply(stream, identity, scope)
+}
+
 impl ScopeIdentity {
     pub(crate) fn writer(fd: &OwnedFd) -> io::Result<Self> {
         // SAFETY: the caller owns this scope descriptor; verify its direction.
@@ -130,13 +285,25 @@ struct LeaseHolder {
     _custody: OwnedFileLock,
     directory: tempfile::TempDir,
     stopping: Arc<AtomicBool>,
+    active: Arc<Mutex<Option<UnixStream>>>,
     server: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for LeaseHolder {
-    fn drop(&mut self) {
+impl LeaseHolder {
+    fn close_admission(&mut self) {
+        if self.server.is_none() {
+            return;
+        }
         self.stopping.store(true, Ordering::Release);
-        // Wake blocking accept; no polling and no lifetime granted to clients.
+        if let Some(stream) = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        // Wake blocking accept; joining drops the server-owned scope writer.
         let _ = UnixStream::connect(self.directory.path().join("lease.sock"));
         if let Some(server) = self.server.take() {
             let _ = server.join();
@@ -147,19 +314,26 @@ impl Drop for LeaseHolder {
     }
 }
 
-fn read_validation_identity(stream: UnixStream) -> io::Result<LeaseIdentity> {
+impl Drop for LeaseHolder {
+    fn drop(&mut self) {
+        self.close_admission();
+    }
+}
+
+fn read_validation_identity(stream: UnixStream) -> io::Result<(LeaseIdentity, Option<OwnedFd>)> {
     read_validation_identity_until(&stream, Instant::now() + VALIDATION_LIMIT)
 }
 
 fn read_validation_identity_until(
     stream: &UnixStream,
     deadline: Instant,
-) -> io::Result<LeaseIdentity> {
+) -> io::Result<(LeaseIdentity, Option<OwnedFd>)> {
     // Darwin rejects setsockopt after the peer has closed, even with a complete
     // reply queued. Bound reads without changing socket options. One deadline
     // covers the entire reply, including EOF; partial progress cannot extend it.
     let mut bytes = [0; 4097];
     let mut length = 0;
+    let mut scopes = Vec::new();
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -198,28 +372,22 @@ fn read_validation_identity_until(
         // whether EOF completes the identity; never discard a queued reply.
         // SAFETY: the live socket and writable buffer tail are valid. Per-call
         // nonblocking I/O prevents a readiness race from blocking past deadline.
-        let count = unsafe {
-            libc::recv(
-                stream.as_raw_fd(),
-                bytes[length..].as_mut_ptr().cast(),
-                bytes.len() - length,
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            if matches!(
-                error.kind(),
-                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-            ) {
+        let count = match receive_scope_reply(stream, &mut bytes[length..], &mut scopes) {
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
                 continue;
             }
-            return Err(error);
-        }
+            Err(error) => return Err(error),
+        };
         if count == 0 {
-            return Ok(serde_json::from_slice(&bytes[..length])?);
+            return Ok((serde_json::from_slice(&bytes[..length])?, scopes.pop()));
         }
-        length += count as usize;
+        length += count;
         if length == bytes.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -290,20 +458,26 @@ impl HostLease {
 
     pub(crate) fn acquire_supervised(
         mode: HostLeaseMode,
-        scope: ScopeIdentity,
+        scope: &OwnedFd,
         wait: impl FnMut(Duration) -> io::Result<bool>,
     ) -> Result<Self, HostLeaseError> {
         let path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
-        Self::acquire_path_with_wait(&path, mode, HOST_LEASE_WAIT_LIMIT, Some(scope), wait)
+        Self::acquire_path_with_wait(
+            &path,
+            mode,
+            HOST_LEASE_WAIT_LIMIT,
+            Some(scope.try_clone().map_err(HostLeaseError::ChildWait)?),
+            wait,
+        )
     }
 
     fn acquire_path_with_wait(
         path: &Path,
         mode: HostLeaseMode,
         limit: Duration,
-        scope: Option<ScopeIdentity>,
+        scope: Option<OwnedFd>,
         wait: impl FnMut(Duration) -> io::Result<bool>,
     ) -> Result<Self, HostLeaseError> {
         let path_str = path.to_str().ok_or_else(|| HostLeaseError::Io {
@@ -346,7 +520,7 @@ impl HostLease {
         path: &Path,
         mode: HostLeaseMode,
         limit: Duration,
-        scope: Option<ScopeIdentity>,
+        scope: Option<OwnedFd>,
         mut wait: impl FnMut(Duration) -> io::Result<bool>,
         fd: OwnedFd,
     ) -> Result<Self, HostLeaseError> {
@@ -414,7 +588,7 @@ impl HostLease {
         path: &Path,
         mode: HostLeaseMode,
         fd: OwnedFileLock,
-        scope: Option<ScopeIdentity>,
+        scope: Option<OwnedFd>,
     ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         // Keep AF_UNIX names short even when the checkout/TMPDIR is long.
@@ -431,22 +605,47 @@ impl HostLease {
             dev,
             ino,
             mode,
-            scope,
+            scope: scope.as_ref().map(ScopeIdentity::writer).transpose()?,
         })?;
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
+        let active = Arc::new(Mutex::new(None::<UnixStream>));
+        let serving = Arc::clone(&active);
+        // SAFETY: geteuid has no preconditions; delegation is owner-only.
+        let owner = unsafe { libc::geteuid() };
         let server = std::thread::Builder::new()
             .name("host-lease-validation".into())
             .spawn(move || {
+                let mut allowed = std::collections::BTreeSet::new();
                 for connection in listener.incoming() {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
                     match connection {
-                        Ok(mut stream) => {
-                            if stream.set_write_timeout(Some(VALIDATION_LIMIT)).is_ok() {
-                                let _ = stream.write_all(&identity);
+                        Ok(stream) => {
+                            {
+                                let mut current = serving
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if stop.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                let Ok(handle) = stream.try_clone() else {
+                                    continue;
+                                };
+                                *current = Some(handle);
                             }
+                            let _ = serve_lease_request(
+                                &stream,
+                                owner,
+                                &mut allowed,
+                                &identity,
+                                scope.as_ref(),
+                            );
+                            serving
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take();
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -458,6 +657,7 @@ impl HostLease {
                 _custody: fd,
                 directory,
                 stopping,
+                active,
                 server: Some(server),
             }),
             _scope: None,
@@ -467,6 +667,13 @@ impl HostLease {
         })
     }
 
+    /// Stop admitting scope writers while retaining flock through cleanup.
+    pub(crate) fn close_admission(&mut self) {
+        if let Some(holder) = &mut self._holder {
+            holder.close_admission();
+        }
+    }
+
     /// Nested commands stay inside the supervisor's workload lifetime. The
     /// scope pipe (never a lock description) also covers fork without exec.
     pub fn configure_command(&self, command: &mut Command) -> io::Result<()> {
@@ -474,13 +681,11 @@ impl HostLease {
         command
             .env_remove("CARRICK_HOST_LEASE_FD")
             .env_remove("CARRICK_HOST_LEASE_MODE")
-            .env(INHERITED_SOCKET, &self.socket);
-        if self._holder.is_some() {
-            command.env("CARRICK_HOST_LEASE_PATH", &self.path);
-        }
+            .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
+            .env(INHERITED_SOCKET, &self.socket)
+            .env("CARRICK_HOST_LEASE_PATH", &self.path);
         if let Some(scope) = &self._scope {
             let scope = scope.try_clone()?;
-            command.env(SCOPE_FD, scope.as_raw_fd().to_string());
             // SAFETY: explicit scope-pipe handoff, only async-signal-safe fcntl.
             unsafe {
                 command.pre_exec(move || {
@@ -500,10 +705,8 @@ impl HostLease {
         socket: &Path,
     ) -> Result<Self, HostLeaseError> {
         use std::os::unix::fs::MetadataExt;
-        let validate = || -> io::Result<LeaseIdentity> {
-            read_validation_identity(UnixStream::connect(socket)?)
-        };
-        let identity = validate().map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
+        let (identity, scope) =
+            lease_request(socket, None).map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
         if identity.mode != requested && identity.mode != HostLeaseMode::Gate {
             return Err(HostLeaseError::Inherited(format!(
                 "cannot nest {requested} under {}; no lock upgrades",
@@ -517,32 +720,18 @@ impl HostLease {
                 "holder does not lease the configured lock file".into(),
             ));
         }
-        let scope = if let Some(expected_scope) = identity.scope {
-            let duplicate_scope = || -> io::Result<OwnedFd> {
-                let fd: libc::c_int = std::env::var(SCOPE_FD)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-                    .parse()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                // SAFETY: duplicate only an inherited descriptor; the owned
-                // duplicate pins the identity while authenticating its scope.
-                let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-                if duplicate < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: newly returned, uniquely owned duplicate scope writer.
-                let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
-                if ScopeIdentity::writer(&duplicate)? != expected_scope {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "descriptor is not this lease's scope",
-                    ));
-                }
-                Ok(duplicate)
-            };
-            Some(duplicate_scope().map_err(|e| HostLeaseError::Inherited(e.to_string()))?)
-        } else {
-            None
-        };
+        match (identity.scope, scope.as_ref()) {
+            (Some(expected), Some(writer))
+                if ScopeIdentity::writer(writer)
+                    .map_err(|e| HostLeaseError::Inherited(e.to_string()))?
+                    == expected => {}
+            (None, None) => {}
+            _ => {
+                return Err(HostLeaseError::Inherited(
+                    "holder returned the wrong scope writer".into(),
+                ));
+            }
+        }
         Ok(Self {
             _holder: None,
             _scope: scope,
@@ -562,10 +751,14 @@ impl HostLease {
     }
 
     /// Hand this lease to a command that runs as another account (sudo).
-    /// The account group may validate the lease and join its scope; it never
+    /// The admitted account uid may validate and join the scope; it never
     /// receives the locked description, so its death cannot release or change
     /// the holder's lock, and nested acquires still refuse upgrades.
-    pub(crate) fn account_handoff(&self, group: libc::gid_t) -> io::Result<AccountHandoff> {
+    pub(crate) fn account_handoff(
+        &self,
+        uid: libc::uid_t,
+        group: libc::gid_t,
+    ) -> io::Result<AccountHandoff> {
         use std::os::unix::fs::PermissionsExt;
         if !self.socket.is_absolute() || !self.path.is_absolute() {
             return Err(io::Error::new(
@@ -576,6 +769,9 @@ impl HostLease {
         let directory = self.socket.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "lease socket has no directory")
         })?;
+        // The socket owner alone can admit another uid. Peer credentials,
+        // not group membership or a caller-supplied uid, authorize requests.
+        lease_request(&self.socket, Some(uid))?;
         // Group traverse and connect only; the directory stays unlistable and
         // closed to every other account.
         for (path, mode) in [(directory, 0o710), (self.socket.as_path(), 0o660)] {
@@ -585,7 +781,6 @@ impl HostLease {
         Ok(AccountHandoff {
             socket: self.socket.clone(),
             path: self.path.clone(),
-            scope: self._scope.as_ref().map(OwnedFd::try_clone).transpose()?,
         })
     }
 
@@ -598,70 +793,35 @@ impl HostLease {
     }
 }
 
-/// Descriptor the scope writer occupies inside the other account. sudo
-/// closes every descriptor above stderr and the runner's sudoers grants no
-/// `closefrom_override`, so the writer crosses as stdin and the account-side
-/// shell moves it here, restoring stdin to /dev/null before exec.
-const ACCOUNT_SCOPE_FD: libc::c_int = 3;
-
-/// Exactly the lease variables and scope writer, nothing else from this env.
+/// Only the socket and lock path cross the cleared account environment.
+/// Scope custody is recovered from the authenticated socket after exec.
 pub(crate) struct AccountHandoff {
     socket: PathBuf,
     path: PathBuf,
-    scope: Option<OwnedFd>,
 }
 
 impl AccountHandoff {
-    /// Arguments between `sudo --` and the account's command.
-    pub(crate) fn launcher(&self) -> Vec<OsString> {
-        if self.scope.is_none() {
-            return Vec::new();
-        }
-        let script = format!("exec {ACCOUNT_SCOPE_FD}>&0 0</dev/null; exec \"$@\"");
-        ["/bin/sh", "-c", &script, "carrick-host-lease"]
-            .map(OsString::from)
-            .to_vec()
-    }
-
-    /// `KEY=VALUE` assignments for the account's `env -i`.
     pub(crate) fn assignments(&self) -> Vec<OsString> {
-        let mut values = vec![
-            (INHERITED_SOCKET, self.socket.clone().into_os_string()),
-            (
-                "CARRICK_HOST_LEASE_PATH",
-                self.path.clone().into_os_string(),
-            ),
-        ];
-        if self.scope.is_some() {
-            values.push((SCOPE_FD, ACCOUNT_SCOPE_FD.to_string().into()));
-        }
-        values
-            .into_iter()
-            .map(|(key, value)| {
-                let mut assignment = OsString::from(key);
-                assignment.push("=");
-                assignment.push(value);
-                assignment
-            })
-            .collect()
-    }
-
-    pub(crate) fn stdin(self) -> std::process::Stdio {
-        self.scope
-            .map_or_else(std::process::Stdio::null, std::process::Stdio::from)
+        [
+            (INHERITED_SOCKET, &self.socket),
+            ("CARRICK_HOST_LEASE_PATH", &self.path),
+        ]
+        .into_iter()
+        .map(|(key, path)| {
+            let mut assignment = OsString::from(key);
+            assignment.push("=");
+            assignment.push(path);
+            assignment
+        })
+        .collect()
     }
 
     #[cfg(test)]
-    pub(crate) fn fixture(scope: bool) -> io::Result<Self> {
-        Ok(Self {
+    pub(crate) fn fixture() -> Self {
+        Self {
             socket: "/tmp/carrick-lease-fixture/lease.sock".into(),
             path: DEFAULT_LOCK_PATH.into(),
-            scope: if scope {
-                Some(std::io::pipe()?.1.into())
-            } else {
-                None
-            },
-        })
+        }
     }
 }
 
@@ -786,7 +946,8 @@ mod tests {
             Some(libc::EINVAL),
             "Darwin closed-peer failure must be active before testing validation",
         );
-        let identity = read_validation_identity(client).unwrap();
+        let (identity, scope) = read_validation_identity(client).unwrap();
+        assert!(scope.is_none());
         assert_eq!(identity.dev, reply.dev);
         assert_eq!(identity.ino, reply.ino);
         assert_eq!(identity.mode, HostLeaseMode::Gate);
@@ -950,17 +1111,22 @@ mod tests {
 
     #[test]
     fn account_handoff_lets_a_stripped_process_reuse_the_holders_lease() {
+        for mode in [HostLeaseMode::Carrick, HostLeaseMode::Gate] {
+            account_handoff_reuses_mode(mode);
+        }
+    }
+
+    fn account_handoff_reuses_mode(mode: HostLeaseMode) {
         // The dispatch loop inherits a supervised lease; its agent runs as
         // another account through sudo, which resets env and closes fds >= 3.
         let lock = NamedTempFile::new().unwrap();
         let (_lifetime, writer) = std::io::pipe().unwrap();
         let writer: OwnedFd = writer.into();
-        let identity = ScopeIdentity::writer(&writer).unwrap();
         let holder = HostLease::acquire_path_with_wait(
             lock.path(),
-            HostLeaseMode::Carrick,
+            mode,
             Duration::ZERO,
-            Some(identity),
+            Some(writer.try_clone().unwrap()),
             |_| Ok(false),
         )
         .unwrap();
@@ -969,11 +1135,11 @@ mod tests {
             _scope: Some(writer),
             socket: holder.socket.clone(),
             path: lock.path().to_path_buf(),
-            mode: HostLeaseMode::Carrick,
+            mode,
         };
         // SAFETY: getgid has no preconditions.
         let handoff = inherited
-            .account_handoff(unsafe { libc::getgid() })
+            .account_handoff(unsafe { libc::geteuid() }, unsafe { libc::getgid() })
             .unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
@@ -981,14 +1147,12 @@ mod tests {
             assert_eq!(mode(holder.socket.parent().unwrap()), 0o710);
             assert_eq!(mode(&holder.socket), 0o660);
         }
-        let launcher = handoff.launcher();
         let elsewhere = tempfile::tempdir().unwrap();
-        let mut account = Command::new(&launcher[0]);
+        let mut account = Command::new("/usr/bin/env");
         account
-            .args(&launcher[1..])
-            .arg("/usr/bin/env")
             .arg("-i")
             .args(handoff.assignments())
+            .arg(format!("EXPECTED_HANDOFF_MODE={mode}"))
             .arg(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -998,7 +1162,7 @@ mod tests {
             ])
             .env_clear()
             .current_dir(elsewhere.path())
-            .stdin(handoff.stdin());
+            .stdin(std::process::Stdio::null());
         // SAFETY: async-signal-safe close only; models sudo's closefrom(3).
         unsafe {
             account.pre_exec(|| {
@@ -1020,6 +1184,16 @@ mod tests {
             HostLease::acquire_path_with_limit(lock.path(), HostLeaseMode::Gate, Duration::ZERO),
             Err(HostLeaseError::Timeout { .. })
         ));
+        if mode == HostLeaseMode::Gate {
+            assert!(matches!(
+                HostLease::acquire_path_with_limit(
+                    lock.path(),
+                    HostLeaseMode::Carrick,
+                    Duration::ZERO
+                ),
+                Err(HostLeaseError::Timeout { .. })
+            ));
+        }
         drop(inherited);
         drop(holder);
     }
@@ -1031,19 +1205,87 @@ mod tests {
             std::env::var_os(INHERITED_SOCKET).is_some(),
             "no lease handoff reached the account"
         );
+        // Model tool runners close inherited descriptors before spawning a tool.
+        unsafe {
+            libc::close(3);
+        }
         let lease = HostLease::acquire(HostLeaseMode::Carrick).unwrap();
         assert!(lease._holder.is_none(), "took a lock instead of inheriting");
         assert!(lease._scope.is_some(), "scope writer did not cross");
-        assert_eq!(lease.mode(), HostLeaseMode::Carrick);
-        assert!(
-            HostLease::inherit(lease.path(), HostLeaseMode::Gate, &lease.socket).is_err(),
-            "nested acquire must not upgrade"
-        );
+        let expected = std::env::var("EXPECTED_HANDOFF_MODE").unwrap();
+        assert_eq!(lease.mode().to_string(), expected);
+        if expected == "gate" {
+            let nested = HostLease::acquire(HostLeaseMode::Gate).unwrap();
+            assert_eq!(nested.mode(), HostLeaseMode::Gate);
+            assert_eq!(nested.path(), lease.path());
+            assert!(nested._holder.is_none(), "nested gate reacquired the lock");
+            assert!(nested._scope.is_some());
+        } else {
+            assert!(
+                HostLease::acquire(HostLeaseMode::Gate).is_err(),
+                "nested acquire must not upgrade"
+            );
+        }
         // stdin is back to /dev/null, not the scope pipe.
         // SAFETY: fstat on stdin into owned storage.
         let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
         assert_eq!(unsafe { libc::fstat(0, &mut stat) }, 0);
         assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFCHR);
+    }
+
+    #[test]
+    fn socket_refuses_unadmitted_uid_and_forged_delegation() {
+        // Real peer credentials come from the connected socket, never the
+        // request's uid. Exercise the exact production request handler.
+        let uid = unsafe { libc::geteuid() };
+        let owner = uid.checked_add(1).unwrap();
+        for admitted in [false, true] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let mut request = [1; 5];
+            request[1..].copy_from_slice(&owner.to_le_bytes());
+            client.write_all(&request).unwrap();
+            let mut allowed = std::collections::BTreeSet::new();
+            if admitted {
+                allowed.insert(uid);
+            }
+            let error = serve_lease_request(&server, owner, &mut allowed, b"{}", None).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!allowed.contains(&owner));
+        }
+    }
+
+    #[test]
+    fn closing_socket_admission_releases_server_scope_but_keeps_flock() {
+        use std::io::Read;
+        let lock = NamedTempFile::new().unwrap();
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let mut holder = HostLease::acquire_path_with_wait(
+            lock.path(),
+            HostLeaseMode::Gate,
+            Duration::ZERO,
+            Some(writer.into()),
+            |_| Ok(false),
+        )
+        .unwrap();
+        // An idle authenticated connection cannot delay cancellation.
+        let _idle = UnixStream::connect(&holder.socket).unwrap();
+        holder.close_admission();
+        let mut event = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut event, 1, 1000) }, 1);
+        assert_eq!(
+            reader.read(&mut [0]).unwrap(),
+            0,
+            "server kept a scope writer"
+        );
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(lock.path(), HostLeaseMode::Carrick, Duration::ZERO),
+            Err(HostLeaseError::Timeout { .. })
+        ));
+        assert!(HostLease::inherit(lock.path(), HostLeaseMode::Carrick, &holder.socket).is_err());
     }
 
     #[test]

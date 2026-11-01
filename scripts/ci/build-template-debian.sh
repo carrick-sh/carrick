@@ -132,6 +132,7 @@ set -euo pipefail
 cd /mnt/carrick-seed
 if [[ $(cat profile) == agent ]]; then
   /usr/sbin/useradd --system --user-group --no-create-home --shell /usr/sbin/nologin carrick-dispatch-agent
+  /usr/sbin/usermod -aG kvm carrick-dispatch-agent
   /usr/sbin/usermod -aG carrick-dispatch-agent runner
   printf '%s\n' 'runner ALL=(carrick-dispatch-agent) NOPASSWD: ALL' > /etc/sudoers.d/carrick-dispatch-agent
   chmod 0440 /etc/sudoers.d/carrick-dispatch-agent

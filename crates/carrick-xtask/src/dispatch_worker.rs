@@ -897,7 +897,7 @@ fn foreground_command(state: &Path, root: &Path, launch: Foreground<'_>) -> Comm
     command
 }
 /// Enter an account only after clearing both the wrapper and model environments.
-/// A host-lease handoff adds only its own variables and scope writer.
+/// A host-lease handoff adds only its socket and lock path.
 fn account_command(
     command: &Command,
     user: &str,
@@ -907,9 +907,6 @@ fn account_command(
     let mut isolated = Command::new("/usr/bin/sudo");
     private_environment(&mut isolated);
     isolated.args(["-n", "-u", user, "--"]);
-    if let Some(lease) = &lease {
-        isolated.args(lease.launcher());
-    }
     isolated.args(["/usr/bin/env", "-i", "-C"]).arg(root);
     for (key, value) in command.get_envs() {
         if let Some(value) = value {
@@ -926,12 +923,12 @@ fn account_command(
         .arg(command.get_program())
         .args(command.get_args())
         .current_dir("/")
-        .stdin(lease.map_or_else(Stdio::null, crate::host_lease::AccountHandoff::stdin));
+        .stdin(Stdio::null());
     isolated
 }
 
-/// The loop's inherited lease, shared with the agent account's group. Nested
-/// `just lease carrick` in the agent then reuses this lease on the one lock path.
+/// Hand the job's gate custody to the agent account's group. Both nested
+/// builds and KVM tests reuse the same lease; a shared job cannot upgrade.
 fn agent_lease() -> Result<
     Option<(
         crate::host_lease::HostLease,
@@ -940,7 +937,7 @@ fn agent_lease() -> Result<
     ScalerError,
 > {
     let Some(lease) =
-        crate::host_lease::HostLease::inherited(crate::host_lease::HostLeaseMode::Carrick)
+        crate::host_lease::HostLease::inherited(crate::host_lease::HostLeaseMode::Gate)
             .map_err(std::io::Error::other)?
     else {
         return Ok(None);
@@ -950,7 +947,12 @@ fn agent_lease() -> Result<
         .trim()
         .parse::<libc::gid_t>()
         .map_err(|_| ScalerError::Guard("invalid pre-created agent gid"))?;
-    let handoff = lease.account_handoff(group)?;
+    let uid = output(Command::new("/usr/bin/id").args(["-u", AGENT_USER]))?;
+    let uid = String::from_utf8_lossy(&uid)
+        .trim()
+        .parse::<libc::uid_t>()
+        .map_err(|_| ScalerError::Guard("invalid pre-created agent uid"))?;
+    let handoff = lease.account_handoff(uid, group)?;
     Ok(Some((lease, handoff)))
 }
 
@@ -996,7 +998,7 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         Implement and verify this brief. Commit your work with a Why/What/Verified body and\n\
         Co-Authored-By: {}\nDo not push, open a PR, or post comments; the workflow publishes those.\n\
         Never use --no-verify, git stash or git add -A. Keep conformance-probes/target out of commits.\n\
-        This is an ephemeral runner. Use local shared carrick leases for builds.\n\
+        This is an ephemeral runner. Reuse the job's VM-local gate lease for builds and KVM tests.\n\
         Contabo leases are per VM under owner decision #639; never acquire a hypervisor lease.\n\
         Run only gates supported by this host; report unavailable Docker, KVM or HVF honestly.\n\
         Prove your slice as AGENTS.md \"Workers prove their slice\" says: focused suites of the\n\
@@ -6116,37 +6118,26 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let plain = args(None);
-        let handed = args(Some(
-            crate::host_lease::AccountHandoff::fixture(true).unwrap(),
-        ));
-        let at = plain.iter().position(|a| a == "--").unwrap() + 1;
+        let handed = args(Some(crate::host_lease::AccountHandoff::fixture()));
         let program = plain.iter().position(|a| a == "python3").unwrap();
-        let launcher = &handed[at..at + 4];
-        assert_eq!(launcher[0], "/bin/sh");
-        assert_eq!(launcher[2], "exec 3>&0 0</dev/null; exec \"$@\"");
-        let lease = &handed[program + 4..program + 7];
         assert_eq!(
-            lease,
+            &handed[program..program + 2],
             [
                 "CARRICK_HOST_LEASE_SOCKET=/tmp/carrick-lease-fixture/lease.sock",
                 "CARRICK_HOST_LEASE_PATH=/tmp/carrick-host-lease.lock",
-                "CARRICK_HOST_LEASE_SCOPE_FD=3",
             ]
         );
-        // Removing exactly the launcher and lease assignments gives the
-        // unchanged credential-free command; nothing else was added.
         let mut stripped = handed.clone();
-        stripped.drain(program + 4..program + 7);
-        stripped.drain(at..at + 4);
+        stripped.drain(program..program + 2);
         assert_eq!(stripped, plain);
         assert!(!plain.iter().any(|a| a.starts_with("CARRICK_HOST_LEASE")));
-        // An unscoped holder needs no descriptor and therefore no shell.
-        let unscoped = args(Some(
-            crate::host_lease::AccountHandoff::fixture(false).unwrap(),
-        ));
-        assert_eq!(unscoped.len(), plain.len() + 2);
-        assert_eq!(unscoped[at], "/usr/bin/env");
+        assert!(
+            !handed
+                .iter()
+                .any(|a| a.starts_with("CARRICK_HOST_LEASE_SCOPE_FD"))
+        );
     }
+
     #[test]
     fn proposed_body_is_bounded_and_cannot_add_linkage_or_provenance() {
         let body = proposed_pr_body(
@@ -8751,6 +8742,24 @@ fi
             "agent modification"
         );
     }
+    #[test]
+    fn worker_takes_gate_before_starting_the_dispatch_loop() {
+        let documents = yaml_rust2::YamlLoader::load_from_str(include_str!(
+            "../../../.github/workflows/dispatch-worker.yml"
+        ))
+        .unwrap();
+        let steps = documents[0]["jobs"]["worker"]["steps"].as_vec().unwrap();
+        let run = steps
+            .iter()
+            .find(|step| step["id"].as_str() == Some("loop"))
+            .unwrap()["run"]
+            .as_str()
+            .unwrap();
+        assert!(run.contains("host-lease --mode gate --check-load --"));
+        assert!(run.contains("dispatch-worker loop --event"));
+        assert!(!run.contains("host-lease --mode carrick"));
+    }
+
     #[test]
     fn worker_disables_compiler_servers_for_every_runner_step() {
         let documents = yaml_rust2::YamlLoader::load_from_str(include_str!(

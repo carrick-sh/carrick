@@ -860,6 +860,33 @@ Workers have no compiler-cache service or inherited endpoint environment.
 Existing H1 executable witnesses exercise marker-writing wrappers and real
 Cargo against dependency-free fixtures.
 
+## Worker KVM access and lease custody (#1351)
+
+Agent-profile template 9000 gives `carrick-dispatch-agent` membership in
+`kvm`; `carrick-dispatch-loop` has no KVM access. Neither model account
+joins the runner or sudo groups. The worker environment stays cleared.
+
+The dispatch job takes its VM-local host lease in exclusive `gate` mode
+before starting the loop and hands that same custody to the worker account.
+Nested `just lease carrick` builds and `just test-kvm` reuse the held lease;
+they do not upgrade, downgrade or reacquire the lock. There is no physical
+hypervisor lease. The merge queue's `kvm-gate` remains the landing authority.
+
+The account handoff carries only the socket and lock paths. The holder
+admits the worker uid using authenticated Unix-socket peer credentials;
+only the holder's uid may delegate access. A nested command receives a
+scope pipe writer through that socket, so closing fd 3 or clearing all
+inherited descriptors does not break lease reuse. The flock descriptor
+never crosses into the worker. Before cleanup, the supervisor closes
+socket admission and drops the server's scope writer while retaining flock
+until workload retirement and lifetime EOF finish.
+
+Deploying this change requires rebuilding template 9000 from the updated
+script, with the controller change announced before and after on #231.
+An existing clone retains its original account groups and lease mode.
+Validate a fresh dispatch round by opening `/dev/kvm` as the worker and
+running a KVM-lane test, recording that the test actually ran.
+
 ## Agent template pool and ACLs (#762)
 
 Template 9000 is a clone source **outside** the `carrick-ci` pool. Template
