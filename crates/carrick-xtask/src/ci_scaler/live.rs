@@ -791,9 +791,30 @@ fn provision(
             .as_deref()
             .ok_or(ScalerError::Guard("clone task missing"))?,
     )?;
-    boot_and_register(pve, gh, ledger, row, dir, path, approval)
+    boot_and_register(pve, gh, ledger, row, dir, path, approval, PreBoot::Defer)
 }
 
+/// What a refused pre-boot admission does. A provisioning worker owns its
+/// row and may wait for other clones to run; the lifecycle loop (resuming a
+/// clone in reconcile) must not, since it also reaps the clones whose exit
+/// would free the host (#1251 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreBoot {
+    /// Wait up to ten minutes for other clones, then fail.
+    Defer,
+    /// Fail at once; reconciliation retries on a later pass.
+    FailFast,
+}
+impl PreBoot {
+    fn deadline(self) -> Instant {
+        match self {
+            Self::Defer => Instant::now() + Duration::from_secs(600),
+            Self::FailFast => Instant::now(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn boot_and_register(
     pve: &Pve,
     gh: &Github,
@@ -802,6 +823,7 @@ fn boot_and_register(
     dir: &Path,
     path: &Path,
     approval: (u64, &Admission),
+    pre_boot: PreBoot,
 ) -> Result<(), ScalerError> {
     let (group, admission) = approval;
     let (key, hosts) = key_paths(dir, row);
@@ -830,9 +852,9 @@ fn boot_and_register(
         &format!("{}/config", pve.base(row.vm)),
     )?;
     // Other clones still booting are charged at nominal size although they
-    // may already use part of it, so a refusal here means "not now": wait
-    // for them to run (or retire), and fail only after ten minutes.
-    let admit_by = Instant::now() + Duration::from_secs(600);
+    // may already use part of it, so a refusal here means "not now". A
+    // worker waits for them to run (or retire); the loop fails fast.
+    let admit_by = pre_boot.deadline();
     loop {
         ledger.refresh()?;
         if resource_admission(pve, ledger.pending(&row.name, nominal(pve)))? {
@@ -1316,9 +1338,16 @@ fn reconcile_one(
                     "vm={} resuming completed clone in place; error history retained",
                     row.vm.get()
                 );
-                if let Err(error) =
-                    boot_and_register(pve, gh, ledger, &mut row, dir, path, approval)
-                {
+                if let Err(error) = boot_and_register(
+                    pve,
+                    gh,
+                    ledger,
+                    &mut row,
+                    dir,
+                    path,
+                    approval,
+                    PreBoot::FailFast,
+                ) {
                     row.failure = Some(match &row.failure {
                         Some(previous) => format!("{previous}; resume: {error}"),
                         None => error.to_string(),
@@ -2419,6 +2448,15 @@ mod tests {
         ledger.rows[1].state = State::Reaping;
         assert_eq!(ledger.pending(&candidate, nominal), Pending::default());
         assert!(admits(ledger.pending(&candidate, nominal)));
+    }
+    /// #1251 review: only a provisioning worker waits at the pre-boot
+    /// re-check; reconciliation resuming a clone fails at once, so it keeps
+    /// reaping the clones whose exit would free the host.
+    #[test]
+    fn only_a_provisioning_worker_defers_at_pre_boot() {
+        let start = Instant::now();
+        assert!(PreBoot::FailFast.deadline() <= Instant::now());
+        assert!(PreBoot::Defer.deadline() >= start + Duration::from_secs(600));
     }
     /// #1251 review P1: a reconcile pass lists its rows when it starts. A
     /// worker that takes its row to Running and releases it mid-pass must
