@@ -2128,7 +2128,6 @@ fn build_gateway() -> Result<GatewayTrampolines, JitStage> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::JitCodeBuffer;
 
     fn test_extents() -> ExtentTable {
         ExtentTable::new().expect("fresh invalidation domain")
@@ -2242,6 +2241,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn published_blocks_and_gateways_are_rx_and_never_writable() {
+        use crate::JitCodeBuffer;
         fn permissions(addr: u64) -> String {
             std::fs::read_to_string("/proc/self/maps")
                 .unwrap()
