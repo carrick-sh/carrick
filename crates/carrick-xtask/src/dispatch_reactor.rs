@@ -26,7 +26,7 @@ pub(crate) const UNATTENDED_ROUNDS: u32 = 3;
 const RUN_LOOKBACK_SECS: u64 = 3 * 3600;
 /// Warn when an interaction limit expires within this long.
 const LIMIT_WARN_SECS: u64 = 30 * 86400;
-const GLOBAL_CAP: usize = 4;
+const GLOBAL_CAP: usize = 6;
 const QUIET_SECS: u64 = 15 * 60;
 const SEEN_LIMIT: usize = 200;
 const BODY_LIMIT: usize = 1500;
@@ -1231,7 +1231,7 @@ mod tests {
             "in flight for this PR",
         );
         busy(
-            (0..4)
+            (0..GLOBAL_CAP)
                 .map(|i| json!({"status":"queued","displayTitle":format!("other {i}"),"headBranch":"main"}))
                 .collect(),
             "global dispatch cap",
