@@ -60,7 +60,7 @@ pub const fn is_canonical_va(va: u64) -> bool {
 #[inline]
 #[must_use]
 pub const fn cpu_access_mode(cpl: u8, ac: bool) -> CpuAccessMode {
-    if cpl == 0 {
+    if cpl < 3 {
         CpuAccessMode::ring0(ac)
     } else {
         CpuAccessMode::ring3_with_ac(ac)
@@ -285,6 +285,31 @@ pub(crate) fn check_system_write<M: SoftMmuMemory>(
 ) -> Result<(), SoftPageFault> {
     let mode = ctx.system_access_mode();
     walk_span_mode(ctx, mem, va, len, SoftAccessKind::Write, mode, |_, _, _| {})
+}
+
+/// Write an IA-32e IDT exception/interrupt stack frame at `va` using `target_cpl`'s paging rights
+/// (SDM Vol. 3A §4.6.1 / §6.14.2: supervisor implicit stack access for `target_cpl < 3`,
+/// user-mode stack access for `target_cpl == 3`).
+pub(crate) fn write_idt_stack_frame<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    va: u64,
+    target_cpl: u8,
+    src: &[u8],
+) -> Result<(), SoftPageFault> {
+    let mode = ctx.stack_push_access_mode(target_cpl);
+    walk_span_mode(
+        ctx,
+        mem,
+        va,
+        src.len(),
+        SoftAccessKind::Write,
+        mode,
+        |off, ptr, chunk| {
+            // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
+            unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+        },
+    )
 }
 
 /// Validate then copy a span. One admission covers both passes and every

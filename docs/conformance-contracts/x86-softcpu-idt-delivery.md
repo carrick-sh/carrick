@@ -1,18 +1,19 @@
-# Software vCPU 64-bit IDT exception and interrupt delivery (`x86.softcpu.idt-delivery`, #669)
+# Software vCPU 64-bit IDT exception delivery (`x86.softcpu.idt-delivery`, #669 slice 1)
 
 Surface: `carrick-softcpu-x86` (`SoftMachine`, `SoftCpu`, `SoftCpuContext`,
-`privileged`, `mmu`, and `build.rs` CPL0 image build). Authority: Intel SDM
-Vol. 3A Ch. 4/6/11/18, Vol. 2A/2B (`INT n`, `IRETQ`, `STI`, `POPFQ`, `HLT`),
-and `carrick-x86` / `carrick-x86-cpl0` (`write_fault_tables_with`,
-`FaultDoorbellRecord`, `IRQ_HEADER_GPA`, `carrick_x86_page_fault_fixup`,
-`carrick_x86_user_page_fault`).
+`block`, `privileged`, and `mmu`). Authority: Intel SDM Vol. 3A Ch. 4/6/17/18,
+Vol. 2A/2B (`INT n`, `IRETQ`, `POPFQ`, `CLTS`), and Vol. 3C §27.3.1.2 (VMX
+guest segment-state checks).
 
-`SoftMachine` delivers `#DE` (0), `#DB` (1), `#UD` (6), `#DF` (8), `#GP` (13),
-`#PF` (14), `#AC` (17), and external interrupts (`32..=255`) through the guest's
-64-bit `IDT` with SDM gate types (`0x0e` interrupt vs `0x0f` trap), 16-byte
-stack alignment, `TSS` `RSP0` and `IST1..7` stack switching, VMX-valid NULL `SS`
-loads, target-`CPL` stack push permissions, `CR2` and error-code bits, `RFLAGS.AC`
-clearing on gate entry, `DR0..DR3`/`DR6`/`DR7`/`RF` debug semantics, `CR8`/`IF`
-and one-instruction `STI` shadow masking, `HLT` wakeup, Table 6-5 `#DF`/triple-fault
-escalation, and identical fault/IRQ execution on the compiled CPL0 fixture image
-in `crates/carrick-softcpu-x86/tests/softcpu_idt_delivery.rs`.
+`SoftMachine` delivers `#DE` (0), `#DB` (1), `#BP` (3), `#OF` (4), `#UD` (6),
+`#NM` (7), `#DF` (8), `#TS` (10), `#NP` (11), `#SS` (12), `#GP` (13), `#PF` (14),
+and `#AC` (17) through the guest's 64-bit `IDT` with SDM gate types (`0x0e`
+interrupt vs `0x0f` trap), descriptor type/present/`DPL` checks (`INT n`/`INT3`
+vs `ICEBP` and hardware exceptions), 16-byte stack alignment, unconditional
+`SS:RSP` frame pushes, `TSS` `RSP0..RSP2` and `IST1..IST7` stack switching,
+VMX-valid NULL `SS` loads, target-`CPL` stack push permissions, architectural
+error-code presence, `#PF` `CR2` and `P`/`W/R`/`U/S`/`RSVD`/`I/D` bits,
+`RFLAGS.AC` clearing on gate entry, `DR0..DR3`/`DR6`/`DR7`/`RF` debug state,
+`CR0.EM`/`CR0.TS` `#UD`/`#NM` + `CLTS` recovery, and Table 6-5 `#PF`-then-`#PF`
+`#DF` / triple-fault escalation in `crates/carrick-softcpu-x86/tests/softcpu_idt_delivery.rs`.
+External interrupt delivery and recorded CPL0 fixture parity follow in slice 2 of #669.

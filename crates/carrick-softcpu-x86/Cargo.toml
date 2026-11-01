@@ -16,26 +16,12 @@ carrick-softmmu = { path = "../carrick-softmmu", features = ["std"] }
 iced-x86 = { workspace = true }
 libc = { workspace = true }
 
-[build-dependencies]
-# build.rs derives the CPL0 image inputs directly from local manifests on Linux x86_64.
-toml.workspace = true
-
 [dev-dependencies]
 carrick-hal = { path = "../carrick-hal" }
 carrick-x86 = { path = "../carrick-x86" }
 goblin = { workspace = true }
 
-[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
-carrick-core = { path = "../carrick-core" }
-carrick-core-abi = { path = "../carrick-core-abi" }
-carrick-el1 = { path = "../carrick-el1" }
-carrick-el1-abi = { path = "../carrick-el1-abi" }
-carrick-guest-arch = { path = "../carrick-guest-arch" }
-carrick-mem = { path = "../carrick-mem" }
-carrick-mmu-core = { path = "../carrick-mmu-core" }
-carrick-sched-core = { path = "../carrick-sched-core" }
-
 [package.metadata.carrick.test-lanes]
 softcpu_level0 = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs in the VM-free host lane on x86_64" }
 softcpu_cpl0 = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs VM-free CPL0 privileged instruction and SoftMachine boot tests on x86_64" }
-softcpu_idt_delivery = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs VM-free per-vector IDT/IRQ delivery and CPL0 fixture fault-handling tests on x86_64" }
+softcpu_idt_delivery = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs VM-free per-vector 64-bit IDT exception delivery tests on x86_64" }

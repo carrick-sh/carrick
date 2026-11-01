@@ -11,7 +11,7 @@ use crate::cpu::{SoftCpu, SoftCpuExit, SoftCpuNewError};
 use crate::cpuid::GuestCpuidView;
 use crate::decode::SensitiveOp;
 use crate::emit::EmitError;
-use crate::mmu::{SoftMmuMemory, is_canonical_va, read_system_bytes, write_system_bytes};
+use crate::mmu::{SoftMmuMemory, is_canonical_va, read_system_bytes, write_idt_stack_frame};
 use crate::privileged::load_gdt_code_or_data_descriptor;
 
 const RFLAGS_TF: u64 = 1 << 8;
@@ -19,6 +19,7 @@ const RFLAGS_IF: u64 = 1 << 9;
 const RFLAGS_NT: u64 = 1 << 14;
 const RFLAGS_RF: u64 = 1 << 16;
 const RFLAGS_VM: u64 = 1 << 17;
+const RFLAGS_AC: u64 = 1 << 18;
 
 /// Host-observable machine exit returned by [`SoftMachine::step`] and [`SoftMachine::run`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,24 +115,6 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
         }
     }
 
-    /// Queue an external maskable interrupt vector (`32..=255`) on this machine's vCPU.
-    pub fn inject_interrupt(
-        &mut self,
-        vector: u8,
-    ) -> Result<(), crate::context::InvalidInterruptVector> {
-        self.cpu.context_mut().inject_interrupt(vector)
-    }
-
-    #[must_use]
-    pub fn is_interrupt_pending(&self, vector: u8) -> bool {
-        self.cpu.context().is_interrupt_pending(vector)
-    }
-
-    #[must_use]
-    pub fn deliverable_interrupt(&self) -> Option<u8> {
-        self.cpu.context().deliverable_interrupt()
-    }
-
     /// Execute one basic block and resolve internal architectural transitions (`SYSCALL`,
     /// 64-bit `IDT` exception/interrupt delivery). Returns `Ok(None)` when guest execution
     /// continues inside the machine, or `Ok(Some(exit))` on a host-visible exit (`HLT`, PIO, triple fault).
@@ -175,7 +158,7 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
             next_rip,
         } => {
             let ctx = cpu.context_mut();
-            match deliver_idt_vector(ctx, mem, vector, rip, next_rip, None, None, true) {
+            match deliver_idt_vector(ctx, mem, vector, rip, next_rip, None, None, true, false) {
                 Ok(()) => None,
                 Err(fault) => deliver_exception_with_escalation(ctx, mem, fault),
             }
@@ -279,8 +262,15 @@ fn deliver_exception_with_escalation<M: SoftMmuMemory>(
     initial: X86Exception,
 ) -> Option<SoftMachineExit> {
     let mut current = initial;
-    let mut sw_origin = current.vector == X86ExceptionVector::Breakpoint;
-    let mut fault_va = if sw_origin {
+    // SDM Vol. 3A §6.13 / Vol. 2A `INT n`:
+    // - `INT3` (`Breakpoint`) checks gate `DPL` and sets `EXT = 0`;
+    // - `INT1` / `ICEBP` (`0xF1`) bypasses gate `DPL` like hardware `#DB`, while keeping `EXT = 0`;
+    // - Hardware exceptions bypass gate `DPL` and set `EXT = 1`.
+    let icebp = current.vector == X86ExceptionVector::Debug && ctx.icebp_trap;
+    ctx.icebp_trap = false;
+    let mut check_dpl = current.vector == X86ExceptionVector::Breakpoint;
+    let mut external_event = !(check_dpl || icebp);
+    let mut fault_va = if check_dpl || icebp {
         ctx.exit_insn_va
     } else {
         current.rip
@@ -291,15 +281,21 @@ fn deliver_exception_with_escalation<M: SoftMmuMemory>(
         if let Some(cr2) = current.cr2 {
             ctx.cr2 = cr2;
         }
+        let arch_error_code = if current.vector.has_error_code() {
+            Some(current.error_code.unwrap_or(0))
+        } else {
+            None
+        };
         match deliver_idt_vector(
             ctx,
             mem,
             current.vector as u8,
             fault_va,
             saved_rip,
-            current.error_code,
+            arch_error_code,
             current.cr2,
-            sw_origin,
+            check_dpl,
+            external_event,
         ) {
             Ok(()) => return None,
             Err(secondary) => {
@@ -318,7 +314,8 @@ fn deliver_exception_with_escalation<M: SoftMmuMemory>(
                 } else {
                     secondary
                 };
-                sw_origin = false;
+                check_dpl = false;
+                external_event = true;
                 fault_va = current.rip;
                 saved_rip = current.rip;
             }
@@ -335,9 +332,10 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     saved_rip: u64,
     error_code: Option<u32>,
     cr2_update: Option<u64>,
-    software_origin: bool,
+    check_dpl: bool,
+    external_event: bool,
 ) -> Result<(), X86Exception> {
-    let ext = u32::from(!software_origin);
+    let ext = u32::from(external_event);
     let gate_err = (u32::from(vector) << 3) | 0x2 | ext;
     let offset = u64::from(vector) * 16;
     if offset.saturating_add(15) > u64::from(ctx.idtr.limit) {
@@ -361,13 +359,13 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     let reserved = u32::from_le_bytes([gate[12], gate[13], gate[14], gate[15]]);
 
     let gate_type = attrs & 0x1f;
-    // Must be a 64-bit Interrupt Gate (0x0e) or Trap Gate (0x0f) with upper bits [12:8] == 0.
+    // Must be a 64-bit Interrupt Gate (0x0e) or Trap Gate (0x0f) with S=0 and upper bits [12:8] == 0.
     if !matches!(gate_type, 0x0e | 0x0f) || (reserved & 0x1f00) != 0 {
         return Err(X86Exception::general_protection(fault_va, gate_err));
     }
     let gate_dpl = (attrs >> 5) & 3;
     let gate_p = (attrs & 0x80) != 0;
-    if software_origin && ctx.cpl > gate_dpl {
+    if check_dpl && ctx.cpl > gate_dpl {
         return Err(X86Exception::general_protection(fault_va, gate_err));
     }
     if !gate_p {
@@ -445,22 +443,17 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     if let Some(cr2) = cr2_update {
         ctx.cr2 = cr2;
     }
-    write_system_bytes(ctx, mem, new_rsp, &frame_buf[..frame_len])
+    write_idt_stack_frame(ctx, mem, new_rsp, new_cpl, &frame_buf[..frame_len])
         .map_err(|pf| X86Exception::page_fault(fault_va, pf.error_code, pf.cr2))?;
     cs_loaded.commit_accessed_write(ctx, mem, fault_va)?;
 
     ctx.cs = cs_loaded.seg;
-    if new_cpl < old_cpl {
-        // SDM Vol. 3A §6.14.2: Inter-privilege interrupt/exception loads NULL SS selector with RPL = new_cpl.
-        ctx.ss = SoftSegment {
-            selector: u16::from(new_cpl),
-            base: 0,
-            limit: 0,
-            ar: SoftSegment::UNUSABLE_BIT,
-        };
+    if new_cpl < old_cpl || ist != 0 {
+        // SDM Vol. 3A §6.14.2: IA-32e stack switch (inter-privilege or IST != 0) loads NULL SS with RPL = new_cpl.
+        ctx.ss = SoftSegment::null_stack(new_cpl);
     }
     ctx.gpr[reg::RSP] = new_rsp;
-    ctx.rflags &= !(RFLAGS_TF | RFLAGS_NT | RFLAGS_RF | RFLAGS_VM);
+    ctx.rflags &= !(RFLAGS_TF | RFLAGS_NT | RFLAGS_RF | RFLAGS_VM | RFLAGS_AC);
     if gate_type == 0x0e {
         ctx.rflags &= !RFLAGS_IF;
     }
