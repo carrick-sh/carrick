@@ -23,7 +23,8 @@ fn prelanding_workflow() -> String {
     std::fs::create_dir_all(&workflows).unwrap();
     std::fs::write(workflows.join("ci.yml"), ci).unwrap();
     let patch = dir.path().join("harvest.patch");
-    std::fs::write(&patch, include_str!("../../../harvest.patch")).unwrap();
+    let handoff = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harvest.patch");
+    std::fs::write(&patch, std::fs::read(handoff).unwrap()).unwrap();
     let output = Command::new("git")
         .current_dir(dir.path())
         .arg("apply")
