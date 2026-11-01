@@ -205,6 +205,7 @@ pub(crate) fn emulate_sensitive_op<M: SoftMmuMemory>(
             }
             ctx.interrupt_shadow = false;
             ctx.halted = true;
+            ctx.halted_rip = va;
             ctx.rip = resume;
             return PrivilegedOutcome::Hlt {
                 rip: va,

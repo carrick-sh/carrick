@@ -364,10 +364,8 @@ impl TscClock for ManualTscClock {
                 || kick.has_pending_irr()
                 || deadline_tsc.is_some_and(|d| self.now() >= d);
         }
-        kick.wait_for_kick_or_timeout(max_wait);
-        kick.is_kicked()
-            || kick.has_pending_irr()
-            || deadline_tsc.is_some_and(|d| self.now() >= d)
+        kick.wait_for_event(max_wait, || deadline_tsc.is_some_and(|d| self.now() >= d));
+        kick.is_kicked() || kick.has_pending_irr() || deadline_tsc.is_some_and(|d| self.now() >= d)
     }
 
     fn register_node(&self, node: Weak<ApicNode>) {
@@ -384,6 +382,7 @@ impl TscClock for ManualTscClock {
 pub struct ApicNode {
     apic_id: AtomicU8,
     svr: AtomicU32,
+    priority: AtomicU8,
     ldr: AtomicU32,
     dfr: AtomicU32,
     irr: [AtomicU32; 8],
@@ -410,6 +409,7 @@ impl ApicNode {
         Self {
             apic_id: AtomicU8::new(apic_id),
             svr: AtomicU32::new(LAPIC_SVR_RESET),
+            priority: AtomicU8::new(0),
             ldr: AtomicU32::new(0),
             dfr: AtomicU32::new(0xffff_ffff),
             irr: [
@@ -513,20 +513,25 @@ impl ApicNode {
 
     /// Waits on the node's condvar until kicked, an `IRR` bit is set, or `timeout` elapses.
     pub fn wait_for_kick_or_timeout(&self, timeout: Duration) -> bool {
-        if self.is_kicked() || self.has_pending_irr() || timeout.is_zero() {
-            return self.is_kicked() || self.has_pending_irr();
+        self.wait_for_event(timeout, || false)
+    }
+
+    fn wait_for_event(&self, timeout: Duration, ready: impl Fn() -> bool) -> bool {
+        let pending = || self.is_kicked() || self.has_pending_irr() || ready();
+        if pending() || timeout.is_zero() {
+            return pending();
         }
         let Ok(guard) = self.wait_lock.lock() else {
-            return self.is_kicked() || self.has_pending_irr();
+            return pending();
         };
-        if self.is_kicked() || self.has_pending_irr() {
+        if pending() {
             return true;
         }
         let start_epoch = *guard;
-        let _ = self.wait_cv.wait_timeout_while(guard, timeout, |epoch| {
-            *epoch == start_epoch && !self.is_kicked() && !self.has_pending_irr()
-        });
-        self.is_kicked() || self.has_pending_irr()
+        let _ = self
+            .wait_cv
+            .wait_timeout_while(guard, timeout, |epoch| *epoch == start_epoch && !pending());
+        pending()
     }
 
     fn matches_logical(&self, dest_mask: u8) -> bool {
@@ -642,10 +647,9 @@ impl ApicCluster {
             };
         }
 
-        let mut delivered = 0usize;
-        for node in &targets {
+        let selected = |node: &Arc<ApicNode>| {
             let id = node.apic_id();
-            let selected = match shorthand {
+            match shorthand {
                 LAPIC_ICR_SHORTHAND_ALL_INCLUDING_SELF => true,
                 LAPIC_ICR_SHORTHAND_ALL_EXCLUDING_SELF => id != sender_id,
                 LAPIC_ICR_SHORTHAND_NONE => {
@@ -656,12 +660,21 @@ impl ApicCluster {
                     }
                 }
                 _ => false,
-            };
-            if selected && node.inject_interrupt(vector) {
-                delivered += 1;
             }
+        };
+        if delivery_mode == LAPIC_ICR_DELIVERY_LOWEST_PRIORITY {
+            // Choose one eligible processor. APIC ID breaks equal-priority ties
+            // deterministically; fixed delivery retains multicast behavior.
+            return targets
+                .iter()
+                .filter(|node| selected(node) && node.software_enabled())
+                .min_by_key(|node| (node.priority.load(Ordering::Acquire) >> 4, node.apic_id()))
+                .map_or(0, |node| usize::from(node.inject_interrupt(vector)));
         }
-        delivered
+        targets
+            .iter()
+            .filter(|node| selected(node) && node.inject_interrupt(vector))
+            .count()
     }
 }
 
@@ -717,6 +730,7 @@ impl Clone for LocalApic {
             self.node.esr_pending.load(Ordering::Acquire),
             Ordering::Release,
         );
+        cloned_node.priority.store(self.ppr(), Ordering::Release);
         Self {
             node: cloned_node,
             cluster: self.cluster.clone(),
@@ -835,12 +849,13 @@ impl LocalApic {
 
     /// Synchronizes `TPR` from a `MOV to CR8` write (`TPR[7:4] = cr8[3:0]`, `TPR[3:0] = 0`).
     pub fn set_cr8(&mut self, cr8: u8) {
-        self.tpr = (cr8 & 0x0f) << 4;
+        self.set_tpr((cr8 & 0x0f) << 4);
     }
 
     /// Sets the 8-bit `TPR` directly (`LAPIC_TPR[7:0]`).
     pub fn set_tpr(&mut self, tpr: u8) {
         self.tpr = tpr;
+        self.node.priority.store(self.ppr(), Ordering::Release);
     }
 
     /// Returns the Spurious Interrupt Vector Register (`SVR`).
@@ -958,6 +973,7 @@ impl LocalApic {
             let mask = 1u32 << (vec & 31);
             self.isr[word] &= !mask;
             self.tmr[word] &= !mask;
+            self.node.priority.store(self.ppr(), Ordering::Release);
         }
     }
 
@@ -993,13 +1009,18 @@ impl LocalApic {
         let mask = 1u32 << (vec & 31);
         self.node.irr[word].fetch_and(!mask, Ordering::AcqRel);
         self.isr[word] |= mask;
+        self.node.priority.store(self.ppr(), Ordering::Release);
         self.delivered_count = self.delivered_count.saturating_add(1);
         Some(vec)
     }
 
     /// Returns the next armed TSC deadline (`IA32_TSC_DEADLINE` or initial-count target TSC), if any.
     #[must_use]
-    pub fn next_timer_deadline_tsc(&self, apic_hw_enabled: bool, tsc_deadline_msr: u64) -> Option<u64> {
+    pub fn next_timer_deadline_tsc(
+        &self,
+        apic_hw_enabled: bool,
+        tsc_deadline_msr: u64,
+    ) -> Option<u64> {
         if !apic_hw_enabled || !self.software_enabled() {
             return None;
         }
@@ -1187,15 +1208,13 @@ impl LocalApic {
                 self.set_apic_id(new_id);
             }
             LAPIC_TPR_OFFSET => {
-                self.tpr = (value & 0xff) as u8;
+                self.set_tpr((value & 0xff) as u8);
             }
             LAPIC_EOI_OFFSET => {
                 self.eoi();
             }
             LAPIC_LDR_OFFSET => {
-                self.node
-                    .ldr
-                    .store(value & 0xff00_0000, Ordering::Release);
+                self.node.ldr.store(value & 0xff00_0000, Ordering::Release);
             }
             LAPIC_DFR_OFFSET => {
                 self.node
@@ -1367,5 +1386,39 @@ impl LocalApic {
         }
         let value = u32::from_le_bytes(word_bytes);
         self.write_reg32(reg_base, value, now_tsc, tsc_deadline_msr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    #[test]
+    fn clock_event_between_probe_and_enrollment_is_observed() {
+        let node = Arc::new(ApicNode::new(0));
+        let mut enrollment = node.wait_lock.lock().unwrap();
+        let reached = Arc::new(AtomicBool::new(false));
+        let (probed_tx, probed_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter_node = node.clone();
+        let waiter_reached = reached.clone();
+        let waiter = std::thread::spawn(move || {
+            let first = AtomicBool::new(true);
+            waiter_node.wait_for_event(Duration::from_millis(100), || {
+                if first.swap(false, Ordering::AcqRel) {
+                    probed_tx.send(()).unwrap();
+                    false
+                } else {
+                    waiter_reached.load(Ordering::Acquire)
+                }
+            })
+        });
+        probed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Publish before enrollment. Its initial epoch will include this event;
+        // only the predicate recheck under the mutex can observe it.
+        reached.store(true, Ordering::Release);
+        *enrollment = enrollment.wrapping_add(1);
+        drop(enrollment);
+        assert!(waiter.join().unwrap());
     }
 }

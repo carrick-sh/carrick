@@ -1,0 +1,37 @@
+schema_version = 1
+id = "x86.softcpu.apic-timer"
+title = "Software xAPIC interrupt priority, IPIs and TSC deadline wakeups"
+guest_surfaces = ["isa:x86_64", "vmm:soft", "interrupt:xapic", "timer:tsc-deadline"]
+semantic_authority = [
+  "Intel SDM Vol. 3A Chapter 10: xAPIC register page, task and processor priority, EOI, fixed-delivery ICR destinations and LVT timer modes",
+  "Intel SDM Vol. 2: HLT, STI, MOV CR8, RDMSR and WRMSR; IA32_TSC_DEADLINE is an absolute guest TSC deadline and clears on expiry",
+]
+fixture = "carrick-softcpu-x86::softcpu_apic_timer"
+scale_points = [1, 1000, 1000000000]
+rationale = "A periodic timer coalesces missed expirations into one pending vector and computes the next deadline arithmetically, independent of elapsed periods. HLT retains its parked state until an interrupt; waits share the clock used by RDTSC and account for guest TSC writes. The two live CPU fixture sends one ping and one pong through guest MMIO, observes ISR before and after EOI, and resumes both CPUs after HLT."
+
+[[structural_budgets]]
+kind = "upper-bound"
+metric = "wake_publications"
+maximum = 1
+layers = ["vm-free"]
+rationale = "One poll coalesces any number of missed periodic deadlines into a single IRR bit; the test asserts timer_fire_count and the exact next deadline at each scale."
+
+[bindings]
+vm_free = [
+  "carrick-softcpu-x86::softcpu_apic_timer::tsc_deadline_and_initial_count_timers_with_injectable_clock_and_bounded_hlt",
+  "carrick-softcpu-x86::softcpu_apic_timer::local_apic_registers_tpr_cr8_ppr_eoi_esr_and_apic_base_relocation",
+  "carrick-softcpu-x86::softcpu_apic_timer::interrupt_priority_sti_shadow_and_nested_preemption_with_eoi",
+  "carrick-softcpu-x86::softcpu_apic_timer::icr_ipi_modes_self_broadcast_physical_and_logical_across_apic_cluster",
+  "carrick-softcpu-x86::softcpu_apic_timer::hlt_deadline_wait_uses_clock_domain_after_guest_tsc_write",
+  "carrick-softcpu-x86::softcpu_apic_timer::periodic_timer_coalesces_missed_periods_without_catchup_deliveries",
+  "carrick-softcpu-x86::softcpu_apic_timer::repeated_hlt_steps_stay_parked_until_an_interrupt_is_delivered",
+  "carrick-softcpu-x86::softcpu_apic_timer::two_vcpu_wake_and_ipi_fixture_on_softmachine",
+  "carrick-softcpu-x86::softcpu_apic_kvm::two_vcpu_wake_and_ipi_matches_kvm",
+  "carrick-softcpu-x86::softcpu_apic_timer::hlt_with_if_clear_does_not_resume_for_a_maskable_ipi",
+  "carrick-softcpu-x86::softcpu_apic_timer::lowest_priority_ipi_selects_one_enabled_destination",
+]
+
+[bindings.unresolved]
+embed_structural = "Soft carrier integration is a later part of #578. This slice executes a small CPL0 image on SoftMachine, not the full Carrick kernel. KVM parity requires accessible /dev/kvm and the separately registered kvm test target. Cross-CPU page-table mutation and shootdown remain #607."
+docker = "The authority for local APIC hardware behavior is the Intel SDM and the identical KVM guest image, rather than Linux userspace in Docker. No Docker runtime-ratio evidence is claimed."

@@ -186,6 +186,17 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
             }
         }
 
+        if self.cpu.context().halted {
+            let next_rip = self.cpu.context().rip;
+            let rip = self.cpu.context().halted_rip;
+            return Ok(handle_cpu_exit(
+                &mut self.cpu,
+                &mut self.mem,
+                SoftCpuExit::Hlt { rip, next_rip },
+                self.hlt_wait_timeout,
+            ));
+        }
+
         let exit = self.cpu.step_block(&mut self.mem)?;
         Ok(handle_cpu_exit(
             &mut self.cpu,
@@ -210,7 +221,10 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
 }
 
 fn wait_for_apic_event(cpu: &SoftCpu, max_wait: Duration) {
-    let deadline = cpu.context().next_timer_deadline_tsc();
+    let deadline = cpu
+        .context()
+        .next_timer_deadline_tsc()
+        .map(|deadline| cpu.context().msrs().clock_deadline(deadline));
     let tsc_hz = cpu.context().tsc_hz();
     let node = cpu.apic_node();
     if let Some(clock) = cpu.context().msrs().clock() {
@@ -248,7 +262,9 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
                 wait_for_apic_event(cpu, max_wait);
                 let _ = cpu.poll_apic_timer();
             }
-            if cpu.context().has_deliverable_apic_interrupt() {
+            if (cpu.context().rflags & RFLAGS_IF) != 0
+                && cpu.context().has_deliverable_apic_interrupt()
+            {
                 cpu.context_mut().halted = false;
                 let _ = cpu.apic_node().take_kick();
                 if (cpu.context().rflags & RFLAGS_IF) != 0
