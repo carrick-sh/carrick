@@ -310,11 +310,18 @@ controller change: announce it before and after under AGENTS.md's “Multiple di
 sessions” rules.
 
 The owner applies the source ACL to both the user and its privilege-separated
-token; both grants are needed:
+token; both grants are needed. `<active VMID>` is the slot the site row
+selects (9000 or 9001):
 
 ```sh
-pveum acl modify /vms/9001 --roles PVETemplateUser --users ci-scaler@pve
-pveum acl modify /vms/9001 --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+pveum acl modify /vms/<active VMID> --roles PVETemplateUser --users ci-scaler@pve
+pveum acl modify /vms/<active VMID> --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+```
+
+Verify that the token holds exactly `VM.Audit` and `VM.Clone` there:
+
+```sh
+pvesh get /access/permissions --path /vms/<active VMID> --userid 'ci-scaler@pve!elastic'
 ```
 
 With agent clones enabled, startup requires exactly `VM.Audit=1` and
@@ -324,6 +331,24 @@ active source configuration directly because its pool inventory excludes
 agent templates. The root-run builder
 uses `qm` to start and stop the agent template during provisioning; the
 controller token retains only its inspection and clone rights.
+
+When an old source is retired, its grants go with it. Only after
+`carrick-xtask ci-scaler check-template-retirement --template <old VMID>`
+passes under the installed active controller, either destroy it with
+`--purge`, which also removes its ACL and pool references:
+
+```sh
+qm destroy <old VMID> --purge
+```
+
+or delete both grants explicitly:
+
+```sh
+pveum acl delete /vms/<old VMID> --roles PVETemplateUser --users ci-scaler@pve
+pveum acl delete /vms/<old VMID> --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+```
+
+Then confirm with `pveum acl list` that no `/vms/<old VMID>` entry remains.
 
 ## Rebuild an agent template beside the running source (#1384)
 
@@ -392,3 +417,31 @@ succeeds; then remove both source ACL grants and `/etc/pve/firewall/9000.fw`
 if Proxmox has not already removed it. Verify that neither agent source
 has joined `carrick-ci`; clones from both sources belong there. The freed
 slot can then be used by the next beside rebuild.
+
+### Rollback
+
+Before cutover, keep a copy of the controller binary that is serving the
+old source, named for the PR being deployed:
+
+```sh
+cp -p /root/carrick-ci/bin/carrick-xtask /root/carrick-ci/bin/carrick-xtask.pre-<pr>
+```
+
+Rollback restores that copy and restarts the service on the existing ledger:
+
+```sh
+install -m 755 /root/carrick-ci/bin/carrick-xtask.pre-<pr> /root/carrick-ci/bin/carrick-xtask &&
+  systemctl restart carrick-ci-standing
+```
+
+The restored controller selects the old source again. Clones admitted from
+the new source keep their own linked base and resume as before. This
+rollback is valid **only while the old template still exists with its
+`PVETemplateUser` ACL grants and its `/etc/pve/firewall/<old VMID>.fw`**;
+the restored controller depends on all of them. Do not retire the old slot
+until the new controller has passed a live dispatch round.
+
+After retirement there is no binary rollback. Rolling back then means
+rebuilding a template in the freed slot with this procedure, and because
+`main` still points the site row at the new slot, it needs a fix-forward PR
+that changes the site row before its controller is deployed.
