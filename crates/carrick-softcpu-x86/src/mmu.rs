@@ -327,18 +327,26 @@ pub fn read_guest_bytes<M: SoftMmuMemory>(
     kind: SoftAccessKind,
 ) -> Result<(), SoftPageFault> {
     let mode = ctx.access_mode();
-    walk_span_mode(ctx, mem, va, dst.len(), kind, mode, |ctx, off, target, chunk| {
-        match target {
-            TranslatedTarget::Ram(ptr) => {
-                // SAFETY: `ptr` has at least `chunk` valid bytes within its 4 KiB page.
-                unsafe { std::ptr::copy_nonoverlapping(ptr, dst[off..].as_mut_ptr(), chunk) };
+    walk_span_mode(
+        ctx,
+        mem,
+        va,
+        dst.len(),
+        kind,
+        mode,
+        |ctx, off, target, chunk| {
+            match target {
+                TranslatedTarget::Ram(ptr) => {
+                    // SAFETY: `ptr` has at least `chunk` valid bytes within its 4 KiB page.
+                    unsafe { std::ptr::copy_nonoverlapping(ptr, dst[off..].as_mut_ptr(), chunk) };
+                }
+                TranslatedTarget::LapicMmio { offset } => {
+                    let bytes = ctx.lapic_mmio_read(offset, chunk);
+                    dst[off..off + chunk].copy_from_slice(&bytes[..chunk]);
+                }
             }
-            TranslatedTarget::LapicMmio { offset } => {
-                let bytes = ctx.lapic_mmio_read(offset, chunk);
-                dst[off..off + chunk].copy_from_slice(&bytes[..chunk]);
-            }
-        }
-    })
+        },
+    )
 }
 
 /// Write `src` to guest `va`, pre-validating all spanned pages before writing any byte.
@@ -350,17 +358,25 @@ pub fn write_guest_bytes<M: SoftMmuMemory>(
 ) -> Result<(), SoftPageFault> {
     let mode = ctx.access_mode();
     let w = SoftAccessKind::Write;
-    walk_span_mode(ctx, mem, va, src.len(), w, mode, |ctx, off, target, chunk| {
-        match target {
-            TranslatedTarget::Ram(ptr) => {
-                // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
-                unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+    walk_span_mode(
+        ctx,
+        mem,
+        va,
+        src.len(),
+        w,
+        mode,
+        |ctx, off, target, chunk| {
+            match target {
+                TranslatedTarget::Ram(ptr) => {
+                    // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
+                    unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+                }
+                TranslatedTarget::LapicMmio { offset } => {
+                    ctx.lapic_mmio_write(offset, &src[off..off + chunk]);
+                }
             }
-            TranslatedTarget::LapicMmio { offset } => {
-                ctx.lapic_mmio_write(offset, &src[off..off + chunk]);
-            }
-        }
-    })
+        },
+    )
 }
 
 /// Read `dst.len()` bytes using implicit supervisor system-table access rights

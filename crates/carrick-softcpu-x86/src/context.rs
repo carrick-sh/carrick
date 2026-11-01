@@ -448,6 +448,7 @@ pub struct SoftCpuContext {
     pub ldtr: SoftSegment,
     pub tr: SoftSegment,
     pub halted: bool,
+    pub(crate) halted_rip: u64,
     /// One-instruction maskable interrupt shadow armed by `STI` when `RFLAGS.IF` transitions `0 -> 1`
     /// (Intel SDM Vol. 3A §6.8.3).
     pub interrupt_shadow: bool,
@@ -597,6 +598,7 @@ impl SoftCpuContext {
                 ar: 0x008b,
             },
             halted: false,
+            halted_rip: 0,
             interrupt_shadow: false,
             icebp_trap: false,
             lapic_mmio_offset: 0,

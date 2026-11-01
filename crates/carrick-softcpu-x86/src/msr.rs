@@ -8,7 +8,7 @@ use std::mem::offset_of;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use crate::apic::TscClock;
+use crate::apic::{MonotonicTscClock, TscClock};
 use crate::cpuid::{DEFAULT_TSC_HZ, GuestCpuidView};
 use crate::mmu::is_canonical_va;
 
@@ -198,7 +198,7 @@ impl MsrFile {
 
     pub(crate) fn new_anchored() -> Self {
         let mut msrs = Self::new();
-        msrs.tsc_anchor = Some(Instant::now());
+        msrs.clock = Some(Arc::new(MonotonicTscClock::default()));
         msrs
     }
 
@@ -211,6 +211,11 @@ impl MsrFile {
     #[must_use]
     pub fn clock(&self) -> Option<&Arc<dyn TscClock>> {
         self.clock.as_ref()
+    }
+
+    /// Convert an absolute guest TSC deadline to the injected clock's counter domain.
+    pub(crate) fn clock_deadline(&self, deadline: u64) -> u64 {
+        deadline.wrapping_sub(self.tsc_base)
     }
 
     pub(crate) const fn tsc_deadline_mut(&mut self) -> &mut u64 {

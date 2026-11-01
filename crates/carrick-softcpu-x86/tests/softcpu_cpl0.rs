@@ -206,6 +206,7 @@ fn setup_cpl0_cpu(
 }
 
 fn enter_cpl0(ctx: &mut SoftCpuContext, rip: u64) {
+    ctx.halted = false;
     ctx.set_cpl(0);
     ctx.cs = SoftSegment::kernel_code64(0x08);
     ctx.ss = SoftSegment::kernel_data(0x10);
@@ -213,6 +214,7 @@ fn enter_cpl0(ctx: &mut SoftCpuContext, rip: u64) {
 }
 
 fn enter_cpl3(ctx: &mut SoftCpuContext, rip: u64) {
+    ctx.halted = false;
     ctx.set_cpl(3);
     ctx.cs = SoftSegment::user_code64(0x23);
     ctx.ss = SoftSegment::user_data(0x1b);
