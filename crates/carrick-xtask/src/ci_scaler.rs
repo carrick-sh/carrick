@@ -18,6 +18,7 @@ mod live;
 mod mac;
 pub(crate) mod mint;
 mod site;
+mod template_retirement;
 
 pub use assignment::{
     admit_assigned, assigned_job_key, pending_assignment, publish_assignment, standing_hook_script,
@@ -150,12 +151,6 @@ pub enum CloneLane {
     Agent,
 }
 impl CloneLane {
-    pub fn template(self) -> u16 {
-        match self {
-            Self::Kvm => 300,
-            Self::Agent => 9000,
-        }
-    }
     pub fn labels(self) -> &'static [&'static str] {
         match self {
             Self::Kvm => &LABELS,
@@ -265,7 +260,8 @@ impl Ledger {
         // unknown object occupies the whole budget: it is never adopted.
         let unknown = inventory.iter().any(|v| {
             v.pool == POOL
-                && !(v.template && ((300..=307).contains(&v.id) || v.id == 9000))
+                && !(v.template
+                    && ((300..=307).contains(&v.id) || site::AgentTemplate::try_from(v.id).is_ok()))
                 && !active.iter().any(|r| r.vm.get() == v.id)
         });
         if unknown {
@@ -1154,12 +1150,21 @@ pub enum ScalerAction {
     Site {
         #[arg(long, value_enum, default_value_t = CloneLane::Kvm)]
         lane: CloneLane,
+        #[arg(long)]
+        template: Option<u16>,
     },
     /// Print this host's PVE VM firewall file for template 300; fails on a
     /// site whose bridge needs no VM firewall.
     VmFirewall {
         #[arg(long, value_enum, default_value_t = CloneLane::Kvm)]
         lane: CloneLane,
+        #[arg(long)]
+        template: Option<u16>,
+    },
+    /// Root on Contabo: refuse retirement of an active or referenced agent base.
+    CheckTemplateRetirement {
+        #[arg(long)]
+        template: u16,
     },
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
@@ -1231,18 +1236,27 @@ pub fn admit_job_context(
 }
 pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
     match args.action {
-        ScalerAction::Site { lane } => {
-            print!("{}", site::Site::local()?.for_lane(lane)?.shell_env()?);
+        ScalerAction::Site { lane, template } => {
+            print!(
+                "{}",
+                site::Site::local()?
+                    .for_lane(lane)?
+                    .with_template(template)?
+                    .shell_env()?
+            );
             Ok(())
         }
-        ScalerAction::VmFirewall { lane } => {
-            let file = site::Site::local()?
+        ScalerAction::VmFirewall { lane, template } => {
+            let site = site::Site::local()?
                 .for_lane(lane)?
-                .vm_firewall_file(lane.template())?
+                .with_template(template)?;
+            let file = site
+                .vm_firewall_file(site.template()?)?
                 .ok_or(ScalerError::Guard("this site uses no VM firewall"))?;
             print!("{file}");
             Ok(())
         }
+        ScalerAction::CheckTemplateRetirement { template } => template_retirement::check(template),
         ScalerAction::VerifyKvm => verify_kvm(),
         ScalerAction::AdmitJob {
             policy_file,

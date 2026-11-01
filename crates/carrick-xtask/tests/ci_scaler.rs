@@ -1801,3 +1801,76 @@ fn cloudmac_ci_macos_runner_jobs_serialize_builds_and_tests_under_carrick_lease(
         ]
     );
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn template_builder_refuses_existing_slot_and_accepts_the_other() {
+    let source = include_str!("../../../scripts/ci/build-template-debian.sh");
+    let profile_guard = source
+        .lines()
+        .find(|line| line.starts_with("case $profile:$template"))
+        .unwrap();
+    let existence_guard = source
+        .lines()
+        .find(|line| line.starts_with("! qm status"))
+        .unwrap();
+    for (template, allowed) in [(9000, false), (9001, true), (9002, false)] {
+        let script = format!(
+            r#"set -euo pipefail
+profile=agent
+template={template}
+qm() {{ [[ $1 == status && $2 == 9000 ]]; }}
+{profile_guard}
+{existence_guard}
+"#
+        );
+        let output = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            allowed,
+            "{template}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn agent_template_qualification_requires_worker_group_and_kvm_open() {
+    let source = include_str!("../../../scripts/ci/build-template-debian.sh");
+    let fragment = source
+        .split("runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm\n")
+        .nth(1)
+        .unwrap()
+        .split("gh_version=")
+        .next()
+        .unwrap();
+    for (groups, kvm_status, allowed, checked) in [
+        ("carrick-dispatch-agent kvm", 0, true, true),
+        ("carrick-dispatch-agent", 0, false, false),
+        ("carrick-dispatch-agent kvm", 1, false, true),
+    ] {
+        let script = format!(
+            r#"set -euo pipefail
+cat() {{ echo agent; }}
+id() {{ echo '{groups}'; }}
+runuser() {{ printf '%s\n' "$@"; return {kvm_status}; }}
+{fragment}"#
+        );
+        let output = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), allowed);
+        let calls = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            calls.contains(
+                "carrick-dispatch-agent\n--\n/usr/local/bin/carrick-xtask\nci-scaler\nverify-kvm\n"
+            ),
+            checked
+        );
+    }
+}

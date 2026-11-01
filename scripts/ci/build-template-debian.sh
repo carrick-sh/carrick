@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Root on a known KVM clone site (Willow or the Contabo host, issue #287)
-# only. Builds approved template 300 or 9000; never allocates or operates a clone. The site's node,
+# only. Builds approved template 300, 9000 or 9001; never allocates or operates a clone. The site's node,
 # storage, bridge and template size come from `carrick-xtask ci-scaler site`,
 # the same typed table the controller authenticates the template against.
 # Dependencies are existing PVE tools; no host package/service/network changes.
 set -euo pipefail
 umask 077
 [[ ${EUID} == 0 ]] || { echo 'Run as root on a KVM clone site' >&2; exit 1; }
-[[ $# == 3 || $# == 4 ]] || { echo 'Usage: build-template-debian.sh INPUT_DIR SCRIPT_COMMIT X86_LINUX_XTASK [kvm|agent]' >&2; exit 1; }
+[[ $# == 3 || $# == 4 || $# == 5 ]] || { echo 'Usage: build-template-debian.sh INPUT_DIR SCRIPT_COMMIT X86_LINUX_XTASK [kvm|agent] [AGENT_TEMPLATE_VMID]' >&2; exit 1; }
 profile=${4:-kvm}
+template_args=()
+if [[ $# == 5 ]]; then template_args=(--template "$5"); fi
 [[ $profile == kvm || $profile == agent ]] || { echo "bad template profile" >&2; exit 1; }
 inputs=$(realpath "$1")
 commit=$2
@@ -30,13 +32,13 @@ declare -A site=()
 while IFS='=' read -r name value; do
   [[ $name =~ ^SITE_[A-Z_]+$ && $value =~ ^[A-Za-z0-9._=/,-]+$ ]] || { echo "bad site line: $name" >&2; exit 1; }
   site[$name]=$value
-done < <("$xtask" ci-scaler site --lane "$profile")
+done < <("$xtask" ci-scaler site --lane "$profile" "${template_args[@]}")
 for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER SITE_VM_FIREWALL SITE_API_CA SITE_ALLOW_KSM SITE_TEMPLATE_VMID; do
   [[ -n ${site[$name]:-} ]] || { echo "site lacks $name" >&2; exit 1; }
 done
 [[ ${site[SITE_NODE]} == $(hostname -s) ]] || { echo 'site node is not this host' >&2; exit 1; }
 template=${site[SITE_TEMPLATE_VMID]}
-case $profile:$template in kvm:300|agent:9000) ;; *) echo "bad profile template" >&2; exit 1 ;; esac
+case $profile:$template in kvm:300|agent:9000|agent:9001) ;; *) echo "bad profile template" >&2; exit 1 ;; esac
 node=${site[SITE_NODE]} api_host=${site[SITE_API_HOST]} storage=${site[SITE_STORAGE]}
 disk_format=${site[SITE_DISK_FORMAT]} bridge=${site[SITE_BRIDGE]}
 cores=${site[SITE_CORES]} memory_mib=${site[SITE_MEMORY_MIB]} disk_gib=${site[SITE_DISK_GIB]}
@@ -211,6 +213,10 @@ chmod 755 /usr/local/bin/carrick-ci-ready
 install -m 755 admit-job.sh /usr/local/bin/carrick-ci-admit-job.sh
 systemctl daemon-reload
 runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
+if [[ $(cat profile) == agent ]]; then
+  id -nG carrick-dispatch-agent | tr ' ' '\n' | grep -qx kvm
+  runuser -u carrick-dispatch-agent -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
+fi
 gh_version=$(cat gh-version)
 gh_first_line=$(gh --version </dev/null | head -n1)
 if ! [[ $gh_first_line =~ ^gh[[:space:]]+version[[:space:]]+([0-9.]+) && ${BASH_REMATCH[1]} == "$gh_version" ]]; then
@@ -255,7 +261,7 @@ if [[ $vm_firewall == 1 ]]; then
   [[ ! -e /etc/pve/firewall/${template}.fw ]] || { echo "stale $template.fw; owner inspection needed" >&2; exit 1; }
   # The rule set comes from the site table; the controller verifies the same
   # rules on the template and on every clone before it boots.
-  "$xtask" ci-scaler vm-firewall --lane "$profile" > /etc/pve/firewall/${template}.fw.new
+  "$xtask" ci-scaler vm-firewall --lane "$profile" "${template_args[@]}" > /etc/pve/firewall/${template}.fw.new
   mv /etc/pve/firewall/${template}.fw.new /etc/pve/firewall/${template}.fw
   net0="$net0,firewall=1"
   # ipfilter admits only the addresses in ipconfig0, so the template needs

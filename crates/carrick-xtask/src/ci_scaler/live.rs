@@ -783,13 +783,8 @@ fn provision(
     )?;
     row.state = State::Cloning;
     update(ledger, row, path)?; // Write-ahead, even if POST's outcome is ambiguous.
-    row.task = Some(task_id(pve.request(
-        PveCall::Post(json!({
-            "newid":row.vm.get(), "pool":POOL, "name":row.name, "full":false,
-            "description":format!("Carrick pilot ledger identity {}", row.name)
-        })),
-        &format!("{}/clone", pve.site.qemu(row.lane.template())),
-    )?)?);
+    let (call, source) = clone_call(pve.site, row)?;
+    row.task = Some(task_id(pve.request(call, &source)?)?);
     update(ledger, row, path)?;
     pve.wait_task(
         row.task
@@ -797,6 +792,19 @@ fn provision(
             .ok_or(ScalerError::Guard("clone task missing"))?,
     )?;
     boot_and_register(pve, gh, ledger, row, dir, path, approval, PreBoot::Defer)
+}
+
+/// One source-selection path for every newly admitted clone. Existing rows
+/// resume their own VM and retain its backing image across a template cutover.
+fn clone_call(site: Site, row: &Record) -> Result<(PveCall, String), ScalerError> {
+    let template = site.for_lane(row.lane)?.template()?;
+    Ok((
+        PveCall::Post(json!({
+            "newid":row.vm.get(), "pool":POOL, "name":row.name, "full":false,
+            "description":format!("Carrick pilot ledger identity {}", row.name)
+        })),
+        format!("{}/clone", site.qemu(template)),
+    ))
 }
 
 /// What a refused pre-boot admission does. A provisioning worker owns its
@@ -1867,10 +1875,13 @@ fn verify_protected_vms(
     // whether agent clone demand is enabled. Only the source template may
     // carry the non-mutating rights needed to inspect and clone it.
     for vm in site.protected {
-        let source_template = site.node == site::CONTABO.node && *vm == 9000;
+        let source_template =
+            site.node == site::CONTABO.node && site::AgentTemplate::try_from(*vm).is_ok();
         let protected = permissions(*vm)?;
-        let source_required = source_template && site.lane == CloneLane::Agent;
-        if (source_required && protected != json!({"/vms/9000": {"VM.Audit": 1, "VM.Clone": 1}}))
+        let source_required =
+            source_template && site.lane == CloneLane::Agent && *vm == site.template()?;
+        if (source_required
+            && protected != json!({format!("/vms/{vm}"): {"VM.Audit": 1, "VM.Clone": 1}}))
             || protected.as_object().is_none_or(|map| {
                 map.values().any(|v| {
                     v.as_object().is_none_or(|rights| {
@@ -1900,7 +1911,7 @@ fn verify_startup(
 ) -> Result<(), ScalerError> {
     for lane in lanes {
         let lane_pve = site.for_lane(*lane)?;
-        let template = lane.template();
+        let template = lane_pve.template()?;
         if *lane == CloneLane::Agent {
             if inventory.iter().any(|v| v.id == template && v.pool == POOL) {
                 return Err(ScalerError::Guard(

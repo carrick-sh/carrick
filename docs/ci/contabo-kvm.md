@@ -11,8 +11,8 @@ for admits it only after the controller re-vets that run
 the controller binary in `/root/carrick-ci/bin` carries this, so deploying it
 needs a controller restart, not a template rebuild.
 
-The same standing service also serves issue-label agent clones from template
-9000; see [dispatch-worker.md](dispatch-worker.md) for the four-clone budget,
+The same standing service also serves issue-label agent clones from the
+active agent template (9000/9001); see [dispatch-worker.md](dispatch-worker.md) for the four-clone budget,
 runner-independent credentials and VM-local leases. The KVM placement
 and its two-clone budget below are separate from the agent budget.
 
@@ -27,7 +27,7 @@ adversarial isolation boundary.
 | Clone storage | `local-lvm` (thin pool, `lvs` headroom) | `local` directory (PVE storage-status headroom) |
 | Bridge, addressing | `vmbr0`, LAN DHCP | `vmbr1` NAT, static `10.77.0.(VMID-200)/24`, resolver 1.1.1.1 |
 | Template 300 and each clone | 2 vCPU, 4 GiB, 64 GiB | 8 vCPU, 16 GiB, 100 GiB |
-| VMs the token must not touch | 105 | 101-104 (agent workers); 9000 is licensed for agent clones after dispatch cutover |
+| VMs the token must not touch | 105 | 101-104 (agent workers); 9000/9001 permit only source inspection and cloning |
 | KSM page merging | allowed (PVE default) | off (`allow-ksm: 0` on template 300, inherited by clones, checked before each boot) |
 
 Selection is by `/etc/hostname` and fails closed: an unknown host is refused,
@@ -170,7 +170,7 @@ the first-rollout selector bootstrap requirement.
    `PVESDNUser` on `/sdn/zones/localnetwork`. Write the token's JSON
    (`full-tokenid`, `value`) to `/root/carrick-ci-token.json`, mode 0600,
    without printing it. The controller refuses to start if the token has
-   unexpected rights over a protected VM (9000 permits only inspection and cloning).
+   unexpected rights over a protected VM (9000/9001 permit only inspection and cloning).
 2. Build `carrick-xtask` on a Debian 13 x86 worker (glibc at most 2.41), and
    copy it with a `git archive` of `scripts/ci`, `Cargo.lock` and
    `rust-toolchain.toml` to `/root/carrick-ci`. Install `genisoimage`, `jq`
@@ -285,7 +285,7 @@ administrative changes.
 
 The [agent dispatch provider](dispatch-worker.md) shares the existing ledger,
 VMID pool, admission checks, assignment re-vetting, deadlines and destruction
-path with `willow-kvm`. Its template is VM 9000, with 8 vCPU and 20 GiB per
+path with `willow-kvm`. Its active template is VM 9001 (9000 retained until unreferenced), with 8 vCPU and 20 GiB per
 clone and at most four live agent clones. KVM capacity is counted separately.
 Clones are destroyed after one job, including failed or timed-out jobs. The
 owner deploys the controller and verifies the live trial; portable tests alone
@@ -301,23 +301,94 @@ do not establish deployed acceptance.
 
 ## Agent template pool and ACLs (#762)
 
-Template 9000 is a clone source **outside** the `carrick-ci` pool. Template
-300 stays in the pool, and clones from either source are created in the pool.
+Agent templates 9000 and 9001 are clone sources **outside** the `carrick-ci`
+pool. Template 300 stays in the pool, and clones from either source are
+created in the pool.
 Pool membership grants administrative VM rights and must never be used for
-9000. Changing `carrick-ci` pool membership is a controller-affecting shared
-change: announce it before and after under AGENTS.md's “Multiple director
+either agent template. Changing `carrick-ci` pool membership is a shared
+controller change: announce it before and after under AGENTS.md's “Multiple director
 sessions” rules.
 
 The owner applies the source ACL to both the user and its privilege-separated
 token; both grants are needed:
 
 ```sh
-pveum acl modify /vms/9000 --roles PVETemplateUser --users ci-scaler@pve
-pveum acl modify /vms/9000 --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+pveum acl modify /vms/9001 --roles PVETemplateUser --users ci-scaler@pve
+pveum acl modify /vms/9001 --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
 ```
 
 With agent clones enabled, startup requires exactly `VM.Audit=1` and
-`VM.Clone=1` on 9000. The controller reads its configuration directly because
-its pool inventory intentionally excludes this source. The root-run builder
+`VM.Clone=1` on the active source. The inactive source may keep only
+those same read/clone rights until retirement. The controller reads the
+active source configuration directly because its pool inventory excludes
+agent templates. The root-run builder
 uses `qm` to start and stop the agent template during provisioning; the
 controller token retains only its inspection and clone rights.
+
+## Rebuild an agent template beside the running source (#1384)
+
+Agent template slots are the typed set **9000 and 9001**, outside
+`carrick-ci`. The Contabo site row now selects **9001** for new clones;
+9000 remains a protected base until its last linked clone is destroyed.
+Their provisioning addresses are `10.77.0.150` and `10.77.0.151`, respectively.
+KVM source 300 and clone VMIDs 308–349 are unchanged. No clone drain or pause
+in dispatch is required while the new template builds.
+
+The director announces the rollout before and after on #231. Build one
+slot at a time. Keep the existing controller serving 9000 while staging
+these inputs and the new xtask; **do not install/restart the new controller
+until 9001 is qualified and its ACLs are ready**. The builder's fifth argument
+selects an approved agent slot independently of the running controller:
+
+```sh
+scripts/ci/build-template-debian.sh INPUT_DIR FULL_COMMIT STAGED_XTASK agent 9001
+```
+
+The builder refuses an existing VMID, including an existing template; it
+never destroys or replaces it. `ci-scaler site --lane agent --template 9001`
+and `ci-scaler vm-firewall --lane agent --template 9001` validate the same
+slot and render its network/firewall inputs. All other VMIDs are refused.
+The builder writes `/etc/pve/firewall/9001.fw`, enables the NIC firewall,
+keeps the source outside `carrick-ci`, and records its VMID in the manifest.
+Qualification includes the existing runner checks, `kvm` group membership
+and `ci-scaler verify-kvm` **as `carrick-dispatch-agent`**, which opens
+`/dev/kvm` and verifies API 12. A failed qualification preserves the new VM
+for diagnosis and leaves the running source alone.
+
+Before cutover, grant only source rights to both ACL principals:
+
+```sh
+pveum acl modify /vms/9001 --roles PVETemplateUser --users ci-scaler@pve
+pveum acl modify /vms/9001 --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+```
+
+Install the new controller binary and restart its service with the existing
+ledger. Startup checks the new source's template flag, resource shape,
+firewall and exact `VM.Audit`/`VM.Clone` rights before dispatching. Newly
+admitted clones use the active site row. Existing clones resume their own
+VMs, retaining the old linked base; neither their disks nor their ledger
+identities are rewritten. Validate a fresh dispatch round's worker KVM
+access and lease handoff; record the actual KVM test, template manifest and
+controller SHA in the rollout evidence. For the next rotation, change the
+site row back to the other qualified slot before deploying the controller.
+
+Retire 9000 only after cutover. As root on Contabo, run the **installed active
+controller version** (an old binary has the wrong active-source guard):
+
+```sh
+carrick-xtask ci-scaler check-template-retirement --template 9000 &&
+  qm destroy 9000
+```
+
+The read-only retirement check refuses the active source, unapproved VMIDs,
+non-templates, missing bases, unreadable storage and any qcow2 backing chain
+that references the old source. It inventories directory storage rather
+than only the ledger/pool, covering stopped and unpooled clones. Inspection
+uses `qemu-img info -U --backing-chain` so running clones keep their locks.
+It is a point-in-time check: Proxmox's own base-volume reference refusal
+remains the backstop at `qm destroy`. Never bypass that refusal or remove a
+base disk by hand. Preserve the old ACLs and firewall until destruction
+succeeds; then remove both source ACL grants and `/etc/pve/firewall/9000.fw`
+if Proxmox has not already removed it. Verify that neither agent source
+has joined `carrick-ci`; clones from both sources belong there. The freed
+slot can then be used by the next beside rebuild.

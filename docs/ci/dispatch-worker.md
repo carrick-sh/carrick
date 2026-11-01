@@ -3,7 +3,8 @@
 Every trigger enters one agent loop on an owner's `[carrick-agent]` disposable
 JIT clone. The controller caps the pool at four clones; the job cap is 85
 minutes. Clones are destroyed after every job, including failure and timeout.
-VM-local leases and template 9000 remain as in [Contabo setup](contabo-kvm.md).
+VM-local leases and agent templates (9000/9001) remain as in
+[Contabo setup](contabo-kvm.md).
 
 ## Admission and scope
 
@@ -862,7 +863,7 @@ Cargo against dependency-free fixtures.
 
 ## Worker KVM access and lease custody (#1351)
 
-Agent-profile template 9000 gives `carrick-dispatch-agent` membership in
+Agent-profile templates (9000/9001) give `carrick-dispatch-agent` membership in
 `kvm`; `carrick-dispatch-loop` has no KVM access. Neither model account
 joins the runner or sudo groups. The worker environment stays cleared.
 
@@ -881,7 +882,7 @@ never crosses into the worker. Before cleanup, the supervisor closes
 socket admission and drops the server's scope writer while retaining flock
 until workload retirement and lifetime EOF finish.
 
-Deploying this change requires rebuilding template 9000 from the updated
+Deploying this change requires rebuilding the agent template from the updated
 script, with the controller change announced before and after on #231.
 An existing clone retains its original account groups and lease mode.
 Validate a fresh dispatch round by opening `/dev/kvm` as the worker and
@@ -889,24 +890,27 @@ running a KVM-lane test, recording that the test actually ran.
 
 ## Agent template pool and ACLs (#762)
 
-Template 9000 is a clone source **outside** the `carrick-ci` pool. Template
-300 stays in the pool, and clones from either source are created in the pool.
+Agent templates 9000 and 9001 are clone sources **outside** the `carrick-ci`
+pool. Template 300 stays in the pool, and clones from either source are
+created in the pool.
 Pool membership grants administrative VM rights and must never be used for
-9000. Changing `carrick-ci` pool membership is a controller-affecting shared
-change: announce it before and after under AGENTS.md's “Multiple director
+either agent template. Changing `carrick-ci` pool membership is a shared
+controller change: announce it before and after under AGENTS.md's “Multiple director
 sessions” rules.
 
 The owner applies the source ACL to both the user and its privilege-separated
 token; both grants are needed:
 
 ```sh
-pveum acl modify /vms/9000 --roles PVETemplateUser --users ci-scaler@pve
-pveum acl modify /vms/9000 --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+pveum acl modify /vms/9001 --roles PVETemplateUser --users ci-scaler@pve
+pveum acl modify /vms/9001 --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
 ```
 
 With agent clones enabled, startup requires exactly `VM.Audit=1` and
-`VM.Clone=1` on 9000. The controller reads its configuration directly because
-its pool inventory intentionally excludes this source. The root-run builder
+`VM.Clone=1` on the active source. The inactive source may keep only
+those same read/clone rights until retirement. The controller reads the
+active source configuration directly because its pool inventory excludes
+agent templates. The root-run builder
 uses `qm` to start and stop the agent template during provisioning; the
 controller token retains only its inspection and clone rights.
 
@@ -926,7 +930,7 @@ and `scripts/ci/inputs/agent-tools.json` has no codex tool. A lone `codex`
 binary cannot run tools without `codex-code-mode-host`.
 
 When the pinned launcher's `CODEX_SDK_VERSION` changes, regenerate the lock
-file for the template's Python (3.13, x86_64) and rebuild template 9000.
+file for the template's Python (3.13, x86_64) and rebuild the agent template.
 The test `agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses`
 ties the builder, the lock file and the driver together.
 
@@ -961,3 +965,24 @@ as owner, and observe a new commit on that PR branch plus an outcome comment.
 Exercise `/agent` on an issue and a merge-conflicted owned PR, verify refusal
 of edited comments, comments from read-only or non-collaborator accounts and an unowned PR, and confirm both model uids
 retired. These trials also complete #799's pending live acceptance.
+
+## Rebuild an agent template beside the running source (#1384)
+
+Agent templates 9000 and 9001 are approved slots outside `carrick-ci`.
+The Contabo site row selects 9001 for new clones; existing clones keep the
+9000 base until they are destroyed. Their provisioning addresses are
+`10.77.0.150` and `10.77.0.151`, with separate VM firewall files.
+
+Follow the [beside rebuild procedure](contabo-kvm.md#rebuild-an-agent-template-beside-the-running-source-1384).
+Keep the old controller dispatching while building and qualifying the unused
+slot with the builder's fifth argument (`agent 9001`). Qualification now
+opens `/dev/kvm` as `carrick-dispatch-agent` as well as `runner`. Grant the
+new source's read/clone ACLs to both principals before deploying the new
+controller. Sources stay outside the pool; their clones go into it.
+
+After cutover, `ci-scaler check-template-retirement --template 9000` checks
+all local qcow2 backing chains, including stopped and unpooled clones.
+It refuses active or referenced templates. Only then attempt `qm destroy`;
+Proxmox's own linked-base refusal remains the backstop. Keep the old ACLs
+and firewall until destruction succeeds. The director records rollout
+announcements and live worker KVM/lease evidence on #231.

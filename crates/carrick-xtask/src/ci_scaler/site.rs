@@ -4,6 +4,31 @@
 
 use super::ScalerError;
 
+/// The only agent base images admitted by the Contabo rollout contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentTemplate {
+    Blue,
+    Green,
+}
+impl AgentTemplate {
+    pub fn vmid(self) -> u16 {
+        match self {
+            Self::Blue => 9000,
+            Self::Green => 9001,
+        }
+    }
+}
+impl TryFrom<u16> for AgentTemplate {
+    type Error = ScalerError;
+    fn try_from(vmid: u16) -> Result<Self, Self::Error> {
+        match vmid {
+            9000 => Ok(Self::Blue),
+            9001 => Ok(Self::Green),
+            _ => Err(ScalerError::Guard("unapproved agent template VMID")),
+        }
+    }
+}
+
 /// How admission measures free space on the clone storage before booting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Headroom {
@@ -37,6 +62,7 @@ pub(super) enum Network {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Site {
     pub lane: super::CloneLane,
+    pub agent_template: Option<AgentTemplate>,
     /// `/etc/hostname`, which is also the PVE node name.
     pub node: &'static str,
     /// Name on the node's PVE certificate; resolved to 127.0.0.1.
@@ -59,6 +85,7 @@ pub(super) struct Site {
 
 pub(super) const WILLOW: Site = Site {
     lane: super::CloneLane::Kvm,
+    agent_template: None,
     node: "willow",
     api_host: "willow.atxconsulting.com",
     api_ca: None,
@@ -76,6 +103,7 @@ pub(super) const WILLOW: Site = Site {
 /// directory storage, and the agent-worker VMs/template protected.
 pub(super) const CONTABO: Site = Site {
     lane: super::CloneLane::Kvm,
+    agent_template: Some(AgentTemplate::Green),
     node: "carrick-ctb",
     api_host: "carrick-ctb.turkey-moth.ts.net",
     api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -91,14 +119,35 @@ pub(super) const CONTABO: Site = Site {
     cores: 8,
     memory_mib: 16384,
     disk_gib: 100,
-    protected: &[101, 102, 103, 104, 9000],
+    protected: &[101, 102, 103, 104, 9000, 9001],
 };
 
 pub(super) const SITES: [Site; 2] = [WILLOW, CONTABO];
 
 impl Site {
+    pub(super) fn template(&self) -> Result<u16, ScalerError> {
+        match self.lane {
+            super::CloneLane::Kvm => Ok(300),
+            super::CloneLane::Agent => self
+                .agent_template
+                .map(AgentTemplate::vmid)
+                .ok_or(ScalerError::Guard("site has no agent template")),
+        }
+    }
+    /// Builder override: approved inactive slots are allowed only on the agent site.
+    pub(super) fn with_template(mut self, vmid: Option<u16>) -> Result<Self, ScalerError> {
+        if let Some(vmid) = vmid {
+            if self.lane != super::CloneLane::Agent || self.agent_template.is_none() {
+                return Err(ScalerError::Guard("template override requires agent site"));
+            }
+            self.agent_template = Some(AgentTemplate::try_from(vmid)?);
+        }
+        Ok(self)
+    }
+
     pub(super) fn for_lane(self, lane: super::CloneLane) -> Result<Self, ScalerError> {
         let mut site = Self::for_hostname(self.node)?;
+        site.agent_template = self.agent_template;
         if lane == super::CloneLane::Agent {
             if site.node != CONTABO.node {
                 return Err(ScalerError::Guard("agent clones require Contabo"));
@@ -146,10 +195,14 @@ impl Site {
                 gateway,
                 ..
             } => {
-                if !(300..=349).contains(&vmid) && vmid != 9000 {
+                if !(300..=349).contains(&vmid) && AgentTemplate::try_from(vmid).is_err() {
                     return Err(ScalerError::Guard("static address outside CI VMIDs"));
                 }
-                let host = if vmid == 9000 { 150 } else { vmid - 200 };
+                let host = if AgentTemplate::try_from(vmid).is_ok() {
+                    150 + vmid - 9000
+                } else {
+                    vmid - 200
+                };
                 Ok(format!("ip={a}.{b}.{c}.{host}/24,gw={a}.{b}.{c}.{gateway}"))
             }
         }
@@ -236,12 +289,16 @@ impl Site {
             Network::Static {
                 subnet: [a, b, c], ..
             } => {
-                if !(300..=349).contains(&vmid) && vmid != 9000 {
+                if !(300..=349).contains(&vmid) && AgentTemplate::try_from(vmid).is_err() {
                     return Err(ScalerError::Guard("static address outside CI VMIDs"));
                 }
                 Ok(Some(format!(
                     "{a}.{b}.{c}.{}",
-                    if vmid == 9000 { 150 } else { vmid - 200 }
+                    if AgentTemplate::try_from(vmid).is_ok() {
+                        150 + vmid - 9000
+                    } else {
+                        vmid - 200
+                    }
                 )))
             }
         }
@@ -292,12 +349,12 @@ impl Site {
             self.cores,
             self.memory_mib,
             self.disk_gib,
-            self.ipconfig(self.lane.template())?,
+            self.ipconfig(self.template()?)?,
             self.nameserver().unwrap_or("none"),
             u8::from(self.isolates_bridge()),
             self.api_ca.unwrap_or("system"),
             u8::from(self.allows_ksm()),
-            self.lane.template(),
+            self.template()?,
         ))
     }
 }
@@ -363,12 +420,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builder_selects_only_approved_agent_template_slots() {
+        let site = CONTABO.for_lane(super::super::CloneLane::Agent).unwrap();
+        for (vmid, address) in [(9000, "10.77.0.150"), (9001, "10.77.0.151")] {
+            let target = site.with_template(Some(vmid)).unwrap();
+            assert_eq!(target.template().unwrap(), vmid);
+            assert!(
+                target
+                    .shell_env()
+                    .unwrap()
+                    .contains(&format!("SITE_TEMPLATE_VMID={vmid}\n"))
+            );
+            assert!(
+                target
+                    .vm_firewall_file(vmid)
+                    .unwrap()
+                    .unwrap()
+                    .contains(address)
+            );
+        }
+        for vmid in [300, 308, 8999, 9002, u16::MAX] {
+            assert!(site.with_template(Some(vmid)).is_err());
+        }
+        assert!(CONTABO.with_template(Some(9001)).is_err());
+        assert!(WILLOW.for_lane(super::super::CloneLane::Agent).is_err());
+    }
+
+    #[test]
     fn willow_row_is_pinned_to_the_pre_site_constants() {
         // Exactly the values live.rs hard-coded before sites existed.
         assert_eq!(
             WILLOW,
             Site {
                 lane: super::super::CloneLane::Kvm,
+                agent_template: None,
                 node: "willow",
                 api_host: "willow.atxconsulting.com",
                 api_ca: None,
@@ -401,6 +486,7 @@ mod tests {
             CONTABO,
             Site {
                 lane: super::super::CloneLane::Kvm,
+                agent_template: Some(AgentTemplate::Green),
                 node: "carrick-ctb",
                 api_host: "carrick-ctb.turkey-moth.ts.net",
                 api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -416,7 +502,7 @@ mod tests {
                 cores: 8,
                 memory_mib: 16384,
                 disk_gib: 100,
-                protected: &[101, 102, 103, 104, 9000],
+                protected: &[101, 102, 103, 104, 9000, 9001],
             }
         );
         assert_eq!(
@@ -450,12 +536,12 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
         let site = CONTABO.for_lane(super::super::CloneLane::Agent).unwrap();
         let env = site.shell_env().unwrap();
         for line in [
-            "SITE_TEMPLATE_VMID=9000",
+            "SITE_TEMPLATE_VMID=9001",
             "SITE_CORES=8",
             "SITE_MEMORY_MIB=20480",
             "SITE_ALLOW_KSM=0",
             "SITE_VM_FIREWALL=1",
-            "SITE_TEMPLATE_IPCONFIG=ip=10.77.0.150/24,gw=10.77.0.1",
+            "SITE_TEMPLATE_IPCONFIG=ip=10.77.0.151/24,gw=10.77.0.1",
         ] {
             assert!(env.lines().any(|actual| actual == line), "{line}");
         }
@@ -465,8 +551,8 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
         );
         assert_eq!(site.cores, 8);
         assert_eq!(site.memory_mib, 20480);
-        assert_eq!(site.lane.template(), 9000);
-        assert_eq!(site.protected, &[101, 102, 103, 104, 9000]);
+        assert_eq!(site.template().unwrap(), 9001);
+        assert_eq!(site.protected, &[101, 102, 103, 104, 9000, 9001]);
         assert_eq!(site.static_address(9000).unwrap().unwrap(), "10.77.0.150");
         assert!(
             site.vm_firewall_file(9000)
