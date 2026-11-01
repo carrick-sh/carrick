@@ -146,7 +146,11 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   include it. Contention fails explicitly after `HOST_LEASE_WAIT_LIMIT` (one
   hour), never skips. `CARRICK_HOST_LEASE_PATH` changes the lock file for tests;
   every participant on a gate host must use the same path. Never unlink a live
-  lock file.
+  lock file. Quietness is for **performance measurement**, where load changes
+  the measured number; a **correctness** verdict (signed EL1 suites, smoke,
+  conformance) must hold under host load (owner, 2026-11-01, #231). Never wait
+  for a quiet box or re-run before one: a verdict that changes with load is a
+  kernel defect, filed `flaky`.
 - **Contabo leases are per VM, never the whole hypervisor** (owner decision
   [#639](https://github.com/carrick-sh/carrick/issues/639), supersedes #565).
   KVM and agent clones use their in-VM lease; the standing controller takes no
