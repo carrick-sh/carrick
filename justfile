@@ -486,8 +486,9 @@ test-kernel-semantics *ARGS:
 # fixtures leak `'static` structures for the life of their process, and one
 # process running the whole suite exhausted a 16 GiB runner (#1297).
 test-el1-native *ARGS:
-    {{_admit}} {{_xtask}} test-isolated --package carrick-el1-linux --skip serial_host --cargo-config {{quote(CARRICK_CARGO_CACHE_CONFIG)}} {{ARGS}}
-    {{_admit}} {{_xtask}} test-isolated --package carrick-el1-linux --only serial_host --jobs 1 --cargo-config {{quote(CARRICK_CARGO_CACHE_CONFIG)}} {{ARGS}}
+    # One invocation runs both sets and fails at the end: as two recipe
+    # lines, a failing parallel line stopped just before `serial_host` (#1313).
+    {{_admit}} {{_xtask}} test-isolated --package carrick-el1-linux --serial serial_host --cargo-config {{quote(CARRICK_CARGO_CACHE_CONFIG)}} {{ARGS}}
 
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test-mm-owner *ARGS:

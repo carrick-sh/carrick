@@ -32,6 +32,10 @@ pub struct TestIsolatedArgs {
     /// Skip tests whose names contain this text (libtest `--skip` rule).
     #[arg(long)]
     pub skip: Option<String>,
+    /// Tests whose names contain this run after the rest, one at a time
+    /// (`serial_host`). Both sets always run; the verdict comes at the end.
+    #[arg(long)]
+    pub serial: Option<String>,
     /// Concurrent test processes. Defaults to `RUST_TEST_THREADS`, then the
     /// available parallelism: the same count libtest's threads would use.
     #[arg(long)]
@@ -226,6 +230,55 @@ fn run_one(binary: &Path, name: &str, timeout: std::time::Duration) -> Outcome {
     }
 }
 
+/// Run `parallel` in a pool of `jobs` processes, then `serial` one at a
+/// time, printing each outcome as it lands. Every test runs whatever came
+/// before it, so a failing parallel test can't hide the serial ones.
+pub fn execute(
+    binary: &Path,
+    parallel: Vec<String>,
+    serial: Vec<String>,
+    jobs: usize,
+    timeout: std::time::Duration,
+    out: &mut dyn Write,
+) -> Vec<(String, Outcome)> {
+    let mut results = Vec::new();
+    for (tests, jobs) in [(parallel, jobs.max(1)), (serial, 1)] {
+        let queue = Arc::new(Mutex::new(tests.into_iter().collect::<VecDeque<_>>()));
+        let (send, receive) = mpsc::channel();
+        let workers: Vec<_> = (0..jobs)
+            .map(|_| {
+                let queue = Arc::clone(&queue);
+                let send = send.clone();
+                let binary = binary.to_owned();
+                std::thread::spawn(move || {
+                    loop {
+                        let next = queue.lock().ok().and_then(|mut q| q.pop_front());
+                        let Some(name) = next else { break };
+                        let outcome = run_one(&binary, &name, timeout);
+                        if send.send((name, outcome)).is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(send);
+        for (name, outcome) in receive {
+            let word = match outcome {
+                Outcome::Ok => "ok",
+                Outcome::Ignored => "ignored",
+                Outcome::Failed(_) => "FAILED",
+            };
+            let _ = writeln!(out, "test {name} ... {word}");
+            results.push((name, outcome));
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+    results
+}
+
 pub fn run(root: &Path, args: TestIsolatedArgs) -> Result<()> {
     let binary = compile(root, &args)?;
     let listing = Command::new(&binary)
@@ -246,48 +299,19 @@ pub fn run(root: &Path, args: TestIsolatedArgs) -> Result<()> {
         .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
         .unwrap_or(1)
         .max(1);
+    let (serial, parallel): (Vec<_>, Vec<_>) = tests
+        .into_iter()
+        .partition(|name| args.serial.as_deref().is_some_and(|f| name.contains(f)));
     let mut stdout = std::io::stdout().lock();
     let _ = writeln!(
         stdout,
         "     Running unittests src/lib.rs ({})\n\nrunning {} tests",
         binary.display(),
-        tests.len()
+        parallel.len() + serial.len()
     );
     let started = Instant::now();
-    let queue = Arc::new(Mutex::new(tests.into_iter().collect::<VecDeque<_>>()));
-    let (send, receive) = mpsc::channel();
-    let workers: Vec<_> = (0..jobs)
-        .map(|_| {
-            let queue = Arc::clone(&queue);
-            let send = send.clone();
-            let binary = binary.clone();
-            let timeout = std::time::Duration::from_secs(args.timeout_secs);
-            std::thread::spawn(move || {
-                loop {
-                    let next = queue.lock().ok().and_then(|mut q| q.pop_front());
-                    let Some(name) = next else { break };
-                    let outcome = run_one(&binary, &name, timeout);
-                    if send.send((name, outcome)).is_err() {
-                        break;
-                    }
-                }
-            })
-        })
-        .collect();
-    drop(send);
-    let mut results = Vec::new();
-    for (name, outcome) in receive {
-        let word = match outcome {
-            Outcome::Ok => "ok",
-            Outcome::Ignored => "ignored",
-            Outcome::Failed(_) => "FAILED",
-        };
-        let _ = writeln!(stdout, "test {name} ... {word}");
-        results.push((name, outcome));
-    }
-    for worker in workers {
-        let _ = worker.join();
-    }
+    let timeout = std::time::Duration::from_secs(args.timeout_secs);
+    let results = execute(&binary, parallel, serial, jobs, timeout, &mut stdout);
     let (text, ok) = summary(&binary, &results, started.elapsed().as_secs_f64());
     let _ = write!(stdout, "{text}");
     let _ = stdout.flush();
@@ -389,6 +413,58 @@ mod tests {
             matches!(&outcome, Outcome::Failed(t) if t.contains("ran no test")),
             "{outcome:?}"
         );
+    }
+
+    /// #1313: a failing parallel test doesn't stop the serial set; both
+    /// sets run and both outcomes are itemized.
+    #[test]
+    fn serial_tests_run_after_a_parallel_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("ran");
+        let stand_in = dir.path().join("tests");
+        // `--exact <name> --test-threads=1`: fail `par_fails`, pass the rest.
+        crate::lock_file::tests::write_test_executable(
+            &stand_in,
+            format!(
+                "#!/bin/sh\necho \"$2\" >> '{}'\n[ \"$2\" = par_fails ] && exit 101\necho 'test result: ok. 1 passed; 0 failed; 0 ignored;'\n",
+                log.display()
+            ),
+            std::fs::Permissions::from_mode(0o755),
+        );
+        let mut out = Vec::new();
+        let results = execute(
+            &stand_in,
+            vec!["par_fails".into(), "par_ok".into()],
+            vec!["serial_host_one".into()],
+            2,
+            std::time::Duration::from_secs(10),
+            &mut out,
+        );
+        let ran = std::fs::read_to_string(&log).unwrap();
+        assert!(ran.lines().any(|l| l == "serial_host_one"), "{ran}");
+        let outcome = |n: &str| results.iter().find(|(name, _)| name == n).map(|(_, o)| o);
+        assert!(matches!(outcome("par_fails"), Some(Outcome::Failed(_))));
+        assert_eq!(outcome("par_ok"), Some(&Outcome::Ok));
+        assert_eq!(outcome("serial_host_one"), Some(&Outcome::Ok));
+        // The serial set ran after the whole parallel set.
+        assert_eq!(ran.lines().last(), Some("serial_host_one"));
+    }
+
+    /// #1313: `just` stops a recipe at its first failing line, so the
+    /// recipe must run both partitions in one `test-isolated` invocation.
+    #[test]
+    fn test_el1_native_runs_both_partitions_in_one_invocation() {
+        let justfile = include_str!("../../../justfile");
+        let start = justfile.find("\ntest-el1-native *ARGS:\n").unwrap();
+        let body: Vec<&str> = justfile[start + 1..]
+            .lines()
+            .skip(1)
+            .take_while(|l| l.starts_with("    ") || l.is_empty())
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .collect();
+        assert_eq!(body.len(), 1, "{body:?}");
+        assert!(body[0].contains("test-isolated") && body[0].contains("--serial serial_host"));
     }
 
     /// Output parses exactly as `cargo test`'s does for `xtask accept`.
