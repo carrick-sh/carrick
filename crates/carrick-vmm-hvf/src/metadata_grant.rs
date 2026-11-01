@@ -2221,6 +2221,11 @@ pub(crate) fn handle_metadata_grant_trap(
     } else {
         None
     };
+    // The authenticated exiting MM names the terminal's process when no host
+    // task is loaded on this vCPU (an idle-entry crossing).
+    let root_mm = execution
+        .as_ref()
+        .map(|(execution, _)| execution.binding.mm);
     let result = if op == carrick_el1_abi::GRANT_OP_RESIDENCY_KICK {
         let slot = usize::try_from(arg1)
             .ok()
@@ -2339,7 +2344,7 @@ pub(crate) fn handle_metadata_grant_trap(
         .map_err(|e| TrapError::Hypervisor(format!("set X2: {e}")))?;
     vcpu.set_reg(Reg::X3, result[3])
         .map_err(|e| TrapError::Hypervisor(format!("set X3: {e}")))?;
-    classify_metadata_trap(op, result)
+    classify_metadata_trap(op, result, root_mm)
 }
 
 /// Observe an authenticated stopped execution without granting or editing it.
@@ -2397,11 +2402,20 @@ fn service_fork_refusal_using_region(
 #[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub(crate) enum MetadataTrapOutcome {
     Resume,
-    RootExit(carrick_sched_core::process::TerminationStatus),
+    RootExit {
+        status: carrick_sched_core::process::TerminationStatus,
+        /// The authenticated exiting MM: on an idle-entry vCPU this is the
+        /// only name for the process whose terminal the host must enter.
+        mm: carrick_core_abi::EntryMmKey,
+    },
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn classify_metadata_trap(op: u64, reply: [u64; 4]) -> Result<MetadataTrapOutcome, TrapError> {
+fn classify_metadata_trap(
+    op: u64,
+    reply: [u64; 4],
+    root_mm: Option<carrick_core_abi::EntryMmKey>,
+) -> Result<MetadataTrapOutcome, TrapError> {
     if op != GRANT_OP_ROOT_EXIT {
         return Ok(MetadataTrapOutcome::Resume);
     }
@@ -2413,10 +2427,14 @@ fn classify_metadata_trap(op: u64, reply: [u64; 4]) -> Result<MetadataTrapOutcom
     }
     let status = i32::try_from(reply[1])
         .map_err(|_| TrapError::Hypervisor("invalid root-exit status".into()))?;
-    Ok(MetadataTrapOutcome::RootExit(
-        carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(status)
+    // A successful reply exists only for an authenticated execution.
+    let mm = root_mm
+        .ok_or_else(|| TrapError::Hypervisor("root exit without its authenticated MM".into()))?;
+    Ok(MetadataTrapOutcome::RootExit {
+        status: carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(status)
             .to_termination_status(),
-    ))
+        mm,
+    })
 }
 
 /// Read only a complete aligned terminal record on the stopped CPU's ABI stack.
@@ -3089,14 +3107,17 @@ mod tests {
                 carrick_sched_core::process::TerminationStatus::signaled(9, false),
             ),
         ] {
+            let mm = carrick_core_abi::EntryMmKey::from_raw(41);
             assert_eq!(
-                classify_metadata_trap(GRANT_OP_ROOT_EXIT, [0, wire, 0, 0]).unwrap(),
-                MetadataTrapOutcome::RootExit(status)
+                classify_metadata_trap(GRANT_OP_ROOT_EXIT, [0, wire, 0, 0], Some(mm)).unwrap(),
+                MetadataTrapOutcome::RootExit { status, mm }
             );
+            // A success without its authenticated MM names no process.
+            assert!(classify_metadata_trap(GRANT_OP_ROOT_EXIT, [0, wire, 0, 0], None).is_err());
         }
-        assert!(classify_metadata_trap(GRANT_OP_ROOT_EXIT, [1, 0, 0, 0]).is_err());
+        assert!(classify_metadata_trap(GRANT_OP_ROOT_EXIT, [1, 0, 0, 0], None).is_err());
         assert_eq!(
-            classify_metadata_trap(METADATA_GRANT_OP_ALLOC, [0; 4]).unwrap(),
+            classify_metadata_trap(METADATA_GRANT_OP_ALLOC, [0; 4], None).unwrap(),
             MetadataTrapOutcome::Resume
         );
     }

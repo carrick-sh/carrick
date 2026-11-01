@@ -642,6 +642,13 @@ pub(crate) enum GuestIdleExit {
     /// A parked native continuation; physical backing custody survives the lane.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     Service(Box<carrick_vmm_hvf::metadata_grant::NativeService>),
+    /// The in-ring process owner crossed its authenticated root exit on this
+    /// vCPU while no host task was loaded. The process terminal is owed to a
+    /// host member of the process that owns `mm`; this executor holds none.
+    RootExit {
+        status: carrick_sched_core::process::TerminationStatus,
+        mm: carrick_core_abi::EntryMmKey,
+    },
     /// No guest scheduler on this backend or carrier.
     Unsupported,
 }
@@ -1622,6 +1629,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         match exit? {
             carrick_aarch64::Aarch64Exit::Halt => {
                 Ok(GuestIdleExit::Idle(SettledIdleSlot::admit(Some(slot))?))
+            }
+            // A native-owned record ran at EL0 from the zone and its owner
+            // ended the process here. The crossing never re-enters this guest
+            // stack; the slot holds no record for the next idle entry.
+            carrick_aarch64::Aarch64Exit::NativeRootExit { status, mm } => {
+                Ok(GuestIdleExit::RootExit { status, mm })
             }
             other => {
                 let held = zone.slot(slot).current().map(|record| {

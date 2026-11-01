@@ -1160,6 +1160,36 @@ impl Drop for NativeOwnerWaitRegistration {
 }
 
 impl Kernel {
+    /// Hand an authenticated root exit that crossed on an idle vCPU to the
+    /// exiting process's host members.
+    ///
+    /// The in-ring process owner crosses its root exit from whichever vCPU
+    /// runs it. On an executor waiting in the guest scheduler no host task is
+    /// loaded, so no binding can enter the process terminal there. The status
+    /// is retained on the exact task that owns `mm` and every host member is
+    /// returned for a control wake; the first to reach its loop top takes the
+    /// status and owns the terminal, as a loaded member does when the crossing
+    /// lands on its own vCPU. Empty: no live task owns `mm`, so nothing could
+    /// ever consume the terminal and the caller must fail closed.
+    pub fn publish_idle_root_exit(
+        &self,
+        mm: carrick_core_abi::EntryMmKey,
+        status: carrick_sched_core::process::TerminationStatus,
+    ) -> Vec<ThreadKey> {
+        let mut members = Vec::new();
+        for id in self.registry().task_ids() {
+            let Some(task) = self.registry().task(id) else {
+                continue;
+            };
+            if task.shared().mm().id().raw() != mm.raw() {
+                continue;
+            }
+            task.publish_native_root_exit(status);
+            members.extend(task.threads().iter().map(|thread| thread.key()));
+        }
+        members
+    }
+
     /// Deliver only the released member's record interests. Record reuse and a
     /// later park cannot receive this notification; enrollment's own probe
     /// handles a release which preceded registration.

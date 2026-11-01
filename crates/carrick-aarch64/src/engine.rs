@@ -2627,7 +2627,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     owed_kick.settle(self.vcpu.get_mut())?;
                     return Ok(None);
                 }
-                Aarch64Exit::NativeRootExit(status) => {
+                Aarch64Exit::NativeRootExit { status, .. } => {
                     owed_kick.settle(self.vcpu.get_mut())?;
                     return Err(TrapError::NativeRootExit { status });
                 }
@@ -3262,7 +3262,7 @@ fn exit_variant_name(exit: &Aarch64Exit) -> &'static str {
         Aarch64Exit::Sys64Read { .. } => "Sys64Read",
         Aarch64Exit::MaintenanceDone => "MaintenanceDone",
         Aarch64Exit::Halt => "Halt",
-        Aarch64Exit::NativeRootExit(_) => "NativeRootExit",
+        Aarch64Exit::NativeRootExit { .. } => "NativeRootExit",
         Aarch64Exit::Kicked => "Kicked",
         Aarch64Exit::Memory { .. } => "Memory",
     }

@@ -490,8 +490,18 @@ type InheritedStateRow = (u64, u64, u64, u64, u64);
 
 type NativeTerminalIdleEntry = Box<dyn FnOnce() -> Result<(), TrapError> + Send>;
 
+/// An authenticated root exit status and its exiting MM.
+type IdleRootExit = (
+    carrick_sched_core::process::TerminationStatus,
+    carrick_core_abi::EntryMmKey,
+);
+
 #[derive(Clone, Default)]
 struct FakeFactory {
+    /// One authenticated root exit the idle vCPU receives with no host task
+    /// loaded, as the HVF backend reports `Aarch64Exit::NativeRootExit` from
+    /// its idle entry. Physical entry is the only thing substituted.
+    idle_root_exit: Option<Arc<parking_lot::Mutex<Option<IdleRootExit>>>>,
     native_terminal_entry: Option<Arc<parking_lot::Mutex<Option<NativeTerminalIdleEntry>>>>,
     native_services: Option<Arc<parking_lot::Mutex<carrick_el1_linux::native_process_runtime::host_test_support::NativeServiceCapacityFixture>>>,
     native_progress: Option<std::sync::mpsc::Sender<usize>>,
@@ -999,10 +1009,20 @@ impl PersistentExecutor for FakeExecutor {
     type TaskBinding = FakeBinding;
 
     fn has_physical_idle_lane(&self) -> bool {
-        self.factory.native_services.is_some() || self.factory.native_terminal_entry.is_some()
+        self.factory.native_services.is_some()
+            || self.factory.native_terminal_entry.is_some()
+            || self.factory.idle_root_exit.is_some()
     }
 
     fn wait_in_guest(&mut self) -> Result<super::GuestIdleExit, TrapError> {
+        if let Some((status, mm)) = self
+            .factory
+            .idle_root_exit
+            .as_ref()
+            .and_then(|exit| exit.lock().take())
+        {
+            return Ok(super::GuestIdleExit::RootExit { status, mm });
+        }
         if let Some(entry) = self
             .factory
             .native_terminal_entry
@@ -8915,6 +8935,55 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
         );
         assert_eq!(scheduler.queued_len(), 0);
     });
+}
+
+/// kernel.scheduler.runnable-progress: the in-ring owner's root exit can
+/// cross on an executor waiting in the guest scheduler, with no host task
+/// loaded there. That executor must hand the terminal to the exiting
+/// process's parked host member and keep serving; dying left the member
+/// parked and the run's result waiter unpublished forever (the
+/// `el1_thread_lifecycle_mask_storm_exactly_once` hang under #1044).
+#[test]
+fn idle_vcpu_root_exit_wakes_the_parked_member_with_its_terminal() {
+    let (kernel, root) = bootstrap(19_795);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let kick = WorkerKick::new(Arc::new(ReceiptLog::default()));
+    let idle = scheduler
+        .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+        .unwrap();
+    let _authority = enqueue_root(&scheduler, &root, publish(&root, 1095));
+    // The member parks on the host: its zone record runs on in the guest.
+    scheduler
+        .settle_blocked(scheduler.take(&idle).unwrap(), BlockedReason::HostWait)
+        .unwrap();
+    let status = carrick_sched_core::process::TerminationStatus::signaled(11, true);
+    let mm = carrick_core_abi::EntryMmKey::from_raw(root.shared().mm().id().raw());
+    let factory = FakeFactory {
+        idle_root_exit: Some(Arc::new(parking_lot::Mutex::new(Some((status, mm))))),
+        ..FakeFactory::default()
+    };
+    let mut backend = factory.create(&idle).unwrap();
+    let next = super::next_runnable(&scheduler, &mut backend, &idle, &kick);
+    assert!(
+        matches!(next, Ok(None)),
+        "the idle executor survives the crossing and keeps serving"
+    );
+    let running = scheduler
+        .try_take(&idle)
+        .unwrap()
+        .expect("the parked member is runnable to take its terminal");
+    assert_eq!(running.thread_key(), root.thread().key());
+    assert_eq!(
+        root.task().take_native_root_exit(),
+        Some(status),
+        "the member's task carries the authenticated status"
+    );
+    assert_eq!(
+        root.task().take_native_root_exit(),
+        None,
+        "exactly one member owns the process terminal"
+    );
+    scheduler.settle_exited(running).unwrap();
 }
 
 /// A native terminal park refused by a pending host request must retain its
