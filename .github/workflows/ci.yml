@@ -261,6 +261,7 @@ jobs:
       pull-requests: read
     outputs:
       heavy: ${{ steps.filter.outputs.heavy }}
+      kvm: ${{ steps.filter.outputs.kvm }}
       macos: ${{ steps.filter.outputs.macos }}
       el1_native: ${{ steps.filter.outputs.el1_native }}
       workflows: ${{ steps.filter.outputs.workflows }}
@@ -2105,6 +2106,206 @@ jobs:
         if: ${{ always() }}
         run: just ci-cache-finish
 
+  # Pre-landing KVM evidence (#1366): merge groups whose changes touch the
+  # KVM closure (`ci-changes` kvm output: kvm-lane packages, x86/CPL0,
+  # soft-CPU and their Linux dependency closure, plus shared build/CI
+  # inputs) run every kvm-lane test on a disposable self-hosted KVM clone
+  # (Contabo, `ci-scaler standing`). Pull requests never run here. The job
+  # body matches kernel-runtime.yml's kvm-tests-willow, which keeps
+  # publishing the main-push baselines this lane is graded against.
+  kvm-tests:
+    name: KVM · x86 kvm-lane tests (Willow)
+    needs: [changes]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'merge_group' &&
+          needs.changes.outputs.kvm == 'true' &&
+          vars.CARRICK_SELF_HOSTED_KVM == 'true' }}
+    runs-on: [self-hosted, Linux, X64, willow-kvm]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify KVM host
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Install per-user compiler cache
+        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+
+      - name: Install x86 image and fixture targets
+        run: rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
+
+      # `xtask accept --profile kvm` runs `just test-kvm` and records every
+      # failing `<test-binary>::<test>` in the receipt (one format with the
+      # signed lane).
+      - name: KVM-lane receipt (CARRICK_REQUIRE_KVM=1)
+        run: |
+          set -euo pipefail
+          # Persistent workspaces: a stale receipt must not stand in for this run.
+          rm -rf target/ci-receipts target/el1-gate
+          mkdir -p target/ci-receipts
+          status=0
+          just accept --profile kvm --receipt target/ci-receipts/receipt.json || status=$?
+          echo "xtask accept exited $status"
+          test -s target/ci-receipts/receipt.json
+
+      # Lane jobs only produce and upload receipts; they never wait for a
+      # base receipt, so a queued entry can never hold the runner its base
+      # entry needs. The hosted `*-gate` jobs compare.
+      - name: Upload per-SHA receipt
+        if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          # The attempt keeps a re-run from colliding with an earlier upload;
+          # the gate picks the newest attempt.
+          name: receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/ci-receipts/receipt.json
+          if-no-files-found: error
+
+      # `xtask accept --profile kvm` writes per-step logs (e.g.
+      # `01-kvm-tests.log`) under `target/el1-gate/<short-sha>/`.
+      - name: Upload step logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvm-logs-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/el1-gate/
+          if-no-files-found: ignore
+
+  # Grades the merge-group receipt against the nearest receipted first-parent
+  # main ancestor of the queued commit (the merge-group base once its
+  # main-push KVM run has published). The selector is built from trusted
+  # refs/heads/main and the comparison from the selected baseline's own
+  # xtask, never from candidate code. Same shape as el1-native-gate.
+  kvm-gate:
+    name: KVM · receipt gate vs receipted main ancestor
+    permissions:
+      contents: read
+      actions: read
+    needs: [changes, kvm-tests]
+    if: github.event_name == 'merge_group' && needs.changes.outputs.kvm == 'true' && needs.kvm-tests.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Check out trusted main for baseline selection
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/heads/main
+          path: selector
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve trusted main first-parent ancestor
+        id: ancestor
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ || "$GITHUB_SHA" =~ ^0{40}$ ]]; then
+            echo "::error title=Invalid candidate commit::Missing, zero or malformed GITHUB_SHA"
+            printf "## Invalid candidate commit\n\nMissing, zero or malformed \`GITHUB_SHA\`; no comparison was made.\n" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          SELECTOR_SHA="$(git -C selector rev-parse --verify HEAD)"
+          git -C selector fetch --no-tags origin "$GITHUB_SHA" \
+            || git -C selector fetch --no-tags origin "+$GITHUB_REF:refs/carrick/candidate"
+          git -C selector cat-file -e "${GITHUB_SHA}^{commit}"
+          git -C selector rev-list --first-parent HEAD > "$RUNNER_TEMP/main-first-parent"
+          if ! git -C selector rev-list --first-parent "${GITHUB_SHA}^1" > "$RUNNER_TEMP/candidate-first-parent"; then
+            echo "::error title=Invalid candidate history::Candidate $GITHUB_SHA has no first parent"
+            printf "## Invalid candidate history\n\nCandidate \`%s\` has no first parent; no comparison was made.\n" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          BEFORE_SHA="$(awk 'NR==FNR { main[$1]=1; next } ($1 in main) { print $1; exit }' "$RUNNER_TEMP/main-first-parent" "$RUNNER_TEMP/candidate-first-parent")"
+          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error title=No main ancestor::Candidate $GITHUB_SHA shares no first-parent ancestor with refs/heads/main"
+            printf "## No main ancestor\n\nCandidate \`%s\` shares no first-parent ancestor with \`refs/heads/main\`; no comparison was made.\n" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          {
+            echo "selector_sha=$SELECTOR_SHA"
+            echo "before_sha=$BEFORE_SHA"
+          } >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: gate-xtask-release-v2
+          workspaces: selector -> target
+          cache-workspace-crates: "true"
+          cache-targets: false
+          save-if: false
+      - name: Build the trusted selector
+        working-directory: selector
+        run: |
+          rustup show active-toolchain
+          cargo build --locked --release -p carrick-xtask
+      - name: Select the nearest trusted receipt baseline
+        id: baseline
+        working-directory: selector
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ steps.ancestor.outputs.before_sha }}
+        run: >-
+          target/release/carrick-xtask ci-receipt select-baseline --lane kvm
+          --before-sha "$BEFORE_SHA" --candidate-sha "$GITHUB_SHA"
+          --wait-minutes 90 --poll-seconds 60
+      - name: Check out the selected baseline cleanly
+        if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.baseline.outputs.sha }}
+          path: baseline
+          clean: true
+          persist-credentials: false
+      - name: Fetch candidate commit objects into baseline repository
+        if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
+        run: |
+          set -euo pipefail
+          git -C baseline fetch --no-tags --depth=1 origin "$GITHUB_SHA" \
+            || git -C baseline fetch --no-tags --depth=1 origin "+$GITHUB_REF:refs/carrick/candidate"
+          git -C baseline cat-file -e "${GITHUB_SHA}^{commit}"
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
+        with:
+          shared-key: gate-xtask-release-v2
+          workspaces: baseline -> target
+          cache-workspace-crates: "true"
+          cache-targets: false
+          save-if: false
+      - name: Build the selected baseline xtask with its own lockfile
+        if: ${{ steps.baseline.outputs.sha != steps.ancestor.outputs.selector_sha }}
+        working-directory: baseline
+        run: |
+          rustup show active-toolchain
+          cargo build --locked --release -p carrick-xtask
+      - name: Download candidate receipt data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: receipt-kvm-${{ github.sha }}-*
+          path: ${{ runner.temp }}/candidate
+      - name: Compare using the selected baseline's code
+        working-directory: ${{ steps.baseline.outputs.sha == steps.ancestor.outputs.selector_sha && 'selector' || 'baseline' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.baseline.outputs.sha }}
+        run: >-
+          target/release/carrick-xtask ci-receipt gate --lane kvm
+          --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
+          --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 0
+
   # Single ruleset check. Only a successful docs-only PR filter permits skips;
   # a failed/cancelled filter or an unexpectedly skipped dependency is red.
   ci-ok:
@@ -2112,6 +2313,8 @@ jobs:
     if: always()
     needs:
       - changes
+      - kvm-tests
+      - kvm-gate
       - xtask-build
       - xtask-tests-build
       - actionlint

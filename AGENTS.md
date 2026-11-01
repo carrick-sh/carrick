@@ -702,11 +702,21 @@ SendMessage.
   exclusive `gate`). Worktree admission keys on the checkout root's
   device+inode: never copy or cross-volume move an admitted checkout; remove
   and re-add it.
-- **KVM evidence comes from the merge queue** (PRs never run `kvm-tests`,
-  so an admin merge has none). The `kvm-tests` lane produces
-  a receipt and `kvm-gate` fails on NEW failures against the merge-group base.
-  Do not run `just test-kvm` on the shared willow worker VMs; a targeted KVM
-  test to debug a specific defect runs under `just lease gate`.
+- **KVM evidence comes from the merge queue** (owner decision 2026-11-01,
+  #231, #1366). `ci.yml` runs `kvm-tests` on a disposable self-hosted KVM
+  clone (Contabo, `willow-kvm` label) for every merge group whose diff
+  touches the KVM closure: kvm-lane packages, x86/CPL0 and soft-CPU crates,
+  their Linux dependency closure, or shared build/CI inputs. When the
+  classification can't be computed, KVM runs. `kvm-gate` grades the receipt
+  against the nearest receipted main ancestor with `ci-receipt`; NEW
+  failures, a missing receipt or a skipped required job make `ci-ok` red,
+  and an outside-closure merge group needs both jobs skipped. Pull requests
+  never run KVM, so an admin merge lands with no KVM evidence.
+  `kernel-runtime.yml` still publishes the main-push baselines. Merge groups
+  are served only once the standing controller and clone job-start hooks
+  run the queue-aware admission in `ci_scaler`. Do not run `just test-kvm`
+  on the shared worker VMs; a targeted KVM test to debug a specific defect
+  runs under `just lease gate`.
 - **Personality split:** the shared kernel is personality-neutral. Linux is
   one personality (`carrick-personality-linux`); out-of-tree personalities
   build only on `carrick-personality-api`. Nothing in carrick names NT or any

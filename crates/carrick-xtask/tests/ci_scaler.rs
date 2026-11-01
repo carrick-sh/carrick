@@ -597,7 +597,10 @@ fn serial_host_standing_policy_admits_trusted_runs_without_one_shot_state() {
     wrong_workflow.workflow_ref = format!("{REPOSITORY}/.github/workflows/ci.yml@refs/heads/main");
     let mut zero_run = standing_context("push", "refs/heads/main");
     zero_run.run_id = 0;
+    let mut queue = standing_context("merge_group", "refs/heads/gh-readonly-queue/main/pr-42-abc");
+    queue.workflow_ref = format!("{REPOSITORY}/{HOSTED_CI_WORKFLOW}@{}", queue.git_ref);
     for denied in [
+        queue,
         standing_context("pull_request", "refs/heads/main"),
         standing_context("push", "refs/heads/work/feature"),
         non_owner_dispatch,
@@ -1800,4 +1803,26 @@ fn cloudmac_ci_macos_runner_jobs_serialize_builds_and_tests_under_carrick_lease(
             "macos-unit-b",
         ]
     );
+}
+
+#[test]
+fn standing_admits_hosted_ci_main_merge_groups_only() {
+    let queue = "gh-readonly-queue/main/pr-42-0123456789abcdef0123456789abcdef01234567";
+    let mut run = standing_run("merge_group", queue);
+    run["path"] = serde_json::json!(".github/workflows/ci.yml");
+    assert!(Admission::Standing.identifies_run(&run));
+    let mut context = standing_context("merge_group", &format!("refs/heads/{queue}"));
+    context.workflow_ref = format!("{REPOSITORY}/.github/workflows/ci.yml@{}", context.git_ref);
+    assert!(Admission::Standing.authorize(&context).is_ok());
+    assert!(bound().authorize(&context).is_ok());
+    assert!(JobPolicy::Standing.authorize(&context).is_err());
+    context.run_attempt += 1;
+    assert!(bound().authorize(&context).is_err());
+    context.run_attempt -= 1;
+    for event in ["push", "pull_request", "workflow_dispatch"] {
+        run["event"] = serde_json::json!(event);
+        context.event = event.into();
+        assert!(!Admission::Standing.identifies_run(&run));
+        assert!(Admission::Standing.authorize(&context).is_err());
+    }
 }
