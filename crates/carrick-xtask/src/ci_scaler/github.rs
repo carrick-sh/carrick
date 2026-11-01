@@ -123,22 +123,34 @@ impl Github {
         }
         Ok(serde_json::from_slice(&output)?)
     }
-    /// Runs of one workflow file only: demand never lists every run.
+    /// List only the workflow files served by this admission.
     pub(super) fn workflow_runs(
         &self,
         admission: &Admission,
         status: &str,
     ) -> Result<Vec<Value>, ScalerError> {
-        let data = self.request(
-            "GET",
-            &format!(
-                "repos/{REPOSITORY}/actions/workflows/{}/runs?status={status}&per_page=100",
-                admission.workflow_file()
-            ),
-            None,
-            true,
-        )?;
-        pages(&data, "workflow_runs")
+        // Standing serves main pushes/dispatches of kernel-runtime.yml and
+        // main merge groups of ci.yml (#1366); `identifies_run` binds each
+        // run's event to its one workflow.
+        let workflows: Vec<&str> = if matches!(admission, Admission::Standing) {
+            [KERNEL_RUNTIME_WORKFLOW, HOSTED_CI_WORKFLOW]
+                .into_iter()
+                .map(|path| path.rsplit('/').next().unwrap_or(path))
+                .collect()
+        } else {
+            vec![admission.workflow_file()]
+        };
+        let mut runs = Vec::new();
+        for workflow in workflows {
+            let data = self.request(
+                "GET",
+                &format!("repos/{REPOSITORY}/actions/workflows/{workflow}/runs?status={status}&per_page=100"),
+                None,
+                true,
+            )?;
+            runs.extend(pages(&data, "workflow_runs")?);
+        }
+        Ok(runs)
     }
     pub(super) fn jobs(&self, run: &Value) -> Result<Vec<Value>, ScalerError> {
         let id = run["id"].as_u64().ok_or(ScalerError::External("run id"))?;
@@ -1493,22 +1505,38 @@ mod tests {
         }
     }
     #[test]
-    fn reservations_and_assignments_accept_main_push_and_dispatch_only() {
+    fn reservations_and_assignments_accept_main_and_hosted_merge_queue_only() {
         let key = JobKey {
             run: RunId(1),
             attempt: 1,
             job: JobId(2),
         };
-        for (event, branch, admitted) in [
-            ("push", "main", true),
-            ("workflow_dispatch", "main", true),
-            ("merge_group", "gh-readonly-queue/main/pr-1-abc", false),
-            ("pull_request", "main", false),
-            ("workflow_dispatch", "work/x", false),
+        for (event, branch, workflow, admitted) in [
+            ("push", "main", KERNEL_RUNTIME_WORKFLOW, true),
+            ("workflow_dispatch", "main", KERNEL_RUNTIME_WORKFLOW, true),
+            (
+                "merge_group",
+                "gh-readonly-queue/main/pr-1-abc",
+                KERNEL_RUNTIME_WORKFLOW,
+                false,
+            ),
+            (
+                "merge_group",
+                "gh-readonly-queue/main/pr-1-abc",
+                HOSTED_CI_WORKFLOW,
+                true,
+            ),
+            ("pull_request", "main", HOSTED_CI_WORKFLOW, false),
+            (
+                "workflow_dispatch",
+                "work/x",
+                KERNEL_RUNTIME_WORKFLOW,
+                false,
+            ),
         ] {
             let run = json!({"id":1,"run_attempt":1,"event":event,
                 "head_sha":"a".repeat(40),"head_branch":branch,
-                "path":KERNEL_RUNTIME_WORKFLOW,
+                "path":workflow,
                 "repository":{"full_name":REPOSITORY},
                 "head_repository":{"full_name":REPOSITORY},
                 "actor":{"login":"tjfontaine"},
@@ -1532,9 +1560,7 @@ mod tests {
                             actor: "tjfontaine".into(),
                             triggering_actor: "tjfontaine".into(),
                             event: event.into(),
-                            workflow_ref: format!(
-                                "{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/{branch}"
-                            ),
+                            workflow_ref: format!("{REPOSITORY}/{workflow}@refs/heads/{branch}"),
                             git_ref: format!("refs/heads/{branch}"),
                             sha: "a".repeat(40),
                             run_id: 1,

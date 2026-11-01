@@ -50,6 +50,7 @@ pub const HVF_CLOSURE_LABELS: [&str; 4] = ["self-hosted", "macOS", "ARM64", "car
 /// A job key whose runners repeatedly closed without running it is not
 /// re-served beyond this many reservations; a re-run is a new attempt.
 pub const MAX_SERVES_PER_JOB: usize = 3;
+pub const HOSTED_CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 pub const KERNEL_RUNTIME_WORKFLOW: &str = ".github/workflows/kernel-runtime.yml";
 pub const PILOT_WORKFLOW: &str = ".github/workflows/willow-pilot.yml";
 const PILOT_BRANCH: &str = "work/willow-pilot";
@@ -615,8 +616,8 @@ pub enum Admission {
     /// The historical one-job pilot: `willow-pilot.yml`, dispatched from
     /// `work/willow-pilot` at one approved SHA.
     Pilot { sha: String },
-    /// `kernel-runtime.yml` on this repository for a push to main
-    /// or an owner workflow_dispatch on main. Never pull_request.
+    /// Main pushes/owner dispatches in `kernel-runtime.yml`, and main merge
+    /// groups in `ci.yml`. Never pull_request.
     Standing,
     /// Owner issue labels on main, served only by credentialed Contabo clones.
     Agent,
@@ -660,9 +661,8 @@ impl Admission {
             Self::Agent => crate::dispatch_worker::dispatch_run_identity(run, None),
             Self::Standing => {
                 run["head_repository"]["full_name"] == REPOSITORY
-                    && run["path"] == KERNEL_RUNTIME_WORKFLOW
                     && run["head_sha"].as_str().is_some_and(full_sha)
-                    && standing_event_ref(event, branch)
+                    && standing_workflow(event, branch).is_some_and(|path| run["path"] == path)
                     && (event != "workflow_dispatch"
                         || (run["actor"]["login"] == DISPATCH_OWNER
                             && run["triggering_actor"]["login"] == DISPATCH_OWNER))
@@ -707,12 +707,16 @@ impl Admission {
                             == format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@{}", context.git_ref)
                 }
                 Self::Standing => {
-                    standing_event_ref(&context.event, branch)
+                    standing_workflow(&context.event, branch).is_some()
                         && (context.event != "workflow_dispatch"
                             || (context.actor == DISPATCH_OWNER
                                 && context.triggering_actor == DISPATCH_OWNER))
                         && context.workflow_ref
-                            == format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@{}", context.git_ref)
+                            == format!(
+                                "{REPOSITORY}/{}@{}",
+                                standing_workflow(&context.event, branch).unwrap_or_default(),
+                                context.git_ref
+                            )
                 }
             };
         if admitted {
@@ -724,10 +728,22 @@ impl Admission {
         }
     }
 }
-fn standing_event_ref(event: &str, branch: &str) -> bool {
+fn standing_workflow(event: &str, branch: &str) -> Option<&'static str> {
     match event {
-        "push" | "workflow_dispatch" => branch == "main",
-        _ => false,
+        "push" | "workflow_dispatch" if branch == "main" => Some(KERNEL_RUNTIME_WORKFLOW),
+        "merge_group"
+            if branch
+                .strip_prefix("gh-readonly-queue/main/")
+                .is_some_and(|entry| {
+                    entry.starts_with("pr-")
+                        && entry.len() > 3
+                        && !entry.contains('/')
+                        && !entry.contains('@')
+                }) =>
+        {
+            Some(HOSTED_CI_WORKFLOW)
+        }
+        _ => None,
     }
 }
 
@@ -964,6 +980,9 @@ impl JobPolicy {
     pub fn authorize(&self, context: &JobContext) -> Result<(), ScalerError> {
         match self {
             Self::Pilot { sha } => Admission::Pilot { sha: sha.clone() }.authorize(context),
+            Self::Standing if context.event == "merge_group" => Err(ScalerError::Guard(
+                "merge-group hardware requires a controller-vetted run binding",
+            )),
             Self::Standing => Admission::Standing.authorize(context),
             Self::Bound(binding) | Self::Agent(binding) => {
                 if matches!(self, Self::Agent(_)) {
@@ -1219,7 +1238,7 @@ pub fn admit_job_context(
                 JobPolicy::Pilot { sha }.authorize(context)?;
                 mark_job_started(state_dir)?;
             }
-            JobPolicy::Standing => Admission::Standing.authorize(context)?,
+            JobPolicy::Standing => JobPolicy::Standing.authorize(context)?,
             JobPolicy::Bound(_) | JobPolicy::Agent(_) => {
                 return Err(ScalerError::Guard(
                     "standing assignments require controller rendezvous",
