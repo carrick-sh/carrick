@@ -211,6 +211,78 @@ pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
     }
 }
 
+/// Complete a staged host-file call. A pipe pair whose user copy failed
+/// retains no numeric slots; exact backing matching protects concurrent reuse.
+pub fn complete_host_file<'a, C: carrick_el1_abi::EntryContext>(
+    region: impl FnOnce() -> Option<IpcRegion<'a>>,
+    record: &[u8],
+    output: Option<carrick_personality_linux::native_host_file::HostFileOutput>,
+    copy_out: &mut dyn FnMut(u64, &[u8]) -> bool,
+    zone: Option<(&carrick_sched_core::ZoneTables<C>, carrick_el1_abi::SlotId)>,
+    task: &CurrentTask,
+) -> Result<carrick_personality_linux::abi::entry::SyscallResult, carrick_el1_abi::ipc::IpcError> {
+    let result = carrick_personality_linux::native_host_file::complete(record, output, copy_out);
+    use carrick_core_abi::host_file::{HostFileOp, record_header, reply};
+    use carrick_el1_abi::ipc::{
+        IpcError,
+        fd::{BackingToken, DeferredRelease, RawTableId},
+        pipe::End,
+    };
+    if result.raw() != carrick_syscall_abi::LINUX_EFAULT.guest_retval() {
+        return Ok(result);
+    }
+    let Some(reply) = reply(record) else {
+        return Ok(result);
+    };
+    let header = record_header(record).ok_or(IpcError::Corrupt)?;
+    if header.op != HostFileOp::Pipe2 || reply.result != 0 {
+        return Ok(result);
+    }
+    let bytes: &[u8; 8] = reply.output.try_into().map_err(|_| IpcError::Corrupt)?;
+    let reader = Fd(i32::from_le_bytes(
+        bytes[..4].try_into().map_err(|_| IpcError::Corrupt)?,
+    ));
+    let writer = Fd(i32::from_le_bytes(
+        bytes[4..].try_into().map_err(|_| IpcError::Corrupt)?,
+    ));
+    let backings = [BackingToken(header.args[1]), BackingToken(header.args[2])];
+    match backings.map(IpcBacking::decode) {
+        [
+            Some(IpcBacking::Pipe {
+                object: a,
+                end: End::Reader,
+            }),
+            Some(IpcBacking::Pipe {
+                object: b,
+                end: End::Writer,
+            }),
+        ] if a == b && reader.0 >= 0 && writer.0 > reader.0 => {}
+        _ => return Err(IpcError::Corrupt),
+    }
+    let region = region().ok_or(IpcError::Corrupt)?;
+    let table = TableId::from_raw(RawTableId {
+        authority: header.table[0],
+        index: header.table[1],
+        generation: header.table[2],
+    });
+    let retired = {
+        let authority = region.fd(carrick_sched_core::ShortLockSpin);
+        let mut transaction = authority.transaction(table).map_err(IpcError::Fd)?;
+        [
+            transaction
+                .close_if_backing(reader, backings[0])
+                .map_err(IpcError::Fd)?,
+            transaction
+                .close_if_backing(writer, backings[1])
+                .map_err(IpcError::Fd)?,
+        ]
+    };
+    for description in retired.into_iter().flatten() {
+        settle_native_release(&region, DeferredRelease::Now(description), zone, task)?;
+    }
+    Ok(result)
+}
+
 /// Tables resolved through the host-published [`IpcTableMap`], keyed by the
 /// running task's host file table (which an EL1 switch-in updates): a table
 /// with no entry is not served.

@@ -446,6 +446,40 @@ impl PipeInner {
             .read_with(count, copy);
         self.finish(guard, step)
     }
+    pub(in crate::dispatch) fn native_pair_backings(
+        &self,
+    ) -> [carrick_el1_abi::ipc::fd::BackingToken; 2] {
+        [core_pipe::End::Reader, core_pipe::End::Writer].map(|end| {
+            IpcBacking::Pipe {
+                object: self.object,
+                end,
+            }
+            .encode()
+        })
+    }
+
+    pub(in crate::dispatch) fn install_native_pair(
+        &self,
+        table: carrick_el1_abi::ipc::fd::TableId,
+        cloexec: bool,
+    ) -> Result<[carrick_el1_abi::ipc::fd::Fd; 2], crate::el1_ipc::InstallHostDescriptionError>
+    {
+        let reader = self.endpoints[0].lock();
+        let writer = self.endpoints[1].lock();
+        reader
+            .description
+            .as_ref()
+            .ok_or(crate::el1_ipc::InstallHostDescriptionError::Unavailable)?
+            .install_pair(
+                writer
+                    .description
+                    .as_ref()
+                    .ok_or(crate::el1_ipc::InstallHostDescriptionError::Unavailable)?,
+                table,
+                cloexec,
+            )
+    }
+
     #[cfg(test)]
     fn install_endpoint_for_test(
         &self,
@@ -1152,6 +1186,52 @@ pub(crate) fn write_pipe<I: Fn() -> bool>(
 }
 
 impl<'a> FsView<'a> {
+    /// One pipe factory for host-task and native callers. Endpoint descriptions
+    /// share the same IPC object; publication chooses only the caller's table.
+    pub(in crate::dispatch) fn create_pipe_pair(
+        &self,
+        owner: Arc<crate::el1_ipc::HostIpc>,
+        flags: u64,
+    ) -> Result<(PipeRef, [crate::dispatch::fd_table::OpenFile; 2]), LinuxErrno> {
+        if super::LinuxPipe2Flags::from_bits(flags).is_none() {
+            return Err(LINUX_EINVAL);
+        }
+        let nonblock = flags & LINUX_O_NONBLOCK;
+        let fd_flags = linux_fd_flags_from_open_flags(flags);
+        let pipe_id = next_pipe_id();
+        let pipe = Arc::new(
+            PipeInner::create(owner, pipe_id, DEFAULT_PIPE_CAPACITY)
+                .map_err(|error| error.errno())?,
+        );
+
+        let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock)
+            .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
+        read_base.set_shared_pipe(Arc::clone(&pipe));
+        let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock)
+            .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
+        write_base.set_shared_pipe(Arc::clone(&pipe));
+
+        let read_open =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
+                    base: read_base,
+                    pipe: Arc::clone(&pipe),
+                })),
+                LINUX_O_RDONLY | nonblock,
+                fd_flags,
+            );
+        let write_open =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
+                    base: write_base,
+                    pipe: Arc::clone(&pipe),
+                })),
+                LINUX_O_WRONLY | nonblock,
+                fd_flags,
+            );
+        Ok((pipe, [read_open, write_open]))
+    }
+
     define_syscall! {
         fn pipe2(this, cx, pipefd: GuestPtr, flags: u64) {
             let address = pipefd.0;
@@ -1159,9 +1239,6 @@ impl<'a> FsView<'a> {
             if super::LinuxPipe2Flags::from_bits(flags).is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-
-            let nonblock = flags & LINUX_O_NONBLOCK;
-            let fd_flags = linux_fd_flags_from_open_flags(flags);
 
             // Prepare the `pipefd` output before creating anything: an owner
             // refusal parks and retries this syscall, which is only clean
@@ -1173,36 +1250,9 @@ impl<'a> FsView<'a> {
                 Err(refusal) => return Ok(refusal.into_outcome()),
             };
 
-            let pipe_id = next_pipe_id();
-            // Only the authority's own host memory is ENOMEM; creation
-            // refusals are typed Linux limits (ENFILE), never a table size.
             let owner = cx.kernel.kernel().ipc().map_err(|_| DispatchError::Errno(LINUX_ENOMEM))?;
-            let pipe = Arc::new(PipeInner::create(owner, pipe_id, DEFAULT_PIPE_CAPACITY)
-                .map_err(|error| DispatchError::Errno(error.errno()))?);
-
-            let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock)
-                .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
-            read_base.set_shared_pipe(Arc::clone(&pipe));
-            let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock)
-                .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
-            write_base.set_shared_pipe(Arc::clone(&pipe));
-
-            let read_open = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
-                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
-                    base: read_base,
-                    pipe: Arc::clone(&pipe),
-                })),
-                LINUX_O_RDONLY | nonblock,
-                fd_flags,
-            );
-            let write_open = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
-                Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
-                    base: write_base,
-                    pipe,
-                })),
-                LINUX_O_WRONLY | nonblock,
-                fd_flags,
-            );
+            let (_, [read_open, write_open]) = this.create_pipe_pair(owner, flags)
+                .map_err(DispatchError::Errno)?;
             let Ok((read_fd, write_fd)) = this.install_fd_pair_at_or_above(0, read_open, write_open)
             else {
                 return Ok(DispatchOutcome::errno(linux_errno::EMFILE));

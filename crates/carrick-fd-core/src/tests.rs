@@ -2681,3 +2681,42 @@ fn filtered_live_close_and_dup_replace_defer_host_release_once() {
     c.destroy_table(peer, |_| panic!("all descriptions already released"))
         .unwrap();
 }
+
+#[test]
+fn conditional_rollback_preserves_reused_slots_and_peer_descriptors() {
+    let c = authority::<2, 4>();
+    let parent = c.create_table(4, &mut storage(4)).unwrap();
+    let fd = c.open(parent, Fd(0), description(11), false).unwrap();
+    let peer = c.fork(parent, &mut storage(4)).unwrap();
+    assert_eq!(c.close(parent, fd), Ok(None));
+    assert_eq!(c.open(parent, Fd(0), description(22), false), Ok(fd));
+    {
+        let mut tx = c.transaction(parent).unwrap();
+        assert_eq!(tx.close_if_backing(fd, BackingToken(11)), Ok(None));
+    }
+    assert_eq!(c.get(parent, fd).unwrap().backing, BackingToken(22));
+    assert_eq!(c.get(peer, fd).unwrap().backing, BackingToken(11));
+    let retired = c
+        .transaction(parent)
+        .unwrap()
+        .close_if_backing(fd, BackingToken(22))
+        .unwrap()
+        .unwrap();
+    assert_eq!(retired.backing, BackingToken(22));
+    assert_eq!(
+        c.transaction(parent)
+            .unwrap()
+            .close_if_backing(fd, BackingToken(22)),
+        Ok(None)
+    );
+    let retired = c
+        .transaction(peer)
+        .unwrap()
+        .close_if_backing(fd, BackingToken(11))
+        .unwrap()
+        .unwrap();
+    assert_eq!(retired.backing, BackingToken(11));
+    for table in [parent, peer] {
+        c.destroy_table(table, |_| panic!("empty table")).unwrap();
+    }
+}

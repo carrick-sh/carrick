@@ -46,6 +46,11 @@ pub enum HostFileOp {
     /// ring then maps it with its own reservation owner. Input is the list of
     /// sources the caller's owner retired, which the carrier releases first.
     MapPrivate = 11,
+    /// Create an in-zone pipe in the caller's ring table (`args[0]` flags).
+    /// Output is two little-endian i32 descriptor numbers, reader then writer.
+    /// The carrier stamps args[1..3] with the two endpoint backing identities
+    /// so a failed user copy can withdraw only this creation, never reused fds.
+    Pipe2 = 12,
 }
 
 /// The byte-source identity a [`HostFileOp::MapPrivate`] reply carries: the
@@ -119,6 +124,7 @@ impl HostFileOp {
             9 => Self::Lseek,
             10 => Self::Getdents64,
             11 => Self::MapPrivate,
+            12 => Self::Pipe2,
             _ => return None,
         })
     }
@@ -237,6 +243,29 @@ pub fn encode(
     Ok(())
 }
 
+/// Decode the fixed request header, including carrier reply stamps.
+pub fn record_header(bytes: &[u8]) -> Option<HostFileHeader> {
+    if read_u32(bytes, 0)? != MAGIC || read_u16(bytes, 4)? != VERSION {
+        return None;
+    }
+    let op = HostFileOp::decode(read_u16(bytes, OP)?)?;
+    let mut table = [0; 3];
+    for (index, word) in table.iter_mut().enumerate() {
+        *word = read_u64(bytes, TABLE + index * 8)?;
+    }
+    let mut args = [0; 4];
+    for (index, word) in args.iter_mut().enumerate() {
+        *word = read_u64(bytes, ARGS + index * 8)?;
+    }
+    Some(HostFileHeader {
+        op,
+        table,
+        fd: read_u32(bytes, FD)? as i32,
+        flags: read_u32(bytes, FLAGS)?,
+        args,
+    })
+}
+
 /// A validated record, as the carrier sees it.
 #[derive(Debug)]
 pub struct HostFileRequestView<'a> {
@@ -252,17 +281,7 @@ impl<'a> HostFileRequestView<'a> {
         if read_u32(bytes, 0) != Some(MAGIC) || read_u16(bytes, 4) != Some(VERSION) {
             return Err(invalid);
         }
-        let op = HostFileOp::decode(read_u16(bytes, OP).ok_or(invalid)?).ok_or(invalid)?;
-        let mut table = [0u64; 3];
-        for (index, word) in table.iter_mut().enumerate() {
-            *word = read_u64(bytes, TABLE + index * 8).ok_or(invalid)?;
-        }
-        let fd = read_u32(bytes, FD).ok_or(invalid)? as i32;
-        let flags = read_u32(bytes, FLAGS).ok_or(invalid)?;
-        let mut args = [0u64; 4];
-        for (index, arg) in args.iter_mut().enumerate() {
-            *arg = read_u64(bytes, ARGS + index * 8).ok_or(invalid)?;
-        }
+        let header = record_header(bytes).ok_or(invalid)?;
         let input_len = read_u32(bytes, INPUT_LEN).ok_or(invalid)? as usize;
         let output_cap = read_u32(bytes, OUTPUT_CAP).ok_or(invalid)? as usize;
         if read_u32(bytes, STATE) != Some(REPLY_PENDING)
@@ -272,13 +291,7 @@ impl<'a> HostFileRequestView<'a> {
         }
         Ok(Self {
             bytes,
-            header: HostFileHeader {
-                op,
-                table,
-                fd,
-                flags,
-                args,
-            },
+            header,
             input_len,
             output_cap,
         })
@@ -288,9 +301,8 @@ impl<'a> HostFileRequestView<'a> {
         self.header
     }
 
-    /// Replace the header's scalar arguments: the ring's own stamp of a
-    /// value only it knows (for example a `Write`'s file-size limit) on a
-    /// record it staged.
+    /// Stamp scalar arguments with their owning authority's values: the
+    /// ring's file-size limit, or the carrier's created endpoint identities.
     pub fn set_args(&mut self, args: [u64; 4]) {
         for (index, arg) in args.iter().enumerate() {
             let offset = ARGS + index * 8;

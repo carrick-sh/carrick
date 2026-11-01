@@ -675,3 +675,41 @@ fn write_records_carry_the_writers_file_size_limit() {
     let view = host_file::HostFileRequestView::parse(&mut open).unwrap();
     assert_eq!(view.header().args, [0o1101, 0o644, 0, 0]);
 }
+
+#[test]
+fn native_pipe2_is_admitted_before_carrier_service() {
+    let call = HostFileCall::decode(crate::crossing::nr::PIPE2, &[BASE, 0, 0, 0, 0, 0])
+        .expect("native child pipe2 must reach its own descriptor venue");
+    let (record, output, resolves_path) = request(run(call, &mut memory(&[0; 8])));
+    assert!(!resolves_path);
+    assert_eq!(output.unwrap().len, 8);
+    assert!(HostFileRequestView::parse(&mut record.into_vec()).is_ok());
+}
+
+#[test]
+fn native_pipe2_prepares_output_before_creation_and_validates_flags_first() {
+    let mut user = memory(&[0; 8]);
+    user.writable = false;
+    let decode = |flags| {
+        HostFileCall::decode(crate::crossing::nr::PIPE2, &[BASE, flags, 0, 0, 0, 0]).unwrap()
+    };
+    assert!(matches!(
+        run(decode(0), &mut user),
+        Some(HostFileStage::Fault {
+            address: BASE,
+            access: Access::Write
+        })
+    ));
+    assert_eq!(
+        run(decode(1), &mut user),
+        returned(carrick_syscall_abi::LINUX_EINVAL)
+    );
+    let flags = carrick_syscall_abi::LinuxPipe2Flags::NONBLOCK.bits()
+        | carrick_syscall_abi::LinuxPipe2Flags::CLOEXEC.bits();
+    user.writable = true;
+    let (mut bytes, _, _) = request(run(decode(flags), &mut user));
+    let view = HostFileRequestView::parse(&mut bytes).unwrap();
+    assert_eq!(view.header().op, HostFileOp::Pipe2);
+    assert_eq!(view.header().args[0], flags);
+    assert_eq!(view.header().table, TABLE);
+}

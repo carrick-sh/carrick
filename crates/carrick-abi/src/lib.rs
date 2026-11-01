@@ -3131,8 +3131,6 @@ pub const LINUX_O_ACCMODE: u64 = 0b11;
 pub const LINUX_O_RDONLY: u64 = 0;
 pub const LINUX_O_WRONLY: u64 = 1;
 pub const LINUX_O_RDWR: u64 = 2;
-pub const LINUX_O_NONBLOCK: u64 = 0o4000;
-pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
 pub const LINUX_O_CREAT: u64 = 0o100;
 pub const LINUX_O_EXCL: u64 = 0o200;
 pub const LINUX_O_TRUNC: u64 = 0o1000;
@@ -4624,14 +4622,6 @@ bitflags! {
         const X_OK = LINUX_X_OK;
     }
 
-    /// `pipe2(2)` creation flags.
-    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
-    pub struct LinuxPipe2Flags: u64 {
-        const CLOEXEC = LINUX_O_CLOEXEC;
-        const NONBLOCK = LINUX_O_NONBLOCK;
-        const DIRECT = 0o200000;
-    }
-
     /// `poll(2)` events / revents interest/readiness mask.
     #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxPollEvents: i16 {
@@ -5000,10 +4990,6 @@ impl LinuxRenameat2Flags {
 
 impl LinuxAccessMode {
     pub const MASK: u64 = LINUX_R_OK | LINUX_W_OK | LINUX_X_OK;
-}
-
-impl LinuxPipe2Flags {
-    pub const SUPPORTED_MASK: u64 = LINUX_O_CLOEXEC | LINUX_O_NONBLOCK | 0o200000;
 }
 
 impl LinuxTfdFlags {
