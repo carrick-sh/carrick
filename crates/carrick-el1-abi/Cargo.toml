@@ -19,3 +19,10 @@ carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-el1-control-abi = { path = "../carrick-el1-control-abi" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-syscall-abi = { path = "../carrick-syscall-abi" }
+
+[features]
+# Substitutions exist only in this crate's unit-test target, never the ABI.
+loom = []
+
+[dev-dependencies]
+loom = "=0.7.2"

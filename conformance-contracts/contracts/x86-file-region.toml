@@ -23,6 +23,7 @@ vm_free = [
   "carrick-x86-cpl0-host::cpl0_boot::initial_reply_tests::{shared_physical_staging_rolls_back_before_exposure,inventory_retains_two_live_owner_selected_mms,initial_inventory_refuses_a_receipt_from_another_mm} (shared initial physical grant staging: exact-MM custody and rollback before exposure; existing file-region semantics unchanged)",
   "carrick-x86-cpl0::file_region:: layout_alignment_capacity_and_extent, stdio_parity_and_closed_descriptor_stays_closed, record_beyond_fifteen_uses_shared_capacity, foreign_retired_and_two_carriers, fork_dup_lookup_and_retire_preserve_live_parent, unpublished_is_distinct_from_retired (all prefixed file_region_)",
   "carrick-el1-abi::tests::fd_map_waiter_does_no_rmw_while_lock_is_observed_held",
+  "carrick-el1-abi::tests::an_image_built_against_another_layout_is_refused (shared ABI identity and EL1_NAME_CACHE_SIZE/alignment asserts include seqlock-backed InotifyNameCache; carrick-x86-cpl0::file_region::file_region_layout_alignment_capacity_and_extent re-verified; no new file-region custody or KVM claim)",
 ]
 
 [bindings.unresolved]

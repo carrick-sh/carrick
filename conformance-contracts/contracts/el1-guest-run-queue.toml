@@ -1,3 +1,6 @@
+# #1153: InotifyNameCache seqlock rebuild and EL1_ABI_LAYOUT_HASH update in
+# shared crates/carrick-el1-abi/src/lib.rs (bound under kernel.el1.inotify and
+# kernel.x86.file-region). Guest run-queue semantics and budgets are unchanged.
 # #1106: mixed host fallback and guest-service rows share the scheduler's
 # enqueue ordering. A compute successor must yield to already-waiting work
 # across the two queues; reversing permanent priority is also a failure.

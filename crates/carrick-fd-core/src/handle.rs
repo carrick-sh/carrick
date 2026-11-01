@@ -78,6 +78,29 @@ impl carrick_core_abi::OpenLifetimeAtomic for LoomAtomicU64 {
     }
 }
 
+#[cfg(all(test, feature = "loom"))]
+impl carrick_core_abi::SeqAtomic for LoomAtomicU64 {
+    #[inline]
+    fn load(&self, order: core::sync::atomic::Ordering) -> u64 {
+        self.0.load(order)
+    }
+
+    #[inline]
+    fn store(&self, val: u64, order: core::sync::atomic::Ordering) {
+        self.0.store(val, order);
+    }
+
+    #[inline]
+    fn release_fence() {
+        loom::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+    }
+
+    #[inline]
+    fn acquire_fence() {
+        loom::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+    }
+}
+
 #[cfg(not(all(test, feature = "loom")))]
 type ObjectLifetime = OpenLifetime;
 

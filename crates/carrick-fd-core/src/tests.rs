@@ -1150,11 +1150,10 @@ fn el1_ipc_contended_table_lock_refuses_before_effects() {
     assert_eq!(el1.get(t, Fd(1)), Err(Error::BadFd));
     assert_eq!(el1.pin(t, Fd(1)).map(|_| ()), Err(Error::BadFd));
     // A writer mid-change of the extent (odd sequence) holds lookups off.
-    let seq = core.tables[0].seq.load(Ordering::Relaxed);
-    core.tables[0].seq.store(seq | 1, Ordering::Release);
+    core.tables[0].begin_write();
     assert_eq!(el1.get(t, Fd(0)).map(|_| ()), Err(Error::Contended));
     assert_eq!(el1.pin(t, Fd(0)).map(|_| ()), Err(Error::Contended));
-    core.tables[0].seq.store(seq, Ordering::Release);
+    core.tables[0].end_write();
     core.tables[0].lock.store(0, Ordering::Release);
     assert_eq!(el1.unpin(pin), Ok(None));
     assert_eq!(el1.refcount(t, Fd(0)), Ok(1));

@@ -1,3 +1,6 @@
+# #1153: InotifyNameCache seqlock rebuild and EL1_ABI_LAYOUT_HASH update in
+# shared crates/carrick-el1-abi/src/lib.rs (bound under kernel.el1.inotify and
+# kernel.x86.file-region). Terminal child retirement semantics are unchanged.
 # #1101: fork lifecycle backing uses retained metadata custody.
 # Lifecycle stocking, child retirement, and reclaim transitions are unchanged; live lifecycle bytes remain retained until their backing authority retires.
 # The component ownership/counter witnesses are registered under

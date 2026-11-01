@@ -1,3 +1,6 @@
+# #1153: InotifyNameCache seqlock rebuild and EL1_ABI_LAYOUT_HASH update in
+# shared crates/carrick-el1-abi/src/lib.rs (bound under kernel.el1.inotify and
+# kernel.x86.file-region). Metadata allocation semantics and budgets are unchanged.
 # Request-lifetime follow-up: request words now carry 64-bit incarnation
 # identities and HOST_REQUEST_PROTOCOL participates in ABI hashing. Record
 # layout/hash regression bindings remain required; no new GIC/fault/page-table
