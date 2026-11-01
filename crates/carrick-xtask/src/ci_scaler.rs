@@ -330,6 +330,58 @@ impl Ledger {
             Err(e) => Err(e.into()),
         }
     }
+    /// Rows a live provisioner owns keep their committed copy (#1251): the
+    /// lifecycle loop's snapshot of them may be older than the owner's write.
+    fn keep_owned_rows(&mut self, committed: &Self, owned: &std::collections::BTreeSet<String>) {
+        for row in self.rows.iter_mut().filter(|r| owned.contains(&r.name)) {
+            if let Some(current) = committed.rows.iter().find(|r| r.name == row.name) {
+                *row = current.clone();
+            }
+        }
+        self.publication = None;
+    }
+    /// A provisioner's write: its row's lifecycle, keeping the committed
+    /// assignment decision (the assignment worker may record one before the
+    /// provisioner marks the row running).
+    fn take_row_lifecycle(&mut self, candidate: &Self, name: &str) {
+        let (Some(row), Some(written)) = (
+            self.rows.iter_mut().find(|r| r.name == name),
+            candidate.rows.iter().find(|r| r.name == name),
+        ) else {
+            return;
+        };
+        let assigned = (
+            row.assigned,
+            row.assigned_key,
+            row.approved,
+            std::mem::take(&mut row.mints),
+        );
+        *row = written.clone();
+        (row.assigned, row.assigned_key, row.approved, row.mints) = assigned;
+        self.publication = None;
+    }
+    /// Nominal resources of clones admitted but not yet running (#1251),
+    /// other than `except`: booting clones have not touched their memory, so
+    /// live readings alone would let a burst overcommit the host.
+    pub fn pending(&self, except: &str, nominal: impl Fn(CloneLane) -> (u32, u64)) -> Pending {
+        self.rows
+            .iter()
+            .filter(|r| {
+                r.name != except
+                    && matches!(
+                        r.state,
+                        State::Reserved | State::Cloning | State::Booting | State::Registered
+                    )
+            })
+            .fold(Pending::default(), |total, r| {
+                let (cores, memory_mib) = nominal(r.lane);
+                Pending {
+                    clones: total.clones + 1,
+                    cores: total.cores + cores,
+                    memory_mib: total.memory_mib + memory_mib,
+                }
+            })
+    }
     fn merge_assignments(&mut self, source: &Self) {
         assignment::merge_records(
             &mut self.rows,
@@ -369,7 +421,23 @@ impl Ledger {
     }
     pub fn save(&self, path: &Path) -> Result<(), ScalerError> {
         if let Some(publication) = &self.publication {
-            publication.commit(self, path, Self::merge_assignments)
+            match publication.role().clone() {
+                assignment::Role::Lifecycle => {
+                    let owned = publication.owners().owned();
+                    publication.commit(self, path, |next, committed| {
+                        next.merge_assignments(committed);
+                        next.keep_owned_rows(committed, &owned);
+                    })
+                }
+                assignment::Role::Assignments => {
+                    publication.commit(self, path, Self::merge_assignments)
+                }
+                assignment::Role::Provisioner(name) => {
+                    publication.commit(self, path, |next, candidate| {
+                        next.take_row_lifecycle(candidate, &name);
+                    })
+                }
+            }
         } else {
             save_json(self, path)
         }
@@ -691,11 +759,38 @@ pub fn admit_resources(
     cores: u32,
     memory_mib: u64,
 ) -> bool {
+    admit_resources_with_pending(
+        cpu_busy,
+        threads,
+        available,
+        cores,
+        memory_mib,
+        Pending::default(),
+    )
+}
+/// Clones admitted but not yet running, charged at their nominal size.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct Pending {
+    pub clones: u32,
+    pub cores: u32,
+    pub memory_mib: u64,
+}
+/// Admission for one more clone with `pending` clones still booting: their
+/// cores and memory count as already used until they run or retire.
+pub fn admit_resources_with_pending(
+    cpu_busy: f64,
+    threads: u32,
+    available: u64,
+    cores: u32,
+    memory_mib: u64,
+    pending: Pending,
+) -> bool {
     cpu_busy.is_finite()
         && (0.0..=1.0).contains(&cpu_busy)
         && threads > 0
-        && cpu_busy + f64::from(cores) / f64::from(threads) <= 0.80
-        && available >= (memory_mib << 20) + (6 << 30) // clone + 6 GiB host reserve
+        && cpu_busy + f64::from(cores + pending.cores) / f64::from(threads) <= 0.80
+        // clone + pending clones + 6 GiB host reserve
+        && available >= ((memory_mib + pending.memory_mib) << 20) + (6 << 30)
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Assignment {
