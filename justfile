@@ -131,6 +131,22 @@ worktree-run +CMD:
 build-cache:
     @if [ -n "$CARRICK_SCCACHE_RESOLVED" ]; then "$CARRICK_SCCACHE_RESOLVED" --show-stats; fi
 
+# CI job end (`if: always()`): cache statistics, then on a self-hosted
+# runner stop this job's sccache server and remove its per-job socket
+# (#1264). The server daemonizes from the rustc wrapper, so it outlives the
+# step (and any `just lease`) that started it; only the job can end it.
+ci-cache-finish:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if [ -n "${CARRICK_SCCACHE_RESOLVED:-}" ]; then "$CARRICK_SCCACHE_RESOLVED" --show-stats; fi
+    socket="${SCCACHE_SERVER_UDS:-}"
+    if [ -n "$socket" ]; then
+        if [ -n "${CARRICK_SCCACHE_RESOLVED:-}" ]; then
+            "$CARRICK_SCCACHE_RESOLVED" --stop-server > /dev/null 2>&1 || true
+        fi
+        rm -f -- "$socket"
+    fi
+
 # Run the Carrick xtask maintenance tool.
 [positional-arguments]
 xtask *ARGS:

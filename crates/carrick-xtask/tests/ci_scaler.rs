@@ -1734,7 +1734,10 @@ fn cloudmac_ci_macos_runner_jobs_serialize_builds_and_tests_under_carrick_lease(
                 let Some(run) = step["run"].as_str() else {
                     continue;
                 };
-                if run == "just build-cache" {
+                // Job end (#1264): statistics and stopping this job's own
+                // sccache server are not build or test work, and they must
+                // run even while another job holds the lease.
+                if run == "just ci-cache-finish" {
                     continue;
                 }
                 assert!(

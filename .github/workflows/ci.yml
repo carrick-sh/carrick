@@ -80,7 +80,7 @@ jobs:
         run: just ci-prebuild-xtask
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
       - uses: actions/upload-artifact@v4
         with:
           name: xtask-linux-x64
@@ -229,7 +229,8 @@ jobs:
               ;;
           esac
       - name: Compiler cache statistics after critical replay
-        run: just build-cache
+        if: ${{ always() }}
+        run: just ci-cache-finish
       - name: Save shared compiler cache
         if: steps.compiler-cache.outputs.backend == 'gha'
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -304,7 +305,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   xtask-tests-build:
     needs: [changes, xtask-build]
@@ -354,7 +355,7 @@ jobs:
         run: just ci-build-xtask-tests
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
       - uses: actions/upload-artifact@v4
         with:
           name: xtask-tests-linux-x64
@@ -510,7 +511,7 @@ jobs:
         run: just clippy
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   lint-gates:
     needs: [changes, xtask-build, xtask-tests-build]
@@ -603,7 +604,7 @@ jobs:
         run: just check-contract-change "$CI_BASE" "$GITHUB_SHA"
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   lint-domains:
     needs: [changes, xtask-build, xtask-tests-build]
@@ -684,7 +685,7 @@ jobs:
         run: just lint-domains-source
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   portable:
     needs: [changes, xtask-build, xtask-tests-build]
@@ -797,7 +798,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   loom:
     needs: [changes, xtask-build]
@@ -867,7 +868,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   linux-doc:
     needs: [changes, xtask-build]
@@ -937,7 +938,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   macos-clippy:
     needs: changes
@@ -1001,7 +1002,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   macos-authority:
     needs: changes
@@ -1061,7 +1062,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   macos-build:
     needs: changes
@@ -1122,7 +1123,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   macos-unit-a:
     needs: changes
@@ -1178,7 +1179,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   macos-unit-b:
     needs: changes
@@ -1234,7 +1235,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   macos-integration:
     needs: changes
@@ -1290,7 +1291,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   cross-check-linux:
     needs: [changes, xtask-build]
@@ -1362,7 +1363,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   # Native Linux run of the kernel-semantics suites (crates/carrick-kernel-example):
   # scripted two-process Linux semantics against the public kernel API with no
@@ -1439,7 +1440,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   cross-check-freebsd:
     needs: [changes, xtask-build]
@@ -1563,7 +1564,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   cross-check-netbsd:
     needs: [changes, xtask-build]
@@ -1680,7 +1681,7 @@ jobs:
 
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   cross-check-macos:
     needs: [changes, xtask-build]
@@ -1776,7 +1777,7 @@ jobs:
         run: just cross-check-macos
       - name: Compiler cache statistics
         if: ${{ always() }}
-        run: just build-cache
+        run: just ci-cache-finish
 
   # Single ruleset check. Only a successful docs-only PR filter permits skips;
   # a failed/cancelled filter or an unexpectedly skipped dependency is red.
