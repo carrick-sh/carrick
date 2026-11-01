@@ -1,0 +1,52 @@
+schema_version = 1
+id = "x86.softcpu.idt-delivery"
+title = "Software x86_64 64-bit IDT exception and external-interrupt delivery match SDM and KVM CPL0 fixtures"
+guest_surfaces = ["isa:x86_64", "vmm:soft", "fault:divide-error", "fault:debug", "fault:invalid-opcode", "fault:general-protection", "fault:page-fault", "fault:alignment-check", "fault:stack-segment", "fault:segment-not-present", "tlb:soft-tlb"]
+semantic_authority = [
+  "Intel SDM Vol. 3A Ch. 6 (Interrupt and Exception Handling): §6.3/§6.9 priority among simultaneous events (Table 6-2), §6.13 error-code format (EXT/IDT/TI/selector and #PF error bits), §6.14 64-bit interrupt/trap gate descriptors, 16-byte stack alignment, TSS RSP0/IST stack switching, RFLAGS TF/NT/RF/VM/AC/IF updates, and §6.15 Table 6-4/6-5 double-fault and triple-fault escalation",
+  "Intel SDM Vol. 3A Ch. 18 (Debug, Branch Profile, TSC) & Vol. 2B STI/POPFQ/IRETQ: single-step #DB (DR6.BS, DR7.GD), DR0..DR3 instruction-execution breakpoints, RFLAGS.RF suppression and one-instruction retirement clearing, ICEBP/INT1 (0xF1) trap semantics, and one-instruction STI interrupt shadow",
+  "Intel SDM Vol. 3A §11.8.3.1 / §4.6.1: CR8 (Task Priority Register) external-interrupt masking ((vector >> 4) > TPR), HLT wake on unmasked external interrupt, and target-CPL stack push translation rights",
+  "carrick-x86 & carrick-x86-cpl0 KVM CPL0 contracts: write_fault_tables_with, FaultDoorbellRecord, IRQ_HEADER_GPA native interrupt/page-fault gates, carrick_x86_page_fault_fixup (SMAP AC recovery), and carrick_x86_user_page_fault",
+]
+fixture = "carrick-softcpu-x86::softcpu_idt_delivery"
+scale_points = [1, 8, 35]
+rationale = """
+Slice #669 (#578) completes clean-room 64-bit IDT exception and external-interrupt
+delivery in `carrick-softcpu-x86` across `#DE` (0), `#DB` (1), `#UD` (6), `#DF` (8),
+`#GP` (13), `#PF` (14), `#AC` (17), and external interrupt vectors `32..=255`.
+
+`SoftMachine` and `SoftCpu` enforce SDM Table 6-2 priority ordering: unmasked
+external interrupts (`RFLAGS.IF = 1`, outside the one-instruction `STI` shadow,
+with `(vector >> 4) > CR8[3:0]`) wake `HLT` or preempt instruction fetch at
+highest vector priority; `DR0..DR3` instruction breakpoints fire as pre-fetch
+faults when `RFLAGS.RF = 0`, while `IRETQ`-restored `RF = 1` suppresses one
+retired instruction before clearing; single-step `#DB` fires only when `TF`
+started and remained set across instruction retirement (`DR6.BS = 1`, `DR7.GD = 0`);
+`ICEBP` (`0xF1`) delivers `#DB` with `EXT = 0` without `DPL` gating; legacy
+128-bit unaligned SIMD accesses never spuriously raise `#AC`; and 64-bit IDT
+gates clear `RFLAGS.AC` on entry, push the frame with target-`CPL` paging rights,
+and load a VMX-valid NULL `SS` (`DPL == RPL == new_cpl`) on both inter-privilege
+and `IST` stack switches. The compiled `carrick-x86-cpl0-fixture` and
+`carrick-x86-cpl0` images execute user/kernel fault recovery, SMAP fixups,
+in-guest prepared/COW page faults, fault doorbells, and native APIC IRQ gates
+on `SoftMachine` identically to KVM.
+"""
+
+[[structural_budgets]]
+kind = "upper-bound"
+metric = "page_table_invalidations"
+maximum = 1
+layers = ["vm-free"]
+rationale = "Delivering an exception or external interrupt through a 64-bit IDT gate issues zero implicit SoftTlb flushes; an in-guest CPL0 fault handler that edits a leaf issues at most one targeted `INVLPG` per resolved fault."
+
+[bindings]
+vm_free = [
+  "carrick-softcpu-x86::softcpu_idt_delivery::cpl0_fixture_image_fault_handling_and_native_irqs_match_kvm",
+  "carrick-softcpu-x86::softcpu_idt_delivery::external_interrupt_delivery_enforces_if_cr8_priority_sti_shadow_trap_vs_intr_gate_and_hlt_wake",
+  "carrick-softcpu-x86::softcpu_idt_delivery::idt_double_fault_escalation_ist_and_triple_fault_match_sdm_table_6_5",
+  "carrick-softcpu-x86::softcpu_idt_delivery::idt_vectors_de_db_ud_gp_pf_ac_match_sdm_frames_error_codes_cr2_and_stack_switch",
+]
+
+[bindings.unresolved]
+embed_structural = "Software vCPU carrier integration (`carrick-vmm-soft`) lands in follow-up slices of #578; slice #669 proves per-vector IDT/IRQ delivery and the compiled CPL0 fixture/production images VM-free on SoftMachine."
+docker = "Docker is unavailable on the x86 worker; slice #669 validates SDM exception/interrupt delivery and real CPL0 fixture fault/IRQ paths over SoftMachine."
