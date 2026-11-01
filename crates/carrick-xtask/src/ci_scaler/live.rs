@@ -511,7 +511,42 @@ fn enforce_cpu_ceiling(busy: f64, threads: u32, cores: u32) -> Result<(), Scaler
         Ok(())
     }
 }
-fn resource_admission(pve: &Pve) -> Result<bool, ScalerError> {
+/// Nominal (cores, memory MiB) of one clone in `lane` at `pve`'s site.
+fn nominal(pve: &Pve) -> impl Fn(CloneLane) -> (u32, u64) + '_ {
+    move |lane| {
+        pve.site
+            .for_lane(lane)
+            .map_or((pve.site.cores, pve.site.memory_mib), |site| {
+                (site.cores, site.memory_mib)
+            })
+    }
+}
+/// One host reading: CPU busy fraction, online threads, available bytes.
+struct HostSample {
+    busy: f64,
+    threads: u32,
+    available: u64,
+}
+/// Whether one more clone of `(cores, memory_mib)` fits `sample` with
+/// `pending` clones still booting. The fatal CPU ceiling looks at the live
+/// reading only: pending charges defer a clone, they never end the
+/// controller.
+fn admission_verdict(
+    sample: &HostSample,
+    (cores, memory_mib): (u32, u64),
+    pending: Pending,
+) -> Result<bool, ScalerError> {
+    enforce_cpu_ceiling(sample.busy, sample.threads, cores)?;
+    Ok(admit_resources_with_pending(
+        sample.busy,
+        sample.threads,
+        sample.available,
+        cores,
+        memory_mib,
+        pending,
+    ))
+}
+fn resource_admission(pve: &Pve, pending: Pending) -> Result<bool, ScalerError> {
     fn cpu() -> Result<(u64, u64), ScalerError> {
         let stat = std::fs::read_to_string("/proc/stat")?;
         let fields: Vec<u64> = stat
@@ -559,23 +594,34 @@ fn resource_admission(pve: &Pve) -> Result<bool, ScalerError> {
         "/proc/loadavg:1m-per-cpu"
     };
     println!(
-        "admission utilization={utilization:.3} utilization_source=/proc/stat:5s-delta load_per_cpu={load:.3} load_source=/proc/loadavg:1m-per-cpu online_cpus={threads} limiting_source={limiting_source} busy={busy:.3} projected={:.3} reserved_vcpus={} memory_available={available}",
-        busy + f64::from(pve.site.cores) / threads as f64,
-        pve.site.cores
-    );
-    enforce_cpu_ceiling(busy, u32::try_from(threads).unwrap_or(0), pve.site.cores)?;
-    Ok(admit_resources(
-        busy,
-        u32::try_from(threads).unwrap_or(0),
-        available,
+        "admission utilization={utilization:.3} utilization_source=/proc/stat:5s-delta load_per_cpu={load:.3} load_source=/proc/loadavg:1m-per-cpu online_cpus={threads} limiting_source={limiting_source} busy={busy:.3} projected={:.3} reserved_vcpus={} memory_available={available} pending_clones={} pending_vcpus={} pending_memory_mib={}",
+        busy + f64::from(pve.site.cores + pending.cores) / threads as f64,
         pve.site.cores,
-        pve.site.memory_mib,
-    ) && storage_headroom(pve)?)
+        pending.clones,
+        pending.cores,
+        pending.memory_mib
+    );
+    let sample = HostSample {
+        busy,
+        threads: u32::try_from(threads).unwrap_or(0),
+        available,
+    };
+    Ok(
+        admission_verdict(&sample, (pve.site.cores, pve.site.memory_mib), pending)?
+            && storage_headroom(pve, pending)?,
+    )
 }
 /// Storage headroom for one more linked clone: 150 GiB free, and for an LVM
 /// thin pool also metadata below 80%. Read-only; never mutates storage.
-fn storage_headroom(pve: &Pve) -> Result<bool, ScalerError> {
-    const FREE: u64 = 150 << 30;
+/// Free storage one more linked clone needs: 150 GiB, plus 20 GiB for each
+/// clone admitted but not yet running (#1251). A freshly booted linked clone
+/// has written only a few GiB, so charging each the whole floor would refuse
+/// a sixth agent clone on ctb's ~780 GiB with nothing actually used.
+fn storage_floor(pending: Pending) -> u64 {
+    (150 << 30) + u64::from(pending.clones) * (20 << 30)
+}
+fn storage_headroom(pve: &Pve, pending: Pending) -> Result<bool, ScalerError> {
+    let free_needed = storage_floor(pending);
     match pve.site.headroom {
         Headroom::LvmThin { pool } => {
             let output = execute(
@@ -601,7 +647,7 @@ fn storage_headroom(pve: &Pve) -> Result<bool, ScalerError> {
                     .ok_or(ScalerError::Guard("thin-pool statistics unavailable"))
             };
             let free = number("lv_size")? * (1.0 - number("data_percent")? / 100.0);
-            Ok(free >= FREE as f64 && number("metadata_percent")? < 80.0)
+            Ok(free >= free_needed as f64 && number("metadata_percent")? < 80.0)
         }
         Headroom::Directory => {
             let status = pve.request(
@@ -611,7 +657,7 @@ fn storage_headroom(pve: &Pve) -> Result<bool, ScalerError> {
                     pve.site.node, pve.site.storage
                 ),
             )?;
-            directory_headroom(&status, FREE)
+            directory_headroom(&status, free_needed)
         }
     }
 }
@@ -783,8 +829,19 @@ fn boot_and_register(
         )?),
         &format!("{}/config", pve.base(row.vm)),
     )?;
-    if !resource_admission(pve)? {
-        return Err(ScalerError::Guard("host admission denied before boot"));
+    // Other clones still booting are charged at nominal size although they
+    // may already use part of it, so a refusal here means "not now": wait
+    // for them to run (or retire), and fail only after ten minutes.
+    let admit_by = Instant::now() + Duration::from_secs(600);
+    loop {
+        ledger.refresh()?;
+        if resource_admission(pve, ledger.pending(&row.name, nominal(pve)))? {
+            break;
+        }
+        if Instant::now() >= admit_by {
+            return Err(ScalerError::Guard("host admission denied before boot"));
+        }
+        std::thread::sleep(Duration::from_secs(15));
     }
     pve.guard(row)?;
     // A linked clone inherits the template's `allow-ksm: 0`; refuse one
@@ -1160,6 +1217,28 @@ fn reconcile_all(
     })
 }
 
+/// The committed copy of `name` for this reconcile step, or `None` while a
+/// provisioning worker owns it (#1251 review). A pass lists its rows when it
+/// starts; a worker that finishes mid-pass releases its row, and acting on
+/// the pass's stale copy would write the row back to an earlier state.
+/// Owned covers live and released-but-unread rows; the refresh that follows
+/// drains releases with a snapshot that holds their last write.
+fn reconcile_target(ledger: &mut Ledger, name: &str) -> Result<Option<Record>, ScalerError> {
+    if ledger
+        .publication
+        .as_ref()
+        .is_some_and(|publication| publication.owners().owned().contains(name))
+    {
+        return Ok(None);
+    }
+    ledger.refresh()?;
+    Ok(ledger
+        .rows
+        .iter()
+        .find(|r| r.name == name && r.state != State::Destroyed)
+        .cloned())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconcile_one(
     pve: &Pve,
@@ -1168,8 +1247,11 @@ fn reconcile_one(
     dir: &Path,
     path: &Path,
     approval: (u64, &Admission),
-    mut row: Record,
+    row: Record,
 ) -> Result<bool, ScalerError> {
+    let Some(mut row) = reconcile_target(ledger, &row.name)? else {
+        return Ok(false);
+    };
     let lane_pve = pve.for_lane(row.lane)?;
     let pve = &lane_pve;
     let lane_admission = row.lane.admission();
@@ -1860,6 +1942,7 @@ pub(super) fn controller(
     let mut frozen = true;
     let mut backoff = Backoff::default();
     let mut admit_after = Instant::now();
+    let provisioners = Provisioners::new();
     let publication = assignment::Publication::new(ledger.clone());
     ledger.publication = Some(publication.clone());
     let _assignments = if matches!(admission, Admission::Standing) {
@@ -1933,27 +2016,51 @@ pub(super) fn controller(
             .iter()
             .filter(|r| r.state != State::Destroyed)
             .count();
-        if !frozen
-            && active
-                < budget.of(CloneLane::Kvm)
-                    + if agents {
-                        budget.of(CloneLane::Agent)
-                    } else {
-                        0
-                    }
-            && Instant::now() >= admit_after
-        {
-            match demand.and_then(|demand| {
-                admit_one(
-                    &pve,
-                    &gh,
-                    &mut ledger,
-                    dir,
-                    &path,
-                    (group, admission, demand),
-                    budget,
-                )
-            }) {
+        // A failed provisioning worker freezes admission exactly as a failed
+        // in-line provision did.
+        let mut provision_failed = None;
+        for result in provisioners.finished() {
+            match result {
+                Ok(()) => {}
+                Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
+                Err(error) => {
+                    provision_failed.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = provision_failed {
+            eprintln!("provisioning failed: {error}; backing off");
+            frozen = true;
+            backoff.grow();
+            admit_after = Instant::now() + backoff.delay();
+        }
+        let cap = budget.of(CloneLane::Kvm)
+            + if agents {
+                budget.of(CloneLane::Agent)
+            } else {
+                0
+            };
+        if !frozen && active < cap && Instant::now() >= admit_after {
+            // Admit until demand or the budget runs out; each worker boots
+            // its clone while the next is reserved.
+            let admitted = demand.and_then(|demand| {
+                let mut admitted = active;
+                while admitted < cap
+                    && admit_one(
+                        &pve,
+                        &gh,
+                        &mut ledger,
+                        dir,
+                        &path,
+                        (group, admission, demand.clone()),
+                        (budget, &provisioners),
+                    )?
+                {
+                    admitted += 1;
+                }
+                Ok(())
+            });
+            match admitted {
                 Ok(()) => backoff.reset(),
                 Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
                 Err(error) => {
@@ -2022,8 +2129,8 @@ fn admit_one(
     dir: &Path,
     path: &Path,
     demand: (u64, &Admission, Vec<JobKey>),
-    budget: CloneBudget,
-) -> Result<(), ScalerError> {
+    (budget, provisioners): (CloneBudget, &Provisioners),
+) -> Result<bool, ScalerError> {
     let (group, original_admission, kvm_demand) = demand;
     let agents = pve.site.node == site::CONTABO.node
         && matches!(original_admission, Admission::Standing)
@@ -2063,19 +2170,21 @@ fn admit_one(
         }
     }
     let Some((lane, admission, job)) = selected else {
-        return Ok(());
+        return Ok(false);
     };
     let lane_pve = pve.for_lane(lane)?;
     let pve = &lane_pve;
     let admission = &admission;
-    let Some(mut row) = reserve_admitted_clone(
+    // Clones admitted but not yet running are charged at their nominal size.
+    let pending = ledger.pending("", nominal(pve));
+    let Some(row) = reserve_admitted_clone(
         ledger,
         path,
         job,
         (budget, lane),
         || {
             gh.vet(admission, job)?;
-            match resource_admission(pve) {
+            match resource_admission(pve, pending) {
                 Err(ScalerError::CpuCeiling { .. }) if lane == CloneLane::Agent => Ok(false),
                 result => result,
             }
@@ -2083,15 +2192,87 @@ fn admit_one(
         || pve.inventory(),
     )?
     else {
-        return Ok(());
+        return Ok(false);
     };
     println!("reserved vm={} job={}", row.vm.get(), job.job.0);
-    if let Err(error) = provision(pve, gh, ledger, &mut row, dir, path, (group, admission)) {
-        row.failure = Some(error.to_string());
-        update(ledger, &row, path)?;
-        return Err(error);
+    provisioners.start(
+        ledger,
+        row,
+        lane_pve,
+        (dir, path),
+        (group, admission.clone()),
+    )?;
+    Ok(true)
+}
+
+/// Provisioning workers (#1251): each owns one reserved row's lifecycle
+/// through its own ledger publication until the clone runs or fails, so a
+/// burst of jobs boots clones side by side instead of one per pass.
+pub(super) struct Provisioners {
+    results: std::sync::mpsc::Sender<Result<(), ScalerError>>,
+    finished: std::sync::mpsc::Receiver<Result<(), ScalerError>>,
+}
+impl Provisioners {
+    pub(super) fn new() -> Self {
+        let (results, finished) = std::sync::mpsc::channel();
+        Self { results, finished }
     }
-    Ok(())
+    /// Hand `row` to a new worker. The claim is taken here, before the
+    /// lifecycle loop's next save, and released when the worker ends,
+    /// including by panic.
+    fn start(
+        &self,
+        ledger: &Ledger,
+        mut row: Record,
+        pve: Pve,
+        paths: (&Path, &Path),
+        approval: (u64, Admission),
+    ) -> Result<(), ScalerError> {
+        let (publication, claim) = ledger
+            .publication
+            .as_ref()
+            .ok_or(ScalerError::Guard(
+                "provisioning needs a ledger publication",
+            ))?
+            .provisioner(&row.name)?;
+        let mut owned = ledger.clone();
+        owned.publication = Some(publication);
+        let (dir, path) = (paths.0.to_owned(), paths.1.to_owned());
+        let results = self.results.clone();
+        std::thread::spawn(move || {
+            let _claim = claim;
+            let (group, admission) = approval;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let provisioned = provision(
+                    &pve,
+                    &Github,
+                    &mut owned,
+                    &mut row,
+                    &dir,
+                    &path,
+                    (group, &admission),
+                );
+                if let Err(error) = &provisioned {
+                    row.failure = Some(error.to_string());
+                    // Keep the provisioning error; reconcile recovers the row
+                    // even if this record is lost.
+                    if let Err(record) = update(&mut owned, &row, &path) {
+                        eprintln!("vm={} failure not recorded: {record}", row.vm.get());
+                    }
+                }
+                provisioned
+            }))
+            .unwrap_or(Err(ScalerError::Guard("provisioning worker panicked")));
+            // The receiver outlives every worker unless the controller is
+            // already exiting; then reconciliation recovers the row.
+            let _ = results.send(result);
+        });
+        Ok(())
+    }
+    /// Results of workers that finished since the last call.
+    fn finished(&self) -> Vec<Result<(), ScalerError>> {
+        self.finished.try_iter().collect()
+    }
 }
 
 #[cfg(test)]
@@ -2102,6 +2283,220 @@ mod security_tests;
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    fn provisioning_ledger(dir: &Path, rows: u64) -> (Ledger, PathBuf) {
+        let path = dir.join("ledger.json");
+        let budget = CloneBudget {
+            kvm: Concurrency::try_from(2).unwrap(),
+            agents: "6".parse().unwrap(),
+        };
+        let mut ledger = Ledger::default();
+        for n in 0..rows {
+            let key = JobKey {
+                run: RunId(10),
+                attempt: 1,
+                job: JobId(n),
+            };
+            ledger
+                .reserve_lane(key, &[], n, budget, CloneLane::Agent)
+                .unwrap();
+        }
+        let publication = assignment::Publication::new(ledger.clone());
+        ledger.publication = Some(publication);
+        ledger.save(&path).unwrap();
+        (ledger, path)
+    }
+    fn committed(ledger: &Ledger, name: &str) -> Record {
+        let mut fresh = ledger.clone();
+        fresh.publication = Some(ledger.publication.as_ref().unwrap().worker());
+        fresh.refresh().unwrap();
+        fresh.rows.into_iter().find(|r| r.name == name).unwrap()
+    }
+    /// #1251 review: two clones provision at once. Each provisioner owns only
+    /// its row; the lifecycle loop's stale saves, before and after a worker
+    /// finishes, never revert either row; the loop's own change to a third
+    /// row survives; and a provisioner keeps the assignment worker's decision.
+    #[test]
+    fn two_concurrent_provisioners_keep_every_lifecycle_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut lifecycle, path) = provisioning_ledger(temp.path(), 3);
+        let names: Vec<String> = lifecycle.rows.iter().map(|r| r.name.clone()).collect();
+        let publication = lifecycle.publication.clone().unwrap();
+        let workers: Vec<_> = names[..2]
+            .iter()
+            .map(|name| {
+                let (owned_publication, claim) = publication.provisioner(name).unwrap();
+                let mut owned = lifecycle.clone();
+                owned.publication = Some(owned_publication);
+                let mut row = owned.rows.iter().find(|r| &r.name == name).unwrap().clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for state in [State::Cloning, State::Booting, State::Registered] {
+                        row.state = state;
+                        update(&mut owned, &row, &path).unwrap();
+                    }
+                    (owned, row, path, claim)
+                })
+            })
+            .collect();
+        // The assignment worker records a decision for the first row.
+        let mut assignments = lifecycle.clone();
+        assignments.publication = Some(publication.worker());
+        assignments.rows[0].assigned_key = Some(lifecycle.rows[0].key);
+        assignments.rows[0].approved = true;
+        assignments.save(&path).unwrap();
+        // The lifecycle loop, holding its pre-provisioning snapshot, edits the
+        // third row and saves while both workers write.
+        lifecycle.rows[2].failure = Some("lifecycle note".into());
+        lifecycle.save(&path).unwrap();
+        for worker in workers {
+            let (mut owned, mut row, path, claim) = worker.join().unwrap();
+            row.state = State::Running;
+            update(&mut owned, &row, &path).unwrap();
+            drop(claim);
+        }
+        // Still stale: released rows stay protected until the loop re-reads.
+        lifecycle.save(&path).unwrap();
+        for name in &names[..2] {
+            assert_eq!(committed(&lifecycle, name).state, State::Running, "{name}");
+        }
+        lifecycle.refresh().unwrap();
+        lifecycle.save(&path).unwrap();
+        let first = committed(&lifecycle, &names[0]);
+        assert_eq!((first.state, first.approved), (State::Running, true));
+        assert_eq!(committed(&lifecycle, &names[1]).state, State::Running);
+        assert_eq!(
+            committed(&lifecycle, &names[2]).failure.as_deref(),
+            Some("lifecycle note")
+        );
+        // A row has one owner at a time.
+        let (_, held) = publication.provisioner(&names[2]).unwrap();
+        assert!(publication.provisioner(&names[2]).is_err());
+        drop(held);
+    }
+    /// #1251 review: clones still booting count at their nominal size, so a
+    /// host whose live reading admits one more refuses it while two boot;
+    /// the charge is released when a clone runs or retires. Driven through
+    /// the controller's admission verdict and its storage floor.
+    #[test]
+    fn admission_is_refused_while_two_clones_boot() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = provisioning_ledger(temp.path(), 3);
+        for row in &mut ledger.rows[..2] {
+            row.state = State::Booting;
+        }
+        let nominal = |_: CloneLane| (8, 20 << 10);
+        let candidate = ledger.rows[2].name.clone();
+        // 50 GiB free and 10% busy on 48 threads: one 20 GiB, 8-vCPU clone fits.
+        let sample = HostSample {
+            busy: 0.10,
+            threads: 48,
+            available: 50 << 30,
+        };
+        let admits = |pending| admission_verdict(&sample, (8, 20 << 10), pending).unwrap();
+        assert!(admits(Pending::default()));
+        let pending = ledger.pending(&candidate, nominal);
+        assert_eq!(
+            pending,
+            Pending {
+                clones: 2,
+                cores: 16,
+                memory_mib: 40 << 10
+            }
+        );
+        assert!(!admits(pending));
+        // Storage: 150 GiB plus 20 GiB per pending clone.
+        let status = |free: u64| json!({"active":1,"enabled":1,"avail":free});
+        assert!(directory_headroom(&status(170 << 30), storage_floor(Pending::default())).unwrap());
+        assert!(!directory_headroom(&status(170 << 30), storage_floor(pending)).unwrap());
+        // A pending charge defers; it never trips the fatal CPU ceiling.
+        let busy_host = HostSample {
+            busy: 0.60,
+            ..sample
+        };
+        assert!(!admission_verdict(&busy_host, (8, 20 << 10), pending).unwrap());
+        // One runs, the other retires: nothing is pending any more.
+        ledger.rows[0].state = State::Running;
+        ledger.rows[1].state = State::Reaping;
+        assert_eq!(ledger.pending(&candidate, nominal), Pending::default());
+        assert!(admits(ledger.pending(&candidate, nominal)));
+    }
+    /// #1251 review P1: a reconcile pass lists its rows when it starts. A
+    /// worker that takes its row to Running and releases it mid-pass must
+    /// not be reconciled from the pass's stale copy (Registered), even after
+    /// another row's refresh drained the release.
+    #[test]
+    fn reconcile_reads_a_row_released_mid_pass_from_the_ledger() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut lifecycle, path) = provisioning_ledger(temp.path(), 2);
+        let name = lifecycle.rows[0].name.clone();
+        let other = lifecycle.rows[1].name.clone();
+        let publication = lifecycle.publication.clone().unwrap();
+        let (owned_publication, claim) = publication.provisioner(&name).unwrap();
+        let mut owned = lifecycle.clone();
+        owned.publication = Some(owned_publication);
+        let mut row = owned.rows[0].clone();
+        row.state = State::Registered;
+        update(&mut owned, &row, &path).unwrap();
+        // The pass starts: its list holds the row at Registered, and owned.
+        lifecycle.refresh().unwrap();
+        let pass: Vec<Record> = lifecycle.rows.clone();
+        assert!(reconcile_target(&mut lifecycle, &name).unwrap().is_none());
+        // Mid-pass, on its own thread, the worker finishes and releases.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            row.state = State::Running;
+            update(&mut owned, &row, &worker_path).unwrap();
+            drop(claim);
+        });
+        go.send(()).unwrap();
+        worker.join().unwrap();
+        // Another row's reconcile step refreshes, draining the release.
+        assert!(reconcile_target(&mut lifecycle, &other).unwrap().is_some());
+        // The pass reaches the row: its stale copy says Registered, but the
+        // step reconciles the committed Running row and keeps it Running.
+        assert_eq!(pass[0].state, State::Registered);
+        let current = reconcile_target(&mut lifecycle, &name).unwrap().unwrap();
+        assert_eq!(current.state, State::Running);
+        update(&mut lifecycle, &current, &path).unwrap();
+        assert_eq!(committed(&lifecycle, &name).state, State::Running);
+    }
+    /// #1251 review: a provisioning worker that dies mid-boot releases its
+    /// row. Reconciliation may take it over (it is no longer live), and the
+    /// loop's next snapshot carries the row's last committed state.
+    #[test]
+    #[allow(clippy::panic)]
+    fn a_provisioner_dying_mid_boot_hands_its_row_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut lifecycle, path) = provisioning_ledger(temp.path(), 1);
+        let name = lifecycle.rows[0].name.clone();
+        let publication = lifecycle.publication.clone().unwrap();
+        let (owned_publication, claim) = publication.provisioner(&name).unwrap();
+        let mut owned = lifecycle.clone();
+        owned.publication = Some(owned_publication);
+        let mut row = owned.rows[0].clone();
+        let worker_path = path.clone();
+        let died = std::thread::spawn(move || {
+            let _claim = claim;
+            row.state = State::Booting;
+            update(&mut owned, &row, &worker_path).unwrap();
+            panic!("worker died mid-boot");
+        })
+        .join();
+        assert!(died.is_err());
+        // Until the loop re-reads, its stale copy (Reserved) can't win.
+        lifecycle.save(&path).unwrap();
+        assert_eq!(committed(&lifecycle, &name).state, State::Booting);
+        // Released but not yet re-read: still skipped this step.
+        let pass_list = reconcile_target(&mut lifecycle, &name).unwrap();
+        assert!(pass_list.is_none(), "released, not yet re-read");
+        // The next step re-reads and reconciles it at its last state.
+        lifecycle.refresh().unwrap();
+        assert!(publication.owners().owned().is_empty());
+        let reclaimed = reconcile_target(&mut lifecycle, &name).unwrap().unwrap();
+        assert_eq!(reclaimed.state, State::Booting);
+    }
     /// #1251: the agent lane reserves up to `--max-agent-clones`, then
     /// refuses; the KVM lane keeps its own budget; out-of-range caps fail.
     #[test]

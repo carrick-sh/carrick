@@ -21,17 +21,69 @@ use serde_json::Value;
 
 /// In-process ledger publication. The assignment worker never owns a lifecycle
 /// transition, and the lifecycle loop never overwrites an assignment decision.
+/// A provisioning worker (#1251) owns one row's lifecycle from reservation
+/// until it runs or fails; the lifecycle loop keeps the committed copy of
+/// every row a live provisioner owns.
 #[derive(Debug, Clone)]
 pub(super) struct Publication<T> {
     committed: std::sync::Arc<std::sync::Mutex<T>>,
-    assignments_only: bool,
+    role: Role,
+    owners: Owners,
     admission: std::sync::Arc<std::sync::Mutex<()>>,
+}
+/// Which part of the ledger a publication's writer owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Role {
+    /// Everything except assignment decisions and rows a provisioner owns.
+    Lifecycle,
+    /// Assignment decisions only.
+    Assignments,
+    /// The named row's lifecycle only.
+    Provisioner(String),
+}
+/// Rows owned by provisioning workers: `live` while a worker runs, then
+/// `released` until the lifecycle loop's next snapshot includes the worker's
+/// last write, so a stale lifecycle copy can never overwrite it.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Owners(std::sync::Arc<std::sync::Mutex<OwnerSets>>);
+#[derive(Debug, Default)]
+pub(super) struct OwnerSets {
+    live: std::collections::BTreeSet<String>,
+    released: std::collections::BTreeSet<String>,
+}
+impl Owners {
+    fn sets(&self) -> std::sync::MutexGuard<'_, OwnerSets> {
+        match self.0.lock() {
+            Ok(sets) => sets,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+    /// Rows the lifecycle loop must not write: live and not yet re-read.
+    pub(super) fn owned(&self) -> std::collections::BTreeSet<String> {
+        let sets = self.sets();
+        sets.live.union(&sets.released).cloned().collect()
+    }
+}
+/// A provisioner's claim on one row. Dropping it, including while a panic
+/// unwinds the worker, hands the row back to reconciliation.
+#[derive(Debug)]
+pub(super) struct OwnerGuard {
+    owners: Owners,
+    name: String,
+}
+impl Drop for OwnerGuard {
+    fn drop(&mut self) {
+        let mut sets = self.owners.sets();
+        sets.live.remove(&self.name);
+        sets.released.insert(self.name.clone());
+    }
 }
 impl<T: Clone> Publication<T> {
     pub(super) fn new(value: T) -> Self {
         Self {
             committed: std::sync::Arc::new(std::sync::Mutex::new(value)),
-            assignments_only: false,
+            role: Role::Lifecycle,
+            owners: Owners::default(),
             admission: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
@@ -39,18 +91,55 @@ impl<T: Clone> Publication<T> {
         self.admission.clone()
     }
     pub(super) fn snapshot(&self) -> Result<T, ScalerError> {
-        self.committed
+        let committed = self
+            .committed
             .lock()
-            .map(|value| value.clone())
-            .map_err(|_| ScalerError::Guard("ledger publication poisoned"))
+            .map_err(|_| ScalerError::Guard("ledger publication poisoned"))?;
+        // Every released row's last write committed before its release, so
+        // this snapshot holds it; only now may the lifecycle loop write it.
+        if self.role == Role::Lifecycle {
+            self.owners.sets().released.clear();
+        }
+        Ok(committed.clone())
     }
     pub(super) fn worker(&self) -> Self {
         Self {
             committed: self.committed.clone(),
-            assignments_only: true,
+            role: Role::Assignments,
+            owners: self.owners.clone(),
             admission: self.admission.clone(),
         }
     }
+    /// A publication owning `name`'s lifecycle, and the claim that keeps it.
+    /// Refused if another live provisioner already owns that row.
+    pub(super) fn provisioner(&self, name: &str) -> Result<(Self, OwnerGuard), ScalerError> {
+        let mut sets = self.owners.sets();
+        if sets.live.contains(name) || !sets.live.insert(name.to_owned()) {
+            return Err(ScalerError::Guard("row already has a provisioning owner"));
+        }
+        drop(sets);
+        Ok((
+            Self {
+                committed: self.committed.clone(),
+                role: Role::Provisioner(name.to_owned()),
+                owners: self.owners.clone(),
+                admission: self.admission.clone(),
+            },
+            OwnerGuard {
+                owners: self.owners.clone(),
+                name: name.to_owned(),
+            },
+        ))
+    }
+    pub(super) fn role(&self) -> &Role {
+        &self.role
+    }
+    pub(super) fn owners(&self) -> &Owners {
+        &self.owners
+    }
+    /// Commit `candidate`. The lifecycle writer's candidate is the base and
+    /// `merge` reads the committed ledger into it; any other writer starts
+    /// from the committed ledger and `merge` reads its candidate.
     pub(super) fn commit(
         &self,
         candidate: &T,
@@ -64,16 +153,13 @@ impl<T: Clone> Publication<T> {
             .committed
             .lock()
             .map_err(|_| ScalerError::Guard("ledger publication poisoned"))?;
-        let mut next = if self.assignments_only {
-            committed.clone()
-        } else {
+        let lifecycle = self.role == Role::Lifecycle;
+        let mut next = if lifecycle {
             candidate.clone()
-        };
-        let source = if self.assignments_only {
-            candidate
         } else {
-            &committed
+            committed.clone()
         };
+        let source = if lifecycle { &committed } else { candidate };
         merge(&mut next, source);
         save_json(&next, path)?;
         *committed = next;

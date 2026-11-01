@@ -41,6 +41,24 @@ mostly on model calls, and admission reads live CPU and `MemAvailable`, so a
 busy or memory-tight host defers the next clone. Every clone, in either lane,
 still passes the 80% projected-CPU and memory admission checks, which defer a
 clone on a busy host; they are not cross-VM isolation.
+Clones are provisioned in parallel (#1251). One admission pass reserves
+clones until demand or the budget runs out. Each reserved clone is handed to
+its own provisioning worker, which owns that ledger row from `Reserved` until
+it runs or fails. The lifecycle loop keeps the committed copy of an owned row
+until its next ledger read. Reconciliation skips an owned row (live, or
+released but not yet re-read) and otherwise works from the row's committed
+copy, never from the list it took when the pass started. A worker that
+dies, even by panic, hands the row back, and reconciliation recovers it as
+after a controller restart. Admission charges
+every clone that is admitted but not yet running (`Reserved`, `Cloning`,
+`Booting`, `Registered`) at its lane's nominal vCPUs and memory, on top of
+the live readings, so a burst cannot overcommit memory that booting clones
+have not touched yet. Free storage must cover the 150 GiB floor plus 20 GiB
+per pending clone. Because a booting clone may already use part of its
+charge, a refusal at the pre-boot re-check waits for other clones to run,
+for up to ten minutes, before it fails. The charge is released when the clone runs or retires,
+and the controller logs it as `pending_clones`, `pending_vcpus` and
+`pending_memory_mib` on each `admission` line.
 Each VM serializes its own builds, gates and oracle phases with a local lease.
 
 On Contabo, clones sit on the private NAT bridge, which they share with the
