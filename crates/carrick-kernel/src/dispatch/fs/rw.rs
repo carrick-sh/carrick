@@ -709,6 +709,21 @@ enum HostFileWriter<'c, 'k, M: CurrentMmMemory> {
 /// inotify or fanotify watch exists; otherwise the venue refuses the write.
 pub(in crate::dispatch) struct CarrierWrite(());
 
+/// `read(2)`/`pread64(2)` of `length` bytes from a synthetic device:
+/// `/dev/null` is at end of file, `/dev/zero` and `/dev/full` read zeros,
+/// the random devices read random bytes.
+fn synthetic_device_read(kind: &carrick_vfs::SyntheticDeviceKind, length: usize) -> Vec<u8> {
+    match kind {
+        carrick_vfs::SyntheticDeviceKind::Null => Vec::new(),
+        carrick_vfs::SyntheticDeviceKind::Zero | carrick_vfs::SyntheticDeviceKind::Full => {
+            vec![0u8; length]
+        }
+        carrick_vfs::SyntheticDeviceKind::Random | carrick_vfs::SyntheticDeviceKind::Urandom => {
+            random_device_bytes(length)
+        }
+    }
+}
+
 /// `write(2)` on a synthetic device: `/dev/full` is full, the rest swallow.
 fn synthetic_device_write(kind: &carrick_vfs::SyntheticDeviceKind, len: usize) -> DispatchOutcome {
     match kind {
@@ -1368,10 +1383,16 @@ impl<'a> FsView<'a> {
             *offset += copied;
             return Ok(DispatchOutcome::returned_len_or_errno(copied));
         }
-        // The native venue's carrier buffer reads only the regular files
-        // and directories that venue opens; every other kind is a task's.
+        // The native venue's carrier buffer reads only the regular files,
+        // directories and synthetic devices that venue opens; every other
+        // kind is a task's.
         let Some(task) = task else {
             return match &mut *open {
+                OpenDescription::SyntheticDevice { kind, .. } => {
+                    let bytes = synthetic_device_read(kind, length);
+                    memory.write_bytes(address, &bytes)?;
+                    Ok(DispatchOutcome::returned_len_or_errno(bytes.len()))
+                }
                 OpenDescription::HostFile { .. } => read_host_file_sequential(
                     &mut open,
                     None,
@@ -1453,16 +1474,8 @@ impl<'a> FsView<'a> {
                 }
             }
             OpenDescription::SyntheticDevice { kind, .. } => {
-                let (read_len, bytes) = match kind {
-                    carrick_vfs::SyntheticDeviceKind::Null => (0, Vec::new()),
-                    carrick_vfs::SyntheticDeviceKind::Zero
-                    | carrick_vfs::SyntheticDeviceKind::Full => (length, vec![0u8; length]),
-                    carrick_vfs::SyntheticDeviceKind::Random
-                    | carrick_vfs::SyntheticDeviceKind::Urandom => {
-                        (length, random_device_bytes(length))
-                    }
-                };
-                (read_len, bytes)
+                let bytes = synthetic_device_read(kind, length);
+                (bytes.len(), bytes)
             }
             OpenDescription::ProcExecutable {
                 executable, offset, ..
@@ -1892,14 +1905,7 @@ impl<'a> FsView<'a> {
             OpenDescription::InMemoryFile { contents, .. } => {
                 contents.read().read_range(offset, length)
             }
-            OpenDescription::SyntheticDevice { kind, .. } => match kind {
-                carrick_vfs::SyntheticDeviceKind::Null => Vec::new(),
-                carrick_vfs::SyntheticDeviceKind::Zero | carrick_vfs::SyntheticDeviceKind::Full => {
-                    vec![0u8; length]
-                }
-                carrick_vfs::SyntheticDeviceKind::Random
-                | carrick_vfs::SyntheticDeviceKind::Urandom => random_device_bytes(length),
-            },
+            OpenDescription::SyntheticDevice { kind, .. } => synthetic_device_read(kind, length),
             OpenDescription::HostFile { .. } => {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }

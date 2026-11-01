@@ -1290,6 +1290,94 @@ mod tests {
         }
     }
 
+    /// The root's own syscall `nr` through its host task, with `path` (if
+    /// any) staged at the first argument the caller points at `BASE`.
+    fn root_syscall(
+        dispatcher: &mut SyscallDispatcher,
+        nr: u64,
+        args: [u64; 6],
+        path: &[u8],
+    ) -> i64 {
+        const BASE: u64 = 0x4_0000;
+        let mut memory = super::super::outcome::LinearMemory::new(BASE, vec![0u8; 0x1000]);
+        memory.bytes[..path.len()].copy_from_slice(path);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = crate::compat::CompatReporter::default();
+        match dispatcher
+            .dispatch(
+                &context,
+                crate::dispatch::SyscallRequest::new(nr, crate::compat::SyscallArgs(args)),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            DispatchOutcome::Errno { errno } => errno.guest_retval(),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    /// A watch anywhere in the run (here the root's inotify watch on
+    /// `/etc`) leaves a native child's read-only opens served, as before
+    /// write opens were: the open and its reads work, without the events a
+    /// host task's open would raise. A write or create open, which no
+    /// earlier venue served, stays refused while a watch exists.
+    #[test]
+    fn native_read_only_open_is_served_while_a_watch_exists() {
+        let mut fixture = writable_fixture(Upper::Memory);
+        let authority = authority_of(&fixture.dispatcher);
+        let inotify = root_syscall(&mut fixture.dispatcher, 26, [0; 6], &[]);
+        assert!(inotify >= 0, "inotify_init1: {inotify}");
+        const BASE: u64 = 0x4_0000;
+        let watch = root_syscall(
+            &mut fixture.dispatcher,
+            27,
+            [inotify as u64, BASE, 0xfff, 0, 0, 0],
+            b"/etc\0",
+        );
+        assert!(watch >= 0, "inotify_add_watch: {watch}");
+        assert!(!fixture.dispatcher.fs.inotify_registry.is_empty());
+
+        assert_eq!(
+            fixture.venue_contents(&authority, b"/etc/ld.so.cache"),
+            b"cache"
+        );
+        let mut create = record(
+            fixture.table,
+            HostFileOp::Openat,
+            FDCWD,
+            [CREATE, 0o644, 0, 0],
+            b"/etc/new",
+            0,
+        );
+        assert_eq!(
+            fixture.serve(Some(&authority), &mut create),
+            Err(NativeHostFileRefusal),
+            "a create would owe IN_CREATE and later events"
+        );
+    }
+
+    /// `cmd < /dev/null`: a venue-opened synthetic device reads through the
+    /// root's read core: `/dev/null` is at end of file, `/dev/zero` fills.
+    #[test]
+    fn native_synthetic_device_reads() {
+        let fixture = writable_fixture(Upper::Memory);
+        let authority = authority_of(&fixture.dispatcher);
+        let rdonly = carrick_abi::LINUX_O_RDONLY;
+        let null = fixture.venue_open(&authority, b"/dev/null", rdonly, 0) as i32;
+        assert!(null >= 0, "open /dev/null: {null}");
+        let read = |fd: i32, op: HostFileOp, args: [u64; 4]| {
+            fixture.result(None, record(fixture.table, op, fd, args, &[], 8))
+        };
+        assert_eq!(read(null, HostFileOp::Read, [0; 4]), (0, Vec::new()));
+        assert_eq!(read(null, HostFileOp::Pread, [0; 4]), (0, Vec::new()));
+        let zero = fixture.venue_open(&authority, b"/dev/zero", rdonly, 0) as i32;
+        assert!(zero >= 0, "open /dev/zero: {zero}");
+        assert_eq!(read(zero, HostFileOp::Read, [0; 4]), (8, vec![0; 8]));
+        assert_eq!(read(zero, HostFileOp::Pread, [4, 0, 0, 0]), (8, vec![0; 8]));
+    }
+
     /// What only a host task's open may hold stays refused for a native
     /// caller, before the mount acts: a terminal end (no pty is allocated)
     /// and the opener's own `/proc` view. Mount-served opens a native caller
