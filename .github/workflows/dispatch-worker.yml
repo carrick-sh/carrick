@@ -197,7 +197,7 @@ jobs:
         run: |
           CARRICK_DISPATCH_STEP_STARTED_AT=$(date +%s)
           export CARRICK_DISPATCH_STEP_STARTED_AT
-          "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode gate --check-load -- \
+          "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load -- \
             "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker loop --event "$GITHUB_EVENT_PATH" \
             --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
       - name: Verify retirement before credentialed completion
