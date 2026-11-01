@@ -678,7 +678,7 @@ pub fn lane_census(
     // Supply source-only target metadata to the canonical lane resolver. Never
     // run candidate Cargo/build scripts in the trusted receipt grader.
     let mut packages = Vec::new();
-    let mut libs = BTreeSet::new();
+    let mut libs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for dir in candidate_crate_dirs(root)? {
         let manifest = crate_manifest(&dir)?;
         let Some(package) = manifest.get("package") else {
@@ -691,19 +691,20 @@ pub fn lane_census(
             || regular_path(&dir, Path::new("src/lib.rs"), false)?
             || regular_path(&dir, Path::new("src/main.rs"), false)?
         {
-            libs.insert(
-                manifest
-                    .get("lib")
-                    .and_then(|v| v.get("name"))
-                    .and_then(toml::Value::as_str)
-                    .unwrap_or(name)
-                    .replace('-', "_"),
-            );
+            let binary = manifest
+                .get("lib")
+                .and_then(|v| v.get("name"))
+                .and_then(toml::Value::as_str)
+                .unwrap_or(name)
+                .replace('-', "_");
+            libs.entry(binary).or_default().insert(name.to_owned());
         }
         if let Some(bins) = manifest.get("bin").and_then(toml::Value::as_array) {
             for bin in bins {
-                if let Some(name) = bin.get("name").and_then(toml::Value::as_str) {
-                    libs.insert(name.replace('-', "_"));
+                if let Some(binary) = bin.get("name").and_then(toml::Value::as_str) {
+                    libs.entry(binary.replace('-', "_"))
+                        .or_default()
+                        .insert(name.to_owned());
                 }
             }
         }
@@ -752,20 +753,43 @@ pub fn lane_census(
         .collect();
     let mut counted = BTreeSet::new();
     for step in &receipt.steps {
+        let words: Vec<_> = step.command.split_whitespace().collect();
+        let selected_packages: BTreeSet<_> = words
+            .windows(2)
+            .filter(|pair| {
+                matches!(pair[0], "-p" | "--package") || pair[0].ends_with("test-signed.sh")
+            })
+            .map(|pair| pair[1])
+            .chain(
+                words
+                    .iter()
+                    .filter_map(|word| word.strip_prefix("--package=")),
+            )
+            .collect();
+        let selected =
+            |package: &str| selected_packages.is_empty() || selected_packages.contains(package);
+        let unit_only =
+            (words.contains(&"--lib") || words.contains(&"--bins")) && !words.contains(&"--test");
+        let integration_only =
+            words.contains(&"--test") && !words.contains(&"--lib") && !words.contains(&"--bins");
         for test in &step.started_tests {
             let Some((bin, _)) = test.split_once("::") else {
                 continue;
             };
             let owners: Vec<_> = targets
                 .iter()
-                .filter(|t| t.target.replace('-', "_") == bin)
+                .filter(|t| !unit_only && selected(&t.package) && t.target.replace('-', "_") == bin)
                 .collect();
             let lanes: BTreeSet<&str> = owners.iter().map(|t| t.lane.as_str()).collect();
+            let unit_matches = !integration_only
+                && libs
+                    .get(bin)
+                    .is_some_and(|packages| packages.iter().any(|package| selected(package)));
             // A bare integration binary shared by several packages cannot
             // establish which lane ran. Do not count it in multiple lanes.
-            let lane = if lanes.len() == 1 && !libs.contains(bin) {
+            let lane = if lanes.len() == 1 && !unit_matches {
                 lanes.first().copied()
-            } else if owners.is_empty() && libs.contains(bin) {
+            } else if owners.is_empty() && unit_matches {
                 Some(crate::test_lanes::DEFAULT_LANE)
             } else {
                 None
