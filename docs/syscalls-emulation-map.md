@@ -165,7 +165,7 @@ reparent-to-init, and `wait4`/`waitid` status all match Linux semantics.
 
 | Syscall(s) | nr | Quality | Darwin backing | Notes |
 |---|---|---|---|---|
-| `clone` | 220 | Emulated (Full) | `libc::fork` (process) or `pthread` + fresh per-thread vCPU (thread) | Flag-consistency validated: `CLONE_THREAD` without `CLONE_VM\|CLONE_SIGHAND` → EINVAL. |
+| `clone` | 220 | Emulated (Full) | `libc::fork` (process) or `pthread` + fresh per-thread vCPU (thread) | Flag-consistency validated: `CLONE_THREAD` without `CLONE_VM\|CLONE_SIGHAND` → EINVAL. **Carrick limit:** an HVPatch process holds at most 8 live threads (leader included; `THREAD_POOL_ENTRIES`), and a further thread clone returns EAGAIN while all 8 are live. Linux has no such per-process limit; growth is [#1142](https://github.com/carrick-sh/carrick/issues/1142). |
 | `clone3` | 435 | **Partial, not promoted** | kernel fork/thread outcomes | `Planned`; validates sizes/flags/stack and supports fork/thread paths, but ignores `set_tid`, `set_tid_size`, and `cgroup`. |
 | `execve` | 221 | Emulated (Full) | re-exec the ELF loader in-process | Resets caught handlers→SIG_DFL, keeps SIG_IGN, preserves mask + pending + sigaltstack. |
 | `execveat` | 281 | **Partial, not promoted** | shared exec loader | `Planned`; path/dirfd, flag validation and `AT_EMPTY_PATH` work. Ordinary fds execute by recorded path, losing opened-inode identity after unlink/replacement. |
