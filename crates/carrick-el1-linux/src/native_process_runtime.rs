@@ -5519,6 +5519,42 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })
     }
 
+    /// A member that enters new native work after its process's terminal
+    /// close has closed the gate never returns to EL0 and publishes no host
+    /// work: it retires with the close status through the same transaction
+    /// as a cancelled continuation (`retire_closing_member`). The handoff
+    /// receipt stays with this entry for its settlement to consume.
+    #[inline(never)]
+    pub(super) fn retire_closing_entry(&mut self) -> Result<NativeResume, NativeProcessError> {
+        let status = self
+            .pending_close_status()
+            .ok_or(NativeProcessError::Quarantined)?;
+        let outcome = match self.retire_closing_member(status) {
+            Ok(outcome) => outcome,
+            Err(error) => self.run_failed(error.run_failure_reason()),
+        };
+        match outcome {
+            LifecycleOutcome::HostCustody => {
+                // An adopted host member retires on its exact host owner.
+                self.handoff = carrick_core::entry::yield_current_to_host(
+                    self.binding,
+                    self.source,
+                    self.record.id,
+                );
+                if self.handoff.is_none() {
+                    return Err(NativeProcessError::Quarantined);
+                }
+                self.current.linux.mark_pending_host_work();
+                Ok(NativeResume::Left(None))
+            }
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            } if self.handoff.is_some() => Ok(NativeResume::Left(self.take_root_exit())),
+            _ => Err(NativeProcessError::Quarantined),
+        }
+    }
+
     /// Retire a non-owner through the same lifecycle-page transaction as a
     /// raw thread `exit`. A cancelled service continuation reaches this path
     /// without returning to EL0, so it must publish both scheduler and page

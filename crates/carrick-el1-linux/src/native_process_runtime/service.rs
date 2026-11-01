@@ -860,15 +860,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map_err(|_| NativeProcessError::Stale)
             })
             .transpose()?;
+        // The claim counter refuses only on overflow. Every live member holds
+        // at most one claim, so overflow is lost claim accounting: a broken
+        // invariant, not contention and not a gate state (#1100).
         self.service_phase = NativeServicePhase::Claim;
         let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
-            .map_err(|_| NativeProcessError::Busy)?;
+            .map_err(|_| NativeProcessError::Quarantined)?;
         self.service_phase = NativeServicePhase::Publication;
+        // A terminal close owns this process: no host work may be published
+        // into it, and this member must not return to EL0.
+        let mut closing = false;
         let published = {
             let graph = self.runtime.graph.lock();
             if !claim.admitted() {
                 self.service_phase = NativeServicePhase::Gate;
-                Err(NativeProcessError::Busy)
+                // The gate closes under this graph lock in the same
+                // transaction that installs the pending close, so the close
+                // is visible here. A closed gate without one is a broken
+                // close, never "not now".
+                closing = graph.pending.has_exit(&self.key);
+                Err(NativeProcessError::Quarantined)
             } else if graph.has_member_wait(&self.record) {
                 self.service_phase = graph.member_wait_phase(&self.record);
                 Err(NativeProcessError::Busy)
@@ -895,6 +906,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Err(error) => {
                 drop(owner_queue);
                 self.release_service_claim(claim)?;
+                if closing {
+                    return self.retire_closing_entry();
+                }
                 return Err(error);
             }
         };
