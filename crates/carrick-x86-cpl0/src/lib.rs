@@ -89,7 +89,11 @@ pub(crate) fn anonymous_call(
         .and_then(carrick_sched_core::SlotId::from_index)?;
     // This venue projects one task, independently of its CPU slot.
     Some(carrick_el1::memory::AnonymousCall::new(
-        call, 0, slot, return_pc,
+        carrick_core::CallOrdinal::from_raw(call.canonical.raw()),
+        call.args,
+        0,
+        slot,
+        return_pc,
     ))
 }
 
@@ -109,6 +113,28 @@ mod anonymous_refusal_tests {
             carrick_personality_linux::pending_anonymous::RetirementStep::Forward
         ));
         assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+    /// Linux decoding stays at the personality edge, before the neutral view.
+    #[test]
+    fn both_linux_decoders_project_the_same_anonymous_call() {
+        use carrick_el1::memory::AnonymousCallView;
+        use carrick_personality_linux::entry::{decode_aarch64, decode_x86_64};
+        let args = [0x100000, 0x3000, 1, 0, 0, 0];
+        for (arm_nr, x86_nr) in [(222, 9), (226, 10), (215, 11)] {
+            let arm = decode_aarch64(arm_nr, args, 0x8000);
+            let x86 = decode_x86_64(x86_nr, args, 0x8000);
+            let pc = carrick_guest_arch::UserVa::new(0x40004);
+            let arm = anonymous_call(arm, 7, pc).unwrap();
+            let x86 = anonymous_call(x86, 7, pc).unwrap();
+            assert_eq!(arm.canonical(), x86.canonical());
+            assert_eq!(x86.canonical().raw(), arm_nr);
+            assert_eq!(arm.arguments(), args);
+            assert_eq!(x86.arguments(), args);
+            assert_eq!(arm.return_address(), pc);
+            assert_eq!(x86.return_address(), pc);
+            assert_eq!(x86.task_index(), 0);
+            assert_eq!(x86.slot().index(), 7);
+        }
     }
     #[test]
     fn invalid_anonymous_slot_declines_without_fatal() {

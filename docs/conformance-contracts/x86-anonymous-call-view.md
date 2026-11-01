@@ -2,8 +2,8 @@
 
 The shared reservation decoder, pending completion authentication and resident
 permission/retirement entry points consume `AnonymousCallView`. ARM projects its
-real `TrapFrame`; CPL0 retains a decoded `CanonicalCall`, CPU slot, return PC
-and independent result word. The latter carries an explicit task-slice index
+real `TrapFrame`; CPL0 retains a neutral `CallOrdinal`, six arguments, CPU
+slot, return PC and independent result word. The latter carries an explicit task-slice index
 independently of the CPU slot. The x86 venue projects its single task at index
 zero while retaining its actual CPU slot for editor ownership. No ARM register frame is
 constructed by the x86 anonymous venue.
@@ -18,7 +18,7 @@ CPU is live, or the `MmuBackend` request/drain receipt otherwise. Physical
 returns remain journaled until the existing inventory settlement.
 
 The VM-free two-ISA binding runs the real shared reservation entry point with
-both native decoders. It narrows a three-page private mapping, removes its
+both native call views. It narrows a three-page private mapping, removes its
 middle page, and checks EINVAL (22) and ENOMEM (12). A second live task in the
 same MM observes the committed permission and split reservation state from a
 bounded host thread. The same peer reads real fixture backing through live
@@ -45,6 +45,16 @@ Migration to mm::retirement ServedTable/StagedInvalidation remains
 [#681 slice 5](https://github.com/carrick-sh/carrick/issues/681); this refactor
 does not satisfy that acceptance item. The ARM drain count is a fixture
 completion marker, not an invalidation witness.
+
+Linux decoder equivalence is tested at the CPL0 Linux edge by
+`both_linux_decoders_project_the_same_anonymous_call`.
+
+The call view uses `carrick_core::CallOrdinal`; Linux `CanonicalCall` is
+projected at the Linux caller. The neutral call adapter and shared engine
+tests do not import Linux entry or dispatch types. The older reservation
+policy references in `memory.rs`, `memory/reservations.rs` and `fault.rs`
+remain the explicitly grandfathered fault/memory migration in the boundary
+auditor; this change does not relocate or disguise that policy debt.
 
 The native projected-task witness also checks that CPU slot 7 owns editor 8
 while looking up task slice index one, and that both resident entry points

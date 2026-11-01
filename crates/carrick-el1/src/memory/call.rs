@@ -1,11 +1,11 @@
 //! Native adapters expose only the anonymous engine's call contract.
+use carrick_core::CallOrdinal;
 use carrick_guest_arch::{NativeReturnWord, UserVa};
-use carrick_personality_linux::entry::{CanonicalCall, CanonicalOrdinal};
 use carrick_sched_core::SlotId;
 
 /// ISA-neutral memory call, including the originating continuation identity.
 pub trait AnonymousCallView {
-    fn canonical(&self) -> CanonicalOrdinal;
+    fn canonical(&self) -> CallOrdinal;
     fn arguments(&self) -> [u64; 6];
     fn return_address(&self) -> UserVa;
     fn slot(&self) -> Option<SlotId>;
@@ -17,7 +17,8 @@ pub trait AnonymousCallView {
 
 /// A decoded native call whose result is copied back by the entry owner.
 pub struct AnonymousCall {
-    call: CanonicalCall,
+    ordinal: CallOrdinal,
+    args: [u64; 6],
     slot: SlotId,
     task_index: usize,
     return_address: UserVa,
@@ -28,14 +29,16 @@ impl AnonymousCall {
         self.slot
     }
     pub fn new(
-        call: CanonicalCall,
+        ordinal: CallOrdinal,
+        args: [u64; 6],
         task_index: usize,
         slot: SlotId,
         return_address: UserVa,
     ) -> Self {
         Self {
-            result: NativeReturnWord(call.args[0]),
-            call,
+            result: NativeReturnWord(args[0]),
+            ordinal,
+            args,
             task_index,
             slot,
             return_address,
@@ -43,11 +46,11 @@ impl AnonymousCall {
     }
 }
 impl AnonymousCallView for AnonymousCall {
-    fn canonical(&self) -> CanonicalOrdinal {
-        self.call.canonical
+    fn canonical(&self) -> CallOrdinal {
+        self.ordinal
     }
     fn arguments(&self) -> [u64; 6] {
-        self.call.args
+        self.args
     }
     fn return_address(&self) -> UserVa {
         self.return_address
@@ -67,8 +70,8 @@ impl AnonymousCallView for AnonymousCall {
 }
 
 impl AnonymousCallView for carrick_el1_abi::TrapFrame {
-    fn canonical(&self) -> CanonicalOrdinal {
-        CanonicalOrdinal::new(self.x[8])
+    fn canonical(&self) -> CallOrdinal {
+        CallOrdinal::from_raw(self.x[8])
     }
     fn arguments(&self) -> [u64; 6] {
         [

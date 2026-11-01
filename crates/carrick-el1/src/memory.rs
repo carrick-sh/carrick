@@ -1478,9 +1478,10 @@ mod tests {
         let (frame, [task], spaces, ttbr0) = fixture(PROT_READ);
         let tasks = [CurrentTask::new(), task];
         let args = [frame.x[0], frame.x[1], frame.x[2], 0, 0, 0];
-        let decoded = carrick_personality_linux::entry::decode_x86_64(10, args, 0x8000);
+        let ordinal = carrick_core::CallOrdinal::from_raw(SYS_MPROTECT);
         let call = AnonymousCall::new(
-            decoded,
+            ordinal,
+            args,
             1,
             SlotId::from_index(7).unwrap(),
             UserVa::new(0x40004),
@@ -1501,9 +1502,10 @@ mod tests {
         assert_eq!(editor.calls.len(), 1);
         assert_eq!(editor.calls[0].0, ttbr0);
         assert_eq!(spaces.active_editor(spaces.find(17).unwrap()), None);
-        let decoded = carrick_personality_linux::entry::decode_x86_64(11, args, 0x8000);
+        let ordinal = carrick_core::CallOrdinal::from_raw(SYS_MUNMAP);
         let call = AnonymousCall::new(
-            decoded,
+            ordinal,
+            args,
             1,
             SlotId::from_index(7).unwrap(),
             UserVa::new(0x40004),
@@ -1523,6 +1525,24 @@ mod tests {
         );
         assert_eq!(editor.calls, vec![(ttbr0, args[0], 0x3000)]);
     }
+    #[test]
+    fn invalid_arm_slot_refuses_mprotect_before_editing() {
+        let (mut frame, tasks, spaces, _) = fixture(PROT_READ);
+        frame.slot = u64::MAX;
+        let mut editor = RecordingEditor::default();
+        assert_eq!(
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                SpaceAccess::source_free(&spaces),
+                &mut editor,
+            ),
+            MprotectDisposition::Forward,
+        );
+        assert!(editor.calls.is_empty());
+        assert_eq!(spaces.active_editor(spaces.find(17).unwrap()), None);
+    }
+
     #[test]
     fn resident_anonymous_mprotect_rounds_and_edits_under_exact_mm_guard() {
         let (frame, tasks, spaces, ttbr0) = fixture(PROT_READ);
@@ -2011,18 +2031,18 @@ mod tests {
             );
             // This fixture models the caller's Linux boundary after the actual
             // resource primitive, keeping all historical final-count assertions.
-            let entry = carrick_personality_linux::dispatch::EntryCounters {
-                served: &counters.served,
-                forwarded: &counters.forwarded,
-            };
             match route {
-                DelegatedAnonymous::Served => entry.served(nr),
-                DelegatedAnonymous::Forward => entry.forwarded(nr),
+                DelegatedAnonymous::Served => {
+                    counters.served[nr as usize].fetch_add(1, Ordering::Relaxed);
+                }
+                DelegatedAnonymous::Forward => {
+                    counters.forwarded[nr as usize].fetch_add(1, Ordering::Relaxed);
+                }
                 _ => {}
             }
             (route, frame.x[0] as i64)
         }
-        /// Both native decoders enter the same reservation transaction. The
+        /// Both native call views enter the same reservation transaction. The
         /// peer observes committed permissions/ranges, not a copied VMA model.
         #[test]
         fn two_isa_anonymous_edits_publish_to_a_live_peer() {
@@ -2076,24 +2096,9 @@ mod tests {
                         }
                     });
                     let invoke = |nr, args, editor: &mut Editor| {
-                        let decoded = match isa {
-                            GuestIsa::Aarch64 => {
-                                carrick_personality_linux::entry::decode_aarch64(nr, args, 0x8000)
-                            }
-                            GuestIsa::X86_64 => {
-                                let native = match nr {
-                                    SYS_MMAP => 9,
-                                    SYS_MPROTECT => 10,
-                                    SYS_MUNMAP => 11,
-                                    _ => unreachable!(),
-                                };
-                                carrick_personality_linux::entry::decode_x86_64(
-                                    native, args, 0x8000,
-                                )
-                            }
-                        };
                         let mut native = AnonymousCall::new(
-                            decoded,
+                            carrick_core::CallOrdinal::from_raw(nr),
+                            args,
                             0,
                             SlotId::from_index(7).unwrap(),
                             UserVa::new(0x40004),
