@@ -1021,7 +1021,16 @@ impl PersistentExecutor for FakeExecutor {
             .as_ref()
             .and_then(|exit| exit.lock().take())
         {
-            return Ok(super::GuestIdleExit::RootExit { status, mm });
+            // The production constructor: the crossing's slot gives up the
+            // exiting space EL1 left installed on it.
+            let (Some(slot), Some(zone)) = (self.idle_slot, carrick_el1_abi::zone_tables()) else {
+                return Err(TrapError::Hypervisor(
+                    "an idle root exit crosses on a zone slot".to_owned(),
+                ));
+            };
+            return Ok(super::GuestIdleExit::RootExit(
+                super::IdleRootExit::retire_slot_space(zone, slot, status, mm)?,
+            ));
         }
         if let Some(entry) = self
             .factory
@@ -1082,25 +1091,29 @@ impl PersistentExecutor for FakeExecutor {
         if let Some(load) = binding.zone_load.lock().take() {
             load.entered.send(()).unwrap();
             load.resume.recv_timeout(Duration::from_secs(5)).unwrap();
-            let super::residency::TaskCpuResidency::Zone {
-                base,
-                record,
-                origin,
-            } = binding.cpu_residency().unwrap()
-            else {
-                panic!("zone continuation")
-            };
-            let result = super::residency::materialize_zone_at(
-                load.zone,
-                &base,
-                record,
-                origin,
-                carrick_hal::trap::ZoneRestoreSite::DirectLoad,
-            );
-            if result.is_err() {
-                self.factory.concurrent_loads.lock().remove(&key);
+            match binding.cpu_residency() {
+                Some(super::residency::TaskCpuResidency::Zone {
+                    base,
+                    record,
+                    origin,
+                }) => {
+                    let result = super::residency::materialize_zone_at(
+                        load.zone,
+                        &base,
+                        record,
+                        origin,
+                        carrick_hal::trap::ZoneRestoreSite::DirectLoad,
+                    );
+                    if result.is_err() {
+                        self.factory.concurrent_loads.lock().remove(&key);
+                    }
+                    result?;
+                }
+                // A retired terminal residency restores no zone continuation,
+                // as the production load of a cleared residency.
+                None => {}
+                Some(_) => panic!("zone continuation"),
             }
-            result?;
         }
         if binding.load_fails.load(Ordering::SeqCst) {
             self.factory.concurrent_loads.lock().remove(&key);
@@ -8939,13 +8952,30 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
 
 /// kernel.scheduler.runnable-progress: the in-ring owner's root exit can
 /// cross on an executor waiting in the guest scheduler, with no host task
-/// loaded there. That executor must hand the terminal to the exiting
-/// process's parked host member and keep serving; dying left the member
-/// parked and the run's result waiter unpublished forever (the
-/// `el1_thread_lifecycle_mask_storm_exactly_once` hang under #1044).
+/// loaded there and the exiting address space still installed on its slot
+/// (the crossing abandons EL1's stack, so EL1 never leaves that space). That
+/// executor must hand the terminal to the exiting process's parked host
+/// member and keep serving; dying left the member parked and the run's
+/// result waiter unpublished forever (the
+/// `el1_thread_lifecycle_mask_storm_exactly_once` hang under #1044). The
+/// member then installs the same MM on that same slot to run the terminal:
+/// a slot that still recorded the space with no host owner refused it
+/// (`SlotWordWithoutOwner`, a `kernel::terminal_settlement` fatal).
 #[test]
-fn idle_vcpu_root_exit_wakes_the_parked_member_with_its_terminal() {
+fn serial_host_idle_vcpu_root_exit_hands_its_slot_and_terminal_to_the_member() {
+    struct Region(Box<carrick_test_support::TestEl1Region>);
+    impl Drop for Region {
+        fn drop(&mut self) {
+            assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
+                self.0.as_ptr() as usize
+            ));
+        }
+    }
+    let region = Region(carrick_test_support::TestEl1Region::zeroed());
+    carrick_el1_abi::record_el1_region_host_ptr(region.0.as_ptr() as usize);
+    let zone = carrick_el1_abi::zone_tables().unwrap();
     let (kernel, root) = bootstrap(19_795);
+    root.thread().set_affinity(CpuAffinity::all(1));
     let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let kick = WorkerKick::new(Arc::new(ReceiptLog::default()));
     let idle = scheduler
@@ -8956,23 +8986,58 @@ fn idle_vcpu_root_exit_wakes_the_parked_member_with_its_terminal() {
     scheduler
         .settle_blocked(scheduler.take(&idle).unwrap(), BlockedReason::HostWait)
         .unwrap();
+    let slot = carrick_el1_abi::SlotId::new(0);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, 0, Some(0), 0);
+    let mm_id = root.shared().mm().id();
+    let space = carrick_sched_core::AddressSpaceKey::from_raw(mm_id.raw()).unwrap();
+    // EL1 installed the exiting space on the idle vCPU, then crossed.
+    zone.occupancy
+        .install(carrick_sched_core::ExecutionSlot::zone(slot), space)
+        .unwrap();
     let status = carrick_sched_core::process::TerminationStatus::signaled(11, true);
-    let mm = carrick_core_abi::EntryMmKey::from_raw(root.shared().mm().id().raw());
+    let mm = carrick_core_abi::EntryMmKey::from_raw(mm_id.raw());
     let factory = FakeFactory {
         idle_root_exit: Some(Arc::new(parking_lot::Mutex::new(Some((status, mm))))),
         ..FakeFactory::default()
     };
     let mut backend = factory.create(&idle).unwrap();
-    let next = super::next_runnable(&scheduler, &mut backend, &idle, &kick);
-    assert!(
-        matches!(next, Ok(None)),
-        "the idle executor survives the crossing and keeps serving"
-    );
-    let running = scheduler
-        .try_take(&idle)
-        .unwrap()
-        .expect("the parked member is runnable to take its terminal");
-    assert_eq!(running.thread_key(), root.thread().key());
+    backend.idle_slot = Some(slot);
+    carrick_kernel::el1_zone::with_test_zone(zone, || {
+        let next = super::next_runnable(&scheduler, &mut backend, &idle, &kick);
+        assert!(
+            matches!(next, Ok(None)),
+            "the idle executor survives the crossing and keeps serving"
+        );
+        assert!(
+            matches!(
+                root.thread().execution_state(),
+                ThreadExecutionState::Runnable { .. }
+            ),
+            "the parked member is woken to take its terminal"
+        );
+        // The member's terminal quantum installs its MM on this same slot.
+        let registry: Arc<dyn carrick_hal::VcpuRegistry> =
+            Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let occupancy = carrick_kernel::kernel::MmOccupancy::install_registered_for_test(
+            carrick_sched_core::ExecutionSlot::zone(slot),
+            mm_id,
+            root.shared().mm().pt_quiesce(),
+            registry,
+            ThreadId::synthetic_for_tests(19_795),
+        );
+        assert!(
+            occupancy.is_ok(),
+            "the terminal owner installs on the crossing's slot: {:?}",
+            occupancy.as_ref().err()
+        );
+        drop(occupancy);
+        assert_eq!(
+            zone.installed_space(slot),
+            0,
+            "the crossing's slot no longer names the exiting space"
+        );
+    });
     assert_eq!(
         root.task().take_native_root_exit(),
         Some(status),
@@ -8983,7 +9048,117 @@ fn idle_vcpu_root_exit_wakes_the_parked_member_with_its_terminal() {
         None,
         "exactly one member owns the process terminal"
     );
-    scheduler.settle_exited(running).unwrap();
+}
+
+/// A member woken to take an idle-vCPU root exit had its zone record retired
+/// by that crossing (the in-ring owner ran it). Loading it must not restore
+/// the retired zone residency: that load reports the continuation missing,
+/// the neutral verdict settles the member exited without a quantum, and the
+/// process terminal is left with no owner (captured live under #1044:
+/// Claimed then SettledExited, never Loaded).
+#[test]
+fn serial_host_root_exit_member_loads_without_its_retired_zone_residency() {
+    use carrick_kernel::kernel::continuation::{
+        BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
+    };
+    struct Region(Box<carrick_test_support::TestEl1Region>);
+    impl Drop for Region {
+        fn drop(&mut self) {
+            assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
+                self.0.as_ptr() as usize
+            ));
+        }
+    }
+    let region = Region(carrick_test_support::TestEl1Region::zeroed());
+    carrick_el1_abi::record_el1_region_host_ptr(region.0.as_ptr() as usize);
+    let zone = carrick_el1_abi::zone_tables().unwrap();
+    let (kernel, root) = bootstrap(19_796);
+    root.thread().set_affinity(CpuAffinity::all(1));
+    let member = sibling(&kernel, &root, 19_797);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel.clone()));
+    let service = CarrierWaitService::new(scheduler.clone());
+    let executor = scheduler
+        .register_executor(Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))))
+        .unwrap();
+    let authority = enqueue_root(&scheduler, &member, publish(&member, 23));
+    let running = scheduler.take(&executor).unwrap();
+    let key = member.thread().key();
+    let id = zone
+        .alloc_record(carrick_el1_abi::ThreadIdentity {
+            tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.tid.raw()).raw(),
+            serial: key.serial.raw(),
+            mm: member.shared().mm().id().raw(),
+            file_table: member.resources().files().id().raw(),
+            generation: running.generation().raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let sequence = zone.next_seq(id);
+    zone.publish_park(id, sequence);
+    let record = zone.record_ref(id);
+    member.thread().control_slot().bind_zone_record(record);
+    let continuation = BlockedContinuation::from_zone_park(
+        ContinuationCapture::from_lease(
+            &member,
+            running.lease(),
+            SyscallRequest::new(98, SyscallArgs([0; 6])),
+            RestartClass::Never,
+        )
+        .unwrap(),
+        ZoneWait::new(record, sequence),
+        None,
+    );
+    let mut registration = service.prepare_registration(&continuation);
+    service.enroll(&mut registration).unwrap();
+    scheduler
+        .settle_blocked_continuation(running, continuation, registration)
+        .unwrap();
+    scheduler.unregister_executor(&executor).unwrap();
+    let binding = FakeBinding::new(23, [Step::Exit]);
+    binding.set_cpu_residency(super::residency::TaskCpuResidency::Zone {
+        base: test_guest_cpu_state(23),
+        record,
+        origin: super::residency::ZoneResumeOrigin::GuestRecord,
+    });
+    let factory = Arc::new(FakeFactory::default());
+    factory.install(&member, binding.clone());
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *binding.zone_load.lock() = Some(ZoneLoad {
+        zone,
+        entered: entered_tx,
+        resume: resume_rx,
+    });
+    // The in-ring owner ran this record and crossed the root exit: the
+    // record is retired, the member is still a live host thread, and the
+    // idle executor published the terminal and control-woke it.
+    zone.free_record(id);
+    assert!(zone.live(record).is_none());
+    assert!(member.exact_thread_is_live());
+    let status = carrick_sched_core::process::TerminationStatus::exited(3);
+    assert!(member.task().publish_native_root_exit(status));
+    scheduler.wake_control(key).unwrap();
+    let pool = start_pool(scheduler, Arc::clone(&factory), 1);
+    let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+    let _ = resume_tx.send(());
+    drop(authority);
+    let report = pool.shutdown();
+    assert!(entered.is_ok(), "the woken member reaches its load");
+    let ran = factory.events.lock().iter().any(|event| {
+        event.kind == BackendEventKind::Run && event.task.is_some_and(|(t, _)| t == key)
+    });
+    assert!(
+        ran,
+        "the member runs a quantum to take its terminal (no retired zone restore)"
+    );
+    report.expect("the member's terminal leaves a clean pool shutdown");
+    assert!(
+        member.task().native_root_exit_pending(),
+        "the fake binding does not consume the status; production takes it at loop top"
+    );
 }
 
 /// A native terminal park refused by a pending host request must retain its

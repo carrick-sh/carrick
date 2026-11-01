@@ -644,13 +644,51 @@ pub(crate) enum GuestIdleExit {
     Service(Box<carrick_vmm_hvf::metadata_grant::NativeService>),
     /// The in-ring process owner crossed its authenticated root exit on this
     /// vCPU while no host task was loaded. The process terminal is owed to a
-    /// host member of the process that owns `mm`; this executor holds none.
-    RootExit {
-        status: carrick_sched_core::process::TerminationStatus,
-        mm: carrick_core_abi::EntryMmKey,
-    },
+    /// host member of the exiting process; this executor holds none.
+    RootExit(IdleRootExit),
     /// No guest scheduler on this backend or carrier.
     Unsupported,
+}
+
+/// A root exit received on an idle vCPU, whose slot no longer names the
+/// exiting address space. The crossing abandoned EL1's stack, so EL1 never
+/// left the space it had installed there; [`Self::retire_slot_space`] is the
+/// only constructor and retires it, so no executor can hand this terminal to
+/// a member (which then installs the same MM on this slot) while the slot
+/// still records that MM with no host owner.
+#[derive(Debug)]
+pub(crate) struct IdleRootExit {
+    status: carrick_sched_core::process::TerminationStatus,
+    mm: carrick_core_abi::EntryMmKey,
+}
+
+impl IdleRootExit {
+    /// The host, with `slot`'s vCPU out of the guest after the crossing.
+    pub(crate) fn retire_slot_space(
+        zone: &carrick_el1_abi::ZoneTables,
+        slot: carrick_el1_abi::SlotId,
+        status: carrick_sched_core::process::TerminationStatus,
+        mm: carrick_core_abi::EntryMmKey,
+    ) -> Result<Self, TrapError> {
+        let space = carrick_sched_core::AddressSpaceKey::from_raw(mm.raw())
+            .ok_or_else(|| TrapError::Hypervisor("root exit names no address space".into()))?;
+        zone.retire_exited_space(slot, space).map_err(|foreign| {
+            TrapError::Hypervisor(format!(
+                "root exit of mm {} on slot {slot:?} found address space {} installed",
+                mm.raw(),
+                foreign.running
+            ))
+        })?;
+        Ok(Self { status, mm })
+    }
+
+    pub(crate) fn status(&self) -> carrick_sched_core::process::TerminationStatus {
+        self.status
+    }
+
+    pub(crate) fn mm(&self) -> carrick_core_abi::EntryMmKey {
+        self.mm
+    }
 }
 
 /// Proof that a guest idle exit left this executor's zone slot with no
@@ -1633,9 +1671,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             // A native-owned record ran at EL0 from the zone and its owner
             // ended the process here. The crossing never re-enters this guest
             // stack; the slot holds no record for the next idle entry.
-            carrick_aarch64::Aarch64Exit::NativeRootExit { status, mm } => {
-                Ok(GuestIdleExit::RootExit { status, mm })
-            }
+            carrick_aarch64::Aarch64Exit::NativeRootExit { status, mm } => Ok(
+                GuestIdleExit::RootExit(IdleRootExit::retire_slot_space(zone, slot, status, mm)?),
+            ),
             other => {
                 let held = zone.slot(slot).current().map(|record| {
                     let rec = zone.record(record);
