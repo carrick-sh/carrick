@@ -2164,6 +2164,31 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(inspect(&tables))
     }
 
+    /// Read an aligned diagnostic atomic in the retained supervisor image.
+    /// Resolve `address` from the exact loaded image, rather than a host symbol.
+    pub fn supervisor_diagnostic_counter(
+        &self,
+        address: carrick_guest_arch::KernelVa,
+    ) -> Result<u64, TrapError> {
+        let offset = address
+            .raw()
+            .checked_sub(IMAGE_VA)
+            .filter(|offset| offset.is_multiple_of(8) && *offset <= IMAGE_SIZE - 8)
+            .ok_or_else(|| fail("diagnostic counter outside supervisor image"))?;
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let pointer = custody
+            .ram
+            .host_ptr(IMAGE_GPA + offset, 8)
+            .ok_or_else(|| fail("diagnostic counter backing absent"))?;
+        // SAFETY: the supervisor image is retained, page-aligned and initialized;
+        // the bounded, aligned word is read atomically, including during execution.
+        let word = unsafe { &*pointer.cast::<std::sync::atomic::AtomicU64>() };
+        Ok(word.load(Ordering::Acquire))
+    }
+
     pub fn initial_execution_witness(&self) -> Result<(u64, u64), TrapError> {
         let custody = self
             .custody
