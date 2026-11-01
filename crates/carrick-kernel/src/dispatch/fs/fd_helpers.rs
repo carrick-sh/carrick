@@ -43,6 +43,31 @@ impl<'a> FsView<'a> {
         }
     }
 
+    /// Whether a watcher could be owed an event for `path` (the object or
+    /// its parent directory): an inotify watch, a fanotify mark (including
+    /// a mount or filesystem mark above it) or a dnotify registration on
+    /// the parent. A native caller's create, truncate or write raises none,
+    /// so the venue refuses those on a covered path.
+    pub(in crate::dispatch) fn watches_cover(&self, path: &str) -> bool {
+        if self.fs.inotify_registry.has_watches_covering(path)
+            || self.fs.fanotify_registry.has_marks_covering(path)
+        {
+            return true;
+        }
+        let registry = self.fs.dnotify_registry.lock();
+        if registry.is_empty() {
+            return false;
+        }
+        let path = self.normalize_dnotify_path(path);
+        let Some(parent) = std::path::Path::new(&path).parent() else {
+            return true;
+        };
+        let parent = display_rootfs_path(parent);
+        registry
+            .iter()
+            .any(|entry| self.dnotify_path_matches(&entry.path, &parent))
+    }
+
     /// Notify a host-file write while borrowing its stable open-description
     /// path. The retained `OpenFile` keeps the description alive after the
     /// host call, avoiding one heap clone per write on watched files.

@@ -640,3 +640,38 @@ fn unserved_epoll_reads_do_not_prepare_output() {
         Some(HostFileStage::InRing)
     ));
 }
+
+/// A staged write carries its writer's own file-size limit; other records
+/// keep their arguments and never ask for the limit.
+#[test]
+fn write_records_carry_the_writers_file_size_limit() {
+    let staged = |op: HostFileOp, args: [u64; 4]| {
+        let mut record = vec![0u8; record_len(3, 0).unwrap()];
+        host_file::encode(
+            &mut record,
+            HostFileHeader {
+                op,
+                table: [1, 2, 3],
+                fd: 4,
+                flags: 0,
+                args,
+            },
+            b"abc",
+            0,
+        )
+        .unwrap();
+        record
+    };
+    for limit in [u64::MAX, 4096, 0] {
+        let mut write = staged(HostFileOp::Write, [0; 4]);
+        stamp_write_file_size_limit::<()>(&mut write, || Ok(limit)).unwrap();
+        let view = host_file::HostFileRequestView::parse(&mut write).unwrap();
+        assert_eq!(view.header().args, [limit, 0, 0, 0]);
+        assert_eq!(view.input(), b"abc");
+    }
+    let mut open = staged(HostFileOp::Openat, [0o1101, 0o644, 0, 0]);
+    stamp_write_file_size_limit::<()>(&mut open, || panic!("an open has no file-size stamp"))
+        .unwrap();
+    let view = host_file::HostFileRequestView::parse(&mut open).unwrap();
+    assert_eq!(view.header().args, [0o1101, 0o644, 0, 0]);
+}

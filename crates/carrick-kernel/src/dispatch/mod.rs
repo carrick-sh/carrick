@@ -850,7 +850,7 @@ pub use carrick_guest_mem::{CurrentMmMemory, Gpa, GuestMemory, GuestVa, HostVa, 
 /// Outcome of [`SyscallDispatcher::try_vfs_open`].
 #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 enum VfsOpenAttempt {
-    Installed(i32),
+    Installed(fs::InstalledFd),
     Errno(LinuxErrno),
     FallThrough,
 }

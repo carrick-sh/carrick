@@ -344,6 +344,25 @@ impl FanotifyRegistry {
         inner.inode.is_empty() && inner.subtree.is_empty()
     }
 
+    /// Whether any mark could report an event on `path`: a mark on the
+    /// object, on its parent directory, or a mount/filesystem mark above it
+    /// (the scopes [`Self::notify`] considers), whatever its mask.
+    pub(crate) fn has_marks_covering(&self, path: &str) -> bool {
+        let key = normalize_path(path);
+        let inner = self.inner.read();
+        let (parent, name) = split_parent_name(&key);
+        inner.inode.get(&key).is_some_and(|marks| !marks.is_empty())
+            || (!name.is_empty()
+                && inner
+                    .inode
+                    .get(parent)
+                    .is_some_and(|marks| !marks.is_empty()))
+            || inner
+                .subtree
+                .iter()
+                .any(|(root, _, _)| path_within(root, &key))
+    }
+
     /// Add (OR in) `mask` for `group` on `path`.
     ///
     /// `ignored` selects which of the mark's two masks is updated:

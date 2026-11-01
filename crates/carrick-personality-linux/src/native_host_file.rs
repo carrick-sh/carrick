@@ -932,5 +932,28 @@ pub fn complete(
     SyscallResult::new(reply.result)
 }
 
+/// Stamp a staged `Write` record with its writer's own `RLIMIT_FSIZE` soft
+/// limit (`args[0]`, `u64::MAX` unlimited), which only the ring that owns
+/// the writer's limits knows. The carrier writes a regular file only for an
+/// unlimited writer, so an unstamped record (0) fails closed. Any other
+/// record is left as staged, and `soft_limit` is consulted only for a
+/// `Write`.
+pub fn stamp_write_file_size_limit<E>(
+    record: &mut [u8],
+    soft_limit: impl FnOnce() -> Result<u64, E>,
+) -> Result<(), E> {
+    let Ok(mut view) = host_file::HostFileRequestView::parse(record) else {
+        // A malformed record is the carrier's to refuse.
+        return Ok(());
+    };
+    let mut args = view.header().args;
+    if view.header().op != HostFileOp::Write {
+        return Ok(());
+    }
+    args[0] = soft_limit()?;
+    view.set_args(args);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
