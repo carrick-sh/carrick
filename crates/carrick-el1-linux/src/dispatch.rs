@@ -2009,6 +2009,18 @@ fn native_service_invariant_at(
 ) -> NativeInvariant {
     use super::native_process_runtime::{NativeProcessError, NativeServicePhase as Phase};
     use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+    if matches!(&error, NativeProcessError::Busy) {
+        return NativeInvariant::NativeService(match phase {
+            Phase::Claim => Fatal::NativeServiceClaimBusy,
+            Phase::Gate => Fatal::NativeServiceGateBusy,
+            Phase::PendingService => Fatal::NativeServiceWaitBusy,
+            Phase::PendingSignal => Fatal::NativeServiceSigWaitBusy,
+            Phase::Publication => Fatal::NativeServicePublishBusy,
+            Phase::Birth => Fatal::NativeServiceBirthBusy,
+            Phase::Settlement => Fatal::NativeServiceSettleBusy,
+            _ => Fatal::NativeServiceBusy,
+        });
+    }
     if !matches!(&error, NativeProcessError::Stale) {
         return native_service_invariant(error);
     }
@@ -2025,6 +2037,10 @@ fn native_service_invariant_at(
         Phase::Park => Fatal::NativeServiceParkStale,
         Phase::Completion => Fatal::NativeServiceCompleteStale,
         Phase::Settlement => Fatal::NativeServiceSettleStale,
+        // Busy-only provenance: no stale identity is decided at these owners.
+        Phase::Claim | Phase::Gate | Phase::PendingService | Phase::PendingSignal => {
+            Fatal::NativeServiceStale
+        }
     })
 }
 
@@ -4015,11 +4031,33 @@ mod tests {
             let reason = native_service_invariant_at(Error::Stale, phase).fatal_reason();
             assert_eq!(reason, expected);
             assert_eq!(Fatal::from_raw(reason as u64), Some(expected));
-            assert_eq!(
-                native_service_invariant_at(Error::Busy, phase).fatal_reason(),
-                Fatal::NativeServiceBusy,
-                "diagnostic provenance cannot turn contention into stale identity"
+            let busy = native_service_invariant_at(Error::Busy, phase).fatal_reason();
+            assert!(
+                std::format!("{busy:?}").ends_with("Busy"),
+                "diagnostic provenance cannot turn contention into stale identity: {busy:?}"
             );
+        }
+    }
+
+    #[test]
+    fn busy_service_diagnostic_names_the_refusing_owner() {
+        use super::super::native_process_runtime::{
+            NativeProcessError as Error, NativeServicePhase as Phase,
+        };
+        use carrick_el1_abi::EntryBindingFatalReason as Fatal;
+        for (phase, expected) in [
+            (Phase::Unspecified, Fatal::NativeServiceBusy),
+            (Phase::Claim, Fatal::NativeServiceClaimBusy),
+            (Phase::Gate, Fatal::NativeServiceGateBusy),
+            (Phase::PendingService, Fatal::NativeServiceWaitBusy),
+            (Phase::PendingSignal, Fatal::NativeServiceSigWaitBusy),
+            (Phase::Publication, Fatal::NativeServicePublishBusy),
+            (Phase::Birth, Fatal::NativeServiceBirthBusy),
+            (Phase::Settlement, Fatal::NativeServiceSettleBusy),
+        ] {
+            let reason = native_service_invariant_at(Error::Busy, phase).fatal_reason();
+            assert_eq!(reason, expected);
+            assert_eq!(Fatal::from_raw(reason as u64), Some(expected));
         }
     }
 

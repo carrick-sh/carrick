@@ -68,6 +68,21 @@ pub enum EntryBindingFatalReason {
     /// claim was neither this slot's `OnCpu*` nor `Free` (#1100). Leaving it
     /// on no run queue would strand the thread.
     RequeueRefused = 49,
+    /// Native-service `Busy`, split by the owner that refused (#1100).
+    /// The custody claim counter could not admit another claim.
+    NativeServiceClaimBusy = 50,
+    /// The process lifecycle gate was terminal under the admitted claim.
+    NativeServiceGateBusy = 51,
+    /// The caller's own record still had a pending service row.
+    NativeServiceWaitBusy = 52,
+    /// The caller's own record still had a pending signal row.
+    NativeServiceSigWaitBusy = 53,
+    /// The caller's own service cell was not idle at publication.
+    NativeServicePublishBusy = 54,
+    /// The caller's service cell refused its bound birth after binding.
+    NativeServiceBirthBusy = 55,
+    /// Busy while settling the service exit.
+    NativeServiceSettleBusy = 56,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -121,6 +136,13 @@ impl EntryBindingFatalReason {
             47 => Some(Self::NativeServiceSettleStale),
             48 => Some(Self::NativeServiceCompleteStale),
             49 => Some(Self::RequeueRefused),
+            50 => Some(Self::NativeServiceClaimBusy),
+            51 => Some(Self::NativeServiceGateBusy),
+            52 => Some(Self::NativeServiceWaitBusy),
+            53 => Some(Self::NativeServiceSigWaitBusy),
+            54 => Some(Self::NativeServicePublishBusy),
+            55 => Some(Self::NativeServiceBirthBusy),
+            56 => Some(Self::NativeServiceSettleBusy),
 
             _ => None,
         }
@@ -443,7 +465,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in 1..=49 {
+        for raw in 1..=56 {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
@@ -762,7 +784,7 @@ mod tests {
             let observed = capture.record.as_mut().unwrap();
             observed.claim = claim;
             observed.claim_after = claim;
-            for reason in (1..=48).chain(core::iter::once(u64::MAX)) {
+            for reason in (1..=56).chain(core::iter::once(u64::MAX)) {
                 capture.registers.reason = Some(reason);
                 let text = format!("{capture}");
                 assert!(
