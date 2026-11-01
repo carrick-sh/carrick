@@ -1092,8 +1092,25 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
     let label_err = format!("{label} stderr");
     round_inbox::set_worker_file(round_inbox::worker_path().as_deref());
     isolated
-        .stdout(live_log::create(&label, &logs.join("agent.out"))?)
-        .stderr(live_log::create(&label_err, &logs.join("agent.err"))?);
+        .stdout(live_log::create(
+            &format!("{label} stdout"),
+            &logs.join("agent.out"),
+        )?)
+        .stderr(live_log::create(
+            &format!("{label} launcher"),
+            &logs.join("agent.err"),
+        )?);
+    // The worker's transcript is the file its launcher writes under the
+    // agent-owned state; its stdout stays empty (#1292).
+    let agent_uid = String::from_utf8_lossy(&output(
+        Command::new("/usr/bin/id").args(["-u", AGENT_USER]),
+    )?)
+    .trim()
+    .parse::<libc::uid_t>()
+    .map_err(|_| ScalerError::Guard("invalid agent uid"))?;
+    let transcript = state.join("runtime/dispatch");
+    live_log::follow(&label, &transcript.join("worker.log"), agent_uid);
+    live_log::follow(&label_err, &transcript.join("worker.err"), agent_uid);
     let remaining = dispatch
         .loop_deadline
         .map(|d| d.saturating_duration_since(std::time::Instant::now()))
@@ -1106,6 +1123,8 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
     );
     live_log::unfollow(&label);
     live_log::unfollow(&label_err);
+    live_log::unfollow(&format!("{label} stdout"));
+    live_log::unfollow(&format!("{label} launcher"));
     round_inbox::set_worker_file(None);
     let _harvest = dispatch.harvest_deadline.map(CommandWindow::until);
     retire_agent()?;

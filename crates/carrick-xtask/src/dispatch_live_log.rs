@@ -31,12 +31,16 @@ const DROPPED: &[u8] = b"[line over 16 KiB dropped]\n";
 /// Most bytes one source streams; the rest is only in the artifacts.
 const STREAM_BYTES: usize = 8 * 1024 * 1024;
 
-/// A followed file, read through the handle its writer was given, never
-/// reopened by name: the agent account could replace the path with a link
-/// to a secret, and a reopen would stream it into the public log.
+/// A followed file, read through one held handle, never reopened by name:
+/// the agent account could replace the path with a link to a secret, and a
+/// reopen would stream it into the public log. A file the agent creates
+/// itself is opened once, when it first appears ([`follow`]).
 struct Source {
     label: String,
-    file: File,
+    file: Option<File>,
+    /// Until `file` is open: the path the agent will create, and the
+    /// account that must own it.
+    pending: Option<(std::path::PathBuf, libc::uid_t)>,
     offset: u64,
     partial: Vec<u8>,
     /// Inside an over-long line: discard until its newline.
@@ -206,31 +210,85 @@ pub(crate) fn create(label: &str, path: &std::path::Path) -> std::io::Result<Fil
         .truncate(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
+    register(label, Some(file.try_clone()?), None);
+    Ok(file)
+}
+
+/// Follow a transcript the agent account creates itself at `path` (#1292:
+/// the coordinator and worker write theirs under `runtime/`, and their
+/// stdout stays empty). The file is opened once, on the first tick that
+/// finds it, with no link at any agent-owned step of the path; it must be
+/// a regular file with one link, owned by `owner`, so it can't be a link
+/// to anything the agent didn't write.
+pub(crate) fn follow(label: &str, path: &std::path::Path, owner: libc::uid_t) {
+    register(label, None, Some((path.to_owned(), owner)));
+}
+
+fn register(label: &str, file: Option<File>, pending: Option<(std::path::PathBuf, libc::uid_t)>) {
+    if !enabled() {
+        return;
+    }
     // Snapshot the secret set now, before the child runs: some of the files
     // it reads are writable by the agent account once it starts. Without a
-    // snapshot nothing is followed (fail closed).
-    let snapshot = crate::dispatch_redaction::DiagnosticSecrets::capture()
-        .map(|c| c.values().to_vec())
-        .ok();
-    if enabled()
-        && let Some(snapshot) = snapshot
-    {
-        LIVE.with(|live| remember(&mut live.borrow_mut(), snapshot));
-        let reader = file.try_clone()?;
-        LIVE.with(|live| {
-            let mut live = live.borrow_mut();
-            live.sources.retain(|s| s.label != label);
-            live.sources.push(Source {
-                label: label.to_owned(),
-                file: reader,
-                offset: 0,
-                partial: Vec::new(),
-                dropping: false,
-                streamed: 0,
-            });
+    // snapshot nothing is followed (fail closed), and the log says so.
+    let snapshot = match crate::dispatch_redaction::DiagnosticSecrets::capture() {
+        Ok(capture) => capture.values().to_vec(),
+        Err(error) => {
+            notice(&format!("[{label}] not streamed live: {error}\n"));
+            return;
+        }
+    };
+    LIVE.with(|live| {
+        let mut live = live.borrow_mut();
+        remember(&mut live, snapshot);
+        live.sources.retain(|s| s.label != label);
+        live.sources.push(Source {
+            label: label.to_owned(),
+            file,
+            pending,
+            offset: 0,
+            partial: Vec::new(),
+            dropping: false,
+            streamed: 0,
         });
+    });
+}
+
+/// Open a pending source once its file exists: `Ok(false)` while it
+/// doesn't. A file that fails the checks ends the source, and the reason
+/// is returned for the log.
+fn open_pending(source: &mut Source) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    if source.file.is_some() {
+        return Ok(true);
     }
-    Ok(file)
+    let Some((path, owner)) = source.pending.clone() else {
+        return Ok(false);
+    };
+    let opened = crate::safe_copy::open_text(&path).and_then(|file| {
+        let meta = file.metadata()?;
+        if meta.uid() != owner || meta.nlink() != 1 {
+            return Err(std::io::Error::other("not the agent's own transcript"));
+        }
+        Ok(file)
+    });
+    match opened {
+        Ok(file) => {
+            source.file = Some(file);
+            source.pending = None;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            source.pending = None;
+            Err(format!("not streamed live: {error}\n"))
+        }
+    }
+}
+
+/// A plain line for the reader; it carries no agent text.
+fn notice(text: &str) {
+    LIVE.with(|live| raw(&live.borrow(), text.as_bytes()));
 }
 
 /// Print what is left under `label`, including a final unterminated line
@@ -307,8 +365,19 @@ pub(crate) fn pump() {
 
 /// Read up to [`READ_BYTES`] new bytes; `false` once nothing more is there.
 fn read_more(source: &mut Source, into: &mut Vec<u8>) -> bool {
+    match open_pending(source) {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(reason) => {
+            into.extend_from_slice(reason.as_bytes());
+            return true;
+        }
+    }
+    let Some(file) = &source.file else {
+        return false;
+    };
     let mut buffer = vec![0; READ_BYTES];
-    match source.file.read_at(&mut buffer, source.offset) {
+    match file.read_at(&mut buffer, source.offset) {
         Ok(read) if read > 0 => {
             into.extend_from_slice(&buffer[..read]);
             source.offset += read as u64;
@@ -426,6 +495,61 @@ mod tests {
         );
     }
 
+    /// #1292: the agents' transcripts are files they create after launch,
+    /// so a followed path streams once it appears, and only when it's the
+    /// agent's own single-link regular file.
+    #[test]
+    fn a_followed_transcript_streams_once_it_appears_and_only_if_it_is_the_agents() {
+        use std::io::Write as _;
+        let me = unsafe { libc::geteuid() };
+        let dir = tempfile::tempdir().unwrap();
+        let sink = super::capture();
+        super::set_token("fixture-token");
+        let log = dir.path().join("runtime/dispatch/worker.log");
+        super::follow("worker", &log, me);
+        super::pump();
+        assert!(sink.borrow().is_empty(), "nothing before the file exists");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let mut out = std::fs::File::create(&log).unwrap();
+        writeln!(out, "first event").unwrap();
+        super::pump();
+        writeln!(out, "second event").unwrap();
+        super::unfollow("worker");
+        let all = String::from_utf8(sink.borrow().clone()).unwrap();
+        let lines: Vec<&str> = all.lines().filter(|l| !l.starts_with("::")).collect();
+        assert_eq!(
+            lines,
+            ["[worker] first event", "[worker] second event"],
+            "{all}"
+        );
+
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "SECRET-SENTINEL\n").unwrap();
+        let refused = |name: &str, path: &std::path::Path, owner: libc::uid_t| {
+            sink.borrow_mut().clear();
+            super::follow(name, path, owner);
+            super::pump();
+            super::unfollow(name);
+            let all = String::from_utf8(sink.borrow().clone()).unwrap();
+            assert!(!all.contains("SECRET-SENTINEL"), "{name}: {all}");
+            assert!(
+                all.contains(&format!("[{name}] not streamed live:")),
+                "{name}: {all}"
+            );
+        };
+        // A link in the agent's place, to a file it didn't write.
+        let link = dir.path().join("link.log");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        refused("symlink", &link, me);
+        // A second name for someone else's file.
+        let hard = dir.path().join("hard.log");
+        std::fs::hard_link(&secret, &hard).unwrap();
+        refused("hardlink", &hard, me);
+        // A file the agent account doesn't own.
+        std::fs::remove_file(&hard).unwrap();
+        refused("owner", &secret, me.wrapping_add(1));
+    }
+
     #[test]
     fn rendered_lines_are_masked_labelled_and_inert() {
         let out = super::render(
@@ -449,7 +573,8 @@ mod tests {
         // An endless line is dropped, not buffered or printed in pieces.
         let mut source = super::Source {
             label: "loop".into(),
-            file: tempfile::tempfile().unwrap(),
+            file: Some(tempfile::tempfile().unwrap()),
+            pending: None,
             offset: 0,
             partial: Vec::new(),
             dropping: false,
