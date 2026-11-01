@@ -214,8 +214,7 @@ pub const CPUID_7_0_EBX_X86_64_V3_USER: u32 =
 pub const CPUID_7_0_EBX_CPL0_SUPERVISOR: u32 = CPUID_7_0_EBX_SMEP | CPUID_7_0_EBX_SMAP;
 
 /// Complete pinned `CPUID.(EAX=07H,ECX=0H):EBX` mask.
-pub const CPUID_7_0_EBX_PINNED: u32 =
-    CPUID_7_0_EBX_X86_64_V3_USER | CPUID_7_0_EBX_CPL0_SUPERVISOR;
+pub const CPUID_7_0_EBX_PINNED: u32 = CPUID_7_0_EBX_X86_64_V3_USER | CPUID_7_0_EBX_CPL0_SUPERVISOR;
 
 // ─── Extended Leaves 0x8000_0001 and 0x8000_0007 ─────────────────────────────
 
@@ -384,7 +383,10 @@ impl fmt::Display for CpuidQualificationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingLeaf { leaf, subleaf } => {
-                write!(f, "host CPUID lacks required leaf ({leaf:#x}, {subleaf:#x})")
+                write!(
+                    f,
+                    "host CPUID lacks required leaf ({leaf:#x}, {subleaf:#x})"
+                )
             }
             Self::MissingFeature {
                 leaf,
@@ -520,8 +522,7 @@ impl GuestCpuidView {
                 CPUID_VENDOR_EDX,
             ),
             (1, _) => {
-                let ebx =
-                    ((self.apic_id as u32) << 24) | (CPUID_CLFLUSH_LINE_CHUNKS << 8);
+                let ebx = ((self.apic_id as u32) << 24) | (CPUID_CLFLUSH_LINE_CHUNKS << 8);
                 let ecx = if osxsave_enabled {
                     CPUID_1_ECX_X86_64_V3
                 } else {
@@ -536,12 +537,7 @@ impl GuestCpuidView {
                 } else {
                     XSAVE_LEGACY_BYTES
                 };
-                CpuidRegs::new(
-                    XCR0_X86_64_V3_MASK,
-                    enabled_bytes,
-                    XSAVE_V3_TOTAL_BYTES,
-                    0,
-                )
+                CpuidRegs::new(XCR0_X86_64_V3_MASK, enabled_bytes, XSAVE_V3_TOTAL_BYTES, 0)
             }
             (0x0d, 2) => CpuidRegs::new(XSAVE_AVX_COMPONENT_BYTES, XSAVE_LEGACY_BYTES, 0, 0),
             (0x15, 0) => match self.tsc {
@@ -641,14 +637,26 @@ impl GuestCpuidView {
         const LEAF_EXT1_ECX_REQUIRED: &[(u8, &str)] = &[(0, "LAHF_LM"), (5, "LZCNT")];
         const LEAF_EXT1_EDX_REQUIRED: &[(u8, &str)] = &[(11, "SYSCALL"), (20, "NX"), (29, "LM")];
 
-        let l1 = find_supported_leaf(supported, 1, 0)
-            .ok_or(CpuidQualificationError::MissingLeaf { leaf: 1, subleaf: 0 })?;
+        let l1 =
+            find_supported_leaf(supported, 1, 0).ok_or(CpuidQualificationError::MissingLeaf {
+                leaf: 1,
+                subleaf: 0,
+            })?;
         require_bits(1, 0, CpuidRegisterName::Ecx, l1.ecx, LEAF_1_ECX_REQUIRED)?;
         require_bits(1, 0, CpuidRegisterName::Edx, l1.edx, LEAF_1_EDX_REQUIRED)?;
 
-        let l7_0 = find_supported_leaf(supported, 7, 0)
-            .ok_or(CpuidQualificationError::MissingLeaf { leaf: 7, subleaf: 0 })?;
-        require_bits(7, 0, CpuidRegisterName::Ebx, l7_0.ebx, LEAF_7_0_EBX_REQUIRED)?;
+        let l7_0 =
+            find_supported_leaf(supported, 7, 0).ok_or(CpuidQualificationError::MissingLeaf {
+                leaf: 7,
+                subleaf: 0,
+            })?;
+        require_bits(
+            7,
+            0,
+            CpuidRegisterName::Ebx,
+            l7_0.ebx,
+            LEAF_7_0_EBX_REQUIRED,
+        )?;
 
         let l0d_0 = find_supported_leaf(supported, 0x0d, 0).ok_or(
             CpuidQualificationError::MissingLeaf {
@@ -724,11 +732,7 @@ impl GuestCpuidView {
     }
 }
 
-fn find_supported_leaf(
-    supported: &[CpuidLeafEntry],
-    leaf: u32,
-    subleaf: u32,
-) -> Option<CpuidRegs> {
+fn find_supported_leaf(supported: &[CpuidLeafEntry], leaf: u32, subleaf: u32) -> Option<CpuidRegs> {
     supported
         .iter()
         .find(|e| {
@@ -770,11 +774,7 @@ mod tests {
 
     /// Lookup helper emulating `KVM_SET_CPUID2` + Intel SDM `check_cpuid_limit` semantics
     /// over an arbitrary `CpuidLeafEntry` slice.
-    fn emulate_cpuid_table_query(
-        entries: &[CpuidLeafEntry],
-        leaf: u32,
-        subleaf: u32,
-    ) -> CpuidRegs {
+    fn emulate_cpuid_table_query(entries: &[CpuidLeafEntry], leaf: u32, subleaf: u32) -> CpuidRegs {
         if let Some(hit) = entries.iter().find(|e| {
             e.function == leaf
                 && ((e.flags & CPUID_FLAG_SIGNIFICANT_INDEX) == 0 || e.index == subleaf)
@@ -826,7 +826,10 @@ mod tests {
             return Err(format!("leaf 1 APIC ID mismatch: ebx={:#x}", l1.ebx));
         }
         if ((l1.ebx >> 8) & 0xff) != CPUID_CLFLUSH_LINE_CHUNKS || (l1.ebx & 0x00ff_00ff) != 0 {
-            return Err(format!("leaf 1 EBX topology/clflush mismatch: ebx={:#x}", l1.ebx));
+            return Err(format!(
+                "leaf 1 EBX topology/clflush mismatch: ebx={:#x}",
+                l1.ebx
+            ));
         }
         if l1.ecx != CPUID_1_ECX_X86_64_V3 {
             let missing = CPUID_1_ECX_X86_64_V3 & !l1.ecx;
@@ -863,7 +866,10 @@ mod tests {
             return Err(format!("leaf (0xd, 0) mismatch: {:?}", query(0x0d, 0)));
         }
         if query(0x0d, 1) != CpuidRegs::ZERO {
-            return Err(format!("leaf (0xd, 1) leaked XSAVEOPT/XSAVEC/XSAVES: {:?}", query(0x0d, 1)));
+            return Err(format!(
+                "leaf (0xd, 1) leaked XSAVEOPT/XSAVEC/XSAVES: {:?}",
+                query(0x0d, 1)
+            ));
         }
         if query(0x0d, 2) != CpuidRegs::new(256, 576, 0, 0) {
             return Err(format!("leaf (0xd, 2) mismatch: {:?}", query(0x0d, 2)));
@@ -871,7 +877,9 @@ mod tests {
         for subleaf in 3..64 {
             let r = query(0x0d, subleaf);
             if r != CpuidRegs::ZERO {
-                return Err(format!("leaf (0xd, {subleaf}) leaked extended state component: {r:?}"));
+                return Err(format!(
+                    "leaf (0xd, {subleaf}) leaked extended state component: {r:?}"
+                ));
             }
         }
 
@@ -889,7 +897,10 @@ mod tests {
             }
         }
 
-        for leaf in [2, 3, 4, 5, 6, 8, 9, 0x0a, 0x0b, 0x0c, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x17, 0x1f, 0x20] {
+        for leaf in [
+            2, 3, 4, 5, 6, 8, 9, 0x0a, 0x0b, 0x0c, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x16,
+            0x17, 0x1f, 0x20,
+        ] {
             let r = query(leaf, 0);
             if r != CpuidRegs::ZERO {
                 return Err(format!("unpopulated basic leaf {leaf:#x} leaked {r:?}"));
@@ -903,20 +914,37 @@ mod tests {
         }
 
         if query(0x8000_0000, 0) != CpuidRegs::new(0x8000_0008, 0, 0, 0) {
-            return Err(format!("leaf 0x8000_0000 mismatch: {:?}", query(0x8000_0000, 0)));
+            return Err(format!(
+                "leaf 0x8000_0000 mismatch: {:?}",
+                query(0x8000_0000, 0)
+            ));
         }
         if query(0x8000_0001, 0)
-            != CpuidRegs::new(0, 0, CPUID_8000_0001_ECX_X86_64_V3, CPUID_8000_0001_EDX_X86_64_V3)
+            != CpuidRegs::new(
+                0,
+                0,
+                CPUID_8000_0001_ECX_X86_64_V3,
+                CPUID_8000_0001_EDX_X86_64_V3,
+            )
         {
-            return Err(format!("leaf 0x8000_0001 mismatch: {:?}", query(0x8000_0001, 0)));
+            return Err(format!(
+                "leaf 0x8000_0001 mismatch: {:?}",
+                query(0x8000_0001, 0)
+            ));
         }
         if query(0x8000_0007, 0) != CpuidRegs::new(0, 0, 0, CPUID_8000_0007_EDX_INVTSC) {
-            return Err(format!("leaf 0x8000_0007 mismatch: {:?}", query(0x8000_0007, 0)));
+            return Err(format!(
+                "leaf 0x8000_0007 mismatch: {:?}",
+                query(0x8000_0007, 0)
+            ));
         }
         if query(0x8000_0008, 0)
             != CpuidRegs::new(u32::from(expected_max_phy_addr) | (48 << 8), 0, 0, 0)
         {
-            return Err(format!("leaf 0x8000_0008 mismatch: {:?}", query(0x8000_0008, 0)));
+            return Err(format!(
+                "leaf 0x8000_0008 mismatch: {:?}",
+                query(0x8000_0008, 0)
+            ));
         }
         for ext_leaf in [
             0x8000_0002,
@@ -986,7 +1014,7 @@ mod tests {
                         | (1 << 30) // AVX512BW
                         | (1 << 31), // AVX512VL
                     (1 << 2) | (1 << 3) | (1 << 6) | (1 << 8) | (1 << 9) | (1 << 16), // UMIP, PKU, VBMI2, GFNI, VAES, LA57
-                    1 << 24, // AMX_TILE
+                    1 << 24,                                                          // AMX_TILE
                 ),
             ),
             CpuidLeafEntry::indexed(7, 1, CpuidRegs::new(1 << 5, 0, 0, 0)), // AVX512_BF16
@@ -1030,10 +1058,22 @@ mod tests {
     #[test]
     fn x86_64_v3_table_advertises_exact_psabi_v3_and_no_feature_outside_v3() {
         let view = GuestCpuidView::x86_64_v3();
+        // Keep these architectural bit positions independent of the production
+        // masks: adding a feature to a mask must not also update its oracle.
+        assert_eq!(view.cpuid(1, 0).ecx, 0x3cd8_3201);
+        assert_eq!(view.cpuid(1, 0).edx, 0x0789_a37d);
+        assert_eq!(view.cpuid(7, 0), CpuidRegs::new(0, 0x0010_01a8, 0, 0));
+        assert_eq!(view.cpuid(0x8000_0001, 0).ecx, 0x21);
+        assert_eq!(view.cpuid(0x8000_0001, 0).edx, 0x2010_0800);
         audit_strict_x86_64_v3_only(|leaf, subleaf| view.cpuid(leaf, subleaf), 0, 48)
             .expect("GuestCpuidView::cpuid must satisfy strict x86-64-v3 profile");
 
         let entries = view.to_leaf_entries();
+        assert_eq!(
+            entries.len(),
+            11,
+            "the installed table has a fixed work budget"
+        );
         audit_strict_x86_64_v3_only(
             |leaf, subleaf| emulate_cpuid_table_query(&entries, leaf, subleaf),
             0,
@@ -1041,7 +1081,23 @@ mod tests {
         )
         .expect("installed KVM leaf entries must satisfy strict x86-64-v3 profile");
 
-        for leaf in [0, 1, 2, 7, 0x0b, 0x0d, 0x15, 0x16, 0x17, 0x4000_0000, 0x8000_0000, 0x8000_0001, 0x8000_0007, 0x8000_0008, 0x8000_001f] {
+        for leaf in [
+            0,
+            1,
+            2,
+            7,
+            0x0b,
+            0x0d,
+            0x15,
+            0x16,
+            0x17,
+            0x4000_0000,
+            0x8000_0000,
+            0x8000_0001,
+            0x8000_0007,
+            0x8000_0008,
+            0x8000_001f,
+        ] {
             for subleaf in 0..=3 {
                 assert_eq!(
                     emulate_cpuid_table_query(&entries, leaf, subleaf),
@@ -1059,12 +1115,8 @@ mod tests {
         let view = GuestCpuidView::qualify_supported(&epyc).expect("qualify EPYC Zen 4");
         assert_eq!(view.max_phy_addr(), 48);
         let entries = view.to_leaf_entries();
-        audit_strict_x86_64_v3_only(
-            |l, s| emulate_cpuid_table_query(&entries, l, s),
-            0,
-            48,
-        )
-        .expect("scrubbed EPYC table must pass strict v3 audit");
+        audit_strict_x86_64_v3_only(|l, s| emulate_cpuid_table_query(&entries, l, s), 0, 48)
+            .expect("scrubbed EPYC table must pass strict v3 audit");
 
         // 46-bit Intel Xeon Skylake-SP host (lacking UMIP, MAXPHYADDR = 46 < 48) -> clamped to 46.
         let mut skylake = synthetic_epyc_zen4_v4_supported();
@@ -1076,8 +1128,7 @@ mod tests {
                 entry.regs = CpuidRegs::new(46 | (48 << 8), 0, 0, 0);
             }
         }
-        let skylake_view =
-            GuestCpuidView::qualify_supported(&skylake).expect("qualify Skylake-SP");
+        let skylake_view = GuestCpuidView::qualify_supported(&skylake).expect("qualify Skylake-SP");
         assert_eq!(skylake_view.max_phy_addr(), 46);
         let skylake_entries = skylake_view.to_leaf_entries();
         audit_strict_x86_64_v3_only(
