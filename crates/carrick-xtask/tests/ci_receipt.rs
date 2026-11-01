@@ -2965,14 +2965,17 @@ fn review_signed_build_diagnostics_reach_receipt() {
         .current_dir(dir.path())
         .args(["test", "--offline", "--no-run", format])
         .env_remove("CARGO_TARGET_DIR")
+        .env("CARGO_TERM_COLOR", "always")
         .output()
         .unwrap();
     assert!(!output.status.success());
     let log = String::from_utf8_lossy(&output.stderr);
-    assert!(log.contains("error: linking with"), "{log}");
+    assert!(log.contains("carrick_receipt_missing_symbol"), "{log}");
     let mut s = step("generic-probe-shards", false, &[]);
     populate_step_from_log(&mut s, &log, &mut vec![]);
-    assert_cli_self_diff(&receipt(vec![s]), false, "build failure");
+    let r = receipt(vec![s]);
+    assert_cli_self_diff(&r, false, "build failure");
+    assert_cli_self_diff(&r, false, "libpython-map");
 }
 
 #[test]
@@ -3045,4 +3048,17 @@ fn review_partial_ltp_row_does_not_finish_a_killed_suite() {
         &mut vec![],
     );
     assert_cli_self_diff(&receipt(vec![s]), false, "binary killed before reporting");
+}
+
+#[test]
+fn review_colored_cargo_population_keeps_binary_identity() {
+    let mut s = step("test", true, &[]);
+    populate_step_from_log(
+        &mut s,
+        "\x1b[1m\x1b[92m     Running\x1b[0m tests/probes.rs (target/debug/deps/probes-0123456789abcdef)\nrunning 1 test\ntest witness ... ok\ntest result: ok. 1 passed; 0 failed\n",
+        &mut vec![],
+    );
+    assert_eq!(s.started_tests, ["probes::witness"]);
+    assert_eq!(s.finished_binaries, ["probes"]);
+    assert_cli_self_diff(&receipt(vec![s]), true, "colored population");
 }

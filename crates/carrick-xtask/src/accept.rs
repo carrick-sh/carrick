@@ -641,11 +641,36 @@ fn extract_test_line(line: &str) -> Option<(&str, &str)> {
     is_valid_test_name(candidate).then_some((candidate, after_dots.trim()))
 }
 
+// CI forces Cargo color even when redirecting output to a receipt log.
+// Normalize CSI controls once so styling cannot split error/test identities.
+fn terminal_text(log: &str) -> std::borrow::Cow<'_, str> {
+    if !log.contains('\x1b') {
+        return std::borrow::Cow::Borrowed(log);
+    }
+    let mut plain = String::with_capacity(log.len());
+    let mut chars = log.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for control in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&control) {
+                    break;
+                }
+            }
+        } else {
+            plain.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(plain)
+}
+
 /// Parse a cargo or `test-signed` log into itemized test failures, unitemized
 /// binary crashes/compile/parse errors, started test names, and finished vs
 /// unfinished test binaries.
 pub fn parse_test_log(log: &str) -> ParsedTestLog {
     use std::collections::BTreeSet;
+
+    let log = terminal_text(log);
 
     let mut current_binary = String::new();
     let mut current_run_saw_result = false;
