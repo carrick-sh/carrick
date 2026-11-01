@@ -987,3 +987,98 @@ fn every_compiler_cache_job_stops_its_server_at_job_end() {
     }
     assert!(jobs > 0, "no compiler-cache jobs found");
 }
+
+/// #1264 reopened: a leased step runs in its own session, and the lease
+/// supervisor kills and reaps it when the step ends, so an sccache server a
+/// leased rustc wrapper started died with the step and left its socket. Each
+/// job that can use the self-hosted local backend starts its server once,
+/// outside any lease, before its first leased step.
+#[test]
+fn local_compiler_cache_server_starts_once_before_any_leased_step() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
+    let mut jobs = 0;
+    for (job, body) in workflow["jobs"].as_hash().unwrap() {
+        let Some(steps) = body["steps"].as_vec() else {
+            continue;
+        };
+        let run = |s: &yaml_rust2::Yaml| s["run"].as_str().unwrap_or_default().to_owned();
+        let Some(r2) = steps
+            .iter()
+            .position(|s| run(s) == "scripts/ci/compiler-cache-start.sh")
+        else {
+            continue;
+        };
+        jobs += 1;
+        let local: Vec<usize> = (0..steps.len())
+            .filter(|&i| run(&steps[i]) == "scripts/ci/compiler-cache-start-local.sh")
+            .collect();
+        assert_eq!(local.len(), 1, "{job:?}: one local server start");
+        let local = local[0];
+        assert_eq!(
+            steps[local]["if"].as_str(),
+            Some("steps.compiler-cache.outputs.backend == 'local'"),
+            "{job:?}"
+        );
+        assert!(local > r2, "{job:?}: after sccache install and selection");
+        if let Some(leased) = steps.iter().position(|s| run(s).starts_with("just lease ")) {
+            assert!(
+                local < leased,
+                "{job:?}: started outside and before any lease"
+            );
+        }
+    }
+    assert!(jobs > 0);
+}
+
+/// The local start leaves a live server alone, removes a socket no server
+/// answers, and starts one otherwise.
+#[test]
+fn local_compiler_cache_start_replaces_only_a_stale_socket() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("calls");
+    let fake = dir.path().join("sccache");
+    // `--show-stats` succeeds only when $FAKE_LIVE exists.
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> {}\ncase \"$1\" in --show-stats) [ -e \"$FAKE_LIVE\" ];; --start-server) exit 0;; esac\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let socket = dir.path().join("job.sock");
+    let live = dir.path().join("live");
+    let start = |calls: &str| {
+        let _ = std::fs::remove_file(&log);
+        let out = std::process::Command::new(root.join("scripts/ci/compiler-cache-start-local.sh"))
+            .env("CARRICK_SCCACHE_BIN", &fake)
+            .env("SCCACHE_SERVER_UDS", &socket)
+            .env("FAKE_LIVE", &live)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), calls);
+    };
+    // A server answers: left running, not restarted.
+    std::fs::write(&live, "").unwrap();
+    std::fs::write(&socket, "").unwrap();
+    start("--show-stats\n");
+    assert!(socket.exists());
+    // A socket no server answers is stale: removed, then a server starts.
+    std::fs::remove_file(&live).unwrap();
+    start("--show-stats\n--start-server\n");
+    assert!(
+        !socket.exists(),
+        "the fake doesn't create one; the stale one is gone"
+    );
+    // No socket: a server starts.
+    start("--show-stats\n--start-server\n");
+}

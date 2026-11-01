@@ -76,6 +76,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Build lean xtask
         run: just ci-prebuild-xtask
       - name: Compiler cache statistics
@@ -143,6 +146,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Identify runner image for warm cross toolchains
         id: warm-runner-image
         if: matrix.family == 'linux-x64'
@@ -290,6 +296,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Detect changed surfaces
         id: filter
         env:
@@ -342,6 +351,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -493,6 +505,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -559,6 +574,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -656,6 +674,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -732,6 +753,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -851,6 +875,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -918,6 +945,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Software x86 CPU and MMU tests on x86_64
         run: cargo test --locked -p carrick-softcpu-x86 -p carrick-softmmu
       - name: Compiler cache statistics
@@ -972,6 +1002,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -1045,6 +1078,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Clippy (no-panic gate)
@@ -1108,6 +1144,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Live host-authority compiler census
@@ -1164,6 +1203,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Workspace build
@@ -1225,6 +1267,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Unit tests shard A (host test lanes)
@@ -1281,6 +1326,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Unit tests shard B (workspace + mm-owner + CLI + host + VFS + kernel + runtime + HVF + EL1)
@@ -1337,6 +1385,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Host integration tests (no HVF)
@@ -1392,6 +1443,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -1486,6 +1540,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Kernel semantics natively on ARM Linux
@@ -1545,6 +1602,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -1668,6 +1728,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
@@ -1783,6 +1846,9 @@ jobs:
       - name: Start compiler cache
         if: steps.compiler-cache.outputs.backend == 'r2'
         run: scripts/ci/compiler-cache-start.sh
+      - name: Start this job's local compiler cache server
+        if: steps.compiler-cache.outputs.backend == 'local'
+        run: scripts/ci/compiler-cache-start-local.sh
       - name: Download xtask
         uses: actions/download-artifact@v4
         with:
