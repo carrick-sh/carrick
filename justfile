@@ -292,6 +292,7 @@ lint-domains-source:
 [private]
 _lint-domains-source:
     ./scripts/lib/test-signed-selection-test.sh
+    ./scripts/lib/test-signed-run-test.sh
     # Libtest filters are a union; integration targets run without filters.
     {{_xtask}} test-batch {{_xtask_test_artifacts}} _test-xtask-domain-unit
     {{_xtask}} test-batch {{_xtask_test_artifacts}} _test-xtask-domain-integration
