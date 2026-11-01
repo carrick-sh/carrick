@@ -1354,10 +1354,8 @@ fn el1_native_closure_gates_pr_surfaces_and_refuses_new_failures_before_landing(
         !run_ci_results("pull_request", Some("false"), &half_skipped),
         "el1-native-tests without el1-native-gate must fail ci-results"
     );
-    let el1_pr_skipped = non_el1_pr_needs.replace(
-        r#""el1_native": "false""#,
-        r#""el1_native": "true""#,
-    );
+    let el1_pr_skipped =
+        non_el1_pr_needs.replace(r#""el1_native": "false""#, r#""el1_native": "true""#);
     assert!(
         !run_ci_results("pull_request", Some("false"), &el1_pr_skipped),
         "PR with el1_native=true and skipped el1-native jobs must fail ci-results"
@@ -1407,4 +1405,3 @@ fn el1_native_closure_gates_pr_surfaces_and_refuses_new_failures_before_landing(
         "merge_group entry with NEW native-process failure (el1-native-gate=failure) must be refused by ci-ok"
     );
 }
-
