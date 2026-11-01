@@ -38,6 +38,8 @@ pub enum Commands {
     LintSource,
     #[command(about = "Compile all recipe lanes once and run their test binaries")]
     TestBatch(crate::test_batch::TestBatchArgs),
+    #[command(about = "Run each lib test of one package in its own process")]
+    TestIsolated(crate::test_isolated::TestIsolatedArgs),
     #[command(about = "Build loom binaries separately, then stream tests under a deadline")]
     LoomRun(crate::loom_run::LoomRunArgs),
     #[command(about = "Package a guest carrier image for an arbitrary composition root")]
@@ -469,6 +471,10 @@ where
         Commands::TestBatch(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::test_batch::run(&root, args).map_err(|e| CliError::TestShards(e.to_string()))
+        }
+        Commands::TestIsolated(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::test_isolated::run(&root, args).map_err(CliError::TestShards)
         }
         Commands::CheckTestShards => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));

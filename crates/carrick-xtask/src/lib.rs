@@ -44,6 +44,7 @@ pub mod smoke_signed;
 mod target_prune;
 pub mod terminal_custody;
 pub mod test_batch;
+pub mod test_isolated;
 pub mod test_lanes;
 pub mod test_shards;
 pub mod workorder;

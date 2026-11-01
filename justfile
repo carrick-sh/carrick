@@ -482,9 +482,12 @@ test-kernel-semantics *ARGS:
 # aarch64 through `xtask accept --profile el1-native` and receipts the
 # result; `el1-native-gate` fails on NEW failures against the receipted
 # main ancestor (#1297).
+# Each test runs in its own process (`xtask test-isolated`): the native
+# fixtures leak `'static` structures for the life of their process, and one
+# process running the whole suite exhausted a 16 GiB runner (#1297).
 test-el1-native *ARGS:
-    {{_admit}} {{_cargo}} test -p carrick-el1-linux --lib {{ARGS}} -- --skip serial_host
-    RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-el1-linux --lib {{ARGS}} -- serial_host
+    {{_admit}} {{_xtask}} test-isolated --package carrick-el1-linux --skip serial_host --cargo-config {{quote(CARRICK_CARGO_CACHE_CONFIG)}} {{ARGS}}
+    {{_admit}} {{_xtask}} test-isolated --package carrick-el1-linux --only serial_host --jobs 1 --cargo-config {{quote(CARRICK_CARGO_CACHE_CONFIG)}} {{ARGS}}
 
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test-mm-owner *ARGS:
