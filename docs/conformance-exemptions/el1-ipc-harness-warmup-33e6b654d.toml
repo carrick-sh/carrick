@@ -1,0 +1,12 @@
+schema = "carrick.conformance-exemption.v1"
+base = "1a963aba162334c33ebdba15f0e0f00eefaca6ce"
+head = "33e6b654d9d4ea10b4594233a2e95f071f10830a"
+contracts = [
+  "kernel.el1.ipc-lifecycle",
+  "kernel.el1.ipc-two-process",
+  "process.native.short-lock",
+]
+paths = [
+  "crates/carrick-el1-linux/src/ipc.rs",
+]
+rationale = "The exact diff in crates/carrick-el1-linux/src/ipc.rs is confined to its #[cfg(test)] module: three allocation-counting windows call carrick_test_support::guest_user::warm() before taking their baseline, so the test harness's own lazily boxed macOS mutexes are not counted as kernel allocations (#1331). No product code, guest-visible behaviour, IPC path or lock changes; the zero-allocation budget the tests assert is unchanged and is now order-independent."
