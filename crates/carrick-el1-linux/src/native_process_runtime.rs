@@ -93,6 +93,14 @@ pub enum NativeServicePhase {
     Park,
     Completion,
     Settlement,
+    /// Native service custody claim admission (`NativeServiceClaim`).
+    Claim,
+    /// The process lifecycle gate, sampled under the admitted claim.
+    Gate,
+    /// The caller's own record still has a pending service row.
+    PendingService,
+    /// The caller's own record still has a pending signal row.
+    PendingSignal,
 }
 // Empty-checkpoint hint only; masks and contexts remain in their exact owners.
 static NATIVE_SIGNAL_CONTINUATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -1352,6 +1360,16 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
         self.pending
             .member(record)
             .is_some_and(|state| state.wait.is_some())
+    }
+
+    /// Diagnostic provenance of a pending member row: which kind of own wait
+    /// refused a new service. Grants no authority.
+    fn member_wait_phase(&self, record: &RecordRef) -> NativeServicePhase {
+        if self.service_wait(record).is_some() {
+            NativeServicePhase::PendingService
+        } else {
+            NativeServicePhase::PendingSignal
+        }
     }
 
     // Signal-mask restoration and external service share the same retained

@@ -498,8 +498,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         exit: NativeServiceExit,
     ) -> Result<NativeResume, NativeProcessError> {
         // Preserve the owner of a refused operation. A later refusal while
-        // folding a non-stale result belongs to settlement itself.
-        if !matches!(&result, Err(NativeProcessError::Stale)) {
+        // folding a non-stale, non-busy result belongs to settlement itself.
+        if !matches!(
+            &result,
+            Err(NativeProcessError::Stale | NativeProcessError::Busy)
+        ) {
             self.service_phase = NativeServicePhase::Settlement;
         }
         if !self.retains_ipc_operation(exit) {
@@ -764,6 +767,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let (page, control, mm) = {
             let graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
+                self.service_phase = graph.member_wait_phase(&self.record);
                 return Err(NativeProcessError::Busy);
             }
             let resources = graph
@@ -856,12 +860,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map_err(|_| NativeProcessError::Stale)
             })
             .transpose()?;
+        self.service_phase = NativeServicePhase::Claim;
         let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
             .map_err(|_| NativeProcessError::Busy)?;
         self.service_phase = NativeServicePhase::Publication;
         let published = {
             let graph = self.runtime.graph.lock();
-            if !claim.admitted() || graph.has_member_wait(&self.record) {
+            if !claim.admitted() {
+                self.service_phase = NativeServicePhase::Gate;
+                Err(NativeProcessError::Busy)
+            } else if graph.has_member_wait(&self.record) {
+                self.service_phase = graph.member_wait_phase(&self.record);
                 Err(NativeProcessError::Busy)
             } else if let Some(wait) = owner_wait {
                 self.control
