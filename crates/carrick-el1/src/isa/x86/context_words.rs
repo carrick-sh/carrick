@@ -345,7 +345,7 @@ mod tests {
         // SAFETY: the newly allocated record is owned by this fixture until
         // requeue; no other actor can read or write its context yet.
         unsafe { *zone.record(record).ctx_mut() = ParkedContextWords::ZERO };
-        zone.requeue_preempted(slot, record);
+        assert!(zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(zone.switch_in(slot), Some(record));
         // SAFETY: this fixture is the only driver of the on-CPU slot.
         assert!(matches!(

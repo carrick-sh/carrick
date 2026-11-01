@@ -1675,7 +1675,12 @@ mod ring_first_tests {
             _: crate::lifecycle::ChildContext,
         ) {
         }
-        fn enqueue_born(&mut self, _: carrick_sched_core::RecordRef) {}
+        fn enqueue_born(
+            &mut self,
+            _: carrick_sched_core::RecordRef,
+        ) -> crate::lifecycle::BornEnqueue {
+            crate::lifecycle::BornEnqueue::Refused
+        }
         fn exit_record(&self) -> Option<crate::lifecycle::ExitRecord> {
             None
         }

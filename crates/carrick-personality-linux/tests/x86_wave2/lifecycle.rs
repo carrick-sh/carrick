@@ -9,7 +9,7 @@ use carrick_el1_abi::TrapFrame;
 use carrick_personality_linux::{
     abi::{entry::LinuxTaskState, thread::*},
     dispatch::{self, PendingFamilies},
-    lifecycle::{ChildContext, ExitRecord, LifecycleNative, UserCopy},
+    lifecycle::{BornEnqueue, ChildContext, ExitRecord, LifecycleNative, UserCopy},
     thread::LifecycleThread,
 };
 use carrick_sched_core::{RecordRef, SlotId, ThreadIdentity, ZoneTables};
@@ -271,8 +271,8 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
         child.child(context);
         self.child = Some((record, child));
     }
-    fn enqueue_born(&mut self, record: RecordRef) {
-        self.process.zone.requeue_preempted(SLOT, record.id);
+    fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue {
+        self.process.zone.requeue_preempted(SLOT, record.id).into()
     }
     fn exit_record(&self) -> Option<ExitRecord> {
         let reference = self.current?;
@@ -605,7 +605,7 @@ pub fn x5_exit_requeued_after_wake_wakes_once() {
                 ..a.zone.record(turn.current.unwrap().id).identity()
             })
             .unwrap();
-        a.zone.requeue_preempted(SlotId::new(1), parent);
+        assert!(a.zone.requeue_preempted(SlotId::new(1), parent).is_queued());
         let before_clear = turn.clears;
         turn.replace_clear_on_wake = replace_clear;
         turn.fail_release = true;

@@ -2889,8 +2889,8 @@ pub enum AnonymousLeave {
     PendingHostWork,
     /// The root guard was held (by the host venue, or EL1 on another vCPU).
     RootBusy,
-    /// The root model could not decide now (`Busy`, `Stale`,
-    /// `MetadataRequired` from the decision itself).
+    /// The root refused a commit or permission step after deciding (the
+    /// decision's own refusals are split below, #1369).
     RootUnavailable,
     /// The root model routed the call to the host (a host-owned node, a
     /// shape EL1 does not serve).
@@ -2915,10 +2915,17 @@ pub enum AnonymousLeave {
     EditRefused,
     /// No owed-return journal slot was free.
     JournalFull,
+    /// The root's decision refused `Busy`.
+    RootUnavailableBusy,
+    /// The root's decision refused `Stale`: no origin for the current task,
+    /// another MM, or a root not yet admitted.
+    RootUnavailableStale,
+    /// The root's decision refused `MetadataRequired`.
+    RootUnavailableMetadataRequired,
 }
 
 impl AnonymousLeave {
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 16;
 }
 
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
@@ -3100,9 +3107,9 @@ pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 pub use carrick_sched_core::{
     Aarch64ParkedContext, AddressSpaces, BoundedSpin, Claim, CurrentHandback, CurrentRelease,
     ExcludedEditor, Exhausted, FirstEntryActivation, Handback, HostClaim, HostPlacement,
-    HostTransfer, LockWait, ParkedContextRead, RecordId, RecordRef, ServiceHead, SlotDrain, SlotId,
-    SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects, WakeRecord, WakeRefusal, Waker,
-    ZONE_SLOTS,
+    HostTransfer, LockWait, ParkedContextRead, RecordId, RecordRef, Requeue, ServiceHead,
+    SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects, WakeRecord,
+    WakeRefusal, Waker, ZONE_SLOTS,
 };
 
 /// The ARM guest and its carrier share one record context type. Every zone
@@ -4535,7 +4542,7 @@ impl Default for InotifyNameCache {
 
 const _: () = {
     assert!(MAX_NAME_CACHE_PATH_LEN == NAME_CACHE_PATH_WORDS * core::mem::size_of::<u64>());
-    assert!(EL1_ABI_LAYOUT_HASH == 0x9280b37d57edf13f);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x3d704cb1611037ff);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

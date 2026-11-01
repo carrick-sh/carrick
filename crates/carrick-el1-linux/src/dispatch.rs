@@ -4283,6 +4283,7 @@ mod tests {
             Run::NativeNoChild,
             Run::BirthSettlement,
             Run::ClaimRollback,
+            Run::BornEnqueueRefused,
         ] {
             let custody = Custody::NativeRunFailure(reason);
             let invariant = NativeInvariant::PhysicalCustody(custody);
@@ -5001,7 +5002,7 @@ mod tests {
                         self.zone.clear_current(slot);
                         self.zone.free_record(self.record);
                         let replacement = self.zone.alloc_record(self.identity).unwrap();
-                        self.zone.requeue_preempted(slot, replacement);
+                        assert!(self.zone.requeue_preempted(slot, replacement).is_queued());
                         assert!(self.zone.switch_in(slot).is_some());
                     }
                 }
@@ -5047,7 +5048,7 @@ mod tests {
                             control_slot: 0x2000,
                         };
                         let record = zone.alloc_record(identity).unwrap();
-                        zone.requeue_preempted(slot, record);
+                        assert!(zone.requeue_preempted(slot, record).is_queued());
                         assert_eq!(zone.switch_in(slot), Some(record));
                         assert!(matches!(zone.record(record).claim(), Claim::OnCpu { .. }));
                         if switched {
@@ -5059,7 +5060,7 @@ mod tests {
                                     ..identity
                                 })
                                 .unwrap();
-                            zone.requeue_preempted(slot, successor);
+                            assert!(zone.requeue_preempted(slot, successor).is_queued());
                         }
                         let tasks = [CurrentTask::new()];
                         tasks[0].set(

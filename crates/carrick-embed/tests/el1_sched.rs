@@ -599,6 +599,12 @@ fn anonymous_leaves_breakdown(measured: &Measured) -> Vec<(&'static str, u64)> {
         ("pending_host_work", L::PendingHostWork),
         ("root_busy", L::RootBusy),
         ("root_unavailable", L::RootUnavailable),
+        ("root_unavailable_busy", L::RootUnavailableBusy),
+        ("root_unavailable_stale", L::RootUnavailableStale),
+        (
+            "root_unavailable_metadata_required",
+            L::RootUnavailableMetadataRequired,
+        ),
         ("root_declined", L::RootDeclined),
         ("no_grant", L::NoGrant),
         ("editor_busy", L::EditorBusy),
@@ -3004,8 +3010,10 @@ fn el1_memory_first_touch_stays_in_guest() {
         );
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched first-touch pages={pages} exits={} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
+            "el1-sched first-touch pages={pages} exits={} forwarded={:?} anonymous_leaves={:?} carrier_cpu_ns={} wall_ms={} zone={:?} {}",
             measured.exits,
+            measured.forwarded_syscalls,
+            anonymous_leaves_breakdown(&measured),
             measured.cpu_ns,
             measured.wall.as_millis(),
             measured.zone,
