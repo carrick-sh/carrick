@@ -20,7 +20,8 @@ pub const HOST_LEASE_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
 const INHERITED_SOCKET: &str = "CARRICK_HOST_LEASE_SOCKET";
 // High nibble identifies Carrick leases; low nibble is the wire version.
 const LEASE_PROTOCOL: u8 = 0xc1;
-const REQUEST_LIMIT: Duration = Duration::from_millis(100);
+// Reap abandoned connections; admission never waits for another client to read.
+const CONNECTION_LIVENESS_LIMIT: Duration = Duration::from_secs(10);
 const VALIDATION_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,12 +227,17 @@ fn lease_request(
 fn serve_lease_request(
     mut stream: &UnixStream,
     owner: libc::uid_t,
-    allowed: &mut std::collections::BTreeSet<libc::uid_t>,
+    allowed: &Mutex<std::collections::BTreeSet<libc::uid_t>>,
     identity: &[u8],
     scope: Option<&OwnedFd>,
 ) -> io::Result<()> {
     let uid = carrick_portable::peer_credentials(stream.as_raw_fd())?.uid;
-    if uid != owner && !allowed.contains(&uid) {
+    if uid != owner
+        && !allowed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&uid)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "lease client uid not admitted",
@@ -239,7 +245,7 @@ fn serve_lease_request(
     }
     stream.set_write_timeout(Some(VALIDATION_LIMIT))?;
     let mut request = [0; 5];
-    let deadline = Instant::now() + REQUEST_LIMIT;
+    let deadline = Instant::now() + CONNECTION_LIVENESS_LIMIT;
     let mut header = [0];
     read_lease_request(stream, &mut header, deadline)?;
     if header[0] != LEASE_PROTOCOL {
@@ -251,9 +257,12 @@ fn serve_lease_request(
     match request[0] {
         0 if request[1..] == [0; 4] => {}
         1 if uid == owner => {
-            allowed.insert(libc::uid_t::from_le_bytes(
-                request[1..].try_into().map_err(io::Error::other)?,
-            ));
+            allowed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(libc::uid_t::from_le_bytes(
+                    request[1..].try_into().map_err(io::Error::other)?,
+                ));
         }
         _ => {
             return Err(io::Error::new(
@@ -328,7 +337,7 @@ struct LeaseHolder {
     _custody: OwnedFileLock,
     directory: tempfile::TempDir,
     stopping: Arc<AtomicBool>,
-    active: Arc<Mutex<Option<UnixStream>>>,
+    active: Arc<Mutex<std::collections::BTreeMap<libc::c_int, UnixStream>>>,
     server: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -338,11 +347,11 @@ impl LeaseHolder {
             return;
         }
         self.stopping.store(true, Ordering::Release);
-        if let Some(stream) = self
+        for stream in self
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+            .values()
         {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
@@ -659,48 +668,63 @@ impl HostLease {
         })?);
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
-        let active = Arc::new(Mutex::new(None::<UnixStream>));
+        let active = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
         let serving = Arc::clone(&active);
         // SAFETY: geteuid has no preconditions; delegation is owner-only.
         let owner = unsafe { libc::geteuid() };
         let server = std::thread::Builder::new()
             .name("host-lease-validation".into())
             .spawn(move || {
-                let mut allowed = std::collections::BTreeSet::new();
-                for connection in listener.incoming() {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    match connection {
-                        Ok(stream) => {
-                            {
-                                let mut current = serving
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if stop.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                let Ok(handle) = stream.try_clone() else {
-                                    continue;
-                                };
-                                *current = Some(handle);
+                let allowed = Mutex::new(std::collections::BTreeSet::new());
+                // Scoped handlers are joined before the server drops its scope
+                // writer. No stalled client can serialize nested admission.
+                std::thread::scope(|threads| {
+                    for connection in listener.incoming() {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let stream = match connection {
+                            Ok(stream) => stream,
+                            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        };
+                        let key = stream.as_raw_fd();
+                        {
+                            let mut current = serving
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            // Register under the shutdown lock: close_admission
+                            // either cancels this socket or prevents admission.
+                            if stop.load(Ordering::Acquire) {
+                                break;
                             }
-                            let _ = serve_lease_request(
-                                &stream,
-                                owner,
-                                &mut allowed,
-                                &identity,
-                                scope.as_ref(),
-                            );
+                            let Ok(handle) = stream.try_clone() else {
+                                continue;
+                            };
+                            current.insert(key, handle);
+                        }
+                        let serving = &serving;
+                        let allowed = &allowed;
+                        let identity = &identity;
+                        let scope = scope.as_ref();
+                        let handler = std::thread::Builder::new()
+                            .name("host-lease-request".into())
+                            .spawn_scoped(threads, move || {
+                                let _ =
+                                    serve_lease_request(&stream, owner, allowed, identity, scope);
+                                serving
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove(&key);
+                            });
+                        if handler.is_err() {
                             serving
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .take();
+                                .remove(&key);
                         }
-                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
                     }
-                }
+                });
             })?;
         Ok(Self {
             _holder: Some(LeaseHolder {
@@ -996,17 +1020,34 @@ mod tests {
     }
 
     #[test]
-    fn silent_connection_does_not_delay_nested_request() {
+    fn concurrent_nested_requests_complete_while_partial_request_waits() {
         let lock = NamedTempFile::new().unwrap();
         let holder = HostLease::acquire_path(lock.path(), HostLeaseMode::Gate).unwrap();
-        let _silent = UnixStream::connect(&holder.socket).unwrap();
-        let start = Instant::now();
-        let nested = HostLease::inherit(lock.path(), HostLeaseMode::Carrick, &holder.socket);
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "silent connection blocked admission"
+        let mut partial = UnixStream::connect(&holder.socket).unwrap();
+        partial.write_all(&[LEASE_PROTOCOL]).unwrap();
+        // Model a descheduled descendant, beyond the former 100 ms budget.
+        std::thread::sleep(Duration::from_millis(250));
+        std::thread::scope(|threads| {
+            let requests: Vec<_> = (0..16)
+                .map(|_| {
+                    threads.spawn(|| {
+                        HostLease::inherit(lock.path(), HostLeaseMode::Carrick, &holder.socket)
+                            .expect("nested request blocked behind partial request")
+                    })
+                })
+                .collect();
+            for request in requests {
+                assert_eq!(request.join().unwrap().mode(), HostLeaseMode::Gate);
+            }
+        });
+        // Other requests finished without evicting the delayed descendant.
+        partial
+            .write_all(&[0; 5])
+            .expect("delayed request was refused");
+        assert_eq!(
+            read_validation_identity(partial).unwrap().0.mode,
+            HostLeaseMode::Gate
         );
-        assert!(nested.is_ok());
     }
 
     #[test]
@@ -1412,9 +1453,10 @@ mod tests {
             if admitted {
                 allowed.insert(uid);
             }
-            let error = serve_lease_request(&server, owner, &mut allowed, b"{}", None).unwrap_err();
+            let allowed = Mutex::new(allowed);
+            let error = serve_lease_request(&server, owner, &allowed, b"{}", None).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-            assert!(!allowed.contains(&owner));
+            assert!(!allowed.lock().unwrap().contains(&owner));
         }
     }
 
