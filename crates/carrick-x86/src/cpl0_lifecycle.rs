@@ -15,7 +15,7 @@ use carrick_personality_linux::lifecycle::LifecycleOutcome;
 use carrick_personality_linux::{
     abi::thread::LifecycleDecline,
     dispatch::{EntryCounters, FamilyCompletion, PendingFamilies},
-    lifecycle::{ChildContext, ExitRecord, LifecycleNative, UserCopy},
+    lifecycle::{BornEnqueue, ChildContext, ExitRecord, LifecycleNative, UserCopy},
     sched::{FutexCall, FutexFrequency, FutexVenue, FutexWait},
     thread::LifecycleThread,
 };
@@ -41,6 +41,8 @@ pub enum LifecycleInvariant {
     ExitRecord,
     ExitRetirement,
     ExitSwitch,
+    /// A committed child birth was not queued (#1100).
+    BornEnqueue,
 }
 #[cfg(target_os = "none")]
 fn committed<T>(value: Option<T>, reason: LifecycleInvariant) -> T {
@@ -263,7 +265,7 @@ mod process_exit_tests {
             .expect("space");
         zone.spaces.open(space);
         let id = zone.alloc_record(parent).expect("runnable parent");
-        zone.requeue_preempted(slot, id);
+        assert!(zone.requeue_preempted(slot, id).is_queued());
         let mut lane = LifecycleLane {
             contexts: [const { NativeBirthContext::EMPTY }; 2],
             parent,
@@ -706,9 +708,12 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             carrick_guest_arch::X86ThreadPointerRegister::Fs,
         );
     }
-    fn enqueue_born(&mut self, record: RecordRef) {
-        self.zone.requeue_preempted(self.lane.slot, record.id);
-        self.lane.births += 1;
+    fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue {
+        let queued = BornEnqueue::from(self.zone.requeue_preempted(self.lane.slot, record.id));
+        if queued == BornEnqueue::Queued {
+            self.lane.births += 1;
+        }
+        queued
     }
     fn exit_record(&self) -> Option<ExitRecord> {
         let id = self.zone.slot(self.lane.slot).current()?;
@@ -864,7 +869,10 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                 visible_tid,
             },
         );
-        self.enqueue_born(reference);
+        committed(
+            (self.enqueue_born(reference) == BornEnqueue::Queued).then_some(()),
+            LifecycleInvariant::BornEnqueue,
+        );
         Some(LifecycleOutcome::Returned {
             result: SyscallResult::new(child.tid as i64),
             work: false,

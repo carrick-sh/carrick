@@ -544,7 +544,11 @@ pub fn signal_irq_return(
                 *source.zone.record(record).ctx_mut() =
                     context::context_words::from_native(&native);
             }
-            source.zone.requeue_preempted(slot, record);
+            // IRQ entry owns this running/home record: a refusal is a broken
+            // invariant, never contention (#1100).
+            if !source.zone.requeue_preempted(slot, record).is_queued() {
+                fatal_boot();
+            }
             suspended = true;
         }
     }

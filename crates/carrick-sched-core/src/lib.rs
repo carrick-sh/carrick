@@ -315,6 +315,11 @@ pub enum Claim {
     FirstEntryHost { incarnation: u64 },
 }
 
+/// The first execution generation of a freshly published execution; equal to
+/// `carrick_core_abi::SnapshotGeneration::INITIAL` (asserted in
+/// `carrick-core`, which sees both crates).
+pub const FIRST_EXECUTION_GENERATION: u64 = 1;
+
 const STATE_FREE: u64 = 0;
 const STATE_PARKED: u64 = 1;
 const STATE_QUEUED: u64 = 2;
@@ -926,6 +931,37 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.is_native_owned() || self.requires_native_entry()
     }
 
+    /// The one decision of who performs an unadopted birth's first entry.
+    ///
+    /// A host birth's first entry is a host executor's adoption of its host
+    /// thread. A native-owned birth has no host thread to adopt: the ring
+    /// performs its first entry ([`Claim::OnCpu`] with generation 0, admitted
+    /// by `carrick_core::entry::admit_born_in_zone`), so no host venue takes
+    /// first-entry custody of it. Before #1100 every unadopted birth was a
+    /// host first entry; an executor took a native fork child's new thread,
+    /// found no host thread, released it as [`Claim::FirstEntryHost`] and
+    /// left it on no queue. ISA-neutral: x86 CPL0 births use these tables.
+    pub fn needs_host_first_entry(&self) -> bool {
+        self.is_unadopted_birth() && !self.has_native_execution_owner()
+    }
+
+    /// Issue a native-owned birth's first execution generation. The only
+    /// caller is the native process runtime's first admission of the born
+    /// thread, which re-keys the thread's member `Born` -> `Issued` in the
+    /// same transaction (#1100). Refused unless the record is an unadopted
+    /// native birth held `OnCpu` on `slot` (the admitting vCPU).
+    pub fn issue_native_first_execution(&self, slot: SlotId) -> bool {
+        if !self.is_unadopted_birth()
+            || !self.has_native_execution_owner()
+            || !matches!(self.claim(), Claim::OnCpu { slot: owner, .. } if owner == slot)
+        {
+            return false;
+        }
+        self.generation
+            .store(FIRST_EXECUTION_GENERATION, Ordering::Release);
+        true
+    }
+
     pub fn needs_host(&self) -> bool {
         if self.requires_native_entry() {
             return false;
@@ -1058,7 +1094,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     }
 
     fn ready_host_claim(&self, seq: u32) -> Claim {
-        if self.is_unadopted_birth() {
+        if self.needs_host_first_entry() {
             Claim::FirstEntryHost {
                 incarnation: self.incarnation(),
             }
@@ -1706,6 +1742,53 @@ pub enum Waker {
     Host,
 }
 
+/// The outcome of [`ZoneTables::requeue_preempted`].
+///
+/// A refused requeue leaves the record on no run queue, so the caller owns
+/// what happens next: it either still owns the record (it keeps running, or
+/// its owner rolls the birth back) or an invariant broke and it fails
+/// closed. Before #1100 the refusal was `()`, and a native birth whose claim
+/// had moved was silently never queued.
+///
+/// Ignoring the outcome does not compile under the workspace's
+/// `-D warnings`:
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use carrick_sched_core::{RecordId, SlotId, ZoneTables};
+/// fn enqueue(zone: &ZoneTables, slot: SlotId, record: RecordId) {
+///     zone.requeue_preempted(slot, record);
+/// }
+/// ```
+/// Handling it does:
+/// ```
+/// #![deny(unused_must_use)]
+/// use carrick_sched_core::{RecordId, SlotId, ZoneTables};
+/// fn enqueue(zone: &ZoneTables, slot: SlotId, record: RecordId) -> bool {
+///     zone.requeue_preempted(slot, record).is_queued()
+/// }
+/// ```
+#[must_use = "a refused requeue leaves the record on no run queue"]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum Requeue {
+    /// The record is queued on the slot (claim `Queued`, `Handback::Resumed`).
+    Queued,
+    /// Not queued: the record held this claim, which is neither this slot's
+    /// `OnCpu*` nor `Free`.
+    Refused(Claim),
+}
+
+impl Requeue {
+    pub const fn is_queued(self) -> bool {
+        matches!(self, Self::Queued)
+    }
+}
+
 /// The outcome of a host claim.
 #[derive(
     ::core::clone::Clone,
@@ -2284,7 +2367,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let identity = self.record_ref(record);
         let transfer = self.begin_host_transfer(identity, Claim::Queued { slot, seq })?;
         self.remove_locked(&guard, record);
-        let first_entry = rec.is_unadopted_birth();
+        let first_entry = rec.needs_host_first_entry();
         if !first_entry && rec.is_cancelled() && rec.has_adapter_operation() {
             rec.handback
                 .store(Handback::Cancelled as u32, Ordering::Release);
@@ -3061,7 +3144,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             && (home || state.is_idle())
             && (home
                 || self.runs_mm_of(slot, rec)
-                || (rec.is_unadopted_birth() && !self.executor_has_task(slot)))
+                || (rec.needs_host_first_entry() && !self.executor_has_task(slot)))
             && (home || rec.allows_cpu(s.cpu.load(Ordering::Relaxed)))
     }
 
@@ -3496,7 +3579,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// installed on the slot that EL1 may not install now (unpublished, a
     /// pause of it is raised, or it is retiring), which its executor loads.
     fn needs_executor(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
-        rec.needs_host() || rec.is_unadopted_birth() || !self.runs_mm_of(slot, rec)
+        rec.needs_host() || rec.needs_host_first_entry() || !self.runs_mm_of(slot, rec)
     }
 
     /// The address space installed on `slot`'s vCPU, by the occupancy
@@ -3866,14 +3949,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// runnable at the tail of the slot's run queue, to resume with its
     /// registers as they were. Room was made by the switch that follows (the
     /// caller switched the head in first).
-    pub fn requeue_preempted(&self, slot: SlotId, record: RecordId) {
+    pub fn requeue_preempted(&self, slot: SlotId, record: RecordId) -> Requeue {
         // The claim and queue membership become visible together to a host
         // requester. It must not observe Queued before push_locked.
-        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
-            return;
-        };
         let rec = self.record(record);
-        let queued = match rec.claim() {
+        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+            return Requeue::Refused(rec.claim());
+        };
+        let observed = rec.claim();
+        let queued = match observed {
             from @ (Claim::OnCpu { slot: owner, seq }
             | Claim::OnCpuRequested { slot: owner, seq })
                 if owner == slot =>
@@ -3896,7 +3980,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             _ => false,
         };
         if !queued {
-            return;
+            return Requeue::Refused(observed);
         }
         rec.handback
             .store(Handback::Resumed as u32, Ordering::Release);
@@ -3909,6 +3993,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.counters
             .el1_preemptions
             .fetch_add(1, Ordering::Relaxed);
+        Requeue::Queued
     }
 
     /// EL1: move queued threads that are not homed on `slot` to idle slots
@@ -4482,7 +4567,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 // address space: moving it would only create a host exit.
                 || (!victim_stopped
                     && self.needs_executor(thief, rec)
-                    && (!rec.is_unadopted_birth() || self.executor_has_task(thief)))
+                    && (!rec.needs_host_first_entry() || self.executor_has_task(thief)))
                 || !rec.allows_cpu(cpu)
             {
                 continue;
@@ -4586,7 +4671,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     fn place_from_claim(&self, record: RecordId, from: Claim) -> Option<HostPlacement> {
         let rec = self.record(record);
         let seq = rec.parked_sequence(from);
-        let service = rec.needs_host() || rec.is_unadopted_birth();
+        let service = rec.needs_host() || rec.needs_host_first_entry();
         let driven = service || rec.has_native_execution_owner();
         if let Some(home) = rec.home() {
             // The host believes its thread runs on its home slot: only that

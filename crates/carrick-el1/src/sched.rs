@@ -491,10 +491,17 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// its creator wrote, joins this vCPU's run queue: it runs when the
     /// running thread parks, when an idle vCPU steals it, or when the slice
     /// ends (the tick migrates it to an idle vCPU first).
-    pub fn enqueue_born(&mut self, record: carrick_el1_abi::RecordId) {
+    ///
+    /// A refusal (the record's claim moved before publication) is returned
+    /// to the birth owner, which fails closed: a born thread on no run queue
+    /// would never run (#1100).
+    pub fn enqueue_born(&mut self, record: carrick_el1_abi::RecordId) -> carrick_el1_abi::Requeue {
         let (zone, slot) = (self.zone, self.slot);
-        zone.requeue_preempted(slot, record);
-        self.arm_published_runnable();
+        let queued = zone.requeue_preempted(slot, record);
+        if queued.is_queued() {
+            self.arm_published_runnable();
+        }
+        queued
     }
 
     /// A native process fork publishes its child only after physical MM
@@ -940,8 +947,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // SAFETY: `prev` holds the running thread (a fresh home record, or
         // the switched-in OnCpu one): this vCPU is its only owner.
         self.cpu.save(frame, unsafe { zone.record(prev).ctx_mut() });
-        zone.requeue_preempted(slot, prev);
-        true
+        requeue_owned(zone, slot, prev)
     }
 
     /// Preempt the running thread: it goes to the tail of this vCPU's run
@@ -966,7 +972,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         self.cpu.save(frame, unsafe { zone.record(prev).ctx_mut() });
         match zone.switch_in_full(slot) {
             Some(switched) => {
-                zone.requeue_preempted(slot, prev);
+                if !requeue_owned(zone, slot, prev) {
+                    // Hosted builds only: the target build failed closed.
+                    return false;
+                }
                 match self.load(frame, switched) {
                     LoadResult::Running => true,
                     LoadResult::NeedsHost => false,
@@ -1037,6 +1046,23 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
 
 #[path = "sched/hw.rs"]
 pub mod hw;
+
+/// Requeue this vCPU's own record: its running thread, or the fresh home
+/// record it just allocated. Only this vCPU moves that record, so a refusal
+/// is a broken invariant, never contention. The target fails closed rather
+/// than leave the thread on no run queue (#1100); hosted builds report it.
+#[track_caller]
+fn requeue_owned(zone: &ZoneTables, slot: SlotId, record: carrick_el1_abi::RecordId) -> bool {
+    match zone.requeue_preempted(slot, record) {
+        carrick_el1_abi::Requeue::Queued => true,
+        carrick_el1_abi::Requeue::Refused(_) => {
+            #[cfg(target_os = "none")]
+            hw::fatal_entry_binding(carrick_el1_abi::EntryBindingFatalReason::RequeueRefused);
+            #[cfg(not(target_os = "none"))]
+            false
+        }
+    }
+}
 #[cfg(target_os = "none")]
 pub use hw::HardwareCpu;
 pub use hw::HardwareUserWord;

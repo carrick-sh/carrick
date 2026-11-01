@@ -342,7 +342,7 @@ mod tests {
             };
             // SAFETY: this new record remains host-owned until requeue.
             unsafe { *zone.record(record).ctx_mut() = park_native_context(&native) };
-            zone.requeue_preempted(slot, record);
+            assert!(zone.requeue_preempted(slot, record).is_queued());
             bindings.push(ContextBinding {
                 record: zone.record_ref(record),
                 address,
@@ -356,7 +356,7 @@ mod tests {
             assert_eq!(zone.installed_space(slot), binding.address.mm.raw().get());
             assert!(!admit_context(&zone, slot, &bindings[(turn + 1) % 2]));
             zone.release_space(slot);
-            zone.requeue_preempted(slot, id);
+            assert!(zone.requeue_preempted(slot, id).is_queued());
         }
         let id = zone.switch_in(slot).unwrap();
         let mut stale = ContextBinding {

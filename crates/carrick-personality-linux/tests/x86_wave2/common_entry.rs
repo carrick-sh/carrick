@@ -1016,7 +1016,7 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
         zone.spaces.open(space);
         assert!(zone.install_space(slot, identity.mm).is_some());
         let record = zone.alloc_record(identity).unwrap();
-        zone.requeue_preempted(slot, record);
+        assert!(zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(zone.switch_in(slot), Some(record));
         let binding = carrick_core_abi::ExecutionBinding {
             task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),

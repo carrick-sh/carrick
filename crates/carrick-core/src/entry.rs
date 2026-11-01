@@ -476,6 +476,13 @@ pub fn terminal_matches<C: EntryContext>(
 /// ```
 const _: () = ();
 
+// The ring's first-entry issuer and native fork publication name the same
+// first execution generation.
+const _: () = assert!(
+    carrick_sched_core::FIRST_EXECUTION_GENERATION
+        == carrick_core_abi::SnapshotGeneration::INITIAL.raw()
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,7 +525,7 @@ mod tests {
             })
             .unwrap();
         assert!(zone.mark_native_owned(record));
-        zone.requeue_preempted(slot, record);
+        assert!(zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(zone.switch_in(slot), Some(record));
         assert!(zone.install_space(slot, 13).is_some());
         let source = BornInZoneSource { zone: &zone, slot };

@@ -683,7 +683,9 @@ struct IssuedExecution {
     generation: carrick_core_abi::SnapshotGeneration,
 }
 /// An unadopted lifecycle member has real guest record custody but no issued
-/// snapshot generation. Never manufacture an execution to index that member.
+/// snapshot generation. Never manufacture an execution to index that member:
+/// its single issuer is its own first admission
+/// (`NativeProcessRuntime::issue_born_execution`, #1100).
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum NativeThreadIdentity {
     Issued(IssuedExecution),
@@ -3661,6 +3663,92 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     }
 
     #[inline(never)]
+    /// The single issuer of a native thread birth's first execution
+    /// (#1100). In one transaction under the registry -> graph lock order it
+    /// issues the record's first generation, re-keys the registry member and
+    /// the graph member `Born(id)` -> `Issued{id, INITIAL}`, and publishes the
+    /// loaded execution, so every later admission finds the thread under the
+    /// identity its binding names. Born threads are admitted only on the vCPU
+    /// that holds their record `OnCpu`; any other state is `Stale`.
+    fn issue_born_execution(
+        &self,
+        registry: &NativeProcessRegistry<'a, M, C>,
+        source: BornInZoneSource<'a, C>,
+        current: &'a CurrentTask,
+        born: NativeExecutionKey,
+    ) -> Result<(ExecutionBinding, NativeExecutionKey), NativeProcessError> {
+        let NativeThreadIdentity::Born(id) = born.task else {
+            return Err(NativeProcessError::Stale);
+        };
+        let issued = NativeExecutionKey {
+            task: NativeThreadIdentity::Issued(IssuedExecution {
+                id,
+                generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+            }),
+            ..born
+        };
+        let record = source
+            .zone
+            .slot(source.slot)
+            .current()
+            .ok_or(NativeProcessError::Stale)?;
+        let record_ref = source.zone.record_ref(record);
+        let mut state = registry.state.lock();
+        let member = state.members.get(&born).ok_or(NativeProcessError::Stale)?;
+        if !core::ptr::eq(Arc::as_ptr(&member.runtime), self)
+            || member.record != record_ref
+            || state.members.contains_key(&issued)
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let process = member.process;
+        {
+            let mut graph = self.graph.lock();
+            let row = graph
+                .owner
+                .task_mut(process)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let graph_member = row
+                .native_mut()
+                .resources_mut()
+                .members
+                .iter_mut()
+                .find(|m| m.thread == born.task && m.record == record_ref)
+                .ok_or(NativeProcessError::Stale)?;
+            if !source
+                .zone
+                .record(record)
+                .issue_native_first_execution(source.slot)
+            {
+                return Err(NativeProcessError::Stale);
+            }
+            graph_member.thread = issued.task;
+        }
+        let member = state
+            .members
+            .remove(&born)
+            .ok_or(NativeProcessError::Stale)?;
+        state.members.insert(issued, member);
+        for key in state.records.values_mut() {
+            if *key == born {
+                *key = issued;
+            }
+        }
+        for (_, keys) in state.by_process.values_mut() {
+            for key in keys.iter_mut() {
+                if *key == born {
+                    *key = issued;
+                }
+            }
+        }
+        drop(state);
+        current.execution.generation.store(
+            carrick_core_abi::SnapshotGeneration::INITIAL,
+            Ordering::Release,
+        );
+        Ok((issued.binding(), issued))
+    }
+
     fn authenticate_registered(
         &self,
         registry: &NativeProcessRegistry<'a, M, C>,
@@ -3684,6 +3772,22 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         }
         let binding = super::common_entry::execution_binding(current);
         let member_key = NativeExecutionKey::new(source.zone, binding, address)?;
+        // A native-owned thread birth's first admission is its first entry:
+        // issue its execution before anything else authenticates it (#1100).
+        // A host birth stays Born here; its host adopter issues it.
+        let native_birth = source
+            .zone
+            .slot(source.slot)
+            .current()
+            .map(|record| source.zone.record(record))
+            .is_some_and(|record| {
+                record.is_unadopted_birth() && record.has_native_execution_owner()
+            });
+        let (binding, member_key) = if native_birth && !binding.generation.issued() {
+            self.issue_born_execution(registry, source, current, member_key)?
+        } else {
+            (binding, member_key)
+        };
         let member = registry
             .state
             .lock()
@@ -7157,7 +7261,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             unrow(self.runtime);
             return Err(NativeProcessError::Quarantined);
         }
-        self.source.zone.requeue_preempted(self.source.slot, record);
+        // The child's only owner is this queue entry: a refusal would leave
+        // the published child on no run queue (#1100).
+        if !self
+            .source
+            .zone
+            .requeue_preempted(self.source.slot, record)
+            .is_queued()
+        {
+            unrow(self.runtime);
+            return Err(NativeProcessError::Quarantined);
+        }
         Ok(visible.get())
     }
 }
@@ -9613,7 +9727,7 @@ mod tests {
                 .or_else(|| zone.slot(slot).host_record())
                 .unwrap();
             drop(parent);
-            zone.requeue_preempted(slot, parent_record);
+            assert!(zone.requeue_preempted(slot, parent_record).is_queued());
             activate(&runtime, source, &task, child_key);
             let child_words = runtime.task_binding(child_key).unwrap().words;
             let mut child = runtime
@@ -10777,7 +10891,7 @@ mod tests {
             })
             .unwrap();
         thread_control.bind_zone_record(zone.record_ref(record));
-        zone.requeue_preempted(slot, record);
+        assert!(zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
         thread.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(42),
@@ -10855,7 +10969,7 @@ mod tests {
         drop(observer_claim);
         drop(process);
         let leader_record = runtime.task_binding(process_key).unwrap().record;
-        zone.requeue_preempted(slot, leader_record.id);
+        assert!(zone.requeue_preempted(slot, leader_record.id).is_queued());
         assert_eq!(zone.switch_in_full(slot).unwrap().record, leader_record.id);
         let mut leader_entry = runtime
             .enter_registered(
@@ -11100,7 +11214,7 @@ mod tests {
             })
             .unwrap();
         thread_control.bind_zone_record(zone.record_ref(record));
-        zone.requeue_preempted(slot, record);
+        assert!(zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
         thread.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(43),
@@ -14916,7 +15030,7 @@ mod tests {
             .expect("fork child succeeds") as i32;
         drop(entry);
 
-        zone.requeue_preempted(slot, parent_record.id);
+        assert!(zone.requeue_preempted(slot, parent_record.id).is_queued());
         let child_key = {
             let graph = runtime.graph.lock();
             graph

@@ -64,6 +64,10 @@ pub enum EntryBindingFatalReason {
     NativeServiceParkStale = 46,
     NativeServiceSettleStale = 47,
     NativeServiceCompleteStale = 48,
+    /// A vCPU's own running or newly allocated record was not queued: its
+    /// claim was neither this slot's `OnCpu*` nor `Free` (#1100). Leaving it
+    /// on no run queue would strand the thread.
+    RequeueRefused = 49,
 }
 impl EntryBindingFatalReason {
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -116,6 +120,7 @@ impl EntryBindingFatalReason {
             46 => Some(Self::NativeServiceParkStale),
             47 => Some(Self::NativeServiceSettleStale),
             48 => Some(Self::NativeServiceCompleteStale),
+            49 => Some(Self::RequeueRefused),
 
             _ => None,
         }
@@ -438,7 +443,7 @@ mod tests {
 
     #[test]
     fn fatal_detail_round_trip_and_formatter() {
-        for raw in 1..=48 {
+        for raw in 1..=49 {
             let reason = EntryBindingFatalReason::from_raw(raw).unwrap();
             for (line, column) in [(0, 0), (1646, 9), (u32::MAX, u32::MAX)] {
                 let detail = EntryBindingFatalDetail {
@@ -631,7 +636,7 @@ mod tests {
             0,
             identity.mm
         ));
-        zone.requeue_preempted(slot, record);
+        assert!(zone.requeue_preempted(slot, record).is_queued());
         assert_eq!(zone.switch_in(slot), Some(record));
         let current = ArmEntryBindingFatal::capture(registers, &frame, binding(), &zone, slot);
         let observed = current.record.unwrap();

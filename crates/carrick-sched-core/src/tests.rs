@@ -1346,7 +1346,7 @@ fn a_preempted_thread_resumes_without_a_result() {
     let a = zone.current_or_new(SLOT, identity(1)).unwrap();
     let switched = zone.switch_in_full(SLOT).unwrap();
     assert_eq!(switched.record, b);
-    zone.requeue_preempted(SLOT, a);
+    assert!(zone.requeue_preempted(SLOT, a).is_queued());
     assert_eq!(zone.record(a).claim(), Claim::Queued { slot: SLOT, seq: 1 });
     assert_eq!(zone.slot(SLOT).current(), Some(b));
     // Next tick: B is preempted, A (home) comes back without a result.
@@ -1356,7 +1356,7 @@ fn a_preempted_thread_resumes_without_a_result() {
     assert_eq!(switched.record, a);
     assert_eq!(switched.result, None);
     assert!(switched.home);
-    zone.requeue_preempted(SLOT, b);
+    assert!(zone.requeue_preempted(SLOT, b).is_queued());
     assert_eq!(zone.counters.el1_preemptions.load(Ordering::Relaxed), 2);
     // An exit now hands B back as preempted.
     zone.leave_guest(SLOT, &HostWait);
@@ -1535,7 +1535,7 @@ fn idle_native_mm_does_not_license_a_host_owned_successor() {
         zone.spaces.open(space);
         let first = zone.alloc_record(identity(1)).unwrap();
         assert!(zone.mark_native_owned(first));
-        zone.requeue_preempted(SLOT, first);
+        assert!(zone.requeue_preempted(SLOT, first).is_queued());
         assert_eq!(zone.switch_in(SLOT), Some(first));
         assert!(zone.install_space(SLOT, MM).is_some());
         assert_eq!(
@@ -1547,7 +1547,7 @@ fn idle_native_mm_does_not_license_a_host_owned_successor() {
         if native_successor {
             assert!(zone.mark_native_owned(next));
         }
-        zone.requeue_preempted(SLOT, next);
+        assert!(zone.requeue_preempted(SLOT, next).is_queued());
         assert!(!zone.executor_has_task(SLOT));
         assert_eq!(zone.installed_space(SLOT), MM);
         if native_successor {
@@ -1579,7 +1579,7 @@ fn idle_native_mm_steals_host_work_without_switching_it_in() {
     let record = zone.alloc_record(identity(2)).unwrap();
     // SAFETY: this record is freshly allocated and unpublished.
     unsafe { zone.record(record).ctx_mut().x[0] = 0xabcdef };
-    zone.requeue_preempted(OTHER, record);
+    assert!(zone.requeue_preempted(OTHER, record).is_queued());
     zone.leave_guest(OTHER, &HostWait);
 
     assert_eq!(zone.steal(SLOT), None);
@@ -1732,7 +1732,7 @@ fn idle_executors_adopt_born_records_from_two_live_process_queues() {
                 ..identity(tid)
             })
             .unwrap();
-        zone.requeue_preempted(victim, born);
+        assert!(zone.requeue_preempted(victim, born).is_queued());
         host_publish(&zone, thief, 0, Some(cpu + 2), 0);
         zone.enter_guest(thief);
         assert!(!zone.enter_idle(thief, false));
@@ -1773,7 +1773,7 @@ fn queued_births_wake_cold_executors_for_both_live_processes() {
                 ..identity(tid)
             })
             .unwrap();
-        zone.requeue_preempted(victim, born);
+        assert!(zone.requeue_preempted(victim, born).is_queued());
         host_publish(&zone, thief, 0, Some(cpu), 0);
         zone.enter_guest(thief);
         zone.enter_idle(thief, true);
@@ -2811,7 +2811,7 @@ fn requested_running_records_survive_preemption_and_unswitch() {
             HostClaim::El1Held { slot: SLOT }
         );
         if preempt {
-            zone.requeue_preempted(SLOT, record);
+            assert!(zone.requeue_preempted(SLOT, record).is_queued());
         } else {
             zone.unswitch(SLOT, record);
         }
@@ -3221,7 +3221,7 @@ mod ipc_wait {
         notify(&zone, key);
         assert_eq!(zone.switch_in(SLOT), Some(record));
         let peer = zone.alloc_record(identity(72)).unwrap();
-        zone.requeue_preempted(SlotId::new(4), peer);
+        assert!(zone.requeue_preempted(SlotId::new(4), peer).is_queued());
         let commits = AtomicU32::new(0);
         let rollbacks = AtomicU32::new(0);
         let (published, observe) = std::sync::mpsc::sync_channel(1);
@@ -3291,7 +3291,7 @@ mod ipc_wait {
         notify(&zone, key);
         assert_eq!(zone.switch_in(SLOT), Some(record));
         let peer = zone.alloc_record(identity(82)).unwrap();
-        zone.requeue_preempted(SlotId::new(4), peer);
+        assert!(zone.requeue_preempted(SlotId::new(4), peer).is_queued());
         let commits = AtomicU32::new(0);
         let rollbacks = AtomicU32::new(0);
         let (reached, blocked) = std::sync::mpsc::sync_channel(1);
@@ -3613,7 +3613,7 @@ fn switched_affinity_change_prompts_only_the_exact_excluded_owner() {
     host_publish(&zone, SLOT, MM, Some(1), 3);
     zone.enter_guest(SLOT);
     let record = zone.alloc_record(identity(703)).unwrap();
-    zone.requeue_preempted(SLOT, record);
+    assert!(zone.requeue_preempted(SLOT, record).is_queued());
     zone.switch_in_full(SLOT).unwrap();
     let reference = zone.record_ref(record);
     zone.record(record).set_affinity(1);
@@ -3829,7 +3829,7 @@ fn interrupt_parked_futex_rechecks_claim_after_futex_enrollment() {
     let zone: Arc<ZoneTables> = Arc::from(zone());
     enter(&zone, SLOT, 0);
     let record = zone.current_or_new(SLOT, identity(41)).unwrap();
-    zone.requeue_preempted(SLOT, record);
+    assert!(zone.requeue_preempted(SLOT, record).is_queued());
     assert_eq!(zone.switch_in_full(SLOT).unwrap().record, record);
     let guard = zone.short_lock(ZoneTables::bucket_of(MM, 0x7000), &ShortLockSpin);
     let seq = zone.next_seq(record);
@@ -3870,4 +3870,99 @@ fn interrupt_parked_futex_rechecks_claim_after_futex_enrollment() {
     let selected = zone.switch_in_full(SLOT).unwrap();
     assert_eq!(selected.record, record);
     assert_eq!(selected.result.map(|value| value as i64), Some(-4));
+}
+
+/// A native process's freshly allocated thread birth: generation 0 with a
+/// lifecycle page and control slot (an unadopted birth), owned by the ring.
+fn native_birth(zone: &ZoneTables, tid: u64) -> RecordId {
+    let id = zone
+        .alloc_record(ThreadIdentity {
+            generation: 0,
+            lifecycle_page: 1,
+            control_slot: 1,
+            ..identity(tid)
+        })
+        .unwrap();
+    assert!(zone.mark_native_owned(id));
+    assert!(zone.record(id).is_unadopted_birth());
+    id
+}
+
+/// #1100: a native fork child's thread birth has no host thread for an
+/// executor to adopt. Its first entry belongs to the ring, so EL1 must
+/// switch it in, never leave the vCPU for an executor that drops it.
+/// Red before the fix: `head_needs_host` was true for every unadopted birth.
+#[test]
+fn native_birth_first_entry_stays_with_the_ring() {
+    let zone = zone();
+    host_publish(&zone, SLOT, 0, Some(0), 0);
+    zone.enter_guest(SLOT);
+    let space = zone.spaces.publish_closed(MM, 0x1000, 0x1000).unwrap();
+    zone.spaces.open(space);
+    let born = native_birth(&zone, 7);
+    // EL1 `enqueue_born`.
+    assert!(zone.requeue_preempted(SLOT, born).is_queued());
+    assert!(!zone.record(born).needs_host_first_entry());
+    assert!(
+        !zone.head_needs_host(SLOT),
+        "a native birth at the head must not send the vCPU to an executor"
+    );
+    assert!(zone.take_service_head_for_executor(SLOT).is_none());
+    assert_eq!(zone.switch_in(SLOT), Some(born));
+    assert!(matches!(zone.record(born).claim(), Claim::OnCpu { slot, .. } if slot == SLOT));
+}
+
+/// #1100, "not now once, then success" on the executor's real path: the
+/// child's MM is closed when its birth reaches the head, so the slot's
+/// executor takes it. It must come back as ring-routable host custody
+/// (never frozen first-entry custody nobody owns), be placed back by the
+/// ring router, and run once the MM opens.
+/// Red before the fix: the executor got `ServiceHead::FirstEntry`, which
+/// `adopt_born_record` released as `FirstEntryHost` on no queue.
+#[test]
+fn native_birth_taken_by_an_executor_returns_to_the_ring_then_runs() {
+    let zone = zone();
+    host_publish(&zone, SLOT, 0, Some(0), 0);
+    zone.enter_guest(SLOT);
+    let space = zone.spaces.publish_closed(MM, 0x1000, 0x1000).unwrap();
+    let born = native_birth(&zone, 8);
+    assert!(zone.requeue_preempted(SLOT, born).is_queued());
+    assert!(
+        zone.head_needs_host(SLOT),
+        "a closed MM is not runnable now"
+    );
+    let record = match zone.take_service_head_for_executor(SLOT) {
+        Some(ServiceHead::Record(record)) => record,
+        Some(ServiceHead::FirstEntry(_)) => {
+            panic!("a native birth must not become host first-entry custody")
+        }
+        None => panic!("the executor takes the head it was sent for"),
+    };
+    assert_eq!(record, zone.record_ref(born));
+    assert!(matches!(zone.record(born).claim(), Claim::Host { .. }));
+    assert!(zone.record(born).needs_native_handback());
+    // The executor's ring route (`el1_zone::route_native_handback`).
+    assert!(zone.place_native_handback(record).is_some());
+    assert!(matches!(zone.record(born).claim(), Claim::Queued { .. }));
+    zone.spaces.open(space);
+    assert!(!zone.head_needs_host(SLOT));
+    assert_eq!(zone.switch_in(SLOT), Some(born));
+}
+
+/// A refused requeue is returned with the claim it observed, and leaves the
+/// record off every run queue: callers cannot treat it as queued (#1100).
+#[test]
+fn requeue_refusal_reports_the_observed_claim() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 0);
+    zone.enter_guest(SLOT);
+    let parked = park(&zone, 9, 0x4000);
+    let claim = zone.record(parked).claim();
+    assert!(matches!(claim, Claim::Parked { .. }));
+    assert_eq!(
+        zone.requeue_preempted(SLOT, parked),
+        Requeue::Refused(claim)
+    );
+    assert_eq!(zone.runnable_head(SLOT), None);
+    assert_eq!(zone.record(parked).claim(), claim);
 }

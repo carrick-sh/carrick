@@ -19,6 +19,8 @@ pub enum NativeRunFailureReason {
     NativeNoChild = 9,
     BirthSettlement = 10,
     ClaimRollback = 11,
+    /// A committed birth's record could not be queued (#1100).
+    BornEnqueueRefused = 12,
 }
 impl NativeRunFailureReason {
     pub const fn as_str(self) -> &'static str {
@@ -34,6 +36,7 @@ impl NativeRunFailureReason {
             Self::NativeNoChild => "native process no child",
             Self::BirthSettlement => "native birth settlement",
             Self::ClaimRollback => "native claim rollback",
+            Self::BornEnqueueRefused => "native birth enqueue refused",
         }
     }
     pub const fn from_raw(raw: u64) -> Option<Self> {
@@ -49,6 +52,7 @@ impl NativeRunFailureReason {
             9 => Some(Self::NativeNoChild),
             10 => Some(Self::BirthSettlement),
             11 => Some(Self::ClaimRollback),
+            12 => Some(Self::BornEnqueueRefused),
             _ => None,
         }
     }

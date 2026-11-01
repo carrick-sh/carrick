@@ -169,5 +169,5 @@ pub use snapshot::{
     ThreadSignalSnapshotRow, ThreadSnapshotClass, ThreadSnapshotRow, VmaSnapshotRow,
     ZombieSnapshotRow,
 };
-pub use thread_ledger::ThreadLedger;
+pub use thread_ledger::{FirstEntryAdoption, ThreadLedger};
 pub use wait_set::{WaitCallbackEnrollment, WaitEnrollment, WaitQueue, WaitSet, WaitSetOutcome};

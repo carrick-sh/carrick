@@ -252,9 +252,12 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
     });
     assert_ne!(children[0].address.mm, children[1].address.mm);
     let parent_binding = runtime.task_binding(parent).unwrap();
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, parent_binding.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .is_queued()
+    );
     let sender_slot = SlotId::new(1);
     let sender_source = BornInZoneSource {
         zone: fixture.zone,
@@ -736,9 +739,12 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                     "restarted read completes after the peer writes"
                 );
             }
-            fixture
-                .zone
-                .requeue_preempted(fixture.slot, child.record.id);
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(fixture.slot, child.record.id)
+                    .is_queued()
+            );
         }
         assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 2);
         return;
@@ -803,9 +809,12 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
         );
         assert_eq!(frame.x[0], 0, "the same read completes EOF, never replays");
         assert!(!fixture.zone.record(child.record.id).has_object_operation());
-        fixture
-            .zone
-            .requeue_preempted(fixture.slot, child.record.id);
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(fixture.slot, child.record.id)
+                .is_queued()
+        );
     }
     assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 2);
 }
@@ -860,9 +869,12 @@ fn serial_host_deliverable_signal_does_not_cancel_mm_edit_conflict() {
             serial: TaskSerial::from_raw_u64(11).unwrap(),
         })
         .unwrap();
-    fixture
-        .zone
-        .requeue_preempted(fixture.slot, binding.record.id);
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(fixture.slot, binding.record.id)
+            .is_queued()
+    );
     activate_target(source, &fixture.task, &binding);
     // SAFETY: this fixture exclusively selected the exact registered root.
     unsafe {

@@ -1584,7 +1584,7 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
         carrick_sched_core::CurrentRelease::Released,
     );
     let record = hosted.zone.alloc_record(identity).unwrap();
-    hosted.zone.requeue_preempted(SLOT, record);
+    assert!(hosted.zone.requeue_preempted(SLOT, record).is_queued());
     assert_eq!(hosted.zone.switch_in(SLOT), Some(record));
     hosted.task().execution.generation.store(
         carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
@@ -3100,7 +3100,7 @@ fn native_exit_group_leaves_the_woken_successor_to_the_scheduler() {
         })
         .unwrap();
     assert!(w.zone.mark_native_owned(record));
-    w.zone.requeue_preempted(SLOT, record);
+    assert!(w.zone.requeue_preempted(SLOT, record).is_queued());
     let mut owner = Exiting {
         binding: crate::common_entry::execution_binding(w.task()),
     };

@@ -737,7 +737,7 @@ fn late_host_work_on_a_switched_native_record_enters_its_owner_boundary() {
         *zone.record(record).ctx_mut() =
             Aarch64ParkedContext::from_register(thread_ctx(0xA, 0x1000), TTBR_MM, MM, 1);
     }
-    zone.requeue_preempted(SLOT, record);
+    assert!(zone.requeue_preempted(SLOT, record).is_queued());
     let task = CurrentTask::new();
     let counters = counters();
     let mut frame = TrapFrame {
@@ -798,7 +798,7 @@ fn late_host_work_settles_native_owner_before_host_affinity_exit() {
         *zone.record(record).ctx_mut() =
             Aarch64ParkedContext::from_register(thread_ctx(0xA, 0x1000), TTBR_MM, MM, 1);
     }
-    zone.requeue_preempted(SLOT, record);
+    assert!(zone.requeue_preempted(SLOT, record).is_queued());
     let task = CurrentTask::new();
     let counters = counters();
     let mut frame = TrapFrame {
@@ -2221,7 +2221,7 @@ fn switched_affinity_boundary(at_return: bool) {
     let mut id = identity(202);
     id.affinity_source = source;
     let record = zone.alloc_record(id).unwrap();
-    zone.requeue_preempted(SLOT, record);
+    assert!(zone.requeue_preempted(SLOT, record).is_queued());
     assert_eq!(zone.switch_in_full(SLOT).unwrap().record, record);
     struct NoHostResidency;
     impl carrick_core::affinity::AffinityNotifier for NoHostResidency {
@@ -2288,7 +2288,7 @@ fn switched_admission_rechecks_affinity_before_loading_its_frame() {
     host_publish(&zone, SLOT, MM, Some(1), 3);
     zone.enter_guest(SLOT);
     let record = zone.alloc_record(identity(703)).unwrap();
-    zone.requeue_preempted(SLOT, record);
+    assert!(zone.requeue_preempted(SLOT, record).is_queued());
     zone.record(record).set_affinity(1);
     let task = task_for(703);
     let mut cpu = FakeCpu::default();

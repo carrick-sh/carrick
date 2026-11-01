@@ -270,7 +270,9 @@ pub fn witness(
             address,
         });
         if index == 0 {
-            zone.requeue_preempted(SLOT, id);
+            if !zone.requeue_preempted(SLOT, id).is_queued() {
+                return Err(fail("run queue publication"));
+            }
         } else {
             let guard = zone
                 .lock(ZoneTables::bucket_of(mm, WAKE_ADDRESS), &BoundedSpin(0))
