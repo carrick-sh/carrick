@@ -14,6 +14,7 @@ pub mod claims;
 pub mod cli;
 pub mod command;
 pub mod commit_trailers;
+mod compiler_cache;
 pub mod copyout_debt;
 pub mod debt_moves;
 mod dispatch_mint;

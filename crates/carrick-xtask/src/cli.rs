@@ -20,6 +20,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Start or attach to the job-local compiler cache under its socket lock.
+    CompilerCacheStart,
     #[command(about = "Acquire and renew CAS leases over refs/claims/*")]
     Claims(crate::claims::ClaimsArgs),
     /// Repeat a signed test and capture the first selected failure (macOS).
@@ -222,6 +224,8 @@ pub struct RepoInfo {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("compiler cache: {0}")]
+    CompilerCache(String),
     #[error("loom-run: {message}")]
     LoomRun { message: String, code: i32 },
     #[error("lint-source: {0} check(s) failed")]
@@ -544,6 +548,9 @@ where
         #[cfg(feature = "impact")]
         Commands::Impact(args) => crate::impact::run(cli.root.as_deref(), args.action)
             .map_err(|e| CliError::Impact(e.to_string())),
+        Commands::CompilerCacheStart => {
+            crate::compiler_cache::start().map_err(|e| CliError::CompilerCache(e.to_string()))
+        }
         Commands::Info => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             let json = serde_json::to_string_pretty(&info)?;
