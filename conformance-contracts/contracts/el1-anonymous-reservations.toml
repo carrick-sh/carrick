@@ -35,12 +35,14 @@ vm_free = [
   "carrick-el1-linux::aarch64_process_tests::native_fault_supply_tests::anonymous_reservation_first_touch_service_budget (red on main: production mmap, first-touch physical-supply selections and authenticated descriptor grants at 64/256/1024; necessary service-request slope <1/8, no transport or HVF exit census)",
   "carrick-el1::memory::tests::delegated::mmap_unrepresented_protection_preserves_host_linux_decoder (decoder fallback only; live descriptor publication requires embed)",
   "carrick-el1::memory::tests::delegated::mmap_stack_hint_is_served_like_private_anonymous (MAP_STACK is a hint served by the root; MAP_GROWSDOWN keeps the host decoder)",
+  "carrick-el1::memory::tests::delegated::two_isa_anonymous_edits_publish_to_a_live_peer",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",
 ]
 
 [bindings.unresolved]
+kvm = "Executing x86 binding: carrick-vmm-kvm::cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring. Requires real KVM; the contract evaluator has no registered KVM observation layer."
 docker = "Native arm64 Docker differential verification for multi-scale anonymous reservations; automated same-source binding remains open."
 embed_structural = "Not yet a registered WorkObservation binding: the signed test (`el1_anonymous_reservations_stay_in_guest`) asserts, outside the contract evaluator, served mmap >= count, served brk >= 2, forwarded mmap/brk equal across scales and an exit slope below 0.125 exits per added reservation (a fractional per-unit slope is not expressible in the integer affine budget schema). Intent: assert guest-served mmap and brk counters cover every reservation, forwarded mmap/brk counts identical across 64, 256 and 1024 operations, and incremental host-exit slope < 0.125 exits per reservation."
 production = "Migrate production brk and mmap dispatch handlers from unconditional Forward to authoritative EL1 service backed by the shared reservation authority."

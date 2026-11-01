@@ -542,6 +542,147 @@ fn production_interrupt_boot_serves_an_ordinary_syscall() {
     assert_eq!(outcome.physical.robust_list_head(0).unwrap(), 0x2345);
 }
 
+/// Production Linux entry, including first touch and partial-range retirement.
+/// No fixture syscall or host mmap-family fallback can satisfy this witness.
+#[test]
+fn production_anonymous_protect_and_partial_unmap_stay_in_ring() {
+    let image = std::fs::read(env!("CARRICK_X86_CPL0_IMAGE")).unwrap();
+    let image = goblin::elf::Elf::parse(&image).unwrap();
+    let unsupported = image
+        .syms
+        .iter()
+        .find(|symbol| {
+            image.strtab.get_at(symbol.st_name) == Some("CARRICK_CPL0_ISA_UNSUPPORTED_FORWARDS")
+                && symbol.st_size == 8
+        })
+        .expect("loaded production image diagnostic counter")
+        .st_value;
+    for fault in [0, 1, 2] {
+        let mut code = Vec::new();
+        let mut failures = Vec::new();
+        let mut denied_pc = None;
+        fn mov(code: &mut Vec<u8>, register: &[u8], value: u64) {
+            code.extend_from_slice(register);
+            code.extend_from_slice(&value.to_le_bytes());
+        }
+        fn check(code: &mut Vec<u8>, failures: &mut Vec<usize>, expected: i8) {
+            code.extend_from_slice(&[0x48, 0x83, 0xf8, expected as u8]); // cmp rax, imm8
+            code.extend_from_slice(&[0x0f, 0x85]); // jne failure
+            failures.push(code.len());
+            code.extend_from_slice(&0_i32.to_le_bytes());
+        }
+        // mmap(NULL, 3 pages, RW, PRIVATE|ANONYMOUS, -1, 0).
+        for (register, value) in [
+            (&[0x48, 0xbf][..], 0),
+            (&[0x48, 0xbe], 0x3000),
+            (&[0x48, 0xba], 3),
+            (&[0x49, 0xba], 0x22),
+            (&[0x49, 0xb8], u64::MAX),
+            (&[0x49, 0xb9], 0),
+            (&[0x48, 0xb8], 9),
+        ] {
+            mov(&mut code, register, value);
+        }
+        code.extend_from_slice(&[0x0f, 0x05, 0x49, 0x89, 0xc4]); // syscall; mov r12, rax
+        // Populate each page before narrowing; a bad mmap faults here.
+        for offset in [0_i32, 0x1000, 0x2000] {
+            code.extend_from_slice(&[0x41, 0xc6, 0x84, 0x24]);
+            code.extend_from_slice(&offset.to_le_bytes());
+            code.push(0x35);
+        }
+        code.extend_from_slice(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
+        mov(&mut code, &[0x48, 0xbe], 0x3000);
+        mov(&mut code, &[0x48, 0xba], 1);
+        mov(&mut code, &[0x48, 0xb8], 10);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        check(&mut code, &mut failures, 0);
+        code.extend_from_slice(&[0x49, 0x0f, 0xb6, 0x04, 0x24]); // movzx rax, byte [r12]
+        check(&mut code, &mut failures, 0x35);
+        if fault == 1 {
+            // A no-op mprotect lets this forbidden store proceed and exits 7.
+            denied_pc = Some(0x4000b0 + code.len() as u64);
+            code.extend_from_slice(&[0x41, 0xc6, 0x04, 0x24, 0x71]);
+        }
+        // Retire only the middle page.
+        code.extend_from_slice(&[0x49, 0x8d, 0xbc, 0x24, 0, 0x10, 0, 0]);
+        mov(&mut code, &[0x48, 0xbe], 0x1000);
+        mov(&mut code, &[0x48, 0xb8], 11);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        check(&mut code, &mut failures, 0);
+        // Both outer pages must survive the partial unmap.
+        for offset in [0_i32, 0x2000] {
+            code.extend_from_slice(&[0x49, 0x0f, 0xb6, 0x84, 0x24]);
+            code.extend_from_slice(&offset.to_le_bytes());
+            check(&mut code, &mut failures, 0x35);
+        }
+        if fault == 2 {
+            // A no-op munmap exposes the old middle byte and exits 7.
+            denied_pc = Some(0x4000b0 + code.len() as u64);
+            code.extend_from_slice(&[0x49, 0x0f, 0xb6, 0x84, 0x24, 0, 0x10, 0, 0]);
+        }
+        // An unmapped range outside the pending physical return must report
+        // ENOMEM(12), not counted ENOSYS.
+        code.extend_from_slice(&[0x49, 0x8d, 0xbc, 0x24, 0, 0x50, 0, 0]);
+        mov(&mut code, &[0x48, 0xb8], 10);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        check(&mut code, &mut failures, -12);
+        code.extend_from_slice(&[0x49, 0x8d, 0x7c, 0x24, 1]); // lea rdi,[r12+1]
+        mov(&mut code, &[0x48, 0xb8], 10);
+        code.extend_from_slice(&[0x0f, 0x05]);
+        check(&mut code, &mut failures, -22);
+        // Exit status identifies a completely checked workload.
+        mov(&mut code, &[0x48, 0xbf], 7);
+        mov(&mut code, &[0x48, 0xb8], 231);
+        code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+        let failure = code.len();
+        mov(&mut code, &[0x48, 0xbf], 9);
+        mov(&mut code, &[0x48, 0xb8], 231);
+        code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+        for branch in failures {
+            let delta = i32::try_from(failure - (branch + 4)).unwrap();
+            code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+        }
+        let outcome = run_pool_fixture(&production_probe_elf(&code), 32);
+        if fault == 0 {
+            assert_eq!(outcome.run.exit_code, 7);
+            assert_eq!(outcome.run.terminating_signal, None);
+        } else {
+            assert_eq!(outcome.run.terminating_signal, Some(libc::SIGSEGV));
+            assert!(outcome.fault_record.is_none(), "SIGSEGV stays in ring");
+            let expected_error = if fault == 1 { 7 } else { 4 };
+            assert!(
+                (0..2).any(|cpu| {
+                    let (active, _, error, pc, reason) =
+                        outcome.physical.user_fault_state(cpu).unwrap();
+                    active == 1
+                        && error & 7 == expected_error
+                        && Some(pc) == denied_pc
+                        && reason == 0
+                }),
+                "the exact denied instruction must fault with the expected P/W/U bits"
+            );
+        }
+        assert_eq!(
+            outcome
+                .physical
+                .supervisor_diagnostic_counter(carrick_guest_arch::KernelVa::new(unsupported),)
+                .unwrap(),
+            0,
+            "no ISA-unsupported forwards"
+        );
+        assert_eq!(outcome.physical.initial_execution_witness().unwrap().1, 0);
+        for canonical in [215, 222, 226] {
+            assert_eq!(
+                outcome
+                    .physical
+                    .refusal_count(carrick_abi::NativeNr(canonical))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+}
+
 fn program(calls: &[(u64, u64)]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for &(head, len) in calls {

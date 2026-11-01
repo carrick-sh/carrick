@@ -32,6 +32,8 @@ vm_free = [
   "carrick-el1::fault::tests::permission_fault_never_requests_a_first_touch_frame_grant",
   "carrick-el1::memory::tests::{resident_anonymous_mprotect_rounds_and_edits_under_exact_mm_guard,a_refused_or_forwarded_mprotect_journals_nothing,ineligible_mapping_and_permission_widening_forward}",
   "carrick-vmm-hvf::trap::frame_inventory::tests::el1_owned_live_leaf_overrides_stale_host_shadow_without_weakening_untagged_parity",
+  "carrick-el1::memory::tests::delegated::two_isa_anonymous_edits_publish_to_a_live_peer",
+  "carrick-el1::memory::tests::native_memory_call_uses_projected_task_and_actual_editor_slot",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_permission_transitions_stay_in_guest",
@@ -41,4 +43,5 @@ docker = [
 ]
 
 [bindings.unresolved]
+kvm = "Executing x86 binding: carrick-vmm-kvm::cpl0_entry::production_anonymous_protect_and_partial_unmap_stay_in_ring. Requires real KVM; the contract evaluator has no registered KVM observation layer."
 production = "Exact complete-range resident private-anonymous mprotect now runs under the guest's exact-MM editor across tagged L1/L2 blocks and L3 leaves, preserves output identity and permission ceilings, performs ASID invalidation, and refuses partial coarse blocks or widening to the host fallback. Permission faults no longer request first-touch grants; host syscall-copy paths read the live tagged permissions; host edits adopt guest-grown hierarchy before mutation; and COW parity accepts a stale shadow only for an exact tagged live leaf. The signed 256/1024/4096-page fixture serves all four target-range transitions per round in EL1, preserves bytes, reports SEGV_ACCERR for every denied read/write, returns every initial frame byte, and remains nearly page-scale flat. One fixed one-page signal-stack guard mprotect still forwards per process and each denied-access signal cycle still exits to the host pending the signal increment. Broader mmap-family ownership, fork-COW authority and final host page-table pause removal remain open checkpoint-2 work."
