@@ -41,6 +41,7 @@ fn prelanding_workflow() -> String {
 
 fn step(name: &str, passed: bool, failed: &[&str]) -> StepResult {
     StepResult {
+        outcome: None,
         name: name.into(),
         command: format!("just {name}"),
         exit_code: Some(if passed { 0 } else { 101 }),
@@ -50,7 +51,7 @@ fn step(name: &str, passed: bool, failed: &[&str]) -> StepResult {
         error: None,
         failed_tests: failed.iter().map(|t| (*t).to_owned()).collect(),
         unitemized_failures: vec![],
-        started_tests: vec![],
+        started_tests: failed.iter().map(|t| (*t).to_owned()).collect(),
         finished_binaries: vec![],
         unfinished_binaries: vec![],
     }
@@ -113,13 +114,16 @@ failures:
 
 #[test]
 fn diff_reports_new_and_fixed_failures_by_identity() {
+    let mut fresh = step("fresh-executable-page", true, &[]);
+    fresh.started_tests = vec!["embed::fresh_page".into()];
+    fresh.finished_binaries = vec!["embed".into()];
     let base = receipt(vec![
         step("el1-embed", true, &["embed::el1_a", "embed::el1_b"]),
-        step("fresh-executable-page", true, &[]),
+        fresh.clone(),
     ]);
     let next = receipt(vec![
         step("el1-embed", false, &["embed::el1_b", "embed::el1_c"]),
-        step("fresh-executable-page", true, &[]),
+        fresh.clone(),
     ]);
     let result = diff(&base, &next).unwrap();
     assert_eq!(result.new, vec!["test:el1-embed:embed::el1_c"]);
@@ -150,12 +154,14 @@ fn a_crashed_step_probe_diff_leak_or_dirty_tree_is_a_failure_identity() {
         vec![
             "dirty-checkout",
             "leak:build",
+            "not-run:build:step skipped or failed before reporting",
+            "not-run:probe-cases:zero tests selected",
             "probe:probe-cases:case_pipe",
             "step:build"
         ]
     );
     let result = diff(&receipt(vec![]), &next).unwrap();
-    assert_eq!(result.new.len(), 4);
+    assert_eq!(result.new.len(), 6);
 }
 
 #[test]
@@ -629,6 +635,7 @@ error: could not compile `carrick-embed` (test \"x\") due to 1 previous error
         result.new,
         vec![
             "cleanup-unknown:probe-cases",
+            "not-run:el1-embed:binary killed before reporting: ",
             "step:el1-embed",
             "unitemized:el1-embed:crash:embed"
         ]
@@ -777,6 +784,7 @@ fn replay_pr338_excerpt_against_main_excerpt_yields_new_keys_for_failures_missin
         result.new,
         vec![
             "missing:el1_kick_served_loop::el1_served_loop_surfaces_kicks",
+            "not-run:el1-embed:binary killed before reporting: el1_kick_served_loop",
             "step:el1-embed",
             "test:el1-embed:el1_inotify::el1_inotify_recall_on_dir_watch",
             "unfinished:el1_kick_served_loop",
@@ -850,8 +858,9 @@ test-signed: FAIL /w/target/release/deps/el1_broken-abcdef0123456789
     let mut failures = Vec::new();
     populate_step_from_log(&mut s, log, &mut failures);
     assert!(!s.passed);
-    assert_eq!(failures.len(), 1);
-    assert!(failures[0].contains("empty itemization"));
+    assert_eq!(failures.len(), 2);
+    assert!(failures.iter().any(|f| f.contains("empty itemization")));
+    assert!(failures.iter().any(|f| f.contains("not-run")));
 
     let keys = failure_keys(&receipt(vec![s]));
     assert!(keys.contains("unitemized:el1-embed:parse-error:el1_broken"));
@@ -907,7 +916,7 @@ fn receipt_from_el1_log(passed: bool, log: &str) -> AcceptReceipt {
 }
 
 #[test]
-fn replay_pr389_all_failed_base_binary_crashing_in_candidate_yields_no_new_failures() {
+fn replay_pr389_all_failed_base_binary_crashing_is_not_run() {
     let base_log = "\
 test-signed: running /w/target/release/deps/el1_host_copyout-983cd9ce6da5d7a1 el1_ --nocapture
 
@@ -949,8 +958,11 @@ test-signed: FAIL /w/target/release/deps/el1_host_copyout-9e4a145bcc081d87
 
     let result = diff(&base, &cand).unwrap();
     assert!(
-        result.new.is_empty(),
-        "a crash in a binary whose base tests all failed must not report NEW failures, got: {:?}",
+        result
+            .new
+            .iter()
+            .any(|key| key.starts_with("not-run:el1-embed:binary killed before reporting")),
+        "a crash must fail even when every test failed in the baseline, got: {:?}",
         result.new
     );
     assert_eq!(
@@ -1029,6 +1041,7 @@ test-signed: FAIL /w/target/release/deps/el1_kick_served_loop-4bc14b20aecdb3a9
         result.new,
         vec![
             "missing:el1_kick_served_loop::el1_served_loop_surfaces_kicks",
+            "not-run:el1-embed:binary killed before reporting: el1_kick_served_loop",
             "step:el1-embed",
             "unfinished:el1_kick_served_loop",
             "unitemized:el1-embed:crash:el1_kick_served_loop",
@@ -2685,4 +2698,126 @@ fn ci_workflow_gates_el1_native_before_landing_with_trusted_baseline_code() {
         .collect();
     assert!(ci_ok_needs.contains(&"el1-native-tests"));
     assert!(ci_ok_needs.contains(&"el1-native-gate"));
+}
+
+/// A broken execution population is never grandfathered by a red baseline.
+#[test]
+fn not_run_steps_fail_even_against_the_identical_baseline() {
+    for (log, code, reason) in [
+        (
+            "error: could not compile `libpython-map` (lib) due to 1 previous error\n",
+            Some(101),
+            "build failure",
+        ),
+        (
+            "Running tests/probes.rs (target/debug/deps/probes-0123456789abcdef)\nrunning 0 tests\ntest result: ok. 0 passed; 0 failed; 2 ignored\n",
+            Some(0),
+            "zero tests selected",
+        ),
+        (
+            "Running tests/probes.rs (target/debug/deps/probes-0123456789abcdef)\nrunning 1 test\ntest witness ...",
+            None,
+            "binary killed before reporting",
+        ),
+    ] {
+        let mut s = step("generic-probe-shards", code == Some(0), &[]);
+        s.exit_code = code;
+        populate_step_from_log(&mut s, log, &mut vec![]);
+        let r = receipt(vec![s]);
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("receipt.json");
+        let summary_path = fixture.path().join("summary.md");
+        std::fs::write(&path, serde_json::to_vec(&r).unwrap()).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["ci-receipt", "diff", "--baseline"])
+            .arg(&path)
+            .arg("--candidate")
+            .arg(&path)
+            .arg("--fail-on-new")
+            .env("GITHUB_STEP_SUMMARY", &summary_path)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{reason}: gate accepted missing execution"
+        );
+        let summary = std::fs::read_to_string(summary_path).unwrap();
+        assert!(
+            summary.contains("generic-probe-shards") && summary.contains(reason),
+            "{summary}"
+        );
+        let result = diff(&r, &r).unwrap();
+        assert!(
+            result
+                .new
+                .iter()
+                .any(|key| key.contains("not-run:generic-probe-shards") && key.contains(reason)),
+            "{reason}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn required_manifest_lane_must_execute_a_test() {
+    let tree = tempfile::tempdir().unwrap();
+    let dir = tree.path().join("crates/guest");
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = 'guest'\n[package.metadata.carrick.test-lanes]\n'*' = 'signed-hvf'\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("tests/guest_probe.rs"), "#[test] fn live() {}\n").unwrap();
+    let empty = receipt(vec![]);
+    let result = diff_trees(&empty, &empty, tree.path(), tree.path()).unwrap();
+    assert!(
+        result
+            .new
+            .iter()
+            .any(|key| key == "not-run:lane:signed-hvf:zero executed tests"),
+        "{result:?}"
+    );
+    let mut s = step("generic-probe-shards", true, &[]);
+    s.started_tests = vec!["guest_probe::live".into()];
+    s.finished_binaries = vec!["guest_probe".into()];
+    let live = receipt(vec![s]);
+    assert!(
+        diff_trees(&live, &live, tree.path(), tree.path())
+            .unwrap()
+            .new
+            .is_empty()
+    );
+}
+
+#[test]
+fn skipped_required_steps_fail_but_profile_exclusions_do_not() {
+    let mut r = receipt(vec![]);
+    r.skipped_steps = vec!["generic-probe-shards".into()];
+    assert!(
+        diff(&r, &r)
+            .unwrap()
+            .new
+            .contains(&"not-run:generic-probe-shards:step skipped".into())
+    );
+    r.skipped_steps = vec!["ltp".into(), "conformance-probes-retained".into()];
+    assert!(diff(&r, &r).unwrap().new.is_empty());
+    r.profile = "full".into();
+    assert_eq!(diff(&r, &r).unwrap().new.len(), 2);
+}
+
+#[test]
+fn candidate_cannot_claim_passed_for_a_build_failure() {
+    use carrick_xtask::accept::StepOutcome;
+    let mut s = step("generic-probe-shards", true, &[]);
+    populate_step_from_log(
+        &mut s,
+        "error: could not compile `libpython-map` (lib)\n",
+        &mut vec![],
+    );
+    assert!(matches!(s.outcome, Some(StepOutcome::NotRun { .. })));
+    let json = serde_json::to_value(&s).unwrap();
+    assert_eq!(json["outcome"]["status"], "not-run");
+    s.outcome = Some(StepOutcome::Passed);
+    s.passed = true;
+    assert!(matches!(s.execution_outcome(), StepOutcome::NotRun { .. }));
 }
