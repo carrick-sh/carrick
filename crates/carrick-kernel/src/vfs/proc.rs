@@ -2565,6 +2565,11 @@ impl Vfs for ProcVfs {
         Err(LINUX_ENOTDIR)
     }
 
+    /// Every node renders the opener's own task view.
+    fn open_needs_caller_task(&self, _path: &str) -> bool {
+        true
+    }
+
     fn open(
         &self,
         path: &str,

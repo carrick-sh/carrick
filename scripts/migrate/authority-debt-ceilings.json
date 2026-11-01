@@ -32883,7 +32883,7 @@
     {
       "family": "k1_create_install",
       "operation": "lock_closed_stdio",
-      "owner": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_at_path_string",
+      "owner": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_with_sink",
       "lane": "shared",
       "ceiling": 1
     },
@@ -32960,7 +32960,7 @@
     {
       "family": "k1_create_install",
       "operation": "write_fd_open_paths",
-      "owner": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_at_path_string",
+      "owner": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_with_sink",
       "lane": "shared",
       "ceiling": 1
     },
@@ -33016,7 +33016,7 @@
     {
       "family": "k1_create_install",
       "operation": "write_for_io",
-      "owner": "carrick_kernel::dispatch::fs::rw::FsView<'a>::write",
+      "owner": "carrick_kernel::dispatch::fs::rw::FsView<'a>::begin_description_write",
       "lane": "shared",
       "ceiling": 1
     },
@@ -33114,7 +33114,7 @@
     {
       "family": "k1_create_install",
       "operation": "write_open_files",
-      "owner": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_at_path_string",
+      "owner": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_with_sink",
       "lane": "shared",
       "ceiling": 1
     },
@@ -34689,7 +34689,7 @@
     {
       "family": "raw_lock",
       "operation": "proc",
-      "owner": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_at_path_string",
+      "owner": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_with_sink",
       "lane": "shared",
       "ceiling": 1
     },

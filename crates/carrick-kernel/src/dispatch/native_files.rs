@@ -66,6 +66,83 @@ impl Drop for NativeOpenFile {
     }
 }
 
+/// Where one venue `openat` installs its descriptor: the lowest free number
+/// of the caller's own ring table, and nowhere else. The open itself is the
+/// dispatcher's one implementation ([`super::fs::OpenSink::Native`]).
+pub(in crate::dispatch) struct NativeOpenSink {
+    owner: Arc<HostIpc>,
+    table: fd::TableId,
+    flags: u64,
+    refused: bool,
+}
+
+impl NativeOpenSink {
+    /// The open needs a host task this caller does not have: the ring
+    /// answers a counted ENOSYS, never a guessed errno.
+    pub(in crate::dispatch) fn refuse(&mut self) -> DispatchOutcome {
+        self.refused = true;
+        DispatchOutcome::errno(carrick_abi::LINUX_ENOSYS)
+    }
+
+    pub(in crate::dispatch) fn install(
+        &mut self,
+        fs: &super::FsView<'_>,
+        file: crate::dispatch::fd_table::OpenFile,
+    ) -> Result<i32, carrick_abi::LinuxErrno> {
+        let open_flags = LinuxOpenFlags::from_bits_retain(self.flags);
+        // A mount-served open meets O_DIRECTORY only after the host task's
+        // install, which then withdraws its fd. A ring descriptor, visible to
+        // the caller's other threads at once, is checked before it exists.
+        if open_flags.contains(LinuxOpenFlags::DIRECTORY) {
+            let record = fs.description_stat_record(&file.description, None)?;
+            if record.mode & carrick_abi::LINUX_S_IFMT != carrick_abi::LINUX_S_IFDIR {
+                return Err(carrick_abi::LINUX_ENOTDIR);
+            }
+        }
+        let access = if open_flags.contains(LinuxOpenFlags::PATH) {
+            fd::AccessMode::Path
+        } else {
+            match self.flags & carrick_abi::LINUX_O_ACCMODE {
+                carrick_abi::LINUX_O_RDONLY => fd::AccessMode::ReadOnly,
+                carrick_abi::LINUX_O_WRONLY => fd::AccessMode::WriteOnly,
+                // The open validated the access mode first (EINVAL).
+                _ => fd::AccessMode::ReadWrite,
+            }
+        };
+        let status = super::fs::reportable_status_flags(file.description.common().status_flags());
+        let status = fd::StatusFlags {
+            append: open_flags.contains(LinuxOpenFlags::APPEND),
+            nonblock: open_flags.contains(LinuxOpenFlags::NONBLOCK),
+            asynchronous: false,
+            direct: false,
+            noatime: false,
+            dsync: false,
+            sync: false,
+            immutable: status
+                & !(carrick_abi::LINUX_O_ACCMODE
+                    | carrick_abi::LINUX_O_NONBLOCK
+                    | carrick_abi::LINUX_O_APPEND
+                    | LinuxOpenFlags::ASYNC.bits()),
+        };
+        match self.owner.install_host_description(
+            self.table,
+            Box::new(NativeOpenFile::new(Arc::clone(&file.description))),
+            access,
+            status,
+            open_flags.contains(LinuxOpenFlags::CLOEXEC),
+        ) {
+            Ok(number) => Ok(number.0),
+            Err(InstallHostDescriptionError::TooManyFiles) => Err(carrick_abi::LINUX_EMFILE),
+            Err(InstallHostDescriptionError::FileTableFull) => Err(carrick_abi::LINUX_ENFILE),
+            Err(InstallHostDescriptionError::NoMemory) => Err(carrick_abi::LINUX_ENOMEM),
+            Err(InstallHostDescriptionError::Unavailable) => {
+                self.refused = true;
+                Err(carrick_abi::LINUX_ENOSYS)
+            }
+        }
+    }
+}
+
 enum Served {
     Reply(i64, Vec<u8>),
     Source(
@@ -90,22 +167,6 @@ fn outcome_result(outcome: DispatchOutcome) -> i64 {
         DispatchOutcome::Errno { errno } => errno.guest_retval(),
         _ => carrick_abi::LINUX_EIO.guest_retval(),
     }
-}
-
-/// Open flags the slice serves: a read-only open of an existing object.
-/// Anything else (write access, creation, `O_PATH`, `O_TMPFILE`, ...) is
-/// refused exactly until a later slice serves it.
-fn native_open_flags_served(flags: u64) -> bool {
-    let served = LinuxOpenFlags::CLOEXEC
-        | LinuxOpenFlags::DIRECTORY
-        | LinuxOpenFlags::NOFOLLOW
-        | LinuxOpenFlags::NONBLOCK
-        | LinuxOpenFlags::LARGEFILE
-        | LinuxOpenFlags::NOCTTY;
-    flags & carrick_abi::LINUX_O_ACCMODE == carrick_abi::LINUX_O_RDONLY
-        && LinuxOpenFlags::from_bits_retain(flags & !carrick_abi::LINUX_O_ACCMODE)
-            .difference(served)
-            .is_empty()
 }
 
 impl SyscallDispatcher {
@@ -182,7 +243,7 @@ impl SyscallDispatcher {
             return self.serve_native_stdio(header, stdio.fd.0, input);
         }
         if let Some(file) = resource.downcast_ref::<NativeOpenFile>() {
-            return self.serve_native_open_file(header, &file.description, capacity);
+            return self.serve_native_open_file(header, &file.description, input, capacity);
         }
         Served::Refused
     }
@@ -211,6 +272,7 @@ impl SyscallDispatcher {
         &self,
         header: HostFileHeader,
         description: &Arc<crate::kernel::FileDescription>,
+        input: &[u8],
         capacity: usize,
     ) -> Served {
         match header.op {
@@ -233,8 +295,17 @@ impl SyscallDispatcher {
                 Ok(None) => Served::errno(carrick_abi::LINUX_EBADF),
                 Err(_) => Served::Refused,
             },
-            // Opened read-only by this slice.
-            HostFileOp::Write => Served::errno(carrick_abi::LINUX_EBADF),
+            HostFileOp::Write => {
+                let fs = self.fs_view();
+                // A file-size limit or a watcher needs the writer's task.
+                let Some(admitted) = fs.admit_carrier_write() else {
+                    return Served::Refused;
+                };
+                match fs.write_description_from_carrier(admitted, description, input) {
+                    Ok(outcome) => served_outcome(outcome, Vec::new()),
+                    Err(_) => Served::Refused,
+                }
+            }
             HostFileOp::MapPrivate => self.native_map_source(description),
             HostFileOp::Openat | HostFileOp::Faccessat | HostFileOp::Newfstatat => Served::Refused,
         }
@@ -297,125 +368,35 @@ impl SyscallDispatcher {
                     Err(errno) => Served::errno(errno),
                 }
             }
-            HostFileOp::Openat => self.native_open(owner, table, path, header.args[0]),
-            _ => Served::Refused,
-        }
-    }
-
-    /// Open an existing rootfs object read-only for a native process and
-    /// install it as the lowest free descriptor of the caller's table.
-    fn native_open(
-        &self,
-        owner: &Arc<HostIpc>,
-        table: fd::TableId,
-        path: &str,
-        flags: u64,
-    ) -> Served {
-        if !native_open_flags_served(flags) {
-            return Served::Refused;
-        }
-        let fs = self.fs_view();
-        if let Err(errno) = super::fs::check_path_length(path) {
-            return Served::errno(errno);
-        }
-        let resolved = match fs.resolve_at_path(LINUX_AT_FDCWD, path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return Served::errno(errno),
-        };
-        let open_flags = LinuxOpenFlags::from_bits_retain(flags);
-        let target = if open_flags.contains(LinuxOpenFlags::NOFOLLOW) {
-            match fs.layered_lstat(&resolved) {
-                Ok(md) if md.kind == carrick_vfs::rootfs::RootFsEntryKind::Symlink => {
-                    return Served::errno(crate::linux_abi::LINUX_ELOOP);
+            HostFileOp::Openat => {
+                let flags = header.args[0];
+                let mut native = NativeOpenSink {
+                    owner: Arc::clone(owner),
+                    table,
+                    flags,
+                    refused: false,
+                };
+                let reporter = crate::compat::CompatReporter::default();
+                // The ring stages a cwd-relative or absolute path with
+                // AT_FDCWD; the caller's cwd is the scope's.
+                let opened = fs.open_with_sink(
+                    &mut super::fs::OpenSink::Native(&mut native),
+                    super::fs::OpenAtArgs {
+                        dirfd: LINUX_AT_FDCWD,
+                        path,
+                        flags,
+                        mode: header.args[1],
+                    },
+                    &reporter,
+                );
+                match opened {
+                    _ if native.refused => Served::Refused,
+                    Ok(outcome) => served_outcome(outcome, Vec::new()),
+                    Err(super::DispatchError::Errno(errno)) => Served::errno(errno),
+                    Err(_) => Served::Refused,
                 }
-                _ => resolved,
             }
-        } else {
-            match fs.canonicalize_following(&resolved) {
-                Ok(target) => target,
-                Err(errno) => return Served::errno(errno),
-            }
-        };
-        // Mount-served, synthetic and device opens need a caller task view
-        // (proc, dev and bind mounts): unrouted until a later slice.
-        if crate::vfs::may_be_synthetic_virtual_path(&target)
-            || target == "/dev"
-            || target.starts_with("/dev/")
-            || self.fs.vfs_mounts.resolve(&target).is_some()
-        {
-            return Served::Refused;
-        }
-        // A FIFO open blocks for its peer: the owned carrier waiter's slice.
-        if fs
-            .layered_metadata(&target)
-            .is_ok_and(|md| md.kind == carrick_vfs::rootfs::RootFsEntryKind::Fifo)
-        {
-            return Served::Refused;
-        }
-        if let Some(errno) = fs.dac_open_check(&target, carrick_abi::LINUX_O_RDONLY, false) {
-            return Served::errno(errno);
-        }
-        let existing = match self
-            .fs
-            .rootfs_vfs
-            .open_for_dispatch(&target, false, false, false, false)
-        {
-            Ok(existing) => existing,
-            Err(errno) => return Served::errno(errno),
-        };
-        let directory = matches!(
-            existing,
-            carrick_vfs::vfs::rootfs::OpenDispatchResult::Directory { .. }
-        );
-        if open_flags.contains(LinuxOpenFlags::DIRECTORY) && !directory {
-            if let carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. } = existing
-            {
-                // SAFETY: the dispatch opened this host fd for us; nothing
-                // else has adopted it.
-                unsafe { libc::close(host_fd) };
-            }
-            return Served::errno(carrick_abi::LINUX_ENOTDIR);
-        }
-        let description = match fs.description_for_existing(existing, target, flags, false, false) {
-            Ok(description) => description,
-            Err(errno) => return Served::errno(errno),
-        };
-        let file = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
-            std::sync::Arc::new(parking_lot::RwLock::new(description)),
-            flags & !carrick_abi::LINUX_O_CLOEXEC,
-            super::linux_fd_flags_from_open_flags(flags),
-        );
-        let status = super::fs::reportable_status_flags(file.description.common().status_flags());
-        let status = fd::StatusFlags {
-            append: false,
-            nonblock: open_flags.contains(LinuxOpenFlags::NONBLOCK),
-            asynchronous: false,
-            direct: false,
-            noatime: false,
-            dsync: false,
-            sync: false,
-            immutable: status
-                & !(carrick_abi::LINUX_O_ACCMODE
-                    | carrick_abi::LINUX_O_NONBLOCK
-                    | carrick_abi::LINUX_O_APPEND
-                    | LinuxOpenFlags::ASYNC.bits()),
-        };
-        match owner.install_host_description(
-            table,
-            Box::new(NativeOpenFile::new(Arc::clone(&file.description))),
-            fd::AccessMode::ReadOnly,
-            status,
-            open_flags.contains(LinuxOpenFlags::CLOEXEC),
-        ) {
-            Ok(number) => Served::value(i64::from(number.0)),
-            Err(InstallHostDescriptionError::TooManyFiles) => {
-                Served::errno(carrick_abi::LINUX_EMFILE)
-            }
-            Err(InstallHostDescriptionError::FileTableFull) => {
-                Served::errno(carrick_abi::LINUX_ENFILE)
-            }
-            Err(InstallHostDescriptionError::NoMemory) => Served::errno(carrick_abi::LINUX_ENOMEM),
-            Err(InstallHostDescriptionError::Unavailable) => Served::Refused,
+            _ => Served::Refused,
         }
     }
 
@@ -567,15 +548,17 @@ mod tests {
         owner: Arc<HostIpc>,
         table: [u64; 3],
         _rootfs: Option<tempfile::TempDir>,
+        _upper: Option<tempfile::TempDir>,
     }
 
     /// An ubuntu-shaped rootfs: `/lib -> usr/lib`, `usr/lib/libc.so.6`,
-    /// `etc/ld.so.cache`.
+    /// `etc/ld.so.cache`, and an empty `/tmp`.
     fn rootfs() -> tempfile::TempDir {
         let lower = tempfile::tempdir().unwrap();
         let root = lower.path();
         std::fs::create_dir_all(root.join("usr/lib")).unwrap();
         std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
         std::os::unix::fs::symlink("usr/lib", root.join("lib")).unwrap();
         std::fs::write(root.join("usr/lib/libc.so.6"), b"\x7fELF-libc-bytes").unwrap();
         std::fs::write(root.join("etc/ld.so.cache"), b"cache").unwrap();
@@ -600,6 +583,7 @@ mod tests {
             owner,
             table: [raw.authority, raw.index, raw.generation],
             _rootfs: rootfs,
+            _upper: None,
         }
     }
 
@@ -611,6 +595,33 @@ mod tests {
         let lower = rootfs();
         let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap();
         fixture_with(SyscallDispatcher::with_rootfs(rootfs), Some(lower))
+    }
+
+    /// The writable upper a run uses: in memory, or a host directory
+    /// (`--fs host`, whose files are host-fd descriptions).
+    #[derive(Clone, Copy, Debug)]
+    enum Upper {
+        Memory,
+        Host,
+    }
+
+    fn writable_fixture(upper: Upper) -> Fixture {
+        let lower = rootfs();
+        let rootfs = carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap();
+        let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+        let scratch = match upper {
+            Upper::Memory => None,
+            Upper::Host => {
+                let scratch = tempfile::tempdir().unwrap();
+                dispatcher.set_fs_backend(Box::new(
+                    carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap(),
+                ));
+                Some(scratch)
+            }
+        };
+        let mut fixture = fixture_with(dispatcher, Some(lower));
+        fixture._upper = scratch;
+        fixture
     }
 
     /// A process's filesystem authority as the capability captures it.
@@ -1061,19 +1072,9 @@ mod tests {
             open(b"/etc/ld.so.cache", carrick_abi::LINUX_O_DIRECTORY),
             carrick_abi::LINUX_ENOTDIR.guest_retval()
         );
-        // Write access and synthetic paths are later slices: refused exactly.
-        let mut write = record(
-            fixture.table,
-            HostFileOp::Openat,
-            FDCWD,
-            [carrick_abi::LINUX_O_WRONLY, 0, 0, 0],
-            b"/etc/ld.so.cache",
-            0,
-        );
-        assert_eq!(
-            fixture.serve(Some(&authority), &mut write),
-            Err(NativeHostFileRefusal)
-        );
+        // Write access is served (the open path is the dispatcher's own);
+        // a caller-relative synthetic tree is still refused exactly.
+        assert!(open(b"/etc/ld.so.cache", carrick_abi::LINUX_O_WRONLY) >= 0);
         let mut proc = record(
             fixture.table,
             HostFileOp::Openat,
@@ -1085,6 +1086,351 @@ mod tests {
         assert_eq!(
             fixture.serve(Some(&authority), &mut proc),
             Err(NativeHostFileRefusal)
+        );
+    }
+
+    impl Fixture {
+        fn venue_open(
+            &self,
+            authority: &NativeFsAuthority,
+            path: &[u8],
+            flags: u64,
+            mode: u64,
+        ) -> i64 {
+            self.result(
+                Some(authority),
+                record(
+                    self.table,
+                    HostFileOp::Openat,
+                    FDCWD,
+                    [flags, mode, 0, 0],
+                    path,
+                    0,
+                ),
+            )
+            .0
+        }
+        fn venue_write(&self, fd: i64, bytes: &[u8]) -> i64 {
+            self.result(
+                None,
+                record(self.table, HostFileOp::Write, fd as i32, [0; 4], bytes, 0),
+            )
+            .0
+        }
+        /// The whole file, read back through a fresh read-only venue open.
+        fn venue_contents(&self, authority: &NativeFsAuthority, path: &[u8]) -> Vec<u8> {
+            let fd = self.venue_open(authority, path, carrick_abi::LINUX_O_RDONLY, 0);
+            assert!(fd >= 0, "reopen {:?}: {fd}", String::from_utf8_lossy(path));
+            let (read, bytes) = self.result(
+                None,
+                record(self.table, HostFileOp::Read, fd as i32, [0; 4], &[], 4096),
+            );
+            assert!(read >= 0, "read back: {read}");
+            bytes
+        }
+        fn ring_fd(&self) -> fd::TableId {
+            fd::TableId::from_raw(fd::RawTableId {
+                authority: self.table[0],
+                index: self.table[1],
+                generation: self.table[2],
+            })
+        }
+    }
+
+    /// The root's own `openat(2)` through its host task.
+    fn root_openat(dispatcher: &mut SyscallDispatcher, path: &[u8], flags: u64) -> i64 {
+        const BASE: u64 = 0x4_0000;
+        let mut memory = super::super::outcome::LinearMemory::new(BASE, vec![0u8; 0x1000]);
+        memory.bytes[..path.len()].copy_from_slice(path);
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = crate::compat::CompatReporter::default();
+        match dispatcher
+            .dispatch(
+                &context,
+                crate::dispatch::SyscallRequest::new(
+                    56,
+                    crate::compat::SyscallArgs([FDCWD as u64, BASE, flags, 0o644, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            DispatchOutcome::Errno { errno } => errno.guest_retval(),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    const CREATE: u64 =
+        carrick_abi::LINUX_O_WRONLY | carrick_abi::LINUX_O_CREAT | carrick_abi::LINUX_O_TRUNC;
+
+    /// `echo x > /tmp/f` in a forked child: create, write, and the bytes
+    /// are the file's, through either writable upper.
+    #[test]
+    fn native_create_write_lands_the_bytes() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = writable_fixture(upper);
+            let authority = authority_of(&fixture.dispatcher);
+            let fd = fixture.venue_open(&authority, b"/tmp/f", CREATE, 0o644);
+            assert!(fd >= 0, "{upper:?}: create: {fd}");
+            let ring = fixture.owner.region();
+            let ring = ring.fd(crate::el1_zone::HostLockWait);
+            let (access, _) = ring.getfl(fixture.ring_fd(), fd::Fd(fd as i32)).unwrap();
+            assert_eq!(access, fd::AccessMode::WriteOnly, "{upper:?}");
+            assert_eq!(fixture.venue_write(fd, b"hello "), 6, "{upper:?}");
+            // The description offset advances: the second write follows.
+            assert_eq!(fixture.venue_write(fd, b"world\n"), 6, "{upper:?}");
+            assert_eq!(
+                fixture.venue_contents(&authority, b"/tmp/f"),
+                b"hello world\n",
+                "{upper:?}"
+            );
+        }
+    }
+
+    /// `: > /dev/null` and `cmd >/dev/null` in a forked child.
+    #[test]
+    fn native_dev_null_opens_write_only_and_swallows_writes() {
+        let fixture = writable_fixture(Upper::Memory);
+        let authority = authority_of(&fixture.dispatcher);
+        let fd = fixture.venue_open(&authority, b"/dev/null", CREATE, 0o666);
+        assert!(fd >= 0, "open /dev/null: {fd}");
+        let ring = fixture.owner.region();
+        let ring = ring.fd(crate::el1_zone::HostLockWait);
+        let (access, _) = ring.getfl(fixture.ring_fd(), fd::Fd(fd as i32)).unwrap();
+        assert_eq!(access, fd::AccessMode::WriteOnly);
+        assert_eq!(fixture.venue_write(fd, b"discarded"), 9);
+    }
+
+    /// `>>`: `O_APPEND` writes land at the end, whatever the offset.
+    #[test]
+    fn native_append_appends() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = writable_fixture(upper);
+            let authority = authority_of(&fixture.dispatcher);
+            let fd = fixture.venue_open(&authority, b"/tmp/log", CREATE, 0o644);
+            assert_eq!(fixture.venue_write(fd, b"abc"), 3, "{upper:?}");
+            let append = carrick_abi::LINUX_O_WRONLY | carrick_abi::LINUX_O_APPEND;
+            let fd = fixture.venue_open(&authority, b"/tmp/log", append, 0);
+            assert!(fd >= 0, "{upper:?}: append open: {fd}");
+            let ring = fixture.owner.region();
+            let ring = ring.fd(crate::el1_zone::HostLockWait);
+            let (_, status) = ring.getfl(fixture.ring_fd(), fd::Fd(fd as i32)).unwrap();
+            assert!(status.append, "{upper:?}: F_GETFL reports O_APPEND");
+            assert_eq!(fixture.venue_write(fd, b"de"), 2, "{upper:?}");
+            assert_eq!(
+                fixture.venue_contents(&authority, b"/tmp/log"),
+                b"abcde",
+                "{upper:?}"
+            );
+        }
+    }
+
+    /// The root's own `write(2)` through an `O_APPEND` descriptor of an
+    /// in-memory upper file lands at the end, as Linux's does: the write
+    /// core the venue shares with the root.
+    #[test]
+    fn root_append_write_lands_at_the_end_of_an_in_memory_file() {
+        let mut fixture = writable_fixture(Upper::Memory);
+        let write = |dispatcher: &mut SyscallDispatcher, fd: i64, bytes: &[u8]| {
+            const BASE: u64 = 0x4_0000;
+            let mut memory = super::super::outcome::LinearMemory::new(BASE, bytes.to_vec());
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let reporter = crate::compat::CompatReporter::default();
+            let args = [fd as u64, BASE, bytes.len() as u64, 0, 0, 0];
+            dispatcher
+                .dispatch(
+                    &context,
+                    crate::dispatch::SyscallRequest::new(64, crate::compat::SyscallArgs(args)),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap()
+        };
+        let fd = root_openat(&mut fixture.dispatcher, b"/tmp/log\0", CREATE);
+        assert_eq!(
+            write(&mut fixture.dispatcher, fd, b"abc"),
+            DispatchOutcome::Returned { value: 3 }
+        );
+        let append = carrick_abi::LINUX_O_WRONLY | carrick_abi::LINUX_O_APPEND;
+        let fd = root_openat(&mut fixture.dispatcher, b"/tmp/log\0", append);
+        assert_eq!(
+            write(&mut fixture.dispatcher, fd, b"de"),
+            DispatchOutcome::Returned { value: 2 }
+        );
+        let authority = authority_of(&fixture.dispatcher);
+        assert_eq!(fixture.venue_contents(&authority, b"/tmp/log"), b"abcde");
+    }
+
+    /// `O_TRUNC` of an existing lower file truncates it; `O_CREAT|O_EXCL`
+    /// of an existing file is EEXIST (17).
+    #[test]
+    fn native_truncate_existing_and_exclusive_create() {
+        for upper in [Upper::Memory, Upper::Host] {
+            let fixture = writable_fixture(upper);
+            let authority = authority_of(&fixture.dispatcher);
+            assert_eq!(
+                fixture.venue_contents(&authority, b"/etc/ld.so.cache"),
+                b"cache"
+            );
+            let trunc = carrick_abi::LINUX_O_WRONLY | carrick_abi::LINUX_O_TRUNC;
+            let fd = fixture.venue_open(&authority, b"/etc/ld.so.cache", trunc, 0);
+            assert!(fd >= 0, "{upper:?}: truncate: {fd}");
+            assert!(
+                fixture
+                    .venue_contents(&authority, b"/etc/ld.so.cache")
+                    .is_empty(),
+                "{upper:?}: truncated"
+            );
+            let excl = CREATE | carrick_abi::LINUX_O_EXCL;
+            let exists = fixture.venue_open(&authority, b"/etc/ld.so.cache", excl, 0o644);
+            assert_eq!(exists, -17, "{upper:?}: EEXIST");
+            assert_eq!(exists, carrick_abi::LINUX_EEXIST.guest_retval());
+        }
+    }
+
+    /// What only a host task's open may hold stays refused for a native
+    /// caller, before the mount acts: a terminal end (no pty is allocated)
+    /// and the opener's own `/proc` view. Mount-served opens a native caller
+    /// may hold still meet `O_DIRECTORY` before a descriptor exists.
+    #[test]
+    fn native_opens_that_need_a_host_task_stay_refused() {
+        let fixture = writable_fixture(Upper::Memory);
+        let authority = authority_of(&fixture.dispatcher);
+        let refused = |path: &[u8], flags: u64| {
+            let mut open = record(
+                fixture.table,
+                HostFileOp::Openat,
+                FDCWD,
+                [flags, 0, 0, 0],
+                path,
+                0,
+            );
+            assert_eq!(
+                fixture.serve(Some(&authority), &mut open),
+                Err(NativeHostFileRefusal),
+                "{}",
+                String::from_utf8_lossy(path)
+            );
+        };
+        let rdwr = carrick_abi::LINUX_O_RDWR;
+        refused(b"/dev/ptmx", rdwr);
+        refused(b"/dev/pts/ptmx", rdwr);
+        refused(b"/dev/tty", rdwr);
+        refused(b"/proc/self/status", carrick_abi::LINUX_O_RDONLY);
+        refused(b"/sys/kernel/mm", carrick_abi::LINUX_O_RDONLY);
+        assert_eq!(
+            fixture.dispatcher.fs.pty_table.lock().slave_name(0),
+            None,
+            "no pty was allocated for a refused open"
+        );
+        let directory = carrick_abi::LINUX_O_RDONLY | carrick_abi::LINUX_O_DIRECTORY;
+        assert!(fixture.venue_open(&authority, b"/dev", directory, 0) >= 0);
+        assert_eq!(
+            fixture.venue_open(&authority, b"/dev/null", directory, 0),
+            carrick_abi::LINUX_ENOTDIR.guest_retval()
+        );
+    }
+
+    /// Two live processes: the root, opening through its host task and host
+    /// fd table, and a native fork child whose descriptors live in its own
+    /// ring table. Each opens through its own path. The child's descriptor
+    /// lands only in its ring table: nothing is reserved or installed in
+    /// the root's host table, whose numbering stays the root's alone, and
+    /// closing the child's descriptor releases its description without
+    /// touching the root's.
+    #[test]
+    fn native_open_lands_only_in_the_callers_ring_table() {
+        let lower = rootfs();
+        let mut root = SyscallDispatcher::with_rootfs(
+            carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
+        );
+        // The child's own ring table (a fork child's table is its own copy).
+        let child = SyscallDispatcher::new();
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let child_files = child
+            .capture_one_task_context()
+            .unwrap()
+            .resources()
+            .files();
+        let map = map();
+        child_files.publish_ipc(Arc::clone(&owner), map).unwrap();
+        let raw = map.lookup(child_files.id().raw()).unwrap();
+        let table = fd::TableId::from_raw(fd::RawTableId {
+            authority: raw.authority,
+            index: raw.index,
+            generation: raw.generation,
+        });
+        let authority = authority_of(&root);
+        let root_files = root.capture_one_task_context().unwrap().resources().files();
+        let root_slots = |files: &Arc<crate::kernel::FileTable>| {
+            (0..8)
+                .map(|fd| {
+                    files
+                        .slot(FileSlotNumber::for_open_fd(fd).unwrap())
+                        .is_some()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = root_slots(&root_files);
+
+        let mut open = record(
+            [raw.authority, raw.index, raw.generation],
+            HostFileOp::Openat,
+            FDCWD,
+            [CREATE, 0o644, 0, 0],
+            b"/tmp/child",
+            0,
+        );
+        root.serve_native_host_file_in(&owner, Some(&authority), &mut open)
+            .unwrap();
+        let native = host_file::reply(&open).unwrap().result as i32;
+        assert_eq!(native, 3, "the child's lowest free ring descriptor");
+        let region = owner.region();
+        let ring = region.fd(crate::el1_zone::HostLockWait);
+        assert_eq!(ring.getfd(table, fd::Fd(native)), Ok(false));
+        assert_eq!(
+            root_slots(&root_files),
+            before,
+            "nothing installed in the root's host table"
+        );
+
+        // The root's next open still gets its own lowest free descriptor:
+        // nothing was reserved there either.
+        assert_eq!(root_openat(&mut root, b"/tmp/root\0", CREATE), 3);
+        let description = owner
+            .with_pinned_host_resource(table, fd::Fd(native), |resource| {
+                resource
+                    .downcast_ref::<NativeOpenFile>()
+                    .map(|file| Arc::clone(&file.description))
+            })
+            .unwrap()
+            .expect("a venue-opened description");
+        assert_eq!(
+            description.fd_ref_count(),
+            1,
+            "the ring descriptor's reference"
+        );
+        let root_description = root_files
+            .slot(FileSlotNumber::for_open_fd(3).unwrap())
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&root_description.description(), &description),
+            "two descriptions, one per process"
+        );
+
+        // Closing the child's descriptor releases its description only.
+        let retained = owner.retained_host_resources();
+        let released = ring.close(table, fd::Fd(native)).unwrap().unwrap();
+        owner.release(released.backing).unwrap();
+        assert_eq!(owner.retained_host_resources(), retained - 1);
+        assert_eq!(description.fd_ref_count(), 0, "release_fd_ref ran");
+        assert_eq!(root_description.description().fd_ref_count(), 1);
+        assert_eq!(
+            root_openat(&mut root, b"/tmp/root2\0", CREATE),
+            4,
+            "the child's close freed nothing in the root's table"
         );
     }
 

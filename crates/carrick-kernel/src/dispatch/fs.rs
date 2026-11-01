@@ -309,6 +309,7 @@ mod xattr;
 pub(crate) use super::dispatcher::FsView;
 pub(in crate::dispatch) use lookup::{LookupIntent, LookupTarget};
 pub(crate) use open::OpenAtArgs;
+pub(in crate::dispatch) use open::OpenSink;
 pub(crate) use pipe::*;
 pub use state::MountRetirement;
 pub use state::StdioSink;
@@ -3239,16 +3240,18 @@ impl SyscallDispatcher {
         access: u64,
         flags: u64,
         create_mode: u32,
-        reservation: &mut Option<crate::kernel::objects::FileSlotReservation>,
+        reservation: Option<crate::kernel::objects::FileSlotReservation>,
     ) -> VfsOpenAttempt {
         self.fs_view().try_vfs_open(
-            context,
-            registry,
+            &mut OpenSink::Task {
+                context,
+                registry,
+                reservation,
+            },
             path,
             access,
             flags,
             create_mode,
-            reservation,
         )
     }
 

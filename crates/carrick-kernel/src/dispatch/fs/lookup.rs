@@ -27,7 +27,7 @@ pub(in crate::dispatch) enum FastPathKind {
 }
 
 /// The intent of the path lookup, distinguishing between open, stat, statx, etc.
-pub(in crate::dispatch) enum LookupIntent<'a> {
+pub(in crate::dispatch) enum LookupIntent<'a, 's> {
     /// `None` names a native (ring-owned) caller: it has no host task, so a
     /// caller-relative synthetic `/proc` answer is unrouted (ENOSYS).
     Stat {
@@ -37,14 +37,13 @@ pub(in crate::dispatch) enum LookupIntent<'a> {
         context: Option<&'a crate::kernel::KernelContext>,
     },
     Open {
-        context: &'a crate::kernel::KernelContext,
-        registry: Option<&'a crate::thread::ThreadRegistry>,
         open_flags: LinuxOpenFlags,
         access: u64,
         writable_request: bool,
         flags: u64,
         reporter: &'a CompatReporter,
-        reservation: &'a mut Option<crate::kernel::objects::FileSlotReservation>,
+        /// The caller, and where its descriptor goes.
+        sink: &'a mut super::open::OpenSink<'s>,
     },
 }
 
@@ -106,7 +105,7 @@ impl<'a> FsView<'a> {
         dirfd: u64,
         path: &str,
         at_flags: carrick_abi::LinuxAtFlags,
-        mut intent: LookupIntent<'_>,
+        mut intent: LookupIntent<'_, '_>,
     ) -> Result<PathLookup, LinuxErrno> {
         // 1. Empty pathname checks
         if path.is_empty() {
@@ -159,51 +158,56 @@ impl<'a> FsView<'a> {
                 access,
                 writable_request,
                 flags,
-                reservation,
+                sink,
                 ..
             } => {
                 let want_create = open_flags.contains(LinuxOpenFlags::CREAT);
                 let want_trunc = open_flags.contains(LinuxOpenFlags::TRUNC);
+                // The host-table fast lanes below are exact shortcuts of the
+                // resolving path; a native caller takes that path.
+                if let Some(reservation) = sink.task_reservation() {
+                    if !want_create
+                        && !want_trunc
+                        && (dirfd == LINUX_AT_FDCWD
+                            || (dirfd as i32) == -100
+                            || path.starts_with('/'))
+                        && path.starts_with('/')
+                    {
+                        dentry_fast_open_attempted = true;
+                        if let Some(outcome) = self.try_dentry_fast_open(
+                            path,
+                            *flags,
+                            *access,
+                            *writable_request,
+                            reservation,
+                        ) {
+                            return Ok(PathLookup {
+                                resolved_path: path.to_string(),
+                                fast_path: FastPathKind::DentryCache,
+                                target: LookupTarget::OpenOutcome(outcome),
+                            });
+                        }
+                    }
 
-                if !want_create
-                    && !want_trunc
-                    && (dirfd == LINUX_AT_FDCWD || (dirfd as i32) == -100 || path.starts_with('/'))
-                    && path.starts_with('/')
-                {
-                    dentry_fast_open_attempted = true;
-                    if let Some(outcome) = self.try_dentry_fast_open(
-                        path,
-                        *flags,
-                        *access,
-                        *writable_request,
-                        reservation,
-                    ) {
+                    if let Some(outcome) =
+                        self.try_immutable_lower_absolute_open(dirfd, path, *flags, reservation)
+                    {
                         return Ok(PathLookup {
                             resolved_path: path.to_string(),
-                            fast_path: FastPathKind::DentryCache,
+                            fast_path: FastPathKind::ImmutableLower,
                             target: LookupTarget::OpenOutcome(outcome),
                         });
                     }
-                }
 
-                if let Some(outcome) =
-                    self.try_immutable_lower_absolute_open(dirfd, path, *flags, reservation)
-                {
-                    return Ok(PathLookup {
-                        resolved_path: path.to_string(),
-                        fast_path: FastPathKind::ImmutableLower,
-                        target: LookupTarget::OpenOutcome(outcome),
-                    });
-                }
-
-                if let Some(outcome) =
-                    self.try_trusted_dirfd_openat(dirfd, path, *flags, reservation)
-                {
-                    return Ok(PathLookup {
-                        resolved_path: path.to_string(),
-                        fast_path: FastPathKind::TrustedDirfd,
-                        target: LookupTarget::OpenOutcome(outcome),
-                    });
+                    if let Some(outcome) =
+                        self.try_trusted_dirfd_openat(dirfd, path, *flags, reservation)
+                    {
+                        return Ok(PathLookup {
+                            resolved_path: path.to_string(),
+                            fast_path: FastPathKind::TrustedDirfd,
+                            target: LookupTarget::OpenOutcome(outcome),
+                        });
+                    }
                 }
             }
         }
@@ -395,9 +399,10 @@ impl<'a> FsView<'a> {
             access,
             writable_request,
             flags,
-            reservation,
+            sink,
             ..
         } = &mut intent
+            && let Some(reservation) = sink.task_reservation()
         {
             let want_create = open_flags.contains(LinuxOpenFlags::CREAT);
             let want_trunc = open_flags.contains(LinuxOpenFlags::TRUNC);
@@ -426,96 +431,123 @@ impl<'a> FsView<'a> {
         // 8. Synthetic /proc, /sys and leaf handling
         match intent {
             LookupIntent::Open {
-                context,
-                registry,
                 open_flags,
                 flags,
                 reporter,
-                reservation,
+                sink,
                 ..
             } => {
                 // Trace every open attempt
                 crate::probes::path_open(&resolved, 0, 0);
 
-                let visible_self = proc_visible_self(context);
-                if let Some(n) = proc_self_fd_number(&resolved, visible_self) {
-                    let outcome = self.reopen_proc_self_fd(
+                let mut path = match &mut *sink {
+                    // A native caller has no task view of `/proc` or `/sys`.
+                    super::open::OpenSink::Native(native) => {
+                        if crate::vfs::may_be_synthetic_virtual_path(&resolved) {
+                            return Ok(PathLookup {
+                                resolved_path: resolved,
+                                fast_path: FastPathKind::None,
+                                target: LookupTarget::OpenOutcome(native.refuse()),
+                            });
+                        }
+                        resolved
+                    }
+                    super::open::OpenSink::Task {
                         context,
                         registry,
-                        n,
-                        flags,
-                        &resolved,
-                        reporter,
                         reservation,
-                    )?;
-                    return Ok(PathLookup {
-                        resolved_path: resolved,
-                        fast_path: FastPathKind::None,
-                        target: LookupTarget::OpenOutcome(outcome),
-                    });
-                }
-
-                if let Some(n) = proc_self_fdinfo_number(&resolved, visible_self) {
-                    let outcome = match self.fdinfo_bytes(n) {
-                        Some(bytes) => {
-                            self.install_proc_synthetic_bytes(&resolved, bytes, flags, reservation)
+                    } => {
+                        let (context, registry) = (*context, *registry);
+                        let visible_self = proc_visible_self(context);
+                        if let Some(n) = proc_self_fd_number(&resolved, visible_self) {
+                            let outcome = self.reopen_proc_self_fd(
+                                context,
+                                registry,
+                                n,
+                                flags,
+                                &resolved,
+                                reporter,
+                                reservation,
+                            )?;
+                            return Ok(PathLookup {
+                                resolved_path: resolved,
+                                fast_path: FastPathKind::None,
+                                target: LookupTarget::OpenOutcome(outcome),
+                            });
                         }
-                        None => DispatchOutcome::errno(LINUX_ENOENT),
-                    };
-                    return Ok(PathLookup {
-                        resolved_path: resolved,
-                        fast_path: FastPathKind::None,
-                        target: LookupTarget::OpenOutcome(outcome),
-                    });
-                }
 
-                if proc_ns_link(&resolved).is_some()
-                    || (resolved.starts_with("/proc/")
-                        && resolved.contains("/ns/")
-                        && crate::vfs::proc::proc_ns_link_type_with_context(
-                            &resolved,
-                            &self.synthetic_proc_context(context),
-                        )
-                        .is_some())
-                {
-                    return Ok(PathLookup {
-                        resolved_path: resolved.clone(),
-                        fast_path: FastPathKind::None,
-                        target: LookupTarget::OpenOutcome(self.install_proc_synthetic_bytes(
-                            &resolved,
-                            Vec::new(),
-                            flags,
-                            reservation,
-                        )),
-                    });
-                }
+                        if let Some(n) = proc_self_fdinfo_number(&resolved, visible_self) {
+                            let outcome = match self.fdinfo_bytes(n) {
+                                Some(bytes) => self.install_proc_synthetic_bytes(
+                                    &resolved,
+                                    bytes,
+                                    flags,
+                                    reservation,
+                                ),
+                                None => DispatchOutcome::errno(LINUX_ENOENT),
+                            };
+                            return Ok(PathLookup {
+                                resolved_path: resolved,
+                                fast_path: FastPathKind::None,
+                                target: LookupTarget::OpenOutcome(outcome),
+                            });
+                        }
 
-                if proc_self_magic_link(&resolved, visible_self) == Some("exe")
-                    && !open_flags.contains(LinuxOpenFlags::NOFOLLOW)
-                    && let Some(current) = self.cross.current_executable()
-                {
-                    let outcome =
-                        self.install_proc_executable_source(&resolved, current, flags, reservation);
-                    return Ok(PathLookup {
-                        resolved_path: resolved,
-                        fast_path: FastPathKind::None,
-                        target: LookupTarget::OpenOutcome(outcome),
-                    });
-                }
+                        if proc_ns_link(&resolved).is_some()
+                            || (resolved.starts_with("/proc/")
+                                && resolved.contains("/ns/")
+                                && crate::vfs::proc::proc_ns_link_type_with_context(
+                                    &resolved,
+                                    &self.synthetic_proc_context(context),
+                                )
+                                .is_some())
+                        {
+                            return Ok(PathLookup {
+                                resolved_path: resolved.clone(),
+                                fast_path: FastPathKind::None,
+                                target: LookupTarget::OpenOutcome(
+                                    self.install_proc_synthetic_bytes(
+                                        &resolved,
+                                        Vec::new(),
+                                        flags,
+                                        reservation,
+                                    ),
+                                ),
+                            });
+                        }
 
-                let mut path = match proc_self_magic_link(&resolved, visible_self) {
-                    Some("exe") => {
-                        let proc_ctx = self.synthetic_proc_context(context);
-                        let exe = proc_ctx.executable_path;
-                        if exe.starts_with("/proc/") {
-                            resolved
-                        } else {
-                            exe
+                        if proc_self_magic_link(&resolved, visible_self) == Some("exe")
+                            && !open_flags.contains(LinuxOpenFlags::NOFOLLOW)
+                            && let Some(current) = self.cross.current_executable()
+                        {
+                            let outcome = self.install_proc_executable_source(
+                                &resolved,
+                                current,
+                                flags,
+                                reservation,
+                            );
+                            return Ok(PathLookup {
+                                resolved_path: resolved,
+                                fast_path: FastPathKind::None,
+                                target: LookupTarget::OpenOutcome(outcome),
+                            });
+                        }
+
+                        match proc_self_magic_link(&resolved, visible_self) {
+                            Some("exe") => {
+                                let proc_ctx = self.synthetic_proc_context(context);
+                                let exe = proc_ctx.executable_path;
+                                if exe.starts_with("/proc/") {
+                                    resolved
+                                } else {
+                                    exe
+                                }
+                            }
+                            Some("cwd") => self.cwd(),
+                            Some("root") => "/".to_string(),
+                            _ => resolved,
                         }
                     }
-                    Some("cwd") => self.cwd(),
-                    Some("root") => "/".to_string(),
-                    _ => resolved,
                 };
 
                 let want_create = open_flags.contains(LinuxOpenFlags::CREAT);
@@ -565,7 +597,7 @@ impl<'a> FsView<'a> {
                                 status,
                                 linux_fd_flags_from_open_flags(flags),
                             );
-                            let fd = match self.install_admitted_open_file(reservation, open_file) {
+                            let fd = match self.install_opened(sink, open_file) {
                                 Ok(fd) => fd,
                                 Err(errno) => {
                                     return Ok(PathLookup {
@@ -577,7 +609,7 @@ impl<'a> FsView<'a> {
                                     });
                                 }
                             };
-                            self.record_fd_open_path(fd, path.clone());
+                            self.record_opened_path(sink, fd, path.clone());
                             return Ok(PathLookup {
                                 resolved_path: path,
                                 fast_path: FastPathKind::None,
