@@ -60,6 +60,18 @@ impl FileSlotNumber {
 
 serial_id!(ThreadSerial);
 serial_id!(MmId);
+
+impl MmId {
+    /// The entry word EL1 publishes for this MM (`ExecutionBinding::mm`).
+    pub const fn entry_key(self) -> carrick_core_abi::EntryMmKey {
+        carrick_core_abi::EntryMmKey::from_raw(self.raw())
+    }
+
+    /// The occupancy key of this MM.
+    pub const fn address_space(self) -> carrick_sched_core::AddressSpaceKey {
+        carrick_sched_core::AddressSpaceKey::new(self.nonzero())
+    }
+}
 serial_id!(FileTableId);
 serial_id!(FileDescriptionId);
 serial_id!(FsContextId);

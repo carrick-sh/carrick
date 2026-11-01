@@ -34,6 +34,15 @@ pub struct ThreadKey {
 impl ThreadKey {
     /// The thread an in-guest zone record names (`tid`, `serial` as the host
     /// published them); `None` for a malformed pair.
+    /// The exact thread an authenticated entry binding names: EL1 publishes
+    /// the switched-in thread's tid as the task key and its serial as the
+    /// thread generation (`publish_identity`).
+    pub fn from_execution_binding(binding: carrick_core_abi::ExecutionBinding) -> Option<Self> {
+        let tid = i32::try_from(binding.task.raw()).ok()?;
+        let serial = std::num::NonZeroU64::new(binding.thread_generation.raw())?;
+        Self::from_zone_identity(tid, serial)
+    }
+
     pub fn from_zone_identity(tid: i32, serial: std::num::NonZeroU64) -> Option<Self> {
         Some(Self {
             tid: LinuxTid::from_registry_allocation(std::num::NonZeroI32::new(tid)?),

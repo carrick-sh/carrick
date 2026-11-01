@@ -53,11 +53,12 @@ pub use carrick_hal::ForkRamStrategy;
 #[derive(Debug, Clone)]
 pub enum Aarch64Exit {
     /// Authenticated terminal completion from the in-ring process owner.
-    /// `mm` is the authenticated exiting MM: on an idle-entry vCPU, which has
-    /// no host task loaded, it is the only name for the exiting process.
+    /// `binding` is the authenticated exiting execution (task, thread
+    /// generation and MM): on an idle-entry vCPU, which has no host task
+    /// loaded, it is the only name for the exiting thread and process.
     NativeRootExit {
         status: carrick_sched_core::process::TerminationStatus,
-        mm: carrick_core_abi::EntryMmKey,
+        binding: carrick_core_abi::ExecutionBinding,
     },
     /// A guest EL0 `svc #0`. `frame` carries x0..x5 + x8 (already read via the
     /// shared `read_aarch64_syscall_frame`); `resume_pc` is `ELR_EL1` (= svc+4).

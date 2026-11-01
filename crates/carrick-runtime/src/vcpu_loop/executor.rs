@@ -421,15 +421,19 @@ where
             }
         }
         backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
-        // The root exit retired this process's zone records, including the
-        // in-ring owner's own. A member woken to take that terminal resumes
-        // no guest state, so its retired zone residency must not be restored:
-        // that load reports the record missing and settles the member exited,
-        // and the terminal would then have no owner.
+        // The root exit retired the in-ring owner's own zone record. Its
+        // host thread, woken to take that terminal, resumes no guest state,
+        // so its retired zone residency must not be restored: that load
+        // reports the record missing and settles it exited, and the terminal
+        // would then have no owner. Only the exact owner sees the pending
+        // exit; every other thread (and a task sharing the MM) keeps its
+        // residency. Its loop top takes the status before anything else, and
+        // nothing else can take it, so the check and the take need no common
+        // lock: between them the custody can only stay owed to this thread.
         if running
             .thread()
             .task()
-            .is_some_and(|task| task.native_root_exit_pending())
+            .is_some_and(|task| task.native_root_exit_pending_for(thread))
         {
             binding
                 .clear_terminal_cpu_residency()
@@ -1745,39 +1749,32 @@ fn next_runnable<F: PersistentExecutor>(
 }
 
 /// An idle executor received the in-ring owner's root exit: it has no task
-/// binding to enter the process terminal with. Retain the status on the exact
-/// process and control-wake its host members; the first one to reach its loop
-/// top owns the terminal (`ProductionHvpatchLoopJob::poll_with_engine`). This
-/// executor keeps serving. Treating the crossing as a dead worker instead left
-/// every member parked and the run's physical-retirement waiter with no
-/// publication, forever.
+/// binding to enter the process terminal with. Retain the status on the
+/// exiting thread's task, owed to that exact thread, and control-wake it; its
+/// loop top takes the status and owns the terminal
+/// (`ProductionHvpatchLoopJob::poll_with_engine`). This executor keeps
+/// serving. Treating the crossing as a dead worker instead left every member
+/// parked and the run's physical-retirement waiter with no publication.
+///
+/// The owner is always a live host thread here: EL1 runs a record natively
+/// from the zone only after an executor adopted it (`needs_executor` sends
+/// an unadopted birth to its executor), so it has a host execution
+/// generation; its host thread is parked on that record's continuation, and
+/// only its own binding can settle it exited, which it cannot do while the
+/// record still runs in the zone. A refusal is therefore a broken invariant.
 fn deliver_idle_root_exit(
     scheduler: &Arc<Scheduler>,
     exit: &backend::IdleRootExit,
 ) -> Result<(), NextError> {
-    let (status, mm) = (exit.status(), exit.mm());
-    let members = scheduler.kernel().publish_idle_root_exit(mm, status);
-    let mut woken = 0usize;
-    for member in &members {
-        match scheduler.wake_control(*member) {
-            Ok(_) => woken += 1,
-            // A member that already left the graph needs no terminal wake.
-            Err(carrick_kernel::kernel::SchedulerError::UnknownThread) => {}
-            Err(error) => {
-                return Err(NextError::Fatal(format!(
-                    "wake host member {member:?} for an idle-vCPU root exit: {error}"
-                )));
-            }
-        }
-    }
-    // An authenticated crossing names a live process: no member to wake is a
-    // broken invariant, never contention.
-    if woken == 0 {
-        return Err(NextError::Fatal(format!(
-            "idle-vCPU root exit {status:?} for mm {} reached no live host member",
-            mm.raw()
-        )));
-    }
+    let owner = scheduler
+        .kernel()
+        .publish_idle_root_exit(exit.binding(), exit.status())
+        .map_err(|refusal| NextError::Fatal(format!("idle-vCPU root exit: {refusal}")))?;
+    scheduler.wake_control(owner).map_err(|error| {
+        NextError::Fatal(format!(
+            "wake root exit owner {owner} for an idle-vCPU root exit: {error}"
+        ))
+    })?;
     Ok(())
 }
 

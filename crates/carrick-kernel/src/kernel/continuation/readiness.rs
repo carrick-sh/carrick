@@ -1159,35 +1159,61 @@ impl Drop for NativeOwnerWaitRegistration {
     }
 }
 
+/// [`Kernel::publish_idle_root_exit`] found no consistent exiting owner: a
+/// broken invariant of the authenticated crossing, never contention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum IdleRootExitRefusal {
+    #[error("root exit binding names no issued thread")]
+    UnissuedBinding,
+    #[error("root exit owner {owner} is not a live host thread")]
+    OwnerGone { owner: ThreadKey },
+    #[error("root exit owner {owner} runs mm {task_mm:?}, the crossing named {crossing_mm:?}")]
+    MmMismatch {
+        owner: ThreadKey,
+        task_mm: carrick_core_abi::EntryMmKey,
+        crossing_mm: carrick_core_abi::EntryMmKey,
+    },
+    #[error("root exit of {owner}'s process was already published")]
+    AlreadyPublished { owner: ThreadKey },
+}
+
 impl Kernel {
     /// Hand an authenticated root exit that crossed on an idle vCPU to the
-    /// exiting process's host members.
+    /// exact exiting thread's host member.
     ///
     /// The in-ring process owner crosses its root exit from whichever vCPU
     /// runs it. On an executor waiting in the guest scheduler no host task is
-    /// loaded, so no binding can enter the process terminal there. The status
-    /// is retained on the exact task that owns `mm` and every host member is
-    /// returned for a control wake; the first to reach its loop top takes the
-    /// status and owns the terminal, as a loaded member does when the crossing
-    /// lands on its own vCPU. Empty: no live task owns `mm`, so nothing could
-    /// ever consume the terminal and the caller must fail closed.
+    /// loaded, so no binding can enter the process terminal there. The
+    /// crossing's authenticated execution names the exiting thread (task key
+    /// = its tid, thread generation = its serial) and MM. The status is
+    /// retained on that thread's task, owed to that thread only; a task that
+    /// merely shares the MM (a vfork child before exec) is never selected.
+    /// The returned thread is the one to wake.
     pub fn publish_idle_root_exit(
         &self,
-        mm: carrick_core_abi::EntryMmKey,
+        binding: carrick_core_abi::ExecutionBinding,
         status: carrick_sched_core::process::TerminationStatus,
-    ) -> Vec<ThreadKey> {
-        let mut members = Vec::new();
-        for id in self.registry().task_ids() {
-            let Some(task) = self.registry().task(id) else {
-                continue;
-            };
-            if task.shared().mm().id().raw() != mm.raw() {
-                continue;
-            }
-            task.publish_native_root_exit(status);
-            members.extend(task.threads().iter().map(|thread| thread.key()));
+    ) -> Result<ThreadKey, IdleRootExitRefusal> {
+        let owner = ThreadKey::from_execution_binding(binding)
+            .ok_or(IdleRootExitRefusal::UnissuedBinding)?;
+        let thread = self
+            .exact_thread_for_scheduler(owner)
+            .ok_or(IdleRootExitRefusal::OwnerGone { owner })?;
+        let task = thread
+            .task()
+            .ok_or(IdleRootExitRefusal::OwnerGone { owner })?;
+        let task_mm = task.shared().mm().id().entry_key();
+        if task_mm != binding.mm {
+            return Err(IdleRootExitRefusal::MmMismatch {
+                owner,
+                task_mm,
+                crossing_mm: binding.mm,
+            });
         }
-        members
+        if !task.publish_native_root_exit(owner, status) {
+            return Err(IdleRootExitRefusal::AlreadyPublished { owner });
+        }
+        Ok(owner)
     }
 
     /// Deliver only the released member's record interests. Record reuse and a

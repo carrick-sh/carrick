@@ -4354,12 +4354,9 @@ where
         Ok(executor::ExecutorExit::Syscall)
     }
 
-    /// Route a terminal outcome produced outside `service_outcome` — a fault
-    /// signal that killed the process, or a forced-exit signal service — into
-    /// the persistent terminal, the same way the trap watchdog does.
     /// The in-ring process owner's authenticated root exit ends the run with
     /// its status. It reaches this member either on its own vCPU (the trap)
-    /// or through [`carrick_kernel::kernel::Task::take_native_root_exit`]
+    /// or through [`carrick_kernel::kernel::Task::take_native_root_exit_for`]
     /// when it crossed on an idle vCPU that had no host task loaded.
     fn enter_native_root_exit(
         &mut self,
@@ -4394,6 +4391,9 @@ where
         Ok(self.enter_terminal_with_outcome(engine, outcome))
     }
 
+    /// Route a terminal outcome produced outside `service_outcome` — a fault
+    /// signal that killed the process, or a forced-exit signal service — into
+    /// the persistent terminal, the same way the trap watchdog does.
     pub(super) fn enter_terminal_with_outcome(
         &mut self,
         engine: &mut E,
@@ -4489,6 +4489,29 @@ where
             return Ok(executor::ExecutorExit::Exited);
         }
         drop(self.slot_wait.take());
+        // A root exit that crossed on an idle vCPU is owed to exactly this
+        // thread (`deliver_idle_root_exit`). Take it before any EL1 resume,
+        // continuation or guest state: its zone record is retired, so there
+        // is nothing of it left to resume.
+        if !self.phase.is_terminal_transition()
+            && let Some(status) = self
+                .state
+                .kernel_thread
+                .clone()
+                .or_else(|| {
+                    self.state
+                        .service_kernel_context
+                        .as_ref()
+                        .map(|context| Arc::clone(context.thread()))
+                })
+                .and_then(|thread| {
+                    thread
+                        .task()
+                        .and_then(|task| task.take_native_root_exit_for(thread.key()))
+                })
+        {
+            return Ok(self.enter_native_root_exit(engine, status)?);
+        }
         // EL1 stopped mid-operation on this vCPU (a stage-1 COW fault EL1
         // took, resolved by the host): re-enter it before ANY host boundary
         // work. Admission, control quanta, quiesce and job-control suspension,
@@ -4504,22 +4527,6 @@ where
             }
             if let Some(context) = self.state.service_kernel_context.as_ref() {
                 self.kernel.wake_native_terminal_members(context)?;
-            }
-            // A root exit that crossed on an idle vCPU is owed to this
-            // process's host members (`deliver_idle_root_exit`); the first one
-            // here takes it before resuming any continuation or guest state.
-            if !self.phase.is_terminal_transition()
-                && let Some(status) = match self.state.service_kernel_context.as_ref() {
-                    Some(context) => context.task().take_native_root_exit(),
-                    None => self
-                        .state
-                        .kernel_thread
-                        .as_ref()
-                        .and_then(|thread| thread.task())
-                        .and_then(|task| task.take_native_root_exit()),
-                }
-            {
-                return Ok(self.enter_native_root_exit(engine, status)?);
             }
             if !self.phase.is_terminal_transition()
                 && !matches!(self.phase, HvpatchProductionPhase::ResumeOwnerPhysical(_))

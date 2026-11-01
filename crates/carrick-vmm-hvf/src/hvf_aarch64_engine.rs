@@ -2136,6 +2136,28 @@ pub fn retire_terminal_resident_vcpu_root(
     vcpu.set_sys_reg(SysReg::Ttbr1, neutral)
 }
 
+/// A root exit crossed on this idle vCPU while it ran the exiting process's
+/// address space, and the crossing abandoned EL1's stack before EL1's own
+/// `leave_space`. Do what that would have done, in its order: drop this
+/// vCPU's TLB entries for the exiting ASID, then switch it to the carrier's
+/// maintenance root. Only then may the slot's occupancy word be retired,
+/// which is what lets the space's tables be freed: the vCPU can no longer
+/// walk them or hit stale translations of them.
+pub fn retire_idle_root_exit_vcpu_root(
+    vmm: &mut HvfAarch64Vmm,
+    vcpu: &mut HvfAarch64Vcpu,
+) -> Result<(), TrapError> {
+    let neutral = carrier_maintenance_ttbr(vmm)?;
+    let ttbr0 = vcpu.get_sys_reg(SysReg::Ttbr0)?;
+    if ttbr0 != neutral {
+        let asid = (ttbr0 >> 48) as u16;
+        if asid != 0 {
+            invalidate_worker_asid(vmm, vcpu, asid)?;
+        }
+    }
+    retire_terminal_resident_vcpu_root(vmm, vcpu)
+}
+
 /// Service an exact-ASID generation on a loaded owner vCPU without detaching
 /// the task or reacquiring runtime page-table exclusion.
 pub fn invalidate_loaded_asid(engine: &mut HvfAarch64Engine, asid: u16) -> Result<(), TrapError> {
