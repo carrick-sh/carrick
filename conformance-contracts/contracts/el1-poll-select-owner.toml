@@ -14,6 +14,7 @@ vm_free = [
   "carrick-el1-abi::ipc::epoll::tests::{edge_triggered_reports_each_arrival_once,oneshot_disarms_until_modified,harvest_honours_maxevents_order_and_requeues_level_items_after_the_scan}",
   "carrick-kernel::dispatch::net::epoll_zone::tests::red_until_step3_m3_zone_pipe_waits_create_host_proxies",
   "carrick-kernel::dispatch::net::netlink_readiness_tests::{poll_and_epoll_negative_and_absent_fd_semantics,epoll_ctl_rejects_two_description_cycle_with_eloop,epoll_readiness_tracks_stored_target_identity_after_fd_close_and_reuse}",
+  "carrick-el1-linux::ipc::tests::{ppoll_nfds_is_bounded_by_the_tables_soft_rlimit_nofile,ppoll_set_the_ring_cannot_allocate_is_enomem,x86_cpl0_poll_is_served_by_the_shared_body}",
 ]
 
 [bindings.unresolved]

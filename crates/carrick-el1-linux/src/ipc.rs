@@ -1485,15 +1485,43 @@ mod tests {
     struct Counting;
     std::thread_local! {
         static ALLOCS: Cell<usize> = const { Cell::new(0) };
+        /// This thread's allocations of at least this many bytes fail, as a
+        /// ring heap too small for the request would.
+        static REFUSE_FROM: Cell<usize> = const { Cell::new(usize::MAX) };
     }
-    // SAFETY: forwards to the system allocator; only counts.
+    /// Make this thread's allocations of `bytes` or more fail until dropped.
+    struct RefuseAllocations(usize);
+    impl RefuseAllocations {
+        fn from(bytes: usize) -> Self {
+            Self(REFUSE_FROM.with(|limit| limit.replace(bytes)))
+        }
+    }
+    impl Drop for RefuseAllocations {
+        fn drop(&mut self) {
+            REFUSE_FROM.with(|limit| limit.set(self.0));
+        }
+    }
+    // SAFETY: forwards to the system allocator; counts, and refuses only the
+    // sizes a test asked this thread to refuse (a null return is allowed).
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if REFUSE_FROM
+                .try_with(Cell::get)
+                .is_ok_and(|from| layout.size() >= from)
+            {
+                return core::ptr::null_mut();
+            }
             let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
             // SAFETY: the caller's contract.
             unsafe { System.alloc(layout) }
         }
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            if REFUSE_FROM
+                .try_with(Cell::get)
+                .is_ok_and(|from| layout.size() >= from)
+            {
+                return core::ptr::null_mut();
+            }
             let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
             // SAFETY: the caller's contract. Keeps the directory mapping's
             // large reservation lazily committed.
@@ -4068,6 +4096,493 @@ mod tests {
             let (bytes2, allocs2, host2) = pairs(n, 16);
             assert_eq!(bytes2, 2 * bytes, "round-count scaling at N={n}");
             assert_eq!((allocs2, host2), (0, 0));
+        }
+    }
+
+    // ---- poll/ppoll through the production dispatcher (#894) ----
+
+    use crate::file_table::{LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, PollFd};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+
+    /// Host-test frame with the production x86 CPL0 poll contract: native
+    /// `poll` (7) or `ppoll` (271) decoded to canonical `ppoll`, the x86
+    /// crossing set and the carrier readiness crossing, which records each
+    /// query and reports every queried entry writable.
+    struct X86PollFrame {
+        frame: TrapFrame,
+        native: u64,
+        queries: Vec<(usize, i32)>,
+    }
+    impl X86PollFrame {
+        fn new(native: u64, args: [u64; 5]) -> Self {
+            let mut frame = TrapFrame::default();
+            frame.x[..5].copy_from_slice(&args);
+            Self {
+                frame,
+                native,
+                queries: Vec::new(),
+            }
+        }
+    }
+    impl carrick_personality_linux::dispatch::SyscallFrame for X86PollFrame {
+        fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+            carrick_syscall_abi::nr::PPOLL
+        }
+        fn argument(&self, index: usize) -> Option<u64> {
+            carrick_personality_linux::dispatch::SyscallFrame::argument(&self.frame, index)
+        }
+        fn result(&self) -> carrick_guest_arch::NativeReturnWord {
+            carrick_personality_linux::dispatch::SyscallFrame::result(&self.frame)
+        }
+        fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
+            carrick_personality_linux::dispatch::SyscallFrame::set_result(&mut self.frame, result);
+        }
+        fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
+            carrick_personality_linux::dispatch::SyscallFrame::slot(&self.frame)
+        }
+        fn user_sp(&self) -> Option<carrick_guest_arch::UserVa> {
+            carrick_personality_linux::dispatch::SyscallFrame::user_sp(&self.frame)
+        }
+    }
+    impl crate::dispatch::GuestDispatchFrame for X86PollFrame {
+        fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
+            carrick_guest_arch::NativeOrdinal::new(self.native)
+        }
+        fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
+            carrick_personality_linux::crossing::HostCrossingSet::X86
+        }
+        fn may_serve_poll(&self) -> bool {
+            true
+        }
+        fn poll_timeout_kind(&self) -> crate::dispatch::PollTimeoutKind {
+            if self.native == carrick_syscall_abi::syscall_x86_64::X86_POLL.raw() {
+                crate::dispatch::PollTimeoutKind::Milliseconds
+            } else {
+                crate::dispatch::PollTimeoutKind::Timespec
+            }
+        }
+        fn query_host_readiness(
+            &mut self,
+            entries: &mut [carrick_el1_abi::HostReadinessEntry],
+            timeout_ms: i32,
+            _: crate::dispatch::PollSignalMask,
+        ) -> Option<i64> {
+            self.queries.push((entries.len(), timeout_ms));
+            for entry in entries.iter_mut() {
+                entry.revents = entry.events & LINUX_POLLOUT;
+            }
+            Some(entries.len() as i64)
+        }
+        fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
+            None
+        }
+        fn arm_frame_ref(&self) -> Option<&TrapFrame> {
+            None
+        }
+        fn arm_scheduler(&self) -> bool {
+            false
+        }
+        fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+            None
+        }
+    }
+
+    /// The delegated tables a venue without a ring descriptor table uses.
+    struct Delegated {
+        fd_map: Box<[carrick_el1_abi::FdMapSlot]>,
+        opens: Box<[carrick_el1_abi::DelegatedOpenFile]>,
+        objects: Box<[carrick_el1_abi::DelegatedFile]>,
+        names: Box<carrick_el1_abi::InotifyNameCache>,
+    }
+    fn delegated() -> Delegated {
+        Delegated {
+            fd_map: (0..carrick_el1_abi::FD_MAP_CAPACITY)
+                .map(|_| carrick_el1_abi::FdMapSlot::new())
+                .collect(),
+            opens: (0..carrick_el1_abi::MAX_ZONE_OPEN_FILES)
+                .map(|_| carrick_el1_abi::DelegatedOpenFile::new())
+                .collect(),
+            objects: (0..64)
+                .map(|_| carrick_el1_abi::DelegatedFile::new())
+                .collect(),
+            names: Box::new(carrick_el1_abi::InotifyNameCache::new()),
+        }
+    }
+
+    /// One poll-family entry through `dispatch_syscall_with_native`, the
+    /// entry both ISAs' carriers call, for the world's task.
+    fn dispatch_poll<G: crate::dispatch::GuestDispatchFrame>(
+        w: &World,
+        frame: &mut G,
+        ipc: Option<&IpcVenue<'_>>,
+        tables: &Delegated,
+    ) -> CompletionRoute {
+        crate::dispatch::dispatch_syscall_with_native::<
+            _,
+            FakeCpu,
+            HardwareUserWord,
+            _,
+            carrick_sched_core::Aarch64ParkedContext,
+        >(
+            frame,
+            w.counters,
+            core::slice::from_ref(&w.task),
+            &tables.fd_map,
+            &tables.objects,
+            &tables.opens,
+            &[],
+            &tables.names,
+            None,
+            ipc,
+            None,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        )
+    }
+
+    /// A ppoll set: one ready eventfd first, then negative (ignored) entries.
+    fn eventfd_set(event: i32, nfds: usize) -> Vec<PollFd> {
+        let mut fds = std::vec![
+            PollFd {
+                fd: -1,
+                events: LINUX_POLLIN,
+                revents: 0x7777,
+            };
+            nfds
+        ];
+        if let Some(first) = fds.first_mut() {
+            first.fd = event;
+        }
+        fds
+    }
+
+    const ZERO_TIMESPEC: [i64; 2] = [0, 0];
+    const UNMAPPED: u64 = 0xffff_ffff_ffff_f000;
+
+    /// ppoll(2)/poll(2): nfds above the caller's soft RLIMIT_NOFILE is
+    /// EINVAL; at the limit the set is served. Linux reads the timespec and
+    /// then the signal mask before it compares nfds, so their EFAULTs win.
+    #[test]
+    fn ppoll_nfds_is_bounded_by_the_tables_soft_rlimit_nofile() {
+        let w = world();
+        let a = w.table(w.a_tid);
+        let event = w.eventfd(a, 5, EventMode::Counter, BLOCK);
+        let venue = w.venue();
+        let tables = delegated();
+        for limit in [64usize, 2048] {
+            w.host().set_limit(a, limit).unwrap();
+            for native in [
+                carrick_syscall_abi::nr::PPOLL.raw(),
+                carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw(),
+            ] {
+                let call = |fds: &mut [PollFd], nfds: usize, timespec: u64| {
+                    let args = [fds.as_mut_ptr() as u64, nfds as u64, timespec, 0, 0];
+                    if native == carrick_syscall_abi::nr::PPOLL.raw() {
+                        let mut frame = TrapFrame::default();
+                        frame.x[..5].copy_from_slice(&args);
+                        frame.x[8] = native;
+                        let route = dispatch_poll(&w, &mut frame, Some(&venue), &tables);
+                        (route, frame.x[0] as i64)
+                    } else {
+                        let mut frame = X86PollFrame::new(native, args);
+                        let route = dispatch_poll(&w, &mut frame, Some(&venue), &tables);
+                        assert!(frame.queries.is_empty(), "an in-zone set never crosses");
+                        (route, frame.frame.x[0] as i64)
+                    }
+                };
+                let timespec = ZERO_TIMESPEC.as_ptr() as u64;
+                let mut fds = eventfd_set(event, limit + 1);
+                assert_eq!(
+                    call(&mut fds, limit + 1, timespec),
+                    (CompletionRoute::Served, -22),
+                    "limit {limit}, native {native}: nfds = limit + 1"
+                );
+                assert_eq!(fds[0].revents, 0x7777, "EINVAL publishes no revents");
+                assert_eq!(
+                    call(&mut fds, limit + 1, UNMAPPED),
+                    (CompletionRoute::Served, -14),
+                    "the timespec is read before nfds is compared"
+                );
+                assert_eq!(
+                    call(&mut fds, limit, timespec),
+                    (CompletionRoute::Served, 1),
+                    "limit {limit}, native {native}: nfds = limit"
+                );
+                assert_eq!(fds[0].revents, LINUX_POLLIN);
+                assert!(fds[1..limit].iter().all(|fd| fd.revents == 0));
+                assert_eq!(fds[limit].revents, 0x7777, "past nfds stays untouched");
+            }
+        }
+        // ppoll's sigsetsize is checked before nfds: EINVAL either way, but a
+        // valid size with an unreadable mask is EFAULT, not nfds' EINVAL.
+        let mut fds = eventfd_set(event, 1);
+        let mut frame = TrapFrame::default();
+        frame.x[..5].copy_from_slice(&[
+            fds.as_mut_ptr() as u64,
+            2049,
+            ZERO_TIMESPEC.as_ptr() as u64,
+            UNMAPPED,
+            8,
+        ]);
+        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
+        assert_eq!(
+            dispatch_poll(&w, &mut frame, Some(&venue), &tables),
+            CompletionRoute::Served
+        );
+        assert_eq!(frame.x[0] as i64, -14);
+    }
+
+    /// A set within RLIMIT_NOFILE that the ring cannot allocate is ENOMEM
+    /// (poll(2): "Unable to allocate memory for kernel data structures"),
+    /// never an aborting allocation, and it reads and writes no user memory.
+    #[test]
+    fn ppoll_set_the_ring_cannot_allocate_is_enomem() {
+        let w = world();
+        let a = w.table(w.a_tid);
+        let event = w.eventfd(a, 5, EventMode::Counter, BLOCK);
+        w.host().set_limit(a, 2048).unwrap();
+        let venue = w.venue();
+        let tables = delegated();
+        // x86 CPL0's delegated namespace, at its 1024 cap.
+        let mut fds = eventfd_set(9, 1024);
+        let mut frame = X86PollFrame::new(
+            carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
+            [fds.as_mut_ptr() as u64, 1024, 0, 0, 0],
+        );
+        let route = {
+            let _refuse = RefuseAllocations::from(1024 * core::mem::size_of::<PollFd>());
+            dispatch_poll(&w, &mut frame, None, &tables)
+        };
+        assert_eq!(
+            (route, frame.frame.x[0] as i64),
+            (CompletionRoute::Served, -12)
+        );
+        assert!(frame.queries.is_empty(), "nothing crosses");
+        assert_eq!(fds[0].revents, 0x7777, "ENOMEM publishes no revents");
+        // The pollfd array fits but the host-entry array for the readiness
+        // crossing does not: still ENOMEM, nothing crosses, no revents.
+        let entry_bytes = 1024 * core::mem::size_of::<carrick_el1_abi::HostReadinessEntry>();
+        assert!(entry_bytes > 1024 * core::mem::size_of::<PollFd>());
+        let file_table = w.task.linux.file_table.load(Ordering::Acquire).max(1);
+        let mut pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        crate::file_table::admit_host_fd(
+            &tables.fd_map,
+            &tables.opens,
+            &tables.objects,
+            file_table,
+            4,
+            pipe[1],
+            0,
+        )
+        .unwrap();
+        let mut fds = std::vec![
+            PollFd {
+                fd: 4,
+                events: LINUX_POLLOUT,
+                revents: 0x7777,
+            };
+            1024
+        ];
+        let mut frame = X86PollFrame::new(
+            carrick_syscall_abi::syscall_x86_64::X86_POLL.raw(),
+            [fds.as_mut_ptr() as u64, 1024, 0, 0, 0],
+        );
+        let route = {
+            let _refuse = RefuseAllocations::from(entry_bytes);
+            dispatch_poll(&w, &mut frame, None, &tables)
+        };
+        assert_eq!(
+            (route, frame.frame.x[0] as i64),
+            (CompletionRoute::Served, -12)
+        );
+        assert!(frame.queries.is_empty(), "nothing crosses");
+        assert!(fds.iter().all(|fd| fd.revents == 0x7777), "no revents");
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        // A ring table whose soft limit admits the set.
+        let mut fds = eventfd_set(event, 2048);
+        for native in [
+            carrick_syscall_abi::nr::PPOLL.raw(),
+            carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw(),
+        ] {
+            let args = [
+                fds.as_mut_ptr() as u64,
+                2048,
+                ZERO_TIMESPEC.as_ptr() as u64,
+                0,
+                0,
+            ];
+            let result = {
+                let _refuse = RefuseAllocations::from(2048 * core::mem::size_of::<PollFd>());
+                if native == carrick_syscall_abi::nr::PPOLL.raw() {
+                    let mut frame = TrapFrame::default();
+                    frame.x[..5].copy_from_slice(&args);
+                    frame.x[8] = native;
+                    let route = dispatch_poll(&w, &mut frame, Some(&venue), &tables);
+                    (route, frame.x[0] as i64)
+                } else {
+                    let mut frame = X86PollFrame::new(native, args);
+                    let route = dispatch_poll(&w, &mut frame, Some(&venue), &tables);
+                    (route, frame.frame.x[0] as i64)
+                }
+            };
+            assert_eq!(result, (CompletionRoute::Served, -12), "native {native}");
+            assert_eq!(fds[0].revents, 0x7777, "ENOMEM publishes no revents");
+        }
+    }
+
+    /// x86 CPL0's native `poll`/`ppoll` reach the one shared poll body.
+    /// Production x86 has no ring descriptor table yet (#1040), so its sets
+    /// resolve through the delegated fd map: an absent descriptor is a
+    /// ready POLLNVAL served in ring, host-bound entries and an empty set
+    /// take the carrier readiness crossing with the caller's timeout, and
+    /// the delegated cap stays 1024. With a ring table, the same frame is
+    /// served from in-zone levels without crossing.
+    #[test]
+    fn x86_cpl0_poll_is_served_by_the_shared_body() {
+        let w = world();
+        let tables = delegated();
+        let file_table = w.task.linux.file_table.load(Ordering::Acquire).max(1);
+        let mut pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        crate::file_table::admit_host_fd(
+            &tables.fd_map,
+            &tables.opens,
+            &tables.objects,
+            file_table,
+            4,
+            pipe[1],
+            0,
+        )
+        .unwrap();
+        let call = |native: u64, args: [u64; 5], ipc: Option<&IpcVenue<'_>>| {
+            let mut frame = X86PollFrame::new(native, args);
+            let route = dispatch_poll(&w, &mut frame, ipc, &tables);
+            assert_eq!(route, CompletionRoute::Served);
+            (frame.frame.x[0] as i64, frame.queries)
+        };
+        let poll = carrick_syscall_abi::syscall_x86_64::X86_POLL.raw();
+        let ppoll = carrick_syscall_abi::syscall_x86_64::X86_PPOLL.raw();
+        let set = |fds: &mut [PollFd], timeout: u64| {
+            [fds.as_mut_ptr() as u64, fds.len() as u64, timeout, 0, 0]
+        };
+        // In-ring ready set: an absent descriptor is POLLNVAL and never crosses.
+        let mut fds = [PollFd {
+            fd: 9,
+            events: LINUX_POLLIN,
+            revents: 0,
+        }];
+        assert_eq!(call(poll, set(&mut fds, 1000), None), (1, Vec::new()));
+        assert_eq!(fds[0].revents, LINUX_POLLNVAL);
+        let mut fds = [PollFd {
+            fd: 9,
+            events: LINUX_POLLIN,
+            revents: 0,
+        }];
+        let zero = ZERO_TIMESPEC.as_ptr() as u64;
+        assert_eq!(call(ppoll, set(&mut fds, zero), None), (1, Vec::new()));
+        assert_eq!(fds[0].revents, LINUX_POLLNVAL);
+        // A host-bound entry crosses once with the caller's timeout.
+        let mut fds = [
+            PollFd {
+                fd: 4,
+                events: LINUX_POLLOUT,
+                revents: 0,
+            },
+            PollFd {
+                fd: -1,
+                events: LINUX_POLLIN,
+                revents: 0x7777,
+            },
+        ];
+        assert_eq!(
+            call(poll, set(&mut fds, 1000), None),
+            (1, std::vec![(1, 1000)])
+        );
+        assert_eq!((fds[0].revents, fds[1].revents), (LINUX_POLLOUT, 0));
+        // Zero-timeout empty set: the carrier answers it with a zero wait.
+        assert_eq!(
+            call(ppoll, [0, 0, zero, 0, 0], None),
+            (0, std::vec![(0, 0)])
+        );
+        assert_eq!(call(poll, [0, 0, 0, 0, 0], None), (0, std::vec![(0, 0)]));
+        // An empty set carries a finite or NULL timeout through the same crossing.
+        assert_eq!(
+            call(poll, [0, 0, 250, 0, 0], None),
+            (0, std::vec![(0, 250)])
+        );
+        assert_eq!(call(ppoll, [0, 0, 0, 0, 0], None), (0, std::vec![(0, -1)]));
+        // The delegated namespace has no soft limit in ring: its cap stays
+        // 1024 descriptors. A bad array is EFAULT.
+        assert_eq!(call(poll, [0x1000, 1025, 0, 0, 0], None).0, -22);
+        assert_eq!(call(poll, [UNMAPPED, 1, 0, 0, 0], None).0, -14);
+        // With a ring table the same x86 frame is served from in-zone
+        // levels, including a set larger than the delegated cap.
+        let a = w.table(w.a_tid);
+        let event = w.eventfd(a, 5, EventMode::Counter, BLOCK);
+        w.host().set_limit(a, 2048).unwrap();
+        let venue = w.venue();
+        let mut fds = eventfd_set(event, 1100);
+        fds[0].events = LINUX_POLLIN | LINUX_POLLOUT;
+        assert_eq!(
+            call(ppoll, set(&mut fds, zero), Some(&venue)),
+            (1, Vec::new())
+        );
+        assert_eq!(fds[0].revents, LINUX_POLLIN | LINUX_POLLOUT);
+        // The carrier crossing samples host-bound entries with one host poll,
+        // bounded at 1024 independently of the guest's soft limit. A larger
+        // host-bound set stays unrouted before any effect: no crossing and
+        // no revents.
+        let token = carrick_el1_abi::ipc::HostResourceToken::new(77).unwrap();
+        let host = w
+            .host()
+            .open(
+                a,
+                Fd(4),
+                Description::new(
+                    IpcBacking::Host(token).encode(),
+                    AccessMode::ReadWrite,
+                    BLOCK,
+                ),
+                false,
+            )
+            .unwrap();
+        assert_eq!(host, Fd(4), "the ring table and fd map name one descriptor");
+        let host_set = |count: usize| {
+            std::vec![
+                PollFd {
+                    fd: 4,
+                    events: LINUX_POLLOUT,
+                    revents: 0x7777,
+                };
+                count
+            ]
+        };
+        let mut fds = host_set(1024);
+        assert_eq!(
+            call(ppoll, set(&mut fds, zero), Some(&venue)),
+            (1024, std::vec![(1024, 0)]),
+            "at the crossing bound the set crosses once"
+        );
+        assert!(fds.iter().all(|fd| fd.revents == LINUX_POLLOUT));
+        let mut fds = host_set(1025);
+        let mut frame = X86PollFrame::new(ppoll, set(&mut fds, zero));
+        let route = dispatch_poll(&w, &mut frame, Some(&venue), &tables);
+        assert!(frame.queries.is_empty(), "no host readiness crossing");
+        assert!(fds.iter().all(|fd| fd.revents == 0x7777), "no revents");
+        assert_eq!(
+            (route, frame.frame.x[0] as i64),
+            (CompletionRoute::Served, -38),
+            "unrouted: the x86 crossing refuses ppoll as a counted ENOSYS"
+        );
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
         }
     }
 }

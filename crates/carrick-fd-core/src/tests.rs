@@ -624,7 +624,9 @@ fn lowered_limit_preserves_existing_entries_and_exec() {
     let c = authority::<2, 8>();
     let t = c.create_table(8, &mut storage(8)).unwrap();
     let high = c.open(t, Fd(7), description(7), true).unwrap();
+    assert_eq!(c.limit(t), Ok(8));
     c.set_limit(t, 0).unwrap();
+    assert_eq!(c.limit(t), Ok(0), "the snapshot reads the soft limit");
     assert!(c.get(t, high).is_ok());
     assert_eq!(c.dup2(t, high, high), Ok(None));
     assert_eq!(c.dup(t, high), Err(Error::TooManyFiles));
@@ -633,6 +635,7 @@ fn lowered_limit_preserves_existing_entries_and_exec() {
     c.set_limit(t, 2).unwrap();
     assert_eq!(c.dup(t, high), Ok(Fd(0)));
     let child = c.fork(t, &mut storage(8)).unwrap();
+    assert_eq!(c.limit(child), Ok(2), "fork inherits the soft limit");
     c.exec(child, |_| panic!("parent retains")).unwrap();
     assert_eq!(c.get(child, high), Err(Error::BadFd));
     assert!(c.get(t, high).is_ok());

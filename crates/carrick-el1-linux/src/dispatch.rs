@@ -2346,10 +2346,26 @@ impl<
                 None => FamilyCompletion::Forward,
             };
         }
-        if nfds > 1024 {
+        let file_table = task
+            .linux
+            .file_table
+            .load(core::sync::atomic::Ordering::Acquire)
+            .max(1);
+        // Linux compares nfds with the caller's soft RLIMIT_NOFILE only after
+        // the timespec and signal mask: EINVAL before the array is touched.
+        let Some(limit) = super::file_table::poll_descriptor_limit(self.ipc, file_table) else {
+            return FamilyCompletion::Forward;
+        };
+        if nfds > limit {
             return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EINVAL.guest_retval());
         }
-        let mut pollfds = alloc::vec![super::file_table::PollFd::default(); nfds];
+        // The guest sizes this array: a set the ring heap cannot hold is
+        // ENOMEM (poll(2)), never an aborting allocation.
+        let mut pollfds = alloc::vec::Vec::new();
+        if pollfds.try_reserve_exact(nfds).is_err() {
+            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_ENOMEM.guest_retval());
+        }
+        pollfds.resize(nfds, super::file_table::PollFd::default());
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(
                 pollfds.as_mut_ptr() as *mut u8,
@@ -2366,11 +2382,6 @@ impl<
         if !copied {
             return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
         }
-        let file_table = task
-            .linux
-            .file_table
-            .load(core::sync::atomic::Ordering::Acquire)
-            .max(1);
         let host_entries = super::file_table::host_readiness_entries(
             self.fd_map,
             self.open_table,
@@ -2378,7 +2389,16 @@ impl<
             &pollfds,
             self.ipc,
         );
+        let Ok(host_entries) = host_entries else {
+            return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_ENOMEM.guest_retval());
+        };
         if let Some(mut entries) = host_entries {
+            // The carrier samples the crossing with one host poll. A larger
+            // host-bound set than it accepts is left unrouted before any
+            // effect; the guest's nfds bound stays its soft RLIMIT_NOFILE.
+            if entries.len() > super::file_table::HOST_READINESS_CROSSING_LIMIT {
+                return FamilyCompletion::Forward;
+            }
             let already_ready = super::file_table::resolve_poll_with_host_readiness(
                 self.fd_map,
                 self.open_table,
