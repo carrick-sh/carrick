@@ -5893,7 +5893,7 @@ fn vfs_open_fallthrough_does_not_build_open_context() {
         LINUX_O_RDWR,
         0,
         0,
-        &mut None,
+        None,
     );
 
     assert_eq!(outcome, VfsOpenAttempt::FallThrough);

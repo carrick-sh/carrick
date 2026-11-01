@@ -2,6 +2,16 @@
   "schema": 1,
   "authority_debt": [
     {
+      "from": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_at_path_string",
+      "to": "carrick_kernel::dispatch::fs::open::FsView<'a>::open_with_sink",
+      "issue": 1335
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::rw::FsView<'a>::write",
+      "to": "carrick_kernel::dispatch::fs::rw::FsView<'a>::begin_description_write",
+      "issue": 1335
+    },
+    {
       "from": "carrick_runtime::vcpu_loop::executor::backend::publish_zone_slot",
       "to": "carrick_runtime::vcpu_loop::executor::backend::fail_zone_slot",
       "issue": 784

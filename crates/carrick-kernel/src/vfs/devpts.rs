@@ -262,6 +262,11 @@ impl Vfs for DevptsVfs {
             .collect())
     }
 
+    /// Every devpts node is a pty end.
+    fn open_needs_caller_task(&self, path: &str) -> bool {
+        path != "/dev/pts"
+    }
+
     fn open(
         &self,
         path: &str,

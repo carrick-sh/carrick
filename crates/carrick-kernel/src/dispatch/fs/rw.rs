@@ -681,7 +681,201 @@ fn read_host_file_sequential<M: CurrentMmMemory>(
     }
 }
 
+/// A `write(2)` of an in-memory `File` description's bytes still to be
+/// written back to the filesystem backend.
+enum FileWriteback {
+    Range {
+        path: String,
+        offset: usize,
+        bytes: Vec<u8>,
+        final_size: usize,
+    },
+}
+
+/// Who a host-file write runs for: a guest task's `write(2)`, or the native
+/// host-file venue's carrier.
+enum HostFileWriter<'c, 'k, M: CurrentMmMemory> {
+    Task {
+        cx: &'c mut SyscallCtx<'k, M>,
+        tid: crate::thread::ThreadId,
+        slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
+    },
+    Carrier(CarrierWrite),
+}
+
+/// Admission of a description write on the native venue's carrier, which
+/// has no task to signal (`SIGXFSZ`) or park and no task to name in a
+/// watcher's event. Held only while no file-size limit applies and no
+/// inotify or fanotify watch exists; otherwise the venue refuses the write.
+pub(in crate::dispatch) struct CarrierWrite(());
+
+/// `write(2)` on a synthetic device: `/dev/full` is full, the rest swallow.
+fn synthetic_device_write(kind: &carrick_vfs::SyntheticDeviceKind, len: usize) -> DispatchOutcome {
+    match kind {
+        carrick_vfs::SyntheticDeviceKind::Full => DispatchOutcome::errno(LINUX_ENOSPC),
+        _ => DispatchOutcome::returned_len_or_errno(len),
+    }
+}
+
+/// `write(2)` into an in-memory `File` description at its offset. `fsize`
+/// is the caller's `RLIMIT_FSIZE` admission of `len` bytes at an offset.
+/// Returns the outcome and the range to write back.
+fn write_file_description(
+    description: &crate::kernel::FileDescription,
+    open: &mut OpenDescription,
+    bytes: &[u8],
+    fsize: impl FnOnce(u64, usize) -> Result<usize, LinuxErrno>,
+) -> Result<(DispatchOutcome, Option<FileWriteback>), LinuxErrno> {
+    let OpenDescription::File {
+        path,
+        contents,
+        offset,
+        writable,
+        metadata,
+        ..
+    } = open
+    else {
+        return Err(LINUX_EBADF);
+    };
+    if !*writable {
+        return Err(LINUX_EBADF);
+    }
+    let cur_len = contents.len()? as usize;
+    // O_APPEND: each write first moves the offset to the end of the file
+    // (open(2)), as the host-file and in-memory-file writes already do.
+    if LinuxOpenFlags::from_bits_truncate(description.common().status_flags())
+        .contains(LinuxOpenFlags::APPEND)
+    {
+        *offset = cur_len;
+    }
+    // memfd write seals: F_SEAL_WRITE → EPERM; F_SEAL_GROW
+    // → EPERM when the write would extend the file.
+    memfd_seal_write_check(description.common().seals(), *offset, bytes.len(), cur_len)?;
+    let bytes = &bytes[..fsize(*offset as u64, bytes.len())?.min(bytes.len())];
+    let write_offset = *offset;
+    let written = write_into_file_contents(contents, offset, bytes)?;
+    let new_len = match contents.len() {
+        Ok(l) => l as usize,
+        Err(errno) if written == 0 => return Err(errno),
+        Err(_) => cur_len.max(write_offset.saturating_add(written)),
+    };
+    metadata.size = new_len;
+    let writeback = (!is_anon_overlay_path(path)).then(|| FileWriteback::Range {
+        path: path.clone(),
+        offset: write_offset,
+        bytes: bytes[..written.min(bytes.len())].to_vec(),
+        final_size: new_len,
+    });
+    Ok((DispatchOutcome::returned_len_or_errno(written), writeback))
+}
+
+/// The shared start of a description write.
+enum DescriptionWrite<'d> {
+    /// A host file, written.
+    Done(DispatchOutcome),
+    /// Any other kind: its write guard and fd lease, for the writer's own
+    /// arms.
+    Other(
+        FileDescriptionWriteGuard<'d>,
+        crate::kernel::objects::FileDescriptionFdLease,
+    ),
+}
+
 impl<'a> FsView<'a> {
+    /// Take the one write guard of `description` for `write(2)` or the
+    /// native venue's carrier, and write a host file through
+    /// [`Self::write_host_file`].
+    fn begin_description_write<'d, M: CurrentMmMemory>(
+        &self,
+        writer: HostFileWriter<'_, '_, M>,
+        description: &'d Arc<crate::kernel::FileDescription>,
+        io_lease: crate::kernel::objects::FileDescriptionFdLease,
+        source: WriteSource<'_>,
+        nonblocking: bool,
+    ) -> Result<DescriptionWrite<'d>, DispatchError> {
+        let Some(mut open) = crate::kernel::FileDescription::write_for_io(description) else {
+            return Ok(DescriptionWrite::Done(DispatchOutcome::errno(LINUX_EBADF)));
+        };
+        if !matches!(&*open, OpenDescription::HostFile { .. }) {
+            return Ok(DescriptionWrite::Other(open, io_lease));
+        }
+        drop(io_lease);
+        self.write_host_file(writer, source, description, &mut open, nonblocking)
+            .map(DescriptionWrite::Done)
+    }
+
+    fn apply_file_writeback(&self, writeback: Option<FileWriteback>) {
+        if let Some(FileWriteback::Range {
+            path,
+            offset,
+            bytes,
+            final_size,
+        }) = writeback
+        {
+            let _ = self
+                .fs
+                .rootfs_vfs
+                .write_file_range(&path, offset, &bytes, final_size);
+        }
+    }
+
+    /// Admit a write on the native venue's carrier: see [`CarrierWrite`].
+    pub(in crate::dispatch) fn admit_carrier_write(&self) -> Option<CarrierWrite> {
+        (self.fsize_soft_limit().is_none()
+            && self.fs.inotify_registry.is_empty()
+            && self.fs.fanotify_registry.is_empty())
+        .then_some(CarrierWrite(()))
+    }
+
+    /// `write(2)` on a description the native host-file venue opened: the
+    /// syscall handler's own description cores, for the kinds that venue
+    /// opens and a carrier can serve (host files, in-memory files and
+    /// synthetic devices). The description's offset and `O_APPEND` apply
+    /// as for any writer; a short write returns its count.
+    pub(in crate::dispatch) fn write_description_from_carrier(
+        &self,
+        admitted: CarrierWrite,
+        description: &Arc<crate::kernel::FileDescription>,
+        bytes: &[u8],
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let nonblocking = LinuxOpenFlags::from_bits_truncate(description.common().status_flags())
+            .contains(LinuxOpenFlags::NONBLOCK);
+        let Some(io_lease) = description.retain_fd_lease() else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        let (mut open, io_lease) = match self.begin_description_write(
+            HostFileWriter::<'_, '_, super::super::outcome::LinearMemory>::Carrier(admitted),
+            description,
+            io_lease,
+            WriteSource::Staged(bytes),
+            nonblocking,
+        )? {
+            DescriptionWrite::Done(outcome) => return Ok(outcome),
+            DescriptionWrite::Other(open, io_lease) => (open, io_lease),
+        };
+        let (outcome, writeback) = match &mut *open {
+            OpenDescription::SyntheticDevice { kind, .. } => {
+                return Ok(synthetic_device_write(kind, bytes.len()));
+            }
+            // No file-size limit applies (`CarrierWrite`).
+            file @ OpenDescription::File { .. } => {
+                match write_file_description(description, file, bytes, |_, len| Ok(len)) {
+                    Ok(written) => written,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            }
+            _ => {
+                return Err(DispatchError::MemoryPreparation(
+                    "a carrier write reached a task-only description".into(),
+                ));
+            }
+        };
+        drop(open);
+        drop(io_lease);
+        self.apply_file_writeback(writeback);
+        Ok(outcome)
+    }
+
     fn suspend_write_copy_in(
         &self,
         target: WriteTarget,
@@ -946,16 +1140,13 @@ impl<'a> FsView<'a> {
         Ok(len.min((limit - offset) as usize))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn write_host_file<M: CurrentMmMemory>(
         &self,
-        cx: &mut SyscallCtx<'_, M>,
-        tid: crate::thread::ThreadId,
+        mut writer: HostFileWriter<'_, '_, M>,
         source: WriteSource<'_>,
-        open_file: &OpenFile,
+        description: &crate::kernel::FileDescription,
         open: &mut FileDescriptionWriteGuard<'_>,
         nonblocking: bool,
-        slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let (out, punch_result) = {
             let Some(host_io) = HostFileIo::from_read(open) else {
@@ -964,16 +1155,21 @@ impl<'a> FsView<'a> {
             if !host_io.is_writable() {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
-            let is_append =
-                LinuxOpenFlags::from_bits_truncate(open_file.description.common().status_flags())
-                    .contains(LinuxOpenFlags::APPEND);
-            let file_limit = self.fsize_soft_limit();
+            let is_append = LinuxOpenFlags::from_bits_truncate(description.common().status_flags())
+                .contains(LinuxOpenFlags::APPEND);
+            let file_limit = match &writer {
+                HostFileWriter::Task { .. } => self.fsize_soft_limit(),
+                // Admitted only with no file-size limit (`CarrierWrite`).
+                HostFileWriter::Carrier(_) => None,
+            };
             let offset_may_be_nonzero = host_io.offset_may_be_nonzero();
             let pos = if is_append {
                 unsafe { libc::lseek(host_io.raw(), 0, libc::SEEK_END) }
             } else if offset_may_be_nonzero || file_limit.is_some() {
                 #[cfg(feature = "conformance-metrics")]
-                if let Some(scope) = cx.kernel.kernel().work_scope() {
+                if let HostFileWriter::Task { cx, .. } = &writer
+                    && let Some(scope) = cx.kernel.kernel().work_scope()
+                {
                     let _ = scope.add(
                         carrick_observability::work_meter::WorkMetric::HostWritePositionQueries,
                         1,
@@ -996,30 +1192,50 @@ impl<'a> FsView<'a> {
             } else {
                 None
             };
-            let write_len = if file_limit.is_some() && pos >= 0 {
-                match self.fsize_write_len(cx, pos as u64, source.len()) {
-                    Ok(len) => len.min(source.len()),
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            let write_len = match (&writer, file_limit) {
+                (HostFileWriter::Task { cx, .. }, Some(_)) if pos >= 0 => {
+                    match self.fsize_write_len(cx, pos as u64, source.len()) {
+                        Ok(len) => len.min(source.len()),
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    }
                 }
-            } else {
-                source.len()
+                _ => source.len(),
             };
             let raw_fd = host_io.raw();
             host_io.record_sequential_io();
-            let host_wait_runner = self.host_wait_runner_for_ctx(cx);
+            let (tid, authority, host_wait_runner): (
+                _,
+                crate::dispatch::io_pipe::HostPipeAuthority,
+                _,
+            ) = match &mut writer {
+                HostFileWriter::Task {
+                    cx,
+                    tid,
+                    slot_authority,
+                } => {
+                    let Some(slot) = *slot_authority else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    (*tid, slot.into(), self.host_wait_runner_for_ctx(cx))
+                }
+                // A regular-file write never parks; a would-block outcome
+                // reaches the venue as an unserved wait.
+                HostFileWriter::Carrier(_) => (
+                    crate::thread::ThreadId::NONE,
+                    WaitFdAuthority::internal(InternalWaitKind::HostReadiness).into(),
+                    None,
+                ),
+            };
             let host_wait_ref = host_wait_runner
                 .as_ref()
                 .map(|runner| runner as &dyn HostWaitRunner);
-            let Some(slot) = slot_authority else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            let target = HostPipeWriteTarget::new(
+            let target: HostPipeWriteTarget<'_> = HostPipeWriteTarget::new(
                 raw_fd,
                 None,
                 nonblocking,
                 HostWriteKind::RegularFile,
                 tid,
-                slot,
+                authority,
                 self.cross.host_signal(),
             )
             .with_host_wait(host_wait_ref);
@@ -1048,7 +1264,10 @@ impl<'a> FsView<'a> {
                         value as usize,
                     );
                 }
-                self.notify_host_file_write_result(cx.kernel, host_io.open_path(), &out);
+                // A carrier write is admitted only with no watchers.
+                if let HostFileWriter::Task { cx, .. } = &writer {
+                    self.notify_host_file_write_result(cx.kernel, host_io.open_path(), &out);
+                }
             }
             (out, punch)
         };
@@ -2151,27 +2370,24 @@ impl<'a> FsView<'a> {
             else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let Some(mut open) =
-                crate::kernel::FileDescription::write_for_io(&open_file.description)
-            else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            let source = match (&direct, zero_copy_host_file) {
+                (Some(read), true) => WriteSource::Guest(read),
+                _ => WriteSource::Staged(bytes),
             };
-            if matches!(&*open, OpenDescription::HostFile { .. }) {
-                drop(io_lease);
-                let source = match (&direct, zero_copy_host_file) {
-                    (Some(read), true) => WriteSource::Guest(read),
-                    _ => WriteSource::Staged(bytes),
-                };
-                return this.write_host_file(
-                    cx,
+            let (mut open, io_lease) = match this.begin_description_write(
+                HostFileWriter::Task {
+                    cx: &mut *cx,
                     tid,
-                    source,
-                    &open_file,
-                    &mut open,
-                    nonblocking,
                     slot_authority,
-                );
-            }
+                },
+                &open_file.description,
+                io_lease,
+                source,
+                nonblocking,
+            )? {
+                DescriptionWrite::Done(outcome) => return Ok(outcome),
+                DescriptionWrite::Other(open, io_lease) => (open, io_lease),
+            };
             // The description stopped being a host file after the
             // zero-copy decision: stage the payload privately now.
             let late_buf;
@@ -2186,28 +2402,15 @@ impl<'a> FsView<'a> {
             };
             // Take an inner scope so the borrow on the description ends
             // before we touch this.fs.rootfs_vfs.overlay (writable File path below).
-            enum FileWriteback {
-                Range {
-                    path: String,
-                    offset: usize,
-                    bytes: Vec<u8>,
-                    final_size: usize,
-                },
-            }
             let outcome: DispatchOutcome;
             let writeback: Option<FileWriteback>;
             let modified_path;
             {
                 modified_path = this.file_write_notification_path(&open, length);
                 match &mut *open {
-                    OpenDescription::SyntheticDevice { kind, .. } => match kind {
-                        carrick_vfs::SyntheticDeviceKind::Full => {
-                            return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
-                        }
-                        _ => {
-                            return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
-                        }
-                    },
+                    OpenDescription::SyntheticDevice { kind, .. } => {
+                        return Ok(synthetic_device_write(kind, bytes.len()));
+                    }
                     OpenDescription::VirtualConsole { console, .. } => {
                         console.write(bytes);
                         return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
@@ -2509,55 +2712,19 @@ impl<'a> FsView<'a> {
                         outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
                         writeback = None;
                     }
-                    OpenDescription::File {
-                        path,
-                        contents,
-                        offset,
-                        writable,
-                        metadata,
-                        ..
-                    } => {
-                        if !*writable {
-                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                        }
-                        let cur_len = match contents.len() {
-                            Ok(l) => l as usize,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                        };
-                        // memfd write seals: F_SEAL_WRITE → EPERM; F_SEAL_GROW
-                        // → EPERM when the write would extend the file.
-                        if let Err(errno) = memfd_seal_write_check(
-                            open_file.description.common().seals(),
-                            *offset,
-                            bytes.len(),
-                            cur_len,
+                    file @ OpenDescription::File { .. } => {
+                        match write_file_description(
+                            &open_file.description,
+                            file,
+                            bytes,
+                            |offset, len| this.fsize_write_len(cx, offset, len),
                         ) {
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        let bytes = match this.fsize_write_len(cx, *offset as u64, bytes.len()) {
-                            Ok(len) => &bytes[..len.min(bytes.len())],
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                        };
-                        let write_offset = *offset;
-                        let written = match write_into_file_contents(contents, offset, bytes) {
-                            Ok(n) => n,
-                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                        };
-                        let new_len = match contents.len() {
-                            Ok(l) => l as usize,
-                            Err(errno) if written == 0 => {
-                                return Ok(DispatchOutcome::errno(errno));
+                            Ok((written, range)) => {
+                                outcome = written;
+                                writeback = range;
                             }
-                            Err(_) => cur_len.max(write_offset.saturating_add(written)),
-                        };
-                        metadata.size = new_len;
-                        outcome = DispatchOutcome::returned_len_or_errno(written);
-                        writeback = (!is_anon_overlay_path(path)).then(|| FileWriteback::Range {
-                            path: path.clone(),
-                            offset: write_offset,
-                            bytes: bytes[..written.min(bytes.len())].to_vec(),
-                            final_size: new_len,
-                        });
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        }
                     }
                     OpenDescription::SyntheticFile { path, .. }
                         if crate::vfs::proc::is_userns_map_path(path) =>
@@ -2657,18 +2824,7 @@ impl<'a> FsView<'a> {
                 }
                 drop(open);
             }
-            if let Some(FileWriteback::Range {
-                path,
-                offset,
-                bytes,
-                final_size,
-            }) = writeback
-            {
-                let _ = this
-                    .fs
-                    .rootfs_vfs
-                    .write_file_range(&path, offset, &bytes, final_size);
-            }
+            this.apply_file_writeback(writeback);
             this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
             return Ok(outcome);
         }

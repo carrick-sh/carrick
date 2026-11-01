@@ -133,6 +133,10 @@ impl Vfs for DevVfs {
         Ok(entries)
     }
 
+    fn open_needs_caller_task(&self, path: &str) -> bool {
+        matches!(path, "/dev/ptmx" | "/dev/tty" | "/dev/tty0")
+    }
+
     fn open(
         &self,
         path: &str,

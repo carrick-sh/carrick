@@ -1121,6 +1121,15 @@ pub trait Vfs: Send + Sync {
         Err(carrick_abi::LINUX_ENOSYS)
     }
 
+    /// True when opening `path` here installs something only a host task's
+    /// open may hold: a terminal end (a pty master or slave, the controlling
+    /// terminal, the virtual console) or a view of the opener's own task. A
+    /// ring-owned (native) process's open refuses such a path before the
+    /// mount acts, rather than open it under another task's identity.
+    fn open_needs_caller_task(&self, _path: &str) -> bool {
+        false
+    }
+
     /// True for single-file synthetic INJECTIONS that are merely defaults the
     /// guest may override: a guest unlink/write/rename of the path detaches the
     /// injection and falls through to the writable rootfs/overlay. Read-only
