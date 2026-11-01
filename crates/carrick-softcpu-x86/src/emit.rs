@@ -349,6 +349,16 @@ fn emit_mem_insn(
     Ok(())
 }
 
+fn uses_high_byte_reg(insn: &Instruction) -> bool {
+    (0..insn.op_count()).any(|i| {
+        insn.op_kind(i) == OpKind::Register
+            && matches!(
+                insn.op_register(i),
+                Register::AH | Register::CH | Register::DH | Register::BH
+            )
+    })
+}
+
 fn emit_rewritten_mem_op(
     out: &mut Vec<u8>,
     insn: &Instruction,
@@ -376,7 +386,28 @@ fn emit_rewritten_mem_op(
     rewritten.set_memory_displacement64(0);
     rewritten.set_memory_displ_size(0);
 
-    encode_one(out, &rewritten, va)?;
+    if uses_high_byte_reg(&rewritten) {
+        // High-byte legacy registers (`AH`/`CH`/`DH`/`BH`) cannot be encoded with any `REX`
+        // prefix, so `[r14]` is illegal. Spill a free non-REX low base register (`RSI`/`RDI`/etc.)
+        // and address `[scratch]` without `REX`.
+        let mut used_mask = (1u16 << 4) | (1u16 << 14) | (1u16 << 15);
+        for r in info_factory.info(&rewritten).used_registers() {
+            if let Some(idx) = gpr_index(r.register()) {
+                used_mask |= 1u16 << idx;
+            }
+        }
+        let addr_gpr = [6usize, 7, 5, 3, 2, 1, 0]
+            .into_iter()
+            .find(|&cand| (used_mask & (1u16 << cand)) == 0)
+            .unwrap_or(6);
+        emit_mov_r15_disp32_from_gpr(out, CTX_VIRT_SPILL1_OFF as i32, addr_gpr);
+        out.extend_from_slice(&[0x4C, 0x89, 0xF0 | (addr_gpr as u8)]); // mov <addr_gpr>, r14
+        rewritten.set_memory_base(map_reg_width(Register::RAX, addr_gpr));
+        encode_one(out, &rewritten, va)?;
+        emit_mov_gpr_from_r15_disp32(out, addr_gpr, CTX_VIRT_SPILL1_OFF as i32);
+    } else {
+        encode_one(out, &rewritten, va)?;
+    }
     end_virt_r14_r15(out, &virt);
     Ok(())
 }
@@ -430,8 +461,14 @@ fn begin_virt_r14_r15(
         }
     }
 
+    let high_byte = uses_high_byte_reg(insn);
     let mut pick_free = || -> usize {
-        for cand in [8usize, 9, 10, 11, 12, 13, 3, 5, 6, 7] {
+        let order: &[usize] = if high_byte {
+            &[3, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        } else {
+            &[8, 9, 10, 11, 12, 13, 3, 5, 6, 7]
+        };
+        for &cand in order {
             if (used_mask & (1u16 << cand)) == 0 {
                 used_mask |= 1u16 << cand;
                 return cand;

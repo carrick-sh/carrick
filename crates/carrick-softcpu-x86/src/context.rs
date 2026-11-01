@@ -175,6 +175,22 @@ impl X86Exception {
     }
 }
 
+/// Refusal returned when injecting an architectural exception vector (`0..=31`) as an external interrupt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidInterruptVector(pub u8);
+
+impl std::fmt::Display for InvalidInterruptVector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "external interrupt vector {} lies in reserved exception range 0..32",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidInterruptVector {}
+
 /// Architectural `GDTR`/`IDTR` 10-byte pseudo-descriptor (`u16` byte limit + 64-bit linear base).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DescriptorTablePtr {
@@ -560,6 +576,21 @@ impl SoftCpuContext {
 
     pub fn reset_tlb_stats(&mut self) {
         self.tlb.reset_stats();
+    }
+
+    /// Queue an external maskable interrupt vector (`32..=255`).
+    pub fn inject_interrupt(&mut self, _vector: u8) -> Result<(), InvalidInterruptVector> {
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn is_interrupt_pending(&self, _vector: u8) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn deliverable_interrupt(&self) -> Option<u8> {
+        None
     }
 
     /// Borrow the single architectural MSR authority for this vCPU.

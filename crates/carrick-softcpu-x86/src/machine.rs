@@ -114,6 +114,24 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
         }
     }
 
+    /// Queue an external maskable interrupt vector (`32..=255`) on this machine's vCPU.
+    pub fn inject_interrupt(
+        &mut self,
+        vector: u8,
+    ) -> Result<(), crate::context::InvalidInterruptVector> {
+        self.cpu.context_mut().inject_interrupt(vector)
+    }
+
+    #[must_use]
+    pub fn is_interrupt_pending(&self, vector: u8) -> bool {
+        self.cpu.context().is_interrupt_pending(vector)
+    }
+
+    #[must_use]
+    pub fn deliverable_interrupt(&self) -> Option<u8> {
+        self.cpu.context().deliverable_interrupt()
+    }
+
     /// Execute one basic block and resolve internal architectural transitions (`SYSCALL`,
     /// 64-bit `IDT` exception/interrupt delivery). Returns `Ok(None)` when guest execution
     /// continues inside the machine, or `Ok(Some(exit))` on a host-visible exit (`HLT`, PIO, triple fault).

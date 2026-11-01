@@ -19,8 +19,8 @@ pub mod privileged;
 pub use block::{BlockExit, BlockFetchFault, MAX_INSN_BYTES, PlannedBlock, plan_block_from_memory};
 pub use cflow::{compute_effective_va, eval_cc, resolve_cflow};
 pub use context::{
-    AdmitRefused, DescriptorTablePtr, FxsaveArea, HostAccess, SoftCpuContext, SoftSegment,
-    X86Exception, X86ExceptionVector, reg,
+    AdmitRefused, DescriptorTablePtr, FxsaveArea, HostAccess, InvalidInterruptVector,
+    SoftCpuContext, SoftSegment, X86Exception, X86ExceptionVector, reg,
 };
 pub use cpu::{JitCodeBuffer, RunningContext, RunningCpu, SoftCpu, SoftCpuExit, SoftCpuNewError};
 pub use cpuid::{Cpl0CpuidView, CpuidRegs, DEFAULT_TSC_HZ, GuestCpuidView, Level0CpuidView};
