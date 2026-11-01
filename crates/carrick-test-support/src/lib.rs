@@ -12,6 +12,10 @@
 //! [`TestEl1Region`] provides aligned backing for VM-free tests that address
 //! cache-line-aligned ABI records in a synthetic EL1 region.
 //!
+//! [`GuestUserBuffer`] provides guest user memory, below the user ceiling on
+//! every host, for hosted kernel tests that pass user pointers; its
+//! [`assert_guest_args`] check catches a host pointer posing as one.
+//!
 //! It is a separate crate, rather than a `#[cfg(test)]` module, for one reason:
 //! the same fixture builders are consumed from MULTIPLE crates' test targets
 //! (`carrick-cli/tests/cli.rs`, `carrick-runtime/tests/...`), and a test-only
@@ -29,6 +33,8 @@ use std::io::Write;
 
 mod el1_region;
 pub use el1_region::TestEl1Region;
+pub mod guest_user;
+pub use guest_user::{GuestUserBuffer, GuestUserValue, assert_guest_args, user_arg};
 
 pub fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
     gzip_tar_with_modes(files.map(|(path, contents)| (path, contents, 0o644)))

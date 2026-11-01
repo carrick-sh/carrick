@@ -164,10 +164,11 @@ fn fork_child_service_ack(stdout: bool, root_exit: bool, child_exit: bool) {
     // Re-selecting a different MM would hide stale installed-space occupancy.
     let mut saved = unsafe { *fixture.zone.record(child).ctx_mut() };
     let stdout_bytes = b"mask-storm role=child sends=2000 send_failures=0 ok=true\n";
+    let stdout_user = carrick_test_support::GuestUserBuffer::from_bytes(stdout_bytes);
     if stdout {
         // Same SVC words as the signed sender's 57-byte stdout write.
         saved.native.x[0] = 1;
-        saved.native.x[1] = stdout_bytes.as_ptr() as u64;
+        saved.native.x[1] = stdout_user.arg();
         saved.native.x[2] = 0x39;
         saved.native.x[8] = 64;
         saved.native.pc = 0x2a6f20;

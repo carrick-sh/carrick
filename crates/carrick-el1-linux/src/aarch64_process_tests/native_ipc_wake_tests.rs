@@ -669,8 +669,8 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                 );
             }
             assert!(!fixture.zone.record(child.record.id).has_object_operation());
-            let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
-            let stack_base = stack.0.as_mut_ptr() as u64;
+            let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+            let stack_base = stack.va().raw();
             assert!(entry.signal_checkpoint_needed());
             let control = fixture.task.lifecycle_refs().unwrap().1;
             let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
@@ -682,7 +682,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                     &mut frame,
                     fp.as_bytes(),
                     &mut ArmWaitSignalMachine {
-                        user_sp: UserVa::new(stack_base + stack.0.len() as u64),
+                        user_sp: stack.va_at(stack.len()),
                         backend: ArmWaitSignalBackend,
                     }
                 ),
@@ -692,7 +692,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             assert_eq!(frame.x[0], 10);
             let offset = usize::try_from(frame.x[1].checked_sub(stack_base).unwrap()).unwrap();
             let decoded = carrick_personality_linux::signal::arm::decode(
-                &stack.0[offset..],
+                &stack.as_bytes()[offset..],
                 UserVa::new(frame.x[1]),
                 true,
             )

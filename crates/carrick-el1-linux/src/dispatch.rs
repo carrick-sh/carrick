@@ -3871,23 +3871,37 @@ pub unsafe fn serve_locked_file_op(
 mod tests {
     use super::super::native_process_runtime::NativeThreadGroupOwner;
     use super::*;
+    use carrick_test_support::GuestUserBuffer;
     use core::sync::atomic::Ordering;
+
+    /// An SVC frame for syscall `nr` whose user pointers are guest user VAs
+    /// (the harness check refuses a host pointer in `args`).
+    fn svc_frame(nr: u64, args: &[u64]) -> TrapFrame {
+        carrick_test_support::assert_guest_args(args);
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            ..TrapFrame::default()
+        };
+        frame.x[..args.len()].copy_from_slice(args);
+        frame.x[8] = nr;
+        frame
+    }
 
     #[test]
     fn blocking_poll_without_a_wait_venue_does_not_publish_timeout_output() {
         let tasks = [CurrentTask::new()];
         let counters = Counters::default();
-        let mut polls = [super::super::file_table::PollFd {
+        let polls = GuestUserBuffer::from_value(super::super::file_table::PollFd {
             fd: -1,
             events: 1,
             revents: 0x1234,
-        }];
-        let timeout = [1i64, 0];
-        let mut frame = TrapFrame::default();
-        frame.x[8] = carrick_syscall_abi::nr::PPOLL.raw();
-        frame.x[0] = polls.as_mut_ptr() as u64;
-        frame.x[1] = 1;
-        frame.x[2] = timeout.as_ptr() as u64;
+        });
+        let timeout = GuestUserBuffer::from_values(&[1i64, 0]);
+        let mut frame = svc_frame(
+            carrick_syscall_abi::nr::PPOLL.raw(),
+            &[polls.arg(), 1, timeout.arg()],
+        );
+        frame.esr = 0;
         let mut pending = El1PendingFamilies {
             handoff: None,
             lifecycle_user: None,
@@ -3912,7 +3926,8 @@ mod tests {
             FamilyCompletion::Forward
         );
         assert_eq!(
-            polls[0].revents, 0x1234,
+            polls.get::<super::super::file_table::PollFd>(0).revents,
+            0x1234,
             "an incomplete readiness decision owns no output"
         );
     }
@@ -4071,19 +4086,12 @@ mod tests {
     #[test]
     fn native_exec_capture_stages_before_releasing_the_ring_lane() {
         let task = CurrentTask::new();
-        let path = b"/bin/static\0";
-        let arg = b"static\0";
-        let env = b"A=B\0";
-        let argv = [arg.as_ptr().addr() as u64, 0];
-        let envp = [env.as_ptr().addr() as u64, 0];
-        let mut frame = TrapFrame {
-            esr: 0x15 << 26,
-            ..TrapFrame::default()
-        };
-        frame.x[8] = 221;
-        frame.x[0] = path.as_ptr().addr() as u64;
-        frame.x[1] = argv.as_ptr().addr() as u64;
-        frame.x[2] = envp.as_ptr().addr() as u64;
+        let path = GuestUserBuffer::from_bytes(b"/bin/static\0");
+        let arg = GuestUserBuffer::from_bytes(b"static\0");
+        let env = GuestUserBuffer::from_bytes(b"A=B\0");
+        let argv = GuestUserBuffer::from_values(&[arg.arg(), 0]);
+        let envp = GuestUserBuffer::from_values(&[env.arg(), 0]);
+        let frame = svc_frame(221, &[path.arg(), argv.arg(), envp.arg()]);
 
         let payload = match native_exec_stage(&frame, &task).unwrap() {
             NativeExecStage::Payload(payload) => payload,
