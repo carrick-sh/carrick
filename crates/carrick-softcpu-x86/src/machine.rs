@@ -157,7 +157,7 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
             next_rip,
         } => {
             let ctx = cpu.context_mut();
-            match deliver_idt_vector(ctx, mem, vector, rip, next_rip, None, None, true, false) {
+            match deliver_idt_vector(ctx, mem, vector, rip, next_rip, None, true, false) {
                 Ok(()) => None,
                 Err(fault) => deliver_exception_with_escalation(ctx, mem, fault),
             }
@@ -277,6 +277,8 @@ fn deliver_exception_with_escalation<M: SoftMmuMemory>(
     let mut saved_rip = current.rip;
 
     loop {
+        // SDM Vol. 3A §6.15 (Interrupt 14): CR2 is loaded when the #PF is recognized,
+        // before delivery, so it holds even if delivery itself then faults.
         if let Some(cr2) = current.cr2 {
             ctx.cr2 = cr2;
         }
@@ -292,7 +294,6 @@ fn deliver_exception_with_escalation<M: SoftMmuMemory>(
             fault_va,
             saved_rip,
             arch_error_code,
-            current.cr2,
             check_dpl,
             external_event,
         ) {
@@ -330,7 +331,6 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     fault_va: u64,
     saved_rip: u64,
     error_code: Option<u32>,
-    cr2_update: Option<u64>,
     check_dpl: bool,
     external_event: bool,
 ) -> Result<(), X86Exception> {
@@ -440,9 +440,6 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     frame_buf[cursor + 32..cursor + 40].copy_from_slice(&u64::from(old_ss).to_le_bytes());
 
     cs_loaded.precheck_accessed_write(ctx, mem, fault_va)?;
-    if let Some(cr2) = cr2_update {
-        ctx.cr2 = cr2;
-    }
     write_idt_stack_frame(ctx, mem, new_rsp, new_cpl, &frame_buf[..frame_len])
         .map_err(|pf| X86Exception::page_fault(fault_va, pf.error_code, pf.cr2))?;
     cs_loaded.commit_accessed_write(ctx, mem, fault_va)?;
