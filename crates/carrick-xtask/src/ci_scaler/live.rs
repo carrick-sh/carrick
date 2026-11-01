@@ -165,8 +165,13 @@ fn clone_config(public_key: &str, site: &Site, vm: CloneId) -> Result<Value, Sca
             encoded.push(char::from(HEX[usize::from(byte & 15)]));
         }
     }
+    // `ciupgrade: 0`: PVE's cloud-init otherwise writes `package_upgrade:
+    // true`, so every clone ran `apt-get update` and `dist-upgrade` against
+    // the Debian mirrors on first boot (about two minutes), and a failed
+    // update left cloud-init degraded and the clone never ready (#1265).
+    // The template already holds its packages.
     let mut config = json!({
-        "ciuser":"runner", "sshkeys":encoded,
+        "ciuser":"runner", "sshkeys":encoded, "ciupgrade":0,
         "ipconfig0":site.ipconfig(vm.get())?, "tags":"carrick-ci;willow-pilot",
         "cores":site.cores,"memory":site.memory_mib,"balloon":0,"cpulimit":site.cores,"cpu":"host"
     });
@@ -3080,6 +3085,11 @@ mod tests {
         assert_eq!(config["memory"], 16384);
         assert_eq!(config["ipconfig0"], "ip=10.77.0.108/24,gw=10.77.0.1");
         assert_eq!(config["nameserver"], "1.1.1.1");
+        // #1265: no clone upgrades its packages at boot, on any site.
+        for site in [&super::site::WILLOW, &super::site::CONTABO] {
+            let config = clone_config("ssh-ed25519 AAAA\n", site, vm).unwrap();
+            assert_eq!(config["ciupgrade"], 0);
+        }
     }
     #[test]
     fn recovered_one_job_preserves_error_history_and_requires_actual_assignment() {
