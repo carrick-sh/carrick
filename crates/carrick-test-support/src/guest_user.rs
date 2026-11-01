@@ -379,6 +379,23 @@ fn host_readable(address: u64) -> bool {
     true
 }
 
+/// Initialise the harness's own state before a test measures allocations.
+///
+/// The live-buffer registry and the host-readable probe are lazily built
+/// statics, and on macOS std's `Mutex` allocates its pthread mutex the first
+/// time it is locked (Linux's futex mutex does not). Whichever test locks
+/// them first pays those allocations, so a zero-allocation window that
+/// reaches [`assert_guest_args`] or [`user_arg`] would count harness work,
+/// not kernel work, depending on test order. Call this once before taking
+/// the baseline of any allocation-counting window; it builds both statics
+/// and takes both locks, leaving later calls allocation-free.
+pub fn warm() {
+    drop(registry().lock().unwrap());
+    // Address 0 is never readable: this builds the probe pipe and takes its
+    // lock without needing a mapped byte.
+    assert!(!host_readable(0), "address 0 must not be host-readable");
+}
+
 /// The harness check for raw syscall arguments a test feeds the kernel.
 ///
 /// Each argument is a scalar, a deliberately invalid address, or a guest
