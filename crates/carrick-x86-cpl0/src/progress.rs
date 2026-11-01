@@ -275,7 +275,9 @@ extern "C" fn carrick_progress_interrupt(
         carrick_x86_carrier::entry::halt();
     }
     // Shared FIFO/claims decide the next task; there is no x86 run queue.
-    zone().requeue_preempted(SLOT, record);
+    if !zone().requeue_preempted(SLOT, record).is_queued() {
+        stop(15);
+    }
     let next = zone().switch_in(SLOT).unwrap_or_else(|| stop(11));
     // SAFETY: `tasks` and `maintenance_root` are initialized before boot and
     // never mutated in CPL0.

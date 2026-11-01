@@ -154,7 +154,7 @@ fn current_handback_preserves_birth_incarnation_for_mint() {
                     zone.occupancy
                         .replace(occupancy::ExecutionSlot::zone(SLOT), 0, 7)
                 );
-                zone.requeue_preempted(SLOT, id);
+                assert!(zone.requeue_preempted(SLOT, id).is_queued());
                 assert_eq!(zone.switch_in(SLOT), Some(id));
                 let seq = zone.record(id).claim().seq();
                 if requested {
@@ -694,7 +694,7 @@ fn concurrent_group_exit_keeps_direct_load_terminal_intent_before_release() {
             })
             .unwrap();
         let record = zone.record_ref(id);
-        zone.requeue_preempted(SLOT, id);
+        assert!(zone.requeue_preempted(SLOT, id).is_queued());
         assert_eq!(zone.switch_in(SLOT), Some(id));
         let owner = Arc::new(AtomicU32::new(0));
         let live = Arc::new(AtomicU32::new(2));

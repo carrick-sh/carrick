@@ -684,7 +684,10 @@ fn exec_publication_retires_late_ledger_entry() {
                 || ("operations drained".into(), None),
             )
             .unwrap();
-        assert_eq!(*late_entries.lock(), [false]);
+        assert_eq!(
+            *late_entries.lock(),
+            [carrick_kernel::kernel::FirstEntryAdoption::NoHostThread]
+        );
         assert!(kernel.task_key_is_live(peer.task().key()));
         assert_eq!(peer.task().threads().len(), 1);
         assert_eq!(contexts[0].task().threads().len(), 1);
