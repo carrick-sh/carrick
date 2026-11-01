@@ -2070,7 +2070,14 @@ else:
         );
         git(
             &origin,
-            &["merge", "--no-ff", "-q", "-m", "Merge pr into main", &pr_head],
+            &[
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "Merge pr into main",
+                &pr_head,
+            ],
         );
         let pr_merge_sha = git(&origin, &["rev-parse", "HEAD"]);
         git(
@@ -2079,10 +2086,7 @@ else:
         );
 
         // Stacked PR targeting work/pr-42 (lower layer based on main_commits[2]).
-        git(
-            &origin,
-            &["checkout", "-q", "-b", "work/pr-43", &pr_head],
-        );
+        git(&origin, &["checkout", "-q", "-b", "work/pr-43", &pr_head]);
         std::fs::write(origin.join("stack.txt"), "upper layer\n").unwrap();
         git(&origin, &["add", "stack.txt"]);
         git(&origin, &["commit", "-q", "-m", "stack upper"]);
@@ -2179,15 +2183,37 @@ else:
         };
 
         // Negative controls fail closed before any receipt lookup.
+        let zero_sha = "0".repeat(40);
         for (bad_sha, bad_ref, expected_heading) in [
-            ("0".repeat(40), "refs/pull/1/merge", "## Invalid candidate commit"),
-            (orphan_root, "refs/heads/unrelated", "## Invalid candidate history"),
-            (orphan_child, "refs/heads/unrelated", "## No main ancestor"),
+            (
+                zero_sha.as_str(),
+                "refs/pull/1/merge",
+                "## Invalid candidate commit",
+            ),
+            (
+                orphan_root.as_str(),
+                "refs/heads/unrelated",
+                "## Invalid candidate history",
+            ),
+            (
+                orphan_child.as_str(),
+                "refs/heads/unrelated",
+                "## No main ancestor",
+            ),
         ] {
-            let (out, gh_out, summary) = run_ancestor_step(&bad_sha, bad_ref);
+            let (out, gh_out, summary) = run_ancestor_step(bad_sha, bad_ref);
             assert!(!out.status.success());
             assert!(gh_out.is_empty(), "{gh_out}");
             assert!(summary.contains(expected_heading), "{summary}");
+            assert!(
+                carrick_xtask::ci_receipt::resolve_main_ancestor(
+                    &job_root.join("selector"),
+                    "HEAD",
+                    bad_sha
+                )
+                .is_err(),
+                "resolve_main_ancestor must reject {bad_sha}"
+            );
         }
 
         // PR merge commit resolves BEFORE_SHA = main_commits[2] even after main moved to [3].
@@ -2223,6 +2249,22 @@ else:
             mg_gh_out.contains(&format!("before_sha={}\n", main_commits[3])),
             "{mg_gh_out}"
         );
+
+        // First-class xtask `resolve_main_ancestor` agrees on every shape.
+        for (candidate_sha, expected_before) in [
+            (&pr_merge_sha, &main_commits[2]),
+            (&stack_merge_sha, &main_commits[2]),
+            (&queue_head, &main_commits[3]),
+        ] {
+            let resolved = carrick_xtask::ci_receipt::resolve_main_ancestor(
+                &job_root.join("selector"),
+                "HEAD",
+                candidate_sha,
+            )
+            .unwrap();
+            assert_eq!(&resolved.selector_sha, &main_commits[3]);
+            assert_eq!(&resolved.before_sha, expected_before);
+        }
 
         // Mock `gh` serving both `gh api` (select-baseline + gate) and `gh run download` (gate).
         // Only main_commits[1] has a trusted kernel-runtime.yml el1-native receipt; an untrusted
@@ -2294,9 +2336,14 @@ else:
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
 
-        // Select baseline for both PR merge commit and merge-group queue head.
+        // Select baseline via both `--before-sha` (workflow rollout compatibility)
+        // and `--main-ref HEAD` (native xtask ancestor resolution).
         for (before_sha, candidate_sha, expected_covered) in [
-            (&main_commits[2], &pr_merge_sha, vec![main_commits[2].clone()]),
+            (
+                &main_commits[2],
+                &pr_merge_sha,
+                vec![main_commits[2].clone()],
+            ),
             (
                 &main_commits[3],
                 &queue_head,
@@ -2308,45 +2355,63 @@ else:
                 ],
             ),
         ] {
-            let sel_out_file = temp.path().join("sel_out");
-            let sel_sum_file = temp.path().join("sel_sum");
-            std::fs::write(&sel_out_file, "").unwrap();
-            std::fs::write(&sel_sum_file, "").unwrap();
-            let sel = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-                .current_dir(job_root.join("selector"))
-                .args([
+            for mode in ["before-sha", "main-ref"] {
+                let sel_out_file = temp.path().join("sel_out");
+                let sel_sum_file = temp.path().join("sel_sum");
+                std::fs::write(&sel_out_file, "").unwrap();
+                std::fs::write(&sel_sum_file, "").unwrap();
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+                cmd.current_dir(job_root.join("selector")).args([
                     "ci-receipt",
                     "select-baseline",
                     "--lane",
                     "el1-native",
-                    "--before-sha",
-                    before_sha,
-                    "--candidate-sha",
-                    candidate_sha,
-                    "--wait-minutes",
-                    "0",
-                    "--poll-seconds",
-                    "1",
-                ])
-                .env("PATH", &path_env)
-                .env("RECEIPT_API_FIXTURE", &api_fixture)
-                .env("GITHUB_OUTPUT", &sel_out_file)
-                .env("GITHUB_STEP_SUMMARY", &sel_sum_file)
-                .output()
-                .unwrap();
-            assert!(
-                sel.status.success(),
-                "{}",
-                String::from_utf8_lossy(&sel.stderr)
-            );
-            let sel_outputs = std::fs::read_to_string(&sel_out_file).unwrap();
-            assert!(
-                sel_outputs.contains(&format!("sha={}\n", main_commits[1])),
-                "{sel_outputs}"
-            );
-            let sel_summary = std::fs::read_to_string(&sel_sum_file).unwrap();
-            for covered in expected_covered {
-                assert!(sel_summary.contains(&covered), "{sel_summary}");
+                ]);
+                if mode == "before-sha" {
+                    cmd.args(["--before-sha", before_sha]);
+                } else {
+                    cmd.args(["--main-ref", "HEAD"]);
+                }
+                let sel = cmd
+                    .args([
+                        "--candidate-sha",
+                        candidate_sha,
+                        "--wait-minutes",
+                        "0",
+                        "--poll-seconds",
+                        "1",
+                    ])
+                    .env("PATH", &path_env)
+                    .env("RECEIPT_API_FIXTURE", &api_fixture)
+                    .env("GITHUB_OUTPUT", &sel_out_file)
+                    .env("GITHUB_STEP_SUMMARY", &sel_sum_file)
+                    .output()
+                    .unwrap();
+                assert!(
+                    sel.status.success(),
+                    "{mode}: {}",
+                    String::from_utf8_lossy(&sel.stderr)
+                );
+                let sel_outputs = std::fs::read_to_string(&sel_out_file).unwrap();
+                assert!(
+                    sel_outputs.contains(&format!("sha={}\n", main_commits[1])),
+                    "{mode}: {sel_outputs}"
+                );
+                if mode == "main-ref" {
+                    assert!(
+                        sel_outputs.contains(&format!("selector_sha={}\n", main_commits[3])),
+                        "{sel_outputs}"
+                    );
+                    assert!(
+                        sel_outputs.contains(&format!("before_sha={before_sha}\n")),
+                        "{sel_outputs}"
+                    );
+                    assert!(sel_outputs.contains("reuse=false\n"), "{sel_outputs}");
+                }
+                let sel_summary = std::fs::read_to_string(&sel_sum_file).unwrap();
+                for covered in &expected_covered {
+                    assert!(sel_summary.contains(covered), "{mode}: {sel_summary}");
+                }
             }
         }
 
@@ -2412,8 +2477,9 @@ else:
         assert!(!regressed_gate.status.success());
         let regressed_stdout = String::from_utf8_lossy(&regressed_gate.stdout);
         assert!(
-            regressed_stdout
-                .contains("test:el1-native-tests:carrick_el1_linux::new_failing_native_process_test"),
+            regressed_stdout.contains(
+                "test:el1-native-tests:carrick_el1_linux::new_failing_native_process_test"
+            ),
             "{regressed_stdout}"
         );
     }
@@ -2470,13 +2536,17 @@ fn ci_workflow_gates_el1_native_before_landing_with_trusted_baseline_code() {
             .all(|r| !r.contains("ci-receipt gate")),
         "el1-native-tests must only produce and upload its receipt"
     );
-    assert!(
-        lane_steps.iter().any(|s| {
+    let accept_step = lane_steps
+        .iter()
+        .find(|s| {
             s["run"]
                 .as_str()
                 .is_some_and(|r| r.contains("just accept --profile el1-native --receipt"))
-        }),
-        "el1-native-tests must run `just accept --profile el1-native`"
+        })
+        .expect("el1-native-tests must run `just accept --profile el1-native`");
+    assert!(
+        accept_step["if"].is_badvalue(),
+        "EL1 native-process receipt step must only run when toolchain/xtask setup succeeded"
     );
     assert!(
         lane_steps.iter().any(|s| {
@@ -2505,10 +2575,11 @@ fn ci_workflow_gates_el1_native_before_landing_with_trusted_baseline_code() {
     assert!(gate["timeout-minutes"].as_i64().unwrap() >= 70);
 
     let gate_steps = gate["steps"].as_vec().unwrap();
-    for checkout in gate_steps
-        .iter()
-        .filter(|s| s["uses"].as_str().is_some_and(|u| u.starts_with("actions/checkout@")))
-    {
+    for checkout in gate_steps.iter().filter(|s| {
+        s["uses"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("actions/checkout@"))
+    }) {
         let path = checkout["with"]["path"].as_str();
         let git_ref = checkout["with"]["ref"].as_str();
         assert!(
@@ -2519,7 +2590,10 @@ fn ci_workflow_gates_el1_native_before_landing_with_trusted_baseline_code() {
             ),
             "el1-native-gate must never check out candidate PR code: path={path:?} ref={git_ref:?}"
         );
-        assert_eq!(checkout["with"]["persist-credentials"].as_bool(), Some(false));
+        assert_eq!(
+            checkout["with"]["persist-credentials"].as_bool(),
+            Some(false)
+        );
     }
     for build_step in gate_steps
         .iter()
@@ -2554,11 +2628,17 @@ fn ci_workflow_gates_el1_native_before_landing_with_trusted_baseline_code() {
 
     let compare = gate_steps
         .iter()
-        .find(|s| s["run"].as_str().is_some_and(|r| r.contains("ci-receipt gate --lane el1-native")))
+        .find(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.contains("ci-receipt gate --lane el1-native"))
+        })
         .unwrap();
     assert_eq!(
         compare["working-directory"].as_str(),
-        Some("${{ steps.baseline.outputs.sha == steps.ancestor.outputs.selector_sha && 'selector' || 'baseline' }}")
+        Some(
+            "${{ steps.baseline.outputs.sha == steps.ancestor.outputs.selector_sha && 'selector' || 'baseline' }}"
+        )
     );
     assert_eq!(
         compare["env"]["BASE_SHA"].as_str(),

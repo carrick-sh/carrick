@@ -1,8 +1,9 @@
 //! Per-SHA trusted-runner baselines over the one `AcceptReceipt` format.
 //!
-//! `kernel-runtime.yml` uploads each signed-HVF and KVM receipt as the
-//! artifact `receipt-<lane>-<sha>-<attempt>`. Trusted pre-push code selects
-//! the nearest receipted first-parent ancestor from event.before. The selected
+//! `kernel-runtime.yml` uploads each signed-HVF, KVM, and `el1-native` receipt
+//! on `main` as `receipt-<lane>-<sha>-<attempt>`, and `ci.yml` uploads
+//! pre-landing `el1-native` receipts for PRs and merge groups. Trusted `main`
+//! code selects the nearest receipted first-parent `main` ancestor, and that
 //! baseline's own xtask grades candidate receipt data and fails on NEW.
 //! Missing baselines and history/walk errors remain distinct from regressions.
 
@@ -1116,6 +1117,105 @@ impl ReceiptWait {
     }
 }
 
+/// Trusted `main` tip (`selector_sha`) and the nearest `main` first-parent
+/// commit (`before_sha`) that is a proper first-parent ancestor of a PR merge
+/// commit, stacked PR merge commit, or merge-group queue head (#1303).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MainAncestor {
+    pub selector_sha: String,
+    pub before_sha: String,
+}
+
+/// Resolve the nearest first-parent commit on `main_ref` (e.g. `HEAD` or
+/// `refs/heads/main`) that is a proper first-parent ancestor of `candidate_sha`.
+pub fn resolve_main_ancestor(
+    root: &Path,
+    main_ref: &str,
+    candidate_sha: &str,
+) -> Result<MainAncestor, ReceiptError> {
+    validate_sha(candidate_sha).map_err(|e| ReceiptError::InvalidPushHistory(e.to_string()))?;
+    if candidate_sha.bytes().all(|b| b == b'0') {
+        return Err(ReceiptError::InvalidPushHistory(
+            "candidate must be a nonzero commit SHA".into(),
+        ));
+    }
+    let main_ref = main_ref.trim();
+    if main_ref.is_empty() {
+        return Err(ReceiptError::InvalidPushHistory(
+            "main_ref must be non-empty".into(),
+        ));
+    }
+    let io = |source| ReceiptError::Io {
+        path: root.to_path_buf(),
+        source,
+    };
+    let rev_parse = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--verify", &format!("{main_ref}^{{commit}}")])
+        .output()
+        .map_err(io)?;
+    if !rev_parse.status.success() {
+        return Err(ReceiptError::InvalidPushHistory(format!(
+            "cannot resolve trusted main ref '{main_ref}'"
+        )));
+    }
+    let selector_sha = String::from_utf8_lossy(&rev_parse.stdout).trim().to_owned();
+    validate_sha(&selector_sha).map_err(|e| ReceiptError::InvalidPushHistory(e.to_string()))?;
+
+    let main_out = Command::new("git")
+        .current_dir(root)
+        .args(["rev-list", "--first-parent", &selector_sha])
+        .output()
+        .map_err(io)?;
+    if !main_out.status.success() {
+        return Err(ReceiptError::InvalidPushHistory(format!(
+            "cannot read first-parent history of '{main_ref}'"
+        )));
+    }
+    let main_text = String::from_utf8_lossy(&main_out.stdout);
+    let main_first_parents: BTreeSet<&str> = main_text.lines().filter(|s| !s.is_empty()).collect();
+
+    let cand_out = Command::new("git")
+        .current_dir(root)
+        .args(["rev-list", "--first-parent", &format!("{candidate_sha}^1")])
+        .output()
+        .map_err(io)?;
+    if !cand_out.status.success() {
+        return Err(ReceiptError::InvalidPushHistory(format!(
+            "candidate {candidate_sha} has no first parent"
+        )));
+    }
+    let cand_text = String::from_utf8_lossy(&cand_out.stdout);
+    let before_sha = cand_text
+        .lines()
+        .find(|sha| main_first_parents.contains(sha))
+        .ok_or_else(|| {
+            ReceiptError::InvalidPushHistory(format!(
+                "candidate {candidate_sha} shares no first-parent ancestor with {main_ref}"
+            ))
+        })?
+        .to_owned();
+
+    Ok(MainAncestor {
+        selector_sha,
+        before_sha,
+    })
+}
+
+/// Resolve the nearest `main` first-parent ancestor of a PR or merge-group
+/// candidate and select its nearest receipted baseline (#1303).
+pub fn select_baseline_from_main(
+    root: &Path,
+    lane: Lane,
+    main_ref: &str,
+    candidate_sha: &str,
+    lookup: impl FnMut(Lane, &str) -> Result<Baseline, ReceiptError>,
+) -> Result<(MainAncestor, BaselineSelection), ReceiptError> {
+    let ancestor = resolve_main_ancestor(root, main_ref, candidate_sha)?;
+    let selected = select_baseline(root, lane, &ancestor.before_sha, candidate_sha, lookup)?;
+    Ok((ancestor, selected))
+}
+
 /// Resolve from the push event's old tip, never from HEAD^1. Receipt lookup
 /// waits for Pending runs before deciding absence. The search inspects at most
 /// 50 first-parent commits and shares one bounded wait across all lookups.
@@ -1414,13 +1514,26 @@ pub enum ReceiptAction {
         #[arg(long)]
         fail_on_new: bool,
     },
-    /// Select the nearest receipted first-parent ancestor from push event.before.
-    /// Emits a notice and job summary; writes sha/reuse to GITHUB_OUTPUT.
+    /// Select the nearest receipted first-parent ancestor from push event.before
+    /// (`--before-sha`) or from a trusted `main` ref (`--main-ref`) for PR and
+    /// merge-group runs (#1303). Emits a notice and job summary; writes
+    /// `sha`/`reuse` (plus `selector_sha`/`before_sha` for `--main-ref`) to
+    /// `GITHUB_OUTPUT`.
     SelectBaseline {
         #[arg(long, value_enum)]
         lane: Lane,
-        #[arg(long)]
-        before_sha: String,
+        #[arg(
+            long,
+            required_unless_present = "main_ref",
+            conflicts_with = "main_ref"
+        )]
+        before_sha: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "before_sha",
+            conflicts_with = "before_sha"
+        )]
+        main_ref: Option<String>,
         #[arg(long)]
         candidate_sha: String,
         #[arg(long, default_value = ".")]
@@ -1516,34 +1629,68 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
         ReceiptAction::SelectBaseline {
             lane,
             before_sha,
+            main_ref,
             candidate_sha,
             history_dir,
             wait_minutes,
             poll_seconds,
         } => {
-            let selected = select_baseline_waiting(
-                &history_dir,
-                lane,
-                &before_sha,
-                &candidate_sha,
-                query_baseline,
-                ReceiptWait::new(
-                    Duration::from_secs(wait_minutes * 60),
-                    Duration::from_secs(poll_seconds),
-                ),
+            let wait = ReceiptWait::new(
+                Duration::from_secs(wait_minutes * 60),
+                Duration::from_secs(poll_seconds),
             );
-            match selected {
-                Ok(selected) => {
+            let outcome = match (before_sha, main_ref) {
+                (Some(before_sha), None) => select_baseline_waiting(
+                    &history_dir,
+                    lane,
+                    &before_sha,
+                    &candidate_sha,
+                    query_baseline,
+                    wait,
+                )
+                .map(|selected| (None, before_sha, selected)),
+                (None, Some(main_ref)) => {
+                    resolve_main_ancestor(&history_dir, &main_ref, &candidate_sha).and_then(
+                        |ancestor| {
+                            select_baseline_waiting(
+                                &history_dir,
+                                lane,
+                                &ancestor.before_sha,
+                                &candidate_sha,
+                                query_baseline,
+                                wait,
+                            )
+                            .map(|selected| {
+                                let before = ancestor.before_sha.clone();
+                                (Some(ancestor), before, selected)
+                            })
+                        },
+                    )
+                }
+                _ => Err(ReceiptError::InvalidPushHistory(
+                    "specify exactly one of --before-sha or --main-ref".into(),
+                )),
+            };
+            match outcome {
+                Ok((ancestor, before_sha, selected)) => {
                     println!("::notice title=Receipt baseline::{}", selected.notice());
                     append_github_file("GITHUB_STEP_SUMMARY", &selected.markdown())?;
-                    append_github_file(
-                        "GITHUB_OUTPUT",
-                        &format!(
+                    let outputs = if let Some(ancestor) = ancestor {
+                        format!(
+                            "selector_sha={}\nbefore_sha={}\nsha={}\nreuse={}",
+                            ancestor.selector_sha,
+                            ancestor.before_sha,
+                            selected.baseline_sha,
+                            selected.baseline_sha == ancestor.selector_sha
+                        )
+                    } else {
+                        format!(
                             "sha={}\nreuse={}",
                             selected.baseline_sha,
                             selected.baseline_sha == before_sha
-                        ),
-                    )?;
+                        )
+                    };
+                    append_github_file("GITHUB_OUTPUT", &outputs)?;
                     Ok(())
                 }
                 Err(error) => {

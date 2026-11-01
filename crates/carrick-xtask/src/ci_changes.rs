@@ -608,7 +608,14 @@ impl El1NativeClosure {
         }
         let output = Command::new("cargo")
             .current_dir(repo_root)
-            .args(["metadata", "--format-version", "1", "--no-deps", "--locked", "--offline"])
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--locked",
+                "--offline",
+            ])
             .stderr(std::process::Stdio::null())
             .output()
             .ok()?;
@@ -620,7 +627,8 @@ impl El1NativeClosure {
     }
 
     pub fn from_cargo_metadata(repo_root: &Path, metadata: &serde_json::Value) -> Option<Self> {
-        let canonical_root = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        let canonical_root =
+            fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
         let packages = metadata.get("packages")?.as_array()?;
         let mut member_dirs = BTreeMap::new();
         let mut pkg_names = BTreeSet::new();
@@ -658,7 +666,10 @@ impl El1NativeClosure {
                 continue;
             };
             let entry = deps_by_pkg.entry(name.to_owned()).or_default();
-            if let Some(deps) = pkg.get("dependencies").and_then(serde_json::Value::as_array) {
+            if let Some(deps) = pkg
+                .get("dependencies")
+                .and_then(serde_json::Value::as_array)
+            {
                 for dep in deps {
                     if let Some(dep_name) = dep.get("name").and_then(serde_json::Value::as_str)
                         && pkg_names.contains(dep_name)
