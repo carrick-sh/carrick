@@ -3351,7 +3351,7 @@ mod layout_manifest {
             ThreadControlSlot,
             release_waiter,
             carrick_core::lifecycle::MemberReleaseWaiter,
-            240,
+            256,
             16,
             8
         );
@@ -3359,7 +3359,7 @@ mod layout_manifest {
             ThreadControlSlot,
             service,
             carrick_core_abi::service::ServiceCell,
-            256,
+            320,
             128,
             64
         );
