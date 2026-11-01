@@ -1103,6 +1103,25 @@ pub struct SlotTableTransaction<'view, 'core, B: SlotBacking, W: LockWait, const
 }
 
 impl<B: SlotBacking, W: LockWait, const T: usize> SlotTableTransaction<'_, '_, B, W, T> {
+    /// Withdraw a slot only while it still names the expected physical
+    /// incarnation. A concurrent close or replacement makes rollback a no-op.
+    /// The returned last-hold description must be released outside this scope.
+    pub fn close_if_backing(
+        &mut self,
+        fd: Fd,
+        expected: BackingToken,
+    ) -> Result<Option<Description>, Error> {
+        let entry = match self.table.entry(fd) {
+            Ok(entry) => entry,
+            Err(Error::BadFd) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if self.authority.snapshot(entry.ofd)?.backing != expected {
+            return Ok(None);
+        }
+        self.authority.close_locked(&self.table, fd)
+    }
+
     /// Publish two prepared descriptions in the lowest free slots at or above
     /// `min` (reader then writer for pipe2). The pins remain caller-owned on
     /// both success and refusal. Provision backing and prepare user copy

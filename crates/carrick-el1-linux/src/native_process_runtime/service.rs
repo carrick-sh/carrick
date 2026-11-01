@@ -2238,17 +2238,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             }
                         };
                     }
+                    let zone = self.source.zone;
+                    let slot = self.source.slot;
+                    let current = self.current;
                     let mut copy_out = |address: u64, bytes: &[u8]| {
                         self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)
                             .is_ok()
                     };
-                    Ok(NativeResume::Returned(
-                        carrick_personality_linux::native_host_file::complete(
-                            &pending_file.record,
-                            pending_file.output,
-                            &mut copy_out,
-                        ),
-                    ))
+                    let result = crate::ipc::complete_host_file(
+                        || crate::ipc::guest_venue(slot.index() as u32).map(|venue| venue.region),
+                        &pending_file.record,
+                        pending_file.output,
+                        &mut copy_out,
+                        Some((zone, slot)),
+                        current,
+                    )
+                    .map_err(|_| NativeProcessError::Quarantined)?;
+                    Ok(NativeResume::Returned(result))
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied) => {
                     // Supplied without a reply is a transport violation.

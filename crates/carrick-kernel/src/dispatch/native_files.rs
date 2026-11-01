@@ -144,6 +144,7 @@ impl NativeOpenSink {
 }
 
 enum Served {
+    PipePair([fd::Fd; 2], [fd::BackingToken; 2]),
     Reply(i64, Vec<u8>),
     Source(
         Arc<dyn carrick_hal::fork_stock::HostBackingRetention>,
@@ -193,7 +194,7 @@ impl SyscallDispatcher {
         authority: Option<&NativeFsAuthority>,
         record: &mut [u8],
     ) -> Result<NativeHostFileServed, NativeHostFileRefusal> {
-        let view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal)?;
+        let mut view = HostFileRequestView::parse(record).map_err(|_| NativeHostFileRefusal)?;
         let header = view.header();
         let table = fd::TableId::from_raw(fd::RawTableId {
             authority: header.table[0],
@@ -228,6 +229,17 @@ impl SyscallDispatcher {
             }
         };
         let (result, output, retained_source) = match served {
+            Served::PipePair(pair, backings) => {
+                let mut args = header.args;
+                args[1] = backings[0].0;
+                args[2] = backings[1].0;
+                view.set_args(args);
+                let mut output = Vec::with_capacity(8);
+                for number in pair {
+                    output.extend_from_slice(&number.0.to_le_bytes());
+                }
+                (0, output, None)
+            }
             Served::Reply(result, output) => (result, output, None),
             Served::Source(source, reply) => (0, reply.encode().to_vec(), Some(source)),
             Served::Refused => return Err(NativeHostFileRefusal),
@@ -324,12 +336,7 @@ impl SyscallDispatcher {
             Err(errno) => return Served::errno(errno),
         };
         match pipe.install_native_pair(table, flags & carrick_abi::LINUX_O_CLOEXEC != 0) {
-            Ok([reader, writer]) => {
-                let mut output = Vec::with_capacity(8);
-                output.extend_from_slice(&reader.0.to_le_bytes());
-                output.extend_from_slice(&writer.0.to_le_bytes());
-                Served::Reply(0, output)
-            }
+            Ok(pair) => Served::PipePair(pair, pipe.native_pair_backings()),
             Err(InstallHostDescriptionError::TooManyFiles) => {
                 Served::errno(carrick_abi::LINUX_EMFILE)
             }
@@ -833,6 +840,72 @@ mod tests {
                 region.lock(object, &HostLockWait).is_err(),
                 "final close retires the object"
             );
+        }
+    }
+
+    #[test]
+    fn native_pipe_failed_completion_withdraws_only_the_created_pair() {
+        use crate::el1_zone::HostLockWait;
+        use carrick_personality_linux::native_host_file::HostFileOutput;
+        for reuse in [false, true] {
+            let fixture = fixture();
+            let child =
+                crate::el1_ipc::HostTable::create(Arc::clone(&fixture.owner), 64, 64).unwrap();
+            let raw = child.id().to_raw();
+            let table = [raw.authority, raw.index, raw.generation];
+            let mut record = record(table, HostFileOp::Pipe2, 0, [0; 4], &[], 8);
+            fixture.serve(None, &mut record).unwrap();
+            let peer = child.fork().unwrap();
+            let region = fixture.owner.region();
+            let fds = region.fd(HostLockWait);
+            let current = carrick_el1_abi::CurrentTask::new();
+            let result = carrick_el1_linux::ipc::complete_host_file::<
+                carrick_sched_core::ParkedContextWords,
+            >(
+                || Some(fixture.owner.region()),
+                &record,
+                Some(HostFileOutput {
+                    address: 0x10000,
+                    len: 8,
+                }),
+                &mut |_, _| {
+                    if reuse {
+                        // A live sibling replaced the returned reader number
+                        // before the failing copy completes. It now names a writer.
+                        assert!(
+                            fds.dup2(child.id(), fd::Fd(1), fd::Fd(0))
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                    false
+                },
+                None,
+                &current,
+            )
+            .unwrap();
+            assert_eq!(result.raw(), carrick_abi::LINUX_EFAULT.guest_retval());
+            assert_eq!(fds.getfd(child.id(), fd::Fd(1)), Err(fd::Error::BadFd));
+            if reuse {
+                assert_eq!(
+                    fds.getfl(child.id(), fd::Fd(0)).unwrap().0,
+                    fd::AccessMode::WriteOnly
+                );
+                assert!(fds.close(child.id(), fd::Fd(0)).unwrap().is_none());
+            } else {
+                assert_eq!(
+                    fds.getfd(child.id(), fd::Fd(0)),
+                    Err(fd::Error::BadFd),
+                    "failed copyout must not leak the pair"
+                );
+            }
+            for fd in [fd::Fd(0), fd::Fd(1)] {
+                assert_eq!(
+                    fds.getfd(peer.id(), fd),
+                    Ok(false),
+                    "rollback belongs only to the creator's table"
+                );
+            }
         }
     }
 

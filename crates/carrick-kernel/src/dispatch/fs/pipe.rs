@@ -446,6 +446,18 @@ impl PipeInner {
             .read_with(count, copy);
         self.finish(guard, step)
     }
+    pub(in crate::dispatch) fn native_pair_backings(
+        &self,
+    ) -> [carrick_el1_abi::ipc::fd::BackingToken; 2] {
+        [core_pipe::End::Reader, core_pipe::End::Writer].map(|end| {
+            IpcBacking::Pipe {
+                object: self.object,
+                end,
+            }
+            .encode()
+        })
+    }
+
     pub(in crate::dispatch) fn install_native_pair(
         &self,
         table: carrick_el1_abi::ipc::fd::TableId,

@@ -18,6 +18,8 @@ Pipe creation is staged once to the carrier's existing pipe factory and
 publishes two existing in-zone OFDs atomically into the caller's ring table.
 It allocates zero host fd slots and retains zero host-resource tokens. Subsequent
 I/O and close remain in ring; the carrier retains no endpoint after publication.
+A failed output copy withdraws each newly created endpoint only while its
+slot still names that exact backing incarnation, preserving concurrent reuse.
 Paths resolve with the caller's own credentials and filesystem context, never
 the serving task's. The VM-free witnesses compare venue results with the
 dispatcher's syscalls byte for byte and prove the in-zone routing.
@@ -30,6 +32,8 @@ vm_free = [
   "carrick-personality-linux::native_host_file::tests::native_pipe2_is_admitted_before_carrier_service",
   "carrick-kernel::dispatch::native_files::tests::native_child_pipe_pair_owns_only_its_table_and_round_trips_in_zone",
   "carrick-kernel::dispatch::native_files::tests::native_pipe_pair_limit_and_invalid_flags_publish_nothing",
+  "carrick-kernel::dispatch::native_files::tests::native_pipe_failed_completion_withdraws_only_the_created_pair",
+  "carrick-fd-core::tests::conditional_rollback_preserves_reused_slots_and_peer_descriptors",
   "carrick-el1-linux::dispatch::tests::native_host_file_stage_keeps_in_zone_writes_in_ring_and_stages_host_stdout",
   "carrick-kernel::dispatch::mem::native_successor::tests::successor_image_rows_cover_every_user_leaf_and_make_elf_pages_lazy",
   "carrick-kernel::dispatch::native_files::tests::in_zone_pipe_stat_matches_the_dispatchers_pipe_record",
