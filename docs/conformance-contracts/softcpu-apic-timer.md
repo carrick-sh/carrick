@@ -54,4 +54,26 @@ Review regressions, all in the `softcpu_apic_timer` bindings:
   case proves an already-passed deadline returns without parking.
 
 The crate suites and two-vCPU fixture pass; there are no `serial_host` cases.
-Delivery modes, cluster broadcast, stale-kick HLT cost and KVM parity remain follow-ups.
+KVM parity remains a follow-up.
+
+### Delivery and halted work bounds (#1357)
+
+Intel SDM Vol. 3A sections 10.6.1 and 10.6.2.2 distinguish fixed and
+lowest-priority delivery from SMI, NMI, INIT and SIPI, and specify destination
+0xFF as broadcast for both logical models. The standalone and clustered ICR
+paths share one decision about which messages populate IRR. Unsupported
+non-fixed modes remain unimplemented; they no longer masquerade as fixed
+interrupts or produce illegal-vector errors for their non-vector payloads.
+Physical 0xFF also broadcasts, including on a standalone APIC.
+
+The VM-free red witnesses observed an IRR bit for mode 0x200 on a standalone
+APIC, no self delivery for physical broadcast, and no logical broadcast in
+cluster mode. The HLT witness exhausted three host exits without a single
+wait enrollment after an illegal vector. With the fix, illegal vectors and
+IRR blocked by TPR, PPR or IF=0 park on the node notification queue. The CPU's
+deliverability predicate is rechecked under the enrollment mutex; kicks are
+notifications, rather than durable evidence that an interrupt can execute.
+At each of three successive waits the host-exit count remains zero until a
+new notification. Timer deadlines still use the same enrolled clock path.
+These are ISA mechanics; no Linux syscall or shared-kernel policy changes.
+Signed kernel/carrier acceptance remains outside this VM-free contract.

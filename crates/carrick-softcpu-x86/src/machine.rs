@@ -227,10 +227,13 @@ fn wait_for_apic_event(cpu: &SoftCpu, max_wait: Duration) {
         .map(|deadline| cpu.context().msrs().clock_deadline(deadline));
     let tsc_hz = cpu.context().tsc_hz();
     let node = cpu.apic_node();
+    let ready = || {
+        (cpu.context().rflags & RFLAGS_IF) != 0 && cpu.context().has_deliverable_apic_interrupt()
+    };
     if let Some(clock) = cpu.context().msrs().clock() {
-        let _ = clock.wait_until(deadline, tsc_hz, &node, max_wait);
+        let _ = clock.wait_until(deadline, tsc_hz, &node, max_wait, &ready);
     } else {
-        let _ = node.wait_for_kick_or_timeout(max_wait);
+        let _ = node.wait_for_event(max_wait, ready);
     }
 }
 
@@ -256,7 +259,8 @@ fn handle_cpu_exit<M: SoftMmuMemory>(
         SoftCpuExit::Continue { .. } => None,
         SoftCpuExit::Hlt { rip, next_rip } => {
             let _ = cpu.poll_apic_timer();
-            if !cpu.context().has_deliverable_apic_interrupt()
+            if ((cpu.context().rflags & RFLAGS_IF) == 0
+                || !cpu.context().has_deliverable_apic_interrupt())
                 && let Some(max_wait) = hlt_wait_timeout
             {
                 wait_for_apic_event(cpu, max_wait);
