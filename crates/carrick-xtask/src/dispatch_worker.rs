@@ -1842,9 +1842,15 @@ fn retire_account(user: &str) -> Result<(), ScalerError> {
     retire_agent_with(&mut command, user)
 }
 fn retire_agent_with(command: &mut Command, user: &str) -> Result<(), ScalerError> {
+    // The census reads each process's state from /proc; without it a
+    // listed pid could not be told from a gone one, so fail closed.
+    if !Path::new("/proc/self/stat").is_file() {
+        return Err(ScalerError::Guard("cannot verify agent process retirement"));
+    }
+    let mut survivors = Vec::new();
     for _ in 0..100 {
         crate::process_helper::run_checked(command)?;
-        let mut empty = true;
+        let mut entries = Vec::new();
         for selector in ["-u", "-U"] {
             let status = Command::new("/usr/bin/pgrep")
                 .args([selector, user])
@@ -1852,30 +1858,121 @@ fn retire_agent_with(command: &mut Command, user: &str) -> Result<(), ScalerErro
             match status.status.code() {
                 Some(1) if status.stdout.is_empty() && status.stderr.is_empty() => {}
                 Some(0) => {
-                    empty = false;
-                    // Reap only this uid's adopted children. A loop launcher may
-                    // exit while a worker retires; its Child still owns its wait.
                     for pid in String::from_utf8_lossy(&status.stdout).split_whitespace() {
                         let pid = pid
                             .parse::<libc::pid_t>()
                             .map_err(|_| ScalerError::Guard("invalid retirement census pid"))?;
+                        // Reap only this uid's adopted children. A loop launcher may
+                        // exit while a worker retires; its Child still owns its wait.
                         // SAFETY: WNOHANG reaps only this named completed child.
                         unsafe {
                             libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
+                        }
+                        if let Some(entry) = census_entry(pid) {
+                            entries.push(entry);
                         }
                     }
                 }
                 _ => return Err(ScalerError::Guard("cannot verify agent process retirement")),
             }
         }
-        if empty {
+        survivors = live_survivors(entries);
+        if survivors.is_empty() {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    Err(ScalerError::Guard(
-        "agent user still has processes; packaging refused",
-    ))
+    Err(ScalerError::Usage(format!(
+        "agent user still has processes; packaging refused: {}",
+        survivors
+            .iter()
+            .map(CensusEntry::describe)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )))
+}
+
+/// One process the retirement census found (#1286), read from
+/// `/proc/<pid>/stat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CensusEntry {
+    pid: libc::pid_t,
+    state: char,
+    parent: libc::pid_t,
+    command: String,
+    /// A thread of this process is in a live state: a zombie thread-group
+    /// leader whose other threads still run is not dead.
+    live_thread: bool,
+}
+impl CensusEntry {
+    fn describe(&self) -> String {
+        format!(
+            "pid {} `{}` state {} parent {}",
+            self.pid, self.command, self.state, self.parent
+        )
+    }
+}
+/// The census entry for `pid`, or `None` only once the process is gone
+/// (`/proc/<pid>` not found). Anything unreadable or unparseable is a
+/// survivor: the census fails closed (#1286 review).
+fn census_entry(pid: libc::pid_t) -> Option<CensusEntry> {
+    let unverified = |why: &str| CensusEntry {
+        pid,
+        state: '?',
+        parent: 0,
+        command: format!("<{why}>"),
+        live_thread: true,
+    };
+    let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(unverified("stat unreadable")),
+    };
+    let Some(mut entry) = parse_stat(pid, &String::from_utf8_lossy(&stat)) else {
+        return Some(unverified("stat unparseable"));
+    };
+    if entry.state == 'Z' {
+        entry.live_thread = match std::fs::read_dir(format!("/proc/{pid}/task")) {
+            Ok(tasks) => tasks.flatten().any(|task| {
+                std::fs::read(task.path().join("stat")).map_or(true, |bytes| {
+                    parse_stat(pid, &String::from_utf8_lossy(&bytes))
+                        .is_none_or(|thread| !matches!(thread.state, 'Z' | 'X' | 'x'))
+                })
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+        };
+    }
+    Some(entry)
+}
+/// `/proc/<pid>/stat`: `pid (comm) state ppid ...`; `comm` may hold spaces
+/// and parentheses, so it ends at the last `)`.
+fn parse_stat(pid: libc::pid_t, stat: &str) -> Option<CensusEntry> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let mut rest = stat.get(close + 1..)?.split_whitespace();
+    let state = rest.next()?.chars().next()?;
+    let parent = rest.next()?.parse().ok()?;
+    Some(CensusEntry {
+        pid,
+        state,
+        parent,
+        command: stat.get(open + 1..close)?.to_owned(),
+        live_thread: false,
+    })
+}
+/// The census entries that can still run (#1286). After the helper's
+/// SIGKILL the agent uid can't run anything; a zombie (`Z`) or a fully
+/// dead (`X`) entry holds no code that could write the worktree, only a
+/// pid its parent has yet to reap, so it doesn't block packaging.
+fn live_survivors(entries: Vec<CensusEntry>) -> Vec<CensusEntry> {
+    let mut live: Vec<CensusEntry> = entries
+        .into_iter()
+        .filter(|entry| entry.live_thread || !matches!(entry.state, 'Z' | 'X' | 'x'))
+        .collect();
+    live.sort_by_key(|entry| entry.pid);
+    live.dedup_by_key(|entry| entry.pid);
+    live
 }
 pub(crate) fn cleanup_dispatch_users() -> Result<(), ScalerError> {
     // Attempt both retirements even when one account census fails.
@@ -5884,6 +5981,44 @@ pub(crate) mod chain_fixture {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    /// #1286: only a process that can still run blocks packaging; a zombie
+    /// left for another parent to reap does not. Survivors are named.
+    #[test]
+    fn retirement_census_ignores_zombies_and_names_live_survivors() {
+        let zombie = parse_stat(41, "41 (cargo) Z 1 41 41 0 -1").unwrap();
+        assert_eq!(
+            zombie,
+            CensusEntry {
+                pid: 41,
+                state: 'Z',
+                parent: 1,
+                command: "cargo".into(),
+                live_thread: false,
+            }
+        );
+        // A command name can hold spaces and parentheses.
+        let odd = parse_stat(42, "42 (rustc (worker) 2) D 40 42 42 0 -1").unwrap();
+        assert_eq!(
+            (odd.command.as_str(), odd.state, odd.parent),
+            ("rustc (worker) 2", 'D', 40)
+        );
+        assert!(live_survivors(vec![zombie.clone()]).is_empty());
+        let live = live_survivors(vec![zombie, odd.clone(), odd]);
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0].describe(),
+            "pid 42 `rustc (worker) 2` state D parent 40"
+        );
+        assert!(parse_stat(43, "garbage").is_none());
+        // A zombie leader whose other threads still run is a survivor.
+        let leader = CensusEntry {
+            live_thread: true,
+            ..parse_stat(44, "44 (worker) Z 1 44 44 0 -1").unwrap()
+        };
+        assert_eq!(live_survivors(vec![leader]).len(), 1);
+        // Gone means only "not found": a pid that can't exist is gone.
+        assert!(census_entry(libc::pid_t::MAX).is_none());
+    }
     /// #1229: a running agent's output reaches the step log while it runs,
     /// through the production serve loop, masked, line by line, with a
     /// final partial line only once the writer exits.
