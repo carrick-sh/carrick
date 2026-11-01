@@ -122,6 +122,11 @@ pub trait GuestCpuidView: Send + Sync {
         let leaf = self.cpuid(0x0d, 0);
         (u64::from(leaf.edx) << 32) | u64::from(leaf.eax)
     }
+
+    /// Initial 8-bit xAPIC ID advertised in `CPUID.01H:EBX[31:24]`.
+    fn apic_id(&self) -> u8 {
+        (self.cpuid(1, 0).ebx >> 24) as u8
+    }
 }
 
 /// Default guest TSC crystal frequency (2 GHz) advertised via `CPUID.15H`.
@@ -209,6 +214,15 @@ impl Cpl0CpuidView {
             umip: true,
             pcid: true,
             tsc_deadline: false,
+        }
+    }
+
+    /// Construct a CPL0 `CPUID` view with `CPUID.01H:ECX.TSC_Deadline[bit 24]` enabled.
+    #[must_use]
+    pub const fn with_tsc_deadline(apic_id: u8, tsc_hz: u32) -> Self {
+        Self {
+            tsc_deadline: true,
+            ..Self::new(apic_id, tsc_hz)
         }
     }
 }

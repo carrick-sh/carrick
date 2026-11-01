@@ -322,6 +322,8 @@ impl SoftCpu {
     ) -> Result<Self, SoftCpuNewError> {
         let mut ctx = SoftCpuContext::new(extents).map_err(SoftCpuNewError::Seat)?;
         ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
+        ctx.tsc_hz = cpuid.tsc_hz();
+        ctx.lapic.set_apic_id(cpuid.apic_id());
         Ok(Self {
             ctx: Box::new(ctx),
             jit: JitCodeBuffer::new(DEFAULT_JIT_CAPACITY).ok_or(SoftCpuNewError::Jit)?,
@@ -337,10 +339,39 @@ impl SoftCpu {
         &*self.cpuid
     }
 
-    /// Replace the installed [`GuestCpuidView`] between runs, updating `MAXPHYADDR`.
+    /// Replace the installed [`GuestCpuidView`] between runs, updating `MAXPHYADDR`, `tsc_hz`,
+    /// and local APIC ID.
     pub fn set_cpuid_view(&mut self, cpuid: Box<dyn GuestCpuidView>) {
         self.ctx.walker.set_max_phy_addr(cpuid.max_phy_addr());
+        self.ctx.tsc_hz = cpuid.tsc_hz();
+        self.ctx.lapic.set_apic_id(cpuid.apic_id());
         self.cpuid = cpuid;
+    }
+
+    /// Attaches an injectable [`crate::apic::TscClock`] to this CPU.
+    pub fn set_clock(&mut self, clock: std::sync::Arc<dyn crate::apic::TscClock>) {
+        self.ctx.set_clock(clock);
+    }
+
+    /// Attaches this CPU's local xAPIC to a shared [`crate::apic::ApicCluster`].
+    pub fn attach_apic_cluster(&mut self, cluster: std::sync::Arc<crate::apic::ApicCluster>) {
+        self.ctx.attach_apic_cluster(cluster);
+    }
+
+    /// Returns a shared handle to this CPU's [`crate::apic::ApicNode`] for cross-thread IPIs and kicks.
+    #[must_use]
+    pub fn apic_node(&self) -> std::sync::Arc<crate::apic::ApicNode> {
+        self.ctx.apic_node()
+    }
+
+    /// Polls the local APIC timer against the current TSC value.
+    pub fn poll_apic_timer(&mut self) -> bool {
+        self.ctx.poll_apic_timer()
+    }
+
+    /// Injects an external interrupt `vector` into this CPU's local APIC `IRR` and kicks it.
+    pub fn inject_interrupt(&self, vector: u8) -> bool {
+        self.ctx.lapic.inject_interrupt(vector)
     }
 
     /// Run a sequence of blocks. Block entry inside the run costs own-line
@@ -399,6 +430,7 @@ impl SoftCpu {
         self.ctx.pending_exception = None;
         self.ctx.icebp_trap = false;
         self.ctx.halted = false;
+        let _ = self.ctx.poll_apic_timer();
         crate::context::prepare_gateway(self.ctx.rip)?;
         if !mem.extents().is_member(&self.ctx.seat) {
             return Err(EmitError::ForeignInventory { va: self.ctx.rip });
@@ -433,6 +465,7 @@ impl SoftCpu {
         match plan_block_from_memory(rip, max_i, max_s, &mut self.ctx, mem) {
             Ok(b) => {
                 let single_step = self.ctx.rflags & (1 << 8) != 0;
+                let had_sti_shadow = self.ctx.interrupt_shadow;
                 let block_exit = &b.exit;
                 let is_iret = matches!(
                     block_exit,
@@ -442,6 +475,9 @@ impl SoftCpu {
                     }
                 );
                 let result = self.execute_planned_block(&b, mem)?;
+                if had_sti_shadow {
+                    self.ctx.interrupt_shadow = false;
+                }
                 if !is_iret && !matches!(result, SoftCpuExit::Exception(_)) {
                     // SDM Vol. 3A §2.3 / §17.3.1.1: RF is cleared after any non-IRET instruction
                     // completes without faulting; IRET loads RF from stacked RFLAGS so RF=1 can

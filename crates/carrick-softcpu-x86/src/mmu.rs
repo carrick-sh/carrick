@@ -107,6 +107,30 @@ fn admit<'c, M: SoftMmuMemory>(
         .map_err(|_| SoftPageFault::new(va, 0))
 }
 
+/// Resolved target of a guest virtual address translation (either host-backed RAM or the local
+/// xAPIC MMIO page at `IA32_APIC_BASE[35:12]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TranslatedTarget {
+    Ram(*mut u8),
+    LapicMmio { offset: u16 },
+}
+
+fn is_lapic_mmio_gpa(ctx: &SoftCpuContext, gpa: u64, kind: SoftAccessKind) -> Option<u16> {
+    if kind == SoftAccessKind::Execute {
+        return None;
+    }
+    let apic_base = ctx.msrs().apic_base();
+    if (apic_base & (1 << 11)) == 0 {
+        return None;
+    }
+    let lapic_page = apic_base & 0x000f_ffff_ffff_f000;
+    if (gpa & !0xfff) == lapic_page {
+        Some((gpa & 0xfff) as u16)
+    } else {
+        None
+    }
+}
+
 /// Walk `va` through `ctx.walker` and `mem`, filling `ctx.tlb` and returning the host byte pointer
 /// and authenticated [`AuthenticatedGpa`] of the resolved 4 KiB frame.
 ///
@@ -168,6 +192,71 @@ fn walk_with_frame_mode<M: SoftMmuMemory>(
     }
 }
 
+fn walk_target_mode<M: SoftMmuMemory>(
+    access: &mut HostAccess<'_>,
+    mem: &mut M,
+    va: u64,
+    kind: SoftAccessKind,
+    mode: CpuAccessMode,
+) -> Result<TranslatedTarget, SoftPageFault> {
+    let ctx = access.context_mut();
+    let root = ctx.root_gpa().ok_or(SoftPageFault::new(va, 0))?;
+    match ctx
+        .walker
+        .walk_and_fill(mem, &mut ctx.tlb, root, GuestVa::new(va), kind, mode)
+    {
+        Ok(WalkOutcome::Ram(resolved)) => Ok(TranslatedTarget::Ram(resolved.host_addr as *mut u8)),
+        Ok(WalkOutcome::Mmio { gpa, .. }) => {
+            if let Some(offset) = is_lapic_mmio_gpa(ctx, gpa, kind) {
+                return Ok(TranslatedTarget::LapicMmio { offset });
+            }
+            let mut bits = if mode.cpl == Cpl::Ring3 {
+                PF_ERR_USER
+            } else {
+                0
+            };
+            if kind == SoftAccessKind::Write {
+                bits |= PF_ERR_WRITE;
+            } else if kind == SoftAccessKind::Execute {
+                bits |= PF_ERR_INSTR;
+            }
+            Err(SoftPageFault::new(va, bits))
+        }
+        Err(SoftTranslationError::UnauthenticatedExtent { leaf, .. }) => {
+            if let Some(offset) = is_lapic_mmio_gpa(ctx, leaf.output.raw(), kind) {
+                return Ok(TranslatedTarget::LapicMmio { offset });
+            }
+            let mut bits = if mode.cpl == Cpl::Ring3 {
+                PF_ERR_USER
+            } else {
+                0
+            };
+            if kind == SoftAccessKind::Write {
+                bits |= PF_ERR_WRITE;
+            } else if kind == SoftAccessKind::Execute {
+                bits |= PF_ERR_INSTR;
+            }
+            Err(SoftPageFault::new(va, bits))
+        }
+        Err(SoftTranslationError::CpuException(SoftCpuException::PageFault(info))) => {
+            Err(SoftPageFault::from_info(info))
+        }
+        Err(_) => {
+            let mut bits = if mode.cpl == Cpl::Ring3 {
+                PF_ERR_USER
+            } else {
+                0
+            };
+            if kind == SoftAccessKind::Write {
+                bits |= PF_ERR_WRITE;
+            } else if kind == SoftAccessKind::Execute {
+                bits |= PF_ERR_INSTR;
+            }
+            Err(SoftPageFault::new(va, bits))
+        }
+    }
+}
+
 /// Translate `va` using `ctx.tlb` as a front cache, falling back to `ctx.walker` on a miss.
 ///
 /// A parked CPU is admitted for the lookup, so a retirement that completed
@@ -182,6 +271,17 @@ pub fn translate_va<M: SoftMmuMemory>(
     let mut access = admit(ctx, mem, va)?;
     let mode = access.access_mode();
     probe_or_walk_mode(&mut access, mem, va, kind, mode)
+}
+
+pub(crate) fn translate_target_va<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    va: u64,
+    kind: SoftAccessKind,
+) -> Result<TranslatedTarget, SoftPageFault> {
+    let mut access = admit(ctx, mem, va)?;
+    let mode = access.access_mode();
+    probe_or_walk_target_mode(&mut access, mem, va, kind, mode)
 }
 
 fn probe_or_walk_mode<M: SoftMmuMemory>(
@@ -201,6 +301,23 @@ fn probe_or_walk_mode<M: SoftMmuMemory>(
     walk_with_frame_mode(access, mem, va, kind, mode).map(|(ptr, _)| ptr)
 }
 
+fn probe_or_walk_target_mode<M: SoftMmuMemory>(
+    access: &mut HostAccess<'_>,
+    mem: &mut M,
+    va: u64,
+    kind: SoftAccessKind,
+    mode: CpuAccessMode,
+) -> Result<TranslatedTarget, SoftPageFault> {
+    if let Some(host_addr) = access
+        .context_mut()
+        .tlb
+        .probe(GuestVa::new(va), 1, kind, mode)
+    {
+        return Ok(TranslatedTarget::Ram(host_addr as *mut u8));
+    }
+    walk_target_mode(access, mem, va, kind, mode)
+}
+
 /// Read `dst.len()` bytes starting at guest `va`, pre-validating all spanned pages.
 pub fn read_guest_bytes<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
@@ -210,9 +327,17 @@ pub fn read_guest_bytes<M: SoftMmuMemory>(
     kind: SoftAccessKind,
 ) -> Result<(), SoftPageFault> {
     let mode = ctx.access_mode();
-    walk_span_mode(ctx, mem, va, dst.len(), kind, mode, |off, ptr, chunk| {
-        // SAFETY: `ptr` has at least `chunk` valid bytes within its 4 KiB page.
-        unsafe { std::ptr::copy_nonoverlapping(ptr, dst[off..].as_mut_ptr(), chunk) };
+    walk_span_mode(ctx, mem, va, dst.len(), kind, mode, |ctx, off, target, chunk| {
+        match target {
+            TranslatedTarget::Ram(ptr) => {
+                // SAFETY: `ptr` has at least `chunk` valid bytes within its 4 KiB page.
+                unsafe { std::ptr::copy_nonoverlapping(ptr, dst[off..].as_mut_ptr(), chunk) };
+            }
+            TranslatedTarget::LapicMmio { offset } => {
+                let bytes = ctx.lapic_mmio_read(offset, chunk);
+                dst[off..off + chunk].copy_from_slice(&bytes[..chunk]);
+            }
+        }
     })
 }
 
@@ -225,9 +350,16 @@ pub fn write_guest_bytes<M: SoftMmuMemory>(
 ) -> Result<(), SoftPageFault> {
     let mode = ctx.access_mode();
     let w = SoftAccessKind::Write;
-    walk_span_mode(ctx, mem, va, src.len(), w, mode, |off, ptr, chunk| {
-        // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
-        unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+    walk_span_mode(ctx, mem, va, src.len(), w, mode, |ctx, off, target, chunk| {
+        match target {
+            TranslatedTarget::Ram(ptr) => {
+                // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
+                unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+            }
+            TranslatedTarget::LapicMmio { offset } => {
+                ctx.lapic_mmio_write(offset, &src[off..off + chunk]);
+            }
+        }
     })
 }
 
@@ -247,9 +379,15 @@ pub fn read_system_bytes<M: SoftMmuMemory>(
         dst.len(),
         SoftAccessKind::Read,
         mode,
-        |off, ptr, chunk| {
-            // SAFETY: `ptr` has at least `chunk` valid bytes within its 4 KiB page.
-            unsafe { std::ptr::copy_nonoverlapping(ptr, dst[off..].as_mut_ptr(), chunk) };
+        |ctx, off, target, chunk| match target {
+            TranslatedTarget::Ram(ptr) => {
+                // SAFETY: `ptr` has at least `chunk` valid bytes within its 4 KiB page.
+                unsafe { std::ptr::copy_nonoverlapping(ptr, dst[off..].as_mut_ptr(), chunk) };
+            }
+            TranslatedTarget::LapicMmio { offset } => {
+                let bytes = ctx.lapic_mmio_read(offset, chunk);
+                dst[off..off + chunk].copy_from_slice(&bytes[..chunk]);
+            }
         },
     )
 }
@@ -269,9 +407,14 @@ pub fn write_system_bytes<M: SoftMmuMemory>(
         src.len(),
         SoftAccessKind::Write,
         mode,
-        |off, ptr, chunk| {
-            // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
-            unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+        |ctx, off, target, chunk| match target {
+            TranslatedTarget::Ram(ptr) => {
+                // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
+                unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+            }
+            TranslatedTarget::LapicMmio { offset } => {
+                ctx.lapic_mmio_write(offset, &src[off..off + chunk]);
+            }
         },
     )
 }
@@ -284,7 +427,15 @@ pub(crate) fn check_system_write<M: SoftMmuMemory>(
     len: usize,
 ) -> Result<(), SoftPageFault> {
     let mode = ctx.system_access_mode();
-    walk_span_mode(ctx, mem, va, len, SoftAccessKind::Write, mode, |_, _, _| {})
+    walk_span_mode(
+        ctx,
+        mem,
+        va,
+        len,
+        SoftAccessKind::Write,
+        mode,
+        |_, _, _, _| {},
+    )
 }
 
 /// Write an IA-32e IDT exception/interrupt stack frame at `va` using `target_cpl`'s paging rights
@@ -305,9 +456,14 @@ pub(crate) fn write_idt_stack_frame<M: SoftMmuMemory>(
         src.len(),
         SoftAccessKind::Write,
         mode,
-        |off, ptr, chunk| {
-            // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
-            unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+        |ctx, off, target, chunk| match target {
+            TranslatedTarget::Ram(ptr) => {
+                // SAFETY: `ptr` has at least `chunk` writable bytes within its 4 KiB page.
+                unsafe { std::ptr::copy_nonoverlapping(src[off..].as_ptr(), ptr, chunk) };
+            }
+            TranslatedTarget::LapicMmio { offset } => {
+                ctx.lapic_mmio_write(offset, &src[off..off + chunk]);
+            }
         },
     )
 }
@@ -321,7 +477,7 @@ fn walk_span_mode<M: SoftMmuMemory>(
     len: usize,
     kind: SoftAccessKind,
     mode: CpuAccessMode,
-    mut commit: impl FnMut(usize, *mut u8, usize),
+    mut commit: impl FnMut(&mut SoftCpuContext, usize, TranslatedTarget, usize),
 ) -> Result<(), SoftPageFault> {
     if len == 0 {
         return Ok(());
@@ -332,9 +488,9 @@ fn walk_span_mode<M: SoftMmuMemory>(
         while off < len {
             let chunk =
                 (len - off).min((SOFT_TLB_PAGE_SIZE - (cur & SOFT_TLB_OFFSET_MASK)) as usize);
-            let ptr = probe_or_walk_mode(&mut access, mem, cur, kind, mode)?;
+            let target = probe_or_walk_target_mode(&mut access, mem, cur, kind, mode)?;
             if pass {
-                commit(off, ptr, chunk);
+                commit(access.context_mut(), off, target, chunk);
             }
             cur = cur.wrapping_add(chunk as u64);
             off += chunk;
@@ -361,7 +517,7 @@ pub(crate) fn check_guest_alignment<M: SoftMmuMemory>(
     let mut offset = 0;
     while offset < len {
         let current = va.wrapping_add(offset as u64);
-        translate_va(ctx, mem, current, kind)
+        translate_target_va(ctx, mem, current, kind)
             .map_err(|pf| crate::context::X86Exception::page_fault(rip, pf.error_code, pf.cr2))?;
         offset +=
             (len - offset).min((SOFT_TLB_PAGE_SIZE - (current & SOFT_TLB_OFFSET_MASK)) as usize);

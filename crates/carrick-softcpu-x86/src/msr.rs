@@ -5,9 +5,10 @@
 //! linear-address MSR writes fail closed with [`MsrError::GeneralProtection`] (`#GP(0)`).
 
 use std::mem::offset_of;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use crate::apic::TscClock;
 use crate::cpuid::{DEFAULT_TSC_HZ, GuestCpuidView};
 use crate::mmu::is_canonical_va;
 
@@ -123,7 +124,7 @@ fn default_tsc_epoch() -> Instant {
 /// fn bypass_ctx(ctx: &mut SoftCpuContext) { ctx.fs_base = 0; }
 /// ```
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct MsrFile {
     fs_base: u64,
     gs_base: u64,
@@ -139,7 +140,29 @@ pub struct MsrFile {
     tsc_deadline: u64,
     tsc_base: u64,
     tsc_anchor: Option<Instant>,
+    clock: Option<Arc<dyn TscClock>>,
 }
+
+impl PartialEq for MsrFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.fs_base == other.fs_base
+            && self.gs_base == other.gs_base
+            && self.kernel_gs_base == other.kernel_gs_base
+            && self.efer == other.efer
+            && self.star == other.star
+            && self.lstar == other.lstar
+            && self.cstar == other.cstar
+            && self.fmask == other.fmask
+            && self.apic_base == other.apic_base
+            && self.misc_enable == other.misc_enable
+            && self.pat == other.pat
+            && self.tsc_deadline == other.tsc_deadline
+            && self.tsc_base == other.tsc_base
+            && self.tsc_anchor == other.tsc_anchor
+    }
+}
+
+impl Eq for MsrFile {}
 
 impl Default for MsrFile {
     fn default() -> Self {
@@ -169,6 +192,7 @@ impl MsrFile {
             tsc_deadline: 0,
             tsc_base: 0,
             tsc_anchor: None,
+            clock: None,
         }
     }
 
@@ -176,6 +200,21 @@ impl MsrFile {
         let mut msrs = Self::new();
         msrs.tsc_anchor = Some(Instant::now());
         msrs
+    }
+
+    /// Attaches an injectable [`TscClock`] for deterministic or shared TSC reads and deadline waits.
+    pub fn set_clock(&mut self, clock: Arc<dyn TscClock>) {
+        self.clock = Some(clock);
+    }
+
+    /// Returns the attached [`TscClock`], if any.
+    #[must_use]
+    pub fn clock(&self) -> Option<&Arc<dyn TscClock>> {
+        self.clock.as_ref()
+    }
+
+    pub(crate) const fn tsc_deadline_mut(&mut self) -> &mut u64 {
+        &mut self.tsc_deadline
     }
 
     #[must_use]
@@ -241,6 +280,9 @@ impl MsrFile {
     /// Sample the guest TSC (`RDTSC` and `RDMSR(IA32_TSC)`) scaled by `tsc_hz`.
     #[must_use]
     pub fn read_tsc(&self, tsc_hz: u64) -> u64 {
+        if let Some(clock) = self.clock.as_ref() {
+            return self.tsc_base.wrapping_add(clock.now_tsc(tsc_hz));
+        }
         let anchor = self.tsc_anchor.unwrap_or_else(default_tsc_epoch);
         let nanos = Instant::now().saturating_duration_since(anchor).as_nanos();
         let delta = (nanos.saturating_mul(u128::from(tsc_hz)) / 1_000_000_000) as u64;
@@ -295,8 +337,12 @@ impl MsrFile {
         let mut effects = MsrWriteEffects::default();
         match index {
             MSR_IA32_TSC => {
-                self.tsc_base = value;
-                self.tsc_anchor = Some(Instant::now());
+                if let Some(clock) = self.clock.as_ref() {
+                    self.tsc_base = value.wrapping_sub(clock.now_tsc(caps.tsc_hz));
+                } else {
+                    self.tsc_base = value;
+                    self.tsc_anchor = Some(Instant::now());
+                }
             }
             MSR_IA32_APIC_BASE => {
                 let phy_limit = if caps.max_phy_addr >= 64 {

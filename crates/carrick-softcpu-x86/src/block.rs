@@ -139,9 +139,10 @@ pub fn plan_block_from_memory<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
 ) -> Result<PlannedBlock, BlockFetchFault> {
-    // Intel SDM Vol. 3A §17.3 / §18.2 / §2.5: step single instructions when TF, RF,
-    // hardware instruction breakpoints (DR7[7:0]), or CR0.EM/TS lazy-FPU traps are armed.
+    // Intel SDM Vol. 3A §6.8.3 / §17.3 / §18.2 / §2.5: step single instructions when TF, RF,
+    // STI interrupt shadow, hardware instruction breakpoints (DR7[7:0]), or CR0.EM/TS lazy-FPU traps are armed.
     let max_insns = if (ctx.rflags & ((1 << 8) | (1 << 16))) != 0
+        || ctx.interrupt_shadow
         || (ctx.dr[7] & 0xff) != 0
         || (ctx.cr0 & 0xc) != 0
     {
