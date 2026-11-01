@@ -203,6 +203,7 @@ pub(crate) fn emulate_sensitive_op<M: SoftMmuMemory>(
             if ctx.cpl != 0 {
                 return PrivilegedOutcome::Exception(X86Exception::general_protection(va, 0));
             }
+            ctx.interrupt_shadow = false;
             ctx.halted = true;
             ctx.rip = resume;
             return PrivilegedOutcome::Hlt {
@@ -251,7 +252,7 @@ fn emulate_mov_from_cr(
         2 => ctx.cr2,
         3 => ctx.cr3,
         4 => ctx.cr4,
-        8 => ctx.cr8,
+        8 => u64::from(ctx.lapic.cr8()),
         _ => return Err(X86Exception::invalid_opcode(va)),
     };
     if gpr >= ctx.gpr.len() {
@@ -381,7 +382,7 @@ fn emulate_mov_to_cr(
             if (val & !0xf) != 0 {
                 return Err(X86Exception::general_protection(va, 0));
             }
-            ctx.cr8 = val;
+            ctx.set_cr8(val);
         }
         _ => return Err(X86Exception::invalid_opcode(va)),
     }
@@ -969,6 +970,7 @@ fn emulate_iret<M: SoftMmuMemory>(
     }
     ctx.set_cpl(rpl);
     ctx.halted = false;
+    ctx.interrupt_shadow = false;
     Ok(new_rip)
 }
 
@@ -1028,9 +1030,12 @@ fn emulate_cli_sti(
         return Err(X86Exception::general_protection(va, 0));
     }
     if enable {
+        let was_clear = (ctx.rflags & RFLAGS_IF) == 0;
         ctx.rflags |= RFLAGS_IF;
+        ctx.interrupt_shadow = was_clear;
     } else {
         ctx.rflags &= !RFLAGS_IF;
+        ctx.interrupt_shadow = false;
     }
     ctx.rip = resume;
     Ok(resume)

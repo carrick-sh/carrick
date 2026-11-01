@@ -4,22 +4,24 @@
 use std::collections::HashMap;
 use std::mem::offset_of;
 use std::ptr::NonNull;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
+use crate::apic::{ApicCluster, ApicNode, LocalApic, TscClock};
 use crate::cflow::compute_effective_va;
+use crate::cpuid::DEFAULT_TSC_HZ;
 use crate::decode::gpr_index;
 use crate::emit::{EmitError, JitStage};
 use crate::mmu::{
     Cpl, CpuAccessMode, ExtentTable, FrameGpa, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK,
     SOFT_TLB_PAGE_SIZE, SoftAccessKind, SoftMmuMemory, SoftPageFault, SoftSeatError, SoftTlb,
-    SoftTlbStats, SoftVcpuSeat, SoftWalker, is_canonical_va, translate_va,
+    SoftTlbStats, SoftVcpuSeat, SoftWalker, TranslatedTarget, is_canonical_va, translate_target_va,
 };
 
 /// Monomorphized translation callback for active [`SoftMmuMemory`] during block execution.
 type ActiveTranslateFn =
-    unsafe fn(&mut SoftCpuContext, u64, SoftAccessKind) -> Result<*mut u8, SoftPageFault>;
+    unsafe fn(&mut SoftCpuContext, u64, SoftAccessKind) -> Result<TranslatedTarget, SoftPageFault>;
 
 /// Monomorphized [`ActiveTranslateFn`] adapter for any `M: SoftMmuMemory`.
 ///
@@ -30,10 +32,10 @@ unsafe fn translate_for_mem<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     va: u64,
     kind: SoftAccessKind,
-) -> Result<*mut u8, SoftPageFault> {
+) -> Result<TranslatedTarget, SoftPageFault> {
     let mem_ptr = ctx.active_mem_ptr.ok_or(SoftPageFault::new(va, 0))?;
     let mem = unsafe { mem_ptr.cast::<M>().as_mut() };
-    translate_va(ctx, mem, va, kind)
+    translate_target_va(ctx, mem, va, kind)
 }
 
 /// Architectural x86_64 general-purpose register indices in [`SoftCpuContext::gpr`].
@@ -429,6 +431,10 @@ pub struct SoftCpuContext {
     pub(crate) seat: SoftVcpuSeat,
     /// Architectural MSR register file (single owner of `EFER`, `FS_BASE`, `GS_BASE`, `KERNEL_GS_BASE`).
     msrs: crate::msr::MsrFile,
+    /// Per-vCPU local xAPIC register file and timer state.
+    pub lapic: LocalApic,
+    /// Nominal TSC frequency in Hz used for `RDTSC`, `IA32_TSC`, and local APIC timer polling.
+    pub tsc_hz: u64,
     pub cr8: u64,
     pub dr: [u64; 8],
     pub gdtr: DescriptorTablePtr,
@@ -442,7 +448,12 @@ pub struct SoftCpuContext {
     pub ldtr: SoftSegment,
     pub tr: SoftSegment,
     pub halted: bool,
+    /// One-instruction maskable interrupt shadow armed by `STI` when `RFLAGS.IF` transitions `0 -> 1`
+    /// (Intel SDM Vol. 3A §6.8.3).
+    pub interrupt_shadow: bool,
     pub(crate) icebp_trap: bool,
+    pub(crate) lapic_mmio_offset: u16,
+    pub(crate) lapic_mmio_size: u8,
 }
 
 const _: () = {
@@ -566,6 +577,8 @@ impl SoftCpuContext {
             x87_data_selector: 0,
             seat,
             msrs,
+            lapic: LocalApic::new(0),
+            tsc_hz: DEFAULT_TSC_HZ,
             cr8: 0,
             dr: [0, 0, 0, 0, 0, 0, 0xffff_0ff0, 0x0000_0400],
             gdtr: DescriptorTablePtr::default(),
@@ -584,7 +597,10 @@ impl SoftCpuContext {
                 ar: 0x008b,
             },
             halted: false,
+            interrupt_shadow: false,
             icebp_trap: false,
+            lapic_mmio_offset: 0,
+            lapic_mmio_size: 0,
         };
         ctx.walker
             .set_nxe((ctx.msrs.efer() & crate::msr::EFER_NXE) != 0);
@@ -617,6 +633,109 @@ impl SoftCpuContext {
         &self.msrs
     }
 
+    /// Borrow this vCPU's local xAPIC model.
+    #[must_use]
+    pub const fn lapic(&self) -> &LocalApic {
+        &self.lapic
+    }
+
+    /// Mutably borrow this vCPU's local xAPIC model.
+    pub fn lapic_mut(&mut self) -> &mut LocalApic {
+        &mut self.lapic
+    }
+
+    /// Returns a shared handle to this vCPU's [`ApicNode`] for cross-thread kicks and IPIs.
+    #[must_use]
+    pub fn apic_node(&self) -> Arc<ApicNode> {
+        self.lapic.node()
+    }
+
+    /// Attaches an injectable [`TscClock`] to this vCPU's MSR/APIC timer subsystem.
+    pub fn set_clock(&mut self, clock: Arc<dyn TscClock>) {
+        clock.register_node(Arc::downgrade(&self.lapic.node()));
+        self.msrs.set_clock(clock);
+    }
+
+    /// Attaches this vCPU's local xAPIC to a shared [`ApicCluster`].
+    pub fn attach_apic_cluster(&mut self, cluster: Arc<ApicCluster>) {
+        self.lapic.attach_cluster(cluster);
+    }
+
+    /// Sets `CR8` (`TPR[7:4]`) and synchronizes `LAPIC_TPR`.
+    pub fn set_cr8(&mut self, value: u64) {
+        let cr8 = (value & 0x0f) as u8;
+        self.cr8 = u64::from(cr8);
+        self.lapic.set_cr8(cr8);
+    }
+
+    /// Returns this vCPU's nominal TSC frequency in Hz.
+    #[must_use]
+    pub const fn tsc_hz(&self) -> u64 {
+        self.tsc_hz
+    }
+
+    /// Samples the current TSC tick value from `MsrFile` (using the attached [`TscClock`] if any).
+    #[must_use]
+    pub fn now_tsc(&self) -> u64 {
+        self.msrs.read_tsc(self.tsc_hz)
+    }
+
+    /// Returns `true` if `IA32_APIC_BASE.EN` (`bit 11`) is set.
+    #[must_use]
+    pub const fn apic_hw_enabled(&self) -> bool {
+        (self.msrs.apic_base() & (1 << 11)) != 0
+    }
+
+    /// Returns the next armed local APIC timer deadline in TSC ticks, if any.
+    #[must_use]
+    pub fn next_timer_deadline_tsc(&self) -> Option<u64> {
+        self.lapic
+            .next_timer_deadline_tsc(self.apic_hw_enabled(), self.msrs.tsc_deadline())
+    }
+
+    /// Polls the local APIC timer (`IA32_TSC_DEADLINE` or initial-count mode) against `now_tsc()`.
+    pub fn poll_apic_timer(&mut self) -> bool {
+        let hw_enabled = self.apic_hw_enabled();
+        let now = self.now_tsc();
+        let fired = self
+            .lapic
+            .poll_timer(hw_enabled, now, self.msrs.tsc_deadline_mut());
+        self.cr8 = u64::from(self.lapic.cr8());
+        fired
+    }
+
+    /// Returns `true` if an unmasked local APIC interrupt outranks `PPR`.
+    #[must_use]
+    pub fn has_deliverable_apic_interrupt(&self) -> bool {
+        self.lapic.has_deliverable_interrupt(self.apic_hw_enabled())
+    }
+
+    /// Accepts the highest-priority deliverable interrupt from `IRR` into `ISR`, if any.
+    pub fn accept_apic_interrupt(&mut self) -> Option<u8> {
+        let vec = self.lapic.accept_interrupt(self.apic_hw_enabled());
+        self.cr8 = u64::from(self.lapic.cr8());
+        vec
+    }
+
+    /// Reads `size` (`1..=8`) bytes from the local xAPIC MMIO page at `offset`.
+    pub fn lapic_mmio_read(&mut self, offset: u16, size: usize) -> [u8; 8] {
+        let now = self.now_tsc();
+        let _ = self
+            .lapic
+            .poll_timer(self.apic_hw_enabled(), now, self.msrs.tsc_deadline_mut());
+        let out = self.lapic.mmio_read(offset, size, now);
+        self.cr8 = u64::from(self.lapic.cr8());
+        out
+    }
+
+    /// Writes `bytes` (`1..=8` bytes) to the local xAPIC MMIO page at `offset`.
+    pub fn lapic_mmio_write(&mut self, offset: u16, bytes: &[u8]) {
+        let now = self.now_tsc();
+        self.lapic
+            .mmio_write(offset, bytes, now, self.msrs.tsc_deadline_mut());
+        self.cr8 = u64::from(self.lapic.cr8());
+    }
+
     #[must_use]
     pub const fn efer(&self) -> u64 {
         self.msrs.efer()
@@ -645,6 +764,9 @@ impl SoftCpuContext {
         caps: crate::msr::MsrCapabilities,
     ) -> Result<crate::msr::MsrWriteEffects, crate::msr::MsrError> {
         let effects = self.msrs.write(index, value, self.cr0, caps)?;
+        if index == crate::msr::MSR_IA32_TSC_DEADLINE && self.lapic.rejects_tsc_deadline_msr() {
+            *self.msrs.tsc_deadline_mut() = 0;
+        }
         self.fs.base = self.msrs.fs_base();
         self.gs.base = self.msrs.gs_base();
         self.walker
@@ -958,20 +1080,20 @@ fn translate_active(
     ctx: &mut SoftCpuContext,
     va: u64,
     kind: SoftAccessKind,
-) -> Result<*mut u8, SoftPageFault> {
+) -> Result<TranslatedTarget, SoftPageFault> {
     let translate_fn = ctx.active_translate_fn.ok_or(SoftPageFault::new(va, 0))?;
     // SAFETY: `active_mem_ptr` and `active_translate_fn` are paired by `SoftCpu::execute_planned_block`.
     unsafe { translate_fn(ctx, va, kind) }
 }
 
-fn translate_or_record(
+fn translate_or_record_target(
     ctx: &mut SoftCpuContext,
     va: u64,
     kind: SoftAccessKind,
     insn_va: u64,
-) -> Option<*mut u8> {
+) -> Option<TranslatedTarget> {
     match translate_active(ctx, va, kind) {
-        Ok(ptr) => Some(ptr),
+        Ok(target) => Some(target),
         Err(pf) => {
             ctx.cr2 = pf.cr2;
             record_exception(
@@ -983,7 +1105,31 @@ fn translate_or_record(
     }
 }
 
-/// Slow-path memory translation and page-crossing bounce-buffer setup.
+fn translate_or_record_ram(
+    ctx: &mut SoftCpuContext,
+    va: u64,
+    kind: SoftAccessKind,
+    insn_va: u64,
+) -> Option<*mut u8> {
+    match translate_or_record_target(ctx, va, kind, insn_va)? {
+        TranslatedTarget::Ram(ptr) => Some(ptr),
+        TranslatedTarget::LapicMmio { .. } => {
+            let mut bits = if ctx.cpl == 3 {
+                crate::mmu::PF_ERR_USER
+            } else {
+                0
+            };
+            if kind == SoftAccessKind::Write {
+                bits |= crate::mmu::PF_ERR_WRITE;
+            }
+            ctx.cr2 = va;
+            record_exception(ctx, X86Exception::page_fault(insn_va, bits, va));
+            None
+        }
+    }
+}
+
+/// Slow-path memory translation and page-crossing / xAPIC MMIO bounce-buffer setup.
 #[unsafe(no_mangle)]
 extern "sysv64" fn softcpu_mem_slow_path(
     ctx: &mut SoftCpuContext,
@@ -1026,7 +1172,7 @@ extern "sysv64" fn softcpu_mem_slow_path(
                 last_va & SOFT_TLB_PAGE_MASK
             },
         ] {
-            if translate_or_record(ctx, addr, kind, insn_va).is_none() {
+            if translate_or_record_target(ctx, addr, kind, insn_va).is_none() {
                 return 0;
             }
         }
@@ -1036,13 +1182,37 @@ extern "sysv64" fn softcpu_mem_slow_path(
 
     let page_off = (guest_va & SOFT_TLB_OFFSET_MASK) as usize;
     if page_off + size <= SOFT_TLB_PAGE_SIZE as usize {
-        let ptr = match access_code {
-            0 => translate_or_record(ctx, guest_va, SoftAccessKind::Read, insn_va),
-            1 => translate_or_record(ctx, guest_va, SoftAccessKind::Write, insn_va),
-            _ => translate_or_record(ctx, guest_va, SoftAccessKind::Read, insn_va)
-                .and_then(|_| translate_or_record(ctx, guest_va, SoftAccessKind::Write, insn_va)),
+        let target = match access_code {
+            0 => translate_or_record_target(ctx, guest_va, SoftAccessKind::Read, insn_va),
+            1 => translate_or_record_target(ctx, guest_va, SoftAccessKind::Write, insn_va),
+            _ => translate_or_record_target(ctx, guest_va, SoftAccessKind::Read, insn_va).and_then(
+                |_| translate_or_record_target(ctx, guest_va, SoftAccessKind::Write, insn_va),
+            ),
         };
-        return ptr.map_or(0, |p| p as u64);
+        let Some(target) = target else {
+            return 0;
+        };
+        return match target {
+            TranslatedTarget::Ram(ptr) => ptr as u64,
+            TranslatedTarget::LapicMmio { offset } => {
+                if size > 8 {
+                    record_exception(ctx, X86Exception::general_protection(insn_va, 0));
+                    return 0;
+                }
+                if access_code != 1 {
+                    let bytes = ctx.lapic_mmio_read(offset, size);
+                    ctx.bounce_buf[..size].copy_from_slice(&bytes[..size]);
+                } else {
+                    ctx.bounce_buf[..size].fill(0);
+                }
+                if access_code != 0 {
+                    ctx.lapic_mmio_offset = offset;
+                    ctx.lapic_mmio_size = size as u8;
+                    ctx.bounce_active = 2;
+                }
+                ctx.bounce_buf.as_mut_ptr() as u64
+            }
+        };
     }
 
     let (len0, len1) = (
@@ -1055,8 +1225,8 @@ extern "sysv64" fn softcpu_mem_slow_path(
     let mut read_ptrs = (std::ptr::null_mut(), std::ptr::null_mut());
     if needs_read {
         let (Some(p0), Some(p1)) = (
-            translate_or_record(ctx, guest_va, SoftAccessKind::Read, insn_va),
-            translate_or_record(ctx, page1_va, SoftAccessKind::Read, insn_va),
+            translate_or_record_ram(ctx, guest_va, SoftAccessKind::Read, insn_va),
+            translate_or_record_ram(ctx, page1_va, SoftAccessKind::Read, insn_va),
         ) else {
             return 0;
         };
@@ -1065,8 +1235,8 @@ extern "sysv64" fn softcpu_mem_slow_path(
 
     if needs_write {
         let (Some(w0), Some(w1)) = (
-            translate_or_record(ctx, guest_va, SoftAccessKind::Write, insn_va),
-            translate_or_record(ctx, page1_va, SoftAccessKind::Write, insn_va),
+            translate_or_record_ram(ctx, guest_va, SoftAccessKind::Write, insn_va),
+            translate_or_record_ram(ctx, page1_va, SoftAccessKind::Write, insn_va),
         ) else {
             return 0;
         };
@@ -1092,10 +1262,10 @@ extern "sysv64" fn softcpu_mem_slow_path(
     ctx.bounce_buf.as_mut_ptr() as u64
 }
 
-/// Commit the per-CPU bounce buffer back to the two pre-validated guest pages.
+/// Commit the per-CPU bounce buffer back to the two pre-validated guest pages or local xAPIC MMIO.
 #[unsafe(no_mangle)]
 extern "sysv64" fn softcpu_commit_bounce(ctx: &mut SoftCpuContext) {
-    if ctx.bounce_active != 0 {
+    if ctx.bounce_active == 1 {
         let wb = ctx.bounce_writeback;
         // SAFETY: `wb.host_ptr0` and `wb.host_ptr1` were validated by `softcpu_mem_slow_path`.
         unsafe {
@@ -1106,6 +1276,12 @@ extern "sysv64" fn softcpu_commit_bounce(ctx: &mut SoftCpuContext) {
                 wb.len1,
             );
         }
+        ctx.bounce_active = 0;
+    } else if ctx.bounce_active == 2 {
+        let size = usize::from(ctx.lapic_mmio_size).min(8);
+        let mut bytes = [0u8; 8];
+        bytes[..size].copy_from_slice(&ctx.bounce_buf[..size]);
+        ctx.lapic_mmio_write(ctx.lapic_mmio_offset, &bytes[..size]);
         ctx.bounce_active = 0;
     }
 }
@@ -1314,12 +1490,25 @@ fn step_fp(
         if size == 16 && va & 15 != 0 {
             return Err(X86Exception::general_protection(ip, 0));
         }
-        walk_active_span(ctx, va, size, SoftAccessKind::Read, ip, |off, ptr, n| {
-            // SAFETY: the walker authenticated this readable span; operand fits 16 bytes.
-            unsafe {
-                std::ptr::copy_nonoverlapping(ptr, run.operand[off..].as_mut_ptr(), n);
-            }
-        })?;
+        walk_active_span(
+            ctx,
+            va,
+            size,
+            SoftAccessKind::Read,
+            ip,
+            |ctx, off, target, n| match target {
+                TranslatedTarget::Ram(ptr) => {
+                    // SAFETY: the walker authenticated this readable span; operand fits 16 bytes.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(ptr, run.operand[off..].as_mut_ptr(), n);
+                    }
+                }
+                TranslatedTarget::LapicMmio { offset } => {
+                    let bytes = ctx.lapic_mmio_read(offset, n);
+                    run.operand[off..off + n].copy_from_slice(&bytes[..n]);
+                }
+            },
+        )?;
     }
     // SAFETY: prepare_block admitted and published this immutable leaf for this
     // exact instruction; it touches only aligned FpRun storage and restores host FP state.
@@ -1401,22 +1590,31 @@ fn step_maskmov(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result
         Register::GS => ctx.gs_base(),
         _ => 0,
     });
-    let mut destinations = [std::ptr::null_mut(); 16];
+    let mut destinations: [Option<TranslatedTarget>; 16] = [None; 16];
     for i in 0..width {
         if mask[i] & 0x80 != 0 {
             let va = addr.wrapping_add(i as u64);
             if !is_canonical_va(va) {
                 return Err(X86Exception::general_protection(ip, 0));
             }
-            destinations[i] = translate_active(ctx, va, SoftAccessKind::Write)
-                .map_err(|pf| X86Exception::page_fault(ip, pf.error_code, pf.cr2))?;
+            destinations[i] = Some(
+                translate_active(ctx, va, SoftAccessKind::Write)
+                    .map_err(|pf| X86Exception::page_fault(ip, pf.error_code, pf.cr2))?,
+            );
         }
     }
     for i in 0..width {
-        if !destinations[i].is_null() {
-            // SAFETY: each selected byte was authenticated for writing above.
-            unsafe {
-                destinations[i].write(data[i]);
+        if let Some(target) = destinations[i] {
+            match target {
+                TranslatedTarget::Ram(ptr) => {
+                    // SAFETY: each selected byte was authenticated for writing above.
+                    unsafe {
+                        ptr.write(data[i]);
+                    }
+                }
+                TranslatedTarget::LapicMmio { offset } => {
+                    ctx.lapic_mmio_write(offset, &[data[i]]);
+                }
             }
         }
     }
@@ -1429,7 +1627,7 @@ fn walk_active_span(
     len: usize,
     kind: SoftAccessKind,
     insn_va: u64,
-    mut commit: impl FnMut(usize, *mut u8, usize),
+    mut commit: impl FnMut(&mut SoftCpuContext, usize, TranslatedTarget, usize),
 ) -> Result<(), X86Exception> {
     if len == 0 {
         return Ok(());
@@ -1449,10 +1647,10 @@ fn walk_active_span(
         while off < len {
             let chunk =
                 (len - off).min((SOFT_TLB_PAGE_SIZE - (cur & SOFT_TLB_OFFSET_MASK)) as usize);
-            let ptr = translate_active(ctx, cur, kind)
+            let target = translate_active(ctx, cur, kind)
                 .map_err(|pf| X86Exception::page_fault(insn_va, pf.error_code, pf.cr2))?;
             if pass {
-                commit(off, ptr, chunk);
+                commit(ctx, off, target, chunk);
             }
             cur = cur.wrapping_add(chunk as u64);
             off += chunk;
@@ -1468,10 +1666,23 @@ fn read_int(
     insn_va: u64,
 ) -> Result<u64, X86Exception> {
     let mut buf = [0u8; 8];
-    walk_active_span(ctx, va, w, SoftAccessKind::Read, insn_va, |off, ptr, n| {
-        // SAFETY: `ptr` has at least `n` readable bytes within its 4 KiB page.
-        unsafe { std::ptr::copy_nonoverlapping(ptr, buf[off..].as_mut_ptr(), n) };
-    })?;
+    walk_active_span(
+        ctx,
+        va,
+        w,
+        SoftAccessKind::Read,
+        insn_va,
+        |ctx, off, target, n| match target {
+            TranslatedTarget::Ram(ptr) => {
+                // SAFETY: `ptr` has at least `n` readable bytes within its 4 KiB page.
+                unsafe { std::ptr::copy_nonoverlapping(ptr, buf[off..].as_mut_ptr(), n) };
+            }
+            TranslatedTarget::LapicMmio { offset } => {
+                let bytes = ctx.lapic_mmio_read(offset, n);
+                buf[off..off + n].copy_from_slice(&bytes[..n]);
+            }
+        },
+    )?;
     Ok(u64::from_le_bytes(buf))
 }
 
@@ -1483,10 +1694,22 @@ fn write_int(
     insn_va: u64,
 ) -> Result<(), X86Exception> {
     let bytes = val.to_le_bytes();
-    walk_active_span(ctx, va, w, SoftAccessKind::Write, insn_va, |off, ptr, n| {
-        // SAFETY: `ptr` has at least `n` writable bytes within its 4 KiB page.
-        unsafe { std::ptr::copy_nonoverlapping(bytes[off..].as_ptr(), ptr, n) };
-    })
+    walk_active_span(
+        ctx,
+        va,
+        w,
+        SoftAccessKind::Write,
+        insn_va,
+        |ctx, off, target, n| match target {
+            TranslatedTarget::Ram(ptr) => {
+                // SAFETY: `ptr` has at least `n` writable bytes within its 4 KiB page.
+                unsafe { std::ptr::copy_nonoverlapping(bytes[off..].as_ptr(), ptr, n) };
+            }
+            TranslatedTarget::LapicMmio { offset } => {
+                ctx.lapic_mmio_write(offset, &bytes[off..off + n]);
+            }
+        },
+    )
 }
 
 pub(crate) fn read_reg_sized(ctx: &SoftCpuContext, r: Register) -> (u64, usize) {
@@ -1805,18 +2028,22 @@ fn string_copy_chunk(
         if !is_canonical_va(src_low) || !is_canonical_va(src_low.wrapping_add(bytes as u64 - 1)) {
             return Err(X86Exception::general_protection(rip, 0));
         }
-        Some(
-            translate_active(ctx, src, SoftAccessKind::Read)
-                .map_err(|pf| X86Exception::page_fault(rip, pf.error_code, pf.cr2))?
-                // SAFETY: src_low and src are in the same authenticated page.
-                .wrapping_sub(src.wrapping_sub(src_low) as usize),
-        )
+        let TranslatedTarget::Ram(ptr) = translate_active(ctx, src, SoftAccessKind::Read)
+            .map_err(|pf| X86Exception::page_fault(rip, pf.error_code, pf.cr2))?
+        else {
+            return Ok(0);
+        };
+        // SAFETY: src_low and src are in the same authenticated page.
+        Some(ptr.wrapping_sub(src.wrapping_sub(src_low) as usize))
     } else {
         None
     };
-    let destination = translate_active(ctx, dst, SoftAccessKind::Write)
+    let TranslatedTarget::Ram(dest_ptr) = translate_active(ctx, dst, SoftAccessKind::Write)
         .map_err(|pf| X86Exception::page_fault(rip, pf.error_code, pf.cr2))?
-        .wrapping_sub(dst.wrapping_sub(dst_low) as usize);
+    else {
+        return Ok(0);
+    };
+    let destination = dest_ptr.wrapping_sub(dst.wrapping_sub(dst_low) as usize);
     let accumulator = ctx.gpr[reg::RAX].to_le_bytes();
     // SAFETY: both complete spans are authenticated within their respective
     // pages. Physical aliases require architectural element-order copying,

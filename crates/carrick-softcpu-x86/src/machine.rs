@@ -6,6 +6,10 @@
 //! escalation), and Ring-0 port I/O exits so CPL0 kernels (including `carrick-x86-cpl0-fixture`)
 //! execute deterministically without `/dev/kvm`.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::apic::{ApicCluster, ApicNode, TscClock};
 use crate::context::{SoftCpuContext, SoftSegment, X86Exception, X86ExceptionVector, reg};
 use crate::cpu::{SoftCpu, SoftCpuExit, SoftCpuNewError};
 use crate::cpuid::GuestCpuidView;
@@ -56,19 +60,28 @@ pub enum SoftMachineExit {
 pub struct SoftMachine<M: SoftMmuMemory> {
     cpu: SoftCpu,
     mem: M,
+    hlt_wait_timeout: Option<Duration>,
 }
 
 impl<M: SoftMmuMemory> SoftMachine<M> {
     /// Create a [`SoftMachine`] seated in `mem.extents()` with `cpuid`.
     pub fn new(mem: M, cpuid: Box<dyn GuestCpuidView>) -> Result<Self, SoftCpuNewError> {
         let cpu = SoftCpu::with_cpuid_view(mem.extents(), cpuid)?;
-        Ok(Self { cpu, mem })
+        Ok(Self {
+            cpu,
+            mem,
+            hlt_wait_timeout: None,
+        })
     }
 
     /// Construct a [`SoftMachine`] from an existing [`SoftCpu`] and `mem`.
     #[must_use]
     pub fn from_parts(cpu: SoftCpu, mem: M) -> Self {
-        Self { cpu, mem }
+        Self {
+            cpu,
+            mem,
+            hlt_wait_timeout: None,
+        }
     }
 
     /// Split into the underlying `(SoftCpu, M)`.
@@ -104,6 +117,45 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
         self.cpu.context_mut()
     }
 
+    /// Attach an injectable [`TscClock`] for `RDTSC` and APIC timer deadlines.
+    pub fn set_clock(&mut self, clock: Arc<dyn TscClock>) {
+        self.cpu.set_clock(clock);
+    }
+
+    /// Attach this machine's local APIC to `cluster` for cross-vCPU `ICR` IPI routing.
+    pub fn attach_apic_cluster(&mut self, cluster: Arc<ApicCluster>) {
+        self.cpu.attach_apic_cluster(cluster);
+    }
+
+    /// Shared local APIC node handle for external interrupt injection and `HLT` kick signaling.
+    #[must_use]
+    pub fn apic_node(&self) -> Arc<ApicNode> {
+        self.cpu.apic_node()
+    }
+
+    /// Inject a fixed external interrupt `vector` into this machine's local APIC `IRR`.
+    pub fn inject_interrupt(&mut self, vector: u8) {
+        self.cpu.inject_interrupt(vector);
+    }
+
+    /// Poll the local APIC timer against the current TSC, latching its LVT vector into `IRR` on expiry.
+    pub fn poll_apic_timer(&mut self) -> bool {
+        self.cpu.poll_apic_timer()
+    }
+
+    /// Configure the maximum bounded wait duration when `HLT` executes with no immediately
+    /// deliverable local APIC interrupt. When `None` (the default), `HLT` exits immediately
+    /// unless an APIC interrupt or expired timer is already pending.
+    pub fn set_hlt_wait_timeout(&mut self, timeout: Option<Duration>) {
+        self.hlt_wait_timeout = timeout;
+    }
+
+    /// Returns the configured bounded wait timeout for `HLT`.
+    #[must_use]
+    pub const fn hlt_wait_timeout(&self) -> Option<Duration> {
+        self.hlt_wait_timeout
+    }
+
     /// Deposit the input value for a preceding [`SoftMachineExit::IoIn`] into `AL`/`AX`/`EAX`.
     pub fn complete_io_in(&mut self, size: u8, value: u32) {
         let rax = &mut self.cpu.context_mut().gpr[reg::RAX];
@@ -115,11 +167,32 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
     }
 
     /// Execute one basic block and resolve internal architectural transitions (`SYSCALL`,
-    /// 64-bit `IDT` exception/interrupt delivery). Returns `Ok(None)` when guest execution
-    /// continues inside the machine, or `Ok(Some(exit))` on a host-visible exit (`HLT`, PIO, triple fault).
+    /// 64-bit `IDT` exception/interrupt delivery, local APIC timer/IPI recognition, and `HLT` wake).
+    /// Returns `Ok(None)` when guest execution continues inside the machine, or `Ok(Some(exit))`
+    /// on a host-visible exit (`HLT`, PIO, triple fault).
     pub fn step(&mut self) -> Result<Option<SoftMachineExit>, EmitError> {
+        let _ = self.cpu.poll_apic_timer();
+
+        if (self.cpu.context().rflags & RFLAGS_IF) != 0
+            && !self.cpu.context().interrupt_shadow
+            && let Some(vector) = self.cpu.context_mut().accept_apic_interrupt()
+        {
+            self.cpu.context_mut().halted = false;
+            let _ = self.cpu.apic_node().take_kick();
+            if let Some(exit) =
+                deliver_external_interrupt(self.cpu.context_mut(), &mut self.mem, vector)
+            {
+                return Ok(Some(exit));
+            }
+        }
+
         let exit = self.cpu.step_block(&mut self.mem)?;
-        Ok(handle_cpu_exit(&mut self.cpu, &mut self.mem, exit))
+        Ok(handle_cpu_exit(
+            &mut self.cpu,
+            &mut self.mem,
+            exit,
+            self.hlt_wait_timeout,
+        ))
     }
 
     /// Run up to `max_steps` basic blocks until a [`SoftMachineExit`] occurs.
@@ -136,14 +209,58 @@ impl<M: SoftMmuMemory> SoftMachine<M> {
     }
 }
 
+fn wait_for_apic_event(cpu: &SoftCpu, max_wait: Duration) {
+    let deadline = cpu.context().next_timer_deadline_tsc();
+    let tsc_hz = cpu.context().tsc_hz();
+    let node = cpu.apic_node();
+    if let Some(clock) = cpu.context().msrs().clock() {
+        let _ = clock.wait_until(deadline, tsc_hz, &node, max_wait);
+    } else {
+        let _ = node.wait_for_kick_or_timeout(max_wait);
+    }
+}
+
+fn deliver_external_interrupt<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    vector: u8,
+) -> Option<SoftMachineExit> {
+    let rip = ctx.rip;
+    match deliver_idt_vector(ctx, mem, vector, rip, rip, None, false, true) {
+        Ok(()) => None,
+        Err(fault) => deliver_exception_with_escalation(ctx, mem, fault),
+    }
+}
+
 fn handle_cpu_exit<M: SoftMmuMemory>(
     cpu: &mut SoftCpu,
     mem: &mut M,
     exit: SoftCpuExit,
+    hlt_wait_timeout: Option<Duration>,
 ) -> Option<SoftMachineExit> {
     match exit {
         SoftCpuExit::Continue { .. } => None,
-        SoftCpuExit::Hlt { rip, next_rip } => Some(SoftMachineExit::Hlt { rip, next_rip }),
+        SoftCpuExit::Hlt { rip, next_rip } => {
+            let _ = cpu.poll_apic_timer();
+            if !cpu.context().has_deliverable_apic_interrupt()
+                && let Some(max_wait) = hlt_wait_timeout
+            {
+                wait_for_apic_event(cpu, max_wait);
+                let _ = cpu.poll_apic_timer();
+            }
+            if cpu.context().has_deliverable_apic_interrupt() {
+                cpu.context_mut().halted = false;
+                let _ = cpu.apic_node().take_kick();
+                if (cpu.context().rflags & RFLAGS_IF) != 0
+                    && let Some(vector) = cpu.context_mut().accept_apic_interrupt()
+                {
+                    return deliver_external_interrupt(cpu.context_mut(), mem, vector);
+                }
+                None
+            } else {
+                Some(SoftMachineExit::Hlt { rip, next_rip })
+            }
+        }
         SoftCpuExit::Syscall { next_rip, .. } => {
             deliver_syscall(cpu.context_mut(), next_rip);
             None
@@ -461,6 +578,7 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     }
     ctx.set_cpl(new_cpl);
     ctx.halted = false;
+    ctx.interrupt_shadow = false;
     ctx.rip = entry_rip;
     Ok(())
 }
