@@ -1549,8 +1549,15 @@ pub enum ReceiptAction {
     Gate {
         #[arg(long, value_enum)]
         lane: Lane,
+        #[arg(
+            long,
+            required_unless_present = "main_ref",
+            conflicts_with = "main_ref"
+        )]
+        base_sha: Option<String>,
+        /// Select the nearest receipted first-parent main ancestor of the candidate.
         #[arg(long)]
-        base_sha: String,
+        main_ref: Option<String>,
         /// Directory with one `receipt-<lane>-<sha>-<attempt>` artifact
         /// directory per downloaded candidate attempt.
         #[arg(long)]
@@ -1702,6 +1709,7 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
         ReceiptAction::Gate {
             lane,
             base_sha,
+            main_ref,
             candidate_dir,
             candidate_sha,
             run_attempt,
@@ -1718,6 +1726,32 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                 &candidate_sha,
                 run_attempt,
             )?)?;
+            let base_sha = match (base_sha, main_ref) {
+                (Some(base_sha), None) => base_sha,
+                (None, Some(main_ref)) => {
+                    let root = Path::new(".");
+                    let ancestor = resolve_main_ancestor(root, &main_ref, &candidate_sha)?;
+                    let selected = select_baseline_waiting(
+                        root,
+                        lane,
+                        &ancestor.before_sha,
+                        &candidate_sha,
+                        query_baseline,
+                        ReceiptWait::new(
+                            Duration::from_secs(wait_minutes * 60),
+                            Duration::from_secs(poll_seconds.max(1)),
+                        ),
+                    )?;
+                    println!("::notice title=Receipt baseline::{}", selected.notice());
+                    append_github_file("GITHUB_STEP_SUMMARY", &selected.markdown())?;
+                    selected.baseline_sha
+                }
+                _ => {
+                    return Err(ReceiptError::InvalidPushHistory(
+                        "specify exactly one of --base-sha or --main-ref".into(),
+                    ));
+                }
+            };
             let baseline = download_baseline(
                 lane,
                 &base_sha,
