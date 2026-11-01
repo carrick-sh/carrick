@@ -1327,3 +1327,62 @@ fn threaded_driver_wait_preemption_work_wakes_on_manual_clock_advance() {
     driver_handle.join().unwrap();
     scheduler.settle_runnable(running_a).unwrap();
 }
+
+/// #1134 (#1106 follow-up): a thread whose every syscall is a short inline
+/// host wait must still exhaust its quantum while a sibling waits for the
+/// same CPU. Each host wait used to finalize the residency and register a
+/// fresh one at resume, so the run budget restarted at zero on every
+/// syscall and the queued sibling waited without bound
+/// (`el1_sched_deferred_handback_capture_observes_guest_records`: the
+/// stepper's socket loop held CPU 0 for its whole run). Run time before a
+/// host wait carries across it; the wait itself is not charged.
+#[test]
+fn host_wait_loop_does_not_reset_the_fairness_quantum() {
+    let t0 = Instant::now();
+    let clock = Arc::new(ManualClock::new(t0));
+    let (kernel, ctx_a, scheduler, _asids) = bootstrap_kernel_with_policy_and_clock(
+        80_101,
+        Arc::new(GuestCpuPolicy::new(1)),
+        clock.clone(),
+    );
+    clock.attach_condvar(scheduler.preemption_condvar());
+    publish_task(&ctx_a, 2101);
+    let ctx_b = create_sibling_thread(&kernel, &ctx_a, 80_102);
+    publish_task(&ctx_b, 2102);
+
+    let kick_a = Arc::new(TestKick::default());
+    let exec_a = scheduler
+        .register_executor_bound(kick_a, Some(GuestCpuId::new(0)), false)
+        .unwrap();
+    scheduler.make_runnable(ctx_a.thread().key()).unwrap();
+    let running_a = scheduler.take(&exec_a).unwrap();
+    // The sibling waits on the only CPU for the whole loop.
+    scheduler.make_runnable(ctx_b.thread().key()).unwrap();
+
+    // One iteration: 1 ms of guest run time, then a 1 ms host-served
+    // syscall (step away and resume on the same executor).
+    let mut preempted_at = None;
+    for iteration in 1..=16u32 {
+        clock.advance(Duration::from_millis(1));
+        let _ = scheduler.poll_due_preemption_requests();
+        if scheduler.should_preempt(&running_a) {
+            preempted_at = Some(iteration);
+            break;
+        }
+        let token = scheduler.begin_host_wait(&running_a, &exec_a).unwrap();
+        clock.advance(Duration::from_millis(1));
+        scheduler.end_host_wait(&running_a, &exec_a, token).unwrap();
+    }
+    // The default quantum is 4 ms of run time: the fourth run millisecond
+    // exhausts it. Host-wait time (another 3 ms by then) is not charged.
+    assert_eq!(
+        preempted_at,
+        Some(4),
+        "a host-wait loop must exhaust its run budget while a sibling waits"
+    );
+    // The preempted thread queues behind the sibling, which runs next.
+    scheduler.settle_runnable(running_a).unwrap();
+    let running_b = scheduler.take(&exec_a).unwrap();
+    assert_eq!(running_b.thread_key(), ctx_b.thread().key());
+    scheduler.settle_runnable(running_b).unwrap();
+}

@@ -8,6 +8,15 @@
 # across the two queues; reversing permanent priority is also a failure.
 # VM-free bounded selection witnesses require progress within two picks and
 # at most two service placements. Signed host-compute 10/10 remains required.
+# #1134: an inline host wait no longer refunds the run budget. Run time
+# spent before a step-away carries into the resumed residency (the wait is
+# not charged), so a thread whose every syscall is host-served exhausts its
+# quantum while a same-CPU sibling waits. The kernel-example witness drives
+# the production begin/end_host_wait path and requires preemption at the
+# fourth run millisecond, then the sibling claimed next. A guest service
+# handed back unplaced moves its held row to a host CPU queue; that move is
+# fairness demand and now schedules the running thread's deadline, as an
+# ordinary enqueue does (serial kernel witness below).
 # #1028: type physical custody diagnostic reasons; no change to this
 # contract's semantics or work budgets. The host dispatch test
 # physical_custody_reasons_preserve_fatal_codes_and_debug_text checks
@@ -50,7 +59,9 @@ vm_free = [
   "carrick-kernel-example::scheduler_affinity::host_and_control_share_the_only_affinity_mask (one retained control authority observed by host placement)",
   "carrick-kernel-example::scheduler_affinity::{sibling_setaffinity_changes_only_the_named_thread,other_process_setaffinity_changes_only_the_named_thread,getaffinity_reads_the_named_thread_including_the_leader_from_a_sibling,affinity_errors_leave_both_masks_unchanged,affinity_permission_uses_the_named_threads_credentials}",
   "carrick-kernel-example::scheduler_handoff::{queued_affinity_change_requires_migration_before_claim,remote_affinity_exclusion_kicks_the_exact_running_thread,self_affinity_change_requires_migration_before_return} (two live processes or threads, no timer advance, one exact kick and migration, zero unrelated or widening kicks)",
+  "carrick-kernel-example::scheduler_preemption::host_wait_loop_does_not_reset_the_fairness_quantum (production begin/end_host_wait with a manual clock, one CPU and two live threads: 1 ms run plus 1 ms host wait per syscall; preemption at exactly 4 ms of run time, not 4 ms of wall time, then the waiting sibling is claimed)",
   "carrick-kernel-example::scheduler_progress_contract",
+  "carrick-kernel::kernel::scheduler::tests::serial_host::an_unplaced_service_handback_is_fairness_demand (production publish_zone_handback of an unplaced service record, one CPU and two live threads: the row reaches the host queue, the running thread gets a fairness deadline, and the sibling is claimed next)",
   "carrick-kernel::kernel::scheduler::tests::serial_host::drain_work_double_release_is_fatal (conserved DrainWork/DrainObligation custody across SubmissionAuthority publication, queued rows, unactivated QueueClaim drop and checked release underflow; VM-free run-queue drain lifecycle only, no new preemption, scaling or runtime-ratio acceptance)",
   "carrick-kernel::kernel::scheduler::tests::serial_host::failed_zone_load_settlement_retires_only_its_owned_continuation (test-only extension: exact continuation transfer and failed-load retirement, zero queued rows after failure/stale delivery; no new preemption, scaling or runtime-ratio acceptance)",
   "carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation,zone_handback_before_registration_kicks_the_running_owner_once} (zone delivery target authentication, retired no-op, and one kick/zero queue rows before enrollment; no new preemption-policy or runtime-cost acceptance)",

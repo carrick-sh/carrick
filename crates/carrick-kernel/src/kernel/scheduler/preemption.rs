@@ -104,6 +104,24 @@ impl<T: ?Sized + MonotonicClock> MonotonicClock for Arc<T> {
     }
 }
 
+/// Execution budget one binding has already spent in its quantum.
+///
+/// A fresh claim starts at [`ConsumedRunTime::NONE`]. An inline host wait
+/// carries the binding's spent run time across the wait (the wait itself is
+/// not charged), so a thread whose every syscall steps away to the host still
+/// exhausts its quantum while a sibling waits for the CPU.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ConsumedRunTime(Duration);
+
+impl ConsumedRunTime {
+    /// A new dispatch: nothing of the quantum is spent.
+    pub const NONE: Self = Self(Duration::ZERO);
+
+    pub const fn as_duration(self) -> Duration {
+        self.0
+    }
+}
+
 /// Active residency of a thread executing on a bound executor.
 #[derive(Clone, Debug)]
 pub struct BindingResidency {
@@ -226,6 +244,10 @@ impl PreemptionState {
         DemandTicket(self.demand_counter)
     }
 
+    /// Register the residency of `binding`. `consumed` is execution budget
+    /// the same binding already spent before an inline host wait; the new
+    /// residency starts that far into its quantum, so stepping away to the
+    /// host never refunds run time a waiting sibling is owed.
     pub fn register_residency(
         &mut self,
         binding: ExecutorBinding,
@@ -233,10 +255,12 @@ impl PreemptionState {
         budget: RunBudget,
         thread: ThreadKey,
         generation: ExecutionGeneration,
+        consumed: ConsumedRunTime,
     ) -> (DemandTicket, u64) {
         let ticket = self.next_ticket();
         let sequence = self.next_sequence();
-        let start = self.clock.now();
+        let now = self.clock.now();
+        let start = now.checked_sub(consumed.0).unwrap_or(now);
         let residency = BindingResidency {
             binding,
             ticket,
@@ -255,6 +279,12 @@ impl PreemptionState {
     pub fn finalize_residency(&mut self, executor: ExecutorId) -> Option<BindingResidency> {
         self.cancel_deadline(executor);
         self.residencies.remove(&executor)
+    }
+
+    /// Run time `residency` has consumed by now: what a host wait that ends
+    /// it must carry into the binding's resumed residency.
+    pub fn consumed_by(&self, residency: &BindingResidency) -> ConsumedRunTime {
+        ConsumedRunTime(self.clock.now().saturating_duration_since(residency.start))
     }
 
     pub fn binding_residency(&self, executor: ExecutorId) -> Option<BindingResidencySnapshot> {

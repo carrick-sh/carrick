@@ -65,6 +65,8 @@ pub struct HostWaitToken<'a> {
     cpu: GuestCpuId,
     process: SchedProcessId,
     preserved_reasons: PreemptionReasons,
+    /// Run time the binding spent before this wait, restored at resume.
+    consumed: preemption::ConsumedRunTime,
     active: bool,
     lease: PhantomData<&'a ThreadExecutionLease>,
     // The retained backend/vCPU belongs to the entering host thread.
@@ -173,6 +175,7 @@ impl HostWaitToken<'_> {
                         budget,
                         self.binding.thread,
                         self.binding.generation,
+                        self.consumed,
                     );
                     if !reasons_to_restore.is_empty() {
                         preemption.add_preemption_reason(self.registration.id, reasons_to_restore);
@@ -404,14 +407,21 @@ impl Scheduler {
         let guest_cpu = &self.queue.inner.cpus[cpu.as_usize()];
         guest_cpu.nudge();
         let process = SchedProcessId::new(thread.task_key().serial.raw());
-        let (preserved_reasons, sequence) = {
+        let (preserved_reasons, consumed, sequence) = {
             let mut preemption = self.preemption.lock();
             let old = preemption.finalize_residency(registration.id);
+            // The wait ends this residency but not the binding's quantum:
+            // resume registers the same binding with this much already spent.
+            // FAIRNESS is recomputed from that budget and live demand there.
+            let consumed = old
+                .as_ref()
+                .map(|r| preemption.consumed_by(r))
+                .unwrap_or_default();
             let reasons = old
                 .map(|r| r.reasons.difference(PreemptionReasons::FAIRNESS))
                 .unwrap_or_default();
             let seq = preemption.next_sequence();
-            (reasons, seq)
+            (reasons, consumed, seq)
         };
         let thread_id = SchedThreadId::new(binding.thread.serial.raw());
         self.queue.inner.policy.on_event(&SchedulingEvent {
@@ -440,6 +450,7 @@ impl Scheduler {
             cpu,
             process,
             preserved_reasons,
+            consumed,
             active: true,
             lease: PhantomData,
             owner_thread: PhantomData,

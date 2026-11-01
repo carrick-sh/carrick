@@ -4097,6 +4097,10 @@ impl Scheduler {
             self.queue
                 .inner
                 .release_zone_row(QueueKey { thread, generation });
+            // The row is now host-queued demand on its CPU: the thread
+            // running there needs its fairness deadline, exactly as for an
+            // ordinary enqueue (`after_insertion`).
+            self.recompute_demand();
             return;
         }
         let Some(key) = crate::el1_zone::thread_key_of(record) else {
@@ -4888,6 +4892,7 @@ impl Scheduler {
             budget,
             row.thread.key(),
             row.key.generation,
+            preemption::ConsumedRunTime::NONE,
         );
         crate::event_ring::rec_sched_dispatch(
             row.thread.key().serial.raw() as i32,
@@ -10725,6 +10730,86 @@ mod tests {
         }
 
         include!("scheduler/exit_drain_tests.rs");
+
+        /// #1134 (#1106): a guest service the zone hands back unplaced moves
+        /// its held row to a host CPU queue. That row is new fairness demand
+        /// on that CPU: the compute thread already running there must get a
+        /// preemption deadline. The handback publication used to move the
+        /// row without recomputing demand, so the running thread kept the
+        /// CPU with no deadline and the host-queued sibling waited without
+        /// bound (signed `el1_sched_host_woken_thread_preempts_a_compute_loop`
+        /// wedges: compute `Running`, sibling host-queued, no deadline).
+        #[test]
+        fn an_unplaced_service_handback_is_fairness_demand() {
+            let _region = ZoneRegion::new();
+            let zone = carrick_el1_abi::zone_tables().unwrap();
+            let (kernel, root) = bootstrap(12_471);
+            root.thread()
+                .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+            let peer = sibling(&kernel, &root, 12_472);
+            peer.thread()
+                .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+            publish(&root, 34);
+            publish(&peer, 35);
+            let scheduler = Arc::new(Scheduler::new_with_policy(
+                Arc::clone(&kernel),
+                Arc::new(PinToCpuZero(1)),
+            ));
+            let executor = scheduler
+                .register_executor_bound(
+                    Arc::new(RecordingKick::default()),
+                    Some(GuestCpuId::new(0)),
+                    false,
+                )
+                .unwrap();
+            scheduler.make_runnable(root.thread().key()).unwrap();
+            let running = scheduler.take(&executor).unwrap();
+            assert!(!scheduler.has_deadline(executor.id()), "uncontended");
+
+            // The sibling's row is held for a guest service record, which the
+            // zone hands back unplaced (no live slot would take it).
+            let inner = &scheduler.queue.inner;
+            let key = QueueKey {
+                thread: peer.thread().key(),
+                generation: peer.thread().execution_state().generation().unwrap(),
+            };
+            {
+                let mut shard = inner.shard(key).lock();
+                shard.queued.insert(key);
+                shard.zone_held.insert(
+                    key,
+                    inner.retain_queued_row(crate::kernel::scheduler::QueueRow {
+                        key,
+                        thread: Arc::clone(peer.thread()),
+                        closing_authorized: false,
+                    }),
+                );
+            }
+            let identity = carrick_el1_abi::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(key.thread.tid.raw()).raw(),
+                serial: key.thread.serial.raw(),
+                mm: 0,
+                file_table: 0,
+                generation: key.generation.raw(),
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+            };
+            let record = zone.record_ref(zone.alloc_host_runnable(identity).unwrap());
+            scheduler.publish_zone_handback(record);
+            assert_eq!(scheduler.scheduler_summary().host_queued, 1);
+            assert!(
+                scheduler.has_deadline(executor.id()),
+                "a handed-back service row on the running thread's CPU is demand"
+            );
+
+            scheduler.settle_runnable(running).unwrap();
+            let next = scheduler.take(&executor).unwrap();
+            assert_eq!(next.thread_key(), peer.thread().key());
+            scheduler.settle_exited(next).unwrap();
+            scheduler.close();
+        }
 
         #[test]
         fn failed_zone_load_settlement_retires_only_its_owned_continuation() {
