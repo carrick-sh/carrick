@@ -106,7 +106,6 @@ embed_structural = "Not yet a registered WorkObservation binding: el1_thread_lif
 # #1100 VM-free bindings: native_fork_child_first_allocation_and_thread_admission;
 # native_fork_child_refills_retires_and_reuses_thread_stock (six births beyond
 # the first clone's initial four, three rounds, no remaining namespace claims or physical loans);
-# native_fork_child_capacity_refusal_is_eagain (seven active workers);
 # native_fork_child_waits_for_final_retired_control_pin (actual retained signal
 # projection followed by a release-less transient pin, owned clone resumes on final release).
 # native_fork_child_clone_storm_recycles_exited_pinned_controls (32 rounds, 256 births);
