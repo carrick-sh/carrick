@@ -3561,6 +3561,8 @@ mod tests {
         w.mem.write(OTHER_MM, va, b"data");
         let b_write = syscall(SYS_WRITE, wfd, va, 4, B_SVC);
         w.queue(202, OTHER_MM, &b_write, B_SVC);
+        // Harness statics allocate on first lock (macOS); not kernel work.
+        carrick_test_support::guest_user::warm();
         let allocs = allocations();
         let mut f = syscall(SYS_READ, r, va, 16, A_SVC);
         let a_regs = f.x;
@@ -3616,6 +3618,8 @@ mod tests {
         w.queue(202, OTHER_MM, &b_read, B_SVC);
         let mut received = Vec::with_capacity(total);
         let mut chunk = [0u8; 65536];
+        // Harness statics allocate on first lock (macOS); not kernel work.
+        carrick_test_support::guest_user::warm();
         let allocs = allocations();
         let mut f = syscall(SYS_WRITE, wfd, 0x100000, total as u64, A_SVC);
         assert_eq!(w.call(&mut f), SWITCHED, "A writes 64 KiB and parks");
@@ -4059,6 +4063,8 @@ mod tests {
         w.mem.map(MM, 0x20000, PAGE);
         w.mem.write(MM, 0x30000, &1u64.to_ne_bytes());
         let copied = Cell::new(0usize);
+        // Harness statics allocate on first lock (macOS); not kernel work.
+        carrick_test_support::guest_user::warm();
         let allocs = allocations();
         for _ in 0..rounds {
             for p in &all {
