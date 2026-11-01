@@ -716,7 +716,8 @@ fn idt_ist_rsp0_stack_switch_alignment_and_frame_layout_match_sdm() {
     assert_eq!(rig.machine.context().rflags & RFLAGS_IF, RFLAGS_IF);
 
     // 3. IST selection from TSS:
-    // 3a. CPL0 -> CPL0 with IST=7 switches to TSS.IST7 (+0xff8 -> +0xff0) and loads NULL SS!
+    // 3a. CPL0 -> CPL0 with IST=7 switches RSP to TSS.IST7 (+0xff8 -> +0xff0) but keeps SS
+    // (SDM `INT n` INTRA-PRIVILEGE-LEVEL-INTERRUPT never loads SS).
     rig.write_handler(0x82, &[0xb0, 0x82, 0xe6, 0xe0, 0x48, 0xcf]);
     rig.set_gate(0x82, IdtTestRig::stub_va(0x82), 0x08, 7, 0x0e, 0, true);
     rig.write_kernel_code(&[0xcd, 0x82, 0xf4]);
@@ -725,8 +726,8 @@ fn idt_ist_rsp0_stack_switch_alignment_and_frame_layout_match_sdm() {
     {
         let ctx = rig.machine.context();
         assert_eq!(ctx.gpr[reg::RSP], IST7_VA + 0xfc8);
-        assert!(ctx.ss.is_unusable());
-        assert_eq!(ctx.ss.selector, 0);
+        assert!(!ctx.ss.is_unusable());
+        assert_eq!(ctx.ss.selector, 0x10);
         assert_vmx_valid(ctx);
     }
     assert_eq!(
@@ -1357,7 +1358,7 @@ fn idt_vector_pf_delivers_cr2_all_five_error_bits_rsp0_ist_and_pte_fixup() {
 }
 
 #[test]
-fn idt_vector_ac_delivers_zero_error_code_clears_ac_and_exempts_movups() {
+fn idt_vector_ac_delivers_zero_error_code_keeps_ac_and_exempts_movups() {
     let mut rig = IdtTestRig::new();
     rig.machine.context_mut().cr0 |= CR0_AM;
     rig.machine.context_mut().set_smap_enabled(true);
@@ -1370,9 +1371,10 @@ fn idt_vector_ac_delivers_zero_error_code_clears_ac_and_exempts_movups() {
     assert_eq!(rig.run_to_vec_port(), 17);
     {
         let ctx = rig.machine.context();
-        // Gate entry clears live RFLAGS.AC (preventing leaked SMAP bypass in CPL0)!
-        assert_eq!(ctx.rflags & RFLAGS_AC, 0);
-        assert!(!ctx.ac());
+        // SDM Vol. 3A §6.12.1.3: IA-32e gate delivery clears TF/NT/RF/VM (and IF for an
+        // interrupt gate) but not AC; only real-address-mode delivery clears AC.
+        assert_eq!(ctx.rflags & RFLAGS_AC, RFLAGS_AC);
+        assert_eq!(ctx.rflags & RFLAGS_IF, 0);
         assert_eq!(ctx.gpr[reg::RSP], RSP0_VA + 0xfc0);
     }
     let ac_rsp0 = rig.read_frame48(rig.rsp0_frame, 0xfc0);
@@ -1530,4 +1532,24 @@ fn native_block_transitions_keep_guest_system_rflags_context_owned() {
         ctx.rflags & (0x3000 | RFLAGS_NT | RFLAGS_IF),
         0x3000 | RFLAGS_IF
     );
+}
+
+#[test]
+fn non_canonical_gate_rip_raises_gp_with_ext() {
+    // SDM Vol. 2A `INT n`: a non-canonical gate RIP raises #GP(EXT): EXT = 1 for a hardware
+    // exception, EXT = 0 for software `INT n`.
+    let mut rig = IdtTestRig::new();
+    rig.set_gate(6, 0x8000_0000_0000_0000, 0x08, 0, 0x0e, 0, true);
+    rig.write_kernel_code(&[0x0f, 0x0b]); // ud2
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 13);
+    let hw = rig.read_frame48(rig.stack_frame, 0xfc0);
+    assert_eq!(hw.error_code, 1);
+    assert_eq!(hw.rip, CODE_VA);
+
+    rig.set_gate(0x84, 0x8000_0000_0000_0000, 0x08, 0, 0x0e, 0, true);
+    rig.write_kernel_code(&[0xcd, 0x84]);
+    rig.enter_cpl0(CODE_VA, RFLAGS_IF);
+    assert_eq!(rig.run_to_vec_port(), 13);
+    assert_eq!(rig.read_frame48(rig.stack_frame, 0xfc0).error_code, 0);
 }

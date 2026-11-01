@@ -13,7 +13,7 @@ vs `ICEBP` and hardware exceptions), 16-byte stack alignment, unconditional
 `SS:RSP` frame pushes, `TSS` `RSP0..RSP2` and `IST1..IST7` stack switching,
 VMX-valid NULL `SS` loads, target-`CPL` stack push permissions, architectural
 error-code presence, `#PF` `CR2` and `P`/`W/R`/`U/S`/`RSVD`/`I/D` bits,
-`RFLAGS.AC` clearing on gate entry, `DR0..DR3`/`DR6`/`DR7`/`RF` debug state,
+live `RFLAGS` `TF`/`NT`/`RF`/`VM` clearing (`AC` kept), `DR0..DR3`/`DR6`/`DR7`/`RF` debug state,
 `CR0.EM`/`CR0.TS` `#UD`/`#NM` + `CLTS` recovery, and Table 6-5 `#PF`-then-`#PF`
 `#DF` / triple-fault escalation in `crates/carrick-softcpu-x86/tests/softcpu_idt_delivery.rs`.
 External interrupt delivery and recorded CPL0 fixture parity follow in slice 2 of #669.

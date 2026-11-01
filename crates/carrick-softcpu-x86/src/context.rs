@@ -246,7 +246,7 @@ impl SoftSegment {
         }
     }
 
-    /// IA-32e NULL stack segment loaded on an inter-privilege or `IST` IDT stack switch
+    /// IA-32e NULL stack segment loaded on an inter-privilege IDT stack switch
     /// (SDM Vol. 3A §6.14.2), preserving `RPL == DPL == cpl` for VMX guest-state checks.
     #[must_use]
     pub fn null_stack(cpl: u8) -> Self {

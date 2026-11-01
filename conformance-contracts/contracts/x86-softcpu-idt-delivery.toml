@@ -3,7 +3,7 @@ id = "x86.softcpu.idt-delivery"
 title = "Software x86_64 64-bit IDT exception delivery matches SDM gate, TSS/IST, error-code, CR2, and double-fault rules"
 guest_surfaces = ["isa:x86_64", "vmm:soft", "fault:divide-error", "fault:debug", "fault:invalid-opcode", "fault:general-protection", "fault:page-fault", "fault:alignment-check", "fault:stack-segment", "fault:segment-not-present", "tlb:soft-tlb"]
 semantic_authority = [
-  "Intel SDM Vol. 3A Ch. 6 (Interrupt and Exception Handling): §6.13 error-code presence and format (EXT/IDT/TI/selector and #PF error bits P, W/R, U/S, RSVD, I/D), §6.14 64-bit interrupt (0x0e) vs trap (0x0f) gate descriptors, present (#NP) and software INT/INT3 DPL checks, unconditional SS:RSP push, 16-byte stack alignment, TSS RSP0..RSP2/IST1..IST7 stack switching, RFLAGS TF/NT/RF/VM/AC/IF updates, and §6.15 Table 6-4/6-5 double-fault and triple-fault escalation",
+  "Intel SDM Vol. 3A Ch. 6 (Interrupt and Exception Handling): §6.13 error-code presence and format (EXT/IDT/TI/selector and #PF error bits P, W/R, U/S, RSVD, I/D), §6.14 64-bit interrupt (0x0e) vs trap (0x0f) gate descriptors, present (#NP) and software INT/INT3 DPL checks, unconditional SS:RSP push, 16-byte stack alignment, TSS RSP0..RSP2/IST1..IST7 stack switching, RFLAGS TF/NT/RF/VM/IF updates (AC preserved outside real-address mode), and §6.15 Table 6-4/6-5 double-fault and triple-fault escalation",
   "Intel SDM Vol. 3A Ch. 17/18 & Vol. 2A/2B (INT n, IRETQ, POPFQ, CLTS): pre-instruction TF single-step #DB (DR6.BS, DR7.GD), DR0..DR3 instruction-execution breakpoints, RFLAGS.RF one-instruction suppression and retirement clearing, ICEBP/INT1 (0xF1) DPL-exempt EXT=0 trap semantics, and CR0.EM/TS #UD/#NM faults with CLTS recovery",
   "Intel SDM Vol. 3A §4.6.1 & Vol. 3C §27.3.1.2: target-CPL stack push translation rights, implicit supervisor stack accesses, and VMX-valid NULL SS access rights (RPL == DPL == new_cpl) across IDT stack switches and CPL < 3 IRETQ",
 ]
@@ -18,9 +18,9 @@ delivery mechanics in `carrick-softcpu-x86` on top of #1237's double-fault class
 `#NP` checks, and `DPL` checks for software `INT n` / `INT3` (`EXT = 0`) vs hardware
 exceptions (`EXT = 1`) and `ICEBP` (`0xF1`, DPL-exempt `EXT = 0`). Stack switching
 selects `IST1..IST7` or `RSP0..RSP2` from `TSS`, aligns `RSP` downward to 16 bytes,
-always pushes the 64-bit `SS:RSP` frame with target-`CPL` paging permissions, clears
-live `RFLAGS.AC` on gate entry, and loads a VMX-valid NULL `SS` (`RPL == DPL == new_cpl`)
-on inter-privilege or `IST` transitions. Error codes are pushed exclusively for
+always pushes the 64-bit `SS:RSP` frame (pre-delivery `RFLAGS`) with target-`CPL` paging
+permissions, clears live `TF`/`NT`/`RF`/`VM` but keeps `AC`, and loads a VMX-valid NULL `SS` (`RPL == DPL == new_cpl`)
+on inter-privilege transitions (a same-CPL `IST` switch keeps `SS`). Error codes are pushed exclusively for
 `#DF`, `#TS`, `#NP`, `#SS`, `#GP`, `#PF`, and `#AC` (never for `#DE`, `#DB`, `#BP`,
 `#OF`, `#UD`, `#NM`, or software `INT n`), `#PF` sets `CR2` and `P`/`W/R`/`U/S`/`RSVD`/`I/D`,
 and `#PF`-then-`#PF` escalates to `#DF(0)`. External interrupt gating (`IF`/`CR8` and
