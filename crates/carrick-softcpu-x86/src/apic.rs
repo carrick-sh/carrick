@@ -253,6 +253,8 @@ pub struct ManualTscClock {
     tsc: AtomicU64,
     auto_advance_on_wait: AtomicBool,
     nodes: Mutex<Vec<Weak<ApicNode>>>,
+    enrolments: Mutex<u64>,
+    enrolment_cv: Condvar,
 }
 
 impl fmt::Debug for ManualTscClock {
@@ -275,6 +277,8 @@ impl ManualTscClock {
             tsc: AtomicU64::new(initial_tsc),
             auto_advance_on_wait: AtomicBool::new(false),
             nodes: Mutex::new(Vec::new()),
+            enrolments: Mutex::new(0),
+            enrolment_cv: Condvar::new(),
         }
     }
 
@@ -286,6 +290,8 @@ impl ManualTscClock {
             tsc: AtomicU64::new(initial_tsc),
             auto_advance_on_wait: AtomicBool::new(true),
             nodes: Mutex::new(Vec::new()),
+            enrolments: Mutex::new(0),
+            enrolment_cv: Condvar::new(),
         }
     }
 
@@ -312,6 +318,18 @@ impl ManualTscClock {
         let next = prev.saturating_add(delta);
         self.notify_nodes();
         next
+    }
+
+    /// Waits for at least `minimum` HLT wait enrolments, with a bounded failure path.
+    /// The count is published under the APIC wait lock, immediately before parking.
+    #[must_use]
+    pub fn wait_for_enrolments(&self, minimum: u64, bound: Duration) -> bool {
+        let Ok(count) = self.enrolments.lock() else {
+            return false;
+        };
+        self.enrolment_cv
+            .wait_timeout_while(count, bound, |count| *count < minimum)
+            .is_ok_and(|(count, _)| *count >= minimum)
     }
 
     fn notify_nodes(&self) {
@@ -364,7 +382,16 @@ impl TscClock for ManualTscClock {
                 || kick.has_pending_irr()
                 || deadline_tsc.is_some_and(|d| self.now() >= d);
         }
-        kick.wait_for_event(max_wait, || deadline_tsc.is_some_and(|d| self.now() >= d));
+        kick.wait_for_event_enrolled(
+            max_wait,
+            || deadline_tsc.is_some_and(|d| self.now() >= d),
+            || {
+                if let Ok(mut count) = self.enrolments.lock() {
+                    *count = count.saturating_add(1);
+                    self.enrolment_cv.notify_all();
+                }
+            },
+        );
         kick.is_kicked() || kick.has_pending_irr() || deadline_tsc.is_some_and(|d| self.now() >= d)
     }
 
@@ -517,6 +544,15 @@ impl ApicNode {
     }
 
     fn wait_for_event(&self, timeout: Duration, ready: impl Fn() -> bool) -> bool {
+        self.wait_for_event_enrolled(timeout, ready, || {})
+    }
+
+    fn wait_for_event_enrolled(
+        &self,
+        timeout: Duration,
+        ready: impl Fn() -> bool,
+        enrolled: impl FnOnce(),
+    ) -> bool {
         let pending = || self.is_kicked() || self.has_pending_irr() || ready();
         if pending() || timeout.is_zero() {
             return pending();
@@ -528,6 +564,7 @@ impl ApicNode {
             return true;
         }
         let start_epoch = *guard;
+        enrolled();
         let _ = self
             .wait_cv
             .wait_timeout_while(guard, timeout, |epoch| *epoch == start_epoch && !pending());
@@ -698,7 +735,6 @@ pub struct LocalApic {
     lvt_lint0: u32,
     lvt_lint1: u32,
     lvt_error: u32,
-    lvt_timer_written: bool,
     timer_icr: u32,
     timer_dcr: u32,
     timer_start_tsc: u64,
@@ -749,7 +785,6 @@ impl Clone for LocalApic {
             lvt_lint0: self.lvt_lint0,
             lvt_lint1: self.lvt_lint1,
             lvt_error: self.lvt_error,
-            lvt_timer_written: self.lvt_timer_written,
             timer_icr: self.timer_icr,
             timer_dcr: self.timer_dcr,
             timer_start_tsc: self.timer_start_tsc,
@@ -792,7 +827,6 @@ impl LocalApic {
             lvt_lint0: LAPIC_LVT_MASKED,
             lvt_lint1: LAPIC_LVT_MASKED,
             lvt_error: LAPIC_LVT_MASKED,
-            lvt_timer_written: false,
             timer_icr: 0,
             timer_dcr: 0,
             timer_start_tsc: 0,
@@ -882,10 +916,10 @@ impl LocalApic {
         LapicTimerMode::from_lvt(self.lvt_timer)
     }
 
-    /// Returns `true` if `LVT_TIMER` was explicitly written via MMIO with a non-TSC-deadline mode.
+    /// Returns `true` unless `LVT_TIMER` selects TSC-deadline mode, including at reset.
     #[must_use]
     pub const fn rejects_tsc_deadline_msr(&self) -> bool {
-        self.lvt_timer_written && !matches!(self.timer_mode(), LapicTimerMode::TscDeadline)
+        !matches!(self.timer_mode(), LapicTimerMode::TscDeadline)
     }
 
     /// Returns the highest-priority vector currently in service (`ISR`), if any.
@@ -1283,12 +1317,10 @@ impl LocalApic {
             }
             LAPIC_LVT_TIMER_OFFSET => {
                 let prev_mode = self.timer_mode();
-                let prev_was_written = self.lvt_timer_written;
                 self.lvt_timer = value & 0x0007_00ff;
-                self.lvt_timer_written = true;
                 let next_mode = self.timer_mode();
                 // Switching between TSC-deadline and counter modes disarms the timer per SDM Vol. 3A §10.5.4.1.
-                if prev_was_written && prev_mode != next_mode {
+                if prev_mode != next_mode {
                     *tsc_deadline_msr = 0;
                     self.timer_icr = 0;
                     self.timer_armed = false;

@@ -26,4 +26,3 @@ softcpu_level0 = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"
 softcpu_cpl0 = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs VM-free CPL0 privileged instruction and SoftMachine boot tests on x86_64" }
 softcpu_idt_delivery = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs VM-free per-vector 64-bit IDT exception delivery tests on x86_64" }
 softcpu_apic_timer = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs VM-free local xAPIC, TSC-deadline timer, and two-vCPU wake/IPI fixture tests on x86_64" }
-softcpu_apic_kvm = { lane = "kvm", reason = "required two-vCPU CPL0 wake/IPI differential against KVM; bounded isolated child, accessible /dev/kvm required" }

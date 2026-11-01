@@ -635,7 +635,7 @@ fn tsc_deadline_and_initial_count_timers_with_injectable_clock_and_bounded_hlt()
     clock.set(2_000);
     let clock_clone = Arc::clone(&clock);
     let advancer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(20));
+        assert!(clock_clone.wait_for_enrolments(1, Duration::from_secs(5)));
         clock_clone.set(10_000);
     });
 
@@ -963,4 +963,102 @@ fn lowest_priority_ipi_selects_one_enabled_destination() {
         "lowest-priority delivery must not broadcast"
     );
     assert!(second.irr_bit(0x51));
+}
+
+fn assert_wide_apic_gp(code: &[u8]) {
+    assert_wide_apic_gp_at(code, LAPIC_DEFAULT_PHYS_BASE);
+}
+
+fn assert_wide_apic_gp_at(code: &[u8], address: u64) {
+    let (mut machine, _, _) = setup_apic_machine(0, code);
+    machine.context_mut().gpr[reg::RSI] = address;
+    machine.context_mut().cr4 |= 1 << 9; // OSFXSR for SSE/FXRSTOR.
+    let (mut cpu, mut mem) = machine.into_parts();
+    assert_eq!(
+        cpu.step_block(&mut mem).unwrap(),
+        carrick_softcpu_x86::SoftCpuExit::Exception(X86Exception::general_protection(CODE_VA, 0)),
+    );
+}
+
+#[test]
+fn wide_apic_lidt_is_gp() {
+    assert_wide_apic_gp(&[0x0f, 0x01, 0x1e]);
+}
+
+#[test]
+fn wide_apic_fxrstor_is_gp() {
+    assert_wide_apic_gp(&[0x0f, 0xae, 0x0e]);
+}
+
+#[test]
+fn wide_apic_frstor_is_gp() {
+    assert_wide_apic_gp(&[0xdd, 0x26]);
+}
+
+#[test]
+fn wide_apic_sse_load_is_gp() {
+    assert_wide_apic_gp(&[0x0f, 0x10, 0x06]); // movups xmm0, [rsi]
+}
+
+#[test]
+fn wide_apic_fp_operand_is_gp() {
+    assert_wide_apic_gp(&[0x0f, 0x58, 0x06]); // addps xmm0, [rsi]
+}
+
+#[test]
+fn wide_apic_idt_gate_is_gp() {
+    let (mut machine, _, _) = setup_apic_machine(0, &[0xcd, 0x20]);
+    machine.context_mut().idtr = DescriptorTablePtr::new(0xfff, LAPIC_DEFAULT_PHYS_BASE);
+    // All three deliveries encounter the APIC page: INT, #GP, then #DF.
+    assert_eq!(
+        machine.run(1).unwrap(),
+        SoftMachineExit::TripleFault {
+            last_exception: X86Exception::general_protection(CODE_VA, 0),
+        },
+    );
+}
+
+#[test]
+fn deadline_written_at_reset_is_ignored() {
+    let (mut machine, _, _) = setup_apic_machine(0, &[0x0f, 0x30]); // wrmsr
+    let clock = Arc::new(ManualTscClock::new(1_000));
+    machine.set_clock(clock.clone());
+    let ctx = machine.context_mut();
+    ctx.gpr[reg::RCX] = u64::from(MSR_IA32_TSC_DEADLINE.raw());
+    ctx.gpr[reg::RAX] = 2_000;
+    let (mut cpu, mut mem) = machine.into_parts();
+    cpu.step_block(&mut mem).unwrap();
+    let ctx = cpu.context_mut();
+    let caps = carrick_softcpu_x86::MsrCapabilities::from_cpuid(&Cpl0CpuidView::with_tsc_deadline(
+        0,
+        1_000_000_000,
+    ));
+    assert_eq!(ctx.msrs().read(MSR_IA32_TSC_DEADLINE, caps).unwrap(), 0);
+    ctx.lapic_mmio_write(LAPIC_SVR_OFFSET, &0x1ffu32.to_le_bytes());
+    ctx.lapic_mmio_write(
+        LAPIC_LVT_TIMER_OFFSET,
+        &(LAPIC_LVT_TIMER_MODE_TSC_DEADLINE | 0xef).to_le_bytes(),
+    );
+    clock.set(3_000);
+    assert!(!ctx.poll_apic_timer());
+    assert!(!ctx.lapic().irr_bit(0xef));
+}
+
+#[test]
+fn deadline_passed_before_enrolment_returns_without_parking() {
+    use carrick_softcpu_x86::TscClock;
+    let clock = ManualTscClock::new(10_000);
+    let lapic = LocalApic::new(0);
+    assert!(clock.wait_until(
+        Some(10_000),
+        1_000_000_000,
+        &lapic.node(),
+        Duration::from_secs(1)
+    ));
+    assert!(!clock.wait_for_enrolments(1, Duration::ZERO));
+}
+
+#[test]
+fn wide_apic_sse_page_crossing_is_gp() {
+    assert_wide_apic_gp_at(&[0x0f, 0x10, 0x06], LAPIC_DEFAULT_PHYS_BASE + 0xff8);
 }

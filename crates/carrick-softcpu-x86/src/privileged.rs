@@ -97,8 +97,7 @@ impl LoadedGdtSegment {
         va: u64,
     ) -> Result<(), X86Exception> {
         if self.writeback_desc.is_some() {
-            check_system_write(ctx, mem, self.desc_va, 8)
-                .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+            check_system_write(ctx, mem, self.desc_va, 8).map_err(|fault| fault.exception(va))?;
         }
         Ok(())
     }
@@ -111,7 +110,7 @@ impl LoadedGdtSegment {
     ) -> Result<(), X86Exception> {
         if let Some(accessed) = self.writeback_desc {
             write_system_bytes(ctx, mem, self.desc_va, &accessed.to_le_bytes())
-                .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+                .map_err(|fault| fault.exception(va))?;
         }
         Ok(())
     }
@@ -139,8 +138,7 @@ pub(crate) fn load_gdt_code_or_data_descriptor<M: SoftMmuMemory>(
         return Err(X86Exception::general_protection(va, sel_err));
     }
     let mut raw_bytes = [0u8; 8];
-    read_system_bytes(ctx, mem, desc_va, &mut raw_bytes)
-        .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+    read_system_bytes(ctx, mem, desc_va, &mut raw_bytes).map_err(|fault| fault.exception(va))?;
     let desc = u64::from_le_bytes(raw_bytes);
     let s = ((desc >> 44) & 1) != 0;
     let p = ((desc >> 47) & 1) != 0;
@@ -531,7 +529,7 @@ fn emulate_lgdt_lidt<M: SoftMmuMemory>(
     }
     let mut buf = [0u8; 10];
     read_guest_bytes(ctx, mem, ea, &mut buf, SoftAccessKind::Read)
-        .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+        .map_err(|fault| fault.exception(va))?;
     let [l0, l1, b @ ..] = buf;
     let (limit, base) = (u16::from_le_bytes([l0, l1]), u64::from_le_bytes(b));
     if !is_canonical_va(base) {
@@ -569,8 +567,7 @@ fn emulate_sgdt_sidt<M: SoftMmuMemory>(
     let mut buf = [0u8; 10];
     buf[0..2].copy_from_slice(&dt.limit.to_le_bytes());
     buf[2..10].copy_from_slice(&dt.base.to_le_bytes());
-    write_guest_bytes(ctx, mem, ea, &buf)
-        .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+    write_guest_bytes(ctx, mem, ea, &buf).map_err(|fault| fault.exception(va))?;
     ctx.rip = resume;
     Ok(resume)
 }
@@ -608,7 +605,7 @@ fn emulate_sldt_str<M: SoftMmuMemory>(
             }
             check_guest_alignment(ctx, mem, ea, 2, 2, SoftAccessKind::Write, va)?;
             write_guest_bytes(ctx, mem, ea, &sel.to_le_bytes())
-                .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+                .map_err(|fault| fault.exception(va))?;
         }
         _ => return Err(X86Exception::invalid_opcode(va)),
     }
@@ -643,8 +640,7 @@ fn emulate_smsw<M: SoftMmuMemory>(
             }
             check_guest_alignment(ctx, mem, ea, 2, 2, SoftAccessKind::Write, va)?;
             let word = (ctx.cr0 as u16).to_le_bytes();
-            write_guest_bytes(ctx, mem, ea, &word)
-                .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+            write_guest_bytes(ctx, mem, ea, &word).map_err(|fault| fault.exception(va))?;
         }
         _ => return Err(X86Exception::invalid_opcode(va)),
     }
@@ -675,7 +671,7 @@ fn emulate_ltr<M: SoftMmuMemory>(
             }
             let mut b = [0u8; 2];
             read_guest_bytes(ctx, mem, ea, &mut b, SoftAccessKind::Read)
-                .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+                .map_err(|fault| fault.exception(va))?;
             u16::from_le_bytes(b)
         }
         _ => return Err(X86Exception::invalid_opcode(va)),
@@ -701,8 +697,7 @@ fn emulate_ltr<M: SoftMmuMemory>(
     }
 
     let mut desc_bytes = [0u8; 16];
-    read_system_bytes(ctx, mem, desc_va, &mut desc_bytes)
-        .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+    read_system_bytes(ctx, mem, desc_va, &mut desc_bytes).map_err(|fault| fault.exception(va))?;
     let [l0, l1, l2, l3, l4, l5, l6, l7, h @ ..] = desc_bytes;
     let low = u64::from_le_bytes([l0, l1, l2, l3, l4, l5, l6, l7]);
     let high = u64::from_le_bytes(h);
@@ -737,7 +732,7 @@ fn emulate_ltr<M: SoftMmuMemory>(
     // Mark TSS descriptor busy (Type 0x9 -> 0xb) in GDT.
     let busy_low = low | (0x2 << 40);
     write_system_bytes(ctx, mem, desc_va, &busy_low.to_le_bytes())
-        .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+        .map_err(|fault| fault.exception(va))?;
 
     let ar = (((busy_low >> 40) & 0xff) as u32) | ((((busy_low >> 52) & 0xf) as u32) << 12);
     ctx.tr = SoftSegment {
@@ -836,7 +831,7 @@ fn emulate_iret<M: SoftMmuMemory>(
         &mut frame[..frame_bytes],
         SoftAccessKind::Read,
     )
-    .map_err(|pf| X86Exception::page_fault(va, pf.error_code, pf.cr2))?;
+    .map_err(|fault| fault.exception(va))?;
 
     let read_slot = |index: usize| -> u64 {
         let s = &frame[index * slot..];

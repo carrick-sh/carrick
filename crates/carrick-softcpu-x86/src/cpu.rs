@@ -679,7 +679,7 @@ impl SoftCpu {
                             )
                         };
                         if let Err(pf) = result {
-                            return self.raise(X86Exception::page_fault(va, pf.error_code, pf.cr2));
+                            return self.raise(pf.exception(va));
                         }
                         if op == SensitiveOp::Ldmxcsr {
                             if u32::from_le_bytes(bytes) & !GUEST_MXCSR_MASK != 0 {
@@ -778,7 +778,7 @@ fn emulate_xstate<M: SoftMmuMemory>(
     };
     let mut area = [0u8; 576];
     let mut ranges = Vec::new();
-    let fault = |pf: crate::mmu::SoftPageFault| X86Exception::page_fault(ip, pf.error_code, pf.cr2);
+    let fault = |fault: crate::mmu::SoftMemoryFault| fault.exception(ip);
     let mut state = request;
     let mut xcomp = 0;
     if ext {
@@ -864,7 +864,7 @@ fn emulate_xstate<M: SoftMmuMemory>(
             // 464..512 (Intel SDM, FXSAVE layout).
             for off in [0, 511] {
                 crate::mmu::translate_va(ctx, mem, ea.wrapping_add(off), SoftAccessKind::Write)
-                    .map_err(fault)?;
+                    .map_err(|pf| X86Exception::page_fault(ip, pf.error_code, pf.cr2))?;
             }
         }
         for &(start, end) in &ranges {
@@ -877,7 +877,8 @@ fn emulate_xstate<M: SoftMmuMemory>(
                 if !is_canonical_va(va) {
                     return Err(X86Exception::general_protection(ip, 0));
                 }
-                crate::mmu::translate_va(ctx, mem, va, SoftAccessKind::Write).map_err(fault)?;
+                crate::mmu::translate_va(ctx, mem, va, SoftAccessKind::Write)
+                    .map_err(|pf| X86Exception::page_fault(ip, pf.error_code, pf.cr2))?;
             }
         }
         for (start, end) in ranges {
@@ -987,7 +988,7 @@ fn emulate_legacy_x87<M: SoftMmuMemory>(
         ip,
     )?;
     let mut image = [0u8; 108];
-    let fault = |pf: crate::mmu::SoftPageFault| X86Exception::page_fault(ip, pf.error_code, pf.cr2);
+    let fault = |fault: crate::mmu::SoftMemoryFault| fault.exception(ip);
     let (cw, sw, tag, fip, fcs, fdp, fds) = if env_len == 28 {
         (0, 4, 8, 12, 16, 20, 24)
     } else {

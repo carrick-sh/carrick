@@ -20,12 +20,9 @@ RAM is aligned atomic-backed storage retained by both memory handles. Page
 tables are fixed; this fixture does not prove shared mutable page-table
 retirement or cross-CPU TLB shootdown (#607).
 
-`softcpu_apic_kvm` is a separate required KVM target. It runs the identical
-image and compares every scratch result with SoftMachine. A ten-second
-isolated-process bound covers blocking KVM_RUN and both joins. An inaccessible
-KVM device fails that target; it never turns a SoftMachine result into a KVM
-parity claim. Full kernel/carrier and signed end-to-end acceptance remain
-outside this VM-free slice.
+KVM parity moves to a follow-up PR to keep this slice reviewable. The two-vCPU
+SoftMachine fixture remains here. Full kernel/carrier and signed end-to-end
+acceptance remain outside this VM-free slice.
 
 The resumed checkpoint did not compile against the current SoftMMU API.
 After porting the fixtures, red-first tests observed a wait deadline of 6000
@@ -41,3 +38,20 @@ selects one enabled destination by its published PPR class, with APIC ID as a
 deterministic tie break. A notification-race test forces a clock event between
 the initial probe and mutex enrollment and requires the enrolled predicate to
 observe it.
+
+Review regressions, all in the `softcpu_apic_timer` bindings:
+
+- Before width guards, LIDT, FXRSTOR, FRSTOR and IDT-gate tests panicked on
+  10, 512, 108 and 16-byte slices. The FP-operand test aborted on a 16-byte
+  slice. All five now return guest #GP(0).
+- The SSE page-crossing test returned #PF before the JIT fix; it now returns
+  #GP(0). The single-page SSE load already returned #GP and stays covered.
+- The reset-deadline test read back 2000 instead of zero before removing
+  `lvt_timer_written`. It now reads zero and cannot fire after a mode switch.
+- The timer HLT test waits for enrollment under the APIC mutex before
+  advancing time. Omitting publication fails its bounded five-second
+  assertion. Restoring it passes, without sleeps. The before-enrollment
+  case proves an already-passed deadline returns without parking.
+
+The crate suites and two-vCPU fixture pass; there are no `serial_host` cases.
+Delivery modes, cluster broadcast, stale-kick HLT cost and KVM parity remain follow-ups.
