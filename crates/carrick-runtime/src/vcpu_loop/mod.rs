@@ -1164,6 +1164,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
 
 /// Transfer restart eligibility from the operation owner to native delivery.
 /// A return with progress must not leak a witness into a later syscall.
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 fn arm_native_forwarded_restart(
     control: &carrick_personality_linux::abi::thread::ThreadControlSlot,
     value: i64,
