@@ -29,7 +29,7 @@ index f51eb8a67..ee8a6a7bd 100644
 @@ -897,9 +900,11 @@ jobs:
          if: ${{ always() }}
          run: just ci-cache-finish
- 
+
 -  # x86_64-only host tests (#1269). Every other host-lane job is arm64, where
 -  # a `#![cfg(target_arch = "x86_64")]` crate or test target compiles to zero
 -  # tests. `test-lanes check` requires each such root to be selected here.
@@ -55,7 +55,7 @@ index f51eb8a67..ee8a6a7bd 100644
 @@ -1553,6 +1558,207 @@ jobs:
          if: ${{ always() }}
          run: just ci-cache-finish
- 
+
 +  # Native Linux aarch64 run of carrick-el1-linux's non-macOS process/template/
 +  # IPC/poll tests (#1297, #1303). Gated on PRs touching carrick-el1-linux's
 +  # workspace closure and on every merge_group; el1-native-gate compares the
