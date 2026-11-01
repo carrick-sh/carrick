@@ -3005,6 +3005,13 @@ fn review_duplicate_binary_cannot_satisfy_two_lanes() {
     let counts = carrick_xtask::ci_receipt::lane_census(&r, tree.path()).unwrap();
     assert_eq!(counts["signed-hvf"], 0);
     assert_eq!(counts["host"], 0);
+    r.steps[0].command = "cargo test -p first --test shared".into();
+    let counts = carrick_xtask::ci_receipt::lane_census(&r, tree.path()).unwrap();
+    assert_eq!(
+        counts["signed-hvf"], 1,
+        "an explicit package selection identifies the owner"
+    );
+    assert_eq!(counts["host"], 0);
 }
 
 #[test]
