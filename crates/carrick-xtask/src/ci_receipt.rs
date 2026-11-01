@@ -77,12 +77,17 @@ pub enum ReceiptError {
 pub enum Lane {
     Hvf,
     Kvm,
+    /// `carrick-el1-linux`'s native-process tests on Linux aarch64 (#1297).
+    #[value(name = "el1-native")]
+    #[serde(rename = "el1-native")]
+    El1Native,
 }
 impl Lane {
     fn name(self) -> &'static str {
         match self {
             Self::Hvf => "hvf",
             Self::Kvm => "kvm",
+            Self::El1Native => "el1-native",
         }
     }
 }
@@ -714,7 +719,21 @@ fn binary_runs_in_receipt_lane(
         let runs = match lane {
             "kvm" => receipt.profile == "kvm",
             "signed-hvf" | "signed-cli" => receipt.phase == "signed",
-            "host" | "integration" => receipt.phase == "host" && receipt.profile != "kvm",
+            // An el1-native receipt runs only carrick-el1-linux's lib tests.
+            "host" | "integration" => {
+                receipt.phase == "host"
+                    && match receipt.profile.as_str() {
+                        "kvm" => false,
+                        "el1-native" => {
+                            manifest
+                                .get("package")
+                                .and_then(|p| p.get("name"))
+                                .and_then(toml::Value::as_str)
+                                == Some("carrick-el1-linux")
+                        }
+                        _ => true,
+                    }
+            }
             "manual" => false,
             unknown => {
                 return Err(ReceiptError::Retired(format!(

@@ -2028,3 +2028,27 @@ else:
         assert!(state.get(&h.commits[1]).is_none());
     }
 }
+
+/// #1297: the el1-native lane's gate looks for exactly the artifact name
+/// `kernel-runtime.yml`'s `el1-native-tests` uploads, and the CLI spelling
+/// the workflow passes (`--lane el1-native`) parses to that lane.
+#[test]
+fn el1_native_lane_names_match_the_workflow_upload_and_cli() {
+    use clap::ValueEnum as _;
+    let sha = "c".repeat(40);
+    assert_eq!(
+        artifact_name(Lane::El1Native, &sha, 2),
+        format!("receipt-el1-native-{sha}-2")
+    );
+    assert_eq!(Lane::from_str("el1-native", false), Ok(Lane::El1Native));
+    let workflow = include_str!("../../../.github/workflows/kernel-runtime.yml");
+    assert!(
+        workflow.contains("name: receipt-el1-native-${{ github.sha }}-${{ github.run_attempt }}")
+    );
+    assert!(workflow.contains("pattern: receipt-el1-native-${{ github.sha }}-*"));
+    assert_eq!(
+        workflow.matches("--lane el1-native").count(),
+        2,
+        "select-baseline and gate"
+    );
+}
