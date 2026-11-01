@@ -155,101 +155,12 @@ fn candidate_receipt(
     Ok(dir.join(name).join("receipt.json"))
 }
 
-fn test_belongs_to_binary(qualified_test: &str, bin: &str) -> bool {
-    qualified_test
-        .split_once("::")
-        .is_some_and(|(test_bin, _)| test_bin == bin)
-}
-
-/// Whether an unfinished or crashed binary `<bin>` in `step_name` should emit
-/// `unfinished:<bin>`, `unitemized:<step>:crash:<bin>`, and the `step:<step>`
-/// key derived from them when compared against `baseline`.
-///
-/// Without a baseline (`failure_keys`), every unfinished/crashed binary is
-/// included. Against a baseline (`diff`), a crash or unfinished state in
-/// `<bin>` is NEW only when the base binary finished (without all its base
-/// tests failing), or had at least one passing test that the candidate now
-/// fails or misses (or `<bin>` did not run in the base at all). A crash in a
-/// binary whose base tests ALL failed is not a new failure.
-fn binary_crash_or_unfinished_active(
-    baseline: Option<&AcceptReceipt>,
-    candidate: &AcceptReceipt,
-    step_name: &str,
-    bin: &str,
-) -> bool {
-    let Some(base) = baseline else {
-        return true;
-    };
-    let base_steps: Vec<_> = base.steps.iter().filter(|s| s.name == step_name).collect();
-    if base_steps.is_empty() {
-        return true;
-    }
-    let base_started: BTreeSet<&str> = base_steps
-        .iter()
-        .flat_map(|s| s.started_tests.iter().map(String::as_str))
-        .collect();
-    let base_failed: BTreeSet<&str> = base_steps
-        .iter()
-        .flat_map(|s| s.failed_tests.iter().map(String::as_str))
-        .collect();
-    let base_finished: BTreeSet<&str> = base_steps
-        .iter()
-        .flat_map(|s| s.finished_binaries.iter().map(String::as_str))
-        .collect();
-    let base_unfinished: BTreeSet<&str> = base_steps
-        .iter()
-        .flat_map(|s| s.unfinished_binaries.iter().map(String::as_str))
-        .collect();
-    let base_crashed = base_steps.iter().any(|s| {
-        s.unitemized_failures
-            .iter()
-            .any(|u| u.strip_prefix("crash:") == Some(bin))
-    });
-    if base_unfinished.contains(bin) || base_crashed {
-        return true;
-    }
-
-    let base_bin_started: Vec<&str> = base_started
-        .iter()
-        .copied()
-        .filter(|t| test_belongs_to_binary(t, bin))
-        .collect();
-    let base_bin_passed: Vec<&str> = base_bin_started
-        .iter()
-        .copied()
-        .filter(|t| !base_failed.contains(*t))
-        .collect();
-
-    if !base_bin_started.is_empty() && base_bin_passed.is_empty() {
-        return false;
-    }
-    if base_finished.contains(bin) || base_bin_started.is_empty() {
-        return true;
-    }
-
-    let cand_started: BTreeSet<&str> = candidate
-        .steps
-        .iter()
-        .filter(|s| s.name == step_name)
-        .flat_map(|s| s.started_tests.iter().map(String::as_str))
-        .collect();
-    let cand_failed: BTreeSet<&str> = candidate
-        .steps
-        .iter()
-        .filter(|s| s.name == step_name)
-        .flat_map(|s| s.failed_tests.iter().map(String::as_str))
-        .collect();
-    base_bin_passed
-        .iter()
-        .any(|t| !cand_started.contains(*t) || cand_failed.contains(*t))
-}
-
-fn receipt_failure_keys(
-    receipt: &AcceptReceipt,
-    baseline: Option<&AcceptReceipt>,
-) -> BTreeSet<String> {
+fn receipt_failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     for step in &receipt.steps {
+        if let crate::accept::StepOutcome::NotRun { reason } = step.execution_outcome() {
+            keys.insert(format!("not-run:{}:{reason}", step.name));
+        }
         let probes: Vec<_> = receipt
             .probe_diffs
             .iter()
@@ -261,22 +172,13 @@ fn receipt_failure_keys(
         for diff in &probes {
             keys.insert(format!("probe:{}:{}", step.name, diff.probe));
         }
-        let mut active_unitemized = false;
+        let active_unitemized =
+            !step.unitemized_failures.is_empty() || !step.unfinished_binaries.is_empty();
         for failure in &step.unitemized_failures {
-            let active = match failure.strip_prefix("crash:") {
-                Some(bin) => binary_crash_or_unfinished_active(baseline, receipt, &step.name, bin),
-                None => true,
-            };
-            if active {
-                active_unitemized = true;
-                keys.insert(format!("unitemized:{}:{failure}", step.name));
-            }
+            keys.insert(format!("unitemized:{}:{failure}", step.name));
         }
         for bin in &step.unfinished_binaries {
-            if binary_crash_or_unfinished_active(baseline, receipt, &step.name, bin) {
-                active_unitemized = true;
-                keys.insert(format!("unfinished:{bin}"));
-            }
+            keys.insert(format!("unfinished:{bin}"));
         }
         let any_explained = !step.failed_tests.is_empty()
             || !probes.is_empty()
@@ -319,7 +221,7 @@ fn receipt_failure_keys(
 /// when a failed step has nothing itemized at all, so a crash or aborted
 /// binary is never hidden behind a test failure the base also had.
 pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
-    receipt_failure_keys(receipt, None)
+    receipt_failure_keys(receipt)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -750,6 +652,83 @@ fn binary_runs_in_receipt_lane(
     Ok(!found)
 }
 
+/// Count executed tests by manifest lane. Excluded profiles (for example
+/// signed-cli's Docker suites in no-docker) are not required by this gate.
+/// Source manifests are read as data; no candidate build script is executed.
+pub fn lane_census(
+    receipt: &AcceptReceipt,
+    root: &Path,
+) -> Result<BTreeMap<String, usize>, ReceiptError> {
+    let required: &[&str] = if receipt.profile == "kvm" {
+        &["kvm"]
+    } else if receipt.profile == "el1-native" {
+        &["host"]
+    } else if receipt.phase == "signed" {
+        if receipt.profile == "full" {
+            &["signed-hvf", "signed-cli"]
+        } else {
+            &["signed-hvf"]
+        }
+    } else {
+        &["host"]
+    };
+    let mut tests_by_binary: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for test in receipt.steps.iter().flat_map(|step| &step.started_tests) {
+        if let Some((bin, name)) = test.split_once("::") {
+            tests_by_binary.entry(bin).or_default().insert(name);
+        }
+    }
+    let mut counts = BTreeMap::new();
+    for dir in candidate_crate_dirs(root)? {
+        let manifest = crate_manifest(&dir)?;
+        let declared = manifest
+            .get("package")
+            .and_then(|v| v.get("metadata"))
+            .and_then(|v| v.get("carrick"))
+            .and_then(|v| v.get("test-lanes"));
+        // Include implicit host ownership as defined by test-lanes resolve.
+        for lane in required {
+            let declared_here = *lane == "host"
+                || declared.and_then(toml::Value::as_table).is_some_and(|d| {
+                    d.values().any(|v| {
+                        v.as_str()
+                            .or_else(|| v.get("lane").and_then(toml::Value::as_str))
+                            == Some(*lane)
+                    })
+                });
+            if !declared_here {
+                continue;
+            }
+            counts.entry((*lane).to_string()).or_insert(0usize);
+        }
+        for (bin, tests) in &tests_by_binary {
+            if !crate_matches_bin(&dir, &manifest, bin)? {
+                continue;
+            }
+            let lane = declared.and_then(|d| {
+                d.as_table()
+                    .and_then(|table| {
+                        table
+                            .iter()
+                            .find(|(key, _)| key.replace('-', "_") == *bin)
+                            .map(|(_, v)| v)
+                    })
+                    .or_else(|| d.get("*"))
+            });
+            let lane = lane
+                .and_then(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("lane").and_then(toml::Value::as_str))
+                })
+                .unwrap_or(crate::test_lanes::DEFAULT_LANE);
+            if let Some(count) = counts.get_mut(lane) {
+                *count += tests.len();
+            }
+        }
+    }
+    Ok(counts)
+}
+
 /// Compare two receipts of the same gate without retired-test declarations.
 pub fn diff(
     baseline: &AcceptReceipt,
@@ -850,7 +829,7 @@ pub fn diff_with_retired(
     }
 
     let base = failure_keys(baseline);
-    let mut next = receipt_failure_keys(candidate, Some(baseline));
+    let mut next = receipt_failure_keys(candidate);
     for base_step in &baseline.steps {
         let base_failed: BTreeSet<&str> =
             base_step.failed_tests.iter().map(String::as_str).collect();
@@ -878,20 +857,46 @@ pub fn diff_with_retired(
             .flat_map(|s| s.finished_binaries.iter().map(String::as_str))
             .collect();
         for bin in &base_step.finished_binaries {
-            if !cand_finished.contains(bin.as_str())
-                && binary_crash_or_unfinished_active(
-                    Some(baseline),
-                    candidate,
-                    &base_step.name,
-                    bin,
-                )
-            {
+            if !cand_finished.contains(bin.as_str()) {
                 next.insert(format!("unfinished:{bin}"));
             }
         }
     }
+    // Missing execution is fatal even when main is missing the same evidence.
+    let mut new: BTreeSet<String> = next.difference(&base).cloned().collect();
+    for step in &candidate.steps {
+        if let crate::accept::StepOutcome::NotRun { reason } = step.execution_outcome() {
+            new.insert(format!("not-run:{}:{reason}", step.name));
+        }
+    }
+    for step in &baseline.steps {
+        if !candidate.steps.iter().any(|s| s.name == step.name) {
+            new.insert(format!("not-run:{}:step skipped", step.name));
+        }
+    }
+    for skipped in &candidate.skipped_steps {
+        // These suites are outside no-docker's declared scope, rather than
+        // required steps whose execution was skipped.
+        let excluded = candidate.profile == "no-docker"
+            && matches!(
+                skipped.as_str(),
+                "conformance-probes-retained" | "ltp" | "inotify09-el1" | "inotify09-el0"
+            );
+        let foreign_compiler = candidate.profile == "linux-portable"
+            && skipped.starts_with("host-authority live compiler profiles ");
+        if !excluded && !foreign_compiler {
+            new.insert(format!("not-run:{skipped}:step skipped"));
+        }
+    }
+    if !candidate_tree.as_os_str().is_empty() {
+        for (lane, executed) in lane_census(candidate, candidate_tree)? {
+            if executed == 0 {
+                new.insert(format!("not-run:lane:{lane}:zero executed tests"));
+            }
+        }
+    }
     Ok(ReceiptDiff {
-        new: next.difference(&base).cloned().collect(),
+        new: new.into_iter().collect(),
         fixed: base.difference(&next).cloned().collect(),
         warnings,
     })
@@ -922,6 +927,24 @@ fn print_diff(base: &str, diff: &ReceiptDiff) {
     }
     for key in &diff.fixed {
         println!("FIXED {key}");
+    }
+    let missing: Vec<_> = diff
+        .new
+        .iter()
+        .filter(|key| key.starts_with("not-run:"))
+        .collect();
+    if !missing.is_empty() {
+        let summary = format!(
+            "## Required tests not run\n\n{}\n",
+            missing
+                .iter()
+                .map(|key| format!("- {key}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        if let Err(error) = append_github_file("GITHUB_STEP_SUMMARY", &summary) {
+            eprintln!("could not write gate summary: {error}");
+        }
     }
 }
 
@@ -1471,9 +1494,6 @@ fn diff_for_gate_commits(
     candidate_sha: &str,
 ) -> Result<ReceiptDiff, ReceiptError> {
     ensure_git_commit(candidate_sha)?;
-    if !git_object_exists(&format!("{candidate_sha}:{RETIRED_TESTS_PATH}"))? {
-        return diff(base, candidate);
-    }
     ensure_git_commit(base_sha)?;
     let base_tree = archive_git_tree(base_sha)?;
     let candidate_tree = archive_git_tree(candidate_sha)?;

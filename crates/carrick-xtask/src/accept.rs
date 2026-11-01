@@ -99,8 +99,19 @@ pub enum AcceptError {
     Failed(String),
 }
 
+/// Whether a step actually supplied the evidence its gate requires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum StepOutcome {
+    Passed,
+    Failed { tests: Vec<String> },
+    NotRun { reason: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StepResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<StepOutcome>,
     pub name: String,
     pub command: String,
     pub exit_code: Option<i32>,
@@ -128,6 +139,74 @@ pub struct StepResult {
     /// printing a `test result:` summary line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unfinished_binaries: Vec<String>,
+}
+
+impl StepResult {
+    /// Recompute from evidence, including old receipts, rather than trusting
+    /// a candidate's declared outcome.
+    pub fn execution_outcome(&self) -> StepOutcome {
+        let reason = if self
+            .unitemized_failures
+            .iter()
+            .any(|f| f.starts_with("compile:"))
+        {
+            Some(format!(
+                "build failure: {}",
+                self.unitemized_failures.join(", ")
+            ))
+        } else if !self.unfinished_binaries.is_empty()
+            || self
+                .unitemized_failures
+                .iter()
+                .any(|f| f.starts_with("crash:") || f == "signal")
+            || (!self.passed
+                && (self.exit_code.is_none()
+                    || self
+                        .exit_code
+                        .is_some_and(|code| code == 124 || code >= 128)))
+        {
+            Some(format!(
+                "binary killed before reporting: {}",
+                self.unfinished_binaries.join(", ")
+            ))
+        } else if self.requires_tests() && self.started_tests.is_empty() {
+            Some("zero tests selected".into())
+        } else if !self.passed
+            && self.failed_tests.is_empty()
+            && self.unitemized_failures.is_empty()
+        {
+            Some("step skipped or failed before reporting".into())
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            StepOutcome::NotRun { reason }
+        } else if self.passed && self.failed_tests.is_empty() && self.unitemized_failures.is_empty()
+        {
+            StepOutcome::Passed
+        } else {
+            StepOutcome::Failed {
+                tests: self.failed_tests.clone(),
+            }
+        }
+    }
+
+    fn requires_tests(&self) -> bool {
+        self.command
+            .split_whitespace()
+            .any(|s| s == "test" || s.starts_with("test-"))
+            || matches!(
+                self.name.as_str(),
+                "el1-embed"
+                    | "fresh-executable-page"
+                    | "generic-probe-shards"
+                    | "probe-cases"
+                    | "conformance-probes-retained"
+                    | "ltp"
+                    | "inotify09-el1"
+                    | "inotify09-el0"
+            )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -937,6 +1016,13 @@ pub fn populate_step_from_log(step: &mut StepResult, log: &str, failures: &mut V
     {
         step.unitemized_failures.push("signal".into());
     }
+    let outcome = step.execution_outcome();
+    if let StepOutcome::NotRun { reason } = &outcome {
+        let message = format!("step '{}' not-run: {reason}", step.name);
+        step.passed = false;
+        step.error = Some(message.clone());
+        failures.push(message);
+    }
     let has_parse_error = (parsed.saw_failed_result && step.failed_tests.is_empty())
         || step
             .unitemized_failures
@@ -972,6 +1058,7 @@ pub fn populate_step_from_log(step: &mut StepResult, log: &str, failures: &mut V
         }
         failures.push(msg);
     }
+    step.outcome = Some(step.execution_outcome());
 }
 
 pub fn extract_probe_name_from_diff(line: &str) -> String {
@@ -1376,6 +1463,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             };
 
             step_results.push(StepResult {
+                outcome: None,
                 name: step.name.to_string(),
                 command: display_cmd,
                 exit_code,
@@ -1435,6 +1523,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         })?;
         println!("  fixtures: {message}");
         step_results.push(StepResult {
+            outcome: None,
             name: "fixtures".into(),
             command: "xtask fixtures verify".into(),
             exit_code: Some(if fixtures_valid { 0 } else { 1 }),
@@ -1550,6 +1639,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             }
 
             step_results.push(StepResult {
+                outcome: None,
                 name: step_name.to_string(),
                 command: cmd_str.to_string(),
                 exit_code,
@@ -1622,6 +1712,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             el1_summary = Some(comparison);
 
             step_results.push(StepResult {
+                outcome: None,
                 name: step_name.to_string(),
                 command: cmd_str.to_string(),
                 exit_code,
@@ -1687,6 +1778,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             };
 
             step_results.push(StepResult {
+                outcome: None,
                 name: step_name.to_string(),
                 command: cmd_str.to_string(),
                 exit_code,
@@ -1767,6 +1859,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             }
 
             step_results.push(StepResult {
+                outcome: None,
                 name: step_name.to_string(),
                 command: cmd_str.to_string(),
                 exit_code,
@@ -1843,6 +1936,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             }
 
             step_results.push(StepResult {
+                outcome: None,
                 name: step_name.to_string(),
                 command: cmd_str.to_string(),
                 exit_code,
@@ -1903,6 +1997,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 };
 
                 step_results.push(StepResult {
+                    outcome: None,
                     name: step_name.to_string(),
                     command: cmd_str.to_string(),
                     exit_code,
@@ -1985,6 +2080,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 };
 
                 step_results.push(StepResult {
+                    outcome: None,
                     name: step_name.to_string(),
                     command: display_cmd,
                     exit_code,
@@ -2066,6 +2162,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 }
 
                 step_results.push(StepResult {
+                    outcome: None,
                     name: step_name,
                     command: cmd_str,
                     exit_code,
@@ -2114,7 +2211,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
     }
     let overall = if failures.is_empty() { "PASS" } else { "FAIL" };
 
-    let receipt = AcceptReceipt {
+    let mut receipt = AcceptReceipt {
         schema_version: 1,
         timestamp: timestamp.clone(),
         head,
@@ -2133,6 +2230,17 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         host_load,
         failures: failures.clone(),
     };
+
+    let census = crate::ci_receipt::lane_census(&receipt, &root)
+        .map_err(|error| AcceptError::Failed(error.to_string()))?;
+    for (lane, executed) in census {
+        if executed == 0 {
+            failures.push(format!("not-run: lane '{lane}': zero executed tests"));
+        }
+    }
+    receipt.failures = failures.clone();
+    let overall = if failures.is_empty() { "PASS" } else { "FAIL" };
+    receipt.overall = overall.into();
 
     if let Some(parent) = receipt_path.parent() {
         fs::create_dir_all(parent).map_err(|e| AcceptError::Io {
@@ -2161,8 +2269,8 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
     println!("\nSteps:");
     for step in &receipt.steps {
         println!(
-            "  [{}] {} ({:.2}s)",
-            if step.passed { "PASS" } else { "FAIL" },
+            "  [{:?}] {} ({:.2}s)",
+            step.execution_outcome(),
             step.name,
             step.duration_s
         );
@@ -2425,6 +2533,7 @@ mod tests {
         let serial_log = "Running unittests src/lib.rs (target/debug/deps/carrick_el1_linux-abcdef)\ntest serial_host_checkpoint ... ok\ntest result: ok. 1 passed; 0 failed\n";
         let result = |spec: &StepSpec, log: &str, exit_code| {
             let mut step = StepResult {
+                outcome: None,
                 name: spec.name.into(),
                 command: format!("{} {}", spec.program, spec.args.join(" ")),
                 exit_code: Some(exit_code),
@@ -2687,6 +2796,7 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
             profile: "no-docker".to_string(),
             overall: "PASS".to_string(),
             steps: vec![StepResult {
+                outcome: None,
                 name: "test-kernel".to_string(),
                 command: "just test-kernel".to_string(),
                 exit_code: Some(0),

@@ -14,13 +14,14 @@ fn killed_binary_cannot_fix_even_an_entirely_failed_base_binary() {
     let mut base = base();
     base.steps[0].failed_tests = base.steps[0].started_tests.clone();
     let candidate = serde_json::from_str(include_str!("fixtures/signed-killed.json")).unwrap();
-    // The previous comparator explicitly permits this all-failed binary's
-    // crash, producing a false green. The strict gate must reject it.
+    // Both comparisons reject missing execution even when all baseline
+    // tests failed; a killed binary cannot be grandfathered.
     assert!(
         carrick_xtask::ci_receipt::diff(&base, &candidate)
             .unwrap()
             .new
-            .is_empty()
+            .iter()
+            .any(|key| key.starts_with("not-run:el1-embed:"))
     );
     let diff = compare(&base, &candidate).unwrap();
     assert!(!diff.passed);
@@ -73,7 +74,7 @@ fn baseline_unfinished_binary_does_not_allow_another_unfinished_binary() {
             .new
             .contains("unfinished:el1-embed:new")
     );
-    assert!(compare(&base, &base).unwrap().passed);
+    assert!(!compare(&base, &base).unwrap().passed);
 }
 
 #[test]

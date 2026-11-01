@@ -201,6 +201,11 @@ pub fn compare(
         new: BTreeSet::new(),
         fixed: BTreeSet::new(),
     };
+    for step in &candidate.steps {
+        if let crate::accept::StepOutcome::NotRun { reason } = step.execution_outcome() {
+            result.new.insert(format!("not-run:{}:{reason}", step.name));
+        }
+    }
     let names: BTreeSet<_> = base_steps
         .keys()
         .chain(candidate_steps.keys())
