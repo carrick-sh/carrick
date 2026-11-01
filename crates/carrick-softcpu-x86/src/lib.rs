@@ -56,10 +56,10 @@ pub use mmu::{
     RetirementWaitError, RootGpa, SOFT_TLB_BITS, SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK,
     SOFT_TLB_INVALID_TAG, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK, SOFT_TLB_PAGE_SHIFT,
     SOFT_TLB_PAGE_SIZE, SOFT_TLB_TAG_AC_BIT, SOFT_TLB_TAG_CPL3_BIT, SoftAccessKind,
-    SoftCpuException, SoftMmuMemory, SoftPageFault, SoftRequester, SoftSeatError, SoftTlb,
-    SoftTlbEntry, SoftTlbPlane, SoftTlbStats, SoftTranslationError, SoftVcpuSeat, SoftWalker,
-    Stage1Gpa, WalkOutcome, cpu_access_mode, is_canonical_va, read_guest_bytes, tlb_tag_mode_bits,
-    translate_va, translate_with_frame, write_guest_bytes,
+    SoftCpuException, SoftMemoryFault, SoftMmuMemory, SoftPageFault, SoftRequester, SoftSeatError,
+    SoftTlb, SoftTlbEntry, SoftTlbPlane, SoftTlbStats, SoftTranslationError, SoftVcpuSeat,
+    SoftWalker, Stage1Gpa, WalkOutcome, cpu_access_mode, is_canonical_va, read_guest_bytes,
+    tlb_tag_mode_bits, translate_va, translate_with_frame, write_guest_bytes,
 };
 pub use msr::{
     DEFAULT_IA32_APIC_BASE, DEFAULT_IA32_PAT, EFER_LMA, EFER_LME, EFER_NXE, EFER_SCE,

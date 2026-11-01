@@ -93,6 +93,34 @@ impl SoftPageFault {
     }
 }
 
+/// A translated memory operand can fault either in paging or at a device boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoftMemoryFault {
+    /// The page walker refused the access.
+    PageFault(SoftPageFault),
+    /// The operand width is unsupported by the xAPIC device.
+    GeneralProtection,
+}
+
+impl From<SoftPageFault> for SoftMemoryFault {
+    fn from(fault: SoftPageFault) -> Self {
+        Self::PageFault(fault)
+    }
+}
+
+impl SoftMemoryFault {
+    /// Attach the faulting instruction address without changing the fault class.
+    #[must_use]
+    pub const fn exception(self, rip: u64) -> crate::context::X86Exception {
+        match self {
+            Self::PageFault(pf) => {
+                crate::context::X86Exception::page_fault(rip, pf.error_code, pf.cr2)
+            }
+            Self::GeneralProtection => crate::context::X86Exception::general_protection(rip, 0),
+        }
+    }
+}
+
 use crate::context::{HostAccess, SoftCpuContext};
 
 /// Admit `ctx` for a host-side access through `mem`, failing closed (a
@@ -325,7 +353,7 @@ pub fn read_guest_bytes<M: SoftMmuMemory>(
     va: u64,
     dst: &mut [u8],
     kind: SoftAccessKind,
-) -> Result<(), SoftPageFault> {
+) -> Result<(), SoftMemoryFault> {
     let mode = ctx.access_mode();
     walk_span_mode(
         ctx,
@@ -355,7 +383,7 @@ pub fn write_guest_bytes<M: SoftMmuMemory>(
     mem: &mut M,
     va: u64,
     src: &[u8],
-) -> Result<(), SoftPageFault> {
+) -> Result<(), SoftMemoryFault> {
     let mode = ctx.access_mode();
     let w = SoftAccessKind::Write;
     walk_span_mode(
@@ -386,7 +414,7 @@ pub fn read_system_bytes<M: SoftMmuMemory>(
     mem: &mut M,
     va: u64,
     dst: &mut [u8],
-) -> Result<(), SoftPageFault> {
+) -> Result<(), SoftMemoryFault> {
     let mode = ctx.system_access_mode();
     walk_span_mode(
         ctx,
@@ -414,7 +442,7 @@ pub fn write_system_bytes<M: SoftMmuMemory>(
     mem: &mut M,
     va: u64,
     src: &[u8],
-) -> Result<(), SoftPageFault> {
+) -> Result<(), SoftMemoryFault> {
     let mode = ctx.system_access_mode();
     walk_span_mode(
         ctx,
@@ -441,7 +469,7 @@ pub(crate) fn check_system_write<M: SoftMmuMemory>(
     mem: &mut M,
     va: u64,
     len: usize,
-) -> Result<(), SoftPageFault> {
+) -> Result<(), SoftMemoryFault> {
     let mode = ctx.system_access_mode();
     walk_span_mode(
         ctx,
@@ -463,7 +491,7 @@ pub(crate) fn write_idt_stack_frame<M: SoftMmuMemory>(
     va: u64,
     target_cpl: u8,
     src: &[u8],
-) -> Result<(), SoftPageFault> {
+) -> Result<(), SoftMemoryFault> {
     let mode = ctx.stack_push_access_mode(target_cpl);
     walk_span_mode(
         ctx,
@@ -494,7 +522,7 @@ fn walk_span_mode<M: SoftMmuMemory>(
     kind: SoftAccessKind,
     mode: CpuAccessMode,
     mut commit: impl FnMut(&mut SoftCpuContext, usize, TranslatedTarget, usize),
-) -> Result<(), SoftPageFault> {
+) -> Result<(), SoftMemoryFault> {
     if len == 0 {
         return Ok(());
     }
@@ -505,6 +533,11 @@ fn walk_span_mode<M: SoftMmuMemory>(
             let chunk =
                 (len - off).min((SOFT_TLB_PAGE_SIZE - (cur & SOFT_TLB_OFFSET_MASK)) as usize);
             let target = probe_or_walk_target_mode(&mut access, mem, cur, kind, mode)?;
+            // Validate the complete operand before any copy or device side effect.
+            // A page boundary must not split an unsupported wide operand into valid chunks.
+            if matches!(target, TranslatedTarget::LapicMmio { .. }) && len > 8 {
+                return Err(SoftMemoryFault::GeneralProtection);
+            }
             if pass {
                 commit(access.context_mut(), off, target, chunk);
             }

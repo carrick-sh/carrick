@@ -479,8 +479,7 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
     }
 
     let mut gate = [0u8; 16];
-    read_system_bytes(ctx, mem, gate_va, &mut gate)
-        .map_err(|pf| X86Exception::page_fault(fault_va, pf.error_code, pf.cr2))?;
+    read_system_bytes(ctx, mem, gate_va, &mut gate).map_err(|fault| fault.exception(fault_va))?;
 
     let offset_low = u16::from_le_bytes([gate[0], gate[1]]);
     let target_cs_sel = u16::from_le_bytes([gate[2], gate[3]]);
@@ -574,7 +573,7 @@ fn deliver_idt_vector<M: SoftMmuMemory>(
 
     cs_loaded.precheck_accessed_write(ctx, mem, fault_va)?;
     write_idt_stack_frame(ctx, mem, new_rsp, new_cpl, &frame_buf[..frame_len])
-        .map_err(|pf| X86Exception::page_fault(fault_va, pf.error_code, pf.cr2))?;
+        .map_err(|fault| fault.exception(fault_va))?;
     cs_loaded.commit_accessed_write(ctx, mem, fault_va)?;
 
     ctx.cs = cs_loaded.seg;
@@ -615,7 +614,6 @@ fn read_tss_stack_ptr<M: SoftMmuMemory>(
         return Err(X86Exception::invalid_tss(fault_va, tr_err));
     }
     let mut b = [0u8; 8];
-    read_system_bytes(ctx, mem, va, &mut b)
-        .map_err(|pf| X86Exception::page_fault(fault_va, pf.error_code, pf.cr2))?;
+    read_system_bytes(ctx, mem, va, &mut b).map_err(|fault| fault.exception(fault_va))?;
     Ok(u64::from_le_bytes(b))
 }

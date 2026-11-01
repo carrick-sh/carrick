@@ -371,6 +371,10 @@ fn msr_file_and_rdmsr_wrmsr_enforce_sdm_semantics_and_gp_ud_paths() {
             ..Default::default()
         }),
     );
+    dl_cpu.context_mut().lapic_mmio_write(
+        carrick_softcpu_x86::LAPIC_LVT_TIMER_OFFSET,
+        &(carrick_softcpu_x86::LAPIC_LVT_TIMER_MODE_TSC_DEADLINE | 0xef).to_le_bytes(),
+    );
     dl_cpu.context_mut().gpr[reg::RCX] = u64::from(MSR_IA32_TSC_DEADLINE.raw());
     dl_cpu.context_mut().gpr[reg::RAX] = 0xdead_beef;
     dl_cpu.context_mut().gpr[reg::RDX] = 0x0000_0012;

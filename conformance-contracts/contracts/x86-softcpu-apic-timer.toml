@@ -27,11 +27,19 @@ vm_free = [
   "carrick-softcpu-x86::softcpu_apic_timer::periodic_timer_coalesces_missed_periods_without_catchup_deliveries",
   "carrick-softcpu-x86::softcpu_apic_timer::repeated_hlt_steps_stay_parked_until_an_interrupt_is_delivered",
   "carrick-softcpu-x86::softcpu_apic_timer::two_vcpu_wake_and_ipi_fixture_on_softmachine",
-  "carrick-softcpu-x86::softcpu_apic_kvm::two_vcpu_wake_and_ipi_matches_kvm",
   "carrick-softcpu-x86::softcpu_apic_timer::hlt_with_if_clear_does_not_resume_for_a_maskable_ipi",
   "carrick-softcpu-x86::softcpu_apic_timer::lowest_priority_ipi_selects_one_enabled_destination",
+  "carrick-softcpu-x86::softcpu_apic_timer::wide_apic_lidt_is_gp",
+  "carrick-softcpu-x86::softcpu_apic_timer::wide_apic_idt_gate_is_gp",
+  "carrick-softcpu-x86::softcpu_apic_timer::wide_apic_fxrstor_is_gp",
+  "carrick-softcpu-x86::softcpu_apic_timer::wide_apic_frstor_is_gp",
+  "carrick-softcpu-x86::softcpu_apic_timer::wide_apic_fp_operand_is_gp",
+  "carrick-softcpu-x86::softcpu_apic_timer::wide_apic_sse_load_is_gp",
+  "carrick-softcpu-x86::softcpu_apic_timer::wide_apic_sse_page_crossing_is_gp",
+  "carrick-softcpu-x86::softcpu_apic_timer::deadline_written_at_reset_is_ignored",
+  "carrick-softcpu-x86::softcpu_apic_timer::deadline_passed_before_enrolment_returns_without_parking",
 ]
 
 [bindings.unresolved]
-embed_structural = "Soft carrier integration is a later part of #578. This slice executes a small CPL0 image on SoftMachine, not the full Carrick kernel. KVM parity requires accessible /dev/kvm and the separately registered kvm test target. Cross-CPU page-table mutation and shootdown remain #607."
-docker = "The authority for local APIC hardware behavior is the Intel SDM and the identical KVM guest image, rather than Linux userspace in Docker. No Docker runtime-ratio evidence is claimed."
+embed_structural = "Soft carrier integration is a later part of #578. This slice executes a small CPL0 image on SoftMachine, not the full Carrick kernel. KVM parity moves to a follow-up PR; this slice proves only the two-vCPU SoftMachine fixture. Cross-CPU page-table mutation and shootdown remain #607."
+docker = "The authority for local APIC hardware behavior is the Intel SDM, rather than Linux userspace in Docker. No Docker runtime-ratio evidence is claimed."

@@ -1116,16 +1116,7 @@ fn translate_or_record_ram(
     match translate_or_record_target(ctx, va, kind, insn_va)? {
         TranslatedTarget::Ram(ptr) => Some(ptr),
         TranslatedTarget::LapicMmio { .. } => {
-            let mut bits = if ctx.cpl == 3 {
-                crate::mmu::PF_ERR_USER
-            } else {
-                0
-            };
-            if kind == SoftAccessKind::Write {
-                bits |= crate::mmu::PF_ERR_WRITE;
-            }
-            ctx.cr2 = va;
-            record_exception(ctx, X86Exception::page_fault(insn_va, bits, va));
+            record_exception(ctx, X86Exception::general_protection(insn_va, 0));
             None
         }
     }
@@ -1226,20 +1217,22 @@ extern "sysv64" fn softcpu_mem_slow_path(
 
     let mut read_ptrs = (std::ptr::null_mut(), std::ptr::null_mut());
     if needs_read {
-        let (Some(p0), Some(p1)) = (
-            translate_or_record_ram(ctx, guest_va, SoftAccessKind::Read, insn_va),
-            translate_or_record_ram(ctx, page1_va, SoftAccessKind::Read, insn_va),
-        ) else {
+        let Some(p0) = translate_or_record_ram(ctx, guest_va, SoftAccessKind::Read, insn_va) else {
+            return 0;
+        };
+        let Some(p1) = translate_or_record_ram(ctx, page1_va, SoftAccessKind::Read, insn_va) else {
             return 0;
         };
         read_ptrs = (p0, p1);
     }
 
     if needs_write {
-        let (Some(w0), Some(w1)) = (
-            translate_or_record_ram(ctx, guest_va, SoftAccessKind::Write, insn_va),
-            translate_or_record_ram(ctx, page1_va, SoftAccessKind::Write, insn_va),
-        ) else {
+        let Some(w0) = translate_or_record_ram(ctx, guest_va, SoftAccessKind::Write, insn_va)
+        else {
+            return 0;
+        };
+        let Some(w1) = translate_or_record_ram(ctx, page1_va, SoftAccessKind::Write, insn_va)
+        else {
             return 0;
         };
         ctx.bounce_writeback = BounceWriteback {
@@ -1651,6 +1644,9 @@ fn walk_active_span(
                 (len - off).min((SOFT_TLB_PAGE_SIZE - (cur & SOFT_TLB_OFFSET_MASK)) as usize);
             let target = translate_active(ctx, cur, kind)
                 .map_err(|pf| X86Exception::page_fault(insn_va, pf.error_code, pf.cr2))?;
+            if matches!(target, TranslatedTarget::LapicMmio { .. }) && len > 8 {
+                return Err(X86Exception::general_protection(insn_va, 0));
+            }
             if pass {
                 commit(ctx, off, target, chunk);
             }
