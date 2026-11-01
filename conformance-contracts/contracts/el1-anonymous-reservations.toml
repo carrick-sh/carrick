@@ -36,6 +36,7 @@ vm_free = [
   "carrick-el1::memory::tests::delegated::mmap_unrepresented_protection_preserves_host_linux_decoder (decoder fallback only; live descriptor publication requires embed)",
   "carrick-el1::memory::tests::delegated::mmap_stack_hint_is_served_like_private_anonymous (MAP_STACK is a hint served by the root; MAP_GROWSDOWN keeps the host decoder)",
   "carrick-el1::memory::tests::delegated::two_isa_anonymous_edits_publish_to_a_live_peer",
+  "carrick-x86-cpl0::anonymous_refusal_tests::both_linux_decoders_project_the_same_anonymous_call",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_reservations_stay_in_guest",

@@ -34,6 +34,8 @@ vm_free = [
   "carrick-vmm-hvf::trap::frame_inventory::tests::el1_owned_live_leaf_overrides_stale_host_shadow_without_weakening_untagged_parity",
   "carrick-el1::memory::tests::delegated::two_isa_anonymous_edits_publish_to_a_live_peer",
   "carrick-el1::memory::tests::native_memory_call_uses_projected_task_and_actual_editor_slot",
+  "carrick-x86-cpl0::anonymous_refusal_tests::both_linux_decoders_project_the_same_anonymous_call",
+  "carrick-el1::memory::tests::invalid_arm_slot_refuses_mprotect_before_editing",
 ]
 embed = [
   "carrick-embed::el1_sched::el1_anonymous_permission_transitions_stay_in_guest",
