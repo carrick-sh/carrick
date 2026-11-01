@@ -1,8 +1,9 @@
 // CPL0 binding of the shared Linux anonymous reservation owner and native
 // descriptor editor. Physical returns remain journaled for owner settlement.
 use carrick_el1::memory::reservations::{X86Cpl0Zone, shared_x86_cpl0_guest};
+use carrick_el1::memory::{AnonymousCall, AnonymousCallView};
 use carrick_el1::memory::{X86AnonymousDecode, classify_anonymous_range};
-use carrick_el1_abi::{CurrentTask, TrapFrame};
+use carrick_el1_abi::CurrentTask;
 use carrick_guest_arch::{FrameGpa, GuestLen, RootGpa, UserRange, UserVa};
 use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
 use carrick_personality_linux::dispatch::FamilyCompletion;
@@ -10,7 +11,6 @@ use carrick_personality_linux::entry::{CanonicalCall, SyscallResult};
 use carrick_personality_linux::pending_anonymous::{
     DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
 };
-use carrick_sched_core::SlotId;
 use carrick_x86_carrier::entry::InitialWords;
 pub use carrick_x86_carrier::table_span::{
     admit_context, admit_tables, live_context, live_words, retire_context, working_tables,
@@ -18,7 +18,7 @@ pub use carrick_x86_carrier::table_span::{
 use core::sync::atomic::Ordering;
 
 pub(super) struct X86AnonymousVenue<'a> {
-    frame: TrapFrame,
+    frame: AnonymousCall,
     task: &'a CurrentTask,
 }
 impl<'a> X86AnonymousVenue<'a> {
@@ -27,49 +27,43 @@ impl<'a> X86AnonymousVenue<'a> {
         task: &'a CurrentTask,
         slot: u32,
         return_pc: u64,
-    ) -> Self {
-        let mut frame = TrapFrame {
-            slot: u64::from(slot),
-            elr: return_pc,
-            ..Default::default()
-        };
-        frame.x[..6].copy_from_slice(&call.args);
-        frame.x[8] = call.canonical.raw();
-        Self { frame, task }
+    ) -> Option<Self> {
+        let frame = crate::anonymous_call(*call, slot, UserVa::new(return_pc))?;
+        Some(Self { frame, task })
+    }
+    fn editor(&self) -> Option<(&'static X86Cpl0Zone, X86AnonymousEditor)> {
+        let mm = carrick_el1_abi::ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))?;
+        let words = live_words(mm)?;
+        let zone_address = carrick_el1::isa::x86_kernel_layout().zone.raw();
+        // SAFETY: boot retains the compact zone throughout this MM's execution.
+        let zone = unsafe { &*(zone_address as *const X86Cpl0Zone) };
+        Some((
+            zone,
+            X86AnonymousEditor {
+                words,
+                sequence: None,
+            },
+        ))
     }
 }
 
 impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     fn original_argument0(&self) -> u64 {
-        self.frame.x[0]
+        self.frame.arguments()[0]
     }
     fn task_state(&self) -> Option<&carrick_personality_linux::abi::entry::LinuxTaskState> {
         Some(&self.task.linux)
     }
     fn delegated(&mut self) -> DelegatedStep {
-        let Some(mm) =
-            carrick_el1_abi::ReservationMm::new(self.task.mm.key.load(Ordering::Acquire))
-        else {
+        let Some((zone, mut editor)) = self.editor() else {
             return DelegatedStep::Forward;
         };
-        let Some(words) = live_words(mm) else {
-            return DelegatedStep::Forward;
-        };
-        let zone_address = carrick_el1::isa::x86_kernel_layout().zone.raw();
-        // SAFETY: boot retains the compact zone throughout this MM's execution.
-        let zone = unsafe { &*(zone_address as *const X86Cpl0Zone) };
-        let Some(slot) = SlotId::from_index(self.frame.slot as usize) else {
-            return DelegatedStep::Forward;
-        };
+        let slot = self.frame.slot();
         let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding() else {
             return DelegatedStep::Forward;
         };
         // SAFETY: this CPU's binding retains its initialized atomic counters.
         let counters = unsafe { &*(binding.counters_address as *const carrick_el1_abi::Counters) };
-        let mut editor = X86AnonymousEditor {
-            words,
-            sequence: None,
-        };
         match carrick_el1::memory::serve_delegated_anonymous(
             &mut self.frame,
             counters,
@@ -80,7 +74,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             None,
         ) {
             carrick_el1::memory::DelegatedAnonymous::Served => {
-                DelegatedStep::Served(SyscallResult::new(self.frame.x[0] as i64))
+                DelegatedStep::Served(SyscallResult::new(self.frame.result().0 as i64))
             }
             carrick_el1::memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
             _ => DelegatedStep::Forward,
@@ -90,19 +84,20 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         None
     }
     fn permission(&mut self) -> PermissionStep {
-        PermissionStep::Forward
+        crate::refuse_anonymous_permission(&crate::CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS)
     }
     fn retirement(&mut self) -> RetirementStep {
-        RetirementStep::Forward
+        crate::refuse_anonymous_retirement(&crate::CARRICK_CPL0_ANONYMOUS_HOOK_REFUSALS)
     }
     fn install_result(&mut self, result: SyscallResult) {
-        self.frame.x[0] = result.raw() as u64;
+        self.frame
+            .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
 }
 
 struct X86AnonymousEditor {
     words: InitialWords,
-    sequence: Option<carrick_el1_abi::ReservationSequence>,
+    sequence: Option<carrick_el1::memory::AnonymousEditGeneration>,
 }
 impl X86AnonymousEditor {
     fn edit(
@@ -111,28 +106,27 @@ impl X86AnonymousEditor {
         range: UserRange,
         operation: carrick_guest_arch::EditOperation,
     ) -> Result<(), carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
-        use carrick_guest_arch::{EditIntent, EditOwner};
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
-        use carrick_mmu_core::x86::descriptor_txn::{
-            DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn,
-        };
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
         let context = self.words.context.ok_or(DescriptorRefusal::StaleRoot)?;
         if context.root != register {
             return Err(DescriptorRefusal::StaleRoot);
         }
-        // SAFETY: serve_delegated_anonymous holds the exact MM editor and root
-        // across this operation; InitialWords retains its authenticated context.
-        let sequence = self
+        // SAFETY: the shared anonymous entry holds the exact MM editor through
+        // settlement and binds this operation generation before editing.
+        // InitialWords retains its authenticated context.
+        let generation = self
             .sequence
-            .and_then(|sequence| core::num::NonZeroU64::new(sequence.raw()))
+            .as_ref()
             .ok_or(DescriptorRefusal::BadEncoding)?;
-        let owner = unsafe { EditOwner::issue(context.root, context.mm.raw(), sequence) };
-        let intent =
-            EditIntent::checked(owner, range, operation, &[]).ok_or(DescriptorRefusal::BadRange)?;
-        let txn = DescriptorTxn::from_intent(&intent)?;
-        match execute_descriptor_txn(&self.words, &txn, context.root, &mut InlineJournal::new())
-            .outcome
-        {
+        match carrick_el1::memory::edit_x86_anonymous(
+            &self.words,
+            context.root,
+            context.mm.raw(),
+            generation,
+            range,
+            operation,
+        )? {
             DescriptorOutcome::Applied { .. } => Ok(()),
             DescriptorOutcome::Refused(reason) | DescriptorOutcome::RolledBack(reason) => {
                 Err(reason)
@@ -143,7 +137,7 @@ impl X86AnonymousEditor {
 }
 impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
     fn bind_operation(&mut self, sequence: carrick_el1_abi::ReservationSequence) {
-        self.sequence = Some(sequence);
+        self.sequence = carrick_el1::memory::AnonymousEditGeneration::reservation(sequence);
     }
     fn backing(
         &mut self,
@@ -176,6 +170,9 @@ impl carrick_el1::memory::AnonymousBackingProbe for X86AnonymousEditor {
     }
 }
 impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
+    fn bind_resident_edit(&mut self, generation: carrick_el1::memory::AnonymousEditGeneration) {
+        self.sequence = Some(generation);
+    }
     fn protect_and_invalidate(
         &mut self,
         root: carrick_guest_arch::AddressSpaceRegister,
@@ -200,6 +197,9 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
     }
 }
 impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
+    fn bind_resident_edit(&mut self, generation: carrick_el1::memory::AnonymousEditGeneration) {
+        self.sequence = Some(generation);
+    }
     fn retire_and_invalidate(
         &mut self,
         mm: carrick_el1_abi::ReservationMm,

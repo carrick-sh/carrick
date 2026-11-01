@@ -3,7 +3,12 @@
 pub mod reservations;
 
 use carrick_core::mm::reservation::ReservationGeometry;
-use carrick_el1_abi::{CurrentTask, TrapFrame};
+use carrick_el1_abi::CurrentTask;
+#[cfg(test)]
+use carrick_el1_abi::TrapFrame;
+
+mod call;
+pub use call::{AnonymousCall, AnonymousCallView};
 use carrick_mmu_core::aarch64::{
     GuestPermissionCeiling, GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
 };
@@ -13,6 +18,35 @@ use carrick_sched_core::AddressSpaces;
 use carrick_sched_core::spaces::notification::SpaceAccess;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
+
+/// Execute the x86 anonymous editor's descriptor transaction on authenticated
+/// live words. The caller retains exact-MM exclusion and validates the root.
+/// Invalidation uses the supplied words' existing invalidate_range hook;
+/// migration of InitialWords to ServedTable/StagedInvalidation is #681 slice 5
+/// (https://github.com/carrick-sh/carrick/issues/681), still outstanding.
+pub fn edit_x86_anonymous(
+    words: &impl carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords,
+    root: carrick_guest_arch::RootGpa,
+    mm: NonZeroU64,
+    generation: &AnonymousEditGeneration,
+    range: carrick_guest_arch::UserRange,
+    operation: carrick_guest_arch::EditOperation,
+) -> Result<
+    carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome,
+    carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+> {
+    use carrick_guest_arch::{EditIntent, EditOwner};
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+    use carrick_mmu_core::x86::descriptor_txn::{
+        DescriptorTxn, InlineJournal, execute_descriptor_txn,
+    };
+    // SAFETY: caller holds the exact-MM editor and supplies its bound generation.
+    let owner = unsafe { EditOwner::issue(root, mm, generation.nonzero()) };
+    let intent =
+        EditIntent::checked(owner, range, operation, &[]).ok_or(DescriptorRefusal::BadRange)?;
+    let txn = DescriptorTxn::from_intent(&intent)?;
+    Ok(execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome)
+}
 
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
@@ -99,7 +133,7 @@ impl PendingReservationSyscall {
     /// pending proposal intact so its owner can explicitly refuse/settle it.
     pub fn complete<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &mut self,
-        frame: &mut TrapFrame,
+        frame: &mut (impl AnonymousCallView + ?Sized),
         current: &CurrentTask,
         model: &mut ReservationModel<'_, G, C>,
         completion: carrick_el1_abi::ReservationCompletion,
@@ -115,7 +149,7 @@ impl PendingReservationSyscall {
         C: Copy + Send + Sync + zerocopy::FromZeros,
     >(
         &mut self,
-        frame: &mut TrapFrame,
+        frame: &mut (impl AnonymousCallView + ?Sized),
         current: &CurrentTask,
         model: &mut ReservationModel<'_, G, C>,
         completion: carrick_el1_abi::ReservationCompletion,
@@ -125,7 +159,7 @@ impl PendingReservationSyscall {
     }
     fn complete_as<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &mut self,
-        frame: &mut TrapFrame,
+        frame: &mut (impl AnonymousCallView + ?Sized),
         current: &CurrentTask,
         model: &mut ReservationModel<'_, G, C>,
         completion: carrick_el1_abi::ReservationCompletion,
@@ -141,20 +175,20 @@ impl PendingReservationSyscall {
             Some(slot) => model.complete_deferring_return(completion, slot)?,
             None => model.complete(completion)?,
         };
-        frame.x[0] = result;
+        frame.set_result(carrick_guest_arch::NativeReturnWord(result));
         Ok(())
     }
-    fn owns_frame(&self, frame: &TrapFrame, current: &CurrentTask) -> bool {
+    fn owns_frame(&self, frame: &(impl AnonymousCallView + ?Sized), current: &CurrentTask) -> bool {
         ReservationOrigin::capture(current) == Some(self.origin)
-            && frame.elr == self.elr
-            && frame.x[8] == self.syscall
-            && frame.x[..6] == self.args
+            && frame.return_address().raw() == self.elr
+            && frame.canonical().raw() == self.syscall
+            && frame.arguments() == self.args
     }
     /// Finish a clean backing/descriptor refusal on the originating thread.
     /// The service must roll back before invoking this method.
     pub fn refuse<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZeros>(
         &mut self,
-        frame: &mut TrapFrame,
+        frame: &mut (impl AnonymousCallView + ?Sized),
         current: &CurrentTask,
         model: &mut ReservationModel<'_, G, C>,
     ) -> Result<(), reservations::Refusal> {
@@ -162,11 +196,13 @@ impl PendingReservationSyscall {
             return Err(reservations::Refusal::Stale);
         }
         model.refuse(self.request)?;
-        frame.x[0] = if self.syscall == SYS_BRK {
-            model.brk_current()
-        } else {
-            (-ENOMEM) as u64
-        };
+        frame.set_result(carrick_guest_arch::NativeReturnWord(
+            if self.syscall == SYS_BRK {
+                model.brk_current()
+            } else {
+                (-ENOMEM) as u64
+            },
+        ));
         Ok(())
     }
     /// Cancel after service rollback when the originating thread is gone.
@@ -187,7 +223,7 @@ pub fn decide_anonymous_syscall<
     G: ReservationGeometry,
     C: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    frame: &TrapFrame,
+    frame: &(impl AnonymousCallView + ?Sized),
     current: &CurrentTask,
     model: &mut ReservationModel<'_, G, C>,
 ) -> ReservationDisposition {
@@ -202,7 +238,7 @@ pub fn decide_reservation_syscall<
     G: ReservationGeometry,
     C: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    frame: &TrapFrame,
+    frame: &(impl AnonymousCallView + ?Sized),
     current: &CurrentTask,
     model: &mut ReservationModel<'_, G, C>,
     file: Option<carrick_el1_abi::HostBackingIdentity>,
@@ -215,11 +251,11 @@ pub fn decide_reservation_syscall<
     if origin.mm != model.mm() || !model.is_admitted() {
         return ReservationDisposition::Unavailable(Refusal::Stale);
     }
-    let nr = frame.x[8];
+    let nr = frame.canonical().raw();
     let result = match nr {
-        SYS_BRK => model.brk(frame.x[0]),
+        SYS_BRK => model.brk(frame.arguments()[0]),
         SYS_MMAP => {
-            let flags = frame.x[3];
+            let flags = frame.arguments()[3];
             // `MAP_STACK` is a placement hint with no effect on the mapping
             // (man 2 mmap); the root serves it as private anonymous memory.
             // MAP_DENYWRITE and MAP_EXECUTABLE are ignored by Linux (man 2
@@ -252,52 +288,54 @@ pub fn decide_reservation_syscall<
             {
                 return ReservationDisposition::Forward;
             }
-            let prot = match MmapProtectionRoute::decode(frame.x[2]) {
+            let prot = match MmapProtectionRoute::decode(frame.arguments()[2]) {
                 MmapProtectionRoute::Reservation(protection) => protection,
                 MmapProtectionRoute::HostUnrepresentedBits => {
                     return ReservationDisposition::Forward;
                 }
             };
-            if !frame.x[5].is_multiple_of(PAGE_SIZE) {
+            if !frame.arguments()[5].is_multiple_of(PAGE_SIZE) {
                 return ReservationDisposition::Return(-EINVAL);
             }
             let placement = if flags & MAP_FIXED_NOREPLACE != 0 {
-                Placement::NoReplace(frame.x[0])
+                Placement::NoReplace(frame.arguments()[0])
             } else if flags & MAP_FIXED != 0 {
-                Placement::Fixed(frame.x[0])
-            } else if frame.x[0] == 0 {
+                Placement::Fixed(frame.arguments()[0])
+            } else if frame.arguments()[0] == 0 {
                 Placement::Anywhere
             } else {
-                Placement::Hint(frame.x[0])
+                Placement::Hint(frame.arguments()[0])
             };
             match file {
-                Some(source) => match source.advance(frame.x[5]) {
-                    Some(source) => model.mmap_private_file(placement, frame.x[1], prot, source),
+                Some(source) => match source.advance(frame.arguments()[5]) {
+                    Some(source) => {
+                        model.mmap_private_file(placement, frame.arguments()[1], prot, source)
+                    }
                     None => return ReservationDisposition::Return(-EINVAL),
                 },
-                None => model.mmap(placement, frame.x[1], prot),
+                None => model.mmap(placement, frame.arguments()[1], prot),
             }
         }
         SYS_MUNMAP | SYS_MPROTECT => {
-            if !frame.x[0].is_multiple_of(PAGE_SIZE) {
+            if !frame.arguments()[0].is_multiple_of(PAGE_SIZE) {
                 return ReservationDisposition::Return(-EINVAL);
             }
             let prot = if nr == SYS_MPROTECT {
-                let Some(prot) = ReservationProtection::from_bits(frame.x[2]) else {
+                let Some(prot) = ReservationProtection::from_bits(frame.arguments()[2]) else {
                     return ReservationDisposition::Return(-EINVAL);
                 };
                 prot
             } else {
                 ReservationProtection::NONE
             };
-            if frame.x[1] == 0 {
+            if frame.arguments()[1] == 0 {
                 return ReservationDisposition::Return(if nr == SYS_MUNMAP { -EINVAL } else { 0 });
             }
-            let range = frame.x[1]
+            let range = frame.arguments()[1]
                 .checked_add(PAGE_SIZE - 1)
                 .map(|v| v & !(PAGE_SIZE - 1))
-                .and_then(|len| frame.x[0].checked_add(len))
-                .and_then(|end| ReservationRange::new(frame.x[0], end));
+                .and_then(|len| frame.arguments()[0].checked_add(len))
+                .and_then(|end| ReservationRange::new(frame.arguments()[0], end));
             let Some(range) = range else {
                 return ReservationDisposition::Return(-ENOMEM);
             };
@@ -314,11 +352,9 @@ pub fn decide_reservation_syscall<
         Ok(Decision::Work(request)) => ReservationDisposition::Work(PendingReservationSyscall {
             request,
             origin,
-            elr: frame.elr,
+            elr: frame.return_address().raw(),
             syscall: nr,
-            args: [
-                frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
-            ],
+            args: frame.arguments(),
         }),
         Err(Refusal::Collision) => ReservationDisposition::Return(-17),
         Err(Refusal::Invalid) => ReservationDisposition::Return(-EINVAL),
@@ -355,8 +391,29 @@ pub enum MunmapDisposition {
     Retired,
 }
 
+/// Synchronous descriptor-operation identity. Issued only after acquiring the
+/// exact-MM editor; it never authorizes an invalidation or a physical return.
+pub struct AnonymousEditGeneration(NonZeroU64);
+impl AnonymousEditGeneration {
+    pub fn reservation(sequence: carrick_el1_abi::ReservationSequence) -> Option<Self> {
+        NonZeroU64::new(sequence.raw()).map(Self)
+    }
+    pub fn nonzero(&self) -> NonZeroU64 {
+        self.0
+    }
+    fn resident() -> Option<Self> {
+        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .ok()
+            .and_then(NonZeroU64::new)
+            .map(Self)
+    }
+}
+
 /// Exact-MM live-leaf operation behind the syscall policy.
 pub trait AnonymousPermissionEditor {
+    fn bind_resident_edit(&mut self, _generation: AnonymousEditGeneration) {}
+
     fn protect_and_invalidate(
         &mut self,
         ttbr0: carrick_guest_arch::AddressSpaceRegister,
@@ -366,6 +423,8 @@ pub trait AnonymousPermissionEditor {
 
 /// Exact-MM live-terminal retirement behind the syscall policy.
 pub trait AnonymousRetirementEditor {
+    fn bind_resident_edit(&mut self, _generation: AnonymousEditGeneration) {}
+
     fn retire_and_invalidate(
         &mut self,
         mm: carrick_el1_abi::ReservationMm,
@@ -829,7 +888,7 @@ pub fn serve_delegated_mapping<
     G: ReservationGeometry,
     C: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    frame: &mut TrapFrame,
+    frame: &mut (impl AnonymousCallView + ?Sized),
     counters: &carrick_el1_abi::Counters,
     current: &CurrentTask,
     spaces: SpaceAccess<'_, C>,
@@ -837,7 +896,7 @@ pub fn serve_delegated_mapping<
     editor: &mut E,
     file: Option<carrick_el1_abi::HostBackingIdentity>,
 ) -> DelegatedAnonymous {
-    let slot = frame.slot as u32;
+    let slot = frame.slot().map_or(u32::MAX, |slot| slot.index() as u32);
     let served = serve_delegated_anonymous(frame, counters, current, spaces, table, editor, file);
     // A retained source this call did not consume (an errno, a refusal or a
     // forward) is retired now; one a committed node holds is unchanged.
@@ -924,7 +983,7 @@ pub fn serve_delegated_anonymous<
     G: ReservationGeometry,
     C: Copy + Send + Sync + zerocopy::FromZeros,
 >(
-    frame: &mut TrapFrame,
+    frame: &mut (impl AnonymousCallView + ?Sized),
     counters: &carrick_el1_abi::Counters,
     current: &CurrentTask,
     spaces: SpaceAccess<'_, C>,
@@ -932,7 +991,7 @@ pub fn serve_delegated_anonymous<
     editor: &mut E,
     file: Option<carrick_el1_abi::HostBackingIdentity>,
 ) -> DelegatedAnonymous {
-    let nr = frame.x[8];
+    let nr = frame.canonical().raw();
     let Some((mm, index)) = delegated_anonymous_root(nr, current, spaces, table) else {
         return DelegatedAnonymous::NotDelegated;
     };
@@ -943,12 +1002,17 @@ pub fn serve_delegated_anonymous<
     };
     use carrick_el1_abi::AnonymousLeave as Leave;
     // Busy: the host venue holds the root; it serves the syscall itself.
-    let Ok(mut model) = table.lock_in(spaces, index.index(), mm, frame.slot as u32) else {
+    let Ok(mut model) = table.lock_in(
+        spaces,
+        index.index(),
+        mm,
+        frame.slot().map_or(u32::MAX, |slot| slot.index() as u32),
+    ) else {
         return forward(Leave::RootBusy);
     };
     let mut pending = match decide_reservation_syscall(frame, current, &mut model, file) {
         ReservationDisposition::Return(value) => {
-            frame.x[0] = value as u64;
+            frame.set_result(carrick_guest_arch::NativeReturnWord(value as u64));
             return DelegatedAnonymous::Served;
         }
         ReservationDisposition::Forward => return forward(Leave::RootDeclined),
@@ -965,8 +1029,12 @@ pub fn serve_delegated_anonymous<
             let _ = pending.cancel(model);
             forward(why)
         };
-    let (Some(grant), Some(owner)) = (spaces.grant(index, mm_key), NonZeroU64::new(frame.slot + 1))
-    else {
+    let (Some(grant), Some(owner)) = (
+        spaces.grant(index, mm_key),
+        frame
+            .slot()
+            .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1)),
+    ) else {
         return refuse(pending, &mut model, Leave::NoGrant);
     };
     let Some(_editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
@@ -1160,16 +1228,16 @@ pub fn delegated_anonymous_root<
 /// successful edit; every mapping shape that is not proven by live tagged
 /// terminals stays on the existing host path without mutation.
 pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
-    frame: &TrapFrame,
+    frame: &(impl AnonymousCallView + ?Sized),
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     editor: &mut E,
 ) -> MunmapDisposition {
-    if frame.x[8] != SYS_MUNMAP {
+    if frame.canonical().raw() != SYS_MUNMAP {
         return MunmapDisposition::Forward;
     }
-    let address = frame.x[0];
-    let requested_len = frame.x[1];
+    let address = frame.arguments()[0];
+    let requested_len = frame.arguments()[1];
     if !address.is_multiple_of(PAGE_SIZE) || requested_len == 0 {
         return MunmapDisposition::Return(-EINVAL);
     }
@@ -1182,7 +1250,7 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     if address.checked_add(len).is_none() {
         return MunmapDisposition::Return(-ENOMEM);
     }
-    let Some(task) = current_tasks.get(frame.slot as usize) else {
+    let Some(task) = current_tasks.get(frame.task_index()) else {
         return MunmapDisposition::Forward;
     };
     let mm_key = task.mm.key.load(Ordering::Acquire);
@@ -1192,12 +1260,19 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     let Some(grant) = spaces.grant(index, mm_key) else {
         return MunmapDisposition::Forward;
     };
-    let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+    let Some(owner) = frame
+        .slot()
+        .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1))
+    else {
         return MunmapDisposition::Forward;
     };
     let Some(_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
         return MunmapDisposition::Forward;
     };
+    let Some(generation) = AnonymousEditGeneration::resident() else {
+        return MunmapDisposition::Forward;
+    };
+    editor.bind_resident_edit(generation);
     match editor.retire_and_invalidate(
         carrick_el1_abi::ReservationMm::new(mm_key).expect("admitted MM is nonzero"),
         carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -1221,17 +1296,17 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
 /// Try to serve canonical AArch64 `mprotect(2)` for a fully resident
 /// private-anonymous range. Every other mapping shape remains on the host path.
 pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
-    frame: &TrapFrame,
+    frame: &(impl AnonymousCallView + ?Sized),
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     editor: &mut E,
 ) -> MprotectDisposition {
-    if frame.x[8] != SYS_MPROTECT {
+    if frame.canonical().raw() != SYS_MPROTECT {
         return MprotectDisposition::Forward;
     }
-    let address = frame.x[0];
-    let requested_len = frame.x[1];
-    let prot = frame.x[2];
+    let address = frame.arguments()[0];
+    let requested_len = frame.arguments()[1];
+    let prot = frame.arguments()[2];
     if !address.is_multiple_of(PAGE_SIZE) || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return MprotectDisposition::Return(-EINVAL);
     }
@@ -1247,7 +1322,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
     if address.checked_add(len).is_none() {
         return MprotectDisposition::Return(-EINVAL);
     }
-    let Some(task) = current_tasks.get(frame.slot as usize) else {
+    let Some(task) = current_tasks.get(frame.task_index()) else {
         return MprotectDisposition::Forward;
     };
     let mm_key = task.mm.key.load(Ordering::Acquire);
@@ -1257,7 +1332,10 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
     let Some(grant) = spaces.grant(index, mm_key) else {
         return MprotectDisposition::Forward;
     };
-    let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+    let Some(owner) = frame
+        .slot()
+        .and_then(|slot| NonZeroU64::new(slot.index() as u64 + 1))
+    else {
         return MprotectDisposition::Forward;
     };
     let Some(guard) = spaces.try_begin_edit(index, mm_key, owner) else {
@@ -1274,6 +1352,10 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         executable: prot & PROT_EXEC != 0,
         cow_ceiling: None,
     };
+    let Some(generation) = AnonymousEditGeneration::resident() else {
+        return MprotectDisposition::Forward;
+    };
+    editor.bind_resident_edit(generation);
     match editor.protect_and_invalidate(
         carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
         edit,
@@ -1344,18 +1426,30 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct RecordingEditor {
+    struct RecordingEditor<'a> {
+        owner_probe: Option<(&'a AddressSpaces, NonZeroU64)>,
+        generation: Option<AnonymousEditGeneration>,
         calls: Vec<(u64, GuestPermissionEdit)>,
         result: Option<GuestPermissionEditError>,
     }
 
-    impl AnonymousPermissionEditor for RecordingEditor {
+    impl AnonymousPermissionEditor for RecordingEditor<'_> {
+        fn bind_resident_edit(&mut self, generation: AnonymousEditGeneration) {
+            self.generation = Some(generation);
+        }
         fn protect_and_invalidate(
             &mut self,
             ttbr0: carrick_guest_arch::AddressSpaceRegister,
             edit: GuestPermissionEdit,
         ) -> Result<(), GuestPermissionEditError> {
             let ttbr0 = ttbr0.raw();
+            assert!(
+                self.generation.is_some(),
+                "resident edit must own an operation generation"
+            );
+            if let Some((spaces, owner)) = self.owner_probe {
+                assert_eq!(spaces.active_editor(spaces.find(17).unwrap()), Some(owner));
+            }
             self.calls.push((ttbr0, edit));
             self.result.map_or(Ok(()), Err)
         }
@@ -1375,6 +1469,78 @@ mod tests {
         frame.x[1] = 0x2001;
         frame.x[2] = prot;
         (frame, [task], spaces, ttbr0)
+    }
+
+    #[test]
+    fn native_memory_call_uses_projected_task_and_actual_editor_slot() {
+        use carrick_guest_arch::UserVa;
+        use carrick_sched_core::SlotId;
+        let (frame, [task], spaces, ttbr0) = fixture(PROT_READ);
+        let tasks = [CurrentTask::new(), task];
+        let args = [frame.x[0], frame.x[1], frame.x[2], 0, 0, 0];
+        let ordinal = carrick_core::CallOrdinal::from_raw(SYS_MPROTECT);
+        let call = AnonymousCall::new(
+            ordinal,
+            args,
+            1,
+            SlotId::from_index(7).unwrap(),
+            UserVa::new(0x40004),
+        );
+        let mut editor = RecordingEditor {
+            owner_probe: Some((&spaces, NonZeroU64::new(8).unwrap())),
+            ..RecordingEditor::default()
+        };
+        assert_eq!(
+            try_serve_mprotect(
+                &call,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut editor,
+            ),
+            MprotectDisposition::Return(0),
+        );
+        assert_eq!(editor.calls.len(), 1);
+        assert_eq!(editor.calls[0].0, ttbr0);
+        assert_eq!(spaces.active_editor(spaces.find(17).unwrap()), None);
+        let ordinal = carrick_core::CallOrdinal::from_raw(SYS_MUNMAP);
+        let call = AnonymousCall::new(
+            ordinal,
+            args,
+            1,
+            SlotId::from_index(7).unwrap(),
+            UserVa::new(0x40004),
+        );
+        let mut editor = RecordingRetirementEditor {
+            owner_probe: Some((&spaces, NonZeroU64::new(8).unwrap())),
+            ..RecordingRetirementEditor::default()
+        };
+        assert_eq!(
+            try_serve_munmap(
+                &call,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut editor,
+            ),
+            MunmapDisposition::Retired,
+        );
+        assert_eq!(editor.calls, vec![(ttbr0, args[0], 0x3000)]);
+    }
+    #[test]
+    fn invalid_arm_slot_refuses_mprotect_before_editing() {
+        let (mut frame, tasks, spaces, _) = fixture(PROT_READ);
+        frame.slot = u64::MAX;
+        let mut editor = RecordingEditor::default();
+        assert_eq!(
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                SpaceAccess::source_free(&spaces),
+                &mut editor,
+            ),
+            MprotectDisposition::Forward,
+        );
+        assert!(editor.calls.is_empty());
+        assert_eq!(spaces.active_editor(spaces.find(17).unwrap()), None);
     }
 
     #[test]
@@ -1531,12 +1697,17 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingRetirementEditor {
+    struct RecordingRetirementEditor<'a> {
+        owner_probe: Option<(&'a AddressSpaces, NonZeroU64)>,
+        generation: Option<AnonymousEditGeneration>,
         calls: Vec<(u64, u64, u64)>,
         result: Option<GuestRetirementError>,
     }
 
-    impl AnonymousRetirementEditor for RecordingRetirementEditor {
+    impl AnonymousRetirementEditor for RecordingRetirementEditor<'_> {
+        fn bind_resident_edit(&mut self, generation: AnonymousEditGeneration) {
+            self.generation = Some(generation);
+        }
         fn retire_and_invalidate(
             &mut self,
             _mm: carrick_el1_abi::ReservationMm,
@@ -1547,6 +1718,13 @@ mod tests {
             let ttbr0 = ttbr0.raw();
             let address = address.raw();
             let len = len.raw();
+            assert!(
+                self.generation.is_some(),
+                "resident retirement must own an operation generation"
+            );
+            if let Some((spaces, owner)) = self.owner_probe {
+                assert_eq!(spaces.active_editor(spaces.find(17).unwrap()), Some(owner));
+            }
             self.calls.push((ttbr0, address, len));
             self.result.map_or(Ok(()), Err)
         }
@@ -1623,6 +1801,7 @@ mod tests {
         };
         use std::boxed::Box;
 
+        include!("memory/live_peer_tests.rs");
         const ARENA: u64 = 0x100000;
 
         fn table() -> Box<SharedReservations> {
@@ -1653,7 +1832,15 @@ mod tests {
             task: CurrentTask,
         }
         fn mm(spaces: &AddressSpaces, table: &SharedReservations, key: u64, admit: bool) -> Mm {
-            let ttbr0 = (key << 48) | 0x8800_0000_0000;
+            mm_at_root(spaces, table, key, admit, (key << 48) | 0x8800_0000_0000)
+        }
+        fn mm_at_root(
+            spaces: &AddressSpaces,
+            table: &SharedReservations,
+            key: u64,
+            admit: bool,
+            ttbr0: u64,
+        ) -> Mm {
             let index = spaces.publish_closed(key, ttbr0, ttbr0).unwrap();
             spaces.open(index);
             let raw = ReservationMm::new(key).unwrap();
@@ -1691,6 +1878,7 @@ mod tests {
             Retire(u64, u64, u64),
         }
         struct Editor {
+            live: Option<Arc<LiveTables>>,
             backing: RangeBacking,
             protect: Option<GuestPermissionEditError>,
             /// `(mm, start, end)` of this MM's live first-touch stock.
@@ -1703,6 +1891,7 @@ mod tests {
         impl Editor {
             fn over(backing: RangeBacking) -> Self {
                 Self {
+                    live: None,
                     backing,
                     protect: None,
                     stock: None,
@@ -1765,6 +1954,9 @@ mod tests {
             ) -> Result<(), GuestPermissionEditError> {
                 let ttbr0 = ttbr0.raw();
                 self.calls.push(Call::Protect(ttbr0, edit));
+                if let Some(live) = &self.live {
+                    live.protect(*self.sequences.last().unwrap(), edit);
+                }
                 self.protect.map_or(Ok(()), Err)
             }
         }
@@ -1780,6 +1972,9 @@ mod tests {
                 let address = address.raw();
                 let len = len.raw();
                 self.calls.push(Call::Retire(ttbr0, address, len));
+                if let Some(live) = &self.live {
+                    live.retire(*self.sequences.last().unwrap(), address, len);
+                }
                 Ok(())
             }
         }
@@ -1836,16 +2031,175 @@ mod tests {
             );
             // This fixture models the caller's Linux boundary after the actual
             // resource primitive, keeping all historical final-count assertions.
-            let entry = carrick_personality_linux::dispatch::EntryCounters {
-                served: &counters.served,
-                forwarded: &counters.forwarded,
-            };
             match route {
-                DelegatedAnonymous::Served => entry.served(nr),
-                DelegatedAnonymous::Forward => entry.forwarded(nr),
+                DelegatedAnonymous::Served => {
+                    counters.served[nr as usize].fetch_add(1, Ordering::Relaxed);
+                }
+                DelegatedAnonymous::Forward => {
+                    counters.forwarded[nr as usize].fetch_add(1, Ordering::Relaxed);
+                }
                 _ => {}
             }
             (route, frame.x[0] as i64)
+        }
+        /// Both native call views enter the same reservation transaction. The
+        /// peer observes committed permissions/ranges, not a copied VMA model.
+        #[test]
+        fn two_isa_anonymous_edits_publish_to_a_live_peer() {
+            use carrick_guest_arch::{GuestIsa, UserVa};
+            use carrick_sched_core::SlotId;
+            use std::sync::mpsc::channel;
+            use std::time::Duration;
+            for isa in [GuestIsa::Aarch64, GuestIsa::X86_64] {
+                let spaces = AddressSpaces::new();
+                let table = table();
+                let task = mm_at_root(&spaces, &table, 17, true, LIVE_ROOT);
+                let live = Arc::new(LiveTables::new(isa));
+                let peer = CurrentTask::new();
+                peer.execution.task.store(118, Ordering::Release);
+                peer.mm.thread_generation.store(12, Ordering::Release);
+                peer.mm.key.store(task.key, Ordering::Release);
+                let counters = Counters::new();
+                let (edited_tx, edited_rx) = channel();
+                let (seen_tx, seen_rx) = channel();
+                std::thread::scope(|scope| {
+                    let spaces = &spaces;
+                    let table = &*table;
+                    let peer = &peer;
+                    let peer_live = Arc::clone(&live);
+                    scope.spawn(move || {
+                        for step in 0..2 {
+                            edited_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            assert_eq!(peer_live.touch(ARENA, false), Some(0x35));
+                            assert_eq!(peer_live.touch(ARENA, true), None);
+                            assert_eq!(peer_live.touch(ARENA + 0x2000, false), Some(0x35));
+                            assert_eq!(
+                                peer_live.touch(ARENA + 0x1000, false),
+                                if step == 0 { Some(0x35) } else { None }
+                            );
+                            let key = peer.mm.key.load(Ordering::Acquire);
+                            let mut model = table
+                                .lock_with_context::<carrick_sched_core::ThreadCtx>(
+                                    spaces.find(key).unwrap().index(),
+                                    ReservationMm::new(key).unwrap(),
+                                )
+                                .unwrap();
+                            let mut rows = Vec::new();
+                            model
+                                .observe_range(
+                                    ReservationRange::new(ARENA, ARENA + 0x3000).unwrap(),
+                                    &mut |row| rows.push(row),
+                                )
+                                .unwrap();
+                            drop(model);
+                            seen_tx.send(rows).unwrap();
+                        }
+                    });
+                    let invoke = |nr, args, editor: &mut Editor| {
+                        let mut native = AnonymousCall::new(
+                            carrick_core::CallOrdinal::from_raw(nr),
+                            args,
+                            0,
+                            SlotId::from_index(7).unwrap(),
+                            UserVa::new(0x40004),
+                        );
+                        let mut arm = TrapFrame {
+                            elr: 0x40004,
+                            ..TrapFrame::default()
+                        };
+                        arm.x[8] = nr;
+                        arm.x[..6].copy_from_slice(&args);
+                        let call: &mut dyn AnonymousCallView = match isa {
+                            GuestIsa::Aarch64 => &mut arm,
+                            GuestIsa::X86_64 => &mut native,
+                        };
+                        let disposition = serve_delegated_anonymous(
+                            call,
+                            &counters,
+                            &task.task,
+                            carrick_sched_core::spaces::notification::SpaceAccess::source_free(
+                                spaces,
+                            ),
+                            table,
+                            editor,
+                            None,
+                        );
+                        assert_eq!(
+                            disposition,
+                            DelegatedAnonymous::Served,
+                            "{isa:?} nr={nr} args={args:?} leaves={:?}",
+                            counters
+                                .anonymous_leaves
+                                .each_ref()
+                                .map(|n| n.load(Ordering::Relaxed))
+                        );
+                        call.result().0 as i64
+                    };
+                    assert_eq!(
+                        invoke(
+                            SYS_MMAP,
+                            mmap_fixed(ARENA, 0x3000),
+                            &mut Editor::over(RangeBacking::Empty)
+                        ),
+                        ARENA as i64
+                    );
+                    live.populate();
+                    let mut editor = Editor::over(RangeBacking::Private);
+                    editor.live = Some(Arc::clone(&live));
+                    assert_eq!(
+                        invoke(
+                            SYS_MPROTECT,
+                            [ARENA, 0x3000, PROT_READ, 0, 0, 0],
+                            &mut editor
+                        ),
+                        0
+                    );
+                    assert_eq!(editor.sequences.len(), 1);
+                    assert!(
+                        matches!(&editor.calls[..], [Call::Probe(_, _, _), Call::Protect(_, edit)] if edit.readable && !edit.writable && edit.len == 0x3000)
+                    );
+                    edited_tx.send(()).unwrap();
+                    let rows = seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].protection.bits(), PROT_READ);
+                    editor.calls.clear();
+                    assert_eq!(
+                        invoke(
+                            SYS_MUNMAP,
+                            [ARENA + 0x1000, 0x1000, 0, 0, 0, 0],
+                            &mut editor
+                        ),
+                        0
+                    );
+                    assert!(
+                        matches!(&editor.calls[..], [Call::Probe(_, _, 0x1000), Call::Retire(_, address, 0x1000)] if *address == ARENA + 0x1000)
+                    );
+                    edited_tx.send(()).unwrap();
+                    let rows = seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(rows[0].range.end(), ARENA + 0x1000);
+                    assert_eq!(rows[1].range.start(), ARENA + 0x2000);
+                    let mut invalid = Editor::over(RangeBacking::Private);
+                    assert_eq!(
+                        invoke(SYS_MPROTECT, [ARENA + 1, 4096, 1, 0, 0, 0], &mut invalid),
+                        -EINVAL
+                    );
+                    assert_eq!(
+                        invoke(
+                            SYS_MPROTECT,
+                            [ARENA + 0x5000, 4096, 1, 0, 0, 0],
+                            &mut invalid
+                        ),
+                        -ENOMEM
+                    );
+                    assert_eq!(
+                        invoke(SYS_MUNMAP, [ARENA, 0, 0, 0, 0, 0], &mut invalid),
+                        -EINVAL
+                    );
+                    assert!(invalid.calls.is_empty());
+                    assert_eq!(live.drains.load(Ordering::Acquire), 2);
+                });
+            }
         }
         const RW: u64 = PROT_READ | PROT_WRITE;
         const ANON: u64 = MAP_PRIVATE | MAP_ANONYMOUS;
