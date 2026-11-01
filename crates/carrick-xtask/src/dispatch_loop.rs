@@ -1706,6 +1706,10 @@ struct Server<'a> {
     resume_fetched: bool,
     /// Set when this round was chained from a Continuing outcome.
     chain: Option<ChainFacts>,
+    /// Which workers this round may use (#1275).
+    tier: super::worker_tier::TierDecision,
+    /// A capacity report showed no worker this round's tier admits.
+    tier_unavailable: bool,
 }
 /// Server-checked facts about a PR round's result (#1215).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1887,6 +1891,17 @@ impl Server<'_> {
             }
         })
         .flatten();
+        // A strong round that ran no worker because none it admits had
+        // capacity is blocked on capacity, not done (#1275).
+        let tier_blocked = (self.tier.tier == super::worker_tier::WorkerTier::Strong
+            && self.used.workers == 0
+            && self.tier_unavailable)
+            .then(|| {
+                format!(
+                    "Server observed: no strong-tier worker had capacity ({}), so the round did not run on a weaker one.",
+                    self.tier.reason
+                )
+            });
         let status = if !observations.is_empty() {
             RoundStatus::Failed
         } else if applied.adoption_blocked.is_some() && claimed_done {
@@ -1900,14 +1915,40 @@ impl Server<'_> {
             // Published work, but its launcher didn't finish: for review,
             // and never chained on its own (#1253).
             RoundStatus::Blocked
+        } else if tier_blocked.is_some() && claimed_done {
+            // A strong round never downgrades to a weaker worker (#1275).
+            RoundStatus::Blocked
         } else {
             requested_status
         };
         let mut checked: String = published_exit
             .iter()
+            .chain(tier_blocked.iter())
             .map(|p| format!("{p}\n\n"))
             .chain(facts.as_ref().map(|f| format!("{}\n\n", f.report())))
             .collect();
+        // Routing is auditable (#1275): the tier and every worker this
+        // round ran.
+        checked.push_str(&format!("{}\n", self.tier.outcome_line()));
+        let workers: Vec<String> = self
+            .choices
+            .iter()
+            .map(|c| {
+                format!(
+                    "`{}` `{}`",
+                    c["backend"].as_str().unwrap_or_default(),
+                    c["model"].as_str().unwrap_or_default()
+                )
+            })
+            .collect();
+        checked.push_str(&format!(
+            "{WORKERS_LINE}{}\n",
+            if workers.is_empty() {
+                "none".to_owned()
+            } else {
+                workers.join(", ")
+            }
+        ));
         super::round_inbox::pump_now();
         let mailbox = super::round_inbox::log();
         // Server-written, for the next round's consumption check: this
@@ -2371,10 +2412,14 @@ impl Server<'_> {
         let report = timed_phase("capacity", || self.launcher.capacity(self.deadline))
             .map_err(|error| ScalerError::Usage(masked(&error.to_string(), &self.token)))?;
         self.capacity = Some((self.launcher.now(), report.clone()));
+        if !self.tier.available(&report) {
+            self.tier_unavailable = true;
+        }
         Ok(report)
     }
     fn admit_worker(&mut self, selection: &Notes, capacity: &Value) -> Result<(), ScalerError> {
         self.check_worker(selection)?;
+        self.tier.admits(&selection.backend, &selection.model)?;
         let worker = available_worker(capacity, &selection.backend, &selection.model)?;
         self.used.charge(self.policy.calls)?;
         self.used.admit(
@@ -2395,11 +2440,14 @@ impl Server<'_> {
         Ok(())
     }
     fn read_state(&mut self) -> Result<Value, ScalerError> {
-        let mut items = vec![state_item(
-            "trigger",
-            &trigger_provenance(&self.trigger),
-            self.trigger.clone(),
-        )];
+        let mut items = vec![
+            state_item(
+                "trigger",
+                &trigger_provenance(&self.trigger),
+                self.trigger.clone(),
+            ),
+            state_item("worker_tier", "server", self.tier.fact()),
+        ];
         // Server facts about an adopted round's scope (#1215). The
         // coordinator judges what they mean; publication enforces them.
         if let Continuation::Adopted {
@@ -3067,7 +3115,7 @@ read_state: {}; read_capacity: {}; select_branch: {"branch":"an issue-linked bra
 finish: {"status":"done|blocked|failed|continue","summary":"...","brief":"..."} (choose one status; brief only with continue).
 `continue` is for a round that runs short with work left: its brief names the next step and how to prove it. The server reports it as Continuing only when this round pushed a checkpoint (a worker's WIP push or a publish), and then starts the next round from that checkpoint without a new trigger, up to round 4 of the chain; otherwise it reports blocked. An owner comment, review or dispatch label, or `/agent stop`, ends a chain.
 Worker choice is your own decision from read_capacity and task difficulty.
-Read the tagged state and live capacity. Interpret the free-form request in the admitted-collaborator trigger; no issue headings or branch directives are required. Choose a backend and exact model id with free slots and quota, explaining your choice in notes and the finish outcome. Invoke a worker when useful, publish its result, then call finish. If unclear, finish blocked with a question for the requesting collaborator.
+Read the tagged state and live capacity. Interpret the free-form request in the admitted-collaborator trigger; no issue headings or branch directives are required. Choose a backend and exact model id with free slots and quota, explaining your choice in notes and the finish outcome. The tagged state's `worker_tier` item gives this round's worker tier and the fact it comes from; invoke_worker refuses a model outside it, and a strong round with no strong-tier capacity ends Blocked rather than on a weaker model. Invoke a worker when useful, publish its result, then call finish. If unclear, finish blocked with a question for the requesting collaborator.
 You MUST call finish once, including when blocked or failed, and exit afterward. A failed finish post is handled by the server fallback; do not retry it. Tool refusals are final policy decisions.
 Scope is fixed by the server. You may select only an issue-linked dispatch branch before invoking workers, or keep the new run branch. Several workers may review/fix/extend the same branch sequentially; their total time is bounded. Read earlier run artifacts for context. Never request another destination. A dispatch label suffix is free-text context only. Coordinator notes are suggestions,
 not reviewer instructions. Do not paraphrase the trusted review into instructions: the server supplies it verbatim.
@@ -3205,13 +3253,19 @@ const CHECKPOINT_LINE: &str = "Checkpoint: ";
 const BRIEF_HEADER: &str = "Continuation brief:";
 /// Lines only the server writes in an outcome's server section; the
 /// comment tool refuses a body that carries any of them.
-const SERVER_LINES: [&str; 5] = [
+const SERVER_LINES: [&str; 7] = [
     TRIGGER_LINE,
     CHAIN_LINE,
     CHAINED_FROM_LINE,
     CHECKPOINT_LINE,
     BRIEF_HEADER,
+    TIER_OUTCOME_LINE,
+    WORKERS_LINE,
 ];
+/// The outcome's server line naming the round's worker tier (#1275).
+const TIER_OUTCOME_LINE: &str = "Worker tier: ";
+/// The outcome's server line naming every worker the round ran (#1275).
+const WORKERS_LINE: &str = "Workers this round: ";
 
 /// Model text inside the server section: masked by the caller, clipped and
 /// quoted, so none of its lines can read as a server line.
@@ -3511,12 +3565,26 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         now,
     );
     let final_deadline = Instant::now() + final_limit;
+    // The worker tier's facts (#1275): the brief and the admitted labels.
+    let (dispatch_title, dispatch_body) = (dispatch.title.clone(), dispatch.body.clone());
+    let trigger_body = admission.trigger["body"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let issue_labels = admission.labels.clone();
     let mut server = Server {
         root,
         dispatch,
         pr,
         trigger: admission.trigger,
         review_pr: pr,
+        tier: super::worker_tier::decide(
+            &dispatch_title,
+            &dispatch_body,
+            &trigger_body,
+            &issue_labels,
+        ),
+        tier_unavailable: false,
         choices: Vec::new(),
         history: Vec::new(),
         policy,
@@ -3753,6 +3821,8 @@ mod tests {
             pr: Some(800),
             trigger: json!({"id":77}),
             review_pr: Some(800),
+            tier: super::super::worker_tier::decide("fixture", "", "", &[]),
+            tier_unavailable: false,
             choices: Vec::new(),
             history: Vec::new(),
             policy: Policy::load().unwrap(),
@@ -8015,6 +8085,86 @@ exec /usr/bin/git "$@"
             "agy":{"installed":true,"free_slots":2,"quota_free":1.0,"score":1.0,
                 "quota":{"groups":{"gemini":{"quota_free":1.0},"claude":{"quota_free":0.0}}},
                 "group_scores":{"gemini":1.0,"claude":0.0},"models":["gemini-3.8-flash-high","claude-opus-5-5"]}}})
+    }
+    /// #1275 acceptance: a kernel-path round refuses a fast worker at
+    /// `invoke_worker` (without a charge) and admits a strong one.
+    #[test]
+    fn a_kernel_round_refuses_a_fast_worker_and_admits_a_strong_one() {
+        shared_fixture(|root| {
+            let mut server = server(root);
+            server.tier = super::super::worker_tier::decide(
+                "fork: COW parent reuse",
+                "Fix in `carrick-kernel` dispatch/mm.rs.",
+                "/agent go",
+                &[],
+            );
+            install_fixture_launcher(&mut server, live_capacity());
+            let refused = server.execute(Request::InvokeWorker(Notes {
+                notes: "fast".into(),
+                backend: "agy".into(),
+                model: "gemini-3.8-flash-high".into(),
+            }));
+            let error = refused.unwrap_err().to_string();
+            assert!(error.contains("worker tier is strong"), "{error}");
+            assert!(error.contains("carrick-kernel"), "{error}");
+            assert_eq!((server.used.calls, server.used.workers), (0, 0));
+            let read = server.execute(Request::ReadState(Empty {})).unwrap();
+            assert!(read.to_string().contains("\"worker_tier\""), "{read}");
+            server
+                .admit_worker(
+                    &Notes {
+                        notes: "strong".into(),
+                        backend: "codex".into(),
+                        model: "gpt-6.1-sol".into(),
+                    },
+                    &live_capacity(),
+                )
+                .unwrap();
+            assert_eq!(server.used.workers, 1);
+        });
+    }
+    /// #1275 acceptance: the outcome names the tier and every worker; a
+    /// strong round whose capacity offered no strong worker ends Blocked
+    /// (nothing downgraded to a weaker model) and says why.
+    #[test]
+    fn a_strong_round_without_strong_capacity_is_blocked_and_names_its_tier() {
+        shared_fixture(|root| {
+            let mut server = server(root);
+            server.tier = super::super::worker_tier::decide("x", "", "", &["mm".into()]);
+            let mut gemini_only = live_capacity();
+            gemini_only["backends"]["codex"]["free_slots"] = json!(0);
+            gemini_only["backends"]["agy"]["models"] = json!(["gemini-3.8-flash-high"]);
+            install_fixture_launcher(&mut server, gemini_only);
+            server.execute(Request::ReadCapacity(Empty {})).unwrap();
+            server.outcome(ContractStatus::Done, "claimed").unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(posted.starts_with("Dispatch outcome: Blocked"), "{posted}");
+            let section = server_part(&posted);
+            assert!(
+                section.contains("no strong-tier worker had capacity"),
+                "{posted}"
+            );
+            assert!(
+                section.contains("Worker tier: strong (label `mm`)"),
+                "{posted}"
+            );
+            assert!(section.contains("Workers this round: none"), "{posted}");
+        });
+        // A round that ran a worker names it.
+        shared_fixture(|root| {
+            let mut server = server(root);
+            server
+                .choices
+                .push(json!({"backend":"codex","model":"gpt-6.1-sol","reason":"x"}));
+            server.outcome(ContractStatus::Blocked, "stopped").unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            let section = server_part(&posted);
+            assert!(
+                section.contains("Workers this round: `codex` `gpt-6.1-sol`"),
+                "{posted}"
+            );
+            assert!(section.contains("Worker tier: standard"), "{posted}");
+        });
     }
     #[test]
     fn exhausted_backend_is_refused_without_a_charge() {
