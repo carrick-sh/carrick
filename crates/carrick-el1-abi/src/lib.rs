@@ -27,12 +27,14 @@
 
 pub use carrick_guest_arch::ContextGeneration;
 
-use carrick_core_abi::OpenLifetime;
+use carrick_core_abi::{ExclusiveSeq, OpenLifetime, SeqByteBuf, SeqLockAtomic, SeqWriteGuard};
 mod entry_binding_fatal;
 mod stack_overflow;
 pub use stack_overflow::*;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod image_layout_tests;
+#[cfg(all(test, feature = "loom"))]
+mod loom_models;
 pub use entry_binding_fatal::*;
 mod open_lifetime;
 pub use open_lifetime::*;
@@ -1252,6 +1254,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(DelegatedInotify, watches) as u64,
         core::mem::offset_of!(DelegatedInotify, queue) as u64,
         core::mem::size_of::<InotifyNameCache>() as u64,
+        core::mem::offset_of!(InotifyNameCacheEntry, seq) as u64,
+        core::mem::offset_of!(InotifyNameCacheEntry, path_bytes) as u64,
     ];
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
@@ -4125,6 +4129,26 @@ pub const NAME_CACHE_ENTRIES: usize = 32;
 /// Maximum pathname length cached in an inotify name cache entry.
 pub const MAX_NAME_CACHE_PATH_LEN: usize = 256;
 
+/// Number of 64-bit atomic words in an inotify name cache path buffer.
+pub const NAME_CACHE_PATH_WORDS: usize = MAX_NAME_CACHE_PATH_LEN / core::mem::size_of::<u64>();
+
+/// Torn reads (a writer began or held the entry) a lookup retries per entry
+/// before treating that entry as a miss. A miss forwards to the host, which
+/// resolves the path itself, so the bound costs a forward, never a result.
+pub const NAME_CACHE_READ_RETRIES: u32 = 4;
+
+/// Atomic 64-bit word operations used by [`InotifyNameCache`].
+pub trait NameCacheAtomic: SeqLockAtomic {
+    fn fetch_add(&self, val: u64, order: Ordering) -> u64;
+}
+
+impl NameCacheAtomic for AtomicU64 {
+    #[inline]
+    fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
+        AtomicU64::fetch_add(self, val, order)
+    }
+}
+
 /// Fast, non-cryptographic FNV-1a hash for path byte slices.
 #[inline]
 pub fn hash_path(path: &[u8]) -> u64 {
@@ -4136,83 +4160,190 @@ pub fn hash_path(path: &[u8]) -> u64 {
     h
 }
 
-/// A single cache entry mapping `(cwd_gen, path_bytes)` -> `delegated_file_handle`.
-#[repr(C)]
-pub struct InotifyNameCacheEntry {
-    pub lock: AtomicU32,
-    pub valid: AtomicU32,
-    pub file_table: AtomicU64,
-    pub cwd_generation: AtomicU64,
-    pub path_len: AtomicU32,
-    pub delegated_file_handle: AtomicU32,
-    pub path_hash: AtomicU64,
-    pub path_bytes: UnsafeCell<[u8; MAX_NAME_CACHE_PATH_LEN]>,
+/// One published mapping, as a reader or writer compares it.
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+struct NameKey<'p> {
+    file_table: u64,
+    path: &'p [u8],
+    path_hash: u64,
 }
 
-unsafe impl Sync for InotifyNameCacheEntry {}
+/// What one sequence-validated read of an entry found.
+enum EntryRead {
+    /// The entry published this key with this nonzero handle.
+    Hit(u32),
+    /// The entry published some other key (or none).
+    Miss,
+    /// A writer held or took the entry during the read; retry.
+    Torn,
+}
+
+/// A single cache entry mapping `(file_table, cwd_gen, path_bytes)` ->
+/// `delegated_file_handle`.
+///
+/// `seq` is both the writer lock and the publication sequence
+/// ([`ExclusiveSeq`]): every field is private, the only mutators live on
+/// [`NameEntryWriter`] (which exists only while `seq` is held odd), and the
+/// only reader is [`InotifyNameCacheEntry::read`], which validates `seq`
+/// around its atomic word loads. Host writers and lock-free guest readers
+/// therefore never share a non-atomic byte, and an invalidate-then-refill
+/// between a reader's ticket and its validation always advances `seq`.
+#[repr(C)]
+pub struct InotifyNameCacheEntry<A = AtomicU64, const WORDS: usize = NAME_CACHE_PATH_WORDS> {
+    seq: ExclusiveSeq<A>,
+    file_table: A,
+    cwd_generation: A,
+    path_len: A,
+    /// Zero while the entry is empty.
+    delegated_file_handle: A,
+    path_hash: A,
+    path_bytes: SeqByteBuf<WORDS, A>,
+}
+
+/// Exclusive write access to one entry; publishes on drop.
+struct NameEntryWriter<'a, A: NameCacheAtomic, const WORDS: usize> {
+    entry: &'a InotifyNameCacheEntry<A, WORDS>,
+    _seq: SeqWriteGuard<'a, A>,
+}
+
+impl<A: NameCacheAtomic, const WORDS: usize> NameEntryWriter<'_, A, WORDS> {
+    /// Under exclusion no other writer runs, so relaxed loads see the last
+    /// publication (the claim's acquire synchronized with it).
+    #[inline]
+    fn handle(&self) -> u64 {
+        self.entry.delegated_file_handle.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn holds(&self, key: NameKey<'_>) -> bool {
+        let e = self.entry;
+        self.handle() != 0
+            && e.file_table.load(Ordering::Relaxed) == key.file_table
+            && e.path_hash.load(Ordering::Relaxed) == key.path_hash
+            && e.path_len.load(Ordering::Relaxed) == key.path.len() as u64
+            && e.path_bytes.eq_slice(key.path)
+    }
+
+    #[inline]
+    fn publish(&self, key: NameKey<'_>, cwd_gen: u64, delegated_file_handle: u32) {
+        let e = self.entry;
+        e.file_table.store(key.file_table, Ordering::Relaxed);
+        e.cwd_generation.store(cwd_gen, Ordering::Relaxed);
+        e.path_len.store(key.path.len() as u64, Ordering::Relaxed);
+        e.path_hash.store(key.path_hash, Ordering::Relaxed);
+        if e.path_bytes.write_slice(key.path) {
+            e.delegated_file_handle
+                .store(u64::from(delegated_file_handle), Ordering::Relaxed);
+        } else {
+            // Callers bound the length first; an oversized path leaves the
+            // entry empty rather than half-written.
+            e.delegated_file_handle.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn clear(&self) {
+        self.entry.delegated_file_handle.store(0, Ordering::Relaxed);
+        self.entry.path_len.store(0, Ordering::Relaxed);
+    }
+}
 
 impl InotifyNameCacheEntry {
     pub const fn new() -> Self {
         Self {
-            lock: AtomicU32::new(0),
-            valid: AtomicU32::new(0),
+            seq: ExclusiveSeq::new(),
             file_table: AtomicU64::new(0),
             cwd_generation: AtomicU64::new(0),
-            path_len: AtomicU32::new(0),
-            delegated_file_handle: AtomicU32::new(0),
+            path_len: AtomicU64::new(0),
+            delegated_file_handle: AtomicU64::new(0),
             path_hash: AtomicU64::new(0),
-            path_bytes: UnsafeCell::new([0; MAX_NAME_CACHE_PATH_LEN]),
+            path_bytes: SeqByteBuf::new(),
         }
-    }
-
-    #[inline]
-    pub fn try_lock(&self) -> bool {
-        // Strong: a spurious LL/SC failure must not look like contention.
-        self.lock
-            .compare_exchange(0, LOCK_GUEST, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-    }
-
-    /// EL1 acquire: wait a bounded while only for another vCPU's in-guest
-    /// critical section (short, and completed even across kicks); a host
-    /// holder may be a long recall, so forward at once. Bounded, so a lock
-    /// order inversion between vCPUs costs a forward, never a deadlock.
-    #[inline]
-    pub fn lock_guest_bounded(&self, max_spins: u32) -> bool {
-        for _ in 0..max_spins {
-            match self
-                .lock
-                .compare_exchange(0, LOCK_GUEST, Ordering::Acquire, Ordering::Relaxed)
-            {
-                Ok(_) => return true,
-                Err(LOCK_HOST) => return false,
-                Err(_) => core::hint::spin_loop(),
-            }
-        }
-        false
-    }
-
-    #[inline]
-    pub fn unlock(&self) {
-        self.lock.store(0, Ordering::Release);
     }
 }
 
-impl Default for InotifyNameCacheEntry {
+impl<A: NameCacheAtomic, const WORDS: usize> InotifyNameCacheEntry<A, WORDS> {
+    #[inline]
+    fn try_writer(&self) -> Option<NameEntryWriter<'_, A, WORDS>> {
+        Some(NameEntryWriter {
+            entry: self,
+            _seq: self.seq.try_write()?,
+        })
+    }
+
+    /// Host writers' peers are other short host critical sections, so
+    /// waiting for one cannot depend on guest progress.
+    #[inline]
+    fn writer(&self) -> NameEntryWriter<'_, A, WORDS> {
+        NameEntryWriter {
+            entry: self,
+            _seq: self.seq.write(),
+        }
+    }
+
+    /// One sequence-validated read. Every word is an atomic load into a
+    /// reader-owned value; nothing is trusted until `validate` passes.
+    #[inline]
+    fn read(&self, key: NameKey<'_>, cwd_gen: u64) -> EntryRead {
+        let Some(ticket) = self.seq.read_begin() else {
+            return EntryRead::Torn;
+        };
+        let handle = self.delegated_file_handle.load(Ordering::Relaxed);
+        let matches = handle != 0
+            && self.file_table.load(Ordering::Relaxed) == key.file_table
+            && self.cwd_generation.load(Ordering::Relaxed) == cwd_gen
+            && self.path_hash.load(Ordering::Relaxed) == key.path_hash
+            && self.path_len.load(Ordering::Relaxed) == key.path.len() as u64
+            && self.path_bytes.eq_slice(key.path);
+        if !self.seq.validate(ticket) {
+            return EntryRead::Torn;
+        }
+        match (matches, u32::try_from(handle)) {
+            (true, Ok(handle)) => EntryRead::Hit(handle),
+            _ => EntryRead::Miss,
+        }
+    }
+
+    /// Unvalidated pre-check so invalidation skips entries that cannot
+    /// need it without claiming them (claiming makes readers retry).
+    #[inline]
+    fn may_need(&self, wanted: impl Fn(u64) -> bool) -> bool {
+        let Some(ticket) = self.seq.read_begin() else {
+            return true;
+        };
+        let handle = self.delegated_file_handle.load(Ordering::Relaxed);
+        !self.seq.validate(ticket) || wanted(handle)
+    }
+}
+
+impl<A: Default, const WORDS: usize> Default for InotifyNameCacheEntry<A, WORDS> {
     fn default() -> Self {
-        Self::new()
+        Self {
+            seq: ExclusiveSeq::default(),
+            file_table: A::default(),
+            cwd_generation: A::default(),
+            path_len: A::default(),
+            delegated_file_handle: A::default(),
+            path_hash: A::default(),
+            path_bytes: SeqByteBuf::default(),
+        }
     }
 }
 
 /// Per-process inotify path name cache at EL1 for exit-free `inotify_add_watch`.
+///
+/// The host writes ([`Self::insert`], [`Self::invalidate_all`],
+/// [`Self::invalidate_file`]); guest vCPUs read lock-free ([`Self::lookup`]).
 #[repr(C)]
 #[repr(align(64))]
-pub struct InotifyNameCache {
-    pub global_cwd_generation: AtomicU64,
-    pub entries: [InotifyNameCacheEntry; NAME_CACHE_ENTRIES],
+pub struct InotifyNameCache<
+    A = AtomicU64,
+    const N: usize = NAME_CACHE_ENTRIES,
+    const WORDS: usize = NAME_CACHE_PATH_WORDS,
+> {
+    global_cwd_generation: A,
+    entries: [InotifyNameCacheEntry<A, WORDS>; N],
 }
-
-unsafe impl Sync for InotifyNameCache {}
 
 impl InotifyNameCache {
     pub const fn new() -> Self {
@@ -4221,10 +4352,24 @@ impl InotifyNameCache {
             entries: [const { InotifyNameCacheEntry::new() }; NAME_CACHE_ENTRIES],
         }
     }
+}
+
+impl<A: NameCacheAtomic, const N: usize, const WORDS: usize> InotifyNameCache<A, N, WORDS> {
+    /// A cache over non-const atomics (Loom models); `new` for production.
+    pub fn with_default_entries() -> Self {
+        let global_cwd_generation = A::default();
+        global_cwd_generation.store(1, Ordering::Relaxed);
+        Self {
+            global_cwd_generation,
+            entries: core::array::from_fn(|_| InotifyNameCacheEntry::default()),
+        }
+    }
 
     #[inline]
     pub fn bump_cwd_generation(&self) -> u64 {
-        self.global_cwd_generation.fetch_add(1, Ordering::AcqRel) + 1
+        self.global_cwd_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
     }
 
     #[inline]
@@ -4232,26 +4377,29 @@ impl InotifyNameCache {
         self.global_cwd_generation.load(Ordering::Acquire)
     }
 
-    pub fn lookup(&self, file_table: u64, path: &[u8], path_hash: u64) -> Option<u32> {
-        let cur_cwd_gen = self.cwd_generation();
-        let path_len = path.len();
-        if path_len == 0 || path_len > MAX_NAME_CACHE_PATH_LEN {
-            return None;
-        }
+    #[inline]
+    fn key<'p>(file_table: u64, path: &'p [u8], path_hash: u64) -> Option<NameKey<'p>> {
+        (!path.is_empty() && path.len() <= SeqByteBuf::<WORDS, A>::capacity_bytes()).then_some(
+            NameKey {
+                file_table,
+                path,
+                path_hash,
+            },
+        )
+    }
 
+    /// The handle published for `path` in `file_table` at the current cwd
+    /// generation, read without any lock. Returns only a handle that one
+    /// complete publication paired with exactly this key.
+    pub fn lookup(&self, file_table: u64, path: &[u8], path_hash: u64) -> Option<u32> {
+        let key = Self::key(file_table, path, path_hash)?;
+        let cur_cwd_gen = self.cwd_generation();
         for entry in self.entries.iter() {
-            if entry.valid.load(Ordering::Acquire) != 0
-                && entry.file_table.load(Ordering::Relaxed) == file_table
-                && entry.cwd_generation.load(Ordering::Relaxed) == cur_cwd_gen
-                && entry.path_hash.load(Ordering::Relaxed) == path_hash
-                && entry.path_len.load(Ordering::Relaxed) as usize == path_len
-            {
-                let path_bytes = unsafe { &*entry.path_bytes.get() };
-                if &path_bytes[..path_len] == path {
-                    let handle = entry.delegated_file_handle.load(Ordering::Relaxed);
-                    if handle != 0 && entry.valid.load(Ordering::Acquire) != 0 {
-                        return Some(handle);
-                    }
+            for _ in 0..NAME_CACHE_READ_RETRIES {
+                match entry.read(key, cur_cwd_gen) {
+                    EntryRead::Hit(handle) => return Some(handle),
+                    EntryRead::Miss => break,
+                    EntryRead::Torn => A::spin_loop(),
                 }
             }
         }
@@ -4266,73 +4414,58 @@ impl InotifyNameCache {
         path_hash: u64,
         delegated_file_handle: u32,
     ) {
-        let path_len = path.len();
-        if path_len == 0 || path_len > MAX_NAME_CACHE_PATH_LEN {
+        if delegated_file_handle == 0 {
             return;
         }
-
-        for entry in self.entries.iter() {
-            if !entry.try_lock() {
-                continue;
-            }
-            let is_match = {
-                let cur_path = unsafe { &*entry.path_bytes.get() };
-                entry.valid.load(Ordering::Relaxed) != 0
-                    && entry.file_table.load(Ordering::Relaxed) == file_table
-                    && entry.path_hash.load(Ordering::Relaxed) == path_hash
-                    && entry.path_len.load(Ordering::Relaxed) as usize == path_len
-                    && &cur_path[..path_len] == path
-            };
-
-            let is_empty = entry.valid.load(Ordering::Relaxed) == 0;
-
-            if is_match || is_empty {
-                entry.valid.store(0, Ordering::Release);
-                entry.file_table.store(file_table, Ordering::Relaxed);
-                entry.cwd_generation.store(cwd_gen, Ordering::Relaxed);
-                entry.path_len.store(path_len as u32, Ordering::Relaxed);
-                entry.path_hash.store(path_hash, Ordering::Relaxed);
-                let path_bytes = unsafe { &mut *entry.path_bytes.get() };
-                path_bytes[..path_len].copy_from_slice(path);
-                entry
-                    .delegated_file_handle
-                    .store(delegated_file_handle, Ordering::Relaxed);
-                entry.valid.store(1, Ordering::Release);
-                entry.unlock();
-                return;
-            }
-            entry.unlock();
-        }
-
-        let Some(entry) = self.entries.first() else {
+        let Some(key) = Self::key(file_table, path, path_hash) else {
             return;
         };
-        if entry.try_lock() {
-            entry.valid.store(0, Ordering::Release);
-            entry.file_table.store(file_table, Ordering::Relaxed);
-            entry.cwd_generation.store(cwd_gen, Ordering::Relaxed);
-            entry.path_len.store(path_len as u32, Ordering::Relaxed);
-            entry.path_hash.store(path_hash, Ordering::Relaxed);
-            let path_bytes = unsafe { &mut *entry.path_bytes.get() };
-            path_bytes[..path_len].copy_from_slice(path);
-            entry
-                .delegated_file_handle
-                .store(delegated_file_handle, Ordering::Relaxed);
-            entry.valid.store(1, Ordering::Release);
-            entry.unlock();
+
+        for entry in self.entries.iter() {
+            // A busy entry belongs to another host writer; the cache is
+            // optional, so try the next one.
+            let Some(writer) = entry.try_writer() else {
+                continue;
+            };
+            if writer.handle() == 0 || writer.holds(key) {
+                writer.publish(key, cwd_gen, delegated_file_handle);
+                return;
+            }
+        }
+
+        if let Some(entry) = self.entries.first()
+            && let Some(writer) = entry.try_writer()
+        {
+            writer.publish(key, cwd_gen, delegated_file_handle);
         }
     }
 
+    /// Empty every entry. Each claim waits out a concurrent host writer, so
+    /// no invalidation is lost to contention.
     pub fn invalidate_all(&self) {
         for entry in self.entries.iter() {
-            entry.valid.store(0, Ordering::Release);
+            if entry.may_need(|handle| handle != 0) {
+                let writer = entry.writer();
+                if writer.handle() != 0 {
+                    writer.clear();
+                }
+            }
         }
     }
 
+    /// Empty every entry that maps to `file_handle` (a closed handle may be
+    /// reused for another file, so this must never be lost).
     pub fn invalidate_file(&self, file_handle: u32) {
+        if file_handle == 0 {
+            return;
+        }
+        let target = u64::from(file_handle);
         for entry in self.entries.iter() {
-            if entry.delegated_file_handle.load(Ordering::Relaxed) == file_handle {
-                entry.valid.store(0, Ordering::Release);
+            if entry.may_need(|handle| handle == target) {
+                let writer = entry.writer();
+                if writer.handle() == target {
+                    writer.clear();
+                }
             }
         }
     }
@@ -4345,7 +4478,8 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0xf3ff85e189b79717);
+    assert!(MAX_NAME_CACHE_PATH_LEN == NAME_CACHE_PATH_WORDS * core::mem::size_of::<u64>());
+    assert!(EL1_ABI_LAYOUT_HASH == 0x7a4ff1b067ac86f6);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -4359,7 +4493,7 @@ const _: () = {
     );
 };
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     #[test]
     fn fd_map_waiter_does_no_rmw_while_lock_is_observed_held() {
@@ -4960,6 +5094,115 @@ mod tests {
         assert_eq!(cache.lookup(file_table, path, hash), Some(9));
         cache.invalidate_all();
         assert_eq!(cache.lookup(file_table, path, hash), None);
+
+        // Zero handle and oversized paths are ignored.
+        cache.insert(file_table, new_gen, path, hash, 0);
+        assert_eq!(cache.lookup(file_table, path, hash), None);
+        let max_path = [b'z'; MAX_NAME_CACHE_PATH_LEN];
+        let max_hash = hash_path(&max_path);
+        cache.insert(file_table, new_gen, &max_path, max_hash, 12);
+        assert_eq!(cache.lookup(file_table, &max_path, max_hash), Some(12));
+        let over_path = [b'z'; MAX_NAME_CACHE_PATH_LEN + 1];
+        cache.insert(file_table, new_gen, &over_path, hash_path(&over_path), 13);
+        assert_eq!(
+            cache.lookup(file_table, &over_path, hash_path(&over_path)),
+            None
+        );
+
+        // Filling all 32 entries then inserting a 33rd evicts slot 0 cleanly.
+        cache.invalidate_all();
+        for idx in 0..=NAME_CACHE_ENTRIES {
+            let p = [b'0'.wrapping_add(idx as u8); 12];
+            cache.insert(file_table, new_gen, &p, hash_path(&p), (idx + 100) as u32);
+        }
+        let first_path = [b'0'; 12];
+        let last_path = [b'0'.wrapping_add(NAME_CACHE_ENTRIES as u8); 12];
+        assert_eq!(
+            cache.lookup(file_table, &first_path, hash_path(&first_path)),
+            None
+        );
+        assert_eq!(
+            cache.lookup(file_table, &last_path, hash_path(&last_path)),
+            Some((NAME_CACHE_ENTRIES + 100) as u32)
+        );
+    }
+
+    /// #1153 witness: one host writer flips a single cache slot between
+    /// two same-hash, same-length paths (invalidate, then refill) while
+    /// oversubscribed guest-side readers look one of them up through the
+    /// production `lookup`. Oversubscription makes the OS preempt readers at
+    /// arbitrary instructions, including between the old reader's path
+    /// comparison and its handle load; a reader resumed there after the
+    /// slot was refilled used to return the other path's handle with
+    /// `valid` set on both sides of the check. The sequence-validated read
+    /// refuses every such mix by construction.
+    #[test]
+    fn name_cache_concurrent_invalidate_and_refill_never_returns_other_paths_handle() {
+        extern crate std;
+        use core::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let cache = std::boxed::Box::new(InotifyNameCache::new());
+        let file_table = 42_u64;
+        let cwd_gen = cache.cwd_generation();
+        // Same hash and length: only the bytes tell the two paths apart, and
+        // they differ only in the first byte, which a reader checks first.
+        let forced_hash = 0xdead_beef_cafe_babe_u64;
+        let mut path_a = [b'x'; MAX_NAME_CACHE_PATH_LEN];
+        path_a[0] = b'a';
+        let mut path_b = [b'x'; MAX_NAME_CACHE_PATH_LEN];
+        path_b[0] = b'b';
+        let handle_a = 11_u32;
+        let handle_b = 22_u32;
+        let readers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .saturating_mul(4)
+            .clamp(8, 64);
+        let budget = Duration::from_millis(2000);
+        let stop = AtomicBool::new(false);
+        let wrong = AtomicU32::new(0);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let started = Instant::now();
+                let mut round = 0_u32;
+                while !stop.load(Ordering::Relaxed) && started.elapsed() < budget {
+                    for _ in 0..1024 {
+                        if round & 1 == 0 {
+                            cache.invalidate_file(handle_b);
+                            cache.insert(file_table, cwd_gen, &path_a, forced_hash, handle_a);
+                            cache.invalidate_file(handle_a);
+                            cache.insert(file_table, cwd_gen, &path_b, forced_hash, handle_b);
+                        } else {
+                            cache.invalidate_all();
+                            cache.insert(file_table, cwd_gen, &path_a, forced_hash, handle_a);
+                            cache.invalidate_all();
+                            cache.insert(file_table, cwd_gen, &path_b, forced_hash, handle_b);
+                        }
+                    }
+                    round = round.wrapping_add(1);
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            for _ in 0..readers {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some(got) = cache.lookup(file_table, &path_a, forced_hash)
+                            && got != handle_a
+                        {
+                            wrong.store(got, Ordering::Relaxed);
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            wrong.load(Ordering::Relaxed),
+            0,
+            "lookup for path_a returned another path's delegated_file_handle across invalidate+refill"
+        );
     }
 
     #[test]

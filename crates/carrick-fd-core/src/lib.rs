@@ -12,9 +12,9 @@
 
 pub use carrick_sched_core::{BoundedSpin, LockWait};
 #[cfg(not(all(test, feature = "loom")))]
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[cfg(all(test, feature = "loom"))]
-use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub mod exec;
 pub mod handle;
@@ -564,49 +564,10 @@ pub(crate) const FREE_INDEX: u64 = u32::MAX as u64;
 const REF: u64 = 1 << 32;
 const PIN: u64 = 1;
 
-/// One shared-memory sequence word for lock-free seqlock readers.
-///
-/// Writers call [`SeqWord::begin_write`] (storing an odd sequence and issuing
-/// a release fence so subsequent relaxed stores cannot be reordered before the
-/// odd transition) and [`SeqWord::end_write`] (storing the next even sequence
-/// with release ordering). Readers call `load(Ordering::Acquire)` and validate
-/// after their relaxed reads with [`SeqWord::unchanged_since`] (which issues
-/// an acquire fence before re-reading the sequence word).
-#[repr(transparent)]
-#[derive(Debug, Default)]
-pub(crate) struct SeqWord(pub(crate) AtomicU64);
-
-impl SeqWord {
-    #[inline]
-    pub(crate) fn load(&self, order: Ordering) -> u64 {
-        self.0.load(order)
-    }
-
-    #[cfg(all(test, not(feature = "loom")))]
-    #[inline]
-    pub(crate) fn store(&self, val: u64, order: Ordering) {
-        self.0.store(val, order);
-    }
-
-    #[inline]
-    pub(crate) fn begin_write(&self) {
-        let seq = self.0.load(Ordering::Relaxed);
-        self.0.store(seq | 1, Ordering::Relaxed);
-        fence(Ordering::Release);
-    }
-
-    #[inline]
-    pub(crate) fn end_write(&self) {
-        let seq = self.0.load(Ordering::Relaxed);
-        self.0.store((seq | 1) + 1, Ordering::Release);
-    }
-
-    #[inline]
-    pub(crate) fn unchanged_since(&self, seq: u64) -> bool {
-        fence(Ordering::Acquire);
-        self.0.load(Ordering::Relaxed) == seq
-    }
-}
+#[cfg(not(all(test, feature = "loom")))]
+pub(crate) use carrick_core_abi::SeqWord;
+#[cfg(all(test, feature = "loom"))]
+pub(crate) type SeqWord = carrick_core_abi::SeqWord<handle::LoomAtomicU64>;
 
 /// One table identity in shared memory. `lock` serializes every operation
 /// that changes the table's slots; the other words are written only under

@@ -1,3 +1,6 @@
+# #1153: InotifyNameCache seqlock rebuild and EL1_ABI_LAYOUT_HASH update in
+# shared crates/carrick-el1-abi/src/lib.rs (bound under kernel.el1.inotify and
+# kernel.x86.file-region). Open-lifetime reference custody is unchanged.
 schema_version = 1
 id = "kernel.el1.open-lifetime"
 title = "One terminal authority for host and ring file references"

@@ -1,3 +1,6 @@
+# #1153: InotifyNameCache seqlock rebuild and EL1_ABI_LAYOUT_HASH update in
+# shared crates/carrick-el1-abi/src/lib.rs (bound under kernel.el1.inotify and
+# kernel.x86.file-region). Stage-1 publication semantics and budgets are unchanged.
 # #898 diagnostic-only: entry_binding fatals now retain their invariant
 # reason and caller coordinates. Existing bindings remain the semantic
 # and work-budget evidence. Rerun the existing control:

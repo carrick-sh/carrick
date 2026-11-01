@@ -452,6 +452,7 @@ test-loom-a *ARGS:
 [private]
 _test-loom-a *ARGS:
     {{_admit}} {{_cargo}} test --locked -p carrick-fd-core --features loom --lib loom_models {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-el1-abi --features loom --lib loom_models {{ARGS}}
 
 test-loom-b *ARGS:
     {{_admit}} {{_xtask}} loom-run _test-loom-b -- {{ARGS}}

@@ -1,3 +1,6 @@
+# #1153: InotifyNameCache seqlock rebuild and EL1_ABI_LAYOUT_HASH update in
+# shared crates/carrick-el1-abi/src/lib.rs (bound under kernel.el1.inotify and
+# kernel.x86.file-region). Signal-owner semantics and stack budgets are unchanged.
 schema_version = 1
 id = "kernel.el1.signal-delivery-owner"
 title = "Signal payload queues and delivery have one shared owner"

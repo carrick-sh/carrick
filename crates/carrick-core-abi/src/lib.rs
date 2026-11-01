@@ -36,6 +36,9 @@ pub use root_exit::*;
 mod open_lifetime;
 pub use open_lifetime::*;
 
+mod seqlock;
+pub use seqlock::*;
+
 pub mod host_file;
 pub mod service;
 
